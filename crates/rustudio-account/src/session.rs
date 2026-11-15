@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use ureq::ResponseExt;
 use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
@@ -34,6 +35,9 @@ pub const ASSET_V2_URL: &str = "https://assetdelivery.roblox.com/v2/assetId";
 
 const KEYRING_SERVICE: &str = "rustudio";
 const KEYRING_KEY: &str = "roblox-cookie";
+
+// Serialize rotation's compare-and-save with account switches and sign-out.
+static SESSION_STORAGE: Mutex<()> = Mutex::new(());
 
 /// Retries of a CSRF-refused request (Studio: counter at 
 ///).
@@ -227,12 +231,14 @@ pub fn keyring_cookie() -> Option<Cookie> {
 
 /// Stores the cookie in the keyring as the active session.
 pub fn keyring_store(c: &Cookie) -> Result<()> {
+    let _storage = SESSION_STORAGE.lock().unwrap_or_else(|e| e.into_inner());
     secret_store(KEYRING_KEY, c)
 }
 
 /// Removes the keyring copy (sign out). The import file is the person's and
 /// is left alone.
 pub fn keyring_clear() -> Result<()> {
+    let _storage = SESSION_STORAGE.lock().unwrap_or_else(|e| e.into_inner());
     secret_clear(KEYRING_KEY, &LEGACY_COOKIE);
     Ok(())
 }
@@ -255,10 +261,12 @@ pub fn account_cookie(user_id: u64) -> Option<Cookie> {
 }
 
 pub fn account_store(user_id: u64, c: &Cookie) -> Result<()> {
+    let _storage = SESSION_STORAGE.lock().unwrap_or_else(|e| e.into_inner());
     secret_store(&account_user(user_id), c)
 }
 
 pub fn account_forget(user_id: u64) {
+    let _storage = SESSION_STORAGE.lock().unwrap_or_else(|e| e.into_inner());
     let id = user_id.to_string();
     secret_clear(
         &account_user(user_id),
@@ -463,8 +471,25 @@ fn text_of(mut r: ureq::http::Response<ureq::Body>) -> Result<(u16, String)> {
 }
 
 /// The `.ROBLOSECURITY` value a reply rotated out (`Set-Cookie`), if any.
+fn trusted_rotation_origin(uri: &ureq::http::Uri) -> bool {
+    uri.scheme_str() == Some("https")
+        && matches!(uri.port_u16(), None | Some(443))
+        && matches!(uri.host(), Some("users.roblox.com" | "auth.roblox.com"
+            | "avatar.roblox.com" | "develop.roblox.com" | "data.roblox.com"
+            | "assetdelivery.roblox.com" | "apis.roblox.com" | "www.roblox.com"))
+}
+
 fn rotated_cookie(r: &ureq::http::Response<ureq::Body>) -> Option<Cookie> {
-    r.headers()
+    // ureq records the URI of the actual response, including after redirects.
+    // Cookie attributes cannot establish the responding server's identity.
+    if !trusted_rotation_origin(r.get_uri()) {
+        return None;
+    }
+    rotation_value(r.headers())
+}
+
+fn rotation_value(headers: &ureq::http::HeaderMap) -> Option<Cookie> {
+    headers
         .get_all("set-cookie")
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -483,9 +508,18 @@ fn rotated_cookie(r: &ureq::http::Response<ureq::Body>) -> Option<Cookie> {
 /// import file's marker — so the file's older copy doesn't take the slot
 /// back on the next start.
 fn persist_rotation(new: &Cookie, old: &Cookie, user_id: u64) {
-    let _ = keyring_store(new);
-    if account_cookie(user_id).is_some() {
-        let _ = account_store(user_id, new);
+    let _storage = SESSION_STORAGE.lock().unwrap_or_else(|e| e.into_inner());
+    let active = keyring_cookie().is_some_and(|c| c.0 == old.0);
+    let saved_active = active && secret_store(KEYRING_KEY, new).is_ok();
+    // An old downloader must not restore a forgotten or replaced account.
+    if account_cookie(user_id).is_some_and(|c| c.0 == old.0) {
+        let _ = secret_store(&account_user(user_id), new);
+    }
+    // Do not suppress the file's only viable credential if the keyring is
+    // unavailable. A missing active slot also means sign-out, so rotations
+    // never create one; load_cookie imports files before validation.
+    if !saved_active {
+        return;
     }
     if let Ok(Some(f)) = file_cookie() {
         if f.0 == old.0 {
@@ -579,19 +613,24 @@ impl Session {
     /// Follows a `.ROBLOSECURITY` rotation a reply carried (`Set-Cookie`).
     /// Roblox rotates the cookie on a cadence of hours to days and rejects
     /// an outdated one on asset delivery before the other hosts do, so every
-    /// reply is checked, not just the identity call.
+    /// authenticated reply from an allowed HTTPS origin is checked, not just
+    /// the identity call.
     fn apply_rotation(&self, r: &ureq::http::Response<ureq::Body>) {
         let Some(new) = rotated_cookie(r) else { return };
-        let old = {
-            let mut held = self.cookie.lock().unwrap_or_else(|e| e.into_inner());
-            if held.0 == new.0 {
-                return;
-            }
-            std::mem::replace(&mut *held, new.clone())
-        };
-        if self.persist {
-            persist_rotation(&new, &old, self.profile.id);
+        self.apply_rotated_cookie(new);
+    }
+
+    fn apply_rotated_cookie(&self, new: Cookie) {
+        // Hold this through persistence: a later downloader rotation must not
+        // reach storage before this generation and then be overwritten by it.
+        let mut held = self.cookie.lock().unwrap_or_else(|e| e.into_inner());
+        if held.0 == new.0 {
+            return;
         }
+        if self.persist {
+            persist_rotation(&new, &held, self.profile.id);
+        }
+        *held = new;
     }
 
     /// GET with the session.
@@ -640,7 +679,9 @@ impl Session {
             }
         }
         let mut r = req.call()?;
-        self.apply_rotation(&r);
+        if with_cookie {
+            self.apply_rotation(&r);
+        }
         let status = r.status().as_u16();
         let mut bytes = Vec::new();
         r.body_mut()
@@ -1125,6 +1166,7 @@ mod rotation {
         let copy = s.downloader();
         let url = format!("{}/identity", server.base);
         s.get(&url).unwrap();
+        s.apply_rotated_cookie(Cookie::new("rotated-value").unwrap());
         assert_eq!(
             copy.cookie().cache_key(),
             Cookie::new("rotated-value").unwrap().cache_key()
@@ -1133,6 +1175,97 @@ mod rotation {
         let sent = server.requests();
         assert_eq!(sent[0].header("cookie"), Some(".ROBLOSECURITY=stale-value"));
         assert_eq!(sent[1].header("cookie"), Some(".ROBLOSECURITY=rotated-value"));
+    }
+
+    #[test]
+    fn only_the_session_cookie_value_is_extracted() {
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.append("set-cookie", "rbx-ip2=1; domain=roblox.com".parse().unwrap());
+        assert!(rotation_value(&headers).is_none());
+        headers.append("set-cookie", ROTATED.parse().unwrap());
+        assert_eq!(rotation_value(&headers).unwrap().0, "rotated-value");
+    }
+
+    #[test]
+    fn rotations_require_an_exact_https_auth_origin() {
+        for url in ["https://users.roblox.com/v1/users/authenticated",
+            "https://assetdelivery.roblox.com:443/v2/assetId/1",
+            "https://auth.roblox.com/"] {
+            assert!(trusted_rotation_origin(&url.parse().unwrap()));
+        }
+        for url in ["http://users.roblox.com/", "https://users.roblox.com:444/",
+            "https://users.roblox.com.evil.example/", "https://evilroblox.com/",
+            "https://tr.rbxcdn.com/", "https://images.rbxcdn.com/",
+            "https://untrusted.roblox.com/", "http://127.0.0.1/"] {
+            assert!(!trusted_rotation_origin(&url.parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn untrusted_and_anonymous_replies_cannot_rotate_any_copy() {
+        let server = MockServer::start(Arc::new(|_: &MockRequest| {
+            MockReply::json(200, "{}").with_header("Set-Cookie", ROTATED)
+        })).unwrap();
+        let s = Session::unchecked(Cookie::new("stale-value").unwrap(), mock(""));
+        let copy = s.downloader();
+        let url = format!("{}/image", server.base);
+        s.get(&url).unwrap();
+        s.fetch_bytes(&url, false).unwrap();
+        s.fetch_bytes(&url, true).unwrap();
+        assert_eq!(copy.cookie().0, "stale-value");
+        assert!(server.requests()[1].header("cookie").is_none());
+    }
+
+    #[test]
+    fn redirected_reply_is_checked_at_its_final_origin() {
+        let destination = MockServer::start(Arc::new(|_: &MockRequest| {
+            MockReply::json(200, "{}").with_header("Set-Cookie", ROTATED)
+        })).unwrap();
+        let location = format!("{}/final", destination.base);
+        let source = MockServer::start(Arc::new(move |_: &MockRequest| {
+            MockReply::json(302, "{}").with_header("Location", &location)
+        })).unwrap();
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false)
+            .build().into();
+        let reply = agent.get(format!("{}/redirect", source.base)).call().unwrap();
+        assert_eq!(reply.get_uri().host(), Some("127.0.0.1"));
+        assert_eq!(reply.get_uri().path(), "/final");
+        assert!(rotated_cookie(&reply).is_none());
+    }
+
+    #[test]
+    fn late_rotation_cannot_replace_active_account_or_restore_signout() {
+        let old = Cookie::new("original-account").unwrap();
+        let new = Cookie::new("rotated-account").unwrap();
+        keyring_store(&old).unwrap();
+        account_store(1, &old).unwrap();
+        keyring_store(&Cookie::new("different-account").unwrap()).unwrap();
+        persist_rotation(&new, &old, 1);
+        assert_eq!(keyring_cookie().unwrap().0, "different-account");
+        assert_eq!(account_cookie(1).unwrap().0, "rotated-account");
+        keyring_clear().unwrap();
+        account_forget(1);
+        persist_rotation(&Cookie::new("late-value").unwrap(), &new, 1);
+        assert!(keyring_cookie().is_none());
+        assert!(account_cookie(1).is_none());
+    }
+
+    #[test]
+    fn rotations_save_in_shared_cookie_order_and_reject_stale_storage() {
+        let old = Cookie::new("original-account").unwrap();
+        keyring_store(&old).unwrap();
+        account_store(1, &old).unwrap();
+        let mut s = Session::unchecked(old.clone(), mock(""));
+        s.persist = true;
+        let copy = s.downloader();
+        s.apply_rotated_cookie(Cookie::new("first-rotation").unwrap());
+        copy.apply_rotated_cookie(Cookie::new("second-rotation").unwrap());
+        assert_eq!(s.cookie().0, "second-rotation");
+        assert_eq!(keyring_cookie().unwrap().0, "second-rotation");
+        assert_eq!(account_cookie(1).unwrap().0, "second-rotation");
+        persist_rotation(&Cookie::new("stale-write").unwrap(), &old, 1);
+        assert_eq!(keyring_cookie().unwrap().0, "second-rotation");
+        assert_eq!(account_cookie(1).unwrap().0, "second-rotation");
     }
 
     #[test]

@@ -195,7 +195,7 @@ impl Client {
     /// The signed-in person's avatar description (avatar.roblox.com/v1/avatar),
     /// from the cache when it belongs to this cookie.
     pub fn avatar_json(&self) -> Result<serde_json::Value> {
-        if let Some(v) = ProfileCache::load(self.session.cookie()).and_then(|c| c.avatar) {
+        if let Some(v) = ProfileCache::load(&self.session.cookie()).and_then(|c| c.avatar) {
             return Ok(v);
         }
         self.session.avatar_json()
@@ -374,7 +374,7 @@ impl Client {
 
     /// Keeps this session as a saved account (account switching).
     pub fn remember_account(&self) -> Result<()> {
-        session::account_store(self.session.profile.id, self.session.cookie())
+        session::account_store(self.session.profile.id, &self.session.cookie())
     }
 
     /// Signs in with a pasted `.ROBLOSECURITY` value: validated first, then
@@ -383,7 +383,7 @@ impl Client {
         let cookie = Cookie::new(raw).ok_or(SignedOut::NoCookie)?;
         let c = Self::open_with(config, cookie, CookieSource::Keyring)?;
         session::mark_file_seen();
-        session::keyring_store(c.session.cookie())
+        session::keyring_store(&c.session.cookie())
             .map_err(|e| SignedOut::Rejected(format!("signed in, but {e}")))?;
         let _ = c.remember_account();
         Ok(c)
@@ -400,7 +400,7 @@ impl Client {
             return Err(SignedOut::Rejected("the saved session belongs to another account".into()));
         }
         session::mark_file_seen();
-        session::keyring_store(c.session.cookie())
+        session::keyring_store(&c.session.cookie())
             .map_err(|e| SignedOut::Rejected(format!("signed in, but {e}")))?;
         Ok(c)
     }

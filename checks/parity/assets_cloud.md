@@ -96,6 +96,12 @@ LoadAsset/LoadAssetAsync now yield on worker downloads; LoadAssetVersion uses
 asset delivery's version-id query rather than incorrectly treating a version
 ID as an asset ID. Authenticated fetch_bytes now preserves Roblox-Place-Id.
 
+The session now follows `.ROBLOSECURITY` rotation (`Set-Cookie`) and retries an
+asset delivery refusal on authentication once — asset delivery enforces the
+current cookie generation before the other hosts do, which is what made
+authenticated avatar/animation downloads say "Authentication required"
+(docs/AUTH.md, "Cookie rotation").
+
 Audio search v2 body recovered: read-only POST to
 `toolbox-service/v2/assets:search`, searchCategoryType Audio, searchView Core,
 query, sortCategory/sortDirection, optional maxPageSize/pageToken/tags, and

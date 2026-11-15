@@ -11,7 +11,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -427,10 +427,18 @@ pub fn session_agent() -> ureq::Agent {
 
 /// A validated session.
 pub struct Session {
-    cookie: Cookie,
+    /// The cookie as it stands now. Roblox rotates `.ROBLOSECURITY` through
+    /// `Set-Cookie` replies (see [`Session::apply_rotation`]); the value is
+    /// shared with every [`Session::downloader`] copy, so one rotation
+    /// reaches a fan-out of downloads.
+    cookie: Arc<Mutex<Cookie>>,
     agent: ureq::Agent,
     /// X-CSRF-TOKEN from the last 403, reused until the session rotates it.
     csrf: Mutex<Option<String>>,
+    /// Store a rotation where `load_cookie` finds it. Off for
+    /// [`Session::unchecked`]: a mock server's `Set-Cookie` must never
+    /// replace the person's stored session.
+    persist: bool,
     pub profile: Profile,
 }
 
@@ -454,6 +462,38 @@ fn text_of(mut r: ureq::http::Response<ureq::Body>) -> Result<(u16, String)> {
     Ok((status, s))
 }
 
+/// The `.ROBLOSECURITY` value a reply rotated out (`Set-Cookie`), if any.
+fn rotated_cookie(r: &ureq::http::Response<ureq::Body>) -> Option<Cookie> {
+    r.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| {
+            let (name, rest) = c.trim().split_once('=')?;
+            if name.trim() != ".ROBLOSECURITY" {
+                return None;
+            }
+            Cookie::new(rest.split(';').next()?.trim())
+        })
+}
+
+/// Roblox rotates `.ROBLOSECURITY` through `Set-Cookie` (docs/AUTH.md). A
+/// rotation is stored where the next `load_cookie` finds it: the keyring's
+/// active slot, the saved-account slot when this account has one, and the
+/// import file's marker — so the file's older copy doesn't take the slot
+/// back on the next start.
+fn persist_rotation(new: &Cookie, old: &Cookie, user_id: u64) {
+    let _ = keyring_store(new);
+    if account_cookie(user_id).is_some() {
+        let _ = account_store(user_id, new);
+    }
+    if let Ok(Some(f)) = file_cookie() {
+        if f.0 == old.0 {
+            mark_seen(&f);
+        }
+    }
+}
+
 impl Session {
     /// Asks Roblox who the cookie belongs to. Err(SIGNED_OUT…) when it isn't
     /// accepted; the cookie never appears in the error.
@@ -464,6 +504,7 @@ impl Session {
             .header("Cookie", &cookie.header())
             .call()
             .map_err(|e| Error(format!("{SIGNED_OUT} (could not reach Roblox: {e})")))?;
+        let rotated = rotated_cookie(&r);
         let (status, text) = text_of(r)?;
         if status != 200 {
             return Err(Error(format!(
@@ -472,21 +513,38 @@ impl Session {
         }
         let profile: Profile = serde_json::from_str(&text)
             .map_err(|_| Error(format!("{SIGNED_OUT} (unexpected reply from Roblox)")))?;
+        // Roblox hands out the next `.ROBLOSECURITY` value on the identity
+        // call when the stored one is outdated. Using it from here on is what
+        // keeps asset delivery working: it already refuses an outdated value
+        // with "Authentication required to access Asset." [verified: live
+        // 2026-11-15 — the stored value validated here but assetdelivery
+        // answered 401 code 11, and the same request with the rotated value
+        // served the animation asset (1166 bytes) and the account's place].
+        let cookie = match rotated {
+            Some(new) if new.0 != cookie.0 => {
+                persist_rotation(&new, &cookie, profile.id);
+                new
+            }
+            _ => cookie,
+        };
         Ok(Session {
-            cookie,
+            cookie: Arc::new(Mutex::new(cookie)),
             agent,
             csrf: Mutex::new(None),
+            persist: true,
             profile,
         })
     }
 
     /// A copy for downloads on other threads, so they don't queue on the
     /// account's lock (it shares the connection pool; no CSRF token).
+    /// The cookie is shared, so a rotation seen by one copy is seen by all.
     pub fn downloader(&self) -> Session {
         Session {
             cookie: self.cookie.clone(),
             agent: self.agent.clone(),
             csrf: Mutex::new(None),
+            persist: self.persist,
             profile: self.profile.clone(),
         }
     }
@@ -496,15 +554,44 @@ impl Session {
     /// a real cookie: nothing about the profile is verified.
     pub fn unchecked(cookie: Cookie, profile: Profile) -> Session {
         Session {
-            cookie,
+            cookie: Arc::new(Mutex::new(cookie)),
             agent: session_agent(),
             csrf: Mutex::new(None),
+            persist: false,
             profile,
         }
     }
 
-    pub fn cookie(&self) -> &Cookie {
-        &self.cookie
+    /// The cookie as it stands now: Roblox may have rotated it since the
+    /// session was validated.
+    pub fn cookie(&self) -> Cookie {
+        self.held()
+    }
+
+    /// The value the next request carries.
+    fn held(&self) -> Cookie {
+        self.cookie
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Follows a `.ROBLOSECURITY` rotation a reply carried (`Set-Cookie`).
+    /// Roblox rotates the cookie on a cadence of hours to days and rejects
+    /// an outdated one on asset delivery before the other hosts do, so every
+    /// reply is checked, not just the identity call.
+    fn apply_rotation(&self, r: &ureq::http::Response<ureq::Body>) {
+        let Some(new) = rotated_cookie(r) else { return };
+        let old = {
+            let mut held = self.cookie.lock().unwrap_or_else(|e| e.into_inner());
+            if held.0 == new.0 {
+                return;
+            }
+            std::mem::replace(&mut *held, new.clone())
+        };
+        if self.persist {
+            persist_rotation(&new, &old, self.profile.id);
+        }
     }
 
     /// GET with the session.
@@ -512,8 +599,9 @@ impl Session {
         let r = self
             .agent
             .get(url)
-            .header("Cookie", &self.cookie.header())
+            .header("Cookie", &self.held().header())
             .call()?;
+        self.apply_rotation(&r);
         text_of(r)
     }
 
@@ -523,13 +611,14 @@ impl Session {
         let r = self
             .agent
             .get(url)
-            .header("Cookie", &self.cookie.header())
+            .header("Cookie", &self.held().header())
             .call()?;
         let h = r
             .headers()
             .get(header)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        self.apply_rotation(&r);
         let (status, text) = text_of(r)?;
         Ok((status, h, text))
     }
@@ -544,13 +633,14 @@ impl Session {
     fn get_bytes(&self, url: &str, with_cookie: bool) -> Result<(u16, Vec<u8>)> {
         let mut req = self.agent.get(url).header("Accept-Encoding", "gzip");
         if with_cookie {
-            req = req.header("Cookie", &self.cookie.header());
+            req = req.header("Cookie", &self.held().header());
             let place = PLACE_CONTEXT.load(std::sync::atomic::Ordering::Relaxed);
             if place != 0 {
                 req = req.header("Roblox-Place-Id", &place.to_string());
             }
         }
         let mut r = req.call()?;
+        self.apply_rotation(&r);
         let status = r.status().as_u16();
         let mut bytes = Vec::new();
         r.body_mut()
@@ -573,11 +663,12 @@ impl Session {
         for _ in 0..=CSRF_MAX_RETRIES {
             let token = self.csrf.lock().ok().and_then(|g| g.clone());
             let mut request = ureq::http::Request::builder().method(method).uri(url)
-                .header("Cookie", self.cookie.header());
+                .header("Cookie", self.held().header());
             for (k,v) in extra { request = request.header(*k,*v); }
             if method != "GET" { if let Some(token) = &token { request = request.header("X-CSRF-TOKEN", token); } }
             let request = request.body(body).map_err(|_|Error::new("invalid engine data HTTP request"))?;
             let response = self.agent.run(request)?;
+            self.apply_rotation(&response);
             let fresh = response.headers().get("x-csrf-token").and_then(|v|v.to_str().ok()).map(str::to_owned);
             let headers = response.headers().iter().filter(|(k,_)| k.as_str().starts_with("roblox-object-") || k.as_str()=="retry-after" || k.as_str()=="content-type" || k.as_str()=="etag" || k.as_str()=="usn" || k.as_str()=="content-md5")
                 .filter_map(|(k,v)|v.to_str().ok().map(|v|(k.as_str().to_owned(),v.to_owned()))).collect();
@@ -620,7 +711,7 @@ impl Session {
             let mut req = self
                 .agent
                 .post(url)
-                .header("Cookie", &self.cookie.header())
+                .header("Cookie", &self.held().header())
                 .header("Content-Type", content_type);
             for (k, v) in extra {
                 req = req.header(*k, *v);
@@ -629,6 +720,7 @@ impl Session {
                 req = req.header("X-CSRF-TOKEN", t);
             }
             let r = req.send(body)?;
+            self.apply_rotation(&r);
             let fresh = r
                 .headers()
                 .get("x-csrf-token")
@@ -663,7 +755,38 @@ impl Session {
 
     /// An asset's bytes through asset delivery v2 with the session (assets
     /// served only to signed-in accounts included), then its CDN location.
+    ///
+    /// Roblox's asset delivery refuses an outdated `.ROBLOSECURITY` with
+    /// "Authentication required to access Asset." (HTTP 200, `errors[0]`
+    /// code 401) while other endpoints still accept it [verified: live
+    /// 2026-11-15 — the stored value validated at
+    /// `users.roblox.com/v1/users/authenticated`, asset delivery answered
+    /// 401 code 11, and the rotated value from that call's `Set-Cookie`
+    /// served the same asset]. So a refusal asks the identity endpoint for
+    /// the rotation once and retries.
     pub fn download_asset(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
+        let first = self.download_asset_at(asset_id, version);
+        if let Err(e) = &first {
+            if e.0.contains("Authentication required") && self.refresh_cookie().unwrap_or(false) {
+                return self.download_asset_at(asset_id, version);
+            }
+        }
+        first
+    }
+
+    /// Asks the identity endpoint for the next `.ROBLOSECURITY` value — the
+    /// `Set-Cookie` rotation — and reports whether the session's value
+    /// changed. Every reply is checked anyway (`apply_rotation`); this is for
+    /// a session that has not talked to a rotating endpoint since the value
+    /// went stale.
+    fn refresh_cookie(&self) -> Result<bool> {
+        let before = self.held();
+        let (status, _) = self.get(AUTHENTICATED_URL)?;
+        Ok(status == 200 && self.held().0 != before.0)
+    }
+
+    /// One asset delivery attempt.
+    fn download_asset_at(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
         let url = match version {
             Some(v) => format!("{ASSET_V2_URL}/{asset_id}/version/{v}"),
             None => format!("{ASSET_V2_URL}/{asset_id}"),
@@ -672,11 +795,13 @@ impl Session {
         // (`Roblox-Place-Id`): assets the place's creator owns (private
         // animations, audio) are then served to its collaborators.
         let place = PLACE_CONTEXT.load(std::sync::atomic::Ordering::Relaxed);
-        let mut req = self.agent.get(&url).header("Cookie", &self.cookie.header());
+        let mut req = self.agent.get(&url).header("Cookie", &self.held().header());
         if place != 0 {
             req = req.header("Roblox-Place-Id", &place.to_string());
         }
-        let (status, text) = text_of(req.call()?)?;
+        let r = req.call()?;
+        self.apply_rotation(&r);
+        let (status, text) = text_of(r)?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             Error(format!(
                 "asset {asset_id}: asset delivery returned HTTP {status}"
@@ -755,7 +880,7 @@ impl Session {
         if !(200..300).contains(&status) {
             let detail: String = text.chars().take(200).collect();
             // A reply that echoes the cookie or names a secret cookie is not shown.
-            let detail = if self.cookie.appears_in(&detail)
+            let detail = if self.held().appears_in(&detail)
                 || SECRET_COOKIES.iter().any(|c| detail.contains(c))
             {
                 String::new()
@@ -969,5 +1094,58 @@ mod live_assets {
                     .map(|a| a.to_string().chars().take(600).collect::<String>())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation {
+    use super::*;
+    use crate::mock::{MockReply, MockRequest, MockServer};
+
+    fn mock(cookie: &'static str) -> Profile {
+        let _ = cookie;
+        Profile {
+            id: 1,
+            name: "Mock".into(),
+            display_name: "Mock".into(),
+        }
+    }
+
+    /// The reply Roblox sends when it hands out the next `.ROBLOSECURITY`.
+    const ROTATED: &str = ".ROBLOSECURITY=rotated-value; Domain=.roblox.com; Path=/; \
+        Expires=Mon, 15 Nov 2027 10:25:03 GMT; Secure; HttpOnly";
+
+    #[test]
+    fn a_reply_rotates_the_cookie_and_every_copy_uses_it() {
+        let server = MockServer::start(std::sync::Arc::new(|_: &MockRequest| {
+            MockReply::json(200, "{}").with_header("Set-Cookie", ROTATED)
+        }))
+        .unwrap();
+        let s = Session::unchecked(Cookie::new("stale-value").unwrap(), mock(""));
+        let copy = s.downloader();
+        let url = format!("{}/identity", server.base);
+        s.get(&url).unwrap();
+        assert_eq!(
+            copy.cookie().cache_key(),
+            Cookie::new("rotated-value").unwrap().cache_key()
+        );
+        copy.get(&url).unwrap();
+        let sent = server.requests();
+        assert_eq!(sent[0].header("cookie"), Some(".ROBLOSECURITY=stale-value"));
+        assert_eq!(sent[1].header("cookie"), Some(".ROBLOSECURITY=rotated-value"));
+    }
+
+    #[test]
+    fn other_cookies_are_not_a_rotation() {
+        let server = MockServer::start(std::sync::Arc::new(|_: &MockRequest| {
+            MockReply::json(200, "{}").with_header("Set-Cookie", "rbx-ip2=1; domain=roblox.com; path=/")
+        }))
+        .unwrap();
+        let s = Session::unchecked(Cookie::new("stale-value").unwrap(), mock(""));
+        s.get(&format!("{}/x", server.base)).unwrap();
+        assert_eq!(
+            s.cookie().cache_key(),
+            Cookie::new("stale-value").unwrap().cache_key()
+        );
     }
 }

@@ -5907,8 +5907,21 @@ impl Runtime {
                 }
             })
             .flatten();
+        let character = match (name, &v) {
+            ("Character", Variant::Ref(c)) if c.is_some() => Some(*c),
+            _ => None,
+        };
         if let Err(e) = store_prop(&self.lua, r, name, v) {
             report(&self.lua, &e);
+        }
+        // The LocalPlayer's Character set: the LocalScripts already in that
+        // model start now, as in Roblox (a server may stream the character
+        // in before it sets the property); ones that arrive later start as
+        // they arrive (set_parent).
+        if let (Some(c), Ok(mut w)) = (character, world(&self.lua)) {
+            if w.d().exists(c) {
+                w.queue_scripts(c);
+            }
         }
         if let (Some((old, new)), Ok(mut w)) = (health, world(&self.lua)) {
             if new != old {

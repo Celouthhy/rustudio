@@ -41,6 +41,16 @@ pub struct PlayInput {
     pub slots: Vec<usize>,
 }
 
+/// Tool::getHandle uses a direct child named "Handle" that is a BasePart.
+/// `find_child` matches classes, and `find_named` also searches descendants.
+fn tool_handle(d: &doc::Document, tool: Ref) -> Option<Ref> {
+    d.dom.get_by_ref(tool)?.children().iter().copied().find(|c| {
+        d.dom
+            .get_by_ref(*c)
+            .is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
+    })
+}
+
 struct Equipped {
     tool: Ref,
     /// Each tool part relative to the handle.
@@ -949,13 +959,7 @@ impl Editor {
         }
         self.unequip_tool();
         self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, model));
-        // Tool::getHandle: the child named "Handle", when it is a BasePart
-        // (find_child matches by class, which would never find it).
-        let handle = self.doc.dom.get_by_ref(tool).and_then(|t| {
-            t.children().iter().copied().find(|c| {
-                self.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
-            })
-        });
+        let handle = tool_handle(&self.doc, tool);
         let parts: Vec<Ref> = self
             .doc
             .dom
@@ -2242,5 +2246,34 @@ impl GameState {
     /// (play_npc.rs walks it there).
     pub(crate) fn walk_target(&self, humanoid: Ref) -> Option<Vec3> {
         self.walks.get(&humanoid).map(|w| w.target)
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn tool_handle_accepts_named_base_part_children() {
+        for class in ["Part", "MeshPart", "UnionOperation"] {
+            let mut d = doc::Document::new_place();
+            let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+            let handle = d.dom.insert(tool, InstanceBuilder::new(class).with_name("Handle"));
+            assert_eq!(tool_handle(&d, tool), Some(handle), "{class}");
+        }
+    }
+
+    #[test]
+    fn tool_handle_ignores_wrong_names_classes_and_nested_parts() {
+        let mut d = doc::Document::new_place();
+        let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+        d.dom.insert(tool, InstanceBuilder::new("Part").with_name("handle"));
+        let folder = d.dom.insert(tool, InstanceBuilder::new("Folder").with_name("Handle"));
+        d.dom.insert(folder, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), None);
+
+        let handle = d.dom.insert(tool, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), Some(handle));
+        assert_eq!(tool_handle(&d, Ref::new()), None);
     }
 }

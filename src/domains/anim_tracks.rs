@@ -1098,3 +1098,70 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replication_preserves_priority_enum_values_without_changing_blend_order() {
+        let lua = Lua::new();
+        // API dump: Core's value is 1000, but it blends below Idle (0).
+        let priorities = [
+            ("Core", 1000, -1),
+            ("Idle", 0, 0),
+            ("Movement", 1, 1),
+            ("Action", 2, 2),
+            ("Action2", 3, 3),
+            ("Action3", 4, 4),
+            ("Action4", 5, 5),
+        ];
+        for (name, wire_value, blend_rank) in priorities {
+            let priority = crate::ltypes::enum_value(
+                &lua,
+                LEnumItem::from_name("AnimationPriority", name).expect("API enum"),
+            )
+            .unwrap();
+            assert_eq!(rank(&priority), blend_rank, "{name} blending order");
+            let r = Ref::new();
+            let mut t = tracks(&lua);
+            t.order.push(r);
+            t.all.insert(
+                r,
+                Track {
+                    me: Value::Nil,
+                    anim: Value::Nil,
+                    owner: Ref::none(),
+                    rig: Ref::none(),
+                    seq: None,
+                    pending: None,
+                    playing: true,
+                    active: true,
+                    ended: false,
+                    release: false,
+                    first_step: false,
+                    speed: 1.0,
+                    weight: 1.0,
+                    target: 1.0,
+                    fade: 0.1,
+                    fade_start: 1.0,
+                    fade_elapsed: 0.0,
+                    time: 0.0,
+                    looped: false,
+                    looped_set: false,
+                    priority,
+                    priority_set: true,
+                    cut: false,
+                },
+            );
+            drop(t);
+            let reps = replicated_state(&lua);
+            assert_eq!(
+                reps.last().unwrap().priority,
+                wire_value,
+                "{name} wire value"
+            );
+            assert_eq!(reps.len(), tracks(&lua).order.len());
+        }
+    }
+}

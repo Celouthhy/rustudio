@@ -6461,6 +6461,47 @@ mod legacy_tests {
         assert!(out.iter().any(|(_, t)| t.starts_with("gui script ran")), "{out:?}");
     }
 
+    #[test]
+    fn replicated_character_starts_only_local_scripts_once_in_either_order() {
+        for character_first in [false, true] {
+            let mut d = Document::new_place();
+            let root = d.dom.root_ref();
+            let players = d.find_child(root, "Players").unwrap();
+            let player = d.dom.insert(players, InstanceBuilder::new("Player"));
+            let other = d.dom.insert(players, InstanceBuilder::new("Player"));
+            d.dom.get_by_ref_mut(players).unwrap().properties
+                .insert(ustr("LocalPlayer"), Variant::Ref(player));
+            let workspace = d.workspace().unwrap();
+            let character = d.dom.insert(workspace, InstanceBuilder::new("Model"));
+            let script_parent = if character_first { root } else { character };
+            let script = d.dom.insert(script_parent, InstanceBuilder::new("LocalScript")
+                .with_property("Source", "print('character script ran')".to_string()));
+            d.dom.insert(character, InstanceBuilder::new("LocalScript")
+                .with_property("Disabled", true)
+                .with_property("Source", "error('disabled character script ran')".to_string()));
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(d, RunMode::Play);
+            w.side = Side::Client;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            rt.apply_prop(other, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.is_empty());
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            if character_first {
+                rt.apply_parent(script, character);
+            }
+            // Repeated replication before dispatch must still execute once.
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.iter().all(|r| *r == script));
+            rt.dispatch();
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            rt.dispatch();
+            let out = rt.leave().output;
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].1.starts_with("character script ran"), "{out:?}");
+        }
+    }
+
     /// Round 26's library gaps from Place D's second admin script and Place B's
     /// an admin script, on the client: settings() refused to a game script,
     /// TextService filtering refused on the client, a CoreGuiType by name,

@@ -817,7 +817,8 @@ pub struct TrackRep {
     pub fade: f64,
     pub time: f64,
     pub looped: bool,
-    /// AnimationPriority value (Core 0).
+    /// The AnimationPriority's enum value (Idle 0 … Action4 5, Core 1000),
+    /// as Animator replication carries it.
     pub priority: u32,
 }
 
@@ -838,7 +839,10 @@ pub fn replicated_state(lua: &Lua) -> Vec<TrackRep> {
             fade: s.fade,
             time: s.time,
             looped: s.looped,
-            priority: rank(&s.priority).max(0) as u32,
+            priority: match &s.priority {
+                Value::UserData(u) => u.borrow::<LEnumItem>().map(|e| e.value as u32).unwrap_or(1000),
+                _ => 1000,
+            },
         })
         .collect()
 }

@@ -949,10 +949,12 @@ impl Editor {
         }
         self.unequip_tool();
         self.with_side(Side::Server, |rt, _, _| rt.apply_parent(tool, model));
-        let handle = self.doc.find_child(tool, "Handle").filter(|h| {
-            self.doc
-                .class_of(*h)
-                .is_some_and(|c| doc::is_a(&c, "BasePart"))
+        // Tool::getHandle: the child named "Handle", when it is a BasePart
+        // (find_child matches by class, which would never find it).
+        let handle = self.doc.dom.get_by_ref(tool).and_then(|t| {
+            t.children().iter().copied().find(|c| {
+                self.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
+            })
         });
         let parts: Vec<Ref> = self
             .doc

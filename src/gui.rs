@@ -725,7 +725,10 @@ fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
             return false;
         }
     }
-    true
+    // A point in line with every edge only happens for a quad with no area
+    // (a zero-size GuiObject, such as legacy chat's MessageMode button),
+    // which takes no input in Roblox.
+    sign != 0.0
 }
 
 // ------------------------------------------------------------------ fonts
@@ -1530,6 +1533,10 @@ mod tests {
         ];
         assert!(point_in_quad(&q, Pos2::new(5.0, 5.0)));
         assert!(!point_in_quad(&q, Pos2::new(0.5, 0.5)));
+        // A zero-size object (all four corners at one point) is hit nowhere.
+        let p = Pos2::new(12.0, 147.3);
+        assert!(!point_in_quad(&[p; 4], Pos2::new(480.0, 300.0)));
+        assert!(!point_in_quad(&[p; 4], p));
     }
 }
 

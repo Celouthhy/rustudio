@@ -73,8 +73,13 @@ pub enum Tab {
     AvatarSettings,
     /// Studio's Terrain Editor (Home / View > Terrain Editor).
     TerrainEditor,
+    /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
+    Toolbox,
     /// A script open in the code editor.
     Script(Ref),
+    /// A plugin's DockWidgetPluginGui (src/plugin_host/widgets_ui.rs: the
+    /// slot number of its `edit_<plugin>_<id>` key).
+    Plugin(u32),
 }
 
 impl Tab {
@@ -86,7 +91,9 @@ impl Tab {
             Tab::Output => "Output",
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
+            Tab::Toolbox => "Toolbox",
             Tab::Script(_) => "Script",
+            Tab::Plugin(_) => "Plugin",
         }
     }
 }
@@ -138,6 +145,10 @@ pub struct Harness {
     /// Studio playtest's do), not from program start.
     pub from_play: bool,
     pub play_started: Option<Instant>,
+    /// Play's simulated seconds since it started, when frames step a fixed dt
+    /// (RUSTUDIO_FIXED_DT): then the harness clock is this one, so a run's shots
+    /// and exit come at the same game time however loaded the machine is.
+    pub play_game_time: Option<f32>,
     /// Frame times (ms) since Play started, for the fidelity report.
     pub frame_ms: Vec<f32>,
     pub last_frame: Option<Instant>,
@@ -150,21 +161,76 @@ pub struct Harness {
     pub roblox_settings: bool,
     /// `--action NAME@S` menu actions now due (run where the egui context is).
     pub ui_due: Vec<String>,
+    /// `--no-ui`: the 3D view (or the game) alone over the whole window; no
+    /// editor UI is built (RustudioApp::no_ui_frame).
+    pub no_ui: bool,
+    /// `--overlays`: with --no-ui, keep the editor's view overlays (grid,
+    /// selection, gizmos, hover, view cube, readouts) in Edit state.
+    pub overlays: bool,
+    /// `--no-render`: no GPU device on purpose (src/offscreen.rs); shots
+    /// write no picture.
+    pub no_render: bool,
+    /// `--seconds N` without --bench in a --no-ui run: end the run at N
+    /// seconds on the harness clock (from Play's start with --from-play).
+    pub end_after: Option<f32>,
+    /// `--fail-on-error`: exit 1 when the Output has an error line.
+    pub fail_on_error: bool,
+    /// `--result FILE`: one JSON for CI at the end of the run (finish_run).
+    pub result: Option<PathBuf>,
+    /// `--plugin FILE` (repeatable) / `--plugins-dir DIR`: plugins loaded
+    /// once the place is open; `--no-plugins`: none at all.
+    pub plugin_files: Vec<PathBuf>,
+    /// --installed-plugin ASSETID:FILE (loaded as cloud_<id>).
+    pub installed_plugins: Vec<(u64, PathBuf)>,
+    pub plugin_dirs: Vec<PathBuf>,
+    pub no_plugins: bool,
+    pub plugins_started: bool,
+    /// StudioTestService:EndTest's value once a script ended the run.
+    pub end_value: Option<String>,
+    /// Every frame's interval and work (ms), from the first frame in Edit
+    /// state, from Play's start in Play (the --result frame statistics).
+    pub run_frames: Vec<(f32, f32)>,
+    pub run_last: Option<Instant>,
+    pub run_playing: bool,
+    pub finished: bool,
+    /// Seconds the (Edit state) schedule was held by a harness wait for an
+    /// event (`toolbox:await-ask`): actions, shots and the end come that
+    /// much later, so what follows the wait runs relative to the event.
+    pub held: f32,
 }
 
+/// The process's exit code once a harness run finished (finish_run).
+pub static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 impl Harness {
+    /// Whether StudioTestService:EndTest ends the whole run here (a --no-ui
+    /// run, or any run with --result) rather than only stopping Play.
+    pub fn ends_on_end_test(&self) -> bool {
+        self.no_ui || self.result.is_some()
+    }
+
     /// Seconds on the harness clock (None before Play when --from-play).
     pub fn now(&self) -> Option<f32> {
         if self.from_play {
-            self.play_started.map(|t| t.elapsed().as_secs_f32())
+            if self.play_started.is_some() && self.play_game_time.is_some() {
+                return self.play_game_time;
+            }
+            self.play_started.map(|t| crate::sim_clock::since(t).as_secs_f32())
         } else {
-            Some(self.started.elapsed().as_secs_f32())
+            Some(self.unheld_now() - self.held)
         }
+    }
+
+    /// Seconds since start, holds included.
+    pub fn unheld_now(&self) -> f32 {
+        crate::sim_clock::since(self.started).as_secs_f32()
     }
 }
 
 pub struct Editor {
     pub doc: Document,
+    /// The document's Highlights, kept from its change journal (viewport.rs).
+    pub highlight_index: Option<crate::doc::ClassIndex>,
     pub cam: Camera,
     pub tool: Tool,
     pub snap_move: bool,
@@ -199,6 +265,11 @@ pub struct Editor {
     pub render_state: Option<egui_wgpu::RenderState>,
     pub renderer: Option<Renderer>,
     pub scene: Scene,
+    /// The parts inside drawn ViewportFrames (vf_render.rs), drawn by the
+    /// same `sync_draws` as the world's, with their own draw cache.
+    pub vf_scene: Scene,
+    pub vf_draw_cache: crate::viewport::DrawCache,
+    pub vf_draws_asset_gen: u64,
     pub hover: Option<Ref>,
     pub drag: Option<GizmoDrag>,
     pub marquee: Option<egui::Pos2>,
@@ -217,10 +288,20 @@ pub struct Editor {
     pub cloud: crate::cloud_ui::CloudUi,
     /// Scripts to open (or focus) as editor tabs at the end of the frame.
     pub open_script: Vec<Ref>,
+    /// Script tabs a plugin closed (ScriptDocument:CloseAsync).
+    pub close_script: Vec<Ref>,
     document_tabs_reset: bool,
     pub scripts: crate::script_editor::ScriptTabs,
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
+    /// Studio plugins in the edit DataModel (src/plugin_host).
+    pub plugins: crate::plugin_host::PluginHost,
+    /// Plugin toolbars / menus / shortcuts as the editor draws them
+    /// (src/plugin_host/ui_ribbon.rs).
+    pub plugin_bar: crate::plugin_host::ui_ribbon::PluginUi,
+    /// Plugin dock widgets' panels, CoreGui over the edit viewport, and the
+    /// edit-mode input plugins hear (src/plugin_host/widgets_ui.rs).
+    pub plugin_ui: crate::plugin_host::widgets_ui::PluginUi,
     /// Fixed frame time for deterministic self-tests.
     pub fixed_dt: Option<f32>,
     /// ParticleEmitters, Beams and Trails (round 25).
@@ -280,6 +361,10 @@ pub struct Editor {
     pub env_probe: crate::env_probe::EnvProbe,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
+    /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
+    pub toolbox: crate::toolbox::Toolbox,
+    /// This frame's Toolbox preview ViewportFrames (drawn with the GUI's).
+    pub toolbox_vf: std::collections::HashMap<rbx_dom_weak::types::Ref, crate::render::vf::Request>,
     /// A brush stroke's voxels, the chunks it touched and whether water may
     /// have changed: drawn next frame without decoding the grid.
     pub terrain_brushed: Option<(crate::terrain::Voxels, Vec<[i32; 3]>, bool)>,
@@ -294,6 +379,14 @@ pub struct Editor {
     pub ui_rects: HashMap<&'static str, egui::Rect>,
     /// Screen positions of gizmo handles last frame (axis, sign) -> point.
     pub gizmo_points: Vec<(crate::viewport::Handle, egui::Pos2)>,
+    /// Selection / hover outlines kept while nothing they depend on changes.
+    pub outline_cache: std::cell::RefCell<crate::viewport::OutlineCache>,
+    /// The hovered instance's outline parts, for (hover, journal end).
+    /// The selection's outline parts, for (journal end, selection).
+    pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
+    /// The view selector's meshes for the current view.
+    pub selector_cache: crate::viewport::SelectorCache,
+    pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64)>, Vec<rbx_dom_weak::types::Ref>),
     pub viewport_rect: egui::Rect,
     pub frame_no: u64,
     pub harness: Harness,
@@ -326,6 +419,9 @@ pub struct Editor {
     /// File > Save as Project Folder… / Project Settings… (src/project_ui.rs).
     pub project_export: Option<crate::project_ui::ExportDialog>,
     pub project_settings: Option<crate::project_ui::SettingsDialog>,
+    /// Studio plugins: the local / installed store, Manage Plugins, and the
+    /// runtime they're handed to (src/plugin_store).
+    pub plugin_store: crate::plugin_store::manager::PluginManager,
     /// Open / save file dialogs, run off the UI thread (src/file_dialog.rs).
     pub dialogs: crate::file_dialog::Dialogs,
     /// Studio's chrome: ribbon tab, run type, panel toggles, popups (src/studio_ui.rs).
@@ -372,7 +468,7 @@ pub struct RustudioApp {
 pub fn default_dock() -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Viewport]);
     let none = HashMap::new();
-    for t in [Tab::Explorer, Tab::Properties, Tab::Output] {
+    for t in [Tab::Explorer, Tab::Properties, Tab::Output, Tab::Toolbox] {
         crate::panels::place(&mut dock, t, &none);
     }
     dock
@@ -385,22 +481,33 @@ impl RustudioApp {
         harness: Harness,
         demo: bool,
     ) -> Self {
-        crate::ti::install(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx);
-        {
-            // (whether the cursor can truly lock: mouse_lock::platform_locks)
-            use eframe::egui_wgpu::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-            crate::mouse_lock::note_window(
-                cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_))),
-            );
-        }
-        let render_state = cc.wgpu_render_state.clone();
+        // (whether the cursor can truly lock: mouse_lock::platform_locks)
+        use eframe::egui_wgpu::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+        let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
+        Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo)
+    }
+
+    /// The app on an egui context and (optional) wgpu device of its own:
+    /// eframe's window (`new`) or the offscreen runner (src/offscreen.rs,
+    /// `--headless`, no window; `--no-render`, no GPU).
+    pub fn new_in(
+        egui_ctx: &egui::Context,
+        render_state: Option<egui_wgpu::RenderState>,
+        wayland: Option<bool>,
+        open: Option<PathBuf>,
+        harness: Harness,
+        demo: bool,
+    ) -> Self {
+        crate::ti::install(egui_ctx);
+        theme::apply(egui_ctx);
+        crate::mouse_lock::note_window(wayland);
         let renderer = render_state
             .as_ref()
             .map(|rs| Renderer::new(&rs.device, &rs.queue));
         let mut ed = Editor {
-            dialogs: crate::file_dialog::Dialogs::new(cc.egui_ctx.clone()),
+            dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
             doc: Document::new_place(),
+            highlight_index: None,
             cam: Camera::default(),
             tool: Tool::Select,
             snap_move: mech::SNAP_ON_BY_DEFAULT,
@@ -421,6 +528,9 @@ impl RustudioApp {
             render_state,
             renderer,
             scene: Scene::default(),
+            vf_scene: Scene::viewport_frames(),
+            vf_draw_cache: Default::default(),
+            vf_draws_asset_gen: 0,
             hover: None,
             drag: None,
             marquee: None,
@@ -433,9 +543,13 @@ impl RustudioApp {
             chars: Default::default(),
             cloud: crate::cloud_ui::CloudUi::new(),
             open_script: Vec::new(),
+            close_script: Vec::new(),
             document_tabs_reset: false,
             scripts: Default::default(),
             play: None,
+            plugins: Default::default(),
+            plugin_ui: Default::default(),
+            plugin_bar: Default::default(),
             fixed_dt: None,
             effects: Default::default(),
             meshes: Default::default(),
@@ -467,6 +581,8 @@ impl RustudioApp {
             water_waves: Default::default(),
             env_probe: Default::default(),
             terrain_ed: Default::default(),
+            toolbox: Default::default(),
+            toolbox_vf: Default::default(),
             terrain_brushed: None,
             phys: Default::default(),
             fly_held: 0.0,
@@ -475,6 +591,10 @@ impl RustudioApp {
             hud: HudStats::default(),
             ui_rects: HashMap::new(),
             gizmo_points: Vec::new(),
+            outline_cache: Default::default(),
+            hover_outline_refs: (None, Vec::new()),
+            selector_cache: Default::default(),
+            selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
             viewport_rect: egui::Rect::NOTHING,
             frame_no: 0,
             harness,
@@ -494,6 +614,10 @@ impl RustudioApp {
             project_choice: None,
             project_export: None,
             project_settings: None,
+            plugin_store: crate::plugin_store::manager::PluginManager::new(
+                crate::plugin_store::Store::open(crate::plugin_store::default_root(), crate::plugin_store::default_plugins_dir(), 0),
+                Box::new(crate::plugin_store::runtime::HostBridge::default()),
+            ),
             ui: crate::studio_ui::UiState::default(),
             play_here: None,
             pending_user_shot: None,
@@ -508,7 +632,7 @@ impl RustudioApp {
         for line in crate::crash::unseen_reports() {
             ed.error(line);
         }
-        if ed.renderer.is_none() {
+        if ed.renderer.is_none() && !ed.harness.no_render {
             ed.error("No wgpu renderer available; the 3D viewport is disabled.");
         }
         let open_none = open.is_none();
@@ -517,7 +641,14 @@ impl RustudioApp {
         } else if demo {
             ed.build_demo();
         }
-        ed.explorer.expand_defaults(&ed.doc);
+        if !ed.harness.no_ui {
+            ed.explorer.expand_defaults(&ed.doc);
+        }
+        // No UI: the scene alone (the comparison captures' clean view)
+        // unless --overlays keeps the editor's overlays.
+        if ed.harness.no_ui && !ed.harness.overlays {
+            ed.clean_view = true;
+        }
         if ed.harness.selftest.is_some() {
             // Deterministic play-session timing for the scripted test.
             ed.fixed_dt = Some(1.0 / 60.0);
@@ -527,6 +658,10 @@ impl RustudioApp {
         // see an unloaded machine).
         if let Some(hz) = std::env::var("RUSTUDIO_FIXED_DT").ok().and_then(|v| v.parse::<f32>().ok()).filter(|h| *h > 0.0) {
             ed.fixed_dt = Some(1.0 / hz);
+        }
+        // --fixed-dt (src/sim_clock.rs): the same fixed step, every clock on it.
+        if let Some(dt) = crate::sim_clock::dt() {
+            ed.fixed_dt = Some(dt);
         }
         if ((ed.harness.selftest.is_none() && ed.harness.bench.is_none())
             || std::env::var_os("RUSTUDIO_SESSION").is_some())
@@ -567,7 +702,7 @@ impl RustudioApp {
         let plain = ed.harness.plain();
         // RUSTUDIO_START_PAGE=1 forces it (screenshots of the page itself).
         let forced = std::env::var_os("RUSTUDIO_START_PAGE").is_some();
-        if forced || (open_none && !demo && plain && std::env::var_os("RUSTUDIO_NO_START_PAGE").is_none()) {
+        if !ed.harness.no_ui && (forced || (open_none && !demo && plain && std::env::var_os("RUSTUDIO_NO_START_PAGE").is_none())) {
             ed.show_start_page();
             let page = std::env::var("RUSTUDIO_START_PAGE").unwrap_or_default();
             ed.start.open_page(&page);
@@ -576,7 +711,7 @@ impl RustudioApp {
         let mut dock = default_dock();
         let mut layout = None;
         let mut panels = crate::panels::Panels::default();
-        if crate::layout_store::enabled(&ed.harness) {
+        if !ed.harness.no_ui && crate::layout_store::enabled(&ed.harness) {
             let saved = crate::layout_store::load();
             if let Some(l) = &saved {
                 l.apply(&mut ed);
@@ -586,6 +721,8 @@ impl RustudioApp {
                 panels = l.panels(&dock);
             }
             layout = Some(crate::layout_store::Saver::new(saved.as_ref()));
+            // (plugin widgets' restore state beside layout.json)
+            crate::plugin_host::widgets_ui::set_persist_dir(Some(crate::paths::config().join("rustudio")));
         }
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
@@ -593,9 +730,13 @@ impl RustudioApp {
         if ed.control.is_some() && layout.is_none() {
             dock = DockState::new(vec![Tab::Viewport]);
         }
+        // (--no-ui never shows the dock.)
+        if ed.harness.no_ui {
+            dock = DockState::new(vec![Tab::Viewport]);
+        }
         // `--play` starts once the 3D view has its size (Camera.ViewportSize).
         RustudioApp {
-            watchdog: crate::frame_watchdog::Watchdog::new(cc.egui_ctx.clone()),
+            watchdog: crate::frame_watchdog::Watchdog::new(egui_ctx.clone()),
             updater: crate::update::Updater::start(),
             dock,
             ed,
@@ -665,6 +806,81 @@ impl Editor {
     pub fn info(&mut self, t: impl Into<String>) {
         self.push_log(Level::Info, t)
     }
+
+    /// The plugin store's frame: startup loads, folder watching, Roblox jobs;
+    /// its lines go to Output.
+    pub fn plugins_tick(&mut self) {
+        let client = self.account.shared_client();
+        let host_on = self.plugins.enabled();
+        if let Some(b) = self.plugin_store.runtime.bridge() {
+            b.host_enabled = host_on;
+        }
+        self.plugin_store.tick(client, self.frame_no);
+        // The store's loads / unloads / reloads, applied to the host.
+        let cmds = self.plugin_store.runtime.bridge().map(|b| std::mem::take(&mut b.cmds)).unwrap_or_default();
+        for cmd in cmds {
+            use crate::plugin_store::runtime::{host_source, RtCmd};
+            match cmd {
+                RtCmd::Load(src) | RtCmd::Reload(src) => {
+                    let known = self.plugin_store.runtime.bridge().and_then(|b| b.ids.get(&src.id).copied());
+                    let host_path = |h: &crate::plugin_host::PluginHost, pid| {
+                        h.loaded().into_iter().find(|i| i.id == pid).and_then(|i| i.source.path().map(|p| p.to_path_buf()))
+                    };
+                    let r = match known {
+                        // Same file (an edit): the host reads it again. (A
+                        // subfolder .lua is an in-memory tree: no path, so
+                        // it is loaded anew below.)
+                        Some(pid) if host_path(&self.plugins, pid).as_deref() == Some(src.path.as_path()) => {
+                            self.plugins.reload(pid);
+                            Ok(pid)
+                        }
+                        // Another file (an update) or an in-memory tree: unload, load anew.
+                        Some(pid) => {
+                            self.plugins.unload(pid);
+                            host_source(&src).and_then(|h| self.plugins.load(h))
+                        }
+                        None => host_source(&src).and_then(|h| self.plugins.load(h)),
+                    };
+                    let b = self.plugin_store.runtime.bridge().unwrap();
+                    match r {
+                        Ok(pid) => {
+                            b.ids.insert(src.id.clone(), pid);
+                        }
+                        Err(e) => {
+                            b.ids.remove(&src.id);
+                            b.loaded.retain(|l| *l != src.id);
+                            self.push_log(Level::Error, format!("Plugin {} failed to load: {e}", src.id));
+                        }
+                    }
+                }
+                RtCmd::Unload(id) => {
+                    if let Some(pid) = self.plugin_store.runtime.bridge().and_then(|b| b.ids.remove(&id)) {
+                        self.plugins.unload(pid);
+                    }
+                }
+            }
+        }
+        for l in std::mem::take(&mut self.plugin_store.lines) {
+            let level = match l.level {
+                crate::plugin_store::watcher::Level::Info => Level::Info,
+                crate::plugin_store::watcher::Level::Warn => Level::Warn,
+                crate::plugin_store::watcher::Level::Error => Level::Error,
+            };
+            self.push_log(level, l.text);
+        }
+    }
+
+    /// Manage Plugins, permission prompts, Publish as Plugin.
+    pub fn plugins_ui(&mut self, ctx: &egui::Context) {
+        let client = self.account.shared_client();
+        crate::plugin_store::ui::show(ctx, &mut self.plugin_store, client);
+        // Plugin menus (ShowAsync), Customize Shortcuts, bound plugin keys.
+        self.plugin_popups(ctx);
+        self.customize_shortcuts_window(ctx);
+        self.plugin_shortcut_keys(ctx);
+        // Dialogs plugins opened (src/plugin_host/prompts.rs).
+        crate::plugin_host::prompts::ui(ctx, &self.doc);
+    }
     pub fn warn(&mut self, t: impl Into<String>) {
         self.push_log(Level::Warn, t)
     }
@@ -697,6 +913,9 @@ impl Editor {
         if !self.use_saved_camera() {
             self.frame_all();
         }
+        // Plugins run in the place that's open: the
+        // old place's go, the new place gets them all.
+        self.plugin_store.on_place_opened();
     }
 
     /// Starts at the place's saved camera (Workspace.CurrentCamera), as
@@ -764,7 +983,9 @@ impl Editor {
         match Document::open(&path) {
             Ok(d) => {
                 let n = d.dom.descendants().count();
+                crate::load_trace::mark("document built");
                 self.set_document(d);
+                crate::load_trace::mark(&format!("opened ({n} instances)"));
                 self.info(format!("Opened {} ({n} instances)", path.display()));
             }
             Err(e) => self.error(format!("Could not open {}: {e}", path.display())),
@@ -905,6 +1126,10 @@ impl Editor {
                 Ok(()) => self.info(format!("Saved selection to {}", path.display())),
                 Err(e) => self.error(format!("Save failed: {e}")),
             },
+            Purpose::SaveLocalPlugin(sel) => {
+                self.doc.selection = sel;
+                self.save_local_plugin_to(path);
+            }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
             Purpose::ProjectParent => {
                 if let Some(d) = self.project_export.as_mut() {
@@ -1346,56 +1571,7 @@ impl Editor {
             return;
         }
         // While playing, WASD/Space/etc. belong to the game.
-        if self.play_game_input() {
-            let esc = ctx.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }
-                    )
-                })
-            });
-            if esc {
-                self.toggle_game_menu();
-            }
-            // Presses this frame: a tap pressed and released within one frame
-            // never shows in keys_down, yet scripts must see it. The key
-            // positions are physical, like Roblox's KeyCodes (src/keys.rs).
-            // (Escape belongs to the Roblox menu: games never hear it.)
-            let taps: Vec<Key> = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::Key {
-                            key,
-                            physical_key,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        } if physical_key.unwrap_or(*key) != Key::Escape => {
-                            Some(physical_key.unwrap_or(*key))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            });
-            // The open menu takes the keys (R, L); the game hears none.
-            if !self.game_menu_keys(&taps) {
-                // (A focused TextBox has them: game-processed, Enter included.)
-                let processed = self.gui.focus.is_some();
-                if let Some(s) = self.play.as_mut() {
-                    if !processed {
-                        s.game.hotbar_taps.extend(taps.iter().copied());
-                    }
-                    s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
-                }
-            }
-            ctx.input_mut(|i| {
-                i.events.retain(
-                    |e| !matches!(e, egui::Event::Key { modifiers, .. } if modifiers.is_none()),
-                );
-            });
-        }
+        self.game_keys(ctx);
         // Studio's menu accelerators (Ctrl+Shift+V, Ctrl+Alt+G, Alt+A, F11…).
         for a in self.menu_shortcut_actions(ctx) {
             self.ui_action(ctx, a);
@@ -1467,6 +1643,73 @@ impl Editor {
         }
         if copied {
             self.note_os_clipboard(ctx);
+        }
+    }
+
+    /// While the client of a Play session is shown: this frame's key presses
+    /// go to the game (UserInputService, the hotbar, the in-game menu) and
+    /// are taken out of the input so no editor shortcut sees them. Shared by
+    /// the editor and the no-UI mode (`--no-ui`), where Escape also reaches
+    /// the game's scripts (gameProcessedEvent true) as well as opening the
+    /// menu, and no editor shortcut (F5, Shift+F5, F8) comes first.
+    pub(crate) fn game_keys(&mut self, ctx: &egui::Context) {
+        let no_ui = self.harness.no_ui;
+        if self.play_game_input() {
+            let esc = ctx.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key { key: Key::Escape, pressed: true, repeat: false, .. }
+                    )
+                })
+            });
+            if esc {
+                self.toggle_game_menu();
+            }
+            // Presses this frame: a tap pressed and released within one frame
+            // never shows in keys_down, yet scripts must see it. The key
+            // positions are physical, like Roblox's KeyCodes (src/keys.rs).
+            // (Escape belongs to the Roblox menu: games never hear it.)
+            let taps: Vec<Key> = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        } if physical_key.unwrap_or(*key) != Key::Escape => {
+                            Some(physical_key.unwrap_or(*key))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            // The open menu takes the keys (R, L); the game hears none.
+            if !self.game_menu_keys(&taps) {
+                // (A focused TextBox has them: game-processed, Enter included.)
+                let processed = self.gui.focus.is_some();
+                if let Some(s) = self.play.as_mut() {
+                    if !processed {
+                        s.game.hotbar_taps.extend(taps.iter().copied());
+                    }
+                    s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
+                }
+            }
+            // No UI: the menu has Escape first, and UserInputService hears it
+            // too, as processed (play_tick lets it past the open menu).
+            if esc && no_ui {
+                if let Some(s) = self.play.as_mut() {
+                    s.game.key_taps.push((Key::Escape, true));
+                }
+            }
+            ctx.input_mut(|i| {
+                i.events.retain(
+                    |e| !matches!(e, egui::Event::Key { modifiers, .. } if modifiers.is_none()),
+                );
+            });
         }
     }
 
@@ -1563,6 +1806,7 @@ impl Editor {
             }
             PendingAction::Quit => {
                 crate::studio_settings::flush();
+                crate::rustudio_settings::flush();
                 std::process::exit(0)
             }
             PendingAction::Restart => self.restart(),
@@ -1626,6 +1870,29 @@ impl Editor {
     /// Opens requested scripts as tabs next to the viewport (or focuses
     /// them, in a panel window too).
     fn open_script_tabs(&mut self, dock: &mut DockState<Tab>, panels: &mut crate::panels::Panels) {
+        // Tabs plugins closed, then the open script tabs as
+        // ScriptEditorService documents (a tab the person closed closes its
+        // document; the front one is StudioService.ActiveScript).
+        for r in std::mem::take(&mut self.close_script) {
+            let tab = Tab::Script(r);
+            if let Some(at) = dock.find_tab(&tab) {
+                dock.remove_tab(at);
+            }
+            for w in panels.popped.iter_mut() {
+                if let Some(at) = w.dock.find_tab(&tab) {
+                    w.dock.remove_tab(at);
+                }
+            }
+        }
+        let mut tabs: Vec<Ref> = dock.iter_all_tabs().filter_map(|(_, t)| match t { Tab::Script(r) => Some(*r), _ => None }).collect();
+        for w in panels.popped.iter() {
+            tabs.extend(w.dock.iter_all_tabs().filter_map(|(_, t)| match t { Tab::Script(r) => Some(*r), _ => None }));
+        }
+        tabs.extend(self.open_script.iter().copied());
+        crate::plugin_host::script_docs::sync_tabs(&tabs);
+        if let Some((_, Tab::Script(r))) = dock.find_active_focused() {
+            crate::plugin_host::script_docs::set_active(Some(*r));
+        }
         for r in std::mem::take(&mut self.open_script) {
             let tab = Tab::Script(r);
             if let Some(w) = panels.popped.iter_mut().find(|w| w.dock.find_tab(&tab).is_some()) {
@@ -1700,6 +1967,7 @@ impl TabViewer for Viewer<'_> {
                 None => self.ed.doc.title.clone().into(),
             },
             Tab::Properties => crate::properties::panel_title(self.ed).into(),
+            Tab::Plugin(n) => self.ed.plugin_widget_title(*n).into(),
             other => other.title().into(),
         }
     }
@@ -1707,6 +1975,7 @@ impl TabViewer for Viewer<'_> {
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
         match tab {
             Tab::Script(r) => egui::Id::new(("script_tab", *r)),
+            Tab::Plugin(n) => egui::Id::new(("plugin_widget_tab", *n)),
             other => egui::Id::new(("tab", other.title())),
         }
     }
@@ -1726,6 +1995,8 @@ impl TabViewer for Viewer<'_> {
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
+            Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
+            Tab::Toolbox => self.ed.toolbox_ui(ui),
             Tab::Script(r) => {
                 if !self.ed.document_tabs_reset {
                     self.ed.script_tab_ui(ui, *r);
@@ -1802,6 +2073,12 @@ impl TabViewer for Viewer<'_> {
             self.ed.request(PendingAction::Close);
             return egui_dock::tab_viewer::OnCloseResponse::Ignore;
         }
+        if let Tab::Plugin(n) = *tab {
+            // The plugin hears of it (BindToClose, or Enabled = false) and
+            // the panel goes when the widget is disabled.
+            self.ed.plugin_widget_close(n);
+            return egui_dock::tab_viewer::OnCloseResponse::Ignore;
+        }
         egui_dock::tab_viewer::OnCloseResponse::Close
     }
 
@@ -1836,7 +2113,13 @@ impl RustudioApp {
                 ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
             }
             let ed = &mut self.ed;
-            let close = ctx.show_viewport_immediate(id, w.builder(), |ui, class| {
+            // eframe panics ("the user callback was never called") when it
+            // can't make the window this frame (no event loop context, or
+            // the platform refused the window: seen on a Windows host's hidden
+            // desktop). That's not fatal: skip the window this frame, and
+            // after a run of failures dock its tabs back.
+            let builder = w.builder();
+            let shown = crate::crash::recoverable(std::panic::AssertUnwindSafe(|| ctx.show_viewport_immediate(id, builder, |ui, class| {
                 ed.ui.popped_class = Some(class);
                 let vctx = ui.ctx().clone();
                 w.track(&vctx);
@@ -1853,7 +2136,19 @@ impl RustudioApp {
                             .show_inside(ui, &mut Viewer { ed: &mut *ed, window: Some(&key), windows });
                     });
                 vctx.input(|i| i.viewport().close_requested())
-            });
+            })));
+            let close = match shown {
+                Ok(c) => {
+                    w.fails = 0;
+                    c
+                }
+                Err(_) => {
+                    w.fails += 1;
+                    eprintln!("rustudio: panel window {} could not be shown ({} frames)", w.key, w.fails);
+                    ctx.request_repaint();
+                    w.fails >= crate::mech::PANEL_WINDOW_MAX_FAILS
+                }
+            };
             if close {
                 // Closing the window docks its panels back (not lost).
                 closed.push(i);
@@ -1906,11 +2201,34 @@ impl RustudioApp {
 impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
         crate::studio_settings::flush();
+        crate::rustudio_settings::flush();
+        crate::plugin_host::widgets_ui::on_exit();
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // A scripted run's window on Windows sits on the real desktop: the
+        // person's (or an idle session's) mouse pointer over it would hover
+        // and click like the script (a ribbon tooltip in a screenshot). Linux
+        // runs them in a headless gamescope with no pointer; here the real
+        // pointer is dropped before the script's own input goes in.
+        if cfg!(windows)
+            && (self.ed.harness.selftest.is_some() || self.ed.harness.screenshot.is_some() || self.ed.harness.ui_shots.is_some())
+            && std::env::var_os("RUSTUDIO_VISIBLE_TESTS").is_none()
+        {
+            raw.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::MouseMoved(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::PointerGone
+                        | egui::Event::MouseWheel { .. }
+                        | egui::Event::Touch { .. }
+                )
+            });
+        }
         if let Some(t) = self.ed.harness.selftest.as_mut() {
             t.inject(raw);
         }
@@ -1924,6 +2242,16 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+}
+
+impl RustudioApp {
+    /// One frame, in eframe's window or offscreen (src/offscreen.rs).
+    pub fn frame(&mut self, ui: &mut egui::Ui) {
+        // (the whole frame, for --bench: the editor's and --no-ui's alike)
+        let _frame_scope = crate::bench::scope("frame");
+        crate::sim_clock::advance();
         let ctx = ui.ctx().clone();
         self.watchdog.begin(ctx.input(|i| !i.viewport().minimized.unwrap_or(false)) && (self.ed.play.is_some() || self.ed.harness.screenshot.is_some()));
         let ed = &mut self.ed;
@@ -1941,6 +2269,7 @@ impl eframe::App for RustudioApp {
         let now = Instant::now();
         let dt = now.duration_since(ed.last_frame).as_secs_f32();
         ed.last_frame = now;
+        crate::load_trace::frame(ed.frame_no.saturating_sub(1) as u64, dt as f64 * 1000.0);
         if dt > 0.0 {
             ed.fps = ed.fps * 0.9 + (1.0 / dt) * 0.1;
         }
@@ -1949,9 +2278,17 @@ impl eframe::App for RustudioApp {
             if err { ed.error(m) } else { ed.info(m) }
         }
         ed.assets.set_client(ed.account.shared_client());
+        // --fixed-dt: last frame's downloads land now, not whenever (src/sim_clock.rs).
+        if crate::sim_clock::on() {
+            ed.assets.wait_pending(std::time::Duration::from_secs(60));
+        }
         let done = ed.assets.poll();
         if ed.textures.poll_decoded() {
             ed.asset_gen += 1;
+        }
+        if crate::load_trace::on() {
+            let (pending, loaded) = ed.textures.counts();
+            crate::load_trace::assets(ed.meshes.count(), pending, loaded);
         }
         if !done.is_empty() {
             ed.meshes.retry(&done);
@@ -1977,12 +2314,33 @@ impl eframe::App for RustudioApp {
         }
         self.watchdog.stage("asset polling", "Play tick: scripts/physics");
         if ed.play.is_some() {
-            let step = ed.fixed_dt.unwrap_or_else(|| frame_grid(dt));
+            let mut step = ed.fixed_dt.unwrap_or_else(|| frame_grid(dt));
+            if let Some(f) = ed.fixed_dt.filter(|_| std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some()) {
+                // (the scripts' os.clock spinning of the last frame: whole fixed periods)
+                step += crate::runtime::take_game_clock_spent(1.0 / f);
+            }
+            if ed.fixed_dt.is_some() && ed.harness.play_started.is_some() {
+                *ed.harness.play_game_time.get_or_insert(0.0) += step;
+            }
             let _p = crate::bench::scope("play_tick");
             ed.play_tick(&ctx, step);
         }
-        self.watchdog.stage("Play tick", "project and scene synchronization");
+        self.watchdog.stage("Play tick", "plugins");
+        {
+            let _p = crate::bench::scope("plugin_tick");
+            let step = ed.fixed_dt.map(|f| f as f64).unwrap_or_else(|| frame_grid(dt) as f64);
+            ed.plugin_tick(step);
+        }
+        self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();
+        ed.plugins_tick();
+        ed.toolbox_tick(&ctx);
+        ed.toolbox_harness_tick();
+        if self.ed.harness.no_ui {
+            self.no_ui_frame(ui, &ctx, frame_start, dt);
+            return;
+        }
+        let ed = &mut self.ed;
         // A folder with several project files: which one to open.
         if let Some((dir, files)) = ed.project_choice.clone() {
             let mut pick = None;
@@ -2033,7 +2391,7 @@ impl eframe::App for RustudioApp {
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor) {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox) {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2121,6 +2479,28 @@ impl eframe::App for RustudioApp {
         // (src/panels.rs, never over the 3D view), and which panels are
         // open (their checkmarks next frame).
         use crate::panels::Location;
+        // `toolbox:ui:width:<px>` (Toolbox layout checks): the side-by-side
+        // split holding the Toolbox gives it that width.
+        if let Some(px) = self.ed.toolbox.ui.want_width.take() {
+            // The split changes after this frame's draw: a layout report
+            // waits for the next one (src/toolbox/glue.rs).
+            self.ed.toolbox.ui.action_seq += 1;
+            if let Some(path) = self.dock.find_tab(&Tab::Toolbox) {
+                let mut node = path.node;
+                let tree = &mut self.dock[path.surface];
+                while let Some(parent) = node.parent() {
+                    if let egui_dock::Node::Horizontal(sp) = &mut tree[parent] {
+                        let w = sp.rect.width();
+                        if w > px {
+                            let f = (px / w).clamp(0.05, 0.95);
+                            sp.fraction = if node.is_left() { f } else { 1.0 - f };
+                        }
+                        break;
+                    }
+                    node = parent;
+                }
+            }
+        }
         for (tab, want) in std::mem::take(&mut self.ed.ui.panel_requests) {
             let found = self.panels.locate(&self.dock, &tab);
             let open = want.unwrap_or(found.is_none());
@@ -2139,6 +2519,16 @@ impl eframe::App for RustudioApp {
                 (None, true) => {
                     if self.panels.restore_window(&self.dock, tab) {
                         // Restored the hidden panel in its original OS window.
+                    } else if let Some(size) = crate::plugin_host::widgets_ui::float_size(&tab) {
+                        // A plugin's Float widget: a floating window of the dock
+                        // (it can be docked by its tab), centred on the main
+                        // window as Studio's (src/plugin_host/widgets_ui.rs).
+                        let size = egui::vec2(size[0].max(60.0), size[1].max(40.0)).min(dock_rect.size() - egui::vec2(8.0, 8.0));
+                        let at = dock_rect.center() - size / 2.0;
+                        let surface = self.dock.add_window(vec![tab]);
+                        if let Some(w) = self.dock.get_window_state_mut(surface) {
+                            w.set_position(at).set_size(size);
+                        }
                     } else if crate::panels::placement(tab.key()).floats {
                         self.panels.pop_out(tab, [420.0, 520.0], None);
                     } else {
@@ -2148,12 +2538,28 @@ impl eframe::App for RustudioApp {
                 (None, false) => {}
             }
         }
+        {
+            crate::plugin_host::widgets_ui::set_dock_area(dock_rect);
+            let (dock, panels) = (&self.dock, &self.panels);
+            self.ed.plugin_ui_note_open(|t| panels.locate(dock, t).is_some());
+            // Float widgets' windows sized so their content is Studio's client area.
+            for (tab, size) in self.ed.plugin_float_fixes() {
+                if let Some(path) = self.dock.find_tab(&tab) {
+                    if let Some(w) = self.dock.get_window_state_mut(path.surface) {
+                        w.set_size(size);
+                    }
+                }
+            }
+            self.ed.plugin_drag_tick(&ctx);
+            self.ed.plugin_widget_shots(&ctx);
+        }
         self.ed.ui.panels_open = [
             (Tab::Explorer, "Explorer"),
             (Tab::Properties, "Properties"),
             (Tab::Output, "Output"),
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
+            (Tab::Toolbox, "Toolbox"),
         ]
         .into_iter()
         .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
@@ -2163,6 +2569,11 @@ impl eframe::App for RustudioApp {
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
         crate::panels::record_homes(&self.dock, &mut self.panels.homes);
         self.ed.ui.popped = self.panels.popped.iter().map(|w| (w.key.clone(), w.tabs())).collect();
+        // A script tab in front of the 3D view (plugin toolbar buttons
+        // without ClickableWhenViewportHidden grey out: ui_ribbon.rs).
+        self.ed.ui.viewport_hidden = self.dock.find_main_surface_tab(&Tab::Viewport).is_some_and(|(n, t)| {
+            matches!(&self.dock.main_surface()[n], egui_dock::Node::Leaf(l) if l.active != t)
+        });
         self.ed.ui.viewport_group = self
             .dock
             .find_main_surface_tab(&Tab::Viewport)
@@ -2174,6 +2585,7 @@ impl eframe::App for RustudioApp {
         let ed = &mut self.ed;
         ed.insert_popup_ui(&ctx);
         ed.about_ui(&ctx);
+        ed.plugins_ui(&ctx);
         ed.studio_settings_ui(&ctx);
         ed.user_screenshot_tick(&ctx);
         crate::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.viewport_rect);
@@ -2182,15 +2594,31 @@ impl eframe::App for RustudioApp {
         ed.character_builder_window(&ctx);
         ed.cloud_windows(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
+        self.finish_frame(&ctx, frame_start, dt);
+    }
+}
+
+impl RustudioApp {
+    /// The end of every frame, the editor's and the no-UI mode's: the
+    /// harness (shots, input, --luau), control, --bench, and repaints.
+    fn finish_frame(&mut self, ctx: &egui::Context, frame_start: Instant, dt: f32) {
+        let ctx = ctx.clone();
+        let ed = &mut self.ed;
         ed.harness_tick(&ctx);
         #[cfg(unix)]
         ed.control_tick(&ctx);
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
+        // RUSTUDIO_GPU_TIMING: resolve this frame's GPU timestamps, collect finished ones.
+        if let Some(rs) = ed.render_state.as_ref() {
+            crate::gpu_timing::end_frame(&rs.device, &rs.queue);
+        }
+        let mut bench_done = false;
         if let Some(b) = ed.harness.bench.as_mut() {
             // Edit-mode benchmark: turn the camera slowly so several views count.
-            if !b.play {
+            // (RUSTUDIO_BENCH_STILL=1: the camera stays put, an idle editor)
+            if !b.play && std::env::var_os("RUSTUDIO_BENCH_STILL").is_none() {
                 ed.cam.yaw += crate::mech::BENCH_TURN_DEG_PER_S.to_radians() * dt;
                 ed.cam.focus = ed.cam.pos + ed.cam.forward() * (ed.cam.focus - ed.cam.pos).length();
             }
@@ -2251,11 +2679,15 @@ impl eframe::App for RustudioApp {
                     if let Err(e) = std::fs::write(out, &text) {
                         eprintln!("bench: can't write {}: {e}", out.display());
                     }
+                    let _ = std::fs::write(out.with_extension("frames.json"), b.frames_json().to_string());
                 }
                 println!("{text}");
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                bench_done = true;
             }
             ctx.request_repaint();
+        }
+        if bench_done {
+            ed.finish_run(&ctx, "bench");
         }
         if ed.drag.is_some()
             || ed.play.is_some()
@@ -2270,6 +2702,203 @@ impl eframe::App for RustudioApp {
         }
         self.watchdog.complete();
     }
+
+    /// `--no-ui`: the 3D view alone over the whole window, nothing of the
+    /// editor built or drawn (no menus, ribbon, dock, Explorer, Properties,
+    /// Output, status bar, panel windows or editor shortcuts). In Edit state
+    /// the document's view through the edit camera; with --play the game,
+    /// with every key going to it (game_keys).
+    fn no_ui_frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame_start: Instant, dt: f32) {
+        let ed = &mut self.ed;
+        {
+            let _p = crate::bench::scope("scene_sync");
+            ed.scene.sync(&mut ed.doc);
+        }
+        if (ctx.zoom_factor() - ed.ui.zoom).abs() > 1e-3 {
+            ctx.set_zoom_factor(ed.ui.zoom);
+        }
+        // --open-roblox / --team-create once the session is checked (no
+        // picker or join windows are drawn).
+        ed.cloud_poll(ctx);
+        self.watchdog.stage("scene synchronization", "3D view");
+        ed.game_keys(ctx);
+        // (Studio menu actions need the editor: --action does nothing here,
+        // except the edits that need no panel: Ctrl+Z / Ctrl+Y / Delete …,
+        // which the plugin checks drive.)
+        for a in std::mem::take(&mut ed.harness.ui_due) {
+            // The ribbon's tools still switch (a plugin's Activate /
+            // Deactivation against them: src/plugin_host/ui_ribbon.rs).
+            if matches!(
+                a.as_str(),
+                "undo" | "redo" | "delete" | "duplicate" | "group" | "ungroup" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate"
+            ) {
+                ed.run_action(&a);
+                continue;
+            }
+            // The Toolbox's deep links work without the panel (headless checks).
+            if a.starts_with("toolbox:") {
+                ed.toolbox_action(&a);
+            } else {
+                eprintln!("--action {a}: no editor in --no-ui");
+            }
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG))
+            .show(ui, |ui| {
+                let _p = crate::bench::scope("viewport");
+                ed.viewport_ui(ui);
+            });
+        // Open plugin widgets as fixed panels over the view (no dock here).
+        if ed.play.is_none() {
+            ed.plugin_noui_widgets(ctx);
+        }
+        ed.user_screenshot_tick(ctx);
+        crate::runtime::domains::assets_cloud::capture::frame_tick(ctx, ed.viewport_rect);
+        self.watchdog.stage("3D view", "harness and screenshot readback");
+        self.finish_frame(ctx, frame_start, dt);
+    }
+}
+
+impl Editor {
+    /// The end of a harness run (shots taken, --bench measured, --seconds
+    /// reached, EndTest): writes --log and --result, sets the exit code
+    /// (--fail-on-error) and closes. Without --result / --fail-on-error /
+    /// --no-ui it only closes, as runs always did.
+    pub fn finish_run(&mut self, ctx: &egui::Context, reason: &str) {
+        if self.harness.finished {
+            return;
+        }
+        self.harness.finished = true;
+        crate::plugin_host::widgets_ui::on_exit();
+        let errors = self.log.iter().filter(|l| l.level == Level::Error).count();
+        let warnings = self.log.iter().filter(|l| l.level == Level::Warn).count();
+        let code = i32::from(self.harness.fail_on_error && errors > 0);
+        if code != 0 {
+            eprintln!("--fail-on-error: {errors} error line(s) in the Output");
+        }
+        EXIT_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
+        if reason != "shots" && reason != "bench" {
+            if let Some(out) = &self.harness.log_out {
+                let text: String = self
+                    .log
+                    .iter()
+                    .map(|l| format!("{:?}: {}\n", l.level, l.text.replace(crate::output_panel::STACK_MARK, "")))
+                    .chain(self.harness.shot_lines.iter().map(|l| format!("{l}\n")))
+                    .collect();
+                if let Err(e) = std::fs::write(out, text) {
+                    eprintln!("log: can't write {}: {e}", out.display());
+                }
+            }
+        }
+        if let Some(out) = self.harness.result.clone() {
+            let body = self.result_json(reason, errors, warnings, code);
+            if let Err(e) = std::fs::write(&out, serde_json::to_string_pretty(&body).unwrap_or_default()) {
+                eprintln!("--result: can't write {}: {e}", out.display());
+            }
+        }
+        crate::telemetry::flush();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn result_json(&self, reason: &str, errors: usize, warnings: usize, code: i32) -> serde_json::Value {
+        let output: Vec<serde_json::Value> = self
+            .log
+            .iter()
+            .map(|l| {
+                let level = match l.level {
+                    Level::Info => "info",
+                    Level::Warn => "warning",
+                    Level::Error => "error",
+                };
+                serde_json::json!({"level": level, "text": l.text.replace(crate::output_panel::STACK_MARK, "")})
+            })
+            .collect();
+        let mut ms: Vec<f32> = self.harness.run_frames.iter().map(|f| f.0).collect();
+        let work: f32 = self.harness.run_frames.iter().map(|f| f.1).sum::<f32>() / self.harness.run_frames.len().max(1) as f32;
+        ms.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f32| ms.get(((ms.len() as f32 * p) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        let mean = ms.iter().sum::<f32>() / ms.len().max(1) as f32;
+        let shots: Vec<String> = self
+            .harness
+            .shot_lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("[shot] ").map(str::to_string))
+            .collect();
+        let value = self
+            .harness
+            .end_value
+            .as_deref()
+            .map(|v| serde_json::from_str(v).unwrap_or(serde_json::Value::Null));
+        let (cpu_s, peak_rss_mb) = process_usage();
+        serde_json::json!({
+            "ended": reason,
+            "exit_code": code,
+            "state": if self.harness.play_started.is_some() { "play" } else { "edit" },
+            "no_ui": self.harness.no_ui,
+            "end_test_value": value,
+            "seconds": self.harness.now(),
+            "errors": errors,
+            "warnings": warnings,
+            "frames": {
+                "count": ms.len(),
+                "mean_ms": mean,
+                "p50_ms": pct(0.5),
+                "p99_ms": pct(0.99),
+                "max_ms": ms.last().copied().unwrap_or(0.0),
+                "mean_work_ms": work,
+                "fixed_dt": self.fixed_dt,
+            },
+            "shots": shots,
+            "plugins": self.plugins.result_json(),
+            "plugin_toolbars": self.plugin_ui_json(),
+            "toolbox": self.toolbox.result_json(),
+            "process": {"cpu_s": cpu_s, "peak_rss_mb": peak_rss_mb},
+            "output": output,
+        })
+    }
+}
+
+/// This process's CPU time (user + system, s) and peak resident memory (MB).
+fn process_usage() -> (f64, f64) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage fills the struct we pass.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let cpu = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 * 1e-6
+            + ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 * 1e-6;
+        // (Linux reports kilobytes)
+        (cpu, ru.ru_maxrss as f64 / 1024.0)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
+        let secs = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 * 1e-7;
+        // SAFETY: the current process's pseudo-handle and four FILETIME out-pointers.
+        let cpu = if unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
+            secs(kernel) + secs(user)
+        } else {
+            f64::NAN
+        };
+        // SAFETY: a zeroed counters struct with its size set, as the API asks.
+        let mut m: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let peak = if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) } != 0 {
+            m.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+        } else {
+            f64::NAN
+        };
+        (cpu, peak)
+    }
+    // Not supported here: NaN, null in --result.
+    #[cfg(not(any(unix, windows)))]
+    {
+        (f64::NAN, f64::NAN)
+    }
 }
 
 // ------------------------------------------------------------------ harness
@@ -2279,12 +2908,40 @@ impl Editor {
         if self.harness.start_play && self.viewport_rect.is_positive() && self.frame_no >= 2 && !self.place_loading() {
             self.harness.start_play = false;
             self.start_play(crate::runtime::RunMode::Play);
-            self.harness.play_started = Some(Instant::now());
+            self.harness.play_started = Some(crate::sim_clock::now());
         }
         if self.harness.play_started.is_some() {
             let now = Instant::now();
             if let Some(last) = self.harness.last_frame.replace(now) {
                 self.harness.frame_ms.push((now - last).as_secs_f32() * 1000.0);
+            }
+        }
+        // --result's frame statistics: Edit state from the first frame, Play
+        // from its start (the first Play frame clears the Edit ones).
+        if self.harness.result.is_some() {
+            let now = Instant::now();
+            let playing = self.harness.play_started.is_some();
+            if playing != self.harness.run_playing {
+                self.harness.run_playing = playing;
+                self.harness.run_frames.clear();
+                self.harness.run_last = None;
+            }
+            if let Some(last) = self.harness.run_last.replace(now) {
+                self.harness.run_frames.push(((now - last).as_secs_f32() * 1000.0, self.last_work_ms));
+            }
+        }
+        if self.harness.finished {
+            return;
+        }
+        // A script ended the run (StudioTestService:EndTest), or --seconds.
+        if self.harness.end_value.is_some() {
+            self.finish_run(ctx, "EndTest");
+            return;
+        }
+        if let (Some(end), Some(now)) = (self.harness.end_after, self.harness.now()) {
+            if now >= end {
+                self.finish_run(ctx, "seconds");
+                return;
             }
         }
         // Timed Luau (`--luau`), once Play runs.
@@ -2364,12 +3021,16 @@ impl Editor {
                 }
             }
             let mut written = Vec::new();
-            match save_png(&image, &path) {
-                Ok(()) => written.push(path.clone()),
-                Err(e) => eprintln!("screenshot failed: {e}"),
+            // (--no-render: an empty picture, nothing to write)
+            if !(image.size == [0, 0] && self.harness.no_render) {
+                match save_png(&image, &path) {
+                    Ok(()) => written.push(path.clone()),
+                    Err(e) => eprintln!("screenshot failed: {e}"),
+                }
             }
             // Just the 3D view too (FILE.view.png), to compare with Studio's viewport.
-            if (self.harness.shot_after.is_some() || multi) && self.viewport_rect.is_positive() {
+            // (--no-ui: the window is the view, one picture is enough.)
+            if (self.harness.shot_after.is_some() || multi) && self.viewport_rect.is_positive() && !self.harness.no_ui {
                 let ppp = ctx.pixels_per_point();
                 let r = self.viewport_rect;
                 let (x0, y0) = ((r.min.x * ppp) as usize, (r.min.y * ppp) as usize);
@@ -2385,6 +3046,17 @@ impl Editor {
                 let view_path = path.with_extension("view.png");
                 if save_png(&view, &view_path).is_ok() {
                     written.push(view_path);
+                }
+            }
+            // Each open plugin widget's content too (FILE.widget-<key>.png).
+            if !self.harness.no_ui {
+                let ppp = ctx.pixels_per_point();
+                for (key, r) in self.plugin_widget_rects() {
+                    let safe: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+                    let wp = path.with_extension(format!("widget-{safe}.png"));
+                    if save_png(&crate::plugin_host::widgets_ui::crop(&image, r, ppp), &wp).is_ok() {
+                        written.push(wp);
+                    }
                 }
             }
             // The written paths, for callers that don't rebuild the names.
@@ -2415,7 +3087,7 @@ impl Editor {
                     return;
                 }
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.finish_run(ctx, "shots");
         }
         if self.harness.shot_after.is_none()
             && self.harness.shots.is_empty()
@@ -2675,7 +3347,26 @@ impl Editor {
                 HarnessAction::MouseMotion(dx, dy) => {
                     raw.events.push(egui::Event::MouseMoved(egui::vec2(dx, dy)));
                 }
-                HarnessAction::UiAction(name) => self.harness.ui_due.push(name),
+                HarnessAction::UiAction(name) => {
+                    // plugin-button:TOOLBAR/BUTTON, plugin-action:ID (src/plugin_host);
+                    // plugin-prompt:ANSWER answers the oldest plugin dialog.
+                    if self.plugin_widget_action(&name, raw) {
+                        // plugin-widget:PLUGIN/WIDGET:CMD (plugin_host/widgets_ui.rs)
+                    } else if self.harness_pointer(&name, raw) {
+                        // ptr:VERB:TARGET (ui_pointer.rs)
+                    } else if let Some(ans) = name.strip_prefix("plugin-prompt:") {
+                        crate::plugin_host::prompts::answer_oldest(ans);
+                    } else if let Some(t) = crate::plugin_host::Trigger::parse(&name) {
+                        match t {
+                            // A click on the ribbon button (Enabled and a
+                            // script tab in front count, as in Studio).
+                            crate::plugin_host::Trigger::Button(tb, b) => self.plugin_harness_click(&tb, &b),
+                            t => self.plugins.trigger(t),
+                        }
+                    } else {
+                        self.harness.ui_due.push(name)
+                    }
+                }
             }
         }
         for e in &raw.events {

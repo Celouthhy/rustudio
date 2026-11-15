@@ -446,8 +446,8 @@ impl CloudsGpu {
             comp_pipe,
             sized: None,
             bsm_key: None,
-            started: Instant::now(),
-            last: Instant::now(),
+            started: crate::sim_clock::now(),
+            last: crate::sim_clock::now(),
             offset: Vec3::ZERO,
             readback: 0,
             mapped: Default::default(),
@@ -549,7 +549,7 @@ impl CloudsGpu {
         sun_y: f32,
         full: [u32; 2],
     ) {
-        let now = Instant::now();
+        let now = crate::sim_clock::now();
         let dt = now.duration_since(self.last).as_secs_f32().min(1.0);
         self.last = now;
         self.active = true;
@@ -557,7 +557,7 @@ impl CloudsGpu {
         let time = std::env::var("RUSTUDIO_CLOUDS_TIME")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or_else(|| self.started.elapsed().as_secs_f32());
+            .unwrap_or_else(|| crate::sim_clock::since(self.started).as_secs_f32());
         let wind = if look.wind.length() > WIND_MAX { look.wind.normalize() * WIND_MAX } else { look.wind };
         // fmodf: the sign follows the dividend.
         self.offset.x = (self.offset.x - WIND_KM * wind.x * dt) % WIND_WRAP;

@@ -16,12 +16,16 @@ pub enum SoundCmd {
     Stop,
     Pause,
     Resume,
+    /// SoundService:PlayLocalSound (client): a detached copy plays.
+    PlayLocal,
 }
 
 /// Things scripts asked the engine for this frame; the play session acts on them.
 #[derive(Default)]
 pub struct Requests {
     pub sounds: Vec<(Ref, SoundCmd)>,
+    /// Sound.TimePosition set by a script while it plays: (sound, seconds).
+    pub sound_seeks: Vec<(Ref, f64)>,
     /// Humanoid:MoveTo / WalkToPoint: (humanoid, target).
     pub move_to: Vec<(Ref, Vec3)>,
     /// Humanoid.Jump = true / ChangeState(Jumping).
@@ -1093,6 +1097,37 @@ struct QueryCache {
     terrain_tris: HashMap<[i32; 3], std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>>,
     /// Water surface triangles per chunk for rays (dropped with `terrain`).
     terrain_water: HashMap<[i32; 3], std::rc::Rc<Vec<[Vec3; 3]>>>,
+    /// A cell index over each chunk's `terrain_tris` for rays (dropped with
+    /// them): a ray tests the triangles in the cells it crosses, not all
+    /// of the chunk's thousands.
+    terrain_index: HashMap<[i32; 3], std::rc::Rc<TriIndex>>,
+    /// Whether a class is a BasePart (a query part when under Workspace):
+    /// property marks of other instances (a rig's Bones, Attachments) are
+    /// passed over without reading the instance again.
+    part_classes: rustc_hash::FxHashMap<rbx_dom_weak::Ustr, bool>,
+    /// The same per instance (an instance's class never changes).
+    part_refs: rustc_hash::FxHashMap<Ref, bool>,
+}
+
+impl QueryCache {
+    /// Whether `r` is a BasePart other than Terrain (what `qpart` can list).
+    fn is_part(&mut self, d: &Document, r: Ref) -> bool {
+        if let Some(&p) = self.part_refs.get(&r) {
+            return p;
+        }
+        let Some(inst) = d.dom.get_by_ref(r) else { return false };
+        let class = inst.class;
+        let p = *self
+            .part_classes
+            .entry(class)
+            .or_insert_with(|| class != "Terrain" && doc::is_a(class.as_str(), "BasePart"));
+        // (Destroyed instances' entries pile up: dropped now and then.)
+        if self.part_refs.len() > 200_000 {
+            self.part_refs.clear();
+        }
+        self.part_refs.insert(r, p);
+        p
+    }
 }
 
 /// A uniform grid over the query parts (by bounding box) so rays and box
@@ -1368,24 +1403,40 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
             // the tree are as they were, only these values are read again.
             // Which of CFrame 1, Size 2, CanCollide 4, CanQuery 8 changed.
             let mut props: rustc_hash::FxHashMap<Ref, u8> = Default::default();
+            // (Names compared as interned pointers: a frame of animation
+            // writes is thousands of marks, most of other properties.)
+            thread_local!(static NAMES: [rbx_dom_weak::Ustr; 6] =
+                ["CFrame", "Size", "CanCollide", "CanQuery", "SmoothGrid", "Shape"].map(rbx_dom_weak::ustr));
+            let [n_cf, n_size, n_collide, n_query, n_smooth, n_shape] = NAMES.with(|k| *k);
             for mark in m {
                 match mark {
                     doc::Mark::Prop(r, name) => {
-                        let bit = match name.as_str() {
-                            "CFrame" => 1,
-                            "Size" => 2,
-                            "CanCollide" => 4,
-                            "CanQuery" => 8,
-                            _ => 0,
+                        let bit = if name == n_cf {
+                            1
+                        } else if name == n_size {
+                            2
+                        } else if name == n_collide {
+                            4
+                        } else if name == n_query {
+                            8
+                        } else {
+                            0
                         };
-                        if bit != 0 {
-                            *props.entry(r).or_default() |= bit;
+                        // Parts only (a rig's Bones and Attachments are most
+                        // of a frame's marks: qpart answers None for them).
+                        if bit != 0 && c.is_part(d, r) {
+                            if c.index.contains_key(&r) {
+                                *props.entry(r).or_default() |= bit;
+                            } else {
+                                // Not a query part yet: checked in full.
+                                touched.insert(r);
+                            }
                         }
-                        if name.as_str() == "SmoothGrid" {
+                        if bit == 0 && name == n_smooth {
                             c.terrain = None;
                         }
                         // A part's Shape: read the part again in full.
-                        if name.as_str() == "Shape" {
+                        if bit == 0 && name == n_shape {
                             touched.insert(r);
                         }
                     }
@@ -1406,7 +1457,6 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
                     continue;
                 }
                 let Some(&i) = index.get(&r) else {
-                    // Not a query part (yet): checked in full.
                     touched.insert(r);
                     continue;
                 };
@@ -1479,7 +1529,7 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
 
 /// Include / exclude filter by instance and descendants.
 struct Filter {
-    list: HashSet<Ref>,
+    list: rustc_hash::FxHashSet<Ref>,
     include: bool,
     respect_collide: bool,
     /// Collision groups that don't collide with the query's CollisionGroup
@@ -1493,7 +1543,7 @@ struct Filter {
 impl Filter {
     fn none() -> Filter {
         Filter {
-            list: HashSet::new(),
+            list: Default::default(),
             include: false,
             respect_collide: false,
             skip_groups: HashSet::new(),
@@ -1528,10 +1578,30 @@ impl Filter {
 /// A query's filter with its RaycastParams / OverlapParams CollisionGroup
 /// applied (groups set not to collide with it are skipped).
 fn params_filter_groups(lua: &Lua, v: &Value) -> Filter {
-    let mut f = params_filter(v);
-    let group = match ud_value(v, "CollisionGroup") {
-        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
-        _ => String::new(),
+    // RaycastParams / OverlapParams: read in place (each field through
+    // __index was most of a short ray's cost).
+    let fast = match v {
+        Value::UserData(u) => u
+            .borrow::<crate::ltypes::LRaycastParams>()
+            .ok()
+            .map(|p| (params_filter_of(&p.0), p.0.collision_group.clone()))
+            .or_else(|| {
+                u.borrow::<crate::ltypes::LOverlapParams>()
+                    .ok()
+                    .map(|p| (params_filter_of(&p.0), p.0.collision_group.clone()))
+            }),
+        _ => None,
+    };
+    let (mut f, group) = match fast {
+        Some(x) => x,
+        None => {
+            let f = params_filter(v);
+            let group = match ud_value(v, "CollisionGroup") {
+                Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            (f, group)
+        }
     };
     let group = if group.is_empty() {
         "Default".to_string()
@@ -1546,8 +1616,19 @@ fn params_filter_groups(lua: &Lua, v: &Value) -> Filter {
     f
 }
 
+/// `params_filter` from the params' own fields (what their getters return).
+fn params_filter_of(q: &crate::ltypes::QueryParams) -> Filter {
+    Filter {
+        list: q.filter.iter().filter_map(opt_inst).collect(),
+        include: q.is_include(),
+        respect_collide: q.respect_can_collide,
+        skip_groups: HashSet::new(),
+        ignore_water: q.ignore_water,
+    }
+}
+
 fn params_filter(v: &Value) -> Filter {
-    let list: HashSet<Ref> = refs_in(&ud_value(v, "FilterDescendantsInstances"))
+    let list: rustc_hash::FxHashSet<Ref> = refs_in(&ud_value(v, "FilterDescendantsInstances"))
         .into_iter()
         .collect();
     let include = opt_ud::<LEnumItem>(&ud_value(v, "FilterType"))
@@ -2070,6 +2151,7 @@ fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<crate::terr
                 c.terrain = Some(t.clone());
                 c.terrain_tris.clear();
                 c.terrain_water.clear();
+                c.terrain_index.clear();
             }
             t
         }
@@ -2136,9 +2218,14 @@ fn terrain_hit(
                 continue;
             }
             let (tris, water) = terrain_chunk_tris(lua, &v, key, !ignore_water);
-            for tri in tris.iter() {
-                if let Some((d, w)) = ray_triangle(origin, dir_n, &tri.0) {
-                    if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
+            // The chunk's nearest front-facing hit in [t0, t1] (the first
+            // triangle among equals, as a scan in order finds it), through
+            // its cell index.
+            if !tris.is_empty() {
+                let index = terrain_tri_index(lua, key, &tris);
+                if let Some((d, i, w)) = index.ray(&tris, origin, dir_n, t0, t1) {
+                    if best.is_none_or(|(bt, _, _)| d < bt) {
+                        let tri = &tris[i];
                         let n = (tri.0[1] - tri.0[0]).cross(tri.0[2] - tri.0[0]).normalize_or_zero();
                         let k = if w.x >= w.y && w.x >= w.z { 0 } else if w.y >= w.z { 1 } else { 2 };
                         best = Some((d, n, tri.1[k]));
@@ -2211,7 +2298,16 @@ fn terrain_sweep(
                 let (tl, th) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
                 tl.cmple(phi).all() && th.cmpge(plo).all()
             };
-            for (p, m) in tris.iter() {
+            // The triangles in the cells the swept box meets, in index
+            // order (the same candidates, in the same order, as a scan).
+            let index = (!tris.is_empty()).then(|| terrain_tri_index(lua, key, &tris));
+            let picked = index.as_ref().map(|ix| ix.in_box(plo, phi));
+            let all: Box<dyn Iterator<Item = usize>> = match &picked {
+                Some(list) => Box::new(list.iter().map(|i| *i as usize)),
+                None => Box::new(0..tris.len()),
+            };
+            for i in all {
+                let (p, m) = &tris[i];
                 if near(p) {
                     cand.push((mats.len(), *p));
                     mats.push(*m);
@@ -2297,6 +2393,195 @@ fn terrain_chunk_tris(
         }
     };
     (solid, Some(wet))
+}
+
+/// A uniform grid of cells over a chunk's triangles (by bounding box,
+/// grown by `TriIndex::PAD`), in compressed rows: cell c's triangles are
+/// `items[starts[c]..starts[c + 1]]`, in index order.
+pub(crate) struct TriIndex {
+    lo: Vec3,
+    n: [i32; 3],
+    starts: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl TriIndex {
+    const CELL: f32 = 8.0;
+    /// Studs a triangle's box and a ray stretch's box are grown by: a hit
+    /// point the triangle test puts a hair outside the triangle still lies
+    /// in a cell the ray visits.
+    const PAD: f32 = 0.01;
+
+    fn build(tris: &[([Vec3; 3], [u8; 3])]) -> TriIndex {
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for (t, _) in tris {
+            lo = lo.min(t[0]).min(t[1]).min(t[2]);
+            hi = hi.max(t[0]).max(t[1]).max(t[2]);
+        }
+        lo -= Vec3::splat(Self::PAD);
+        hi += Vec3::splat(Self::PAD);
+        let span = ((hi - lo) / Self::CELL).ceil().max(Vec3::ONE).min(Vec3::splat(64.0));
+        let n = [span.x as i32, span.y as i32, span.z as i32];
+        let mut idx = TriIndex { lo, n, starts: vec![0; (n[0] * n[1] * n[2]) as usize + 1], items: Vec::new() };
+        let range = |t: &[Vec3; 3], idx: &TriIndex| {
+            let a = t[0].min(t[1]).min(t[2]) - Vec3::splat(Self::PAD);
+            let b = t[0].max(t[1]).max(t[2]) + Vec3::splat(Self::PAD);
+            (idx.cell_of(a), idx.cell_of(b))
+        };
+        for (t, _) in tris {
+            let (a, b) = range(t, &idx);
+            for x in a[0]..=b[0] {
+                for y in a[1]..=b[1] {
+                    for z in a[2]..=b[2] {
+                        let c = idx.flat([x, y, z]);
+                        idx.starts[c + 1] += 1;
+                    }
+                }
+            }
+        }
+        for c in 1..idx.starts.len() {
+            idx.starts[c] += idx.starts[c - 1];
+        }
+        let mut fill = idx.starts.clone();
+        idx.items = vec![0; *idx.starts.last().unwrap_or(&0) as usize];
+        for (i, (t, _)) in tris.iter().enumerate() {
+            let (a, b) = range(t, &idx);
+            for x in a[0]..=b[0] {
+                for y in a[1]..=b[1] {
+                    for z in a[2]..=b[2] {
+                        let c = idx.flat([x, y, z]);
+                        idx.items[fill[c] as usize] = i as u32;
+                        fill[c] += 1;
+                    }
+                }
+            }
+        }
+        idx
+    }
+
+    /// The triangles whose cells meet the box (a superset of those whose
+    /// boxes do), each once, in index order.
+    fn in_box(&self, lo: Vec3, hi: Vec3) -> Vec<u32> {
+        let pad = Vec3::splat(Self::PAD);
+        let top = self.lo + Vec3::new(self.n[0] as f32, self.n[1] as f32, self.n[2] as f32) * Self::CELL;
+        if (hi + pad).cmplt(self.lo).any() || (lo - pad).cmpgt(top).any() {
+            return Vec::new();
+        }
+        let (a, b) = (self.cell_of(lo - pad), self.cell_of(hi + pad));
+        let mut out = Vec::new();
+        for x in a[0]..=b[0] {
+            for y in a[1]..=b[1] {
+                for z in a[2]..=b[2] {
+                    let c = self.flat([x, y, z]);
+                    out.extend_from_slice(&self.items[self.starts[c] as usize..self.starts[c + 1] as usize]);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn cell_of(&self, p: Vec3) -> [i32; 3] {
+        let c = ((p - self.lo) / Self::CELL).floor();
+        [
+            (c.x as i32).clamp(0, self.n[0] - 1),
+            (c.y as i32).clamp(0, self.n[1] - 1),
+            (c.z as i32).clamp(0, self.n[2] - 1),
+        ]
+    }
+
+    fn flat(&self, c: [i32; 3]) -> usize {
+        ((c[0] * self.n[1] + c[1]) * self.n[2] + c[2]) as usize
+    }
+
+    /// The nearest front-facing hit of the ray (unit `dir`) at a distance in
+    /// [t0, t1]: (distance, triangle, barycentric weights), the lowest
+    /// triangle index among equal distances: what testing every triangle
+    /// in order with `ray_triangle` finds. Walks the ray a cell length at
+    /// a time and stops once a hit lies inside the stretch walked.
+    fn ray(&self, tris: &[([Vec3; 3], [u8; 3])], o: Vec3, dir: Vec3, t0: f32, t1: f32) -> Option<(f32, usize, Vec3)> {
+        // The ray's stretch inside the index's box.
+        let hi = self.lo + Vec3::new(self.n[0] as f32, self.n[1] as f32, self.n[2] as f32) * Self::CELL;
+        let (mut ta, mut tb) = (t0, t1);
+        for k in 0..3 {
+            if dir[k].abs() < 1e-9 {
+                if o[k] < self.lo[k] || o[k] > hi[k] {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((self.lo[k] - o[k]) / dir[k], (hi[k] - o[k]) / dir[k]);
+            ta = ta.max(a.min(b));
+            tb = tb.min(a.max(b));
+        }
+        if ta > tb {
+            return None;
+        }
+        thread_local!(static SEEN: std::cell::RefCell<(Vec<u32>, u32)> = const { std::cell::RefCell::new((Vec::new(), 0)) });
+        SEEN.with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let (stamps, gen) = &mut *seen;
+            if stamps.len() < tris.len() {
+                stamps.resize(tris.len(), 0);
+            }
+            *gen = gen.wrapping_add(1);
+            if *gen == 0 {
+                stamps.iter_mut().for_each(|s| *s = 0);
+                *gen = 1;
+            }
+            let g = *gen;
+            let mut best: Option<(f32, usize, Vec3)> = None;
+            let pad = Vec3::splat(Self::PAD);
+            let mut t = ta;
+            loop {
+                let end = (t + Self::CELL).min(tb);
+                let (p, q) = (o + dir * t, o + dir * end);
+                let (a, b) = (self.cell_of(p.min(q) - pad), self.cell_of(p.max(q) + pad));
+                for x in a[0]..=b[0] {
+                    for y in a[1]..=b[1] {
+                        for z in a[2]..=b[2] {
+                            let c = self.flat([x, y, z]);
+                            for &i in &self.items[self.starts[c] as usize..self.starts[c + 1] as usize] {
+                                let i = i as usize;
+                                if stamps[i] == g {
+                                    continue;
+                                }
+                                stamps[i] = g;
+                                if let Some((d, w)) = ray_triangle(o, dir, &tris[i].0) {
+                                    if d >= t0
+                                        && d <= t1
+                                        && best.is_none_or(|(bd, bi, _)| d < bd || (d == bd && i < bi))
+                                    {
+                                        best = Some((d, i, w));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Every triangle hit up to `end` lies in a cell visited.
+                if best.is_some_and(|(bd, ..)| bd + Self::PAD <= end) || end >= tb {
+                    break;
+                }
+                t = end;
+            }
+            best
+        })
+    }
+}
+
+/// A chunk's triangle index (built on its first ray).
+fn terrain_tri_index(lua: &Lua, key: [i32; 3], tris: &[([Vec3; 3], [u8; 3])]) -> std::rc::Rc<TriIndex> {
+    if let Some(i) = lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_index.get(&key).cloned()) {
+        return i;
+    }
+    let i = std::rc::Rc::new(TriIndex::build(tris));
+    if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
+        c.terrain_index.insert(key, i.clone());
+    }
+    i
 }
 
 /// Terrain under a ray for the play mouse (Mouse.Hit / Mouse.Target):
@@ -2390,10 +2675,13 @@ fn tags_of(lua: &Lua, r: Ref) -> mlua::Result<Vec<String>> {
 
 fn set_tags(lua: &Lua, r: Ref, tags: Vec<String>) -> mlua::Result<()> {
     let mut w = world(lua)?;
+    let mut old = None;
     if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
-        i.properties
+        old = i.properties
             .insert(ustr("Tags"), Variant::Tags(Tags::from(tags)));
     }
+    // (A plugin's tag edit is in the change history: Studio undoes it.)
+    crate::runtime::note_script_prop(&mut w, r, ustr("Tags"), old);
     w.dm().mark_prop(r, ustr("Tags"));
     Ok(())
 }
@@ -2663,16 +2951,61 @@ pub fn create_any(lua: &Lua, class: &str) -> mlua::Result<Ref> {
     Ok(r)
 }
 
-/// Sound playback requests (also used when a script sets Sound.Playing).
+/// Sound:Play / Stop / Pause / Resume.
 pub fn sound(lua: &Lua, r: Ref, cmd: SoundCmd) -> mlua::Result<()> {
+    sound_ev(lua, r, cmd, true)
+}
+
+/// A Sound's TimePosition as scripts read it (the playback clock while it
+/// plays, else what Play / Stop / the end or a script left).
+fn sound_time(w: &World, r: Ref) -> f64 {
+    w.input
+        .sound_pos
+        .get(&r)
+        .copied()
+        .unwrap_or_else(|| sound_set_time(w, r))
+}
+
+/// The TimePosition a script set (stored), where the next Play() starts.
+fn sound_set_time(w: &World, r: Ref) -> f64 {
+    match w.d().prop(r, "TimePosition") {
+        Some(Variant::Float64(v)) => v,
+        Some(Variant::Float32(v)) => v as f64,
+        _ => 0.0,
+    }
+    .max(0.0)
+}
+
+/// Sound playback requests. `events` is false for Sound.Playing writes,
+/// which pause / go on without Played, Paused or Resumed (Studio).
+/// Studio's TimePosition: Play() starts at the TimePosition a script set
+/// since the last start, else 0 (also after Pause or the end); Stop()
+/// puts it to 0; Pause keeps it. Changed fires for Playing and for a
+/// TimePosition that moved.
+pub fn sound_ev(lua: &Lua, r: Ref, cmd: SoundCmd, events: bool) -> mlua::Result<()> {
+    if cmd == SoundCmd::PlayLocal {
+        // SoundService:PlayLocalSound: a copy plays on this client only;
+        // the Sound itself is untouched (Playing stays false, no events).
+        world(lua)?.requests.sounds.push((r, cmd));
+        return Ok(());
+    }
     let playing = matches!(cmd, SoundCmd::Play | SoundCmd::Resume);
-    {
+    let moved = {
         let mut w = world(lua)?;
-        if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
-            i.properties.insert(ustr("Playing"), Variant::Bool(playing));
+        let old = sound_time(&w, r);
+        let new = match cmd {
+            SoundCmd::Play => Some(sound_set_time(&w, r)),
+            SoundCmd::Stop => {
+                if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
+                    i.properties.insert(ustr("TimePosition"), Variant::Float64(0.0));
+                }
+                Some(0.0)
+            }
+            _ => None,
+        };
+        if let Some(t) = new {
+            w.input.sound_pos.insert(r, t);
         }
-        w.dm().mark_prop(r, ustr("Playing"));
-        w.record(RepOp::Prop(r, "Playing".into()));
         w.requests.sounds.push((r, cmd));
         if playing {
             w.input.sound_playing.insert(r);
@@ -2684,12 +3017,26 @@ pub fn sound(lua: &Lua, r: Ref, cmd: SoundCmd) -> mlua::Result<()> {
         } else {
             w.input.sound_paused.remove(&r);
         }
+        new.is_some_and(|t| t != old)
+    };
+    if world(lua)?.d().exists(r) {
+        store_prop(lua, r, "Playing", Variant::Bool(playing))?;
+    }
+    if moved {
+        let mut w = world(lua)?;
+        w.record(RepOp::Prop(r, "TimePosition".into()));
+        let name = Value::String(lua.create_string("TimePosition")?);
+        w.fire(r, "Changed", vec![name]);
+        w.fire(r, "Changed:TimePosition", vec![]);
+    }
+    if !events {
+        return Ok(());
     }
     let ev = match cmd {
         SoundCmd::Play => "Played",
         SoundCmd::Stop => "Stopped",
         SoundCmd::Pause => "Paused",
-        SoundCmd::Resume => "Resumed",
+        SoundCmd::Resume | SoundCmd::PlayLocal => "Resumed",
     };
     let sid = match world(lua)?.d().prop(r, "SoundId") {
         Some(Variant::ContentId(c)) => c.as_str().to_string(),
@@ -2766,6 +3113,126 @@ fn load_asset(lua: &Lua, id: u64) -> mlua::Result<Ref> {
         tmp.transfer(c, &mut w.dm().dom, model);
     }
     Ok(model)
+}
+
+/// Puts a HumanoidDescription's accessories on a character, as Studio's
+/// CreateHumanoidModelFromDescription / ApplyDescription do (read from a
+/// running Studio with a jacket, pants, shoes and a hat, Order and
+/// Puffiness set, checks/mesh-deform/AUDIT.md (d)): each accessory is the
+/// asset's own Accessory, AccessoryType set from the entry; a layered one's
+/// WrapLayer takes the entry's Order and Puffiness (1 when the entry has
+/// none); the Handle carries an OriginalSize Vector3Value (a rigid one also
+/// OriginalPosition) and is held by a RigidConstraint named
+/// AccessoryRigidConstraint from its attachment to the body's of the same
+/// name. An accessory whose asset can't be loaded is left off with a warning.
+pub fn dress_from_description(lua: &Lua, model: Ref, desc: Ref) -> mlua::Result<()> {
+    use rbx_dom_weak::types::{Enum as DEnum, Vector3 as DV3};
+    const TYPES: &[&str] = &[
+        "Unknown", "Hat", "Hair", "Face", "Neck", "Shoulder", "Front", "Back", "Waist", "TShirt", "Shirt", "Pants",
+        "Jacket", "Sweater", "Shorts", "LeftShoe", "RightShoe", "DressSkirt", "Eyebrow", "Eyelash",
+    ];
+    let list = crate::runtime::domains::avatar::desc::accessories(lua, desc)?;
+    for a in list {
+        if a.asset_id <= 0 {
+            continue;
+        }
+        // Studio's loader asks for the MeshPart form of the accessory.
+        let meshpart = crate::runtime::outside_budget(lua, || crate::avatar::meshpart_accessory(a.asset_id as u64));
+        let holder = match meshpart.and_then(|b| Document::decode(&b).ok()) {
+            Some(mut tmp) => {
+                let mut w = world(lua)?;
+                let model = w.dm().dom.insert(Ref::none(), InstanceBuilder::new("Model").with_name("Model"));
+                for c in tmp.root().children().to_vec() {
+                    tmp.transfer(c, &mut w.dm().dom, model);
+                }
+                model
+            }
+            None => match load_asset(lua, a.asset_id as u64) {
+                Ok(m) => m,
+                Err(e) => {
+                    world(lua)?.output.push((Level::Warn, format!("{e}")));
+                    continue;
+                }
+            },
+        };
+        let mut w = world(lua)?;
+        let d = w.dm();
+        let accs: Vec<Ref> = d
+            .dom
+            .get_by_ref(holder)
+            .map(|h| h.children().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| crate::doc::is_a(&i.class, "Accoutrement")))
+            .collect();
+        for acc in accs {
+            d.dom.transfer_within(acc, model);
+            if let (Some(i), Some(t)) = (d.dom.get_by_ref_mut(acc), TYPES.iter().position(|t| *t == a.ty)) {
+                i.properties.insert(ustr("AccessoryType"), Variant::Enum(DEnum::from_u32(t as u32)));
+            }
+            let Some(handle) = d.find_named(acc, "Handle") else { continue };
+            if a.layered {
+                let wl = d.dom.get_by_ref(handle).and_then(|h| {
+                    h.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.class == "WrapLayer"))
+                });
+                if let Some(i) = wl.and_then(|wl| d.dom.get_by_ref_mut(wl)) {
+                    if let Some(o) = a.order {
+                        i.properties.insert(ustr("Order"), Variant::Int32(o as i32));
+                    }
+                    i.properties.insert(ustr("Puffiness"), Variant::Float32(a.puffiness.unwrap_or(1.0).clamp(-1.0, 1.0)));
+                }
+            }
+            // OriginalPosition: the handle attachment's own position.
+            let att_pos = d.dom.get_by_ref(handle).and_then(|h| {
+                h.children().iter().find_map(|c| {
+                    let i = d.dom.get_by_ref(*c)?;
+                    match (i.class.as_str(), i.properties.get(&ustr("CFrame"))) {
+                        ("Attachment", Some(Variant::CFrame(c))) => Some(c.position),
+                        _ => None,
+                    }
+                })
+            });
+            let (size, pos) = (d.dom.get_by_ref(handle).and_then(|h| h.properties.get(&ustr("Size")).cloned()), att_pos);
+            // (ApplyDescription, avatar_apply.luau, finds the accessories it put on by these)
+            if let Some(i) = d.dom.get_by_ref_mut(acc) {
+                let mut attrs = match i.properties.get(&ustr("Attributes")) {
+                    Some(Variant::Attributes(a)) => a.clone(),
+                    _ => rbx_dom_weak::types::Attributes::new(),
+                };
+                attrs.insert("RustudioAssetId".into(), Variant::Float64(a.asset_id as f64));
+                if a.layered {
+                    attrs.insert("RustudioLayered".into(), Variant::Bool(true));
+                }
+                i.properties.insert(ustr("Attributes"), Variant::Attributes(attrs));
+            }
+            if let Some(i) = d.dom.get_by_ref_mut(handle) {
+                i.properties.insert(ustr("Anchored"), Variant::Bool(false));
+                i.properties.insert(ustr("CanCollide"), Variant::Bool(false));
+            }
+            if let Some(Variant::Vector3(v)) = size {
+                d.dom.insert(handle, InstanceBuilder::new("Vector3Value").with_name("OriginalSize").with_property("Value", Variant::Vector3(v)));
+            }
+            if !a.layered {
+                if let Some(p) = pos {
+                    d.dom.insert(handle, InstanceBuilder::new("Vector3Value").with_name("OriginalPosition").with_property("Value", Variant::Vector3(DV3::new(p.x, p.y, p.z))));
+                }
+            }
+            crate::avatar::hold_accessory(&mut d.dom, model, acc);
+            d.mark_tree(acc);
+        }
+        d.dom.destroy(holder);
+    }
+    // The Humanoid keeps a copy of the description, as in Studio.
+    let mut w = world(lua)?;
+    let d = w.dm();
+    if let Some(hum) = d.dom.get_by_ref(model).and_then(|m| {
+        m.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.class == "Humanoid"))
+    }) {
+        let copy = d.dom.clone_within(desc);
+        d.dom.transfer_within(copy, hum);
+        d.mark_tree(copy);
+    }
+    Ok(())
 }
 
 /// An FBX upload, imported the way Roblox imports FBX models (see fbx.rs):
@@ -2874,15 +3341,246 @@ pub struct AbsBox {
     pub rot: f32,
 }
 
-/// As drawn last frame; before that (or when hidden), from the UDim2s.
-fn abs_now(w: &World, r: Ref) -> AbsBox {
-    match w.input.gui_layout.get(&r) {
-        Some(b) => AbsBox { pos: b.pos, size: b.size, rot: b.rot },
-        None => {
-            let (pos, size) = gui_rect(w, r, 0);
-            AbsBox { pos, size, rot: 0.0 }
+/// A GUI object's box as Studio reports it when a script reads it: Studio
+/// lays the object out on the read, so a box read right after a script
+/// moved, resized or reparented it (or one of its ancestors) in the same
+/// frame is the new one. Here: the drawn box when nothing on its way up
+/// changed since the layout was handed over, else placed from the nearest
+/// unchanged drawn ancestor with the UDim2s (a game's 2D emitter
+/// reads its host's box right after scripts move it; it got last frame's).
+/// A listener connected to a GUI object never laid out yet (not drawn, its
+/// box never read; Fusion / Roact connect OnChange "AbsoluteSize" as they
+/// build): its box is still the zero one, so the first layout is a change it
+/// hears (Studio: Argon's error box sizes itself from that change and shows
+/// its three lines, checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
+/// A read (abs_now through a script) lays it out and replaces the zero box.
+pub(crate) fn seed_unlaid(w: &mut World, r: Ref) {
+    if !w.d().class_of(r).is_some_and(|c| doc::is_a(&c, "GuiObject")) || w.input.gui_layout.contains_key(&r) {
+        return;
+    }
+    w.abs_seen.entry(r).or_insert(AbsBox { pos: [0.0; 2], size: [0.0; 2], rot: 0.0 });
+}
+
+/// `r` is (in) a LayerCollector: a ScreenGui, a widget, a SurfaceGui ….
+fn in_layer_collector(w: &World, r: Ref) -> bool {
+    let d = w.d();
+    let mut c = r;
+    for _ in 0..64 {
+        let Some(i) = d.dom.get_by_ref(c) else { return false };
+        if doc::is_a(&i.class, "LayerCollector") {
+            return true;
+        }
+        c = i.parent();
+    }
+    false
+}
+
+pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
+    abs_scan(w);
+    let w = &*w;
+    let d = w.d();
+    let mut chain: Vec<Ref> = Vec::with_capacity(16);
+    let mut c = r;
+    while let Some(i) = d.dom.get_by_ref(c) {
+        chain.push(c);
+        if doc::is_a(&i.class, "LayerCollector") || chain.len() > 64 {
+            break;
+        }
+        c = i.parent();
+    }
+    if chain.is_empty() {
+        let (pos, size) = gui_rect(w, r, 0);
+        return AbsBox { pos, size, rot: 0.0 };
+    }
+    let dirty_top = if w.abs_all {
+        Some(chain.len() - 1)
+    } else {
+        chain.iter().rposition(|x| w.abs_dirty.contains(x))
+    };
+    let drawn = |x: Ref| w.input.gui_layout.get(&x).map(|b| AbsBox { pos: b.pos, size: b.size, rot: b.rot });
+    if dirty_top.is_none() {
+        if let Some(b) = drawn(r) {
+            return b;
         }
     }
+    // Start from the nearest drawn ancestor above every change (or the root).
+    let from = dirty_top.map_or(1, |k| k + 1);
+    let top = chain.len() - 1;
+    let (base_idx, mut cur) = match (from..chain.len()).find_map(|k| drawn(chain[k]).map(|b| (k, b))) {
+        Some(x) => x,
+        None => {
+            let (pos, size) = gui_rect(w, chain[top], 0);
+            (top, AbsBox { pos, size, rot: 0.0 })
+        }
+    };
+    let scale_of = |x: Ref| -> f32 {
+        d.dom
+            .get_by_ref(x)
+            .and_then(|i| i.children().iter().copied().find(|k| d.class_of(*k).is_some_and(|c| c == "UIScale")))
+            .and_then(|s| crate::scene::f32_of(d.prop(s, "Scale")))
+            .unwrap_or(1.0)
+    };
+    // UIScale above: offsets of the objects below grow with it.
+    let mut scale: f32 = chain[base_idx..].iter().map(|x| scale_of(*x)).product();
+    let mut cur_ref = chain[base_idx];
+    for k in (0..base_idx).rev() {
+        let x = chain[k];
+        let Some(class) = d.class_of(x) else { break };
+        if !doc::is_a(&class, "GuiObject") {
+            // Folders (and the like) hold GUI objects without a box of their own.
+            continue;
+        }
+        let child_of = |p: Ref, cls: &str| {
+            d.dom
+                .get_by_ref(p)
+                .and_then(|i| i.children().iter().copied().find(|k| d.class_of(*k).is_some_and(|c| doc::is_a(&c, cls))))
+        };
+        // Laid out by a UIListLayout / grid / page layout, or sized by its
+        // content: the drawn box is the best known.
+        let auto = crate::scene::enum_u32(d.prop(x, "AutomaticSize")).unwrap_or(0) != 0;
+        if child_of(cur_ref, "UIGridStyleLayout").is_some() || auto {
+            if let Some(b) = drawn(x) {
+                cur = b;
+                cur_ref = x;
+                scale *= scale_of(x);
+                continue;
+            }
+        }
+        let u2 = |name: &str| match d.prop(x, name) {
+            Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+            _ => [0.0; 4],
+        };
+        // The parent's content box (inside its UIPadding), unturned.
+        let (mut cpos, mut csize) = (cur.pos, cur.size);
+        if let Some(pad) = child_of(cur_ref, "UIPadding") {
+            let u = |name: &str| match d.prop(pad, name) {
+                Some(Variant::UDim(u)) => [u.scale, u.offset as f32],
+                _ => [0.0, 0.0],
+            };
+            let (l, rr, t, b) = (u("PaddingLeft"), u("PaddingRight"), u("PaddingTop"), u("PaddingBottom"));
+            let (left, topp) = (l[0] * csize[0] + l[1] * scale, t[0] * csize[1] + t[1] * scale);
+            cpos = [cpos[0] + left, cpos[1] + topp];
+            csize = [
+                csize[0] - left - rr[0] * csize[0] - rr[1] * scale,
+                csize[1] - topp - b[0] * csize[1] - b[1] * scale,
+            ];
+        }
+        let s = u2("Size");
+        let p = u2("Position");
+        let mut size = [s[0] * csize[0] + s[1] * scale, s[2] * csize[1] + s[3] * scale];
+        if let Some(c) = child_of(x, "UISizeConstraint") {
+            let v = |n: &str, dflt: f32| match d.prop(c, n) {
+                Some(Variant::Vector2(v)) => [v.x, v.y],
+                _ => [dflt, dflt],
+            };
+            let (mn, mx) = (v("MinSize", 0.0), v("MaxSize", f32::INFINITY));
+            size = [size[0].clamp(mn[0], mx[0].max(mn[0])), size[1].clamp(mn[1], mx[1].max(mn[1]))];
+        }
+        if let Some(c) = child_of(x, "UIAspectRatioConstraint") {
+            let ratio = crate::scene::f32_of(d.prop(c, "AspectRatio")).unwrap_or(1.0).max(1e-3);
+            if crate::scene::enum_u32(d.prop(c, "AspectType")) == Some(1) {
+                if crate::scene::enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
+                    size[0] = size[1] * ratio;
+                } else {
+                    size[1] = size[0] / ratio;
+                }
+            } else if size[0] / size[1].max(1e-3) > ratio {
+                size[0] = size[1] * ratio;
+            } else {
+                size[1] = size[0] / ratio;
+            }
+        }
+        let own = scale_of(x);
+        // (negative sizes are reported as they are, as in Studio)
+        size = [size[0] * own, size[1] * own];
+        let anchor = match d.prop(x, "AnchorPoint") {
+            Some(Variant::Vector2(v)) => [v.x, v.y],
+            _ => [0.0, 0.0],
+        };
+        // Its centre, unturned, then turned about the parent's centre.
+        let cx = cpos[0] + p[0] * csize[0] + p[1] * scale - anchor[0] * size[0] + size[0] * 0.5;
+        let cy = cpos[1] + p[2] * csize[1] + p[3] * scale - anchor[1] * size[1] + size[1] * 0.5;
+        let (pcx, pcy) = (cur.pos[0] + cur.size[0] * 0.5, cur.pos[1] + cur.size[1] * 0.5);
+        let (sn, cs) = cur.rot.to_radians().sin_cos();
+        let (dx, dy) = (cx - pcx, cy - pcy);
+        let (tx, ty) = (pcx + cs * dx - sn * dy, pcy + sn * dx + cs * dy);
+        let rot = crate::scene::f32_of(d.prop(x, "Rotation")).unwrap_or(0.0);
+        cur = AbsBox { pos: [tx - size[0] * 0.5, ty - size[1] * 0.5], size, rot: cur.rot + rot };
+        cur_ref = x;
+        scale *= own;
+    }
+    cur
+}
+
+/// Whether `r`'s drawn text may be out of date (its text or box changed
+/// since the layout was handed over), for TextBounds.
+fn text_dirty(w: &mut World, r: Ref) -> bool {
+    abs_scan(w);
+    if w.abs_all {
+        return true;
+    }
+    let d = w.d();
+    let mut c = r;
+    for _ in 0..64 {
+        if w.abs_dirty.contains(&c) {
+            return true;
+        }
+        match d.dom.get_by_ref(c) {
+            Some(i) if !doc::is_a(&i.class, "LayerCollector") => c = i.parent(),
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Properties that change a GUI object's box, its children's, or its text.
+static ABS_PROPS: std::sync::OnceLock<HashSet<rbx_dom_weak::Ustr>> = std::sync::OnceLock::new();
+
+/// Reads the journal since the last look and notes what scripts changed
+/// (see `World::abs_dirty`).
+fn abs_scan(w: &mut World) {
+    if w.abs_all {
+        return;
+    }
+    let props = ABS_PROPS.get_or_init(|| {
+        [
+            "Size", "Position", "AnchorPoint", "Rotation", "SizeConstraint", "AutomaticSize", "Scale",
+            "AspectRatio", "AspectType", "DominantAxis", "MinSize", "MaxSize", "PaddingLeft", "PaddingRight",
+            "PaddingTop", "PaddingBottom", "IgnoreGuiInset", "ScreenInsets", "CanvasSize", "CanvasPosition",
+            "Text", "TextSize", "Font", "FontFace", "TextScaled", "TextWrapped", "RichText", "LineHeight",
+            "MaxTextSize", "MinTextSize", "Padding", "FillDirection", "HorizontalAlignment", "VerticalAlignment",
+            "SortOrder", "CellSize", "CellPadding", "LayoutOrder", "Visible", "Enabled",
+        ]
+        .into_iter()
+        .map(rbx_dom_weak::ustr)
+        .collect()
+    });
+    let d = w.d();
+    let end = d.journal_end();
+    if end == w.abs_scan {
+        return;
+    }
+    let Some(marks) = d.marks_since(w.abs_scan) else {
+        w.abs_all = true;
+        return;
+    };
+    let mut add: Vec<Ref> = Vec::new();
+    for m in marks {
+        let r = match m {
+            doc::Mark::Prop(r, name) if props.contains(name) => *r,
+            doc::Mark::Tree(r) => *r,
+            _ => continue,
+        };
+        add.push(r);
+        // A modifier (UIScale, UIPadding, a layout…) changes its parent's box.
+        if let Some(i) = d.dom.get_by_ref(r) {
+            if !doc::is_a(&i.class, "GuiBase2d") {
+                add.push(i.parent());
+            }
+        }
+    }
+    w.abs_scan = end;
+    w.abs_dirty.extend(add);
 }
 
 /// Fires Changed / GetPropertyChangedSignal for AbsolutePosition,
@@ -2924,7 +3622,14 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
             ["Size", "Position", "AnchorPoint", "IgnoreGuiInset", "ScreenInsets", "CanvasSize"].map(rbx_dom_weak::ustr)
         });
         let mut check: Vec<Ref> = Vec::new();
-        match w.dm().marks_for(doc::Reader::Layout) {
+        let marks = w.dm().marks_for(doc::Reader::Layout);
+        // The new layout holds every change so far: reads see it until
+        // scripts change something again (`abs_now`).
+        let end = w.d().journal_end();
+        w.abs_scan = end;
+        w.abs_dirty.clear();
+        w.abs_all = false;
+        match marks {
             doc::Marks::All => all = true,
             doc::Marks::Some(marks) => {
                 let mut roots: Vec<Ref> = Vec::new();
@@ -2978,7 +3683,11 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
         };
         w.abs_laid = laid;
         for r in listened {
-            let now = abs_now(&w, r);
+            // (a seeded zero box waits until the object is in a LayerCollector)
+            if w.abs_seen.get(&r).is_some_and(|b| b.size == [0.0; 2] && b.pos == [0.0; 2]) && !in_layer_collector(&w, r) {
+                continue;
+            }
+            let now = abs_now(&mut w, r);
             match w.abs_seen.insert(r, now) {
                 Some(old) if old != now => {
                     if old.pos != now.pos {
@@ -2992,6 +3701,26 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
                     }
                 }
                 _ => {}
+            }
+        }
+        // A layout's AbsoluteContentSize (Roact / Fusion bindings size their
+        // frames from it): listened layouts, against what scripts last saw.
+        let layouts: Vec<Ref> = {
+            let d = w.d();
+            w.listening
+                .iter()
+                .copied()
+                .filter(|r| d.class_of(*r).is_some_and(|c| doc::is_a(&c, "UIGridStyleLayout")))
+                .collect()
+        };
+        for r in layouts {
+            let size = content_size(&w, r);
+            let now = AbsBox { pos: [0.0; 2], size, rot: 0.0 };
+            // (a layout nobody has read yet had (0, 0) before its first
+            // layout pass, so a listener hears the content arrive)
+            let old = w.abs_seen.insert(r, now).map_or([0.0; 2], |b| b.size);
+            if old != size {
+                fires.push((r, "AbsoluteContentSize"));
             }
         }
         // (nothing kept for instances gone or no longer listened to)
@@ -3008,6 +3737,40 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+/// UIListLayout / UIGridLayout / UITableLayout.AbsoluteContentSize: the
+/// extent of the visible GuiObjects it lays out (its siblings), as drawn
+/// last frame (before that, from their UDim2s).
+pub(crate) fn content_size(w: &World, r: Ref) -> [f32; 2] {
+    let d = w.d();
+    let parent = d.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
+    let kids: Vec<Ref> = d
+        .dom
+        .get_by_ref(parent)
+        .map(|p| p.children().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|k| {
+            d.class_of(*k).is_some_and(|c| doc::is_a(&c, "GuiObject"))
+                && !matches!(d.prop(*k, "Visible"), Some(Variant::Bool(false)))
+        })
+        .collect();
+    if kids.is_empty() {
+        return [0.0; 2];
+    }
+    let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for k in &kids {
+        let (pos, size) = match w.input.gui_layout.get(k) {
+            Some(b) => (b.pos, b.size),
+            None => gui_rect(w, *k, 0),
+        };
+        for a in 0..2 {
+            mn[a] = mn[a].min(pos[a]);
+            mx[a] = mx[a].max(pos[a] + size[a]);
+        }
+    }
+    [mx[0] - mn[0], mx[1] - mn[1]]
+}
+
 static LAYOUT_PROPS: std::sync::OnceLock<[rbx_dom_weak::Ustr; 6]> = std::sync::OnceLock::new();
 
 fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
@@ -3020,10 +3783,21 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
     let Some(i) = d.dom.get_by_ref(r) else {
         return ([0.0; 2], screen);
     };
+    if depth <= 64 && !doc::is_a(&i.class, "GuiBase2d") && !i.parent().is_none() && i.class != "DataModel" && d.dom.get_by_ref(i.parent()).is_some_and(|p| doc::is_a(&p.class, "GuiBase2d") || p.class == "Folder") {
+        // A Folder (or any non-GUI holder) between GUI objects has no box:
+        // its children are laid out in the GUI object above it.
+        return gui_rect(w, i.parent(), depth + 1);
+    }
     if depth > 64 || !doc::is_a(&i.class, "GuiObject") {
         // The GUI's own canvas: a ScreenGui below the top bar inset (unless it
         // ignores it), a SurfaceGui its CanvasSize.
-        let inset = mech::GUI_TOP_INSET;
+        // (no top bar in the edit DataModel: a ScreenGui there, in CoreGui
+        // or StarterGui, is the whole view: )
+        let inset = if w.mode == crate::runtime::RunMode::Edit { 0.0 } else { mech::GUI_TOP_INSET };
+        // A plugin's dock widget: its panel's content, 0 x 0 while closed.
+        if doc::is_a(&i.class, "PluginGui") {
+            return ([0.0, 0.0], w.input.gui_layout.get(&r).filter(|_| matches!(d.prop(r, "Enabled"), Some(Variant::Bool(true)))).map_or([0.0, 0.0], |b| b.size));
+        }
         return match i.class.as_str() {
             "ScreenGui" if matches!(crate::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
                 ([0.0, -inset], screen)
@@ -3274,6 +4048,15 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
 }
 
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
+    if class == "MeshPart" && matches!(key, "MeshContent" | "MeshId") {
+        if let Some(em) = super::editable::linked_mesh(r) {
+            return Ok(Some(if key == "MeshId" {
+                Value::String(lua.create_string("")?)
+            } else {
+                super::editable::content_value(lua, &rbx_dom_weak::types::Content::from_referent(em))?
+            }));
+        }
+    }
     if class.starts_with("Editable") {
         if let Some(v) = super::editable::prop_get(lua, r, class, key)? {
             return Ok(Some(v));
@@ -3290,7 +4073,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         // As drawn last frame; before that (or when hidden), from the UDim2s.
         let b = {
             let mut w = world(lua)?;
-            let b = abs_now(&w, r);
+            let b = abs_now(&mut w, r);
             // (what the script saw: a later layout that differs fires Changed)
             w.abs_seen.insert(r, b);
             b
@@ -3309,41 +4092,30 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     // extent of the visible GuiObjects it lays out (its siblings), as drawn
     // last frame (before that, from their UDim2s).
     if key == "AbsoluteContentSize" && doc::is_a(class, "UIGridStyleLayout") {
-        let w = world(lua)?;
-        let d = w.d();
-        let parent = d.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
-        let kids: Vec<Ref> = d
-            .dom
-            .get_by_ref(parent)
-            .map(|p| p.children().to_vec())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|k| {
-                d.class_of(*k).is_some_and(|c| doc::is_a(&c, "GuiObject"))
-                    && !matches!(d.prop(*k, "Visible"), Some(Variant::Bool(false)))
-            })
-            .collect();
-        let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
-        for k in &kids {
-            let (pos, size) = match w.input.gui_layout.get(k) {
-                Some(b) => (b.pos, b.size),
-                None => gui_rect(&w, *k, 0),
-            };
-            for a in 0..2 {
-                mn[a] = mn[a].min(pos[a]);
-                mx[a] = mx[a].max(pos[a] + size[a]);
-            }
-        }
-        let size = if kids.is_empty() {
-            glam::Vec2::ZERO
-        } else {
-            glam::Vec2::new(mx[0] - mn[0], mx[1] - mn[1])
+        let size = {
+            let mut w = world(lua)?;
+            let size = content_size(&w, r);
+            // (what the script saw: a later layout that differs fires Changed)
+            w.abs_seen.insert(r, AbsBox { pos: [0.0; 2], size, rot: 0.0 });
+            size
         };
-        drop(w);
-        return Ok(Some(Value::UserData(lua.create_userdata(LVector2(size))?)));
+        return Ok(Some(Value::UserData(lua.create_userdata(LVector2(glam::Vec2::new(size[0], size[1])))?)));
     }
     if key == "TextBounds" && matches!(class, "TextLabel" | "TextButton" | "TextBox") {
-        if let Some(t) = world(lua)?.input.gui_layout.get(&r).and_then(|b| b.text) {
+        let measured = {
+            let mut w = world(lua)?;
+            let drawn = w.input.gui_layout.get(&r).and_then(|b| b.text);
+            match drawn {
+                Some(t) if !text_dirty(&mut w, r) => Some(t),
+                _ => {
+                    // Not drawn with this text / box yet: measured now, as
+                    // Studio does on the read.
+                    let b = abs_now(&mut w, r);
+                    crate::gui::text_bounds_now(w.d(), r, b.size, 1.0).or(drawn)
+                }
+            }
+        };
+        if let Some(t) = measured {
             return Ok(Some(Value::UserData(
                 lua.create_userdata(LVector2(glam::Vec2::new(t[0], t[1])))?,
             )));
@@ -3571,9 +4343,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     if class == "Sound" {
         let w = world(lua)?;
         return Ok(match key {
-            "TimePosition" => Some(Value::Number(
-                w.input.sound_pos.get(&r).copied().unwrap_or(0.0),
-            )),
+            "TimePosition" => Some(Value::Number(sound_time(&w, r))),
             "TimeLength" => Some(Value::Number(
                 w.input.sound_len.get(&r).copied().unwrap_or(0.0),
             )),
@@ -3583,7 +4353,12 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             // a
             // sound that never played or has ended reads IsPaused = true.
             "IsPaused" => Some(Value::Boolean(!w.input.sound_playing.contains(&r))),
-            "IsLoaded" => Some(Value::Boolean(true)),
+            // False while a SoundId a script set is still loading (until
+            // Loaded fires), as in Studio.
+            "IsLoaded" => {
+                drop(w);
+                Some(Value::Boolean(!super::domains::media::sound_loading(lua, r)?))
+            }
             _ => None,
         });
     }
@@ -3714,7 +4489,35 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                 (true, false, false) => SoundCmd::Play,
                 (false, true, _) => SoundCmd::Pause,
             };
-            sound(lua, r, cmd)?;
+            sound_ev(lua, r, cmd, false)?;
+            Ok(true)
+        }
+        ("Sound", "TimePosition") => {
+            // Read back at once; while it plays the sound seeks there; the
+            // next Play() starts there (stored). Changed fires when it moves.
+            let Some(t) = num(value) else {
+                return Err(rt_err(format!(
+                    "Unable to assign property TimePosition. Number expected, got {}",
+                    value.type_name()
+                )));
+            };
+            let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
+            let mut w = world(lua)?;
+            let old = sound_time(&w, r);
+            w.input.sound_pos.insert(r, t);
+            if w.input.sound_playing.contains(&r) || w.input.sound_paused.contains(&r) {
+                w.requests.sound_seeks.push((r, t));
+            }
+            if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
+                i.properties.insert(ustr("TimePosition"), Variant::Float64(t));
+            }
+            w.dm().mark_prop(r, ustr("TimePosition"));
+            w.record(RepOp::Prop(r, "TimePosition".into()));
+            if old != t {
+                let name = Value::String(lua.create_string("TimePosition")?);
+                w.fire(r, "Changed", vec![name]);
+                w.fire(r, "Changed:TimePosition", vec![]);
+            }
             Ok(true)
         }
         ("Humanoid", "PlatformStand") => {
@@ -4041,7 +4844,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             let dir = ud_field::<LVector3>(&ray, "Direction")
                 .map(|v| v.0)
                 .unwrap_or(Vec3::ZERO);
-            let list: HashSet<Ref> = refs_in(&arg(args, 2)).into_iter().collect();
+            let list: rustc_hash::FxHashSet<Ref> = refs_in(&arg(args, 2)).into_iter().collect();
             // FindPartOnRay(ray, ignore, terrainCellsAreCubes, ignoreWater),
             // ...WithIgnoreList(ray, list, terrainCellsAreCubes, ignoreWater),
             // ...WithWhitelist(ray, list, ignoreWater).
@@ -4092,7 +4895,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         | "FindPartsInRegion3WithWhiteList" => {
             let (lo, hi) = region_box(&arg(args, 1))
                 .ok_or_else(|| rt_err(format!("{name}: Region3 expected")))?;
-            let listed: HashSet<Ref> = refs_in(&arg(args, 2)).into_iter().collect();
+            let listed: rustc_hash::FxHashSet<Ref> = refs_in(&arg(args, 2)).into_iter().collect();
             let filter = Filter {
                 list: listed,
                 include: name.ends_with("WhiteList"),
@@ -4204,10 +5007,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             one(Value::Table(list(lua, parts)?))
         }
         "GetServerTimeNow" => one(Value::Number(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0),
+            crate::runtime::fixed_epoch_time(lua).unwrap_or_else(crate::sim_clock::epoch_secs),
         )),
         "GetRealPhysicsFPS" => one(Value::Number(crate::physics::step_rate().0 as f64)),
         "MoveTo" => {
@@ -4403,7 +5203,10 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         "PlayLocalSound" => {
             let s =
                 opt_inst(&arg(args, 1)).ok_or_else(|| rt_err("PlayLocalSound: Sound expected"))?;
-            sound(lua, s, SoundCmd::Play)?;
+            if world(lua)?.side == Side::Server {
+                return Err(rt_err("SoundService:PlayLocalSound only works on a client."));
+            }
+            sound(lua, s, SoundCmd::PlayLocal)?;
             none()
         }
         "Activate" | "Deactivate" => {
@@ -4614,6 +5417,8 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             // A Content: a URI, or an EditableMesh (editable.rs snapshots it
             // as a generated mesh, sized to its bounds).
             let mut editable_size = None;
+            // (an EditableMesh source: linked to the part, skinned when boned)
+            let mut editable_src: Option<rbx_dom_weak::types::Content> = None;
             let content = match arg(args, 1) {
                 Value::String(s) => s.to_str()?.to_string(),
                 Value::Number(n) => format!("rbxassetid://{}", n as u64),
@@ -4622,6 +5427,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         Some(r) => {
                             let (id, size) = r?;
                             editable_size = Some(size);
+                            editable_src = Some(c.0.clone());
                             id
                         }
                         None => c.0.as_uri().map(str::to_string).ok_or_else(|| rt_err("CreateMeshPartAsync: empty Content"))?,
@@ -4633,6 +5439,9 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 crate::assets::asset_ref(&content)
                     .and_then(|a| crate::assets::local_asset_path(a.id))
                     .and_then(|p| std::fs::read(p).ok())
+                    // Else any content (place-local files, cache, download):
+                    // Studio's call yields until the mesh is in.
+                    .or_else(|| crate::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
                     .and_then(|b| crate::mesh::parse(&b).ok())
                     .map(|m| (m.max - m.min).max(Vec3::splat(0.05)))
                     .unwrap_or(Vec3::ONE)
@@ -4661,6 +5470,20 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         ustr("MeshSize"),
                         Variant::Vector3(Vector3::new(size.x, size.y, size.z)),
                     );
+                    i.properties.insert(
+                        ustr("InitialSize"),
+                        Variant::Vector3(Vector3::new(size.x, size.y, size.z)),
+                    );
+                    let skinned = match &editable_src {
+                        Some(c) => super::editable::content_skinned(c),
+                        None => crate::assets::asset_ref(&content)
+                            .and_then(|a| crate::assets::local_asset_path(a.id))
+                            .and_then(|p| std::fs::read(p).ok())
+                            .or_else(|| crate::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
+                            .and_then(|b| crate::mesh::parse(&b).ok())
+                            .is_some_and(|m| m.skin.is_some()),
+                    };
+                    i.properties.insert(ustr("HasSkinnedMesh"), Variant::Bool(skinned));
                     if let Some(c) = collision {
                         i.properties.insert(
                             ustr("CollisionFidelity"),
@@ -4674,6 +5497,9 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         );
                     }
                 }
+            }
+            if let Some(c) = &editable_src {
+                super::editable::link(c, r, &content);
             }
             one(inst_value(lua, r)?)
         }
@@ -4789,11 +5615,59 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 &scales,
                 humanoid,
             );
-            {
+            let account_look = {
                 let mut w = world(lua)?;
-                if let Some(look) = desc.filter(|d| w.avatar_descs.contains(d)).and(w.avatar.clone()) {
-                    crate::avatar::dress(w.dm(), r, &look);
+                let dressed = match desc.filter(|d| w.avatar_descs.contains(d)).and(w.avatar.clone()) {
+                    Some(look) => {
+                        crate::avatar::dress(w.dm(), r, &look);
+                        true
+                    }
+                    None => false,
+                };
+                // Which body parts collide, as on a spawned player (play.rs; Studio
+                // builds both the same way). insert_character leaves every part
+                // CanCollide false, so a rig made here (an NPC, the solver
+                // harness's scenes) had no contacts at all: it walked through
+                // walls and, dead, fell through the floor (solver/HARNESS.md §3).
+                let dom = &mut w.dm().dom;
+                let body: Vec<(Ref, bool)> = dom
+                    .get_by_ref(r)
+                    .map(|i| i.children().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| {
+                        let i = dom.get_by_ref(c)?;
+                        crate::doc::is_a(&i.class, "BasePart").then(|| (c, crate::play::studio_collides(&i.name, rig)))
+                    })
+                    .collect();
+                for (c, on) in body {
+                    if let Some(i) = dom.get_by_ref_mut(c) {
+                        i.properties.insert(ustr("CanCollide"), Variant::Bool(on));
+                        // Every body MeshPart collides as its box (Studio 0.747
+                        // 2026-11-14, default description R15: CollisionFidelity Box on all
+                        // 15 MeshParts; lane DEATH). As a convex decomposition the
+                        // LowerTorso's rounded top let a step's top face lift the character
+                        // (probe T5_step2.5's periodic +0.014).
+                        if i.class == "MeshPart" {
+                            i.properties.insert(
+                                ustr("CollisionFidelity"),
+                                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(2)),
+                            );
+                        }
+                    }
                 }
+                // Studio's R15 model from a description is already joint-upgraded, as a
+                // spawned character is (measured in Studio-11-13, default
+                // description: 15 AnimationConstraints, 14 BallSocketConstraints, 19
+                // NoCollisionConstraints, no Motor6D).
+                if rig == crate::rig::RigType::R15 {
+                    crate::rig::upgrade_rig(dom, r);
+                }
+                dressed
+            };
+            // Any other description: its accessories by asset id.
+            if let (false, Some(d)) = (account_look, desc) {
+                dress_from_description(lua, r, d)?;
             }
             one(inst_value(lua, r)?)
         }
@@ -4852,6 +5726,141 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Terrain's chunk triangle index answers rays and swept boxes exactly
+    /// as a scan of every triangle in order does (nearest hit, the first
+    /// triangle among equal distances; the same candidates in order).
+    #[test]
+    fn terrain_tri_index_matches_a_scan() {
+        let mut seed = 12345u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        // A bumpy grid surface (shared edges: equal distances) plus loose
+        // triangles both ways round.
+        let mut tris: Vec<([Vec3; 3], [u8; 3])> = Vec::new();
+        let h = |x: i32, z: i32| ((x * 7 + z * 13) % 5) as f32 * 0.5;
+        for x in 0..32 {
+            for z in 0..32 {
+                let p = |dx: i32, dz: i32| Vec3::new(((x + dx) * 4) as f32, h(x + dx, z + dz), ((z + dz) * 4) as f32);
+                tris.push(([p(0, 0), p(0, 1), p(1, 0)], [1, 2, 3]));
+                tris.push(([p(1, 0), p(0, 1), p(1, 1)], [4, 5, 6]));
+            }
+        }
+        for _ in 0..400 {
+            let c = Vec3::new(rnd() * 128.0, rnd() * 40.0 - 5.0, rnd() * 128.0);
+            let t = [c, c + Vec3::new(rnd() * 9.0 - 4.5, rnd() * 9.0 - 4.5, rnd() * 9.0 - 4.5), c + Vec3::new(rnd() * 9.0 - 4.5, rnd() * 9.0 - 4.5, rnd() * 9.0 - 4.5)];
+            tris.push((t, [7, 8, 9]));
+        }
+        let index = TriIndex::build(&tris);
+        let scan = |o: Vec3, d: Vec3, t0: f32, t1: f32| {
+            let mut best: Option<(f32, usize, Vec3)> = None;
+            for (i, tri) in tris.iter().enumerate() {
+                if let Some((dist, w)) = ray_triangle(o, d, &tri.0) {
+                    if dist >= t0 && dist <= t1 && best.is_none_or(|(bd, ..)| dist < bd) {
+                        best = Some((dist, i, w));
+                    }
+                }
+            }
+            best
+        };
+        let mut hits = 0;
+        for k in 0..3000 {
+            let o = Vec3::new(rnd() * 160.0 - 16.0, rnd() * 60.0 - 10.0, rnd() * 160.0 - 16.0);
+            let d = match k % 4 {
+                0 => Vec3::NEG_Y,
+                1 => Vec3::new(rnd() - 0.5, -rnd(), rnd() - 0.5).normalize_or(Vec3::NEG_Y),
+                2 => Vec3::new(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize_or(Vec3::X),
+                // through grid vertices and edges exactly
+                _ => {
+                    let o2 = Vec3::new((k % 33 * 4) as f32, 30.0, ((k / 33) % 33 * 4) as f32);
+                    let got = index.ray(&tris, o2, Vec3::NEG_Y, 0.0, 100.0);
+                    assert_eq!(got.map(|g| (g.0.to_bits(), g.1)), scan(o2, Vec3::NEG_Y, 0.0, 100.0).map(|g| (g.0.to_bits(), g.1)), "vertex ray {o2}");
+                    continue;
+                }
+            };
+            let (t0, t1) = if k % 7 == 0 { (5.0, 40.0) } else { (0.0, 300.0) };
+            let got = index.ray(&tris, o, d, t0, t1);
+            let want = scan(o, d, t0, t1);
+            assert_eq!(got.map(|g| (g.0.to_bits(), g.1)), want.map(|g| (g.0.to_bits(), g.1)), "ray {o} {d}");
+            hits += usize::from(want.is_some());
+        }
+        assert!(hits > 500, "{hits}");
+        for _ in 0..500 {
+            let lo = Vec3::new(rnd() * 140.0 - 10.0, rnd() * 30.0 - 10.0, rnd() * 140.0 - 10.0);
+            let hi = lo + Vec3::new(rnd() * 30.0, rnd() * 30.0, rnd() * 30.0);
+            let near = |p: &[Vec3; 3]| {
+                let (tl, th) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+                tl.cmple(hi).all() && th.cmpge(lo).all()
+            };
+            let want: Vec<usize> = (0..tris.len()).filter(|i| near(&tris[*i].0)).collect();
+            let got: Vec<usize> = index.in_box(lo, hi).into_iter().map(|i| i as usize).filter(|i| near(&tris[*i].0)).collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// game.ItemChanged fires for changes while connected and not after; a
+    /// DataModel listened to for something else makes no ItemChanged; a
+    /// Position set through an attachment's frame still fires Changed.
+    #[test]
+    fn item_changed_only_while_connected() {
+        let (out, _) = run(r#"
+            local part = Instance.new("Part") part.Parent = workspace
+            local att = Instance.new("Attachment") att.Parent = part
+            local n, a = 0, 0
+            game.DescendantAdded:Connect(function() end)
+            part.Transparency = 0.2
+            local c = game.ItemChanged:Connect(function(i, p) if i == part then n += 1 end end)
+            att:GetPropertyChangedSignal("Position"):Connect(function() a += 1 end)
+            part.Transparency = 0.5
+            att.Position = Vector3.new(1, 2, 3)
+            task.wait()
+            print("ic1", n, a, tostring(att.Position))
+            c:Disconnect()
+            part.Transparency = 0.7
+            task.wait()
+            print("ic2", n)
+        "#);
+        assert!(out.iter().any(|l| l.starts_with("ic1 1 1 1, 2, 3  ")), "{out:?}");
+        assert!(out.iter().any(|l| l.starts_with("ic2 1  ")), "{out:?}");
+    }
+
+    /// The query cache follows moved parts through a frame of Bone and
+    /// Attachment writes (marks of non-parts passed over), and
+    /// RaycastParams' fields are read as the script set them.
+    #[test]
+    fn query_cache_follows_parts_among_rig_writes() {
+        let (out, _) = run(r#"
+            local p = Instance.new("Part") p.Anchored = true p.Size = Vector3.new(4, 1, 4) p.Position = Vector3.new(300, 10, 0) p.Parent = workspace
+            local q = Instance.new("Part") q.Anchored = true q.Size = Vector3.new(4, 1, 4) q.Position = Vector3.new(350, 10, 0) q.Parent = workspace
+            local holder = Instance.new("Part") holder.Anchored = true holder.CanQuery = false holder.CanCollide = false holder.Parent = workspace
+            local bones = {}
+            for i = 1, 100 do local b = Instance.new("Bone") b.Parent = holder table.insert(bones, b) end
+            local att = Instance.new("Attachment") att.Parent = holder
+            -- (away from the place's SpawnLocation)
+            local function ray(x, params) local r = workspace:Raycast(Vector3.new(x + 300, 20, 0), Vector3.new(0, -20, 0), params) return r and r.Instance.Name or "nil" end
+            p.Name = "P" q.Name = "Q"
+            local s = { ray(0), ray(50) }
+            for f = 1, 3 do
+                for _, b in bones do b.CFrame = CFrame.new(0, f, 0) end
+                att.Position = Vector3.new(f, 0, 0)
+                p.CFrame = CFrame.new(300, 10, 100 * f)
+                table.insert(s, ray(0))
+                p.CFrame = CFrame.new(300, 10, 0)
+                q.Size = Vector3.new(4, 1, 0.1 * f)
+                table.insert(s, ray(0) .. ray(50))
+            end
+            local ex = RaycastParams.new() ex.FilterType = Enum.RaycastFilterType.Exclude ex.FilterDescendantsInstances = { p }
+            local inc = RaycastParams.new() inc.FilterType = Enum.RaycastFilterType.Include inc.FilterDescendantsInstances = { q }
+            local g = RaycastParams.new() g.CollisionGroup = ""
+            table.insert(s, ray(0, ex) .. ray(50, ex) .. ray(0, inc) .. ray(50, inc) .. ray(0, g))
+            p.CanQuery = false p.CanCollide = false
+            table.insert(s, ray(0))
+            print(table.concat(s, " "))
+        "#);
+        assert!(out.iter().any(|l| l.starts_with("P Q nil PQ nil PQ nil PQ nilQnilQP nil  ")), "{out:?}");
+    }
 
     /// A part far out saturates its cell indices; the width must not wrap
     /// to a small count (that walked billions of cells: a live place freeze).

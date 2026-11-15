@@ -173,8 +173,13 @@ behaviour, from a server Script in a Run (F8) test.
 - WebSocketService / WebSocketClient, WebStreamClient (+ their events),
   LanguageService: `GetService` returns nil in this Studio for game scripts
   *and* the command bar, so there is nothing reachable to measure;
-  CreateWebStreamClient gives Studio's HTTP-disabled error and, when enabled,
-  an honest "not supported" error.
+  rustudio's CreateWebStreamClient gives game scripts the HTTP-disabled error
+  measured for RequestAsync (not measured for this call); plugins (and
+  HttpEnabled places) get a working WebStreamClient (SSE, RawStream,
+  WebSocket: src/domains/services_stream.rs, checks/plugins/webstream/check.py;
+  Rojo 7.7.1 syncs through it against the official `rojo serve`). Its event
+  codes/messages, headers format and edge cases are rustudio's choices
+  pending a Studio measurement (services_stream.rs header).
 - (done) RunService.Misprediction: Connect/connect/Once → "cannot connect
   'Misprediction' (lacking capability PluginOrOpenCloud)", Wait → "cannot
   wait"; Rollback connects normally (Studio). The prelude's Signal checks

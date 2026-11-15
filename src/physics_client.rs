@@ -39,16 +39,23 @@ const NEAR_LEAD_S: f32 = 0.5;
 /// The client DataModel's simulation (built on first use).
 #[derive(Default)]
 pub struct ClientSim {
-    physics: Option<Physics>,
+    pub(super) physics: Option<Physics>,
     /// Replicated parts in the client world now (as fixed followers), with
     /// the frame each was last inside a client body's neighbourhood.
     near: HashMap<Ref, u64>,
     frame: u64,
+    /// Bodies with a stand-in in the server's world: their velocities when this
+    /// frame's step began (physics_client_link.rs).
+    pub(super) link_start: HashMap<rp::RigidBodyHandle, (Vec3, Vec3)>,
 }
 
 impl ClientSim {
     pub fn physics(&self) -> Option<&Physics> {
         self.physics.as_ref()
+    }
+
+    pub(super) fn physics_mut(&mut self) -> Option<&mut Physics> {
+        self.physics.as_mut()
     }
 
     /// Whether this world has bodies of its own to step.
@@ -61,8 +68,8 @@ impl ClientSim {
     /// (linear velocity, angular velocity, assembly centre of mass). Client
     /// scripts read these (AssemblyLinearVelocity / AssemblyAngularVelocity),
     /// the replicated parts' come from the server, as in Studio.
-    pub fn own_motion(&self, c2s: &HashMap<Ref, Ref>) -> HashMap<Ref, (Vec3, Vec3, Vec3)> {
-        let mut out = HashMap::new();
+    pub fn own_motion(&self, c2s: &std::collections::HashMap<Ref, Ref>) -> std::collections::HashMap<Ref, (Vec3, Vec3, Vec3)> {
+        let mut out = std::collections::HashMap::new();
         let Some(p) = self.physics.as_ref() else { return out };
         for a in p.asms.values() {
             let Some(b) = p.world.bodies.get(a.body) else { continue };
@@ -87,8 +94,8 @@ impl ClientSim {
         &mut self,
         server: &Physics,
         cd: &mut Document,
-        s2c: &HashMap<Ref, Ref>,
-        c2s: &HashMap<Ref, Ref>,
+        s2c: &std::collections::HashMap<Ref, Ref>,
+        c2s: &std::collections::HashMap<Ref, Ref>,
         vel: &[(Ref, Vec3)],
         dt: f32,
     ) -> StepResult {
@@ -106,7 +113,7 @@ impl ClientSim {
                     .filter(|i| doc::is_a(&i.class, "BasePart") && c2s.contains_key(&i.referent()))
                     .map(|i| i.referent())
                     .collect(),
-                None => HashSet::new(),
+                None => HashSet::default(),
             };
             let mut p = Physics::new_skipping(cd, skip);
             p.groups = server.groups.clone();
@@ -140,7 +147,7 @@ impl ClientSim {
                 }
             } else if pb.asm.is_some() && !p.external.contains(&r) {
                 let mut group = vec![r];
-                let mut seen: HashSet<Ref> = HashSet::from([r]);
+                let mut seen: HashSet<Ref> = [r].into_iter().collect();
                 let mut i = 0;
                 while i < group.len() {
                     let n: Vec<Ref> = p.neighbours(group[i]).collect();
@@ -183,19 +190,30 @@ impl ClientSim {
                     regions.push(bb.loosened(NEAR_MARGIN + lead));
                 }
             }
-            let mut now: HashSet<Ref> = HashSet::new();
+            let mut now: HashSet<Ref> = HashSet::default();
+            // RUSTUDIO_SOLVER=studio: the player's character meets the client's bodies
+            // in the server's world, through their stand-ins (physics_client_link.rs);
+            // here it would push them a second time. Under rapier its parts come in.
+            let link = server.studio.is_some() && server.link.player.is_some() && !super::client_link::off();
+            let player_part = |s: &Ref| {
+                link && server.hums.of_part.get(s).and_then(|m| server.hums.by_model.get(m)).map(|h| h.body) == server.link.player
+            };
             if !regions.is_empty() {
                 let qp = server.world.query_pipeline();
                 for reg in &regions {
                     for (h, _) in qp.intersect_aabb_conservative(*reg) {
-                        if let Some(c) = server.by_collider.get(&h).and_then(|s| s2c.get(s)) {
+                        let Some(s) = server.by_collider.get(&h) else { continue };
+                        if player_part(s) {
+                            continue;
+                        }
+                        if let Some(c) = s2c.get(s) {
                             now.insert(*c);
                         }
                     }
                 }
                 // The character isn't in the server's world (it moves it
                 // itself): its parts by their client poses.
-                for s in &server.skip {
+                for s in server.skip.iter().filter(|s| !player_part(s)) {
                     let Some(c) = s2c.get(s) else { continue };
                     let Some(xf) = xform_of(cd, *c) else { continue };
                     let pt = rv(xf.pos);

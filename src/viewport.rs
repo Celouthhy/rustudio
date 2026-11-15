@@ -51,6 +51,130 @@ pub struct GizmoDrag {
 
 /// Fly speed multiplier after `held` seconds of holding movement keys
 /// (Studio's per-tick step over its base step).
+/// Where a face's Decal / Texture image lands on a part, in its unit box
+/// (Enum.NormalId: Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5),
+/// as Studio 0.747 maps it: seen from outside, the image upright and not
+/// mirrored (checks/mesh-deform/tools/decalprobe.py, a grid image on all
+/// six faces of a Part: Front u runs toward −X, Back toward +X, Top's u
+/// toward −X and v toward −Z).
+pub(crate) fn decal_face_uv(face: u32, v: Vec3) -> glam::Vec2 {
+    match face {
+        0 => glam::Vec2::new(0.5 - v.z, 0.5 - v.y),
+        1 => glam::Vec2::new(0.5 - v.x, 0.5 - v.z),
+        2 => glam::Vec2::new(v.x + 0.5, 0.5 - v.y),
+        3 => glam::Vec2::new(v.z + 0.5, 0.5 - v.y),
+        4 => glam::Vec2::new(v.x + 0.5, 0.5 - v.z),
+        _ => glam::Vec2::new(0.5 - v.x, 0.5 - v.y),
+    }
+}
+
+/// The face whose Decal a mesh triangle takes: its geometric normal's
+/// largest axis (mesh space). Studio 0.747: a quad turned 44° from Front
+/// takes the Front image, 46° doesn't (about either axis, skinned or not,
+/// Size × (1, 1, 3) the same); a triangle's vertex normals don't count.
+pub(crate) fn decal_face_of(n: Vec3) -> Option<u32> {
+    let a = n.abs();
+    if a.max_element() <= 0.0 || !n.is_finite() {
+        return None;
+    }
+    Some(if a.x >= a.y && a.x >= a.z {
+        if n.x > 0.0 { 0 } else { 3 }
+    } else if a.y >= a.z {
+        if n.y > 0.0 { 1 } else { 4 }
+    } else if n.z > 0.0 {
+        2
+    } else {
+        5
+    })
+}
+
+impl Editor {
+    /// This frame's Highlight instances (highlight.rs): enabled, adorning
+    /// (Adornee, else the parent) something in the Workspace; the parts
+    /// they cover are the adornee and its descendant parts. The list of
+    /// Highlights is kept by a class index fed from the change journal (a
+    /// full walk only when the document is new), not by walking the place.
+    fn highlight_draws(&mut self) -> Vec<crate::highlight::HighlightDraw> {
+        use rbx_dom_weak::types::Variant as V;
+        let refs = {
+            let index = self
+                .highlight_index
+                .get_or_insert_with(|| crate::doc::ClassIndex::new(crate::doc::Reader::Highlights));
+            index.update(&mut self.doc, |c| c == "Highlight");
+            if index.list().is_empty() {
+                return Vec::new();
+            }
+            index.list().to_vec()
+        };
+        let d = &self.doc;
+        let Some(ws) = d.workspace() else { return Vec::new() };
+        let color = |r: Ref, k: &str, dflt: [f32; 3]| match d.prop(r, k) {
+            Some(V::Color3(c)) => [c.r, c.g, c.b],
+            Some(V::Color3uint8(c)) => [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0],
+            _ => dflt,
+        };
+        let num = |r: Ref, k: &str, dflt: f32| match d.prop(r, k) {
+            Some(V::Float32(v)) => v,
+            Some(V::Float64(v)) => v as f32,
+            _ => dflt,
+        };
+        let mut out = Vec::new();
+        for h in refs {
+            if !d.exists(h) || matches!(d.prop(h, "Enabled"), Some(V::Bool(false))) {
+                continue;
+            }
+            let adornee = match d.prop(h, "Adornee") {
+                Some(V::Ref(a)) if d.exists(a) => a,
+                _ => match d.dom.get_by_ref(h) {
+                    Some(i) => i.parent(),
+                    None => continue,
+                },
+            };
+            if adornee.is_none() || !d.is_ancestor(ws, adornee) {
+                continue;
+            }
+            let items: Vec<Ref> = std::iter::once(adornee)
+                .chain(d.dom.descendants_of(adornee).map(|i| i.referent()))
+                .filter(|r| self.scene.get(*r).is_some())
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            let fill = color(h, "FillColor", [1.0, 0.0, 0.0]);
+            let outline = color(h, "OutlineColor", [1.0, 1.0, 1.0]);
+            let fa = (1.0 - num(h, "FillTransparency", 0.5)).clamp(0.0, 1.0);
+            let oa = (1.0 - num(h, "OutlineTransparency", 0.0)).clamp(0.0, 1.0);
+            let on_top = !matches!(d.prop(h, "DepthMode"), Some(V::Enum(e)) if e.to_u32() == 1);
+            out.push(crate::highlight::HighlightDraw {
+                items,
+                fill: [fill[0], fill[1], fill[2], fa],
+                outline: [outline[0], outline[1], outline[2], oa],
+                on_top,
+            });
+            if out.len() >= crate::highlight::MAX {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// A Texture's tiling on a MeshPart (uv scale and offset over the face's
+/// 0..1 image coordinates): Studio 0.747 anchors the tiles at the face's
+/// centre, u = (x from the centre + OffsetStudsU) / StudsPerTileU (v the
+/// same, downward), where a plain Part anchors them at the face's top-left
+/// corner (tools/decalprobe.py, two tilings: 1.5 / 0.25, 0.5 and
+/// 1.2, 0.9 / 0.4, 0.3, on a MeshPart and a Part side by side).
+fn mesh_texture_uvt(tiling: Option<[f32; 4]>, w: f32, h: f32) -> [f32; 4] {
+    match tiling {
+        Some([su, sv, ou, ov]) => {
+            let (su, sv) = (su.max(0.01), sv.max(0.01));
+            [w / su, h / sv, ((ou - w * 0.5) / su).rem_euclid(1.0), ((ov - h * 0.5) / sv).rem_euclid(1.0)]
+        }
+        None => crate::render::PartDraw::NO_UVT,
+    }
+}
+
 pub fn fly_boost_at(held: f32) -> f32 {
     let ticks = held * mech::FLY_TICK_HZ;
     if ticks <= mech::FLY_RAMP_AFTER_TICKS {
@@ -482,11 +606,81 @@ impl Editor {
     /// loaded meshes, textures, classic clothing and Decal / Texture quads
     /// resolved. Parts whose assets are still loading are redone when an
     /// asset arrives.
+    /// EditableMesh edits since the last frame (runtime/editable.rs
+    /// `sync_live`): value edits go into the loaded copy's vertex buffer in
+    /// place; rebuilt ones are dropped from the mesh cache and their parts
+    /// returned to be redone.
+    fn sync_live_meshes(&mut self, removed: &[Ref]) -> (Vec<Ref>, bool) {
+        use crate::runtime::editable::{self, LivePatch};
+        let _s = crate::bench::scope("sd_live_mesh");
+        editable::live_users_gone(removed);
+        let patches = editable::sync_live();
+        if patches.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut redo = Vec::new();
+        let mut patched = false;
+        let queue = self.render_state.as_ref().map(|rs| rs.queue.clone());
+        for (id, p) in patches {
+            match p {
+                LivePatch::Ranges(runs) => {
+                    let ok = match (self.meshes.loaded(&id), self.renderer.as_mut(), &queue) {
+                        (Some(m), Some(r), Some(q)) => runs.iter().all(|(first, verts)| r.write_mesh_vertices(q, m.index, *first, verts)),
+                        _ => false,
+                    };
+                    if !ok {
+                        self.meshes.forget(&id);
+                    }
+                    patched = true;
+                }
+                LivePatch::Rebuild { users, skinned } => {
+                    self.meshes.forget(&id);
+                    if skinned {
+                        crate::skin::forget_base(&id);
+                    }
+                    redo.extend(users);
+                }
+            }
+        }
+        (redo, patched)
+    }
+
     pub fn sync_draws(&mut self) {
+        // EditableMeshes edited since the last frame: their parts' copies
+        // patched in place (or rebuilt and the parts redone), in the world
+        // and in ViewportFrames.
+        let mut removed = self.scene.peek_removed();
+        removed.extend(self.vf_scene.peek_removed());
+        let (live_redo, patched) = self.sync_live_meshes(&removed);
+        if patched {
+            if let Some(r) = self.renderer.as_mut() {
+                r.touch_layers();
+            }
+        }
+        self.sync_draws_of(false, &live_redo);
+        // ViewportFrames' parts: the same resolution, their own scene,
+        // cache and renderer layer.
+        std::mem::swap(&mut self.scene, &mut self.vf_scene);
+        std::mem::swap(&mut self.draw_cache, &mut self.vf_draw_cache);
+        std::mem::swap(&mut self.draws_asset_gen, &mut self.vf_draws_asset_gen);
+        let stats = self.draw_stats;
+        self.sync_draws_of(true, &live_redo);
+        self.draw_stats = stats;
+        std::mem::swap(&mut self.scene, &mut self.vf_scene);
+        std::mem::swap(&mut self.draw_cache, &mut self.vf_draw_cache);
+        std::mem::swap(&mut self.draws_asset_gen, &mut self.vf_draws_asset_gen);
+    }
+
+    /// `sync_draws` for one scene: the world's, or (`layered`) the parts
+    /// in ViewportFrames, each in its frame's renderer layer.
+    fn sync_draws_of(&mut self, layered: bool, live_redo: &[Ref]) {
         use crate::assets::{clothing_role, composite_over, template_box, ClothingLayer};
         use crate::render::{PartDraw, TexMode};
-        let changes = self.scene.take_changes();
-        if changes.full || !changes.changed.is_empty() || !changes.removed.is_empty() || !changes.restyled.is_empty() {
+        let mut changes = self.scene.take_changes();
+        changes.changed.extend(live_redo.iter().copied().filter(|r| self.scene.get(*r).is_some()));
+        if layered {
+            // (the world's light grid doesn't see these)
+        } else if changes.full || !changes.changed.is_empty() || !changes.removed.is_empty() || !changes.restyled.is_empty() {
             self.lighting.lightgrid_dirty = true;
             self.lighting.lightocc_dirty = true;
         } else if !changes.moved.is_empty() {
@@ -496,7 +690,7 @@ impl Editor {
             self.lighting.lightocc_dirty = true;
         }
         let regen = self.asset_gen != self.draws_asset_gen;
-        if regen {
+        if regen && !layered {
             self.lighting.lightgrid_dirty = true;
         }
         if !changes.full
@@ -533,12 +727,21 @@ impl Editor {
         let dir = doc_dir.as_deref();
         let use2022 = scene::use_2022_materials(&self.doc);
         if changes.full {
-            renderer.clear_items();
+            if layered {
+                renderer.clear_layered_items();
+            } else {
+                renderer.clear_items();
+            }
             *draw_cache = DrawCache::default();
         }
         for r in &changes.removed {
-            renderer.remove_item(*r);
+            if layered {
+                renderer.remove_layered_item(*r);
+            } else {
+                renderer.remove_item(*r);
+            }
             draw_cache.forget(*r);
+            crate::skin::forget_part(*r);
         }
         // Moved parts: carry their resolved draws along rigidly.
         for r in &changes.moved {
@@ -586,6 +789,9 @@ impl Editor {
                         }
                         d.reflectance = sp.draw.reflectance;
                         d.cast_shadow = sp.draw.cast_shadow;
+                        if d.surface_tint.is_some() {
+                            d.surface_tint = sp.draw.surface_tint;
+                        }
                         Some(d)
                     }
                     _ => None,
@@ -621,10 +827,25 @@ impl Editor {
             }
             todo.extend(ready);
         }
+        // A layered garment is drawn by a body part: what redraws the
+        // garment (its SurfaceAppearance's Color, say) redraws that part.
+        let drawers: Vec<Ref> = todo
+            .iter()
+            .filter(|r| crate::wrap::is_layered_handle(&self.doc, **r))
+            .filter_map(|r| {
+                let model = self.doc.dom.get_by_ref(*r).and_then(|h| self.doc.dom.get_by_ref(h.parent())).map(|a| a.parent())?;
+                match crate::wrap::fitted(&self.doc, model) {
+                    crate::wrap::Lookup::Ready(fit) => fit.garments.iter().find(|g| g.handle == *r).map(|g| g.owner),
+                    _ => None,
+                }
+            })
+            .collect();
+        todo.extend(drawers);
         let mut seen = std::collections::HashSet::new();
         todo.retain(|r| seen.insert(*r));
         for r in todo {
             let Some(sp) = scene.get(r) else { continue };
+            renderer.set_layer(r, sp.layer);
             // Layered garments are drawn with the body parts they fit.
             if crate::wrap::is_layered_handle(&self.doc, r) {
                 renderer.set_item(r, Vec::new());
@@ -649,11 +870,37 @@ impl Editor {
                 d.placeholder = false;
                 alpha_forced = true;
             }
+            // A body part under layered clothing drops the faces its
+            // garments hide (hsr.rs), drawn from a trimmed copy of its mesh.
+            let mut hsr_wait = false;
+            let hsr_id = match &sp.mesh_asset {
+                Some(asset) if asset.fit_to_part && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart") => {
+                    match crate::hsr::body_mesh(&self.doc, sp.r, &asset.id) {
+                        crate::hsr::Look::Ready(id) => Some(id),
+                        crate::hsr::Look::Pending => {
+                            hsr_wait = true;
+                            None
+                        }
+                        crate::hsr::Look::None => None,
+                    }
+                }
+                _ => None,
+            };
+            // A skinned mesh (its id and base) and this frame's pose (None
+            // inside: at rest), for its decals.
+            let mut skin_base: Option<(String, std::sync::Arc<crate::skin::Base>)> = None;
+            let mut skin_pose: Option<Option<(Vec<Xform>, Vec3, Vec3)>> = None;
             if let Some(asset) = &sp.mesh_asset {
                 waiting = true;
                 let sd = crate::bench::scope("sd_mesh_get");
-                let got = meshes.get(&asset.id, dir, assets, &mut |p, n, u, c, planes| {
-                    renderer.add_mesh_projected(&device, p, n, u, c, planes)
+                // (a WrapDeformer's result shown in place of the part's mesh)
+                let shown = crate::runtime::editable::shown_mesh(sp.r);
+                let mesh_id = shown.as_deref().or(hsr_id.as_deref()).unwrap_or(&asset.id);
+                crate::runtime::editable::live_user(mesh_id, sp.r);
+                let got = meshes.live(mesh_id, &mut |v| renderer.add_mesh_vertices(&device, v)).or_else(|| {
+                    meshes.get_colored(mesh_id, asset.vertex_colors, dir, assets, &mut |p, n, u, c, planes| {
+                        renderer.add_mesh_projected(&device, p, n, u, c, planes)
+                    })
                 });
                 drop(sd);
                 if let Some(m) = got {
@@ -684,12 +931,40 @@ impl Editor {
                     // A MeshPart with Bones: its skinned mesh, deformed by
                     // the Bones' current frames (skin.rs).
                     let _skin_scope = crate::bench::scope("sd_skin");
-                    if asset.fit_to_part && crate::skin::has_bones(&self.doc, sp.r) {
-                        if let crate::assets::Fetch::Ready(bytes) = assets.content(&asset.id, dir) {
-                            if let Some(base) = crate::skin::base(&asset.id, &bytes) {
-                                if let Some(idx) = crate::skin::skinned_mesh(&self.doc, sp.r, &base, &mut |slot, p, n, u, c| {
-                                    renderer.set_mesh(&device, &queue, slot, p, n, u, c)
-                                }) {
+                    if asset.fit_to_part && crate::skin::part_has_bones(&self.doc, sp.r, &asset.id) {
+                        // (the parsed base once there is one: no fetch of the bytes per redo)
+                        let base = crate::skin::cached_base(&asset.id).or_else(|| match assets.content(&asset.id, dir) {
+                            crate::assets::Fetch::Ready(bytes) => crate::skin::base(&asset.id, &bytes),
+                            _ => None,
+                        });
+                        {
+                            if let Some(base) = base {
+                                skin_base = Some((asset.id.clone(), base.clone()));
+                                if crate::skin::cpu_skinning() {
+                                    if let Some(idx) = crate::skin::skinned_mesh(&self.doc, sp.r, &base, &mut |slot, p, n, u, c| {
+                                        renderer.set_mesh(&device, &queue, slot, p, n, u, c)
+                                    }) {
+                                        d.custom_mesh = Some(idx);
+                                    }
+                                } else if let Some((palette, scale, origin)) = crate::skin::pose(&self.doc, sp.r, &base) {
+                                    skin_pose = Some(Some((palette.clone(), scale, origin)));
+                                    // GPU skinning (skin_gpu.rs): only the palette goes up.
+                                    let corners = base.positions.len();
+                                    let have = crate::skin::slot_of(sp.r, corners);
+                                    // Redone with the pose its slot already holds
+                                    // (another reason, or a Bone it doesn't use):
+                                    // no skinning pass, no upload.
+                                    let idx = match have {
+                                        Some(i) if crate::skin::same_pose(sp.r, 0, &base, &palette, scale, origin) => i,
+                                        _ => {
+                                            if have.is_none() {
+                                                crate::skin::same_pose(sp.r, 0, &base, &palette, scale, origin);
+                                            }
+                                            let req = crate::skin_gpu::Request { key: &asset.id, base: &base, palette: &palette, scale, origin };
+                                            renderer.skin_mesh(&device, &queue, have, &req)
+                                        }
+                                    };
+                                    crate::skin::set_slot(sp.r, idx, corners);
                                     d.custom_mesh = Some(idx);
                                 }
                             }
@@ -908,6 +1183,7 @@ impl Editor {
                         }
                         d.texture = Some(tex);
                         d.tex_mode = TexMode::Over;
+                        d.surface_tint = None;
                         d.placeholder = false;
                     }
                 }
@@ -925,7 +1201,7 @@ impl Editor {
                 if !csg {
                     let double = class.as_ref().is_some_and(|c| c == "MeshPart")
                         && matches!(self.doc.prop(sp.r, "DoubleSided"), Some(rbx_dom_weak::types::Variant::Bool(true)));
-                    renderer.set_mesh_cull(i, !double);
+                    d.custom_mesh = Some(renderer.mesh_cull_slot(i, !double));
                 }
             }
             // A MaterialVariant draws through the part material shader, like
@@ -973,20 +1249,101 @@ impl Editor {
                     .then(|| crate::render::shape_triangles(sp.draw.mesh).map(|t| (format!("{:?}", sp.draw.mesh), std::sync::Arc::new(t))))
                     .flatten();
                 let is_shape = shape.is_some();
+                // Textures too: Studio projects a tiled Texture on a
+                // MeshPart onto the same triangles as a Decal.
                 let tris = shape.or_else(|| {
-                    dec.tiling.is_none().then(|| {
-                        sp.mesh_asset.as_ref().and_then(|a| crate::assets::mesh_triangles(&a.id).map(|t| (a.id.clone(), t)))
-                    }).flatten()
+                    sp.mesh_asset.as_ref().and_then(|a| crate::assets::mesh_triangles(&a.id).map(|t| (a.id.clone(), t)))
                 });
+                let ext = sp
+                    .mesh_asset
+                    .as_ref()
+                    .and_then(|a| crate::assets::mesh_extent(&a.id))
+                    .unwrap_or(Vec3::ONE);
+                // A dynamic head (a MeshPart with FaceControls): Studio 0.747
+                // draws its Front Decal through the mesh's own UVs over the
+                // whole head, like a TextureID (tools/facsprobe.py: the grid
+                // as a Front Decal and as TextureID give the same picture),
+                // on the skinned (FACS-posed) mesh.
+                let face_head = dec.face == 5
+                    && dec.tiling.is_none()
+                    && skin_base.is_some()
+                    && self.doc.dom.get_by_ref(sp.r).is_some_and(|i| {
+                        i.children().iter().any(|c| self.doc.class_of(*c).is_some_and(|k| k == "FaceControls"))
+                    });
+                if face_head {
+                    extra.push(PartDraw {
+                        texture: Some(t.index),
+                        tex_mode: TexMode::Decal, color: dec.color,
+                        alpha: (1.0 - dec.transparency).clamp(0.0, 1.0),
+                        material: 0.0, material_id: 256, mat_layer: -1,
+                        surfaces: 0, cast_shadow: false, surface_tint: None, uvt: PartDraw::NO_UVT,
+                        emissive: [0.0; 3], reflectance: 0.0,
+                        ..d
+                    });
+                    continue;
+                }
+                // A skinned MeshPart: the projected copy is skinned with it.
+                let skinned = (!is_shape)
+                    .then(|| skin_base.as_ref())
+                    .flatten()
+                    .and_then(|(id, b)| crate::skin::decal_base(b, id, dec.face).map(|db| (b.clone(), db)));
+                if let Some((mesh_base, db)) = skinned {
+                    let corners = db.positions.len();
+                    let tag = crate::skin::DECAL_TAG + dec.face;
+                    let pose = skin_pose.get_or_insert_with(|| crate::skin::pose(&self.doc, sp.r, &mesh_base));
+                    let index = match pose {
+                        Some((palette, scale, origin)) => {
+                            let have = crate::skin::slot_of_tag(sp.r, tag, corners);
+                            let idx = if crate::skin::cpu_skinning() {
+                                let (p, n) = crate::skin::deform(&db, palette, *scale, *origin);
+                                renderer.set_mesh(&device, &queue, have, &p, &n, &db.uvs, &[])
+                            } else {
+                                let dkey = format!("{}|decal{}", skin_base.as_ref().map(|s| s.0.as_str()).unwrap_or(""), dec.face);
+                                let req = crate::skin_gpu::Request { key: &dkey, base: &db, palette, scale: *scale, origin: *origin };
+                                renderer.skin_mesh(&device, &queue, have, &req)
+                            };
+                            crate::skin::set_slot_tag(sp.r, tag, idx, corners);
+                            idx
+                        }
+                        None => *clothing_meshes
+                            .entry(format!("decal-skinned|{}|{}", skin_base.as_ref().map(|s| s.0.as_str()).unwrap_or(""), dec.face))
+                            .or_insert_with(|| renderer.add_mesh(&device, &db.positions, &db.normals.iter().map(|n| *n / db.extent).collect::<Vec<_>>(), &db.uvs)),
+                    };
+                    let s = sp.decal_size;
+                    let (w, h) = match axis {
+                        0 => (s.z, s.y),
+                        1 => (s.x, s.z),
+                        _ => (s.x, s.y),
+                    };
+                    let uvt = mesh_texture_uvt(dec.tiling, w, h);
+                    extra.push(PartDraw {
+                        custom_mesh: Some(index), texture: Some(t.index),
+                        tex_mode: TexMode::Decal, color: dec.color,
+                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).clamp(0.0, 1.0),
+                        material: 0.0, material_id: 256, mat_layer: -1,
+                        surfaces: 0, cast_shadow: false, surface_tint: None, uvt,
+                        emissive: [0.0; 3], reflectance: 0.0,
+                        ..d
+                    });
+                    continue;
+                }
                 if let Some((source, tris)) = tris {
-                    let key = format!("decal-projection|{}|{}", source, dec.face);
+                    let key = format!("decal-projection2|{}|{}", source, dec.face);
                     let index = *clothing_meshes.entry(key).or_insert_with(|| {
                         let mut positions = Vec::new();
                         let mut normals = Vec::new();
                         let mut uvs = Vec::new();
                         for tri in tris.iter() {
                             let normal = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-                            if normal[axis] * sign <= 0.01 { continue; }
+                            if is_shape {
+                                if normal[axis] * sign <= 0.01 { continue; }
+                            } else {
+                                // A mesh: the face its normal (mesh space)
+                                // points most along (decal_face_of).
+                                let geo = (tri[1] - tri[0]).cross(tri[2] - tri[0])
+                                    * Vec3::new(ext.y * ext.z, ext.x * ext.z, ext.x * ext.y);
+                                if decal_face_of(geo) != Some(dec.face) { continue; }
+                            }
                             for v in tri {
                                 positions.push(*v + normal * 0.0005);
                                 normals.push(normal);
@@ -997,14 +1354,7 @@ impl Editor {
                                 let uv = if slope {
                                     glam::Vec2::new(0.5 - v.x, 0.5 - v.z)
                                 } else {
-                                    match dec.face {
-                                        0 => glam::Vec2::new(0.5 - v.z, 0.5 - v.y),
-                                        1 => glam::Vec2::new(v.x + 0.5, v.z + 0.5),
-                                        2 => glam::Vec2::new(0.5 - v.x, 0.5 - v.y),
-                                        3 => glam::Vec2::new(v.z + 0.5, 0.5 - v.y),
-                                        4 => glam::Vec2::new(v.x + 0.5, 0.5 - v.z),
-                                        _ => glam::Vec2::new(v.x + 0.5, 0.5 - v.y),
-                                    }
+                                    decal_face_uv(dec.face, *v)
                                 };
                                 uvs.push(uv);
                             }
@@ -1017,18 +1367,22 @@ impl Editor {
                         1 => (s.x, s.z),
                         _ => (s.x, s.y),
                     };
-                    let uvt = match dec.tiling {
-                        // Offsets wrapped into one tile: a negative uvt.w means
-                        // mesh-projected UVs to the shader (part_out).
-                        Some([su, sv, ou, ov]) => [w / su.max(0.01), h / sv.max(0.01), (ou / su.max(0.01)).rem_euclid(1.0), (ov / sv.max(0.01)).rem_euclid(1.0)],
-                        None => PartDraw::NO_UVT,
+                    let uvt = if is_shape {
+                        match dec.tiling {
+                            // Offsets wrapped into one tile: a negative uvt.w means
+                            // mesh-projected UVs to the shader (part_out).
+                            Some([su, sv, ou, ov]) => [w / su.max(0.01), h / sv.max(0.01), (ou / su.max(0.01)).rem_euclid(1.0), (ov / sv.max(0.01)).rem_euclid(1.0)],
+                            None => PartDraw::NO_UVT,
+                        }
+                    } else {
+                        mesh_texture_uvt(dec.tiling, w, h)
                     };
                     extra.push(PartDraw {
                         custom_mesh: Some(index), texture: Some(t.index),
                         tex_mode: TexMode::Decal, color: dec.color,
                         alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).clamp(0.0, 1.0),
                         material: 0.0, material_id: 256, mat_layer: -1,
-                        surfaces: 0, cast_shadow: false, uvt,
+                        surfaces: 0, cast_shadow: false, surface_tint: None, uvt,
                         emissive: [0.0; 3], reflectance: 0.0,
                         ..d
                     });
@@ -1070,15 +1424,16 @@ impl Editor {
                 // A decal has one surface. A thin closed Block draws the
                 // same image on both sides, visibly doubling it at oblique
                 // angles because the decal pass does not write depth.
-                let key = format!("decal-plane|{}", dec.face);
+                let key = format!("decal-plane2|{}", dec.face);
                 let index = *clothing_meshes.entry(key).or_insert_with(|| {
+                    // (as decal_face_uv: the directions u and v grow in)
                     let (u, v) = match dec.face {
                         0 => (-Vec3::Z, -Vec3::Y),
-                        1 => (Vec3::X, Vec3::Z),
-                        2 => (-Vec3::X, -Vec3::Y),
+                        1 => (-Vec3::X, -Vec3::Z),
+                        2 => (Vec3::X, -Vec3::Y),
                         3 => (Vec3::Z, -Vec3::Y),
                         4 => (Vec3::X, -Vec3::Z),
-                        _ => (Vec3::X, -Vec3::Y),
+                        _ => (-Vec3::X, -Vec3::Y),
                     };
                     let points = [(-u-v)*0.5, (u-v)*0.5, (u+v)*0.5, (-u+v)*0.5];
                     let ids = [0, 1, 2, 0, 2, 3];
@@ -1108,6 +1463,7 @@ impl Editor {
                     surfaces: 0,
                     material_id: 256,
                     mat_layer: -1,
+                    surface_tint: None,
                     cast_shadow: false,
                 });
             }
@@ -1126,34 +1482,22 @@ impl Editor {
                     .unwrap_or_else(Ref::none);
                 match crate::wrap::fitted(&self.doc, model) {
                     crate::wrap::Lookup::Ready(fit) => {
-                        for (i, piece) in fit.pieces.iter().enumerate().filter(|(_, p)| p.part == r)
-                        {
-                            let key = (std::sync::Arc::as_ptr(&fit) as usize, i);
-                            let (mesh, centre, extent) =
-                                *self.wrap_meshes.entry(key).or_insert_with(|| {
-                                    let (lo, hi) = piece.positions.iter().fold(
-                                        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
-                                        |(a, b), p| (a.min(*p), b.max(*p)),
-                                    );
-                                    let centre = (lo + hi) * 0.5;
-                                    let extent = (hi - lo).max(Vec3::splat(1e-4));
-                                    let unit: Vec<Vec3> = piece
-                                        .positions
-                                        .iter()
-                                        .map(|p| (*p - centre) / extent)
-                                        .collect();
-                                    let normals: Vec<Vec3> = piece
-                                        .normals
-                                        .iter()
-                                        .map(|n| (*n * extent).normalize_or_zero())
-                                        .collect();
-                                    (
-                                        renderer.add_mesh(&device, &unit, &normals, &piece.uvs),
-                                        centre,
-                                        extent,
-                                    )
-                                });
-                            let Some(hsp) = scene.get(piece.handle) else {
+                        // Each garment skinned to the body parts (wrap.rs), drawn with its main part.
+                        for gm in fit.garments.iter().filter(|g| g.owner == r) {
+                            let Some(palette) = crate::wrap::garment_palette(&self.doc, gm) else { continue };
+                            let corners = gm.base.positions.len();
+                            let slot_key = gm.handle;
+                            let have = crate::skin::slot_of(slot_key, corners);
+                            let mesh = if crate::skin::cpu_skinning() {
+                                let (p, n) = crate::skin::deform(&gm.base, &palette, Vec3::ONE, Vec3::ZERO);
+                                renderer.set_mesh(&device, &queue, have, &p, &n, &gm.base.uvs, &[])
+                            } else {
+                                let req = crate::skin_gpu::Request { key: &gm.key, base: &gm.base, palette: &palette, scale: Vec3::ONE, origin: Vec3::ZERO };
+                                renderer.skin_mesh(&device, &queue, have, &req)
+                            };
+                            crate::skin::set_slot(slot_key, mesh, corners);
+                            let (centre, extent) = (gm.base.center, gm.base.extent);
+                            let Some(hsp) = scene.get(gm.handle) else {
                                 continue;
                             };
                             let mut g = hsp.draw;
@@ -1298,11 +1642,12 @@ impl Editor {
                 (sp.mesh_asset.is_some() && d.custom_mesh.is_some()) as u32,
                 matches!(
                     d.tex_mode,
-                    TexMode::Over | TexMode::Opaque | TexMode::OpaqueTinted | TexMode::Cutout
+                    TexMode::Over | TexMode::Opaque | TexMode::OpaqueTinted | TexMode::Cutout | TexMode::TintMask
                 ) as u32,
                 extra.len() as u32,
                 (sp.clothing.is_some() && d.texture.is_some()) as u32,
             ];
+            waiting |= hsr_wait;
             draw_cache.set(r, sp.xf, flags, waiting || !tex_wait.is_empty());
             let tex_only = !waiting && !tex_wait.is_empty();
             if tex_only {
@@ -1501,6 +1846,7 @@ impl Editor {
                     surfaces: 0,
                     material_id: 256,
                     mat_layer: -1,
+                    surface_tint: None,
                     cast_shadow: false,
                 });
             }
@@ -2062,6 +2408,7 @@ impl Editor {
             && !context_menu_open
             && !ctx.egui_wants_keyboard_input()
             && self.gui.focus.is_none()
+            && !self.plugin_ui.has_text_focus()
             && self.ui.insert_popup.is_none()
             && self.explorer.renaming.is_none()
             && !ctrl;
@@ -2109,6 +2456,17 @@ impl Editor {
         {
             let _s = crate::bench::scope("vp_scene_sync");
             self.scene.sync(&mut self.doc);
+            // The parts of the ViewportFrames the GUI drew last frame.
+            // (plus the Toolbox detail page's 3D preview, an orphan frame)
+            self.toolbox_vf = self.toolbox.preview.frames(&mut self.doc);
+            if self.toolbox_vf.is_empty() {
+                self.vf_scene.set_viewport_frames(&self.doc, self.gui.viewport_frames());
+            } else {
+                let mut roots = self.gui.viewport_frames().clone();
+                roots.extend(self.toolbox_vf.keys().copied());
+                self.vf_scene.set_viewport_frames(&self.doc, &roots);
+            }
+            self.vf_scene.sync(&mut self.doc);
         }
         let pointer = resp.hover_pos();
         let handles = self.handles(rect);
@@ -2192,7 +2550,7 @@ impl Editor {
         let probe = (globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
             let _p = crate::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
-            let now = self.harness.started.elapsed().as_secs_f64();
+            let now = crate::sim_clock::since(self.harness.started).as_secs_f64();
             let dt = ctx.input(|i| i.unstable_dt);
             let (doc, scene) = (&self.doc, &self.scene);
             let ray = |o: Vec3, d: Vec3, len: f32| crate::env_probe::world_ray(doc, scene, o, d, len);
@@ -2214,7 +2572,7 @@ impl Editor {
                     lines: &lines,
                     sky: self.cam.ortho.is_none(),
                     water: crate::water::WaterLook {
-                        time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| self.harness.started.elapsed().as_secs_f32()),
+                        time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| crate::sim_clock::since(self.harness.started).as_secs_f32()),
                         ..self.water_waves
                     },
                     clouds: crate::clouds::look(&self.doc),
@@ -2303,6 +2661,7 @@ impl Editor {
                         store: assets,
                         doc_dir: doc_dir.as_deref(),
                         playing,
+                        roots: crate::gui::Roots::View,
                     },
                 );
                 // The game's cursor image over the view. While LockCenter
@@ -2347,6 +2706,27 @@ impl Editor {
                 false
             }
         };
+        // What plugins put in CoreGui, over the edit view, and the edit-mode
+        // input plugins hear (src/plugin_host/widgets_ui.rs); a press a
+        // CoreGui button, a handle or an active plugin's mouse took is not
+        // the selection tool's.
+        let plugin_took = if !playing && show_gui {
+            let took = self.plugin_viewport(&ctx, &painter, rect, &resp);
+            self.plugin_keys(&ctx);
+            took
+        } else {
+            false
+        };
+        // ViewportFrames the GUI drew: their parts through this renderer
+        // (vf_render.rs), before the world GUI pass and egui composite them.
+        if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+            let _g = crate::bench::scope("vf_render");
+            let mut reqs = self.gui.vf_requests(&self.doc);
+            reqs.extend(self.toolbox_vf.iter().map(|(k, v)| (*k, *v)));
+            r.render_viewport_frames(rs, &reqs);
+            self.gui.set_vf_textures(|vf| r.vf_texture(vf));
+            self.toolbox.preview.set_texture(|vf| r.vf_texture(vf));
+        }
         // ParticleEmitters, Beams and Trails: triangles in the same pass, after
         // the GUIs (round 25).
         // (RUSTUDIO_NO_FX leaves them out, to measure their cost.)
@@ -2378,11 +2758,14 @@ impl Editor {
             }
         }
         // SurfaceGuis / BillboardGuis behind the world stay behind it (round 23).
+        let hl = self.highlight_draws();
         if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
             let _g = crate::bench::scope("gui_world_pass");
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = crate::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             r.draw_world_gui(rs, &self.gui.world_batches, self.effects.drawn(), curve);
+            // Highlights last, over the finished image (highlight.rs).
+            r.draw_highlights(rs, &hl);
         }
         if let Some(s) = self
             .play
@@ -2399,7 +2782,16 @@ impl Editor {
         }
 
         // Playing: clicks, keys and the hotbar go to the game.
-        let in_game = self.game_viewport(ui, rect, &resp, gui_took);
+        // (a press a plugin took keeps its release and drag: not the editor's click)
+        let (pressed, held) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));
+        if pressed {
+            self.plugin_ui.press_taken = plugin_took;
+        }
+        let press_taken = self.plugin_ui.press_taken;
+        if !held && !pressed {
+            self.plugin_ui.press_taken = false;
+        }
+        let in_game = self.game_viewport(ui, rect, &resp, gui_took) || plugin_took;
 
         // The Terrain Editor's brush has the left button while one is picked.
         let brushing = !in_game && !alt && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter);
@@ -2416,7 +2808,7 @@ impl Editor {
         }
         // -------------------------------------------------- select & gizmo
         let primary_drag = resp.dragged_by(PointerButton::Primary) && (!alt || self.drag.is_some() || self.part_drag.is_some()) && !in_game && !brushing;
-        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !brushing {
+        if resp.drag_started_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
             let start = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             if let Some(p) = start {
                 // A handle takes the press even with Alt held (Alt = scale all axes).
@@ -2468,7 +2860,7 @@ impl Editor {
                 }
             }
         }
-        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !brushing {
+        if resp.clicked_by(PointerButton::Primary) && self.tool != Tool::None && !in_game && !press_taken && !brushing {
             if let Some(p) = pointer {
                 // A GUI object under the cursor is picked first, as in Studio.
                 let hit = self
@@ -2504,10 +2896,17 @@ impl Editor {
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
         if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
-            let refs: Vec<_> = std::iter::once(h)
-                .chain(self.doc.dom.descendants_of(h).map(|i| i.referent())).collect();
+            // (the hovered instance and its descendants, walked again only
+            // when the hover or the document changes)
+            let journal = self.doc.journal_end();
+            if self.hover_outline_refs.0 != Some((h, journal)) {
+                let refs = std::iter::once(h).chain(self.doc.dom.descendants_of(h).map(|i| i.referent())).collect();
+                self.hover_outline_refs = (Some((h, journal)), refs);
+            }
+            let refs = std::mem::take(&mut self.hover_outline_refs.1);
             self.draw_outline_union(&painter, rect, &refs,
                 Stroke::new(crate::studio_settings::hover_outline_px(), crate::studio_settings::color("Studio", "Hover Over Color", theme::HOVER_3D)));
+            self.hover_outline_refs.1 = refs;
         }
         // A free drag hides the handles (Studio draws only the pivot then).
         let handles = if self.part_drag.is_some() { Vec::new() } else { self.handles(rect) };
@@ -2607,6 +3006,10 @@ impl Editor {
             self.draw_viewport_hud(ui, rect);
             self.draw_drag_hotkeys(&painter, rect);
         }
+        // A Toolbox card dragged here: preview and drop (src/toolbox/glue.rs).
+        if !self.is_playing() {
+            self.toolbox_viewport_drop(ui, rect, &resp);
+        }
     }
 
     pub(crate) fn draw_box(
@@ -2631,26 +3034,95 @@ impl Editor {
     }
 
     fn draw_outline_union(&self, painter: &egui::Painter, rect: Rect, refs: &[Ref], stroke: Stroke) {
-        let mut mask = SilhouetteMask::new(rect);
+        // Nothing to outline: no mask (building and scanning one costs about
+        // 50 M instructions at a 952x569 view, and an empty one has no edges).
+        if refs.is_empty() {
+            return;
+        }
         let vp = self.cam.view_proj(rect);
+        // What the outline is made from (OutlineKey): the view, the parts and
+        // their drawn transforms, sizes, shapes and loaded meshes, and the
+        // document's change journal (Bone, Motor6D and property edits). A
+        // still selection reuses last frame's edges. While playing, skinned
+        // poses move without journal marks: no reuse then.
+        let mut parts = Vec::with_capacity(refs.len());
+        let mut sources = Vec::with_capacity(refs.len());
         for r in refs {
-            let Some(sp) = self.scene.get(*r) else { continue };
+            let Some(sp) = self.scene.get(*r) else {
+                parts.push(None);
+                continue;
+            };
             let d = self.renderer.as_ref().and_then(|renderer| renderer.item_draws(*r))
                 .and_then(|draws| draws.first()).unwrap_or(&sp.draw);
             let asset = sp.mesh_asset.as_ref().and_then(|asset| crate::assets::mesh_triangles(&asset.id));
-            let triangles = asset.as_deref().map(Vec::as_slice)
+            let skin = sp.mesh_asset.as_ref().and_then(|asset| crate::skin::cached_base(&asset.id));
+            let bits = |v: Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+            parts.push(Some(PartSig {
+                pos: bits(d.xf.pos),
+                rot: [bits(d.xf.rot.x_axis), bits(d.xf.rot.y_axis), bits(d.xf.rot.z_axis)],
+                size: bits(d.size),
+                mesh: d.mesh,
+                asset: asset.as_ref().map_or(0, |a| std::sync::Arc::as_ptr(a) as usize),
+                skin: skin.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize),
+            }));
+            sources.push((*r, sp, *d, asset));
+        }
+        let key = OutlineKey {
+            rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
+            vp: vp.to_cols_array(),
+            refs: refs.to_vec(),
+            parts,
+            journal: self.doc.journal_end(),
+        };
+        let reuse = !self.is_playing();
+        let mut cache = self.outline_cache.borrow_mut();
+        let cache = &mut *cache;
+        if reuse {
+            if let Some(i) = cache.entries.iter().position(|e| e.0 == key) {
+                let e = cache.entries.remove(i);
+                for edge in &e.1 { painter.line_segment(*edge, stroke); }
+                cache.entries.push(e);
+                return;
+            }
+        }
+        let mut mask = SilhouetteMask::new(rect, &mut cache.scratch);
+        for (r, sp, d, asset) in &sources {
+            // A skinned mesh: its deformed triangles (Studio's selection
+            // box and Highlight trace the drawn shape).
+            let posed = sp.mesh_asset.as_ref().and_then(|a| crate::skin::posed_triangles(&self.doc, *r, &a.id));
+            let triangles = posed.as_deref()
+                .or(asset.as_deref().map(Vec::as_slice))
                 .unwrap_or_else(|| crate::render::outline_triangles(d.mesh));
             for triangle in triangles {
                 mask.triangle(triangle.map(|p| vp * (d.xf.pos + d.xf.rot * (p * d.size)).extend(1.0)));
             }
         }
-        for edge in mask.edges() { painter.line_segment(edge, stroke); }
+        let edges = mask.edges();
+        for edge in &edges { painter.line_segment(*edge, stroke); }
+        if reuse {
+            // The selection's and a few hovered parts' (moving the mouse
+            // across parts and back doesn't redo each one).
+            if cache.entries.len() >= OUTLINE_CACHE_ENTRIES {
+                cache.entries.remove(0);
+            }
+            cache.entries.push((key, edges));
+        }
     }
 
     fn draw_selection(&self, painter: &egui::Painter, rect: Rect) {
         // Studio Settings > Selection: Selection Color, Selection Line Thickness.
-        self.draw_outline_union(painter, rect, &self.selected_parts(),
+        // (the selected parts, walked again only when the selection or the
+        // document changes)
+        let journal = self.doc.journal_end();
+        let mut cached = self.selection_outline_refs.borrow_mut();
+        if cached.0 != journal || cached.1 != self.doc.selection {
+            *cached = (journal, self.doc.selection.clone(), self.selected_parts());
+        }
+        let refs = std::mem::take(&mut cached.2);
+        drop(cached);
+        self.draw_outline_union(painter, rect, &refs,
             Stroke::new(crate::studio_settings::selection_outline_px(), crate::studio_settings::color("Studio", "Select Color", theme::SELECT)));
+        self.selection_outline_refs.borrow_mut().2 = refs;
     }
 
     /// Releasing the box keeps what it held (with Shift / Ctrl, added to
@@ -2727,6 +3199,17 @@ impl Editor {
         let view = self.cam.view();
         let center = area.center() - Vec2::new(0.0, 5.0);
         let project = |v: Vec3| { let v = view.transform_vector3(v); center + Vec2::new(v.x, -v.y) * 29.0 };
+        // The selector's meshes depend only on the view's rotation and where
+        // it sits: kept until either changes (SelectorCache).
+        let rot = glam::Mat3::from_mat4(view);
+        let view_key: [u32; 11] = {
+            let c = rot.to_cols_array();
+            let mut k = [0u32; 11];
+            for (i, v) in c.iter().enumerate() { k[i] = v.to_bits(); }
+            k[9] = center.x.to_bits();
+            k[10] = center.y.to_bits();
+            k
+        };
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let selector_resource = |id: &str| {
             crate::assets::resolve(id, None).filter(|p| p.is_file()).or_else(|| {
@@ -2752,20 +3235,26 @@ impl Editor {
             let path = selector_resource("rbxasset://models/ViewSelector/Basic.mesh")?;
             crate::mesh::parse(&std::fs::read(path).ok()?).ok()
         }) {
-            let mut mesh = egui::Mesh::default();
-            for (tri, normals) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
-                if view.transform_vector3((normals[0]+normals[1]+normals[2])/3.0).z <= 0.0 { continue; }
-                let start = mesh.vertices.len() as u32;
-                for (pos,n) in tri.iter().zip(normals) {
-                    // Model: color (181,187,199), transparency .5; viewport
-                    // ambient 200/255, directional 140/255 along (-1,-1,-1).
-                    let light = (200.0/255.0 + 140.0/255.0*n.dot(Vec3::ONE.normalize()).max(0.0)).min(1.0);
-                    mesh.colored_vertex(project(*pos/25.0), Color32::from_rgba_unmultiplied(
-                        (181.0*light) as u8,(187.0*light) as u8,(199.0*light) as u8,128));
+            let cache = &mut self.selector_cache;
+            if cache.body.as_ref().is_none_or(|b| b.0 != view_key) {
+                let mut mesh = egui::Mesh::default();
+                for (tri, normals) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
+                    if view.transform_vector3((normals[0]+normals[1]+normals[2])/3.0).z <= 0.0 { continue; }
+                    let start = mesh.vertices.len() as u32;
+                    for (pos,n) in tri.iter().zip(normals) {
+                        // Model: color (181,187,199), transparency .5; viewport
+                        // ambient 200/255, directional 140/255 along (-1,-1,-1).
+                        let light = (200.0/255.0 + 140.0/255.0*n.dot(Vec3::ONE.normalize()).max(0.0)).min(1.0);
+                        mesh.colored_vertex(project(*pos/25.0), Color32::from_rgba_unmultiplied(
+                            (181.0*light) as u8,(187.0*light) as u8,(199.0*light) as u8,128));
+                    }
+                    mesh.add_triangle(start,start+1,start+2);
                 }
-                mesh.add_triangle(start,start+1,start+2);
+                cache.body = Some((view_key, std::sync::Arc::new(mesh)));
             }
-            p.add(egui::Shape::mesh(mesh));
+            if let Some((_, mesh)) = &cache.body {
+                p.add(egui::Shape::Mesh(mesh.clone()));
+            }
         }
         let mut faces = Vec::new();
         for (label, key, normal, u, v) in [
@@ -2810,6 +3299,10 @@ impl Editor {
                 Some(t)
             });
             if let Some(texture) = texture {
+                let face_key = (label, texture.id());
+                if let Some((_, mesh)) = self.selector_cache.faces.iter().find(|f| f.0 == (face_key, view_key)) {
+                    p.add(egui::Shape::Mesh(mesh.clone()));
+                } else {
                 let mut mesh = egui::Mesh::with_texture(texture.id());
                 if let Some(Some(geometry)) = SELECTOR.get() {
                     for (tri, ns) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
@@ -2825,7 +3318,15 @@ impl Editor {
                         mesh.add_triangle(start,start+1,start+2);
                     }
                 }
-                p.add(egui::Shape::mesh(mesh));
+                let mesh = std::sync::Arc::new(mesh);
+                let faces = &mut self.selector_cache.faces;
+                faces.retain(|f| f.0.0.0 != label || f.0.1 != view_key);
+                faces.push(((face_key, view_key), mesh.clone()));
+                if faces.len() > 12 {
+                    faces.remove(0);
+                }
+                p.add(egui::Shape::Mesh(mesh));
+                }
             }
             if inside {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3007,7 +3508,7 @@ impl Editor {
         // A prepared sky from the worker (decode, resize, flips and the
         // irradiance took ~145 ms on the main thread when Place A swapped skies).
         if let Some((key, rx)) = &self.lighting.sky_job {
-            match rx.try_recv() {
+            match crate::sim_clock::job_recv(rx) {
                 Ok(done) => {
                     let key = key.clone();
                     self.lighting.sky_job = None;
@@ -3122,7 +3623,7 @@ impl Editor {
             }
         }
         if let Some(rx) = &st.lightgrid_job {
-            match rx.try_recv() {
+            match crate::sim_clock::job_recv(rx) {
                 Ok((mut grid, occ, locals)) => {
                     st.lightgrid_occ = Some(occ);
                     if let Ok(points) = std::env::var("RUSTUDIO_LIGHTGRID_DEBUG") {
@@ -3167,7 +3668,7 @@ impl Editor {
         }
         let key = (origin, self.doc.id);
         let moved = st.lightgrid_key != Some(key);
-        let since = st.lightgrid_at.map(|t| t.elapsed().as_secs_f32());
+        let since = st.lightgrid_at.map(|t| crate::sim_clock::since(t).as_secs_f32());
         let stale = (st.lightgrid_dirty && since.is_none_or(|t| t >= mech::LIGHTGRID_REFRESH_S))
             || (st.lightgrid_moves && since.is_none_or(|t| t >= mech::LIGHTGRID_MOVES_REFRESH_S));
         if (moved || stale) && st.lightgrid_job.is_none() {
@@ -3257,7 +3758,7 @@ impl Editor {
             });
             st.lightgrid_job = Some(rx);
             st.lightgrid_key = Some(key);
-            st.lightgrid_at = Some(std::time::Instant::now());
+            st.lightgrid_at = Some(crate::sim_clock::now());
             st.lightgrid_dirty = pending_meshes;
             st.lightgrid_moves = false;
         }
@@ -3306,7 +3807,7 @@ impl Editor {
         }
         let st = &mut self.lighting;
         if let Some(rx) = &st.lightocc_job {
-            match rx.try_recv() {
+            match crate::sim_clock::job_recv(rx) {
                 Ok(grid) => {
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
                         renderer.set_lightocc(&rs.queue, &grid.data);
@@ -3325,7 +3826,7 @@ impl Editor {
         let stale = st.lightocc_dirty
             && st
                 .lightocc_at
-                .is_none_or(|t| t.elapsed().as_secs_f32() >= mech::LIGHTOCC_REFRESH_S);
+                .is_none_or(|t| crate::sim_clock::since(t).as_secs_f32() >= mech::LIGHTOCC_REFRESH_S);
         if (moved || stale) && st.lightocc_job.is_none() {
             let _b = crate::bench::scope("lightocc");
             let hosts = st.lights.hosts(&mut self.doc);
@@ -3361,7 +3862,7 @@ impl Editor {
             });
             st.lightocc_job = Some(rx);
             st.lightocc_origin = Some(key);
-            st.lightocc_at = Some(std::time::Instant::now());
+            st.lightocc_at = Some(crate::sim_clock::now());
             st.lightocc_dirty = false;
         }
         match st.lightocc_shown {
@@ -3756,46 +4257,126 @@ fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: 
     updates
 }
 
-/// Rasterize the union of clipped triangles and emit coverage boundaries only.
-struct SilhouetteMask {
-    rect: Rect, width: usize, height: usize, delta: Vec<i64>, full_rows: Vec<bool>, covered_span: Vec<(usize,usize)>, remaining_rows: usize,
+/// The view selector's projected meshes (draw_viewport_hud), for one view
+/// rotation and position: the body, and each face's lettering by (label,
+/// texture).
+#[derive(Default)]
+pub struct SelectorCache {
+    body: Option<([u32; 11], std::sync::Arc<egui::Mesh>)>,
+    #[allow(clippy::type_complexity)]
+    faces: Vec<(((&'static str, egui::TextureId), [u32; 11]), std::sync::Arc<egui::Mesh>)>,
 }
-impl SilhouetteMask {
-    fn new(rect: Rect) -> Self {
-        // Fixed viewport budget; work is O(triangles * height + width * height).
+
+/// Outlines kept from earlier frames (newest last), at most this many.
+const OUTLINE_CACHE_ENTRIES: usize = 6;
+
+/// One outlined part as the outline last saw it (bit-exact floats).
+#[derive(PartialEq)]
+struct PartSig {
+    pos: [u32; 3],
+    rot: [[u32; 3]; 3],
+    size: [u32; 3],
+    mesh: crate::render::MeshKind,
+    /// The loaded mesh / skinning base (their allocation: a new download is a new one).
+    asset: usize,
+    skin: usize,
+}
+
+/// Everything a union outline's edges depend on.
+#[derive(PartialEq)]
+struct OutlineKey {
+    rect: [f32; 4],
+    vp: [f32; 16],
+    refs: Vec<Ref>,
+    parts: Vec<Option<PartSig>>,
+    journal: u64,
+}
+
+/// Outline edges kept between frames, and the mask's buffers (reused, so a
+/// recompute neither allocates nor clears a whole view-sized buffer).
+#[derive(Default)]
+pub struct OutlineCache {
+    entries: Vec<(OutlineKey, Vec<[Pos2; 2]>)>,
+    scratch: MaskScratch,
+}
+
+/// SilhouetteMask's buffers. `delta` is all zeros between uses (each use
+/// clears the box it wrote).
+#[derive(Default)]
+struct MaskScratch {
+    delta: Vec<i32>,
+    full_rows: Vec<bool>,
+    covered_span: Vec<(usize, usize)>,
+    spans: Vec<(f32, f32)>,
+    prev: Vec<bool>,
+    cur: Vec<bool>,
+    vstart: Vec<usize>,
+}
+
+/// Rasterize the union of clipped triangles and emit coverage boundaries only.
+/// The boundaries are found in the box the coverage spans touched.
+struct SilhouetteMask<'a> {
+    rect: Rect, width: usize, height: usize, remaining_rows: usize,
+    s: &'a mut MaskScratch,
+    /// The covered box (empty: no edges; all of them off screen, or no
+    /// triangles at all): columns x0..x1, rows y0..y1.
+    x0: usize, x1: usize, y0: usize, y1: usize,
+}
+impl<'a> SilhouetteMask<'a> {
+    fn new(rect: Rect, s: &'a mut MaskScratch) -> Self {
+        // Fixed viewport budget; work is O(triangles * height + covered box).
         let scale = (1024.0 / rect.width().max(rect.height()).max(1.0)).min(2.0);
         let width = (rect.width() * scale).ceil().max(1.0) as usize;
         let height = (rect.height() * scale).ceil().max(1.0) as usize;
-        Self { rect, width, height, delta: vec![0; (width + 1) * height], full_rows: vec![false; height], covered_span: vec![(0,0); height], remaining_rows: height }
+        let n = (width + 1) * height;
+        if s.delta.len() < n {
+            s.delta.resize(n, 0);
+        }
+        s.full_rows.clear();
+        s.full_rows.resize(height, false);
+        s.covered_span.clear();
+        s.covered_span.resize(height, (0, 0));
+        Self { rect, width, height, remaining_rows: height, s, x0: usize::MAX, x1: 0, y0: usize::MAX, y1: 0 }
     }
     fn triangle(&mut self, tri: [glam::Vec4; 3]) {
         if self.remaining_rows == 0 || tri.iter().any(|p| !p.is_finite()) { return; }
-        let mut poly = tri.to_vec();
-        // WGPU homogeneous frustum, including the near plane, before divide.
+        let distance = |plane: usize, p: glam::Vec4| match plane {
+            0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,
+            3 => p.w-p.y, 4 => p.z, _ => p.w-p.z,
+        };
+        // Wholly outside one frustum plane: nothing to clip or cover.
+        if (0..6).any(|plane| tri.iter().all(|p| distance(plane, *p) < 0.0)) { return; }
+        // WGPU homogeneous frustum, including the near plane, before divide
+        // (a triangle clipped by 6 planes has at most 9 corners).
+        let mut poly = [glam::Vec4::ZERO; 9];
+        let mut len = 3;
+        poly[..3].copy_from_slice(&tri);
         for plane in 0..6 {
-            let distance = |p: glam::Vec4| match plane {
-                0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,
-                3 => p.w-p.y, 4 => p.z, _ => p.w-p.z,
-            };
-            if poly.iter().all(|p| distance(*p) >= 0.0) { continue; }
-            let mut clipped = Vec::with_capacity(9);
-            for i in 0..poly.len() {
-                let a=poly[i]; let b=poly[(i+1)%poly.len()];
-                let da=distance(a); let db=distance(b);
-                if da >= 0.0 { clipped.push(a); }
-                if (da >= 0.0) != (db >= 0.0) { clipped.push(a+(b-a)*(da/(da-db))); }
+            if poly[..len].iter().all(|p| distance(plane, *p) >= 0.0) { continue; }
+            let mut clipped = [glam::Vec4::ZERO; 9];
+            let mut n = 0;
+            for i in 0..len {
+                let a=poly[i]; let b=poly[(i+1)%len];
+                let da=distance(plane, a); let db=distance(plane, b);
+                if da >= 0.0 && n < 9 { clipped[n] = a; n += 1; }
+                if (da >= 0.0) != (db >= 0.0) && n < 9 { clipped[n] = a+(b-a)*(da/(da-db)); n += 1; }
             }
-            poly=clipped;
-            if poly.len()<3 { return; }
+            poly=clipped; len=n;
+            if len<3 { return; }
         }
-        let points: Vec<_> = poly.iter().map(|p| egui::pos2(
-            (p.x/p.w+1.0)*0.5*self.width as f32,
-            (1.0-p.y/p.w)*0.5*self.height as f32)).collect();
+        let mut points = [egui::Pos2::ZERO; 9];
+        for (q, p) in points.iter_mut().zip(&poly[..len]) {
+            *q = egui::pos2((p.x/p.w+1.0)*0.5*self.width as f32, (1.0-p.y/p.w)*0.5*self.height as f32);
+        }
+        let points = &points[..len];
         let lo=points.iter().map(|p| p.y).fold(f32::INFINITY,f32::min).max(0.0) as usize;
         let hi=points.iter().map(|p| p.y).fold(0.0,f32::max).ceil().min(self.height as f32) as usize;
+        if hi <= lo { return; }
         // Each convex polygon edge contributes a linear x intersection. Compute
         // slopes once, and step them rather than divide for every row.
-        let mut spans = vec![(f32::INFINITY, f32::NEG_INFINITY); hi-lo];
+        let spans = &mut self.s.spans;
+        spans.clear();
+        spans.resize(hi-lo, (f32::INFINITY, f32::NEG_INFINITY));
         for i in 0..points.len() {
             let mut a=points[i]; let mut b=points[(i+1)%points.len()];
             if a.y > b.y { std::mem::swap(&mut a,&mut b); }
@@ -3804,61 +4385,246 @@ impl SilhouetteMask {
             let end=(b.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
             let slope=(b.x-a.x)/(b.y-a.y);
             for y in start..end {
-                if self.full_rows[y] { continue; }
+                if self.s.full_rows[y] { continue; }
                 let x=a.x+slope*(y as f32+0.5-a.y);
                 spans[y-lo].0=spans[y-lo].0.min(x);
                 spans[y-lo].1=spans[y-lo].1.max(x);
             }
         }
         for y in lo..hi {
-            if self.full_rows[y] { continue; }
-            let (left,right)=spans[y-lo];
+            if self.s.full_rows[y] { continue; }
+            let (left,right)=self.s.spans[y-lo];
             if left <= right {
                 let start=(left-0.5).ceil().clamp(0.0,self.width as f32) as usize;
                 let end=(right-0.5).ceil().clamp(0.0,self.width as f32) as usize;
-                self.delta[y*(self.width+1)+start]+=1;
-                self.delta[y*(self.width+1)+end]-=1;
+                self.s.delta[y*(self.width+1)+start]+=1;
+                self.s.delta[y*(self.width+1)+end]-=1;
+                // (the box holds every delta written, so edges() can clear it)
+                self.x0=self.x0.min(start); self.x1=self.x1.max(end);
+                self.y0=self.y0.min(y); self.y1=self.y1.max(y+1);
                 // A conservative connected covered interval permits saturation
                 // across adjacent triangles. Disconnected spans never bridge gaps.
-                let span=&mut self.covered_span[y];
+                let span=&mut self.s.covered_span[y];
                 if span.0 == span.1 { *span=(start,end); }
                 else if start <= span.1 && end >= span.0 {
                     span.0=span.0.min(start); span.1=span.1.max(end);
                 }
                 if span.0 == 0 && span.1 == self.width {
-                    self.full_rows[y]=true;
+                    self.s.full_rows[y]=true;
                     self.remaining_rows-=1;
                 }
             }
         }
     }
 
-    fn edges(mut self) -> Vec<[Pos2;2]> {
-        for y in 0..self.height {
-            let mut coverage=0;
-            for x in 0..self.width { let i=y*(self.width+1)+x; coverage+=self.delta[i]; self.delta[i]=i64::from(coverage>0); }
+    /// The coverage boundaries as line segments: horizontal ones row by row,
+    /// then vertical ones column by column (one pass over the covered box).
+    fn edges(self) -> Vec<[Pos2;2]> {
+        let (x0, x1, y0, y1) = (self.x0, self.x1, self.y0, self.y1);
+        if x0 > x1 || y0 >= y1 {
+            return Vec::new();
         }
-        let filled=|x: usize,y: usize| self.delta[y*(self.width+1)+x]>0;
-        let point=|x: usize,y: usize| self.rect.min+egui::vec2(x as f32/self.width as f32*self.rect.width(),y as f32/self.height as f32*self.rect.height());
-        let mut edges=Vec::new();
-        // Join collinear boundary pixels so antialiased line caps do not
-        // produce a dotted outline on straight edges.
-        for y in 0..=self.height {
-            let mut start=None;
-            for x in 0..=self.width {
-                let boundary=x<self.width && ((y>0 && filled(x,y-1)) != (y<self.height && filled(x,y)));
+        let (w, h, rect) = (self.width, self.height, self.rect);
+        let s = self.s;
+        let stride = w + 1;
+        let point=|x: usize,y: usize| rect.min+egui::vec2(x as f32/w as f32*rect.width(),y as f32/h as f32*rect.height());
+        let bw = x1 - x0;
+        s.prev.clear(); s.prev.resize(bw, false);
+        s.cur.clear(); s.cur.resize(bw, false);
+        s.vstart.clear(); s.vstart.resize(bw + 1, usize::MAX);
+        let mut horizontal = Vec::new();
+        let mut vertical: Vec<(usize, usize, [Pos2; 2])> = Vec::new();
+        for y in y0..=y1 {
+            // Row y's coverage (none past the box), clearing its deltas.
+            if y < y1 {
+                let row = &mut s.delta[y*stride + x0..=y*stride + x1];
+                let mut coverage = 0;
+                for (c, d) in s.cur.iter_mut().zip(row.iter()) { coverage += *d; *c = coverage > 0; }
+                row.fill(0);
+            } else {
+                s.cur.fill(false);
+            }
+            // Horizontal boundaries on line y: row y-1 against row y.
+            let mut start = None;
+            for x in 0..=bw {
+                let boundary = x < bw && s.prev[x] != s.cur[x];
                 if boundary { start.get_or_insert(x); }
-                else if let Some(a)=start.take() { edges.push([point(a,y),point(x,y)]); }
+                else if let Some(a) = start.take() { horizontal.push([point(x0 + a, y), point(x0 + x, y)]); }
+            }
+            // Vertical boundaries on column x within row y: x-1 against x.
+            for x in 0..=bw {
+                let boundary = y < y1 && (x > 0 && s.cur[x-1]) != (x < bw && s.cur[x]);
+                if boundary {
+                    if s.vstart[x] == usize::MAX { s.vstart[x] = y; }
+                } else if s.vstart[x] != usize::MAX {
+                    let a = std::mem::replace(&mut s.vstart[x], usize::MAX);
+                    vertical.push((x, a, [point(x0 + x, a), point(x0 + x, y)]));
+                }
+            }
+            std::mem::swap(&mut s.prev, &mut s.cur);
+        }
+        vertical.sort_unstable_by_key(|v| (v.0, v.1));
+        horizontal.extend(vertical.into_iter().map(|v| v.2));
+        horizontal
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    // The silhouette mask before it reused its buffers and scanned only the
+    // covered box: the new one must give the same edges in the same order.
+    /// Rasterize the union of clipped triangles and emit coverage boundaries only.
+    struct RefMask {
+        rect: Rect, width: usize, height: usize, delta: Vec<i64>, full_rows: Vec<bool>, covered_span: Vec<(usize,usize)>, remaining_rows: usize,
+        /// Whether any triangle covered a pixel: without one the mask is empty
+        /// and has no edges (all of them off screen, or no triangles at all).
+        covered: bool,
+    }
+    impl RefMask {
+        fn new(rect: Rect) -> Self {
+            // Fixed viewport budget; work is O(triangles * height + width * height).
+            let scale = (1024.0 / rect.width().max(rect.height()).max(1.0)).min(2.0);
+            let width = (rect.width() * scale).ceil().max(1.0) as usize;
+            let height = (rect.height() * scale).ceil().max(1.0) as usize;
+            Self { rect, width, height, delta: vec![0; (width + 1) * height], full_rows: vec![false; height], covered_span: vec![(0,0); height], remaining_rows: height, covered: false }
+        }
+        fn triangle(&mut self, tri: [glam::Vec4; 3]) {
+            if self.remaining_rows == 0 || tri.iter().any(|p| !p.is_finite()) { return; }
+            let mut poly = tri.to_vec();
+            // WGPU homogeneous frustum, including the near plane, before divide.
+            for plane in 0..6 {
+                let distance = |p: glam::Vec4| match plane {
+                    0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,
+                    3 => p.w-p.y, 4 => p.z, _ => p.w-p.z,
+                };
+                if poly.iter().all(|p| distance(*p) >= 0.0) { continue; }
+                let mut clipped = Vec::with_capacity(9);
+                for i in 0..poly.len() {
+                    let a=poly[i]; let b=poly[(i+1)%poly.len()];
+                    let da=distance(a); let db=distance(b);
+                    if da >= 0.0 { clipped.push(a); }
+                    if (da >= 0.0) != (db >= 0.0) { clipped.push(a+(b-a)*(da/(da-db))); }
+                }
+                poly=clipped;
+                if poly.len()<3 { return; }
+            }
+            let points: Vec<_> = poly.iter().map(|p| egui::pos2(
+                (p.x/p.w+1.0)*0.5*self.width as f32,
+                (1.0-p.y/p.w)*0.5*self.height as f32)).collect();
+            let lo=points.iter().map(|p| p.y).fold(f32::INFINITY,f32::min).max(0.0) as usize;
+            let hi=points.iter().map(|p| p.y).fold(0.0,f32::max).ceil().min(self.height as f32) as usize;
+            // Each convex polygon edge contributes a linear x intersection. Compute
+            // slopes once, and step them rather than divide for every row.
+            let mut spans = vec![(f32::INFINITY, f32::NEG_INFINITY); hi-lo];
+            for i in 0..points.len() {
+                let mut a=points[i]; let mut b=points[(i+1)%points.len()];
+                if a.y > b.y { std::mem::swap(&mut a,&mut b); }
+                if a.y == b.y { continue; }
+                let start=(a.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
+                let end=(b.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
+                let slope=(b.x-a.x)/(b.y-a.y);
+                for y in start..end {
+                    if self.full_rows[y] { continue; }
+                    let x=a.x+slope*(y as f32+0.5-a.y);
+                    spans[y-lo].0=spans[y-lo].0.min(x);
+                    spans[y-lo].1=spans[y-lo].1.max(x);
+                }
+            }
+            for y in lo..hi {
+                if self.full_rows[y] { continue; }
+                let (left,right)=spans[y-lo];
+                if left <= right {
+                    let start=(left-0.5).ceil().clamp(0.0,self.width as f32) as usize;
+                    let end=(right-0.5).ceil().clamp(0.0,self.width as f32) as usize;
+                    self.delta[y*(self.width+1)+start]+=1;
+                    self.delta[y*(self.width+1)+end]-=1;
+                    self.covered |= start < end;
+                    // A conservative connected covered interval permits saturation
+                    // across adjacent triangles. Disconnected spans never bridge gaps.
+                    let span=&mut self.covered_span[y];
+                    if span.0 == span.1 { *span=(start,end); }
+                    else if start <= span.1 && end >= span.0 {
+                        span.0=span.0.min(start); span.1=span.1.max(end);
+                    }
+                    if span.0 == 0 && span.1 == self.width {
+                        self.full_rows[y]=true;
+                        self.remaining_rows-=1;
+                    }
+                }
             }
         }
-        for x in 0..=self.width {
-            let mut start=None;
+
+        fn edges(mut self) -> Vec<[Pos2;2]> {
+            if !self.covered {
+                return Vec::new();
+            }
+            for y in 0..self.height {
+                let mut coverage=0;
+                for x in 0..self.width { let i=y*(self.width+1)+x; coverage+=self.delta[i]; self.delta[i]=i64::from(coverage>0); }
+            }
+            let filled=|x: usize,y: usize| self.delta[y*(self.width+1)+x]>0;
+            let point=|x: usize,y: usize| self.rect.min+egui::vec2(x as f32/self.width as f32*self.rect.width(),y as f32/self.height as f32*self.rect.height());
+            let mut edges=Vec::new();
+            // Join collinear boundary pixels so antialiased line caps do not
+            // produce a dotted outline on straight edges.
             for y in 0..=self.height {
-                let boundary=y<self.height && ((x>0 && filled(x-1,y)) != (x<self.width && filled(x,y)));
-                if boundary { start.get_or_insert(y); }
-                else if let Some(a)=start.take() { edges.push([point(x,a),point(x,y)]); }
+                let mut start=None;
+                for x in 0..=self.width {
+                    let boundary=x<self.width && ((y>0 && filled(x,y-1)) != (y<self.height && filled(x,y)));
+                    if boundary { start.get_or_insert(x); }
+                    else if let Some(a)=start.take() { edges.push([point(a,y),point(x,y)]); }
+                }
             }
+            for x in 0..=self.width {
+                let mut start=None;
+                for y in 0..=self.height {
+                    let boundary=y<self.height && ((x>0 && filled(x-1,y)) != (x<self.width && filled(x,y)));
+                    if boundary { start.get_or_insert(y); }
+                    else if let Some(a)=start.take() { edges.push([point(x,a),point(x,y)]); }
+                }
+            }
+            edges
         }
-        edges
+    }
+
+    fn rng(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32) / (1u64 << 31) as f32
+    }
+
+    #[test]
+    fn bounded_mask_matches_full_scan() {
+        let mut seed = 7u64;
+        let mut scratch = MaskScratch::default();
+        let mut with_edges = 0;
+        for case in 0..300 {
+            let rect = match case % 4 {
+                0 => Rect::from_min_size(egui::pos2(10.0, 50.0), egui::vec2(952.0, 569.0)),
+                1 => Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1930.0, 1010.0)),
+                2 => Rect::from_min_size(egui::pos2(3.0, 7.0), egui::vec2(300.0, 700.0)),
+                _ => Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(64.0, 40.0)),
+            };
+            let mut old = RefMask::new(rect);
+            let mut new = SilhouetteMask::new(rect, &mut scratch);
+            // A cluster of triangles somewhere (often partly off screen, some behind the camera).
+            let n = 1 + (rng(&mut seed) * 60.0) as usize;
+            let (cx, cy, r) = (rng(&mut seed) * 3.0 - 1.5, rng(&mut seed) * 3.0 - 1.5, rng(&mut seed) * 1.2 + 0.01);
+            for _ in 0..n {
+                let tri = [0, 1, 2].map(|_| {
+                    let w = rng(&mut seed) * 2.0 + 0.2;
+                    let z = rng(&mut seed) * 1.4 - 0.2;
+                    glam::Vec4::new((cx + (rng(&mut seed) - 0.5) * r) * w, (cy + (rng(&mut seed) - 0.5) * r) * w, z * w, w)
+                });
+                old.triangle(tri);
+                new.triangle(tri);
+            }
+            let (a, b) = (old.edges(), new.edges());
+            with_edges += usize::from(!a.is_empty());
+            assert_eq!(a, b, "case {case}");
+        }
+        assert!(with_edges > 150, "most cases draw an outline ({with_edges})");
+        assert!(scratch.delta.iter().all(|d| *d == 0), "the scratch buffer is left clear");
     }
 }

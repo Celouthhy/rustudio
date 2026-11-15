@@ -47,7 +47,7 @@ impl InstanceBuilder {
         let name = class.to_string();
 
         InstanceBuilder {
-            referent: Ref::new(),
+            referent: crate::new_ref(),
             name,
             class,
             properties: Vec::new(),
@@ -62,7 +62,7 @@ impl InstanceBuilder {
         let name = class.to_string();
 
         InstanceBuilder {
-            referent: Ref::new(),
+            referent: crate::new_ref(),
             name,
             class,
             properties: Vec::with_capacity(capacity),
@@ -73,7 +73,7 @@ impl InstanceBuilder {
     /// Create a new `InstanceBuilder` with all values set to empty.
     pub fn empty() -> Self {
         InstanceBuilder {
-            referent: Ref::new(),
+            referent: crate::new_ref(),
             name: String::new(),
             class: Ustr::default(),
             properties: Vec::new(),

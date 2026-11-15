@@ -929,6 +929,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
             for (k, v) in props {
                 store_prop(lua, this, k, v)?;
             }
+            crate::runtime::editable::link_like(src, this);
             Ok(MultiValue::new())
         }
         _ => Ok(MultiValue::new()),
@@ -983,4 +984,63 @@ end
     .set_name("geometry_ops")
     .exec()?;
     Ok(())
+}
+
+// ------------------------------------------------- the editor's CSG tools
+
+/// Studio's Model-tab CSG as plugins call it (plugin:Union / Intersect /
+/// Negate, src/plugin_host/api_studio.rs): the result, unparented, made
+/// from `parts` (the first is the main part: its CFrame frame and
+/// properties), with the source parts kept in its ChildData2 (as an rbxm)
+/// so Separate can bring them back. `op` is "Union" or "Intersect".
+/// Studio's error for a non-part: "<Op> failed: Part type not supported in
+/// CSG. Only blocks, spheres, cylinders, wedges and corner-wedges are
+/// currently supported."
+pub fn editor_csg(lua: &Lua, op: &str, parts: &[Ref]) -> mlua::Result<Ref> {
+    let unsupported = || rt_err(format!("{op} failed: Part type not supported in CSG. Only blocks, spheres, cylinders, wedges and corner-wedges are currently supported."));
+    let main = *parts.first().ok_or_else(unsupported)?;
+    let (tris, xf, child) = {
+        let w = world(lua)?;
+        let d = w.d();
+        for r in parts {
+            let ok = d.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart") && c != "Terrain");
+            if !ok {
+                return Err(unsupported());
+            }
+        }
+        let o = if op == "Intersect" { Op::Intersect } else { Op::Union };
+        let (tris, xf) = run_op(d, o, main, &parts[1..]).map_err(|_| unsupported())?;
+        (tris, xf, d.encode(parts, false).unwrap_or_default())
+    };
+    if tris.is_empty() {
+        return Err(rt_err(format!("{op} failed: the result is empty")));
+    }
+    let p = piece(&tris, xf.rot)?;
+    let (class, name) = if op == "Intersect" { ("IntersectOperation", "Intersection") } else { ("UnionOperation", "Union") };
+    let r = make_result(lua, main, class, name, &p, &Fid { collision: 0, render: 0 })?;
+    if let Some(i) = world(lua)?.dm().dom.get_by_ref_mut(r) {
+        i.properties.insert(ustr("ChildData2"), Variant::SharedString(SharedString::new(child)));
+    }
+    Ok(r)
+}
+
+/// plugin:Negate of one part: a NegateOperation named "NegativePart" with
+/// the part's geometry (and the part in ChildData2).
+pub fn editor_negate(lua: &Lua, part: Ref) -> mlua::Result<Ref> {
+    let (tris, xf, child) = {
+        let w = world(lua)?;
+        let d = w.d();
+        let ok = d.class_of(part).is_some_and(|c| doc::is_a(&c, "BasePart") && c != "Terrain");
+        if !ok {
+            return Err(rt_err("Negate failed: Part type not supported in CSG. Only blocks, spheres, cylinders, wedges and corner-wedges are currently supported."));
+        }
+        let (polys, xf) = polys_of(d, part)?;
+        (csg::triangles(&polys), xf, d.encode(&[part], false).unwrap_or_default())
+    };
+    let p = piece(&tris, xf.rot)?;
+    let r = make_result(lua, part, "NegateOperation", "NegativePart", &p, &Fid { collision: 0, render: 0 })?;
+    if let Some(i) = world(lua)?.dm().dom.get_by_ref_mut(r) {
+        i.properties.insert(ustr("ChildData2"), Variant::SharedString(SharedString::new(child)));
+    }
+    Ok(r)
 }

@@ -60,6 +60,9 @@ struct Track {
     pending: Option<String>,
     /// The SoundId it last started with.
     id: Option<String>,
+    /// SoundService:PlayLocalSound's copy: plays, but the Sound's own state
+    /// (Playing, TimePosition, Ended) is not touched.
+    detached: bool,
 }
 
 pub struct Flash {
@@ -90,6 +93,8 @@ pub struct GameState {
     pub states_off: HashSet<String>,
     audio: Option<Audio>,
     tracks: HashMap<u64, Track>,
+    /// SoundService:PlayLocalSound calls so far (keys their copies).
+    local_plays: u64,
     pub flashes: Vec<Flash>,
     pub chat_open: bool,
     /// Frames the playtest view had chat available but closed: where the
@@ -214,6 +219,7 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<crate::gui::GuiEvent>, gui_serv
     use crate::gui::{GuiArg, GuiEvent};
     let lua = &rt.lua;
     let debug = std::env::var_os("RUSTUDIO_GUI_DEBUG").is_some();
+    crate::runtime::domains::gui_input::focus_now(lua);
     for ev in events {
         if debug
             && !matches!(
@@ -276,37 +282,137 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<crate::gui::GuiEvent>, gui_serv
                     );
                 }
             }
-            GuiEvent::Scroll(r, d) => {
-                let (cur, max) = rt
-                    .world_mut()
-                    .map(|w| {
-                        let doc = w.d();
-                        let cp = match doc.prop(r, "CanvasPosition") {
-                            Some(Variant::Vector2(v)) => [v.x, v.y],
-                            _ => [0.0, 0.0],
-                        };
-                        let laid = w.input.gui_layout.get(&r);
-                        let size = laid.map(|b| b.size).unwrap_or([0.0, 0.0]);
-                        // The drawn canvas (AutomaticCanvasSize included).
-                        let cs = match (laid.and_then(|b| b.canvas), doc.prop(r, "CanvasSize")) {
-                            (Some(c), _) => c,
-                            (None, Some(Variant::UDim2(u))) => [
-                                u.x.scale * size[0] + u.x.offset as f32,
-                                u.y.scale * size[1] + u.y.offset as f32,
-                            ],
-                            _ => size,
-                        };
-                        (cp, [(cs[0] - size[0]).max(0.0), (cs[1] - size[1]).max(0.0)])
-                    })
-                    .unwrap_or(([0.0, 0.0], [0.0, 0.0]));
-                let step = mech::GUI_SCROLL_PX_PER_POINT;
-                let next = glam::Vec2::new(
-                    (cur[0] + d[0] * step).clamp(0.0, max[0]),
-                    (cur[1] + d[1] * step).clamp(0.0, max[1]),
-                );
-                if let Ok(v) = lua.create_userdata(crate::ltypes::LVector2(next)) {
-                    rt.set(r, "CanvasPosition", Value::UserData(v));
-                }
+            GuiEvent::Scroll(r, d) => scroll_by(rt, r, d),
+        }
+    }
+    rt.dispatch();
+}
+
+/// A ScrollingFrame on its way to where the wheel sent it (Studio eases
+/// each notch in over a few frames: captures/studio-widgets.txt in
+/// checks/plugins/widgets, two notches 0 → 8, 24, 42 … 92, 103, 120 … 200).
+struct SmoothScroll {
+    pos: glam::Vec2,
+    vel: glam::Vec2,
+    target: glam::Vec2,
+    /// The CanvasPosition last written: anything else there means a script
+    /// moved the canvas, which ends the glide.
+    written: glam::Vec2,
+    acc: f32,
+}
+
+/// The glides of one VM (the game's, or the plugins' edit VM), kept in that
+/// Lua state's app data: they go when the VM goes, and a new VM (a reload,
+/// a new Play session) starts with none.
+#[derive(Default)]
+struct SmoothScrolls(HashMap<Ref, SmoothScroll>);
+
+fn scrolls_mut(lua: &mlua::Lua) -> mlua::AppDataRefMut<'_, SmoothScrolls> {
+    if lua.app_data_ref::<SmoothScrolls>().is_none() {
+        lua.set_app_data(SmoothScrolls::default());
+    }
+    lua.app_data_mut::<SmoothScrolls>().expect("smooth scroll state")
+}
+
+/// A ScrollingFrame's CanvasPosition and how far it can scroll now (canvas
+/// less the frame), from its last layout and its CanvasSize as it is now
+/// (so a canvas a script resized is seen before the next layout). None
+/// when the frame is gone.
+fn scroll_range(rt: &crate::runtime::Runtime, r: Ref) -> Option<(glam::Vec2, glam::Vec2)> {
+    let w = rt.world_mut()?;
+    let doc = w.d();
+    if !doc.exists(r) {
+        return None;
+    }
+    let cp = match doc.prop(r, "CanvasPosition") {
+        Some(Variant::Vector2(v)) => glam::Vec2::new(v.x, v.y),
+        _ => glam::Vec2::ZERO,
+    };
+    let laid = w.input.gui_layout.get(&r);
+    let size = laid.map(|b| b.size).unwrap_or([0.0, 0.0]);
+    let cs_prop = match doc.prop(r, "CanvasSize") {
+        Some(Variant::UDim2(u)) => Some([u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32]),
+        _ => None,
+    };
+    // The drawn canvas (AutomaticCanvasSize included), redone with the
+    // current CanvasSize when the layout recorded how.
+    let cs = match (laid.and_then(|b| cs_prop.and_then(|c| b.canvas_for(c))), laid.and_then(|b| b.canvas), cs_prop) {
+        (Some(c), _, _) => c,
+        (None, Some(c), _) => c,
+        (None, None, Some(u)) => [u[0] * size[0] + u[1], u[2] * size[1] + u[3]],
+        _ => size,
+    };
+    Some((cp, glam::Vec2::new((cs[0] - size[0]).max(0.0), (cs[1] - size[1]).max(0.0))))
+}
+
+/// The wheel over a ScrollingFrame: its target moves by the notches
+/// (ScrollWheelDeltaAmount pixels each), within the canvas; the canvas
+/// glides there in `step_smooth_scrolls`. Another notch during a glide
+/// adds to its target (Studio's two-notch capture); after a script wrote
+/// CanvasPosition the next notch starts from the script's value.
+fn scroll_by(rt: &crate::runtime::Runtime, r: Ref, d: [f32; 2]) {
+    let Some((cur, max)) = scroll_range(rt, r) else {
+        return;
+    };
+    let delta = glam::Vec2::new(d[0], d[1]) * mech::GUI_SCROLL_PX_PER_POINT;
+    let mut m = scrolls_mut(&rt.lua);
+    let fresh = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0 };
+    let s = m.0.entry(r).or_insert(fresh);
+    if s.written != cur {
+        *s = SmoothScroll { pos: cur, vel: glam::Vec2::ZERO, target: cur, written: cur, acc: 0.0 };
+    }
+    s.target = (s.target + delta).clamp(glam::Vec2::ZERO, max);
+}
+
+/// One frame of the gliding ScrollingFrames (`scroll_by`), in steps of
+/// Studio's 60 Hz frame (assumed: the capture has no timestamps): the speed
+/// eases toward a share of the distance left (mech GUI_SCROLL_EASE_*),
+/// CanvasPosition takes whole pixels as Studio reports them, and lands
+/// exactly on the target. The scroll range is read again each frame: a
+/// canvas that shrank mid-glide pulls the target in, and the canvas never
+/// goes past either end (rustudio's rule; no Studio capture of a resize
+/// mid-glide).
+pub fn step_smooth_scrolls(rt: &crate::runtime::Runtime, dt: f32) {
+    let lua = &rt.lua;
+    let todo: Vec<Ref> = match lua.app_data_ref::<SmoothScrolls>() {
+        Some(m) if !m.0.is_empty() => m.0.keys().copied().collect(),
+        _ => return,
+    };
+    for r in todo {
+        let range = scroll_range(rt, r);
+        let next = {
+            let mut m = scrolls_mut(lua);
+            let Some(s) = m.0.get_mut(&r) else { continue };
+            let Some((_, max)) = range.filter(|(now, _)| *now == s.written) else {
+                // Gone, or a script moved the canvas.
+                m.0.remove(&r);
+                continue;
+            };
+            s.target = s.target.clamp(glam::Vec2::ZERO, max);
+            s.acc += dt.max(0.0);
+            let frame = 1.0 / 60.0;
+            while s.acc >= frame * 0.999 {
+                s.acc -= frame;
+                let want = (s.target - s.pos) * mech::GUI_SCROLL_EASE_PULL;
+                s.vel += (want - s.vel) * mech::GUI_SCROLL_EASE_BLEND;
+                s.pos += s.vel;
+                // Past an end (the canvas shrank): stop there on that axis.
+                let held = s.pos.clamp(glam::Vec2::ZERO, max);
+                s.vel = glam::Vec2::select(held.cmpne(s.pos), glam::Vec2::ZERO, s.vel);
+                s.pos = held;
+            }
+            let done = (s.target - s.pos).abs().max_element() < 0.5 && s.vel.abs().max_element() < 0.5;
+            let out = if done { s.target } else { s.pos.round() };
+            let changed = out != s.written;
+            s.written = out;
+            if done {
+                m.0.remove(&r);
+            }
+            changed.then_some(out)
+        };
+        if let Some(v) = next {
+            if let Ok(u) = lua.create_userdata(crate::ltypes::LVector2(v)) {
+                rt.set(r, "CanvasPosition", Value::UserData(u));
             }
         }
     }
@@ -800,7 +906,20 @@ impl Editor {
                 Side::Server => (Some(r), self.client_of(r)),
                 Side::Client => (self.server_of(r), Some(r)),
             };
+            if cmd == SoundCmd::PlayLocal {
+                // The client's own instance only (its copy of a server Sound
+                // plays the same asset there).
+                self.sound_command(None, Some(r), cmd);
+                continue;
+            }
             self.sound_command(server, client, cmd);
+        }
+        for (r, t) in reqs.sound_seeks {
+            let (server, client) = match side {
+                Side::Server => (Some(r), self.client_of(r)),
+                Side::Client => (self.server_of(r), Some(r)),
+            };
+            self.seek_sound(server, client, t);
         }
         for (h, target) in reqs.move_to {
             if mine(h, self) {
@@ -1218,19 +1337,56 @@ impl Editor {
     }
 
     fn sound_command(&mut self, server: Option<Ref>, client: Option<Ref>, cmd: SoundCmd) {
-        let Some(key_ref) = client.or(server) else {
+        // Keyed by the server Sound when there is one: a Sound made and
+        // played on the server in one frame has no client copy yet, and a
+        // later Stop (after replication) must reach the same track.
+        let Some(key_ref) = server.or(client) else {
             return;
         };
-        let key = sound_key(key_ref);
+        let mut key = sound_key(key_ref);
+        if cmd == SoundCmd::PlayLocal {
+            // Each PlayLocalSound is its own detached copy.
+            let Some(s) = self.play.as_mut() else { return };
+            s.game.local_plays += 1;
+            key ^= s.game.local_plays.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            s.game.tracks.insert(
+                key,
+                Track { server, client, pending: None, id: None, detached: true },
+            );
+            self.start_sound(key);
+            return;
+        }
         if let Some(s) = self.play.as_mut() {
-            s.game.tracks.entry(key).or_insert(Track {
+            let t = s.game.tracks.entry(key).or_insert(Track {
                 server,
                 client,
                 pending: None,
                 id: None,
+                detached: false,
             });
+            t.server = t.server.or(server);
+            t.client = t.client.or(client);
         }
+        // The other side's view of the same Sound (the side that asked has
+        // set its own in the runtime).
+        let stopped = cmd == SoundCmd::Stop;
+        self.set_sound_info(server, client, |inp, r| match cmd {
+            SoundCmd::Play | SoundCmd::Resume => {
+                inp.sound_playing.insert(r);
+                inp.sound_paused.remove(&r);
+            }
+            _ => {
+                inp.sound_playing.remove(&r);
+                if stopped {
+                    inp.sound_paused.remove(&r);
+                    inp.sound_pos.insert(r, 0.0);
+                } else {
+                    inp.sound_paused.insert(r);
+                }
+            }
+        });
         match cmd {
+            SoundCmd::PlayLocal => {}
             SoundCmd::Play => self.start_sound(key),
             SoundCmd::Stop | SoundCmd::Pause | SoundCmd::Resume => {
                 if let Some(a) = self.play.as_mut().and_then(|s| s.game.audio.as_mut()) {
@@ -1295,13 +1451,22 @@ impl Editor {
                     f32_prop(d, r, "Volume", 0.5),
                     f32_prop(d, r, "PlaybackSpeed", 1.0),
                     matches!(d.prop(r, "Looped"), Some(Variant::Bool(true))),
-                    f32_prop(d, r, "TimePosition", 0.0) as f64,
+                    0.0f64,
                     region,
                 )
             })
         else {
             return;
         };
+        // Where Play() starts: the TimePosition a script set on either side
+        // (both are put back to 0 once used).
+        let doc_time = |d: &Document, r: Option<Ref>| {
+            r.filter(|r| d.exists(*r))
+                .map_or(0.0, |r| (f32_prop(d, r, "TimePosition", 0.0) as f64).max(0.0))
+        };
+        let start = start
+            .max(doc_time(&self.doc, server))
+            .max(self.play.as_ref().and_then(|s| s.other_doc.as_ref()).map_or(0.0, |d| doc_time(d, client)));
         if id.trim().is_empty() {
             return;
         }
@@ -1334,19 +1499,32 @@ impl Editor {
                 }
                 if let Err(e) = audio.play(key, bytes, volume, speed, looped, start, region) {
                     if s.game.warned.insert(id.clone()) {
-                        self.warn(format!("Sound {id} can't play: {e}"));
+                        // Studio's wording for a sound that fails to load.
+                        self.warn(format!("Failed to load sound {id}: {e}"));
                     }
                     return;
                 }
-                if let Some(t) = self.play.as_mut().and_then(|s| s.game.tracks.get_mut(&key)) {
-                    t.pending = None;
-                    t.id = Some(id.clone());
-                }
+                let detached = match self.play.as_mut().and_then(|s| s.game.tracks.get_mut(&key)) {
+                    Some(t) => {
+                        t.pending = None;
+                        t.id = Some(id.clone());
+                        t.detached
+                    }
+                    None => false,
+                };
                 self.log_audio_start(key, &id);
                 if let Some(len) = len {
                     self.set_sound_info(server, client, |inp, r| {
                         inp.sound_len.insert(r, len);
                     });
+                }
+                if !detached {
+                    // The TimePosition a script set is used up: the next
+                    // Play() starts at 0 unless one is set again (Studio).
+                    self.set_sound_info(server, client, |inp, r| {
+                        inp.sound_pos.insert(r, start);
+                    });
+                    self.reset_sound_doc_time(server, client);
                 }
             }
             crate::assets::Fetch::Pending => {
@@ -1405,6 +1583,49 @@ impl Editor {
         }
         if let (Some(r), Some(w)) = (client, s.client.as_mut().and_then(|c| c.world.as_mut())) {
             f(&mut w.input, r);
+        }
+    }
+
+    /// Changes a Sound's instance on both sides (no Changed signal).
+    fn set_sound_doc(
+        &mut self,
+        server: Option<Ref>,
+        client: Option<Ref>,
+        f: impl Fn(&mut rbx_dom_weak::Instance),
+    ) {
+        if let Some(i) = server.and_then(|r| self.doc.dom.get_by_ref_mut(r)) {
+            f(i);
+        }
+        if let (Some(c), Some(d)) = (client, self.play.as_mut().and_then(|s| s.other_doc.as_mut())) {
+            if let Some(i) = d.dom.get_by_ref_mut(c) {
+                f(i);
+            }
+        }
+    }
+
+    /// The stored TimePosition (where the next Play() starts) back to 0.
+    fn reset_sound_doc_time(&mut self, server: Option<Ref>, client: Option<Ref>) {
+        self.set_sound_doc(server, client, |i| {
+            i.properties.insert(ustr("TimePosition"), Variant::Float64(0.0));
+        });
+    }
+
+    /// A script set TimePosition while its Sound plays (or is paused): the
+    /// audio goes on from there.
+    fn seek_sound(&mut self, server: Option<Ref>, client: Option<Ref>, t: f64) {
+        let Some(key_ref) = server.or(client) else { return };
+        let key = sound_key(key_ref);
+        let sought = self
+            .play
+            .as_mut()
+            .and_then(|s| s.game.audio.as_mut())
+            .is_some_and(|a| a.seek(key, t));
+        self.set_sound_info(server, client, |inp, r| {
+            inp.sound_pos.insert(r, t);
+        });
+        // (still downloading: the stored TimePosition is where it starts)
+        if sought {
+            self.reset_sound_doc_time(server, client);
         }
     }
 
@@ -1524,22 +1745,33 @@ impl Editor {
             None => (Vec::new(), Vec::new()),
         };
         for k in done {
-            let Some((server, client)) = self
+            let Some((server, client, detached)) = self
                 .play
                 .as_ref()
                 .and_then(|s| s.game.tracks.get(&k))
-                .map(|t| (t.server, t.client))
+                .map(|t| (t.server, t.client, t.detached))
             else {
                 continue;
             };
+            if detached {
+                if let Some(s) = self.play.as_mut() {
+                    s.game.tracks.remove(&k);
+                }
+                continue;
+            }
+            // Studio, at the end of a sound that isn't looped: Playing and
+            // IsPlaying false, IsPaused true, TimePosition 0, all already so
+            // when Ended runs (once, on each side); no Changed signal.
             self.set_sound_info(server, client, |inp, r| {
                 inp.sound_playing.remove(&r);
                 inp.sound_paused.remove(&r);
+                inp.sound_pos.insert(r, 0.0);
+            });
+            self.set_sound_doc(server, client, |i| {
+                i.properties.insert(ustr("Playing"), Variant::Bool(false));
+                i.properties.insert(ustr("TimePosition"), Variant::Float64(0.0));
             });
             if let Some(r) = server.filter(|r| self.doc.exists(*r)) {
-                if let Some(i) = self.doc.dom.get_by_ref_mut(r) {
-                    i.properties.insert(ustr("Playing"), Variant::Bool(false));
-                }
                 self.with_side(Side::Server, |rt, _, _| rt.fire(r, "Ended", vec![]));
             }
             if let Some(c) = client {
@@ -1551,6 +1783,7 @@ impl Editor {
                 .play
                 .as_ref()
                 .and_then(|s| s.game.tracks.get(&k))
+                .filter(|t| !t.detached)
                 .map(|t| (t.server, t.client))
             else {
                 continue;
@@ -1562,18 +1795,18 @@ impl Editor {
                 self.with_side(Side::Client, |rt, _, _| rt.fire(c, "DidLoop", vec![]));
             }
         }
-        let tracks: Vec<(u64, Option<Ref>, Option<Ref>)> = self
+        let tracks: Vec<(u64, Option<Ref>, Option<Ref>, bool)> = self
             .play
             .as_ref()
             .map(|s| {
                 s.game
                     .tracks
                     .iter()
-                    .map(|(k, t)| (*k, t.server, t.client))
+                    .map(|(k, t)| (*k, t.server, t.client, t.detached))
                     .collect()
             })
             .unwrap_or_default();
-        for (k, server, client) in tracks {
+        for (k, server, client, detached) in tracks {
             let playing = self
                 .play
                 .as_ref()
@@ -1582,15 +1815,17 @@ impl Editor {
             if !playing {
                 continue;
             }
-            let pos = self
-                .play
-                .as_ref()
-                .and_then(|s| s.game.audio.as_ref())
-                .map(|a| a.position(k))
-                .unwrap_or(0.0);
-            self.set_sound_info(server, client, |inp, r| {
-                inp.sound_pos.insert(r, pos);
-            });
+            if !detached {
+                let pos = self
+                    .play
+                    .as_ref()
+                    .and_then(|s| s.game.audio.as_ref())
+                    .map(|a| a.position(k))
+                    .unwrap_or(0.0);
+                self.set_sound_info(server, client, |inp, r| {
+                    inp.sound_pos.insert(r, pos);
+                });
+            }
             let settings = self.sound_doc(server, client).map(|(d, r)| {
                 (
                     f32_prop(d, r, "Volume", 0.5).clamp(0., 10.),
@@ -1998,7 +2233,7 @@ impl Editor {
             .play
             .as_ref()
             .map(|s| match s.showing {
-                Side::Server => s.physics.skip.clone(),
+                Side::Server => s.physics.skip.iter().copied().collect(),
                 Side::Client => s
                     .physics
                     .skip

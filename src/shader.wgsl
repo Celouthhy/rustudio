@@ -261,8 +261,12 @@ fn under_water() -> bool {
     return g.fog.z > 1.5 && g.fog.z < 2.5;
 }
 
-/// How fogged a point `d` studs away is: Lighting's linear fog, or under
-/// terrain water (fog.z 2) Studio's exp2 curve, 2^(a − k·d) − 1 visible.
+/// How fogged a point `d` studs away is: Lighting's FogStart / FogEnd fog,
+/// or under terrain water (fog.z 2) Studio's exp2 curve, 2^(a − k·d) − 1
+/// visible. FogStart / FogEnd use the same form (Windows 0.744 Studio:
+/// k = 1 / (FogEnd − FogStart), FogParams = (k·FogEnd, 0, −k, 1)), so
+/// 2^((FogEnd − d) / (FogEnd − FogStart)) − 1 is visible: not linear
+/// (checks/fog-linear).
 fn fog_amount(d: f32) -> f32 {
     if (g.fog.z > 2.5) {
         // Atmosphere: e^(−k·d), kept in exp2 form.
@@ -271,7 +275,7 @@ fn fog_amount(d: f32) -> f32 {
     if (g.fog.z > 1.5) {
         return 1.0 - clamp(exp2(g.fog.x - g.fog.y * d) - 1.0, 0.0, 1.0);
     }
-    return clamp((d - g.fog.x) / max(g.fog.y - g.fog.x, 1e-3), 0.0, 1.0);
+    return 1.0 - clamp(exp2((g.fog.y - d) / max(g.fog.y - g.fog.x, 1e-3)) - 1.0, 0.0, 1.0);
 }
 
 /// The fog's colour; under water the WaterColor lit by ambient and sun.
@@ -340,6 +344,7 @@ struct PartIn {
     @location(9) uvt: vec4<f32>,   // uv scale (xy) and offset (zw)
     @location(10) emissive: vec4<f32>, // SurfaceAppearance EmissiveTint^2 x EmissiveStrength
     @location(11) vcol: vec4<f32>,     // per-vertex colour (sRGB; a 0 = the part's Color): a 1 union child colours, a in [-2, -1] mesh vertex colours (alpha -a - 1)
+    @location(13) tint: vec4<f32>,     // SurfaceAppearance.Color (sRGB, 0..1), w 1 = drawn with a SurfaceAppearance
 };
 
 struct PartOut {
@@ -357,8 +362,9 @@ struct PartOut {
     // Material map scale per stud (uvt.xy).
     @location(10) mscale: vec4<f32>,
     @location(11) @interpolate(flat) oblique: u32,
-    // Mesh vertex colour (squared) and alpha; (1, 1, 1, 1) without one.
+    // Mesh vertex colour (sRGB, squared per fragment) and alpha; (1, 1, 1, 1) without one.
     @location(12) vtint: vec4<f32>,
+    @location(13) @interpolate(flat) tint: vec4<f32>,
 };
 
 @group(0) @binding(7) var studs_tex: texture_2d<f32>;
@@ -434,7 +440,9 @@ fn part_out(v: PartIn) -> PartOut {
         // Mesh vertex colours (mesh.rs gpu_colors): Studio's part VS takes
         // VARYING2 = COLOR0 × the instance colour, alpha included; fs_part
         // multiplies it into Color or the texture (texture × VARYING2)².
-        o.vtint = vec4<f32>(sq(v.vcol.rgb), -v.vcol.a - 1.0);
+        // Squared in fs_part, after interpolation, as Studio's FS does: a
+        // 0.2 → 0.8 gradient is 0.5² at its midpoint (DefaultUnified*FS).
+        o.vtint = vec4<f32>(v.vcol.rgb, -v.vcol.a - 1.0);
     }
     o.extra = v.extra;
     o.local = v.pos * v.size.xyz;
@@ -472,6 +480,7 @@ fn part_out(v: PartIn) -> PartOut {
 
     o.emissive = v.emissive.rgb;
     o.emissive_albedo = v.emissive.w;
+    o.tint = v.tint;
     o.half = v.size.xyz * 0.5;
     o.objn = v.normal;
     o.oblique = select(0u, 1u, v.projection.x == -99.0);
@@ -910,13 +919,85 @@ fn face_studs(objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>, oblique: u32) 
 // Test the same filtered alpha and authored opacity as the color pass.
 @fragment
 fn fs_decal_depth(in: PartOut) -> @location(0) vec4<f32> {
-    let alpha = textureSample(tex, tex_sampler, in.uv).a * in.color.a;
+    let decal_clamp = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
+    let alpha = textureSample(tex, tex_sampler, suv).a * in.color.a;
     if (u32(in.extra.w + 0.5) != 2u || alpha < 1.0) { discard; }
     return vec4<f32>(0.0);
 }
 
+// See-through surfaces blend as Studio's do: in its scene buffer, which
+// holds e = sqrt(clamp(L x 0.25 x exposure)) (R10G10B10A2; the composite
+// decodes 4 e^2 / exposure: neon_over_scene), so a layer mixes into what's behind it by its
+// alpha in that encoding, not in linear light (white at Transparency 0.5
+// over black shows as 135, not 182; checks/alpha-hosts). Decals and
+// see-through parts are drawn into a copy of the scene in that encoding
+// (fs_see_encode, then fs_part_enc, then fs_see_decode: render.rs).
+var<private> ENC_OUT: bool = false;
+// The encoding's exponent on rustudio's linear light: Studio's own is a
+// square root, but 0.525 fits its pixels (131 probe cells within 4 levels
+// but the alpha-to-coverage ones; 0.5 left them 3 levels dark on average,
+// up to 9), i.e. Studio's linear light grows a little faster than colour².
+const SEE_Q: f32 = 0.525;
+
+fn see_k() -> f32 {
+    return 0.25 * max(g.params.y, 1e-4);
+}
+
+/// Linear light -> Studio's scene encoding.
+fn see_enc(c: vec3<f32>) -> vec3<f32> {
+    return pow(clamp(c * see_k(), vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(SEE_Q));
+}
+
+/// Studio's encoded scene -> linear light.
+fn see_dec(e: vec3<f32>) -> vec3<f32> {
+    return pow(clamp(e, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / SEE_Q)) / see_k();
+}
+
+/// A see-through fragment: colour c (linear, not premultiplied) weighted by
+/// w, alpha a; premultiplied, linear or (fs_part_enc) encoded. The encoded
+/// alpha marks the pixel covered (fs_see_decode), so never quite 0.
+fn see_out(c: vec3<f32>, w: f32, a: f32) -> vec4<f32> {
+    if (ENC_OUT) {
+        return vec4<f32>(see_enc(c) * w, max(a, 1.0 / 1024.0));
+    }
+    return vec4<f32>(c * w, a);
+}
+
 @fragment
 fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return part_shade(in, front);
+}
+
+@fragment
+fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    ENC_OUT = true;
+    return part_shade(in, front);
+}
+
+@group(1) @binding(0) var see_scene: texture_multisampled_2d<f32>;
+
+/// The scene (per sample) into the see-through encoding; alpha 0 = no
+/// see-through layer over it yet.
+@fragment
+fn fs_see_encode(@builtin(position) p: vec4<f32>, @builtin(sample_index) s: u32) -> @location(0) vec4<f32> {
+    let l = textureLoad(see_scene, vec2<i32>(p.xy), i32(s)).rgb;
+    return vec4<f32>(see_enc(max(l, vec3<f32>(0.0))), 0.0);
+}
+
+/// Back to linear light where a see-through layer drew; elsewhere the scene
+/// keeps its own value (also above the encoding's ceiling).
+@fragment
+fn fs_see_decode(@builtin(position) p: vec4<f32>, @builtin(sample_index) s: u32) -> @location(0) vec4<f32> {
+    let e = textureLoad(see_scene, vec2<i32>(p.xy), i32(s));
+    if (e.a <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(see_dec(e.rgb), 1.0);
+}
+
+fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     // extra.x: shading kind (0..7), + 8 mesh-UV mapping, + 16 × (layer + 1).
     let code = u32(in.extra.x + 0.5);
     let kind = f32(code & 7u);
@@ -938,7 +1019,8 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     // Two-sided meshes: light the side that faces the camera, whatever the
     // triangle winding (imported meshes wind either way).
     if (dot(n, g.cam_pos.xyz - in.world) < 0.0) { n = -n; }
-    var base = in.color.rgb * in.vtint.rgb;
+    let vtint = sq(in.vtint.rgb);
+    var base = in.color.rgb * vtint;
     var alpha = in.color.a;
     // Studio's opaque pass ignores VARYING2.w and texel alpha (MeshPart
     // TextureID, SpecialMesh TextureId: transparent texels draw their RGB);
@@ -954,7 +1036,12 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
     // SurfaceAppearanceFS: (texture × VARYING2)²); the texture is stored
     // sRGB here (shared with GUI pipelines), so the sample is re-encoded to
     // its byte value, then squared. The part colour is squared already.
-    let t_s = textureSample(tex, tex_sampler, in.uv);
+    // An untiled Decal clamps at the image's edges (a skinned mesh's
+    // projection reaches past them: skin.rs decal_base); tiled Textures repeat.
+    let decal_clamp = u32(in.extra.w + 0.5) == 2u && all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
+    let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
+    let t_s = textureSample(tex, tex_sampler, suv);
     let t_raw = select(1.055 * pow(max(t_s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), 12.92 * t_s.rgb, t_s.rgb <= vec3<f32>(0.0031308));
     let t = vec4<f32>(t_raw * t_raw, t_s.a);
     let emask = textureSample(emissive_tex, tex_sampler, in.uv).r;
@@ -971,28 +1058,38 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         let edge = max(rim, pulse);
         let cover = alpha * max(mix(pulse, 1.0, edge) * edge, 0.05);
         let fog = fog_amount(length(in.world - g.cam_pos.xyz));
-        return vec4<f32>(mix(base, fog_rgb_at(in.world), fog) * cover, cover * (1.0 - fog));
+        return see_out(mix(base, fog_rgb_at(in.world), fog), cover, cover * (1.0 - fog));
     }
-    if (mode == 1u) {
-        base = mix(base, t.rgb * in.emissive_albedo * in.vtint.rgb, t.a);
+    // A SurfaceAppearance (Studio's SurfaceAppearanceFS): its Color
+    // multiplies the raw texel (VARYING7, a per-instance constant), the
+    // vertex colour only the part colour (VARYING2); every AlphaMode mixes
+    // before squaring. Overlay: mix(VARYING2, texel x Color, a); Transparency:
+    // texel x Color, alpha x a; TintMask: mix(texel, texel x Color, a).
+    let surface = in.tint.w > 0.5;
+    let sa_raw = t_raw * in.tint.rgb * sqrt(max(in.emissive_albedo, 0.0));
+    if (mode == 1u && surface) {
+        let under = sqrt(max(in.color.rgb, vec3<f32>(0.0))) * in.vtint.rgb;
+        let raw = mix(under, sa_raw, t.a);
+        base = raw * raw;
+    } else if (mode == 1u) {
+        base = mix(base, t.rgb * in.emissive_albedo * vtint, t.a);
+    } else if (mode == 6u) {
+        let raw = t_raw * mix(vec3<f32>(1.0), in.tint.rgb, t.a) * sqrt(max(in.emissive_albedo, 0.0));
+        base = raw * raw;
     } else if (mode == 2u) {
         base = t.rgb * base;
         alpha = alpha * t.a;
     } else if (mode == 3u) {
-        base = t.rgb * in.emissive_albedo * in.vtint.rgb;
+        base = t.rgb * in.emissive_albedo * vtint;
         if (translucent) { alpha = alpha * t.a; }
     } else if (mode == 5u) {
-        base = t.rgb * in.color.rgb * in.vtint.rgb;
+        base = t.rgb * in.color.rgb * vtint;
         if (translucent) { alpha = alpha * t.a; }
     } else if (mode == 4u) {
-        // SurfaceAppearance AlphaMode Transparency: a cutout at half alpha
-        // while opaque, blended by texel alpha once translucent.
-        base = t.rgb * in.emissive_albedo * in.vtint.rgb;
-        if (translucent) {
-            alpha = alpha * t.a;
-        } else if (t.a < 0.5) {
-            discard;
-        }
+        // SurfaceAppearance AlphaMode Transparency: texel x Color, blended
+        // by VARYING2.w x texel alpha at any Transparency (render.rs pass_of).
+        base = select(t.rgb * in.emissive_albedo * vtint, sa_raw * sa_raw, surface);
+        alpha = in.color.a * in.vtint.a * t.a;
     }
     // extra.y: placeholder (bit 0) and the six surfaces above it.
     // Material maps (Studio's part shader): colour × part colour, squared;
@@ -1144,6 +1241,15 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
         base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
     }
+    if (g.lamp1.w > 1.5) {
+        // A ViewportFrame (vf_render.rs): Ambient² + LightColor² × N·L
+        // toward -LightDirection (ambient, sun_color, sun_dir here, squared
+        // already), clamped to 1, times the surface colour² (Studio 0.747,
+        // checks/viewport-frame-render/studio); no shadows, sky, fog or
+        // local lights. The blit takes the square root.
+        let lit = min(g.ambient.rgb + g.sun_color.rgb * max(dot(n, normalize(g.sun_dir.xyz)), 0.0), vec3<f32>(1.0));
+        return see_out(lit * base, alpha, alpha);
+    }
     var c: vec3<f32>;
     if (kind > 4.5 && kind < 5.5) {
         // Terrain water (round 21, Studio's SmoothWater FS LQ): WaterColor
@@ -1174,7 +1280,7 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
             let f = fog_amount(d);
             c = mix(c, fog_rgb_at(in.world), f);
         }
-        return vec4<f32>(c * alpha, alpha);
+        return see_out(c, alpha, alpha);
     } else if (kind > 0.5 && kind < 1.5) {
         // Neon glows at its own colour, unlit (and blooms). See-through
         // Neon blends the same radiance (neon_over_scene below).
@@ -1316,13 +1422,17 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         c = mix(c, fog_rgb_at(in.world), f);
     }
     if (see_through_neon) {
-        return neon_over_scene(c, 1.0 - visibility * (1.0 - alpha), in.clip.xy);
+        let a = 1.0 - visibility * (1.0 - alpha);
+        // Drawn into the encoded scene: Studio's blend itself.
+        if (ENC_OUT) { return see_out(c, a, a); }
+        return neon_over_scene(c, a, in.clip.xy);
     }
     if (glass_scene_alpha >= 0.0) {
         let visibility = select(1.0, 1.0 - fog_amount(length(in.world - g.cam_pos.xyz)), g.fog.z > 0.5);
-        return vec4<f32>(c, glass_scene_alpha * visibility);
+        // (No blending: the composite replaces the pixel.)
+        return see_out(c, 1.0, glass_scene_alpha * visibility);
     }
-    return vec4<f32>(c * alpha, alpha);
+    return see_out(c, alpha, alpha);
 }
 
 // --------------------------------------------------------------- water
@@ -2328,30 +2438,50 @@ fn near_color(uv: vec2<f32>) -> vec3<f32> {
     let step = 0.5/vec2<f32>(textureDimensions(hdr_tex));
     return (textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step,0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv-step,0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step*vec2<f32>(1.0,-1.0),0.0)+textureSampleLevel(hdr_tex,hdr_sampler,in.uv+step*vec2<f32>(-1.0,1.0),0.0))*0.25;
 }
+// Studio picks each side's DoF path by its intensity (Windows 0.744: far
+// Studio reads, near Studio reads; checks/dof-intensity):
+// below 0.22 the full-resolution CheapBokehFS pass Studio,
+// radius 1.4 × intensity, weight CoC²; from 0.22 the reduced
+// chain, radius = intensity, resolve weight (1.5 CoC)² (DOFResolveFar/NearFS).
+const DOF_CHEAP_BELOW: f32 = 0.22;
+fn dof_radius(coc: f32, intensity: f32) -> f32 {
+    return coc * coc * intensity * select(1.0, 1.4, intensity < DOF_CHEAP_BELOW);
+}
+fn dof_weight(coc: f32, intensity: f32) -> f32 {
+    let a = select(min(coc * 1.5, 1.0), coc, intensity < DOF_CHEAP_BELOW);
+    return select(0.0, a * a, intensity > 0.0 && coc > 0.0);
+}
 @fragment fn fs_dof_v(in: PostOut) -> @location(0) vec4<f32> {
     let center = textureSampleLevel(hdr_tex, hdr_sampler, in.uv, 0.0);
-    let far_coc = max(center.a, 0.0);
-    let coc2 = far_coc * far_coc;
+    // Near pixels (negative CoC) take this pass only on the cheap path; the
+    // near chain (fs_near_*, fs_post) covers NearIntensity from 0.22.
+    let near = center.a < 0.0 && g.dof.z > 0.0 && g.dof.z < DOF_CHEAP_BELOW;
+    let side = select(1.0, -1.0, near);
+    let c = max(center.a * side, 0.0);
+    let coc2 = c * c;
     let size = vec2<f32>(textureDimensions(hdr_tex));
     let scale = vec2<f32>(size.y / size.x, 1.0) * 0.014;
-    let intensity = g.dof.w;
-    let radius = coc2 * intensity;
+    let intensity = select(g.dof.w, g.dof.z, near);
+    let radius = dof_radius(c, intensity);
     var sum = center * coc2;
     var weight = coc2;
     for (var i = 0; i < 27; i++) {
         let offset = DOF_CHEAP_DISK[i] * radius;
         let uv = in.uv + offset * scale;
         let tap = textureSampleLevel(hdr_tex, hdr_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
-        let coc = max(tap.a, 0.0);
+        let coc = max(tap.a * side, 0.0);
         if (all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0))) {
             sum += tap*coc;
             weight += coc;
         }
     }
     let blurred = sum * clamp(1.0 / (weight + 0.001), 0.0, 1.0);
+    // The far chain blends in its resolve (fs_post): hand it the bokeh.
+    if (!near && intensity >= DOF_CHEAP_BELOW) {
+        return vec4<f32>(select(center.rgb, blurred.rgb, c > 0.0), center.a);
+    }
     // CheapBokehFS: mix(center*(1+a), blurred*a, a) = mix(center, blurred, a*a).
-    let amount = select(0.0, center.a, g.dof.w > 0.0 && center.a > 0.0);
-    return vec4<f32>(mix(center.rgb, blurred.rgb, amount * amount), center.a);
+    return vec4<f32>(mix(center.rgb, blurred.rgb, dof_weight(c, intensity)), center.a);
 }
 
 @group(2) @binding(0) var fx_depth_ms: texture_depth_multisampled_2d;
@@ -2388,11 +2518,27 @@ fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
         let distance = fx_distance(in.uv);
         let far_coc = clamp((distance - (g.dof.x + g.dof.y + 0.5)) / distance, 0.0, 1.0);
         let near_coc = clamp(((g.dof.x - g.dof.y + 0.5) - distance) / distance, 0.0, 1.0);
-        // Native stages: full-resolution far resolve, then near coverage over it.
-        if (g.dof.w > 0.0) {
+        // Native stages: full-resolution far resolve (and the cheap near
+        // pass, fs_dof_v), then the near chain's coverage over it.
+        let scene = c;
+        if (g.dof.w > 0.0 || g.dof.z < DOF_CHEAP_BELOW) {
             c = max(textureSampleLevel(surface_tex, hdr_sampler, in.uv, 0.0).rgb, vec3<f32>(0.0));
         }
-        if (g.dof.z > 0.0) {
+        if (g.dof.w >= DOF_CHEAP_BELOW && far_coc > 0.0) {
+            // DOFResolveFarFS: a 9-tap tent of the bokeh, 2 half-resolution
+            // texels (4 px) apart, over the scene by (1.5 CoC)².
+            let step = vec2<f32>(4.0) / vec2<f32>(textureDimensions(surface_tex));
+            var tent = vec3<f32>(0.0);
+            for (var y = -1; y <= 1; y++) {
+                for (var x = -1; x <= 1; x++) {
+                    let w = select(1.0, 2.0, x == 0) * select(1.0, 2.0, y == 0);
+                    let uv = clamp(in.uv + vec2<f32>(f32(x), f32(y)) * step, vec2<f32>(0.0), vec2<f32>(1.0));
+                    tent += max(textureSampleLevel(surface_tex, hdr_sampler, uv, 0.0).rgb, vec3<f32>(0.0)) * w * 0.0625;
+                }
+            }
+            c = mix(scene, tent, dof_weight(far_coc, g.dof.w));
+        }
+        if (g.dof.z >= DOF_CHEAP_BELOW) {
             // Native resolve (event748): tent-filter RGBA, then max the
             // filtered coverage with current near CoC before squaring weight.
             let step = vec2<f32>(4.0) / vec2<f32>(textureDimensions(hdr_tex));

@@ -148,6 +148,7 @@ const CLAIMERS: &[(&str, &[&str])] = &[
     ("players_chat", &["domains/players_chat"]),
     ("assets_cloud", &["domains/assets_cloud"]),
     ("testing", &["domains/testing"]),
+    ("plugin", &["plugin_host/api"]),
     ("ext", &["runtime_ext", "editable"]),
 ];
 
@@ -650,6 +651,7 @@ fn member_claims() {
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("member_claims.rs");
     std::fs::write(out, code).unwrap();
     println!("cargo:rerun-if-changed=src/domains");
+    println!("cargo:rerun-if-changed=src/plugin_host");
     println!("cargo:rerun-if-changed=src/runtime_ext.rs");
     println!("cargo:rerun-if-changed=src/editable.rs");
 }

@@ -37,6 +37,9 @@ pub struct RepMap {
     arrived: Vec<Ref>,
     /// Client Animator track slots that changed (crate::anim_replicate).
     anim_dirty: Vec<(Ref, usize)>,
+    /// Server parts whose client copy the hand-over buffer moves (play.rs
+    /// `handover_frame`, lane DEATH): their physics moves are not copied over.
+    pub buffered: HashSet<Ref>,
     /// Frame time average (µs) and this frame's replication time.
     frame_ema_us: f64,
     frame_used: Duration,
@@ -517,7 +520,7 @@ fn apply_op(
             client.apply_prop(c, &name, v);
         }
         RepOp::Moved(r) => {
-            if !seen_props.insert((r, "CFrame".into())) {
+            if map.buffered.contains(&r) || !seen_props.insert((r, "CFrame".into())) {
                 return;
             }
             let (Some(c), Some(v)) = (

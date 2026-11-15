@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.1.0"
+version = "0.2.0"
 
 [package]
 name = "rustudio"
@@ -14,6 +14,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 default-run = "rustudio"
+
+[features]
+# `cargo test --features skip-physics-tests`: leaves out physics.rs's test module, which
+# does not compile (mech items the capsule deletion removed), so the other tests can run.
+skip-physics-tests = []
 
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
@@ -47,6 +52,8 @@ toml = "0.9"
 rustc-hash = "2"
 # services domain: HttpService (real HTTP), EncodingService (zstd, hashes)
 ureq = "3"
+# HttpService:CreateWebStreamClient (WebSocket type)
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 zstd = "0.13"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -68,8 +75,9 @@ inherits = "release"
 debug = "line-tables-only"
 
 [target.'cfg(windows)'.dependencies]
-# The Recycle Bin (platform.rs).
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+# The Recycle Bin (platform.rs); thread/process CPU time, cycles and peak
+# memory for --bench / --result (bench.rs, app.rs).
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Finder trash (platform.rs), the app menu and Finder's Open (macos.rs).
@@ -106,3 +114,20 @@ egui_dock = { path = "vendor/egui_dock" }
 # end-first child removal: bulk Destroy / ClearAllChildren without a scan
 # of the parent's child list per child (round 2 perf, bulk).
 rbx_dom_weak = { path = "vendor/rbx_dom_weak" }
+# rapier3d 0.36.1 + CollisionPipeline::contact_recycle_distance (marked
+# rustudio): the Studio solver port (the default; src/solver) runs
+# rapier's collision detection alone and needs its contact recycling to cost
+# what the narrow phase costs inside rapier's own pipeline
+# (checks/humanoid-physics/solver/HARNESS.md "The switch").
+rapier3d = { path = "vendor/rapier3d" }
+
+# Fast rebuilds for test runs by agents and for local iteration: release
+# optimisation, but compiled in many small units that are reused between
+# builds, so a one-file change recompiles only what it touched.
+# Use: cargo build --profile agent   (binary: target/agent/rustudio)
+# Slightly slower at run time than --release; measure performance and build
+# what gets installed with --release.
+[profile.agent]
+inherits = "release"
+incremental = true
+codegen-units = 256

@@ -17,7 +17,7 @@
 use super::*;
 use rp::{GenericJointBuilder, JointAxesMask as Mask, JointAxis as Axis, MotorModel};
 
-const JOINT_CLASSES: [&str; 9] = [
+const JOINT_CLASSES: [&str; 10] = [
     "HingeConstraint",
     "BallSocketConstraint",
     "PrismaticConstraint",
@@ -27,6 +27,8 @@ const JOINT_CLASSES: [&str; 9] = [
     "NoCollisionConstraint",
     "SpringConstraint",
     "TorsionSpringConstraint",
+    // (no rapier joint; tracked for the Studio solver's force items, JOINT I.14)
+    "LineForce",
 ];
 
 pub(super) fn is_joint_constraint(class: &str) -> bool {
@@ -39,6 +41,12 @@ pub(super) struct LiveJoint {
     handle: rp::ImpulseJointHandle,
     bodies: (rp::RigidBodyHandle, rp::RigidBodyHandle),
     sig: Vec<f32>,
+}
+
+impl LiveJoint {
+    pub(super) fn handle(&self) -> rp::ImpulseJointHandle {
+        self.handle
+    }
 }
 
 /// One end of a constraint: its body (None = fixed: the ground body) and
@@ -76,9 +84,11 @@ impl Physics {
 
     /// An attachment's end: its part's body and its frame there.
     fn joint_end(&self, doc: &Document, att: Ref) -> Option<End> {
-        let part = attachment_part(doc, att)?;
+        let part_d = attachment_part(doc, att)?;
         let att_world = crate::attachment::world(doc, att, false)?;
-        let part_doc = xform_of(doc, part)?;
+        let part_doc = xform_of(doc, part_d)?;
+        // (a client-owned mover read from the client document: its part's server copy)
+        let part = self.hums.desc_remap.get(&part_d).copied().unwrap_or(part_d);
         // The attachment in its part's space, from the document (both there).
         let local = pose(&part_doc).inverse() * pose(&att_world);
         let world = pose(&self.part_xform(doc, part).unwrap_or(part_doc)) * local;
@@ -88,9 +98,26 @@ impl Physics {
                 frame: pb.local * local,
                 world,
             }),
+            // A Humanoid's part (its own body, physics_humanoid.rs): the attachment in
+            // that body's frame. (Studio: the character is one assembly like any other;
+            // a mover on it acts on that assembly's body, JOINT I.13 / I.14.)
+            _ if self.studio.is_some() && self.humanoid_body_of(part).is_some() => {
+                let hb = self.humanoid_body_of(part)?;
+                let bp = *self.world.bodies.get(hb)?.position();
+                Some(End { body: Some(hb), frame: bp.inverse() * world, world })
+            }
             // Anchored / not simulated: the ground body, in world space.
             _ => Some(End { body: None, frame: world, world }),
         }
+    }
+
+    /// A part's collider: its own, or its collider on a Humanoid's body.
+    fn collider_of_part(&self, r: Ref) -> Option<rp::ColliderHandle> {
+        if let Some(pb) = self.parts.get(&r) {
+            return Some(pb.collider);
+        }
+        let m = self.hums.of_part.get(&r)?;
+        self.hums.by_model.get(m)?.parts.iter().find(|p| p.part == r).map(|p| p.collider)
     }
 
     /// Creates, updates or drops the joints for the joint constraints.
@@ -100,18 +127,45 @@ impl Physics {
         }
         let Some(ws) = doc.workspace() else { return };
         let cons: Vec<Ref> = self.joint_cons.iter().copied().collect();
-        let mut keep: HashSet<Ref> = HashSet::new();
+        let mut keep: HashSet<Ref> = HashSet::default();
+        let mut no_collide: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
         for r in cons {
             let Some(class) = doc.class_of(r) else {
                 self.joint_cons.remove(&r);
                 continue;
             };
+            // RUSTUDIO_SOLVER=studio: only NoCollisionConstraints are read here; the other
+            // classes are the solver's connectors (studio_constraints, which checks them
+            // itself), so they skip the ancestor walk every frame (CHAR-3, ph_joints).
+            if self.studio.is_some() && class != "NoCollisionConstraint" && is_joint_constraint(&class) {
+                continue;
+            }
             if !is_joint_constraint(&class) || !doc.is_ancestor(ws, r) {
                 self.joint_cons.remove(&r);
                 continue;
             }
-            if matches!(class.as_str(), "SpringConstraint" | "TorsionSpringConstraint") {
+            if matches!(class.as_str(), "SpringConstraint" | "TorsionSpringConstraint" | "LineForce") {
                 continue; // apply_springs
+            }
+            // RUSTUDIO_SOLVER=studio: the constraints are the solver's connectors
+            // (studio_constraints); rapier keeps only NoCollisionConstraint's joint, as
+            // the narrow phase's contact filter.
+            if self.studio.is_some() && class != "NoCollisionConstraint" {
+                continue;
+            }
+            // Studio path: a NoCollisionConstraint removes the contact of its two parts
+            // (ContactStore::no_collide); it is no rapier joint (the collision pipeline
+            // ignores joints).
+            if self.studio.is_some() {
+                if bool_prop(doc, r, "Enabled", true) {
+                    if let Some((p0, p1)) = crate::physics::joint_parts(doc, r) {
+                        if let (Some(c0), Some(c1)) = (self.collider_of_part(p0), self.collider_of_part(p1)) {
+                            let (a, b) = (c0.into_raw_parts().0, c1.into_raw_parts().0);
+                            no_collide.insert((a.min(b), a.max(b)));
+                        }
+                    }
+                }
+                continue;
             }
             if !bool_prop(doc, r, "Enabled", true) {
                 continue;
@@ -143,6 +197,9 @@ impl Physics {
                     self.live_joints.insert(r, LiveJoint { handle, bodies: (b0, b1), sig });
                 }
             }
+        }
+        if let Some(sv) = self.studio.as_mut() {
+            sv.contacts.no_collide = no_collide;
         }
         let gone: Vec<Ref> = self.live_joints.keys().filter(|r| !keep.contains(r)).copied().collect();
         for r in gone {
@@ -316,7 +373,7 @@ impl Physics {
 
     /// SpringConstraint and TorsionSpringConstraint: forces for one substep.
     pub(super) fn apply_springs(&mut self, doc: &Document, _h: f32) {
-        if self.joint_cons.is_empty() {
+        if self.joint_cons.is_empty() || self.studio.is_some() {
             return;
         }
         let springs: Vec<Ref> = self
@@ -408,6 +465,473 @@ impl Physics {
                 }
             }
         }
+    }
+}
+
+/// Studio solver path (RUSTUDIO_SOLVER=studio): the constraint Instances as
+/// Studio's connectors (src/solver/joints, JOINT I). Every frame each tracked
+/// constraint's properties and attachments are read into a `Desc`; the solver keeps
+/// one connector set per Instance (kept impulses survive property changes).
+fn studio_end(e: &End) -> solver_joints::End {
+    let t = e.frame.translation;
+    let r = e.frame.rotation;
+    solver_joints::End {
+        body: e.body,
+        pos: Vec3::new(t.x, t.y, t.z),
+        rot: Mat3::from_quat(Quat::from_xyzw(r.x, r.y, r.z, r.w)),
+        mass: 0.0,
+    }
+}
+
+use crate::solver::joints as solver_joints;
+use solver_joints::instance::Class as SClass;
+
+/// The last frame's connector descriptions (`studio_constraints`' change tracking).
+pub(super) struct SjCache {
+    sig: (u64, usize, usize),
+    refs: Vec<Ref>,
+    known: HashSet<Ref>,
+    descs: Vec<Option<solver_joints::Desc>>,
+    /// Indices read every frame (ends on a Humanoid's body, client-owned movers).
+    volatile: Vec<usize>,
+    /// Constraint / attachment / part → the indices whose description reads it.
+    deps: HashMap<Ref, Vec<u32>>,
+}
+
+impl Physics {
+    pub(super) fn studio_constraints(&mut self, doc: &Document, marks: doc::Marks) {
+        if self.studio.is_none() {
+            return;
+        }
+        let Some(ws) = doc.workspace() else { return };
+        let mut seen: HashSet<Ref> = HashSet::default();
+        let mut refs: Vec<Ref> = self.joint_cons.iter().chain(self.ropes.iter()).chain(self.movers.keys()).copied().filter(|r| seen.insert(*r)).collect();
+        // Connectors are allocated (and keyed: the batch's sort key, DUAL §1 step 5) in
+        // document order, standing in for Studio's creation order: new Instances are
+        // upserted in the order the Workspace lists them.
+        // (A Ref is new when last frame's list did not have it: one with no description
+        // never gets a solver Instance, and testing that made every frame walk the whole
+        // Workspace — the 3.2 M instructions a step of og.rbxl's ph_joints.)
+        let new = match &self.sj_cache {
+            Some(c) => refs.len() > c.known.len() || refs.iter().any(|r| !c.known.contains(r)),
+            None => true,
+        };
+        if new {
+            refs = doc.dom.descendants_of(ws).map(|i| i.referent()).filter(|r| seen.contains(r)).collect();
+            // Constraints outside Workspace (a character's ragdoll sockets kept in a
+            // Model, a destroyed original) are no connectors: forgotten here, or every
+            // frame finds them "new" and walks the Workspace again (round HANG: the
+            // client's world in FtF, 330k instances, every frame it stepped). A tree
+            // mark brings one back if it is ever parented in (`note_other`).
+            if refs.len() < seen.len() {
+                let inside: HashSet<Ref> = refs.iter().copied().collect();
+                self.joint_cons.retain(|r| inside.contains(r));
+                self.ropes.retain(|r| inside.contains(r));
+            }
+        } else if let Some(c) = &self.sj_cache {
+            refs = c.refs.iter().copied().filter(|r| seen.contains(r)).collect();
+        }
+        // Change tracking: a description is read again only when a journal mark touches
+        // the constraint, one of its attachments or their parts; all of them when the set
+        // of constraints, the bodies (dyn_version) or the collider / body counts change,
+        // or the journal was lost. Ends on a Humanoid's body and client-owned movers read
+        // live state: read every frame.
+        let sig = (self.dyn_version, self.world.bodies.len(), self.world.colliders.len());
+        let full = match (&self.sj_cache, &marks) {
+            (Some(c), doc::Marks::Some(_)) => c.sig != sig || new || c.refs != refs,
+            _ => true,
+        };
+        let mut cache = if full { None } else { self.sj_cache.take() };
+        let dirty: Vec<usize> = match (&cache, &marks) {
+            (Some(c), doc::Marks::Some(ms)) => {
+                let mut d: Vec<usize> = c.volatile.clone();
+                for m in ms {
+                    let r = match m {
+                        doc::Mark::Prop(r, _) | doc::Mark::Tree(r) => *r,
+                    };
+                    if let Some(v) = c.deps.get(&r) {
+                        d.extend(v.iter().map(|&i| i as usize));
+                    }
+                }
+                d.sort_unstable();
+                d.dedup();
+                d
+            }
+            _ => Vec::new(),
+        };
+        let mut c = match cache.take() {
+            Some(mut c) => {
+                for &i in &dirty {
+                    let r = c.refs[i];
+                    c.descs[i] = self.studio_desc_of(doc, ws, r);
+                }
+                c
+            }
+            None => {
+                let mut c = SjCache { sig, known: refs.iter().copied().collect(), refs: refs.clone(), descs: Vec::with_capacity(refs.len()), volatile: Vec::new(), deps: HashMap::default() };
+                for (i, &r) in refs.iter().enumerate() {
+                    c.descs.push(self.studio_desc_of(doc, ws, r));
+                    let mut dep = vec![r];
+                    let mut live = self.hums.owned_movers.contains(&r);
+                    let parent = doc.dom.get_by_ref(r).map(|x| x.parent());
+                    for a in [ref_prop(doc, r, "Attachment0"), ref_prop(doc, r, "Attachment1")].into_iter().flatten() {
+                        dep.push(a);
+                        if let Some(p) = attachment_part(doc, a) {
+                            dep.push(p);
+                            live |= self.hums.desc_remap.contains_key(&p) || self.humanoid_body_of(p).is_some();
+                        }
+                    }
+                    if let Some(p) = parent {
+                        dep.push(p);
+                        live |= self.hums.desc_remap.contains_key(&p) || self.humanoid_body_of(p).is_some();
+                    }
+                    if live {
+                        c.volatile.push(i);
+                    }
+                    for d in dep {
+                        c.deps.entry(d).or_default().push(i as u32);
+                    }
+                }
+                c
+            }
+        };
+        let Some(sv) = self.studio.as_mut() else { return };
+        sv.joints.begin_sync();
+        let changed: HashSet<usize> = if full { (0..c.refs.len()).collect() } else { dirty.iter().copied().collect() };
+        for (i, (r, d)) in c.refs.iter().zip(&c.descs).enumerate() {
+            let Some(d) = d else { continue };
+            if changed.contains(&i) {
+                sv.joints.upsert(*r, d);
+            } else {
+                sv.joints.keep(*r);
+            }
+        }
+        sv.joints.end_sync();
+        c.sig = sig;
+        self.sj_cache = Some(c);
+    }
+
+    /// One constraint's description (a client-owned mover: as the client's DataModel has
+    /// it, physics_humanoid.rs `set_owned_movers`, `owned_descs`).
+    fn studio_desc_of(&mut self, doc: &Document, ws: Ref, r: Ref) -> Option<solver_joints::Desc> {
+        if self.hums.owned_movers.contains(&r) {
+            return self.hums.owned_descs.get(&r).cloned();
+        }
+        self.studio_desc(doc, ws, r)
+    }
+
+    /// The part's assembly mass (Studio, the spring arbiter's; JOINT §5):
+    /// the body's for a simulated part, the collider's own for an anchored one.
+    fn studio_mass(&self, doc: &Document, att: Ref) -> f32 {
+        let Some(part) = attachment_part(doc, att) else { return 0.0 };
+        if let Some(b) = self.body_of(part).and_then(|b| self.world.bodies.get(b)) {
+            return b.mass();
+        }
+        self.parts.get(&part).and_then(|pb| self.world.colliders.get(pb.collider)).map_or(0.0, |c| c.mass())
+    }
+
+    pub(super) fn studio_desc(&mut self, doc: &Document, ws: Ref, r: Ref) -> Option<solver_joints::Desc> {
+        let class = doc.class_of(r)?;
+        if !doc.is_ancestor(ws, r) || class == "NoCollisionConstraint" {
+            return None;
+        }
+        let n = |name: &str, d: f32| num(doc, r, name, d);
+        let on = |name: &str| bool_prop(doc, r, name, false);
+        let e = |name: &str, d: u32| enum_u32(doc.prop(r, name)).unwrap_or(d);
+        let v = |name: &str| vec3_of(doc.prop(r, name)).filter(|v| !v.is_nan()).unwrap_or(Vec3::ZERO);
+        let inf = f32::INFINITY;
+        let legacy = class.starts_with("Body") || class == "RocketPropulsion";
+        let mut enabled = legacy || bool_prop(doc, r, "Enabled", true);
+        let a0 = ref_prop(doc, r, "Attachment0");
+        let a1 = ref_prop(doc, r, "Attachment1");
+        // One-attachment classes / modes: B = the world (I.10, I.11, I.12, I.14)
+        let one = match class.as_str() {
+            "AlignPosition" | "AlignOrientation" => e("Mode", 1) == 0,
+            "VectorForce" | "Torque" | "LinearVelocity" => true,
+            "AngularVelocity" => a1.is_none(),
+            _ => false,
+        };
+        let end = |me: &Self, a: Option<Ref>| a.and_then(|a| me.joint_end(doc, a)).map(|x| {
+            let mut s = studio_end(&x);
+            s.mass = a.map_or(0.0, |a| me.studio_mass(doc, a));
+            // [J3] the attachment writers copy the Attachment's own f32 CFrame:
+            // when the attachment sits directly in a part that is its body's frame, take
+            // that matrix as is rather than through the quaternion of `joint_end`
+            if let Some(a) = a {
+                if let Some(f) = me.attachment_frame_f32(doc, a) {
+                    if s.body.is_some() {
+                        s.rot = f.0;
+                        s.pos = f.1;
+                    } else if let Some((pr, pp)) = me.part_frame_f32(doc, a) {
+                        // An anchored part's end is in world space: its f32 CFrame times the
+                        // attachment's (lane STACK: through the quaternion, a −90° attachment's
+                        // cos(π/2) = 6.1e-17 became −1.19e-7 and hinge_limits' Align2Axes row
+                        // got a 2⁻²³ position target at rest; Studio's stays at 1e-17).
+                        s.rot = pr * f.0;
+                        s.pos = pr * f.1 + pp;
+                    }
+                }
+            }
+            s
+        });
+        // A legacy mover acts on its parent part's body (I.15: Inst = the part)
+        let mover_end = || -> Option<solver_joints::End> {
+            let part = doc.dom.get_by_ref(r)?.parent();
+            let part = self.hums.desc_remap.get(&part).copied().unwrap_or(part);
+            let body = self.body_of(part)?;
+            // [J3] the part's frame in its body (slot 78 reads the part's pose, Studio)
+            let (pos, rot) = match self.parts.get(&part) {
+                Some(pb) => {
+                    let t = pb.local.translation;
+                    let q = pb.local.rotation;
+                    (Vec3::new(t.x, t.y, t.z), Mat3::from_quat(Quat::from_xyzw(q.x, q.y, q.z, q.w)))
+                }
+                None => (Vec3::ZERO, Mat3::IDENTITY),
+            };
+            Some(solver_joints::End { body: Some(body), pos, rot, mass: 0.0 })
+        };
+        let ea = if legacy { Some(mover_end().unwrap_or(solver_joints::End::WORLD)) } else { end(self, a0) };
+        let eb = if legacy || one { Some(solver_joints::End::WORLD) } else { end(self, a1) };
+        if ea.is_none() || eb.is_none() {
+            enabled = false;
+        }
+        let (a, b) = (ea.unwrap_or(solver_joints::End::WORLD), eb.unwrap_or(solver_joints::End::WORLD));
+        // both fixed, or one assembly: not in the world (I.16)
+        if !legacy && (a.body.is_none() && b.body.is_none() || a.body.is_some() && a.body == b.body) {
+            enabled = false;
+        }
+        let class = match class.as_str() {
+            "HingeConstraint" => SClass::Hinge {
+                actuator: e("ActuatorType", 0),
+                ang_resp: n("AngularResponsiveness", 45.0),
+                ang_speed: n("AngularSpeed", 0.0),
+                ang_vel: n("AngularVelocity", 0.0),
+                lower: n("LowerAngle", -45.0),
+                upper: n("UpperAngle", 45.0),
+                motor_max_acc: n("MotorMaxAcceleration", inf),
+                motor_max_torque: n("MotorMaxTorque", 0.0),
+                restitution: n("Restitution", 0.0),
+                servo_max_torque: n("ServoMaxTorque", 0.0),
+                target: n("TargetAngle", 0.0),
+                limits: on("LimitsEnabled"),
+            },
+            "BallSocketConstraint" => SClass::BallSocket {
+                max_friction: n("MaxFrictionTorque", 0.0),
+                restitution: n("Restitution", 0.0),
+                twist_lower: n("TwistLowerAngle", -45.0),
+                twist_upper: n("TwistUpperAngle", 45.0),
+                upper: n("UpperAngle", 45.0),
+                limits: on("LimitsEnabled"),
+                twist_limits: on("TwistLimitsEnabled"),
+            },
+            "PrismaticConstraint" | "CylindricalConstraint" | "SlidingBallConstraint" => SClass::Sliding {
+                variant: match class.as_str() {
+                    "PrismaticConstraint" => 0,
+                    "CylindricalConstraint" => 1,
+                    _ => 2,
+                },
+                actuator: e("ActuatorType", 0),
+                lin_resp: n("LinearResponsiveness", 45.0),
+                lower: n("LowerLimit", 0.0),
+                upper: n("UpperLimit", 5.0),
+                motor_max_acc: n("MotorMaxAcceleration", inf),
+                motor_max_force: n("MotorMaxForce", 0.0),
+                restitution: n("Restitution", 0.0),
+                servo_max_force: n("ServoMaxForce", 0.0),
+                speed: n("Speed", 0.0),
+                target: n("TargetPosition", 0.0),
+                velocity: n("Velocity", 0.0),
+                limits: on("LimitsEnabled"),
+                ang: (class == "CylindricalConstraint").then(|| solver_joints::instance::CylAngular {
+                    actuator: e("AngularActuatorType", 0),
+                    resp: n("AngularResponsiveness", 45.0),
+                    restitution: n("AngularRestitution", 0.0),
+                    speed: n("AngularSpeed", 0.0),
+                    velocity: n("AngularVelocity", 0.0),
+                    lower: n("LowerAngle", -45.0),
+                    upper: n("UpperAngle", 45.0),
+                    motor_max_acc: n("MotorMaxAngularAcceleration", inf),
+                    motor_max_torque: n("MotorMaxTorque", 0.0),
+                    servo_max_torque: n("ServoMaxTorque", 0.0),
+                    target: n("TargetAngle", 0.0),
+                    inclination: n("InclinationAngle", 0.0),
+                    limits: on("AngularLimitsEnabled"),
+                }),
+            },
+            "UniversalConstraint" => SClass::Universal { max_angle: n("MaxAngle", 45.0), restitution: n("Restitution", 0.0), limits: on("LimitsEnabled") },
+            "PlaneConstraint" => SClass::Plane,
+            "RodConstraint" => SClass::Rod { length: n("Length", 5.0), limit0: n("LimitAngle0", 90.0), limit1: n("LimitAngle1", 90.0), limits: on("LimitsEnabled") },
+            "RopeConstraint" => SClass::Rope {
+                length: n("Length", 5.0),
+                restitution: n("Restitution", 0.0),
+                winch: on("WinchEnabled"),
+                winch_force: n("WinchForce", 1000.0),
+                winch_resp: n("WinchResponsiveness", 45.0),
+                winch_speed: n("WinchSpeed", 2.0),
+                winch_target: n("WinchTarget", 5.0),
+            },
+            "SpringConstraint" => SClass::Spring {
+                damping: n("Damping", 0.0),
+                free_length: n("FreeLength", 1.0),
+                max_force: n("MaxForce", inf),
+                max_length: n("MaxLength", 5.0),
+                min_length: n("MinLength", 0.0),
+                stiffness: n("Stiffness", 0.0),
+                limits: on("LimitsEnabled"),
+            },
+            "TorsionSpringConstraint" => SClass::Torsion {
+                damping: n("Damping", 0.01),
+                max_angle: n("MaxAngle", 45.0),
+                max_torque: n("MaxTorque", inf),
+                restitution: n("Restitution", 0.0),
+                stiffness: n("Stiffness", 100.0),
+                limits: on("LimitsEnabled"),
+            },
+            "AlignPosition" => SClass::AlignPosition {
+                one_attachment: one,
+                position: v("Position"),
+                magnitude_mode: e("ForceLimitMode", 0) == 0,
+                relative_to: e("ForceRelativeTo", 2) as u8,
+                max_force: n("MaxForce", 10000.0),
+                max_axes_force: v("MaxAxesForce"),
+                max_velocity: n("MaxVelocity", inf),
+                responsiveness: n("Responsiveness", 10.0),
+                at_com: on("ApplyAtCenterOfMass"),
+                reaction: on("ReactionForceEnabled"),
+                rigid: on("RigidityEnabled"),
+            },
+            "AlignOrientation" => {
+                // OneAttachment's goal frame: PrimaryAxis / SecondaryAxis when set, else CFrame
+                let target = match (vec3_of(doc.prop(r, "PrimaryAxis")), vec3_of(doc.prop(r, "SecondaryAxis"))) {
+                    (Some(x), Some(y)) if x.length_squared() > 0.0 && y.length_squared() > 0.0 => {
+                        let x = x.normalize();
+                        let z = x.cross(y).normalize_or_zero();
+                        Mat3::from_cols(x, z.cross(x), z)
+                    }
+                    _ => Mat3::from_quat(rot_prop(doc, r, "CFrame")),
+                };
+                SClass::AlignOrientation {
+                    one_attachment: one,
+                    target,
+                    align_type: e("AlignType", 5),
+                    primary_only: on("PrimaryAxisOnly"),
+                    max_ang_vel: n("MaxAngularVelocity", inf),
+                    max_torque: n("MaxTorque", 10000.0),
+                    responsiveness: n("Responsiveness", 10.0),
+                    reaction: on("ReactionTorqueEnabled"),
+                    rigid: on("RigidityEnabled"),
+                }
+            }
+            "AngularVelocity" => SClass::AngularVelocity { ang_vel: v("AngularVelocity"), max_torque: n("MaxTorque", 0.0), relative_to: e("RelativeTo", 2) as u8, reaction: on("ReactionTorqueEnabled") },
+            "LinearVelocity" => SClass::LinearVelocity {
+                mode: e("VelocityConstraintMode", 2),
+                relative_to: e("RelativeTo", 2),
+                force_limit_mode: e("ForceLimitMode", 0),
+                limits: bool_prop(doc, r, "ForceLimitsEnabled", true),
+                max_force: n("MaxForce", 1000.0),
+                max_axes_force: vec3_of(doc.prop(r, "MaxAxesForce")).unwrap_or(Vec3::splat(1000.0)),
+                vector_velocity: v("VectorVelocity"),
+                line_direction: vec3_of(doc.prop(r, "LineDirection")).unwrap_or(Vec3::X),
+                line_velocity: n("LineVelocity", 0.0),
+                reaction: on("ReactionForceEnabled"),
+                // [J3] Plane mode (wrapper): PlaneVelocity, MaxPlanarAxesForce (Vector2),
+                // Primary / SecondaryTangentAxis
+                plane_velocity: vec2_prop(doc, r, "PlaneVelocity").unwrap_or([0.0, 0.0]),
+                max_planar_axes_force: vec2_prop(doc, r, "MaxPlanarAxesForce").unwrap_or([1000.0, 1000.0]),
+                primary_tangent: vec3_of(doc.prop(r, "PrimaryTangentAxis")).unwrap_or(Vec3::X),
+                secondary_tangent: vec3_of(doc.prop(r, "SecondaryTangentAxis")).unwrap_or(Vec3::Y),
+            },
+            "VectorForce" => SClass::VectorForce { force: v("Force"), relative_to: e("RelativeTo", 0) as u8, at_com: on("ApplyAtCenterOfMass") },
+            "Torque" => SClass::Torque { torque: v("Torque"), relative_to: e("RelativeTo", 0) as u8 },
+            "LineForce" => SClass::LineForce {
+                magnitude: n("Magnitude", 0.0),
+                max_force: n("MaxForce", 0.0),
+                inverse_square: on("InverseSquareLaw"),
+                at_com: on("ApplyAtCenterOfMass"),
+                reaction: on("ReactionForceEnabled"),
+            },
+            // I.15 [J2]: the per-step update (vt slot 78) — BodyVelocity Studio (connector =
+            // Velocity, = clampF(MaxForce)), BodyForce Studio (F = Force, world)
+            "BodyVelocity" => SClass::BodyVelocity { velocity: v("Velocity"), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::splat(4000.0)), p: n("P", 1250.0) },
+            "BodyForce" => SClass::BodyForce { force: v("Force") },
+            // [J3] slot 78: BodyThrust Studio, BodyAngularVelocity Studio, BodyPosition Studio
+            "BodyGyro" => SClass::BodyGyro {
+                cframe: Mat3::from_quat(rot_prop(doc, r, "CFrame")),
+                max_torque: vec3_of(doc.prop(r, "MaxTorque")).unwrap_or(Vec3::new(400000.0, 400000.0, 400000.0)),
+                p: n("P", 3000.0),
+                d: n("D", 500.0),
+            },
+            "BodyThrust" => SClass::BodyThrust { force: v("Force"), location: v("Location") },
+            "BodyAngularVelocity" => SClass::BodyAngularVelocity { ang_vel: vec3_of(doc.prop(r, "AngularVelocity")).unwrap_or(Vec3::new(0.0, 2.0, 0.0)), max_torque: vec3_of(doc.prop(r, "MaxTorque")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 1250.0) },
+            "BodyPosition" => SClass::BodyPosition { position: vec3_of(doc.prop(r, "Position")).unwrap_or(Vec3::new(0.0, 50.0, 0.0)), max_force: vec3_of(doc.prop(r, "MaxForce")).unwrap_or(Vec3::new(4000.0, 4000.0, 4000.0)), p: n("P", 10000.0), d: n("D", 1250.0) },
+            c if c.starts_with("Body") || c == "RocketPropulsion" => {
+                if c == "RocketPropulsion" {
+                    uncovered_once(&UNCOVERED_ROCKET, "RocketPropulsion");
+                }
+                SClass::LegacyMover
+            }
+            _ => return None,
+        };
+        if let SClass::AlignOrientation { align_type: 4, .. } = &class {
+            uncovered_once(&UNCOVERED_LOOKAT, "AlignOrientation with AlignType PrimaryAxisLookAt");
+        }
+        // VectorForce / Torque with RelativeTo Attachment1 read B's frame
+        let b = match &class {
+            SClass::VectorForce { relative_to: 1, .. } | SClass::Torque { relative_to: 1, .. } => end(self, a1).unwrap_or(b),
+            SClass::LineForce { .. } => end(self, a1).unwrap_or(b),
+            SClass::LinearVelocity { relative_to: 1, .. } => end(self, a1).unwrap_or(b),
+            _ => b,
+        };
+        Some(solver_joints::Desc { class, a, b, in_world: enabled })
+    }
+}
+
+static UNCOVERED_ROCKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UNCOVERED_LOOKAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the Studio solver (the default) does not simulate yet but rapier does: said
+/// once per process, so a place that relies on it can be run with the old physics.
+fn uncovered_once(flag: &std::sync::atomic::AtomicBool, what: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "rustudio: {what} is not simulated by the Studio solver yet (it exerts nothing); \
+             run with RUSTUDIO_SOLVER=rapier for the old physics, which does"
+        );
+    }
+}
+
+impl Physics {
+    /// The Attachment's CFrame (part space, f32 rows) when its parent is a part whose
+    /// pose in its body is the identity; `None` otherwise.
+    /// The f32 CFrame of an attachment's part, from the document (row-major orientation).
+    fn part_frame_f32(&self, doc: &Document, att: Ref) -> Option<(Mat3, Vec3)> {
+        let part = doc.dom.get_by_ref(att)?.parent();
+        let Variant::CFrame(cf) = doc.prop(part, "CFrame")? else { return None };
+        let m = cf.orientation;
+        let rot = Mat3::from_cols(Vec3::new(m.x.x, m.y.x, m.z.x), Vec3::new(m.x.y, m.y.y, m.z.y), Vec3::new(m.x.z, m.y.z, m.z.z));
+        Some((rot, Vec3::new(cf.position.x, cf.position.y, cf.position.z)))
+    }
+
+    fn attachment_frame_f32(&self, doc: &Document, att: Ref) -> Option<(Mat3, Vec3)> {
+        let part = doc.dom.get_by_ref(att)?.parent();
+        if !doc::is_a(&doc.dom.get_by_ref(part)?.class, "BasePart") {
+            return None;
+        }
+        let pb = self.parts.get(&part)?;
+        if pb.local.translation != rp::Pose::IDENTITY.translation || pb.local.rotation != rp::Pose::IDENTITY.rotation {
+            return None;
+        }
+        let Variant::CFrame(cf) = doc.prop(att, "CFrame")? else { return None };
+        let m = cf.orientation;
+        let rot = Mat3::from_cols(Vec3::new(m.x.x, m.y.x, m.z.x), Vec3::new(m.x.y, m.y.y, m.z.y), Vec3::new(m.x.z, m.y.z, m.z.z));
+        Some((rot, Vec3::new(cf.position.x, cf.position.y, cf.position.z)))
+    }
+}
+
+fn vec2_prop(doc: &Document, r: Ref, name: &str) -> Option<[f32; 2]> {
+    match doc.prop(r, name)? {
+        Variant::Vector2(v) => Some([v.x, v.y]),
+        _ => None,
     }
 }
 

@@ -161,6 +161,30 @@ pub fn part_mass(d: &Document, r: Ref) -> PMass {
     }
 }
 
+/// The Studio solver's mass record of a part (solver/mass.rs, STEP §5b [L2]): shape code
+/// prim, size, density. None where `part_mass` takes another route (terrain, a worn
+/// accessory's Handle, a character's mesh Head).
+pub fn studio_part_mass(d: &Document, r: Ref) -> Option<crate::solver::mass::PartMass> {
+    use crate::solver::mass;
+    let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
+    if class == "Terrain" || accessory_handle_on_character(d, r) {
+        return None;
+    }
+    let size = v3p(d, r, "Size").unwrap_or(Vec3::ONE);
+    let rho = phys_props(d, r).density;
+    if head_mesh_mass(d, r, &class, size.max(Vec3::splat(0.05)), rho).is_some() {
+        return None;
+    }
+    let code = match shape(d, r, &class) {
+        Shape::Ball => mass::BALL,
+        Shape::Cylinder => mass::CYLINDER,
+        Shape::Block => mass::BLOCK,
+        Shape::Wedge => mass::WEDGE,
+        Shape::CornerWedge => mass::CORNER_WEDGE,
+    };
+    Some(mass::part(code, size, rho))
+}
+
 /// A Humanoid character's MeshPart Head: mass, centre and inertia of its
 /// collision mesh (cached per mesh and size).
 fn head_mesh_mass(d: &Document, r: Ref, class: &str, s: Vec3, rho: f32) -> Option<PMass> {
@@ -798,6 +822,11 @@ pub fn player_owned_roots(doc_id: u64) -> Vec<Ref> {
     OWNERS.with(|o| o.borrow().iter().filter(|((d, _), w)| *d == doc_id && !w.auto && w.player.is_some()).map(|((_, r), _)| *r).collect())
 }
 
+/// The assembly roots a script gave `player` (SetNetworkOwner(player)).
+pub fn player_owned_roots_of(doc_id: u64, player: Ref) -> Vec<Ref> {
+    OWNERS.with(|o| o.borrow().iter().filter(|((d, _), w)| *d == doc_id && !w.auto && w.player == player).map(|((_, r), _)| *r).collect())
+}
+
 /// The assembly roots a script kept on the server with SetNetworkOwner(nil).
 pub fn server_owned_roots(doc_id: u64) -> Vec<Ref> {
     OWNERS.with(|o| o.borrow().iter().filter(|((d, _), w)| *d == doc_id && !w.auto && w.player.is_none()).map(|((_, r), _)| *r).collect())
@@ -856,6 +885,27 @@ fn character_owner(d: &Document, r: Ref) -> Option<Ref> {
         }
     }
     None
+}
+
+/// Whether `r` is in a character whose Humanoid is dead. Studio Play (probe
+/// T14srv_parts, lane DEATH): GetNetworkOwner on the server is nil for every part
+/// of the dead character from the frame its Humanoid dies there (the loose parts
+/// are the server's; the client only shows the server's copy from then on).
+fn in_dead_character(d: &Document, r: Ref) -> bool {
+    let mut m = d.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
+    while let Some(i) = d.dom.get_by_ref(m) {
+        if i.class == "Model" {
+            let dead = i.children().iter().any(|h| {
+                d.dom.get_by_ref(*h).is_some_and(|x| x.class == "Humanoid")
+                    && matches!(d.prop(*h, "Health"), Some(Variant::Float32(x)) if x <= 0.0)
+            });
+            if dead {
+                return true;
+            }
+        }
+        m = i.parent();
+    }
+    false
 }
 
 // ------------------------------------------------------------------ hooks
@@ -1020,6 +1070,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
                     let set = OWNERS.with(|o| o.borrow().get(&(d.id, root)).copied());
                     let owner = match set {
                         Some(o) if !o.auto => o.player,
+                        _ if in_dead_character(d, this) => Ref::none(),
                         _ => character_owner(d, this)
                             .or_else(|| auto_owner(&w, d, root))
                             .unwrap_or_else(Ref::none),

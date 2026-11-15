@@ -827,7 +827,9 @@ end
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
-    if world(lua).is_err() {
+    // No chat session in the edit DataModel (the plugin host's VM): the
+    // channels, commands and TextSources are made by Play.
+    if world(lua).map_or(true, |w| w.mode == RunMode::Edit) {
         return Ok(());
     }
     let f: Option<Function> = lua.globals().get("__rs_pc_step").ok();

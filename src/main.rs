@@ -1,6 +1,13 @@
 //! rustudio: a native Linux editor for Roblox place and model files.
 
 mod grass_stream;
+mod plugin_store;
+mod toolbox;
+mod ui_pointer;
+mod offscreen;
+mod sim_clock;
+mod bytecode_cache;
+mod load_trace;
 mod update;
 mod env_probe;
 mod account_ui;
@@ -28,6 +35,7 @@ mod audio_scene;
 mod audio_capture;
 mod avatar;
 mod bench;
+mod gpu_timing;
 mod bin_dump;
 mod camera;
 mod collision;
@@ -45,7 +53,9 @@ mod file_dialog;
 mod hypr;
 mod game_settings;
 mod studio_settings;
+mod rustudio_settings;
 mod fbx;
+mod fbx_anim;
 mod api;
 mod api_stubs;
 mod client_joints;
@@ -54,7 +64,6 @@ mod fidelity;
 mod telemetry;
 mod gui;
 mod gui_modal;
-mod gui_viewport;
 mod icons;
 mod live_drafts;
 mod layout_store;
@@ -77,9 +86,12 @@ mod mesh;
 mod truss;
 mod mesh_bvh;
 mod physics;
+mod solver;
+mod solver_ticks;
 mod humanoid;
 mod physics_mesh;
 mod play;
+mod plugin_host;
 mod project;
 mod project_config;
 mod project_export;
@@ -98,6 +110,10 @@ mod globals_parity;
 mod sharedtable;
 mod scene;
 mod skin;
+mod cage_rbf;
+mod hsr;
+mod skin_gpu;
+mod highlight;
 mod script_editor;
 mod selftest;
 mod terrain;
@@ -140,6 +156,46 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        or File > Experience Settings (settings)
   --play               start Play (F5) right after loading
   --team-create U P    join the live Team Create server for universe U, place P
+  --no-ui              no rustudio UI: the window (exactly --window WxH) shows the
+                       3D view alone, no menus, ribbon, Explorer, Properties,
+                       Output or status bar (none of them is built). Without
+                       --play: the place in Edit state through the edit camera
+                       (--camera), scene only: grid, selection, gizmos, hover,
+                       view cube and readouts are off (--overlays keeps them).
+                       With --play: the game as a player sees it (ScreenGuis,
+                       cursor, the Esc menu); every key goes to the game, F1–F12
+                       and Escape included (Escape opens the menu and reaches
+                       UserInputService as gameProcessedEvent true); no editor
+                       shortcut (F5, Shift+F5, F8, …) and no --action.
+                       --click/--move/--ldrag/--wheel X,Y are window pixels.
+                       --shots writes one picture per time, FILE-<t>s.png, the
+                       view at the window's size (no FILE-<t>s.view.png; the
+                       .frames.json / .cursor.json beside it as in the editor)
+  --play-only          --no-ui --play
+  --overlays           with --no-ui in Edit state: keep the editor's overlays
+  --headless           no window, no compositor, no display server (no gamescope
+                       or Xvfb needed): frames are drawn offscreen at --window
+                       WxH and read back for shots; 60 frames a second (unpaced
+                       with --bench). Silent unless --audio. With --no-ui or
+                       --play-only only
+  --no-render          --headless with no GPU at all: scripts, physics, sound
+                       state and the harness run, nothing is drawn; --shots
+                       write the log and frame times but no picture. The Output
+                       log is a rendered run's minus the renderer's own lines
+                       (Sky: …)
+  --audio              with --headless / --no-render: play sound (default silent)
+  --fixed-dt DT        deterministic stepping: every frame advances the game by
+                       exactly DT (1/60, 0.0166 or 60hz) and frames run as fast
+                       as the machine allows. Harness times (--key, --luau,
+                       --shots, --seconds), os.clock, tick, os.time, time,
+                       DateTime.now, task.wait, RunService deltas and
+                       FrameTime, tweens, animations, sound positions and
+                       physics all follow the simulated clock; unseeded
+                       math.random / Random.new / BrickColor.Random take seeds
+                       in a fixed order. Not deterministic: when downloaded
+                       assets arrive, table/function addresses in tostring,
+                       GUIDs. tick / os.time / os.date / DateTime.now start at
+                       2026-01-01 00:00 UTC (RUSTUDIO_EPOCH=SECONDS to change)
   --screenshot FILE    draw ~120 frames, save the window as PNG, exit
   --self-test FILE     drive the editor with scripted input, write results, exit
   --shot-after S       with --screenshot: take it S seconds after start
@@ -147,11 +203,26 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        the Output log and frame times with each (FILE-<t>s.png …)
   --from-play          harness times (shots, --luau, --key) count from Play start
   --write-corpus DIR   write the fidelity corpus places (demo, control) and exit
+  --plugin FILE        load this Studio plugin (.lua/.luau/.rbxm/.rbxmx) once the place
+                       is open, as a local plugin (user_<file name>); repeatable
+  --plugins-dir DIR    load every plugin file in DIR, in Studio's order (.lua, .luau,
+                       .rbxm, .rbxmx, each by name)
+  --no-plugins         no plugin loads at all (also RUSTUDIO_NO_PLUGINS=1)
+  --installed-plugin ID:FILE  load FILE as the installed plugin ID (cloud_<ID>)
+  --action plugin-button:TOOLBAR/BUTTON@S, --action plugin-action:ACTIONID@S,
+  --action plugin-menu:CHOICE@S (answers an open PluginMenu:ShowAsync: N, N.M,
+                       an action id or text, or escape)
+                       fire a plugin toolbar button's Click / a PluginAction's
+                       Triggered at S seconds (works with --no-ui)
   --api-coverage OUT [GAPS…]  measure API coverage against app/api-dump.json
                        (RUSTUDIO_GAPS files from real runs add call gaps)
   --dump-scripts PLACE DIR  write every script's source under DIR
   --log FILE           with --screenshot: write the Output lines to FILE
   --key NAME@S[:HOLD]  press a key at S seconds (held HOLD seconds)
+  --shift S:HOLD       hold Shift from S seconds for HOLD seconds
+  --luau server|client FILE@S  run the Luau in FILE on that side of Play at S
+                       seconds (with --play; see --from-play)
+  --action NAME@S      run a Studio menu action by id at S seconds (e.g. panel_output)
   --move X,Y@S         move the pointer to view position X,Y (hover)
   --wheel N@S[:X,Y]    turn the mouse wheel N notches over the 3D view's centre
                        (or at view position X,Y)
@@ -164,6 +235,47 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --camera X,Y,Z,YAW,PITCH  start the editor camera there (degrees)
   --bench FILE         measure frame times (after a 3 s warm-up) for N seconds
                        (default 10) at 1265x900 without vsync, write JSON, exit
+  --seconds N          with --bench: how long to measure; with --no-ui (no
+                       --bench): end the run at N seconds (from Play's start
+                       with --from-play)
+  --result FILE        at the end of a test run, one JSON: why it ended (shots,
+                       seconds, bench, EndTest), exit code, Edit or Play, the
+                       EndTest value, error and warning counts, frame times
+                       (count, mean, p50, p99, max, work), the shots written,
+                       CPU time and peak RSS, and the whole Output log
+  --fail-on-error      exit 1 if the Output has any error line (script errors,
+                       --luau errors, engine errors shown in red)
+                       A server script ends a --no-ui (or --result) run with
+                       game:GetService(\"StudioTestService\"):EndTest(value): Play
+                       stops, --log / --result are written, the process exits
+  --ui-shots DIR       pictures of the ribbon tabs, menus and panels in DIR, exit
+
+tools (no window; each exits when done):
+  --stats PLACE        counts of what is in a place
+  --script PLACE PATTERN  print the scripts whose full name contains PATTERN
+  --fetch-assets DIR ID…  download public assets by id into DIR
+  --install-studio-content  download Studio's built-in content from Roblox's CDN
+  --list-plugins [--json]   the local and installed plugins rustudio would load
+  --install-plugin ID       Get (free) + download a Creator Store plugin; --update-plugin ID
+  --uninstall-plugin ID     remove an installed plugin from rustudio
+  --enable-plugin ID / --disable-plugin ID   (cloud_<n>, user_<file>, asset id or file name)
+  --sync-plugins            read your installed plugins from Roblox
+  --import-studio-plugins [N]  list Studio installs / copy install N's plugins in
+  --search-plugins WORDS    Creator Store plugin search
+  --publish-plugin FILE NAME [--overwrite ID] [--dry-run]  upload a model as a plugin
+  --export-project OUT_DIR PLACE [--lua] [--no-sourcemap] [--containers A,B/C]
+                       write a place out as a Rojo / Argon project folder
+  --sourcemap FOLDER|FILE.project.json [OUT.json] [--include-non-scripts]
+                       write Rojo's sourcemap.json (stdout without OUT)
+  --build OUT.rbxl FOLDER|FILE.project.json  save a project folder as one place
+  --solver-ticks SCENE.json [--out FILE]  step one physics lab scene tick by tick
+                       and print every body's state
+
+physics (environment):
+  RUSTUDIO_SOLVER=studio   Studio's own (legacy) solver: the default when unset
+  RUSTUDIO_SOLVER=rapier   the old physics (rapier), as before the switch; use it
+                       for a place that uses what the Studio solver does not
+                       cover yet (rustudio names the class once when it sees one)
 ";
 
 /// Test runs (--screenshot / --self-test) re-launch themselves inside a headless
@@ -173,10 +285,11 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
 fn rerun_headless() -> Option<i32> {
     use std::os::unix::fs::OpenOptionsExt;
     let argv: Vec<String> = std::env::args().collect();
-    let testing = argv
-        .iter()
-        .any(|a| a == "--screenshot" || a == "--self-test" || a == "--bench" || a == "--ui-shots");
+    let testing = is_test_run(&argv);
+    // (--headless / --no-render need no display at all: src/offscreen.rs)
+    let offscreen = argv.iter().any(|a| a == "--headless" || a == "--no-render");
     if !testing
+        || offscreen
         || std::env::var_os("RUSTUDIO_HEADLESS_CHILD").is_some()
         || std::env::var_os("RUSTUDIO_VISIBLE_TESTS").is_some()
     {
@@ -201,6 +314,7 @@ fn rerun_headless() -> Option<i32> {
     let _ = std::fs::create_dir_all(&tmp);
     let gs_log = tmp.join("gamescope.log");
     let gs_out = std::fs::File::create(&gs_log).ok();
+    load_trace::mark("headless: starting gamescope");
     let mut cmd = std::process::Command::new("gamescope");
     let mut pumps = Vec::new();
     if let Some(f) = gs_out {
@@ -249,6 +363,12 @@ fn rerun_headless() -> Option<i32> {
             }
         }
     }
+    // gamescope exits 0 whatever happened to its client (a panic, or another
+    // agent's `pkill -9 -f gamescopereaper` / loose pkill patterns killing
+    // it), so a run that never wrote its screenshot looked like a success.
+    // A shell inside records rustudio's own exit status (128 + signal when
+    // killed); no status at all means the run was killed from outside.
+    let status_file = tmp.join("status");
     let status = cmd
         .args([
             "--backend",
@@ -262,11 +382,16 @@ fn rerun_headless() -> Option<i32> {
             "-h",
             &h,
             "--",
+            "sh",
+            "-c",
+            "\"$0\" \"$@\"; echo $? > \"$RUSTUDIO_HEADLESS_STATUS\"",
         ])
         .args(&argv)
         .env("RUSTUDIO_HEADLESS_CHILD", "1")
+        .env("RUSTUDIO_HEADLESS_STATUS", &status_file)
         .status()
         .ok(); // no gamescope: fall back to a normal window
+    let inner: Option<i32> = std::fs::read_to_string(&status_file).ok().and_then(|s| s.trim().parse().ok());
     for (fifo, done) in pumps {
         // (A FIFO rustudio never opened: open its write end so the copier's
         // open returns, then let it see the end.)
@@ -281,12 +406,31 @@ fn rerun_headless() -> Option<i32> {
     let gs_text = std::fs::read_to_string(&gs_log).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&tmp);
     let status = status?;
+    let code = match (inner, status.code()) {
+        (Some(0), _) => 0,
+        (Some(c), _) if c > 128 => {
+            eprintln!("rustudio: the test run was killed by signal {} (inside the headless gamescope)", c - 128);
+            c
+        }
+        (Some(c), _) => c,
+        (None, Some(_)) => {
+            eprintln!(
+                "rustudio: the test run inside the headless gamescope ended without an exit status \
+                 (killed from outside, e.g. a pkill of gamescope / gamescopereaper)"
+            );
+            1
+        }
+        (None, None) => {
+            eprintln!("rustudio: the headless gamescope was killed by a signal before the test run finished");
+            1
+        }
+    };
     // A failed run shows gamescope's lines after all (it may never have
     // started rustudio).
-    if !status.success() && !gs_text.is_empty() {
+    if code != 0 && !gs_text.is_empty() {
         eprintln!("gamescope output:\n{gs_text}");
     }
-    Some(status.code().unwrap_or(1))
+    Some(code)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -317,6 +461,14 @@ fn restore_parent_fds() {
 #[cfg(not(target_os = "linux"))]
 fn restore_parent_fds() {}
 
+/// A harness run that ends by itself (pictures, a self-test, a benchmark,
+/// a CI result, or a --no-ui run with --seconds): no window on screen.
+fn is_test_run(argv: &[String]) -> bool {
+    let has = |f: &str| argv.iter().any(|a| a == f);
+    ["--screenshot", "--self-test", "--bench", "--ui-shots", "--result", "--fail-on-error"].iter().any(|f| has(f))
+        || ((has("--no-ui") || has("--play-only")) && has("--seconds"))
+}
+
 fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
     let i = argv.iter().position(|a| a == "--window")?;
     let (w, h) = argv.get(i + 1)?.split_once('x')?;
@@ -324,7 +476,21 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Headless runs are silent unless --audio (before any thread starts).
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        let headless = argv.iter().any(|a| a == "--headless" || a == "--no-render");
+        if headless && !argv.iter().any(|a| a == "--audio") && std::env::var_os("RUSTUDIO_NO_AUDIO").is_none() {
+            std::env::set_var("RUSTUDIO_NO_AUDIO", "1");
+        }
+        // (lsfg-vk's frame generation layer, when installed, only adds
+        // errors about its own config to a run that presents nothing.)
+        if headless && std::env::var_os("DISABLE_LSFGVK").is_none() {
+            std::env::set_var("DISABLE_LSFGVK", "1");
+        }
+    }
     restore_parent_fds();
+    load_trace::init();
     // First: a panic or fatal signal from here on leaves a report.
     crash::install();
     // RUSTUDIO_CRASH_TEST=panic|segv|thread: check the reports themselves.
@@ -350,6 +516,16 @@ fn main() -> eframe::Result<()> {
     if let Some(p) = std::env::var("RUSTUDIO_PLACE_CONTEXT").ok().and_then(|v| v.parse().ok()) {
         rustudio_account::session::set_place_context(p);
     }
+    // Plugin store commands (src/plugin_store/cli.rs), no window.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(code) = plugin_store::cli::run(&argv) {
+            std::process::exit(code);
+        }
+        if let Some(code) = toolbox::cli::run(&argv) {
+            std::process::exit(code);
+        }
+    }
     // `--install-studio-content`: download Studio's built-in content from
     // Roblox's CDN into ~/.local/share/rustudio/studio, then exit.
     if std::env::args().any(|a| a == "--install-studio-content") {
@@ -370,6 +546,19 @@ fn main() -> eframe::Result<()> {
             Err(e) => {
                 eprintln!("write-corpus: {e}");
                 std::process::exit(1);
+            }
+        }
+    }
+    // `--solver-ticks SCENE.json [--out FILE]`: one compiled physics scene
+    // stepped tick by tick, every body's state printed (src/solver_ticks.rs).
+    if let Some(i) = argv.iter().position(|a| a == "--solver-ticks") {
+        let scene = argv.get(i + 1).cloned().unwrap_or_default();
+        let out = argv.iter().position(|a| a == "--out").and_then(|j| argv.get(j + 1)).map(|s| s.as_str());
+        match solver_ticks::run(&scene, out) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("solver-ticks: {e}");
+                std::process::exit(2);
             }
         }
     }
@@ -473,8 +662,7 @@ fn main() -> eframe::Result<()> {
     }
     // First launch without a Studio install: fetch Studio's built-in content
     // in the background (never in test runs, which must be reproducible).
-    let test_run = std::env::args()
-        .any(|a| matches!(a.as_str(), "--screenshot" | "--self-test" | "--bench" | "--ui-shots"));
+    let test_run = is_test_run(&std::env::args().collect::<Vec<_>>());
     if !test_run {
         studio_content::spawn_background_install_if_missing();
     }
@@ -497,6 +685,18 @@ fn main() -> eframe::Result<()> {
     let mut roblox_picker: Option<cloud_ui::PickerTab> = None;
     let mut roblox_settings = false;
     let mut local_copy = false;
+    let mut no_ui = false;
+    let mut overlays = false;
+    let mut headless = false;
+    let mut no_render = false;
+    let mut seconds_given = false;
+    let mut fixed_dt: Option<f64> = None;
+    let mut fail_on_error = false;
+    let mut result: Option<PathBuf> = None;
+    let mut plugin_files: Vec<PathBuf> = Vec::new();
+    let mut installed_plugins: Vec<(u64, PathBuf)> = Vec::new();
+    let mut plugin_dirs: Vec<PathBuf> = Vec::new();
+    let mut no_plugins = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -606,7 +806,33 @@ fn main() -> eframe::Result<()> {
             "--window" => {
                 args.next();
             }
-            "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()).unwrap_or(seconds),
+            "--seconds" => {
+                seconds = args.next().and_then(|s| s.parse().ok()).unwrap_or(seconds);
+                seconds_given = true;
+            }
+            "--fail-on-error" => fail_on_error = true,
+            "--fixed-dt" => {
+                let v = args.next().unwrap_or_default();
+                match sim_clock::parse_dt(&v) {
+                    Some(dt) => fixed_dt = Some(dt),
+                    None => {
+                        eprintln!("--fixed-dt: can't read {v:?} (1/60, 0.0166 or 60hz)");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--result" => result = args.next().map(PathBuf::from),
+            "--plugin" => plugin_files.extend(args.next().map(PathBuf::from)),
+            // An installed (Creator Store) plugin: ASSETID:FILE, named cloud_<id>.
+            "--installed-plugin" => {
+                if let Some((id, f)) = args.next().as_deref().and_then(|v| v.split_once(':')) {
+                    if let Ok(id) = id.parse() {
+                        installed_plugins.push((id, PathBuf::from(f)));
+                    }
+                }
+            }
+            "--plugins-dir" => plugin_dirs.extend(args.next().map(PathBuf::from)),
+            "--no-plugins" => no_plugins = true,
             "--self-test" => selftest = args.next().map(PathBuf::from),
             "--ui-shots" => ui_shots = args.next().map(PathBuf::from),
             "--stats" => {
@@ -738,6 +964,19 @@ fn main() -> eframe::Result<()> {
             }
             "--demo" => demo = true,
             "--play" => start_play = true,
+            "--no-ui" => no_ui = true,
+            "--play-only" => {
+                no_ui = true;
+                start_play = true;
+            }
+            "--overlays" => overlays = true,
+            "--headless" => headless = true,
+            "--no-render" => {
+                headless = true;
+                no_render = true;
+            }
+            // (read at the start of main)
+            "--audio" => {}
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -749,17 +988,30 @@ fn main() -> eframe::Result<()> {
             _ => open = Some(PathBuf::from(a)),
         }
     }
+    if headless && !no_ui {
+        eprintln!("--headless / --no-render: only with --no-ui (or --play-only); the editor's own UI needs a window");
+        std::process::exit(2);
+    }
+    if no_ui && (selftest.is_some() || ui_shots.is_some()) {
+        eprintln!("--no-ui: --self-test and --ui-shots drive the editor's UI; run them without --no-ui");
+        std::process::exit(2);
+    }
     // The screenshot shows the editor with something in it to look at.
     if screenshot.is_some() && open.is_none() {
         demo = true;
     }
 
+    // --fixed-dt: simulated clocks from here (src/sim_clock.rs).
+    if let Some(dt) = fixed_dt {
+        sim_clock::enable(dt);
+    }
     let harness = app::Harness {
         shot_after,
         log_out,
         actions,
         pointer: None,
-        started: std::time::Instant::now(),
+        started: sim_clock::now(),
+        held: 0.0,
         screenshot,
         selftest: selftest.map(selftest::SelfTest::new),
         ui_shots: ui_shots.map(ui_shots::UiShots::new),
@@ -772,6 +1024,7 @@ fn main() -> eframe::Result<()> {
         shot_lines: Vec::new(),
         from_play,
         play_started: None,
+        play_game_time: None,
         frame_ms: Vec::new(),
         last_frame: None,
         open_roblox: open_roblox.map(|p| (p, local_copy)),
@@ -779,6 +1032,23 @@ fn main() -> eframe::Result<()> {
         roblox_picker,
         roblox_settings,
         ui_due: Vec::new(),
+        no_ui,
+        overlays,
+        no_render,
+        // (--seconds ends a --no-ui run; with --bench it is the measuring time)
+        end_after: (no_ui && seconds_given && bench.is_none()).then_some(seconds),
+        fail_on_error,
+        result,
+        plugin_files,
+        installed_plugins,
+        plugin_dirs,
+        no_plugins,
+        plugins_started: false,
+        end_value: None,
+        run_frames: Vec::new(),
+        run_last: None,
+        run_playing: false,
+        finished: false,
         bench: bench.map(|out| {
             let label = open
                 .as_ref()
@@ -788,7 +1058,8 @@ fn main() -> eframe::Result<()> {
         }),
     };
     // No vsync when measuring, so frame times show the real cost.
-    let bench_mode = harness.bench.is_some() || harness.selftest.is_some();
+    // (--fixed-dt: as fast as the machine allows)
+    let bench_mode = harness.bench.is_some() || harness.selftest.is_some() || sim_clock::on();
     let argv: Vec<String> = std::env::args().collect();
     let size = match window_arg(&argv) {
         Some((w, h)) => [w as f32, h as f32],
@@ -800,8 +1071,11 @@ fn main() -> eframe::Result<()> {
     };
     // Studio Settings: the user's for plain runs (src/studio_settings.rs).
     studio_settings::init(layout_store::enabled(&harness));
+    // rustudio's own options: likewise only for runs a person drives, never
+    // under RUSTUDIO_DETERMINISTIC (src/rustudio_settings.rs).
+    rustudio_settings::init(layout_store::enabled(&harness));
     // The saved window (src/layout_store.rs), for plain interactive runs.
-    let saved_layout = layout_store::enabled(&harness).then(layout_store::load).flatten();
+    let saved_layout = (!harness.no_ui && layout_store::enabled(&harness)).then(layout_store::load).flatten();
     let icon = egui::IconData {
         rgba: icons::logo_rgba(64),
         width: 64,
@@ -811,8 +1085,18 @@ fn main() -> eframe::Result<()> {
         .with_title("rustudio")
         .with_app_id("rustudio")
         .with_inner_size(size)
-        .with_min_inner_size([900.0, 560.0])
         .with_icon(icon);
+    // (--no-ui: any size, the view is the whole window)
+    if !harness.no_ui {
+        viewport = viewport.with_min_inner_size([900.0, 560.0]);
+    }
+    // A test run gets the size it asked for even on a smaller desktop
+    // (eframe clamps the first size to the monitor: an 800x600 session
+    // desktop made `--window 1024x768` an 800x600 editor, its docked
+    // widgets too short for the checks).
+    if cfg!(windows) && is_test_run(&argv) {
+        viewport = viewport.with_clamp_size_to_monitor_size(false);
+    }
     if let Some(l) = &saved_layout {
         viewport = l.window_builder(viewport);
     }
@@ -822,34 +1106,58 @@ fn main() -> eframe::Result<()> {
     if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
         viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
+    let wgpu_options = egui_wgpu::WgpuConfiguration {
+        wgpu_setup: {
+            let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            let descriptor = setup.device_descriptor.clone();
+            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+                let mut d = descriptor(adapter);
+                d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // Studio HBAO writes its full-resolution R8 visibility UAV.
+                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+                // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
+                d.required_features |= gpu_timing::features(adapter.features());
+                // GPU memory in blocks sized for memory use (8-64 MB), not
+                // wgpu's default 128-256 MB device blocks: the allocator keeps
+                // its last empty block, so a 1440 island settled 2.18-2.19 GB
+                // with them and 1.79-1.81 GB with these, with the same frame
+                // instructions, GPU time and texture load time (RX 9070,
+                // Vulkan; Windows RTX 3070: 1.83-2.09 -> 1.58-1.61 GB).
+                // RUSTUDIO_GPU_MEMORY=performance: wgpu's default blocks.
+                if std::env::var("RUSTUDIO_GPU_MEMORY").ok().as_deref() != Some("performance") {
+                    d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
+                }
+                d
+            });
+            egui_wgpu::WgpuSetup::CreateNew(setup)
+        },
+        surface: egui_wgpu::SurfaceConfig {
+            // No vsync when measuring or driven for captures: a shot waits
+            // for a few frames after each camera move.
+            present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
+                egui_wgpu::wgpu::PresentMode::AutoNoVsync
+            } else {
+                egui_wgpu::wgpu::PresentMode::AutoVsync
+            },
+            ..egui_wgpu::SurfaceConfig::LOW_LATENCY
+        },
+        ..Default::default()
+    };
+    // --headless / --no-render: no window at all (src/offscreen.rs).
+    if headless {
+        let px = [size[0].round() as u32, size[1].round() as u32];
+        let code = offscreen::run(
+            wgpu_options,
+            offscreen::Options { size: px, render: !no_render, paced: !bench_mode },
+            move |ctx, rs| app::RustudioApp::new_in(ctx, rs, None, open, harness, demo),
+        );
+        crate::telemetry::flush();
+        std::process::exit(code.max(app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport,
-        wgpu_options: egui_wgpu::WgpuConfiguration {
-            wgpu_setup: {
-                let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-                let descriptor = setup.device_descriptor.clone();
-                setup.device_descriptor = std::sync::Arc::new(move |adapter| {
-                    let mut d = descriptor(adapter);
-                    d.required_limits.max_sampled_textures_per_shader_stage = 24;
-                    // Storage writes to R8 targets need the adapter-specific format features.
-                    d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-                    d
-                });
-                egui_wgpu::WgpuSetup::CreateNew(setup)
-            },
-            surface: egui_wgpu::SurfaceConfig {
-                // No vsync when measuring or driven for captures: a shot waits
-                // for a few frames after each camera move.
-                present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
-                    egui_wgpu::wgpu::PresentMode::AutoNoVsync
-                } else {
-                    egui_wgpu::wgpu::PresentMode::AutoVsync
-                },
-                ..egui_wgpu::SurfaceConfig::LOW_LATENCY
-            },
-            ..Default::default()
-        },
+        wgpu_options: wgpu_options.clone(),
         // macOS: rustudio sets the app menu itself (macos.rs).
         #[cfg(target_os = "macos")]
         event_loop_builder: Some(Box::new(|b| {
@@ -861,7 +1169,7 @@ fn main() -> eframe::Result<()> {
     // Files opened from Finder arrive as Apple Events, not argv.
     #[cfg(target_os = "macos")]
     macos::install_open_handler();
-    eframe::run_native(
+    let r = eframe::run_native(
         "rustudio",
         options,
         Box::new(move |cc| {
@@ -872,5 +1180,12 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app::RustudioApp::new(cc, open, harness, demo)))
         }),
-    )
+    );
+    // --fail-on-error (app::Editor::finish_run); a windowed test run's exit
+    // status reaches the caller through the headless wrapper's status file.
+    let code = app::EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    r
 }

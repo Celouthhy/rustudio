@@ -489,7 +489,24 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     g.set(
         "is_client",
-        lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| w.side == Side::Client)))?,
+        // (the edit DataModel's plugins see the edit viewport as a client
+        // does its view: src/plugin_host/widgets_ui.rs feeds its input)
+        lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| w.side == Side::Client || w.mode == RunMode::Edit)))?,
+    )?;
+    g.set(
+        "is_edit",
+        lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| w.mode == RunMode::Edit)))?,
+    )?;
+    // A handle adornment is under the mouse or held: the edit viewport's
+    // selection tools leave the press to it (Studio's priority).
+    g.set(
+        "set_adorn_hot",
+        lua.create_function(|_, (on, handles): (bool, Option<bool>)| {
+            let mut s = crate::gui::share();
+            s.adorn_hot = on;
+            s.adorn_handles = on && handles.unwrap_or(false);
+            Ok(())
+        })?,
     )?;
     g.set(
         "playing",
@@ -900,6 +917,17 @@ pub fn engine_message(rt: &Runtime, inst: Ref, player: Ref, args: &[Xfer], map: 
         }
     }
     rt.dispatch();
+}
+
+/// Fires the focus changes queued so far (FocusLost of a box a press left)
+/// before the GUI events of the same frame are fired.
+pub fn focus_now(lua: &Lua) {
+    if crate::gui::share().focus_events.is_empty() {
+        return;
+    }
+    if let Ok(f) = module(lua).and_then(|m| m.get::<Function>("focus_now")) {
+        let _ = f.call::<()>(());
+    }
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {

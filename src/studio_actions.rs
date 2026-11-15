@@ -83,9 +83,12 @@ impl Editor {
             "live_collaborators" | "invite_collaborators" => (true,None),
             "avatar_settings" => (true, open("Avatar Settings")),
             "terrain_editor" => (true, open("Terrain Editor")),
+            "toolbox" => (true, open("Toolbox")),
+            a if a.starts_with("toolbox:") => (true, None),
             "character" => (edit, Some(self.chars.open)),
             a if a.starts_with("character:") => (edit, None),
             "about" | "exit" | "studio_settings" => (true, None),
+            "customize_shortcuts" => (true, Some(self.plugin_bar.shortcuts.open)),
             a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") => (true, None),
             "undo" => (edit && self.doc.can_undo().is_some(), None),
             "redo" => (edit && self.doc.can_redo().is_some(), None),
@@ -129,6 +132,10 @@ impl Editor {
             "reset_layout" => (true, None),
             "dock_all" => (!self.ui.popped.is_empty(), None),
             "documentation" | "tutorials" | "developer_forum" => (true, None),
+            "manage_plugins" => (true, Some(self.plugin_store.ui.open)),
+            a if a.starts_with("manage_plugins:") => (true, None),
+            "plugins_folder" => (true, None),
+            "save_local_plugin" | "publish_plugin" => (edit && sel, None),
             "command_bar" => (false, Some(false)),
             // Ribbon-only actions.
             "transform" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => (true, None),
@@ -231,8 +238,11 @@ impl Editor {
             "experience_settings" => self.cloud.settings_open = true,
             "avatar_settings" => self.ui.panel_requests.push((Tab::AvatarSettings, None)),
             "terrain_editor" => self.ui.panel_requests.push((Tab::TerrainEditor, None)),
+            "toolbox" => self.ui.panel_requests.push((Tab::Toolbox, None)),
+            a if a.starts_with("toolbox:") => self.toolbox_action(a),
             "about" => self.ui.about = true,
             "studio_settings" => self.ui.studio_settings.open = true,
+            "customize_shortcuts" => self.plugin_bar.shortcuts.open = true,
             // Harness: open on a page ("studio_settings:Physics"), or filling
             // the window like the Vinegar captures ("studio_settings_fill:…").
             a if a.starts_with("studio_settings:") => self.ui.studio_settings.open_at(&a["studio_settings:".len()..], false),
@@ -323,7 +333,16 @@ impl Editor {
             "test" => self.start_run(RunType::Test),
             "test_here" => self.start_run(RunType::TestHere),
             "run" => self.start_run(RunType::Run),
-            "toggle_client_server" => self.play_shows_client = !self.play_shows_client,
+            // Studio's Client / Server button: the other side of the running
+            // Play in front (Explorer, viewport, the plugins' toolbars and
+            // widgets); each Play still starts on the client.
+            "toggle_client_server" => {
+                let side = match self.play.as_ref().map(|p| p.showing) {
+                    Some(crate::runtime::Side::Client) => crate::runtime::Side::Server,
+                    _ => crate::runtime::Side::Client,
+                };
+                self.show_play_side(side);
+            }
             "stop" => self.stop_play(),
             "panel_properties" => self.ui.panel_requests.push((Tab::Properties, None)),
             "panel_explorer" => self.ui.panel_requests.push((Tab::Explorer, None)),
@@ -340,6 +359,28 @@ impl Editor {
             "documentation" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs")),
             "tutorials" => ctx.open_url(egui::OpenUrl::new_tab("https://create.roblox.com/docs/tutorials")),
             "developer_forum" => ctx.open_url(egui::OpenUrl::new_tab("https://devforum.roblox.com")),
+            "manage_plugins" => self.plugin_store.ui.open = !self.plugin_store.ui.open,
+            // Harness: Manage Plugins on a page ("manage_plugins:find:WORDS",
+            // "manage_plugins:perms:ID").
+            a if a.starts_with("manage_plugins:") => {
+                self.plugin_store.ui.open = true;
+                let rest = &a["manage_plugins:".len()..];
+                if let Some(q) = rest.strip_prefix("find:") {
+                    self.plugin_store.ui.find = true;
+                    self.plugin_store.ui.query = q.to_string();
+                    let client = self.account.shared_client();
+                    self.plugin_store.search(client, q.to_string());
+                } else if let Some(id) = rest.strip_prefix("perms:") {
+                    self.plugin_store.ui.perms_page = Some(id.to_string());
+                } else if let Some((on, id)) = rest.strip_prefix("enable:").map(|i| (true, i)).or_else(|| rest.strip_prefix("disable:").map(|i| (false, i))) {
+                    // The Enabled switch on a plugin's card.
+                    let client = self.account.shared_client();
+                    self.plugin_store.set_enabled(client, id, on);
+                }
+            }
+            "plugins_folder" => crate::plugin_store::ui::open_plugins_folder(&mut self.plugin_store),
+            "save_local_plugin" => self.save_local_plugin(),
+            "publish_plugin" => self.publish_as_plugin(),
             "transform" => self.tool = self.tool.toggle(Tool::Transform),
             "tool_select" => self.tool = self.tool.toggle(Tool::Select),
             "tool_move" => self.tool = self.tool.toggle(Tool::Move),
@@ -394,6 +435,64 @@ impl Editor {
         }
     }
 
+    /// Plugins > Save as Local Plugin: the selection as a model file in the
+    /// local Plugins folder, named after the first selected object, then
+    /// loaded at once (Studio).
+    pub fn save_local_plugin(&mut self) {
+        if self.doc.selection.is_empty() {
+            self.warn("Select the plugin's objects in the Explorer first");
+            return;
+        }
+        let name = self.doc.dom.get_by_ref(self.doc.selection[0]).map(|i| i.name.to_string()).unwrap_or_else(|| "Plugin".into());
+        let _ = self.plugin_store.store.ensure_plugins_dir();
+        let default = self.plugin_store.store.local_save_path(&name, "rbxmx");
+        if std::env::var_os("RUSTUDIO_NO_DIALOGS").is_some() {
+            self.save_local_plugin_to(default);
+            return;
+        }
+        use crate::file_dialog::{Kind, Purpose};
+        let d = rfd::AsyncFileDialog::new()
+            .add_filter("Roblox model", &["rbxmx", "rbxm"])
+            .set_directory(&self.plugin_store.store.plugins_dir)
+            .set_file_name(default.file_name().unwrap().to_string_lossy());
+        self.dialogs.start(Purpose::SaveLocalPlugin(self.doc.selection.clone()), d, Kind::SaveFile);
+    }
+
+    /// Writes the selection to `path` as a local plugin and loads it.
+    pub fn save_local_plugin_to(&mut self, path: std::path::PathBuf) {
+        let sel = self.doc.selection.clone();
+        let xml = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rbxmx"));
+        let bytes = match self.doc.encode(&self.doc.top_level(&sel), xml) {
+            Ok(b) => b,
+            Err(e) => return self.error(format!("Save as Local Plugin: {e}")),
+        };
+        if let Err(e) = self.plugin_store.save_local(&path, &bytes) {
+            self.error(format!("Save as Local Plugin: {e}"));
+        }
+    }
+
+    /// Plugins > Publish as Plugin: the confirm dialog (name, description,
+    /// creator; new plugin or overwrite one the account owns), then the
+    /// upload through the session.
+    pub fn publish_as_plugin(&mut self) {
+        if self.doc.selection.is_empty() {
+            self.warn("Select the plugin's objects in the Explorer first");
+            return;
+        }
+        if !self.account.signed_in() {
+            self.warn("Sign in to publish a plugin (File > Account)");
+            return;
+        }
+        let sel = self.doc.top_level(&self.doc.selection.clone());
+        let rbxm = match self.doc.encode(&sel, false) {
+            Ok(b) => b,
+            Err(e) => return self.error(format!("Publish as Plugin: {e}")),
+        };
+        let name = self.doc.dom.get_by_ref(sel[0]).map(|i| i.name.to_string()).unwrap_or_default();
+        let creator = self.account.shared_client().and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.who()))).unwrap_or_default();
+        self.plugin_store.ui.publish = Some(crate::plugin_store::ui::PublishDialog { name, description: String::new(), creator, overwrite: String::new(), rbxm, error: None });
+    }
+
     /// Starts the selected kind of test session (Studio's Play button).
     pub fn start_run(&mut self, t: RunType) {
         use crate::runtime::RunMode;
@@ -431,6 +530,10 @@ impl Editor {
             for (title, items) in MENUS {
                 let r = ui.menu_button(*title, |ui| {
                     self.menu_items(ui, items, &mut chosen);
+                    if *title == "Plugins" {
+                        // One submenu per plugin toolbar (src/plugin_host/ui_ribbon.rs).
+                        self.plugins_menu_toolbars(ui);
+                    }
                 });
                 self.ui_rects.insert(menu_rect_key(title), r.response.rect);
             }
@@ -528,6 +631,7 @@ impl Editor {
         }
         self.ui.studio_settings.ui(ctx);
         crate::studio_settings::tick();
+        crate::rustudio_settings::tick();
     }
 
     /// File > About rustudio.

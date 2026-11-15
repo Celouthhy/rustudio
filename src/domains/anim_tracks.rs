@@ -189,7 +189,16 @@ fn load(lua: &Lua, id: &str) -> mlua::Result<(Option<Rc<Seq>>, bool)> {
         return Ok((Some(s.clone()), false));
     }
     let f: Function = lua.globals().get("__rs_anim_load")?;
-    let (seq, still): (Value, bool) = f.call(id)?;
+    let (mut seq, mut still): (Value, bool) = f.call(id)?;
+    // RUSTUDIO_DETERMINISTIC=1 (test runs): wait for the asset (it arrives on a background
+    // thread at wall-clock time), so a track starts on the same frame on every run.
+    if rbx_dom_weak::deterministic() {
+        let t0 = std::time::Instant::now();
+        while still && matches!(seq, Value::Nil) && t0.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            (seq, still) = f.call(id)?;
+        }
+    }
     let Value::Table(t) = seq else { return Ok((None, still)) };
     let s = Rc::new(convert(lua, &t)?);
     tracks(lua).seqs.insert(id.to_string(), s.clone());
@@ -537,7 +546,23 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<bool> {
     }
     let rig = st.rig;
     drop(t);
-    Ok(world(lua)?.d().dom.get_by_ref(rig).is_some_and(|i| i.parent().is_some()))
+    let w = world(lua)?;
+    let d = w.d();
+    if !d.dom.get_by_ref(rig).is_some_and(|i| i.parent().is_some()) {
+        return Ok(false);
+    }
+    // In a ViewportFrame a track poses its rig only under a WorldModel
+    // (Studio 0.747: a rig directly under the frame stays in its rest pose;
+    // checks/viewport-frame-render/studio).
+    let mut cur = rig;
+    while let Some(i) = d.dom.get_by_ref(cur) {
+        match i.class.as_str() {
+            "WorldModel" => break,
+            "ViewportFrame" => return Ok(false),
+            _ => cur = i.parent(),
+        }
+    }
+    Ok(true)
 }
 
 /// Workspace.Retargeting on (Studio's Workspace check Studio): Enabled,
@@ -629,6 +654,19 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
             e.1 = i.referent();
         } else {
             out.push((name, i.referent()));
+        }
+    }
+    // Bones are animated by their own name (a skinned rig's poses name its
+    // Bones); a joint already posed through a Motor6D's Part1 keeps that.
+    let joints = out.len();
+    for i in d.dom.descendants_of(rig) {
+        if i.class != "Bone" || out[..joints].iter().any(|e| e.0 == i.name) {
+            continue;
+        }
+        if let Some(e) = out[joints..].iter_mut().find(|e| e.0 == i.name) {
+            e.1 = i.referent();
+        } else {
+            out.push((i.name.clone(), i.referent()));
         }
     }
     Ok(out)

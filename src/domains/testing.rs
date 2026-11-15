@@ -153,6 +153,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("StepOver", "DebuggerManager"),
     // Studio side
     ("GetSyncState", "LiveSyncService"),
+    ("GetUserId", "StudioService"),
     ("BindToClose", "PluginGui"),
 ];
 

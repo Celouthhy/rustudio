@@ -145,7 +145,8 @@ pub fn install_vector3(lua: &Lua) -> LResult<()> {
         getters.raw_set(n, get(|v| Value::Number(v.length() as f64))?)?;
     }
     for n in ["Unit", "unit"] {
-        getters.raw_set(n, get(|v| LVector3(v.normalize_or_zero()).into_value())?)?;
+        // Studio: the zero vector's Unit is NaN, NaN, NaN (not zero).
+        getters.raw_set(n, get(|v| LVector3(if v == Vec3::ZERO { Vec3::splat(f32::NAN) } else { v / v.length() }).into_value())?)?;
     }
     let methods = lua.create_table()?;
     macro_rules! method {
@@ -191,8 +192,16 @@ impl UserData for LVector2 {
         for (name, i) in [("X", 0), ("Y", 1), ("x", 0), ("y", 1)] {
             f.add_field_method_get(name, move |_, this| Ok(this.0[i] as f64));
         }
-        f.add_field_method_get("Magnitude", |_, this| Ok(this.0.length() as f64));
-        f.add_field_method_get("Unit", |_, this| Ok(LVector2(this.0.normalize_or_zero())));
+        // (and the deprecated lower-case names, as Studio still answers them:
+        // VFX Suite reads `.magnitude`)
+        for n in ["Magnitude", "magnitude"] {
+            f.add_field_method_get(n, |_, this| Ok(this.0.length() as f64));
+        }
+        // Studio: Vector2.zero.Unit is NAN, NAN (scripts test for it, e.g.
+        // a game's 2D emitter turning a still particle to 0, not 180).
+        for n in ["Unit", "unit"] {
+            f.add_field_method_get(n, |_, this| Ok(LVector2(if this.0 == glam::Vec2::ZERO { glam::Vec2::splat(f32::NAN) } else { this.0 / this.0.length() })));
+        }
     }
 
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
@@ -201,7 +210,9 @@ impl UserData for LVector2 {
             Ok(LVector2(this.0.lerp(o.0, a)))
         });
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| {
-            Ok(format!("{}, {}", g9(this.0.x), g9(this.0.y)))
+            // (Studio prints a Vector2's NaN as NAN, a Vector3's as nan)
+            let c = |x: f32| if x.is_nan() { "NAN".to_string() } else { g9(x) };
+            Ok(format!("{}, {}", c(this.0.x), c(this.0.y)))
         });
         m.add_meta_method(MetaMethod::Eq, |_, this, o: LVector2| Ok(this.0 == o.0));
         m.add_meta_method(MetaMethod::Unm, |_, this, ()| Ok(LVector2(-this.0)));
@@ -223,7 +234,9 @@ impl UserData for LVector2 {
         m.add_meta_function(MetaMethod::Div, |_, (a, b): (LVector2, Value)| {
             match (ud::<LVector2>(&b), num(&b)) {
                 (Some(y), _) => Ok(LVector2(a.0 / y.0)),
-                (None, Some(k)) => Ok(LVector2(a.0 / k as f32)),
+                // Studio multiplies by the reciprocal: Vector2.new(1/3, 2/3) / 7
+                // is 0.0476190522 there (as * (1/7)), not 0.0476190485.
+                (None, Some(k)) => Ok(LVector2(a.0 * (1.0 / k) as f32)),
                 _ => Err(rt_err("attempt to divide a Vector2 with an incompatible value type or nil")),
             }
         });
@@ -587,7 +600,8 @@ impl UserData for LColor3 {
         });
         m.add_method("ToHex", |_, this, ()| {
             let c = this.0.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-            Ok(format!("{:02X}{:02X}{:02X}", c[0], c[1], c[2]))
+            // Lower case, as Studio's (0.747: MainBackground:ToHex() "191a1f").
+            Ok(format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2]))
         });
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| {
             Ok(format!(
@@ -1125,7 +1139,10 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     v3.set("zAxis", LVector3(Vec3::Z))?;
     v3.set(
         "FromNormalId",
-        lua.create_function(|_, n: LEnumItem| {
+        // (an enum argument also takes the item's name or value, as Roblox's
+        // do: F3X passes "Top" etc.)
+        lua.create_function(|_, v: Value| {
+            let n = enum_arg_named(&v, "NormalId", "FromNormalId")?;
             Ok(LVector3(match n.name.as_str() {
                 "Right" => Vec3::X,
                 "Top" => Vec3::Y,
@@ -1138,7 +1155,8 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     )?;
     v3.set(
         "FromAxis",
-        lua.create_function(|_, a: LEnumItem| {
+        lua.create_function(|_, v: Value| {
+            let a = enum_arg_named(&v, "Axis", "FromAxis")?;
             Ok(LVector3(match a.name.as_str() {
                 "Y" => Vec3::Y,
                 "Z" => Vec3::Z,
@@ -1372,13 +1390,12 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
             ))
         })?,
     )?;
-    let random_brick = lua.create_function(|_, ()| {
-        let n = (std::time::SystemTime::now()
+    let random_brick = lua.create_function(|lua, ()| {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-            % 200) as u16
-            + 1;
+            .unwrap_or(0);
+        let n = (crate::sim_clock::seed(lua, nanos as u64) % 200) as u16 + 1;
         Ok(LBrickColor(BrickColor::from_number(n).unwrap_or_else(
             || BrickColor::from_number(194).expect("default"),
         )))
@@ -2260,18 +2277,24 @@ impl LRandom {
         r
     }
 
-    fn from_entropy() -> Self {
+    fn from_entropy(lua: &mlua::Lua) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        LRandom::new(
+        // RUSTUDIO_DETERMINISTIC (test runs): seeds by creation order only.
+        let t = if rbx_dom_weak::deterministic() {
+            0
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        };
+        LRandom::new(crate::sim_clock::seed(
+            lua,
             t ^ COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-        )
+        ))
     }
 
     pub fn next_u32(&mut self) -> u32 {
@@ -2440,9 +2463,13 @@ from_ud!(LDateTime, "DateTime");
 
 impl LDateTime {
     pub fn now() -> Self {
-        let ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_millis() as i64,
-            Err(e) => -(e.duration().as_millis() as i64),
+        let ms = if crate::sim_clock::on() {
+            (crate::sim_clock::epoch_secs() * 1000.0).floor() as i64
+        } else {
+            match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_millis() as i64,
+                Err(e) => -(e.duration().as_millis() as i64),
+            }
         };
         LDateTime { millis: ms }
     }
@@ -2464,6 +2491,18 @@ impl LDateTime {
         Some(LDateTime {
             millis: days * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000 + ms,
         })
+    }
+
+    /// The same wall-clock reading in the machine's time zone (offset at
+    /// that instant), for ToLocalTime / FormatLocalTime.
+    fn local(&self) -> Self {
+        use chrono::{Local, TimeZone};
+        let off = Local
+            .timestamp_millis_opt(self.millis)
+            .single()
+            .map(|t| t.offset().local_minus_utc() as i64)
+            .unwrap_or(0);
+        LDateTime { millis: self.millis + off * 1000 }
     }
 
     fn civil(&self) -> Civil {
@@ -2687,10 +2726,10 @@ impl UserData for LDateTime {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        // No timezone database is used, so local time is treated as UTC
-        // (estimated).
+        // Local time: the machine's zone offset at that instant (as the
+        // Roblox client does; Argon's waypoint names show the local clock).
         m.add_method("ToUniversalTime", |lua, this, ()| this.table(lua));
-        m.add_method("ToLocalTime", |lua, this, ()| this.table(lua));
+        m.add_method("ToLocalTime", |lua, this, ()| this.local().table(lua));
         m.add_method("ToIsoDate", |_, this, ()| Ok(this.iso()));
         m.add_method(
             "FormatUniversalTime",
@@ -2698,7 +2737,7 @@ impl UserData for LDateTime {
         );
         m.add_method(
             "FormatLocalTime",
-            |_, this, (fmt, _locale): (String, Option<String>)| Ok(this.format(&fmt)),
+            |_, this, (fmt, _locale): (String, Option<String>)| Ok(this.local().format(&fmt)),
         );
         // Studio prints the Unix time in milliseconds (`DateTime.fromUnixTimestamp(0)` → "0").
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(this.millis.to_string()));
@@ -2907,6 +2946,25 @@ fn query_fields<T: HasQuery, F: UserDataFields<T>>(f: &mut F) {
         this.q_mut().brute_force_all_slow = v;
         Ok(())
     });
+    // IncludeInstances / ExcludeInstances: the filter list as a whitelist /
+    // an ignore list (FilterDescendantsInstances + FilterType in one write).
+    // Brushtool 2.1 sets them on OverlapParams for its brush sweeps; reading
+    // gives the list while FilterType matches, else an empty table.
+    for (name, include) in [("IncludeInstances", true), ("ExcludeInstances", false)] {
+        f.add_field_method_get(name, move |lua, this| {
+            if this.q().is_include() == include {
+                lua.create_sequence_from(this.q().filter.iter().cloned())
+            } else {
+                lua.create_table()
+            }
+        });
+        f.add_field_method_set(name, move |_, this, t: Table| {
+            let q = this.q_mut();
+            q.filter = t.sequence_values::<Value>().collect::<LResult<Vec<_>>>()?;
+            q.filter_type = enum_arg(None, "RaycastFilterType", if include { "Include" } else { "Exclude" })?;
+            Ok(())
+        });
+    }
     if T::OVERLAP {
         f.add_field_method_get("MaxParts", |_, this| Ok(this.q().max_parts as f64));
         f.add_field_method_set("MaxParts", |_, this, v: f64| {
@@ -3618,10 +3676,10 @@ fn install_datatypes(lua: &Lua, g: &Table) -> LResult<()> {
     let rnd = lua.create_table()?;
     rnd.set(
         "new",
-        lua.create_function(|_, seed: Option<f64>| {
+        lua.create_function(|lua, seed: Option<f64>| {
             Ok(match seed {
                 Some(s) if s.is_finite() => LRandom::new(s.trunc() as i64 as u64),
-                _ => LRandom::from_entropy(),
+                _ => LRandom::from_entropy(lua),
             })
         })?,
     )?;
@@ -4221,6 +4279,9 @@ impl UserData for LFont {
 pub struct LInputObject {
     data: Table,
     methods: Table,
+    /// Called with (object, field) when a write changes a field (the
+    /// library's GetPropertyChangedSignal signals).
+    on_change: Option<mlua::Function>,
 }
 
 impl UserData for LInputObject {
@@ -4229,7 +4290,14 @@ impl UserData for LInputObject {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        m.add_meta_method(mlua::MetaMethod::Index, |_, this, key: Value| {
+        m.add_meta_function(mlua::MetaMethod::Index, |lua, (ud, key): (mlua::AnyUserData, Value)| {
+            // InputObject.Changed (the library's per-object signal)
+            if matches!(&key, Value::String(s) if s.as_bytes() == b"Changed") {
+                if let Ok(sig) = lua.globals().get::<mlua::Function>("__rs_input_changed_signal") {
+                    return sig.call(ud);
+                }
+            }
+            let this = ud.borrow::<LInputObject>()?;
             let v: Value = this.data.raw_get(key.clone())?;
             if !v.is_nil() {
                 return Ok(v);
@@ -4243,9 +4311,23 @@ impl UserData for LInputObject {
                 key.to_string().unwrap_or_default()
             )))
         });
-        m.add_meta_method(
+        m.add_meta_function(
             mlua::MetaMethod::NewIndex,
-            |_, this, (k, v): (Value, Value)| this.data.raw_set(k, v),
+            |_, (me, k, v): (mlua::AnyUserData, Value, Value)| {
+                let (old, hook) = {
+                    let this = me.borrow::<LInputObject>()?;
+                    let old: Value = this.data.raw_get(k.clone())?;
+                    this.data.raw_set(k.clone(), v.clone())?;
+                    (old, this.on_change.clone())
+                };
+                // Changed / GetPropertyChangedSignal (library.luau's io_changed)
+                if let Some(f) = hook {
+                    if !old.equals(&v)? {
+                        f.call::<()>((me, k))?;
+                    }
+                }
+                Ok(())
+            },
         );
         m.add_meta_method(mlua::MetaMethod::ToString, |_, _, ()| Ok("InputObject"));
     }
@@ -4337,8 +4419,8 @@ impl UserData for LSignal {
 pub fn install_font(lua: &Lua, g: &Table) -> LResult<()> {
     g.set(
         "__rs_make_input_object",
-        lua.create_function(|_, (data, methods): (Table, Table)| {
-            Ok(LInputObject { data, methods })
+        lua.create_function(|_, (data, methods, on_change): (Table, Table, Option<mlua::Function>)| {
+            Ok(LInputObject { data, methods, on_change })
         })?,
     )?;
     g.set(
@@ -4496,5 +4578,22 @@ mod direct_call_tests {
             .eval()
             .unwrap();
         assert!(n > 100, "{n} raisers captured");
+    }
+}
+
+/// An enum argument as Roblox reads one: the EnumItem, its name, or its value.
+fn enum_arg_named(v: &Value, en: &str, func: &str) -> mlua::Result<LEnumItem> {
+    let bad = || mlua::Error::runtime(format!("invalid argument #1 to '{func}' (EnumItem expected, got {})", v.type_name()));
+    match v {
+        Value::UserData(u) => u.borrow::<LEnumItem>().map(|e| e.clone()).map_err(|_| bad()),
+        Value::String(s) => LEnumItem::from_name(en, &s.to_string_lossy()).ok_or_else(bad),
+        Value::Integer(_) | Value::Number(_) => {
+            let n = match v { Value::Integer(i) => *i as u32, Value::Number(f) => *f as u32, _ => 0 };
+            LEnumItem::dump_items(en)
+                .and_then(|items| items.iter().find(|(_, val)| *val == n).map(|(name, _)| name.clone()))
+                .and_then(|name| LEnumItem::from_name(en, &name))
+                .ok_or_else(bad)
+        }
+        _ => Err(bad()),
     }
 }

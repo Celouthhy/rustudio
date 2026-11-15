@@ -7,7 +7,11 @@
 //!   shows `f1,2`). The Get* lists come in creation order.
 //! - AddTriangle / AddFace (3 or 4 vertices) give each corner its vertex's
 //!   default normal / UV / colour, made on the vertex's first face: an
-//!   automatic (smooth, area-weighted) normal, UV (0,0), white alpha 1.
+//!   automatic (smooth) normal, UV (0,0), white alpha 1. An automatic
+//!   normal is the sum of the unit normals of the faces that use it, each
+//!   weighted by sin² of the face's angle at that corner (Studio 0.747,
+//!   GetNormal on fans of 2-3 triangles: 10 values within 1e-5; area or
+//!   angle weighting miss by up to 0.2), recomputed when positions move.
 //! - bones (Name, CFrame, Virtual, optional ParentId), per-vertex bone ids
 //!   and weights (stored as bytes: 0.5 reads back 128/255), FACS poses and
 //!   correctives (virtual bones only).
@@ -157,11 +161,32 @@ pub struct Bone {
     virt: bool,
 }
 
+/// What changed since the renderer last copied the mesh (kept only while
+/// a MeshPart shows it, `Mesh::live`): value edits by id, or `layout` for
+/// anything that changes which corners exist or which ids they use.
+#[derive(Clone, Debug, Default)]
+pub struct Journal {
+    pub layout: bool,
+    pub verts: Vec<u64>,
+    pub normals: Vec<u64>,
+    pub uvs: Vec<u64>,
+    pub colors: Vec<u64>,
+}
+
+impl Journal {
+    pub fn is_empty(&self) -> bool {
+        !self.layout && self.verts.is_empty() && self.normals.is_empty() && self.uvs.is_empty() && self.colors.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Mesh {
     pub n: u64,
     pub gen: u64,
     pub fixed: bool,
+    /// A MeshPart draws it (CreateMeshPartAsync): edits go in `journal`.
+    pub live: bool,
+    pub journal: Journal,
     pub verts: Slab<Vertex>,
     pub normals: Slab<Normal>,
     pub uvs: Slab<Vec2>,
@@ -174,12 +199,44 @@ pub struct Mesh {
     correctives: Vec<(Vec<u32>, Vec<(u64, Xform)>)>,
 }
 
+/// sin² of the angle at `p` between `a - p` and `b - p`: a corner's weight
+/// in an automatic normal (Studio 0.747: a 45° or 135° corner counts half a
+/// right angle, 30° a quarter, whatever the edge lengths).
+pub fn corner_weight(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let (e1, e2) = (a - p, b - p);
+    let d = e1.length_squared() * e2.length_squared();
+    if d <= 0.0 {
+        return 0.0;
+    }
+    e1.cross(e2).length_squared() / d
+}
+
+/// Adds a zero-area triangle so the corners' bounds centre on `centre`.
+fn pad_about(corners: &mut Vec<(Vec3, Vec3, Vec2, [f32; 4])>, centre: Option<Vec3>) -> bool {
+    let Some(c) = centre else { return false };
+    if corners.is_empty() {
+        return false;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for k in corners.iter() {
+        lo = lo.min(k.0);
+        hi = hi.max(k.0);
+    }
+    let (a, b) = (c * 2.0 - lo, c * 2.0 - hi);
+    for p in [a, b, b] {
+        corners.push((p, Vec3::Y, Vec2::ZERO, [1.0; 4]));
+    }
+    true
+}
+
 impl Default for Mesh {
     fn default() -> Self {
         Mesh {
             n: 0,
             gen: 0,
             fixed: false,
+            live: false,
+            journal: Journal::default(),
             verts: Slab::new(K_VERTEX),
             normals: Slab::new(K_NORMAL),
             uvs: Slab::new(K_UV),
@@ -231,8 +288,9 @@ impl Mesh {
         n
     }
 
-    /// A normal's value: an automatic one is the area-weighted average of
-    /// the faces that use it.
+    /// A normal's value: an automatic one is the sum of the unit normals
+    /// of the faces that use it, each weighted by sin² of the face's angle
+    /// at the corner that uses it (`corner_weight`).
     pub fn normal_value(&self, id: u64) -> Option<Vec3> {
         let n = self.normals.get(id)?;
         if !n.auto {
@@ -240,11 +298,59 @@ impl Mesh {
         }
         let mut s = Vec3::ZERO;
         for (_, f) in self.faces.iter() {
-            if f.n.contains(&id) {
-                s += self.face_normal(f);
+            if !f.n.contains(&id) {
+                continue;
+            }
+            let fnm = self.face_normal(f).normalize_or_zero();
+            for (i, n) in f.n.iter().enumerate() {
+                if *n == id {
+                    s += fnm * self.face_corner_weight(f, i);
+                }
             }
         }
         Some(s.normalize_or_zero())
+    }
+
+    fn face_corner_weight(&self, f: &Face, i: usize) -> f32 {
+        let k = f.v.len();
+        let (Some(p), Some(a), Some(b)) =
+            (self.pos(f.v[i]), self.pos(f.v[(i + 1) % k]), self.pos(f.v[(i + k - 1) % k]))
+        else {
+            return 0.0;
+        };
+        corner_weight(p, a, b)
+    }
+
+    /// Every automatic normal's value in one pass over the faces (the
+    /// per-normal `normal_value` walked every face for each corner:
+    /// quadratic, ~4 ms for a 650-triangle snapshot).
+    pub fn auto_normals(&self) -> HashMap<u64, Vec3> {
+        let mut out: HashMap<u64, Vec3> = HashMap::new();
+        for (_, f) in self.faces.iter() {
+            if !f.n.iter().any(|n| self.normals.get(*n).is_some_and(|n| n.auto)) {
+                continue;
+            }
+            let fnm = self.face_normal(f).normalize_or_zero();
+            for (i, n) in f.n.iter().enumerate() {
+                if self.normals.get(*n).is_some_and(|n| n.auto) {
+                    *out.entry(*n).or_insert(Vec3::ZERO) += fnm * self.face_corner_weight(f, i);
+                }
+            }
+        }
+        for v in out.values_mut() {
+            *v = v.normalize_or_zero();
+        }
+        out
+    }
+
+    /// Whether normal `id` is automatic.
+    pub fn normal_is_auto(&self, id: u64) -> bool {
+        self.normals.get(id).is_some_and(|n| n.auto)
+    }
+
+    /// An explicit normal's value (None: automatic or gone).
+    pub fn normal_set(&self, id: u64) -> Option<Vec3> {
+        self.normals.get(id).filter(|n| !n.auto).map(|n| n.v)
     }
 
     /// Triangles as (face id, [corner index; 3]) (quads split 0-1-2, 0-2-3).
@@ -311,12 +417,14 @@ impl Mesh {
     /// Positions, normals, uvs and colours as triangle corners (for the
     /// renderer snapshot and CSG).
     pub fn corners(&self) -> Vec<(Vec3, Vec3, Vec2, [f32; 4])> {
+        let auto = self.auto_normals();
+        let value = |id: u64| auto.get(&id).copied().or_else(|| self.normal_set(id));
         let mut out = Vec::new();
         for (_, f, k) in self.tris() {
             let Some(p) = k.iter().map(|&i| self.pos(f.v[i])).collect::<Option<Vec<_>>>() else { continue };
             let flat = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
             for (j, &i) in k.iter().enumerate() {
-                let n = f.n.get(i).and_then(|n| self.normal_value(*n)).filter(|n| n.length_squared() > 1e-12).unwrap_or(flat);
+                let n = f.n.get(i).and_then(|n| value(*n)).filter(|n| n.length_squared() > 1e-12).unwrap_or(flat);
                 let uv = f.uv.get(i).and_then(|u| self.uvs.get(*u).copied()).unwrap_or(Vec2::ZERO);
                 let c = f.c.get(i).and_then(|c| self.colors.get(*c).copied()).unwrap_or(([1.0; 3], 1.0));
                 out.push((p[j], n, uv, [c.0[0], c.0[1], c.0[2], c.1]));
@@ -325,10 +433,67 @@ impl Mesh {
         out
     }
 
-    /// The mesh as binary 2.00 mesh bytes (one vertex per face corner) and
-    /// its bounds.
+    /// Whether it has bones (its snapshot is then a skinned 4.00 mesh).
+    pub fn skinned(&self) -> bool {
+        self.bones.iter().next().is_some()
+    }
+
+    /// The (vertex, normal, UV, colour) ids behind each corner of
+    /// `corners()` (same order and skips; u64::MAX where a face has none).
+    pub fn corner_ids(&self) -> Vec<[u64; 4]> {
+        let mut out = Vec::new();
+        for (_, f, k) in self.tris() {
+            if k.iter().any(|&i| self.pos(f.v[i]).is_none()) {
+                continue;
+            }
+            let at = |l: &Vec<u64>, i: usize| l.get(i).copied().unwrap_or(u64::MAX);
+            out.extend(k.iter().map(|&i| [f.v[i], at(&f.n, i), at(&f.uv, i), at(&f.c, i)]));
+        }
+        out
+    }
+
+    /// A UV's value.
+    pub fn uv(&self, id: u64) -> Option<Vec2> {
+        self.uvs.get(id).copied()
+    }
+
+    /// A colour's value (RGB, alpha).
+    pub fn color(&self, id: u64) -> Option<([f32; 3], f32)> {
+        self.colors.get(id).copied()
+    }
+
+    /// The vertex behind each corner of `corners()` (same order and skips).
+    fn corner_vertices(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for (_, f, k) in self.tris() {
+            if k.iter().any(|&i| self.pos(f.v[i]).is_none()) {
+                continue;
+            }
+            out.extend(k.iter().map(|&i| f.v[i]));
+        }
+        out
+    }
+
+    /// The mesh as binary mesh bytes (one vertex per face corner) and its
+    /// bounds: 2.00, or with bones a skinned 4.00 (bones in mesh space from
+    /// their CFrames, each corner's four largest weights, subsets of at
+    /// most 26 bones), which the skinning path (skin.rs) deforms like any
+    /// skinned .mesh: Studio's CreateMeshPartAsync part from a boned
+    /// EditableMesh is skinned (HasSkinnedMesh true, AUDIT.md (f)).
     pub fn to_mesh_bytes(&self) -> (Vec<u8>, Vec3, Vec3) {
-        let corners = self.corners();
+        self.to_mesh_bytes_about(None)
+    }
+
+    /// `to_mesh_bytes`, its bounds centred on `centre` when given (one
+    /// zero-area triangle stretches them): a live re-snapshot keeps the
+    /// first snapshot's mesh-to-part offset, as Studio's part keeps drawing
+    /// the mesh where it was when edits grow its bounds.
+    pub fn to_mesh_bytes_about(&self, centre: Option<Vec3>) -> (Vec<u8>, Vec3, Vec3) {
+        if self.skinned() {
+            return self.to_skinned_bytes(centre);
+        }
+        let mut corners = self.corners();
+        pad_about(&mut corners, centre);
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         let mut verts: Vec<u8> = Vec::with_capacity(corners.len() * 40);
         for (p, n, uv, c) in &corners {
@@ -356,6 +521,198 @@ impl Mesh {
             (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
         }
         (out, lo, hi)
+    }
+
+    fn to_skinned_bytes(&self, centre: Option<Vec3>) -> (Vec<u8>, Vec3, Vec3) {
+        let mut corners = self.corners();
+        let mut cv = self.corner_vertices();
+        if pad_about(&mut corners, centre) {
+            cv.extend([u64::MAX; 3]);
+        }
+        let order: Vec<u64> = self.bones.iter().map(|(id, _)| id).collect();
+        let index = |id: u64| order.iter().position(|b| *b == id);
+        // Per corner: up to four (bone index, u8 weight), largest first.
+        let infl: Vec<Vec<(usize, u8)>> = cv
+            .iter()
+            .map(|v| {
+                let x = self.verts.get(*v);
+                let mut w: Vec<(usize, u8)> = x
+                    .map(|x| x.bones.iter().zip(&x.weights).filter_map(|(b, w)| Some((index(*b)?, *w))).filter(|p| p.1 > 0).collect())
+                    .unwrap_or_default();
+                w.sort_by(|a, b| b.1.cmp(&a.1));
+                w.truncate(4);
+                w
+            })
+            .collect();
+        // Subsets: whole triangles, at most 26 bones each.
+        let mut subsets: Vec<(usize, usize, Vec<usize>)> = Vec::new(); // (first corner, corners, bones)
+        for t in 0..corners.len() / 3 {
+            let need: Vec<usize> = (0..3).flat_map(|k| infl[t * 3 + k].iter().map(|p| p.0)).collect();
+            let fits = subsets.last().is_some_and(|s| {
+                let mut u = s.2.clone();
+                u.extend(need.iter().copied());
+                u.sort();
+                u.dedup();
+                u.len() <= 26
+            });
+            if !fits {
+                subsets.push((t * 3, 0, Vec::new()));
+            }
+            let s = subsets.last_mut().expect("pushed");
+            s.1 += 3;
+            for b in need {
+                if !s.2.contains(&b) {
+                    s.2.push(b);
+                }
+            }
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let mut verts: Vec<u8> = Vec::with_capacity(corners.len() * 40);
+        for (p, n, uv, c) in &corners {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+            for x in [p.x, p.y, p.z, n.x, n.y, n.z, uv.x, uv.y, 0.0] {
+                verts.extend_from_slice(&x.to_le_bytes());
+            }
+            for x in c {
+                verts.push((x.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+        }
+        let mut env = Vec::with_capacity(corners.len() * 8);
+        for s in &subsets {
+            for c in s.0..s.0 + s.1 {
+                let mut ids = [0u8; 4];
+                let mut ws = [0u8; 4];
+                for (k, (b, w)) in infl[c].iter().enumerate() {
+                    ids[k] = s.2.iter().position(|x| x == b).unwrap_or(0) as u8;
+                    ws[k] = *w;
+                }
+                env.extend_from_slice(&ids);
+                env.extend_from_slice(&ws);
+            }
+        }
+        let mut names = Vec::new();
+        let mut bones = Vec::new();
+        for id in &order {
+            let b = self.bones.get(*id).expect("listed");
+            let off = names.len() as u32;
+            names.extend_from_slice(b.name.as_bytes());
+            names.push(0);
+            let parent = index(b.parent).map(|p| p as u16).unwrap_or(0xFFFF);
+            bones.extend_from_slice(&off.to_le_bytes());
+            bones.extend_from_slice(&parent.to_le_bytes());
+            bones.extend_from_slice(&parent.to_le_bytes());
+            bones.extend_from_slice(&1.0f32.to_le_bytes()); // culling radius (> 0: Studio needs one)
+            let r = b.cf.rot;
+            for row in 0..3 {
+                for col in 0..3 {
+                    bones.extend_from_slice(&r.col(col)[row].to_le_bytes());
+                }
+            }
+            for x in [b.cf.pos.x, b.cf.pos.y, b.cf.pos.z] {
+                bones.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let nv = corners.len() as u32;
+        let nf = nv / 3;
+        let mut out = b"version 4.00\n".to_vec();
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&nv.to_le_bytes());
+        out.extend_from_slice(&nf.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&(order.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(subsets.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&verts);
+        out.extend_from_slice(&env);
+        for i in 0..nv {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&nf.to_le_bytes());
+        out.extend_from_slice(&bones);
+        out.extend_from_slice(&names);
+        for s in &subsets {
+            for x in [s.0 as u32 / 3, s.1 as u32 / 3, s.0 as u32, s.1 as u32, s.2.len() as u32] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            for k in 0..26 {
+                out.extend_from_slice(&s.2.get(k).map(|b| *b as u16).unwrap_or(0xFFFF).to_le_bytes());
+            }
+        }
+        if nf == 0 {
+            (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
+        }
+        (out, lo, hi)
+    }
+
+    /// A mesh file as AssetService:CreateEditableMeshAsync loads it in
+    /// Studio 0.747 (checks/mesh-deform/tools/idprobe.py, AUDIT.md (f)):
+    /// - 3.00 and later: every stored vertex in file order, unused ones
+    ///   too, each with its own normal, UV and colour id (in that order);
+    ///   faces (LOD0) in file order. A Layered-clothing cage (2.00, 4949
+    ///   vertices) keeps all of them.
+    /// - 2.00: vertices equal in position, normal, UV and colour are one,
+    ///   numbered in the order the faces first use them; unused ones are
+    ///   dropped (the jacket cage's two vertices that differ only in their
+    ///   colour bytes stay two: 4949).
+    /// Ids are numbered as Studio's (kind << 32 | index), so scripts that
+    /// edit by id or by list index reach the same vertices.
+    pub fn from_stored(d: &crate::mesh::Stored) -> Mesh {
+        let mut m = Mesh::default();
+        let mut own = |m: &mut Mesh, i: usize| -> (u64, u64, u64, u64) {
+            let v = m.add_vertex(d.pos[i]);
+            let n = m.normals.add(Normal { v: d.nrm[i], auto: false });
+            let u = m.uvs.add(d.uv[i]);
+            let c = d.col[i];
+            let c = m.colors.add(([c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0], c[3] as f32 / 255.0));
+            if let Some(x) = m.verts.get_mut(v) {
+                x.dflt = [Some(n), Some(u), Some(c)];
+            }
+            (v, n, u, c)
+        };
+        let ids: Vec<Option<(u64, u64, u64, u64)>> = if d.major <= 2 {
+            let mut key: HashMap<[u32; 9], (u64, u64, u64, u64)> = HashMap::new();
+            let mut map = vec![None; d.pos.len()];
+            for f in &d.faces {
+                for &i in f {
+                    let i = i as usize;
+                    if map[i].is_some() {
+                        continue;
+                    }
+                    let (p, n, u) = (d.pos[i], d.nrm[i], d.uv[i]);
+                    let c = u32::from_le_bytes(d.col[i]);
+                    let [a0, a1, a2, a3, a4, a5, a6, a7] = [p.x, p.y, p.z, n.x, n.y, n.z, u.x, u.y].map(f32::to_bits);
+                    let k = [a0, a1, a2, a3, a4, a5, a6, a7, c];
+                    let got = match key.get(&k) {
+                        Some(x) => *x,
+                        None => {
+                            let x = own(&mut m, i);
+                            key.insert(k, x);
+                            x
+                        }
+                    };
+                    map[i] = Some(got);
+                }
+            }
+            map
+        } else {
+            (0..d.pos.len()).map(|i| Some(own(&mut m, i))).collect()
+        };
+        for f in &d.faces {
+            let c: Vec<(u64, u64, u64, u64)> = f.iter().filter_map(|&i| ids[i as usize]).collect();
+            if c.len() == 3 {
+                m.faces.add(Face {
+                    v: c.iter().map(|x| x.0).collect(),
+                    n: c.iter().map(|x| x.1).collect(),
+                    uv: c.iter().map(|x| x.2).collect(),
+                    c: c.iter().map(|x| x.3).collect(),
+                });
+            }
+        }
+        m
     }
 
     /// A mesh file's triangles: corners at one position share a vertex, as
@@ -784,6 +1141,42 @@ fn ray_tri(o: Vec3, d: Vec3, t: [Vec3; 3]) -> Option<(f32, Vec3)> {
 
 /// One EditableMesh method on `m`. Returns Ok(None) for a name that isn't
 /// an EditableMesh method.
+/// Records a successful edit in the journal of a mesh a MeshPart shows:
+/// value edits by id, anything that changes the drawn layout as `layout`.
+/// Edits that change nothing drawn (new unused vertices / normals / UVs /
+/// colours, FACS poses) leave it alone.
+pub fn note_edit(m: &mut Mesh, name: &str, args: &MultiValue) {
+    if !m.live || m.journal.layout {
+        return;
+    }
+    let id1 = idv(&arg(args, 1)) as u64;
+    let j = &mut m.journal;
+    match name {
+        "SetPosition" => j.verts.push(id1),
+        "SetNormal" | "ResetNormal" => j.normals.push(id1),
+        "SetUV" => j.uvs.push(id1),
+        "SetColor" | "SetColorAlpha" => j.colors.push(id1),
+        "BatchSetValues" => {
+            for id in ids_of(&arg(args, 1)) {
+                let id = id as u64;
+                match parse(id as f64).map(|p| p.0) {
+                    Some(K_VERTEX) => j.verts.push(id),
+                    Some(K_NORMAL) => j.normals.push(id),
+                    Some(K_UV) => j.uvs.push(id),
+                    Some(K_COLOR) => j.colors.push(id),
+                    _ => j.layout = true,
+                }
+            }
+        }
+        "AddVertex" | "AddNormal" | "AddUV" | "AddColor" | "SetFacsPose" | "SetFacsBonePose" | "SetFacsCorrectivePose" => {}
+        _ => j.layout = true,
+    }
+    // A huge backlog costs more to replay than a fresh copy.
+    if j.verts.len() + j.normals.len() + j.uvs.len() + j.colors.len() > 1 << 20 {
+        *j = Journal { layout: true, ..Default::default() };
+    }
+}
+
 pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Result<Option<MultiValue>> {
     let a1 = arg(args, 1);
     let a2 = arg(args, 2);
@@ -879,8 +1272,8 @@ pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Res
             one(list(lua, removed)?)
         }
         "Clear" => {
-            let (n, gen, fixed) = (m.n, m.gen, m.fixed);
-            *m = Mesh { n, gen, fixed, ..Default::default() };
+            let (n, gen, fixed, live) = (m.n, m.gen, m.fixed, m.live);
+            *m = Mesh { n, gen, fixed, live, ..Default::default() };
             none()
         }
         "GetVertices" => one(list(lua, m.verts.ids())?),

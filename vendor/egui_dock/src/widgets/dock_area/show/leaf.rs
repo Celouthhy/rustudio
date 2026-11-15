@@ -441,7 +441,12 @@ impl<Tab> DockArea<'_, Tab> {
 
             let show_close_button = self.show_close_buttons && closeable;
 
-            let (response, title_id) = if is_being_dragged {
+            let live_window_drag = !path.surface.is_main()
+                && self.dock_state[path.surface].num_tabs() == 1;
+            if is_being_dragged && live_window_drag {
+                self.try_initiate_tab_drag(tabs_ui, state, path, tab_index);
+            }
+            let (response, title_id) = if is_being_dragged && !live_window_drag {
                 let layer_id = LayerId::new(Order::Tooltip, id);
                 let response = tabs_ui
                     .scope_builder(UiBuilder::new().layer_id(layer_id), |ui| {
@@ -993,6 +998,14 @@ impl<Tab> DockArea<'_, Tab> {
         tab_index: TabIndex,
     ) -> Option<Vec2> {
         let pointer_pos = ui.ctx().pointer_interact_pos()?;
+        if !path.surface.is_main() && self.dock_state[path.surface].num_tabs() == 1 {
+            state.floating_drag.get_or_insert((
+                path.surface,
+                ui.ctx().memory(|mem| mem.area_rect(ui.layer_id().id))
+                    .unwrap_or(self.dock_state[path].rect().unwrap()).min,
+                ui.input(|i| i.pointer.press_origin()).unwrap_or(pointer_pos),
+            ));
+        }
         let start = *state.drag_start.get_or_insert(pointer_pos);
         let delta = pointer_pos - start;
         (delta.x.abs() > 30.0 || delta.y.abs() > 6.0).then(|| {
@@ -1502,7 +1515,13 @@ impl<Tab> DockArea<'_, Tab> {
 
             // Use rect.contains instead of response.hovered as the dragged tab covers
             // the underlying responses.
-            if state.drag_start.is_some() && rect.contains(pointer) && is_dragged_valid {
+            // The moving window follows the pointer, so let the surfaces beneath
+            // it supply docking targets instead of targeting its own tab bar.
+            let moving_source = state.floating_drag
+                .is_some_and(|(surface, _, _)| surface == path.surface);
+            if state.drag_start.is_some() && rect.contains(pointer) && is_dragged_valid
+                && !moving_source
+            {
                 let on_title_bar = tabbar_rect.contains(pointer);
                 let (dst, tab) = {
                     match self.tab_hover_rect {

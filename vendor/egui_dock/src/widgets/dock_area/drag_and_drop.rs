@@ -180,6 +180,7 @@ impl DragDropState {
         allowed_splits: AllowedSplits,
         windows_allowed: bool,
         window_bounds: Rect,
+        live_window_drag: bool,
     ) -> Option<TabDestination> {
         assert!(!self.is_on_title_bar());
 
@@ -247,7 +248,9 @@ impl DragDropState {
         if let Some(TabDestination::Window(rect)) = destination {
             let rect = self.window_preview_rect(rect);
             let rect_bounded = constrain_rect_to_area(ui, rect, window_bounds);
-            draw_window_rect(rect_bounded, ui, style);
+            if !live_window_drag {
+                draw_window_rect(rect_bounded, ui, style);
+            }
         }
         destination
     }
@@ -259,6 +262,7 @@ impl DragDropState {
         allowed_splits: AllowedSplits,
         windows_allowed: bool,
         window_bounds: Rect,
+        live_window_drag: bool,
     ) -> Option<TabDestination> {
         // If windows are not allowed, any hover over a window is immediately disallowed.
         if !windows_allowed && self.hover.dst.surface_address() != SurfaceIndex::main() {
@@ -360,7 +364,9 @@ impl DragDropState {
             Some(TabDestination::Window(rect)) => {
                 let rect = self.window_preview_rect(rect);
                 let rect_bounded = constrain_rect_to_area(ui, rect, window_bounds);
-                draw_window_rect(rect_bounded, ui, style);
+                if !live_window_drag {
+                    draw_window_rect(rect_bounded, ui, style);
+                }
             }
             Some(_) => {
                 draw_drop_rect(hover_rect.intersect(overlay_rect), ui, style);

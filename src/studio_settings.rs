@@ -76,6 +76,14 @@ pub struct Def {
 /// The dialog's pages in order.
 pub const PAGES: &[&str] = &["Studio", "Selection", "Script Editor", "Diagnostics", "Network", "Physics", "Rendering"];
 
+/// The page after Studio's: rustudio's own options (src/rustudio_settings.rs).
+pub const RUSTUDIO_PAGE: usize = PAGES.len();
+const RUSTUDIO_PAGE_NAME: &str = "rustudio";
+
+fn page_name(i: usize) -> &'static str {
+    PAGES.get(i).copied().unwrap_or(RUSTUDIO_PAGE_NAME)
+}
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Val {
@@ -520,6 +528,9 @@ pub struct Dialog {
     scroll_to: Option<f32>,
     /// What was clickable last frame and where (the self-test clicks these).
     pub hits: Vec<(Hit, Rect)>,
+    /// Scroll this row (DEFS index) into view once, as a person scrolls to
+    /// it (the self-test, when the window is too short for the page).
+    pub reveal: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -527,6 +538,8 @@ pub enum Hit {
     Page(usize),
     /// A row's value cell (DEFS index).
     Value(usize),
+    /// A rustudio option's value cell (rustudio_settings::OPTS index).
+    Opt(usize),
     Close,
 }
 
@@ -549,12 +562,19 @@ impl Dialog {
         self.scroll_to = scroll.parse().ok();
         if let Some(i) = PAGES.iter().position(|p| p.eq_ignore_ascii_case(page)) {
             self.page = i;
+        } else if page.eq_ignore_ascii_case(RUSTUDIO_PAGE_NAME) {
+            self.page = RUSTUDIO_PAGE;
         }
     }
 
     fn matches(&self, d: &Def) -> bool {
         let q = self.search.trim().to_lowercase();
         q.is_empty() || d.label.to_lowercase().contains(&q)
+    }
+
+    fn matches_opt(&self, o: &crate::rustudio_settings::Opt) -> bool {
+        let q = self.search.trim().to_lowercase();
+        q.is_empty() || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
     }
 
     pub fn ui(&mut self, ctx: &egui::Context) {
@@ -624,9 +644,12 @@ impl Dialog {
         }
 
         // Pages that have a matching row; the shown page stays one of them.
-        let visible: Vec<usize> = (0..PAGES.len())
+        let mut visible: Vec<usize> = (0..PAGES.len())
             .filter(|&i| DEFS.iter().any(|d| d.page == PAGES[i] && self.matches(d)))
             .collect();
+        if crate::rustudio_settings::OPTS.iter().any(|o| self.matches_opt(o)) {
+            visible.push(RUSTUDIO_PAGE);
+        }
         if !visible.contains(&self.page) {
             if let Some(&f) = visible.first() {
                 self.page = f;
@@ -639,7 +662,12 @@ impl Dialog {
         let list = Rect::from_min_max(Pos2::new(full.min.x, top), Pos2::new(full.min.x + list_w, bottom));
         p.rect_filled(list, 0.0, c::LIST);
         for (n, &i) in visible.iter().enumerate() {
-            let r = Rect::from_min_size(Pos2::new(list.min.x, list.min.y + n as f32 * LIST_ROW_H), Vec2::new(list_w, LIST_ROW_H));
+            // (rustudio's page sits apart from Studio's, below a rule.)
+            let gap = if i == RUSTUDIO_PAGE && n > 0 { 9.0 } else { 0.0 };
+            let r = Rect::from_min_size(Pos2::new(list.min.x, list.min.y + n as f32 * LIST_ROW_H + gap), Vec2::new(list_w, LIST_ROW_H));
+            if gap > 0.0 {
+                p.hline(list.min.x + 4.0..=list.max.x - 4.0, r.min.y - gap / 2.0, egui::Stroke::new(1.0, c::TEXT_DIM.gamma_multiply(0.6)));
+            }
             let resp = ui.interact(r, egui::Id::new(("studio_settings_page", i)), Sense::click());
             self.hits.push((Hit::Page(i), r));
             if i == self.page {
@@ -647,7 +675,7 @@ impl Dialog {
             } else if resp.hovered() {
                 p.rect_filled(r, 0.0, c::LIST_HOVER);
             }
-            p.text(Pos2::new(r.min.x + 4.0, r.center().y), egui::Align2::LEFT_CENTER, PAGES[i], FontId::proportional(FONT), c::TEXT);
+            p.text(Pos2::new(r.min.x + 4.0, r.center().y), egui::Align2::LEFT_CENTER, page_name(i), FontId::proportional(FONT), c::TEXT);
             if resp.clicked() && i != self.page {
                 self.page = i;
                 self.editing = None;
@@ -713,6 +741,9 @@ impl Dialog {
 
     /// The page's property grid.
     fn grid(&mut self, ui: &mut egui::Ui) {
+        if self.page == RUSTUDIO_PAGE {
+            return self.rustudio_grid(ui);
+        }
         let page = PAGES[self.page];
         let rows: Vec<usize> = (0..DEFS.len()).filter(|&i| DEFS[i].page == page && self.matches(&DEFS[i])).collect();
         let w = ui.available_width();
@@ -731,23 +762,8 @@ impl Dialog {
             if d.cat != cat {
                 cat = d.cat;
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
-                let p = ui.painter();
                 let open = !self.collapsed.contains(&(self.page, cat));
-                let tri = Rect::from_center_size(Pos2::new(r.min.x + 9.0, r.center().y), Vec2::splat(12.0));
-                crate::ti::paint(p, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, c::TEXT);
-                let mut job = egui::text::LayoutJob::default();
-                job.append(
-                    cat,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: FontId::new(FONT, egui::FontFamily::Name("bold".into())),
-                        color: c::TEXT,
-                        extra_letter_spacing: 1.5,
-                        ..Default::default()
-                    },
-                );
-                let g = ui.fonts_mut(|f| f.layout_job(job));
-                p.galley(Pos2::new(r.min.x + 22.0, r.center().y - g.size().y / 2.0), g, c::TEXT);
+                paint_category(ui, r, cat, open);
                 if resp.clicked() {
                     if open {
                         self.collapsed.insert((self.page, cat));
@@ -779,6 +795,12 @@ impl Dialog {
         let vx = r.min.x + col;
         let vr = Rect::from_min_max(Pos2::new(vx, inner.min.y), inner.max);
         let vresp = ui.interact(vr, egui::Id::new(("studio_settings_value", i)), Sense::click());
+        if self.reveal == Some(i) {
+            // (the grid's scroll offset next frame: the row a third down)
+            self.reveal = None;
+            let in_content = r.min.y - ui.min_rect().min.y;
+            self.scroll_to = Some((in_content - ui.clip_rect().height() / 3.0).max(0.0));
+        }
         if ui.clip_rect().intersects(vr) {
             self.hits.push((Hit::Value(i), vr.intersect(ui.clip_rect())));
         }
@@ -879,6 +901,180 @@ impl Dialog {
     }
 }
 
+// ------------------------------------------------------------------ the rustudio page
+
+const DESC_FONT: f32 = 11.0;
+
+impl Dialog {
+    /// rustudio's own options (src/rustudio_settings.rs): the grid's look,
+    /// each row followed by its description; a row an environment variable
+    /// overrides shows that and can't be changed.
+    fn rustudio_grid(&mut self, ui: &mut egui::Ui) {
+        use crate::rustudio_settings::{self as rs, OptKind, Shown, OPTS};
+        let rows: Vec<usize> = (0..OPTS.len()).filter(|&i| self.matches_opt(&OPTS[i])).collect();
+        let w = ui.available_width();
+        let font = FontId::proportional(FONT);
+        let label_w = rows
+            .iter()
+            .map(|&i| ui.fonts_mut(|f| f.layout_no_wrap(OPTS[i].label.to_string(), font.clone(), c::TEXT).size().x))
+            .fold(0.0f32, f32::max);
+        let col = 22.0 + label_w + 8.0;
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        let mut cat = "";
+        for &i in &rows {
+            let o = &OPTS[i];
+            if o.cat != cat {
+                cat = o.cat;
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::click());
+                let open = !self.collapsed.contains(&(self.page, cat));
+                paint_category(ui, r, cat, open);
+                if resp.clicked() {
+                    if open {
+                        self.collapsed.insert((self.page, cat));
+                    } else {
+                        self.collapsed.remove(&(self.page, cat));
+                    }
+                }
+            }
+            if self.collapsed.contains(&(self.page, o.cat)) {
+                continue;
+            }
+            let env = rs::overridden_by(o);
+            let inactive = rs::inactive(o);
+            let locked = env.is_some();
+            let mut note = o.desc.to_string();
+            if let Some(e) = env {
+                note = format!("Set by {e} (the environment wins over this setting). {note}");
+            } else if inactive.is_some() {
+                note = format!("No effect with the Legacy solver. {note}");
+            }
+            let galley = ui.fonts_mut(|f| {
+                f.layout(note, FontId::proportional(DESC_FONT), c::TEXT_DIM, (w - 22.0 - 8.0).max(80.0))
+            });
+            let h = ROW_H + galley.size().y + 5.0;
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
+            let inner = Rect::from_min_max(r.min, Pos2::new(r.max.x, r.max.y - 1.0));
+            let p = ui.painter().clone();
+            p.rect_filled(inner, 0.0, if resp.hovered() { c::ROW_HOVER } else { c::ROW });
+            let top = Rect::from_min_size(r.min, Vec2::new(w, ROW_H));
+            p.vline(r.min.x + col - 4.0, top.y_range(), egui::Stroke::new(1.0, c::BG));
+            let dim = locked || inactive.is_some();
+            let tc = if dim { c::TEXT_DIM } else { c::TEXT };
+            p.text(Pos2::new(r.min.x + 22.0, top.center().y), egui::Align2::LEFT_CENTER, o.label, font.clone(), tc);
+            p.galley(Pos2::new(r.min.x + 22.0, top.max.y + 1.0), galley, c::TEXT_DIM);
+            let vx = r.min.x + col;
+            let vr = Rect::from_min_max(Pos2::new(vx, top.min.y), Pos2::new(top.max.x, top.max.y - 1.0));
+            let vresp = ui.interact(vr, egui::Id::new(("rustudio_option_value", i)), if locked { Sense::hover() } else { Sense::click() });
+            if ui.clip_rect().intersects(vr) {
+                self.hits.push((Hit::Opt(i), vr.intersect(ui.clip_rect())));
+            }
+            match (o.kind, rs::shown(o)) {
+                (OptKind::Bool, Shown::Bool(b)) => {
+                    let br = Rect::from_center_size(Pos2::new(vx + 10.0, top.center().y), Vec2::splat(15.0));
+                    let on = if dim { c::TEXT_DIM } else { c::CHECK_ON };
+                    if b {
+                        p.rect_filled(br, 2.0, on);
+                        crate::ti::paint(&p, br.shrink(1.0), "check", c::CHECK_MARK);
+                    } else {
+                        p.rect_filled(br, 2.0, c::CHECK_OFF);
+                    }
+                    if vresp.clicked() {
+                        rs::set_bool(o.key, !b);
+                    }
+                }
+                (OptKind::Choice(items), Shown::Choice(sel)) => {
+                    let text = items.get(sel).map(|x| x.1).unwrap_or("");
+                    p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, text, font.clone(), tc);
+                    let id = egui::Id::new(("rustudio_option_choice", i));
+                    if vresp.clicked() {
+                        egui::Popup::open_id(ui.ctx(), id);
+                    }
+                    let width = vr.width().clamp(140.0, 320.0);
+                    let mut picked = None;
+                    egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(vr.left_bottom()), ui.layer_id())
+                        .open_memory(None)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                        .width(width)
+                        .frame(egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                        .show(|ui| {
+                            ui.set_width(width - 4.0);
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                            for (n, (_, s)) in items.iter().enumerate() {
+                                let (ir, iresp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 19.0), Sense::click());
+                                if n == sel || iresp.hovered() {
+                                    ui.painter().rect_filled(ir, 0.0, if n == sel { c::LIST_SEL } else { c::LIST_HOVER });
+                                }
+                                ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *s, FontId::proportional(FONT), c::TEXT);
+                                if iresp.clicked() {
+                                    picked = Some(n);
+                                }
+                            }
+                        });
+                    if let Some(n) = picked {
+                        rs::set_choice(o.key, items[n].0, items[0].0);
+                    }
+                }
+                (OptKind::Path, Shown::Path(path)) => {
+                    // Index past DEFS so it never shares Studio's rows' edit state.
+                    let ei = DEFS.len() + i;
+                    let editing = self.editing.as_ref().is_some_and(|(e, _)| *e == ei);
+                    if editing && !locked {
+                        let er = Rect::from_min_max(Pos2::new(vx + 1.0, top.min.y + 1.0), Pos2::new(top.max.x - 2.0, top.max.y - 2.0));
+                        let mut text = self.editing.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+                        let te = ui.put(
+                            er,
+                            egui::TextEdit::singleline(&mut text)
+                                .id(egui::Id::new(("rustudio_option_edit", i)))
+                                .font(font.clone())
+                                .margin(egui::Margin::symmetric(2, 1)),
+                        );
+                        if !te.has_focus() && !te.lost_focus() {
+                            te.request_focus();
+                        }
+                        let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                        let esc = ui.input(|inp| inp.key_pressed(egui::Key::Escape));
+                        if esc {
+                            self.editing = None;
+                        } else if te.lost_focus() || enter {
+                            rs::set_path(o.key, &text);
+                            self.editing = None;
+                        } else {
+                            self.editing = Some((ei, text));
+                        }
+                    } else {
+                        let (t, col) = if path.is_empty() { ("(off)".to_string(), c::TEXT_DIM) } else { (path.clone(), tc) };
+                        p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, t, font.clone(), col);
+                        if vresp.clicked() {
+                            self.editing = Some((ei, path));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A grid category header: the caret and the spaced bold name.
+fn paint_category(ui: &egui::Ui, r: Rect, cat: &str, open: bool) {
+    let p = ui.painter();
+    let tri = Rect::from_center_size(Pos2::new(r.min.x + 9.0, r.center().y), Vec2::splat(12.0));
+    crate::ti::paint(p, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, c::TEXT);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        cat,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::new(FONT, egui::FontFamily::Name("bold".into())),
+            color: c::TEXT,
+            extra_letter_spacing: 1.5,
+            ..Default::default()
+        },
+    );
+    let g = ui.fonts_mut(|f| f.layout_job(job));
+    p.galley(Pos2::new(r.min.x + 22.0, r.center().y - g.size().y / 2.0), g, c::TEXT);
+}
+
 // ------------------------------------------------------------------ Luau (settings())
 
 /// The settings() items the dialog has rows for (their members go through
@@ -941,13 +1137,12 @@ pub fn lua_set(class: &str, key: &str, value: &mlua::Value) -> mlua::Result<Opti
             return Err(mlua::Error::RuntimeError(format!("Unable to assign property {key}. Property is read only")));
         }
         Kind::Font | Kind::Dir => return Ok(None),
-        Kind::Bool => match value {
-            Value::Boolean(b) => Val::Bool(*b),
-            Value::Nil => Val::Bool(false),
-            _ => return Err(bad("bool")),
-        },
-        Kind::Int => Val::Num(num(value).ok_or_else(|| bad("int"))?.trunc()),
-        Kind::Float => Val::Num(num(value).ok_or_else(|| bad("float"))?),
+        // Studio takes any value for a bool setting (truthiness) and reads
+        // anything that isn't a number or a numeric string as 0 for a number
+        // one (api-walk: write-table ok's bool rule).
+        Kind::Bool => Val::Bool(!matches!(value, Value::Nil | Value::Boolean(false))),
+        Kind::Int => Val::Num(num(value).unwrap_or(0.0).trunc()),
+        Kind::Float => Val::Num(num(value).unwrap_or(0.0)),
         Kind::Str => match value {
             Value::String(s) => Val::Str(s.to_str()?.to_string()),
             Value::Integer(_) | Value::Number(_) => Val::Str(num(value).map(|n| n.to_string()).unwrap_or_default()),
@@ -957,7 +1152,10 @@ pub fn lua_set(class: &str, key: &str, value: &mlua::Value) -> mlua::Result<Opti
             if en == "StudioTheme" || en == "Language" {
                 return Ok(None);
             }
-            let e = enum_from_lua(value, en, items).ok_or_else(|| bad(&format!("Enum.{en}")))?;
+            let e = enum_from_lua(value, en, items).ok_or_else(|| match value {
+                Value::UserData(_) | Value::Integer(_) | Value::Number(_) | Value::String(_) => bad(&format!("Enum.{en}")),
+                _ => bad("EnumItem, number, or string"),
+            })?;
             if !items.iter().any(|x| x.1 == e) {
                 return Err(bad(&format!("Enum.{en}")));
             }

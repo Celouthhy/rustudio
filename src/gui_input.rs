@@ -112,7 +112,6 @@ impl Gui {
     pub fn sync_roots(&mut self, d: &mut Document) {
         let _p = crate::bench::scope("gui_roots");
         let marks = d.marks_for(doc::Reader::Gui);
-        self.vf_dirty(d, &marks);
         self.cache_marks(d, &marks);
         let ws = d.workspace();
         let layer = |d: &Document, r: Ref| {
@@ -190,6 +189,72 @@ impl Gui {
                         .collect(),
                     None => HashSet::new(),
                 };
+                self.root_boxes.clear();
+                self.layout.clear();
+                self.layout_from.clear();
+                self.layout_changed = true;
+            }
+        }
+    }
+
+    /// `sync_roots` for a plugin `Gui` (Roots::CoreGui / Widget): the
+    /// journal's marks come from the caller (one reader for all plugin
+    /// GUIs: src/plugin_host/widgets_ui.rs). Keeps the BillboardGuis /
+    /// SurfaceGuis under CoreGui and the handle adornments under CoreGui or
+    /// Workspace (Studio draws a plugin's handles in the edit view).
+    pub fn sync_plugin(&mut self, d: &Document, marks: &doc::Marks) {
+        let _p = crate::bench::scope("gui_roots_plugin");
+        self.cache_marks(d, marks);
+        let root = d.dom.root_ref();
+        let core = d.find_child(root, "CoreGui");
+        let ws = d.workspace();
+        let under = |r: Ref| core.is_some_and(|c| d.is_ancestor(c, r)) || ws.is_some_and(|w| d.is_ancestor(w, r));
+        let layer = |r: Ref| {
+            d.dom.get_by_ref(r).is_some_and(|i| i.class == "SurfaceGui" || i.class == "BillboardGui")
+                && core.is_some_and(|c| d.is_ancestor(c, r))
+        };
+        match marks {
+            doc::Marks::Some(marks) if d.id == self.roots_doc => {
+                for m in marks {
+                    let doc::Mark::Tree(t) = m else { continue };
+                    for r in d.subtree(*t) {
+                        let adorn = d.class_of(r).is_some_and(|c| super::adorn::is_adornment(&c));
+                        if adorn && under(r) {
+                            self.adorn_roots.insert(r);
+                        } else {
+                            self.adorn_roots.remove(&r);
+                        }
+                        let keep = layer(r);
+                        let has = self.world_roots_set.contains(&r);
+                        if keep && !has {
+                            self.world_roots_set.insert(r);
+                            self.world_roots.push(r);
+                        } else if !keep && has {
+                            self.world_roots_set.remove(&r);
+                            self.world_roots.retain(|x| *x != r);
+                            self.root_boxes.remove(&r);
+                        }
+                    }
+                    // (a removed subtree: its entries go)
+                    if !d.exists(*t) {
+                        self.adorn_roots.remove(t);
+                    }
+                }
+                self.adorn_roots.retain(|r| d.exists(*r));
+            }
+            _ => {
+                self.roots_doc = d.id;
+                let scan = |top: Option<Ref>| -> Vec<Ref> {
+                    top.map(|t| d.dom.descendants_of(t).map(|i| i.referent()).collect()).unwrap_or_default()
+                };
+                let core_list = scan(core);
+                self.world_roots = core_list.iter().copied().filter(|r| layer(*r)).collect();
+                self.world_roots_set = self.world_roots.iter().copied().collect();
+                self.adorn_roots = core_list
+                    .into_iter()
+                    .chain(scan(ws))
+                    .filter(|r| d.class_of(*r).is_some_and(|c| super::adorn::is_adornment(&c)))
+                    .collect();
                 self.root_boxes.clear();
                 self.layout.clear();
                 self.layout_from.clear();
@@ -405,66 +470,14 @@ impl Gui {
         }
     }
 
-    /// ViewportFrames draw again only when what they show changed: a mark on
-    /// the frame or anything under it, on its camera, or a part it drew
-    /// being taken away.
-    fn vf_dirty(&mut self, d: &Document, marks: &doc::Marks) {
-        if self.vf_targets.is_empty() {
-            return;
-        }
-        let marks = match marks {
-            doc::Marks::Some(m) if d.id == self.roots_doc => m,
-            _ => {
-                for t in self.vf_targets.values_mut() {
-                    t.dirty = true;
-                }
-                return;
-            }
-        };
-        for m in marks {
-            let (r, tree) = match *m {
-                doc::Mark::Prop(r, _) => (r, false),
-                doc::Mark::Tree(r) => (r, true),
-            };
-            let mut cur = r;
-            while let Some(i) = d.dom.get_by_ref(cur) {
-                if let Some(t) = self.vf_targets.get_mut(&cur) {
-                    t.dirty = true;
-                    break;
-                }
-                cur = i.parent();
-            }
-            for t in self.vf_targets.values_mut() {
-                if !t.dirty && t.cam == Some(r) {
-                    t.dirty = true;
-                }
-            }
-            if tree && self.vf_targets.values().any(|t| !t.dirty && !t.parts.is_empty()) {
-                for x in d.subtree(r) {
-                    for t in self.vf_targets.values_mut() {
-                        if t.parts.contains(&x) {
-                            t.dirty = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Draws every GUI in view and remembers what can be clicked.
     pub fn draw(&mut self, ctx: &egui::Context, painter: &egui::Painter, mut inp: DrawIn<'_>) {
-        if let Some(rs) = inp.render_state {
-            self.vf_targets.retain(|r, target| {
-                let keep = inp.doc.exists(*r) && target.used.elapsed().as_secs() < 30;
-                if !keep { rs.renderer.write().free_texture(&target.id); }
-                keep
-            });
-        }
+        self.vf_live.clear();
         self.hits.clear();
         self.world_batches.clear();
         self.cache_check(ctx, inp.doc);
         self.fx_frame(inp.doc);
-        if inp.playing {
+        if (inp.playing && inp.roots == Roots::View) || inp.roots == Roots::CoreGui {
             let _a = crate::bench::scope("gui_adorn");
             self.draw_adornments(inp.doc, inp.cam, inp.rect, painter);
         }
@@ -476,7 +489,9 @@ impl Gui {
 
         // ScreenGuis: the LocalPlayer's PlayerGui while playing; StarterGui
         // (ShowDevelopmentGui) while editing, as Studio shows them.
-        let screen_parent = if inp.playing {
+        let screen_parent = if inp.roots != Roots::View {
+            None
+        } else if inp.playing {
             d.find_child(root, "Players")
                 .and_then(|p| match d.prop(p, "LocalPlayer") {
                     Some(Variant::Ref(lp)) if d.exists(lp) => d.find_child(lp, "PlayerGui"),
@@ -526,11 +541,60 @@ impl Gui {
                 }
             }
         }
+        match inp.roots {
+            Roots::View => {}
+            // A plugin's dock widget: its panel's content is the canvas, in
+            // widget pixels from the panel's top-left.
+            Roots::Widget(w) => {
+                if d.exists(w) {
+                    roots.push(Root {
+                        on_top: true,
+                        light: 1.0,
+                        order: 0,
+                        dist: 0.0,
+                        gui: w,
+                        target: Target::Screen(rect.min),
+                        canvas: [rect.width(), rect.height()],
+                        abs_offset: [0.0, 0.0],
+                    });
+                }
+            }
+            // CoreGui in the edit viewport: its ScreenGuis (directly in it or
+            // in Folders) cover the whole view with no inset (F46: the
+            // viewport's size, IgnoreGuiInset false).
+            Roots::CoreGui => {
+                if let Some(core) = d.find_child(root, "CoreGui") {
+                    let mut stack: Vec<Ref> = children(d, core);
+                    stack.reverse();
+                    while let Some(g) = stack.pop() {
+                        let Some(class) = d.class_of(g) else { continue };
+                        if class == "ScreenGui" {
+                            if boolp(d, g, "Enabled", true) {
+                                roots.push(Root {
+                                    on_top: true,
+                                    light: 1.0,
+                                    order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                    dist: 0.0,
+                                    gui: g,
+                                    target: Target::Screen(rect.min),
+                                    canvas: [rect.width(), rect.height()],
+                                    abs_offset: [0.0, 0.0],
+                                });
+                            }
+                        } else if !doc::is_a(&class, "LayerCollector") && !doc::is_a(&class, "GuiObject") {
+                            let mut k = children(d, g);
+                            k.reverse();
+                            stack.extend(k);
+                        }
+                    }
+                }
+            }
+        }
         layered.extend(
             self.world_roots
                 .iter()
                 .copied()
-                .filter(|g| d.exists(*g) && boolp(d, *g, "Enabled", true)),
+                .filter(|g| !matches!(inp.roots, Roots::Widget(_)) && d.exists(*g) && boolp(d, *g, "Enabled", true)),
         );
         drop(pre);
         let place = crate::bench::scope("gui_place");
@@ -580,7 +644,7 @@ impl Gui {
             let canvas_rect =
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(root.canvas[0], root.canvas[1]));
             let clip =
-                if class == "ScreenGui" || boolp(d, g, "ClipsDescendants", class == "SurfaceGui") {
+                if class == "ScreenGui" || doc::is_a(&class, "PluginGui") || boolp(d, g, "ClipsDescendants", class == "SurfaceGui") {
                     canvas_rect
                 } else {
                     Rect::EVERYTHING
@@ -591,6 +655,7 @@ impl Gui {
                 rot: 0.0,
                 text: None,
                 canvas: None,
+                canvas_fit: None,
             };
             if self.layout.insert(g, root_box) != Some(root_box) {
                 self.layout_changed = true;
@@ -631,14 +696,14 @@ impl Gui {
             let mut kept: Option<RootCache> = None;
             let mut reuse: Option<RootCache> = None;
             if let Some(c) = self.cache.get(&g).filter(|c| c.key == key) {
-                let vfs_ok = c.vfs.iter().all(|v| self.vf_targets.get(v).is_some_and(|t| !t.dirty));
+                // (its ViewportFrames' images are the renderer's, updated in
+                // place: kept unless one got a new texture)
+                let vfs_ok = c.vfs.iter().all(|v| {
+                    let now = self.vf_tex.get(v).filter(|t| Some(&t.1) == self.vf_size.get(v)).map(|t| t.0);
+                    self.vf_walked.get(v).is_some_and(|w| *w == now && now.is_some())
+                });
                 if vfs_ok {
-                    let now = std::time::Instant::now();
-                    for v in &c.vfs {
-                        if let Some(t) = self.vf_targets.get_mut(v) {
-                            t.used = now;
-                        }
-                    }
+                    self.vf_live.extend(c.vfs.iter().copied());
                 }
                 if vfs_ok && verify {
                     kept = self.cache.remove(&g);
@@ -805,6 +870,7 @@ impl Gui {
                             tint: [1.0, 1.0, 1.0],
                             scale: root_scale,
                             z: 0,
+                            turn: 0.0,
                         },
                     );
                     drop(walk_scope);
@@ -834,7 +900,7 @@ impl Gui {
                             rec: Vec::new(),
                             replaying: 0,
                         };
-                        w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0 });
+                        w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0, turn: 0.0 });
                         let (items2, hits2, boxes2) = (std::mem::take(&mut w.items), std::mem::take(&mut w.hits), std::mem::take(&mut w.boxes));
                         self.memo_off = false;
                         self.no_cache = saved.0;
@@ -1120,6 +1186,34 @@ impl Gui {
 
     /// Pointer over the viewport: hover, clicks and the wheel. Queues events;
     /// returns true when the GUI took the input (no 3D picking or clicks).
+    /// Some GUI object has the pointer over it (MouseEnter without a Leave yet).
+    pub fn has_hover(&self) -> bool {
+        !self.hovered.is_empty()
+    }
+
+    /// A drag from elsewhere (Explorer instances) let go at `p` over this
+    /// plugin GUI: nothing here was pressed, so only the top object that
+    /// takes clicks hears MouseButton1Up (a button) and InputEnded
+    /// (MouseButton1); no Click or Activated (Studio 0.747,
+    /// checks/plugins/ref/captures/xdrag.txt S1, S4).
+    pub fn drop_release(&mut self, p: Pos2, rect: Rect) {
+        let Some(t) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|h| h.sink && point_in_quad(&h.quad, p) && h.clip.is_none_or(|c| point_in_quad(&c, p)))
+            .cloned()
+        else {
+            return;
+        };
+        let inset = self.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+        let (x, y) = (p.x - rect.left(), p.y - rect.top() - inset);
+        if t.button {
+            self.events.push(GuiEvent::Fire(t.r, "MouseButton1Up", vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)]));
+        }
+        self.events.push(GuiEvent::Fire(t.r, "InputEnded", vec![GuiArg::Input { button: 1, began: false, x, y }]));
+    }
+
     pub fn input(&mut self, ctx: &egui::Context, resp: &egui::Response, rect: Rect) -> bool {
         let pointer = self.pointer_override.or(resp.hover_pos()).filter(|p| rect.contains(*p));
         let under: Vec<Hit> = match pointer {
@@ -1135,7 +1229,14 @@ impl Gui {
         };
         let top = under.iter().rev().find(|h| h.sink).cloned();
         // GUI coordinates: from the view's top-left, below the top bar inset (as InputObject.Position).
-        let gui_xy = |p: Pos2| (p.x - rect.left(), p.y - rect.top() - mech::GUI_TOP_INSET);
+        let inset = self.input_inset.unwrap_or(mech::GUI_TOP_INSET);
+        // Plugin GUIs (dock widgets, CoreGui in the edit view) follow Studio's
+        // edit-mode order (checks/plugins/widgets/captures): the pointer coming
+        // in is an InputBegan (MouseMovement), MouseButton1Down comes before
+        // InputBegan, MouseButton1Click before MouseButton1Up, Activated's
+        // click count is 0.
+        let plugin = self.input_inset.is_some();
+        let gui_xy = |p: Pos2| (p.x - rect.left(), p.y - rect.top() - inset);
         let now: HashSet<Ref> = under.iter().map(|h| h.r).collect();
         let moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
         if let Some(p) = pointer {
@@ -1147,6 +1248,9 @@ impl Gui {
                         "MouseEnter",
                         vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
                     ));
+                    if plugin {
+                        self.events.push(GuiEvent::Fire(h.r, "InputBegan", vec![GuiArg::Input { button: 0, began: true, x, y }]));
+                    }
                 } else if moved {
                     self.events.push(GuiEvent::Fire(
                         h.r,
@@ -1174,6 +1278,9 @@ impl Gui {
                 "MouseLeave",
                 vec![GuiArg::Num(lx as f64), GuiArg::Num(ly as f64)],
             ));
+            if plugin {
+                self.events.push(GuiEvent::Fire(*r, "InputEnded", vec![GuiArg::Input { button: 0, began: false, x: lx, y: ly }]));
+            }
         }
         self.hovered = now;
         {
@@ -1233,6 +1340,7 @@ impl Gui {
                     sh.focus = None;
                     self.focus = None;
                 }
+                let began_at = self.events.len();
                 for h in &under {
                     self.events
                         .push(GuiEvent::Fire(h.r, "InputBegan", vec![input.clone()]));
@@ -1258,7 +1366,7 @@ impl Gui {
                     self.pressed = Some((t.r, b));
                     super::share().pressed = Some(t.r);
                     if t.button {
-                        self.events.push(GuiEvent::Fire(
+                        let ev = GuiEvent::Fire(
                             t.r,
                             if b == 1 {
                                 "MouseButton1Down"
@@ -1266,7 +1374,12 @@ impl Gui {
                                 "MouseButton2Down"
                             },
                             vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
-                        ));
+                        );
+                        if plugin {
+                            self.events.insert(began_at, ev);
+                        } else {
+                            self.events.push(ev);
+                        }
                     }
                     if t.textbox && b == 1 && self.focus != Some(t.r) {
                         self.focus = Some(t.r);
@@ -1292,6 +1405,7 @@ impl Gui {
                     }
                     took = true;
                     if self.hits.iter().any(|h| h.r == pr && h.button) {
+                        let up_at = self.events.len();
                         self.events.push(GuiEvent::Fire(
                             pr,
                             if b == 1 {
@@ -1301,7 +1415,16 @@ impl Gui {
                             },
                             vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
                         ));
-                        if top.as_ref().is_some_and(|t| t.r == pr) {
+                        if plugin && top.as_ref().is_some_and(|t| t.r == pr) {
+                            // Click, Up, Activated (count 0)
+                            let up = self.events.remove(up_at);
+                            self.events.push(GuiEvent::Fire(pr, if b == 1 { "MouseButton1Click" } else { "MouseButton2Click" }, vec![]));
+                            self.events.push(up);
+                            if b == 1 {
+                                self.events.push(GuiEvent::Fire(pr, "Activated", vec![input.clone(), GuiArg::Num(0.0)]));
+                            }
+                            self.last_click = Some(pr);
+                        } else if top.as_ref().is_some_and(|t| t.r == pr) {
                             self.events.push(GuiEvent::Fire(
                                 pr,
                                 if b == 1 {

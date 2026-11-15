@@ -30,7 +30,14 @@ quite yet.
   project folders (`*.project.json` with plain files as the source of truth,
   Rojo/Argon sync rules, `sourcemap.json`, and File > Save as Project
   Folder… to turn any place into one).
-- **Play / Run:** separate server and client, remotes, physics (rapier3d),
+- **Plugins:** Roblox Studio plugins run in the editor: local plugins from a
+  Plugins folder and plugins installed from the Creator Store, with
+  toolbars, dock widgets, menus, drag and drop, and Plugins > Manage Plugins
+  to install, update, turn off or remove them. Rojo and Argon connect.
+- **Toolbox:** search the Creator Store, your Inventory, Recent and
+  Creations, and insert models, meshes, images, audio and plugins (signed in).
+- **Play / Run:** separate server and client, remotes, physics that follows
+  Studio's solver (`RUSTUDIO_SOLVER=rapier` for the earlier rapier3d one),
   R15/R6 characters with climbing and held jump, saved play settings, shift
   lock, sounds, tweens, 2D and 3D GUIs.
 - **Luau:** the real Luau VM, with most of the engine API that real games

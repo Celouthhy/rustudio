@@ -45,6 +45,8 @@ impl<Tab> DockArea<'_, Tab> {
             let tab_dst = self.show_drag_drop_overlay(ui, &mut state, tab_viewer);
             if ui.input(|i| i.pointer.primary_released())
                 && let Some(destination) = tab_dst
+                && !(state.floating_drag.is_some()
+                    && matches!(destination, TabDestination::Window(_)))
             {
                 let source = {
                     match state.dnd.as_ref().unwrap().drag.src {
@@ -68,6 +70,13 @@ impl<Tab> DockArea<'_, Tab> {
         }
 
         if ui.input(|i| i.pointer.primary_released()) {
+            if let Some((surface, origin, pointer_origin)) = state.floating_drag
+                && let Some(pointer) = ui.ctx().pointer_interact_pos()
+                && self.dock_state.is_surface_valid(surface)
+                && let Some(window) = self.dock_state.get_window_state_mut(surface)
+            {
+                window.set_position(origin + (pointer - pointer_origin));
+            }
             state.reset_drag();
         }
 
@@ -234,6 +243,7 @@ impl<Tab> DockArea<'_, Tab> {
         }
 
         let window_bounds = self.window_bounds.unwrap();
+        let live_window_drag = state.floating_drag.is_some();
         match (style.overlay.overlay_type, drag_state.is_on_title_bar()) {
             (OverlayType::HighlightedAreas, _) | (_, true) => drag_state.resolve_traditional(
                 ui,
@@ -241,6 +251,7 @@ impl<Tab> DockArea<'_, Tab> {
                 allowed_splits,
                 allowed_in_window,
                 window_bounds,
+                live_window_drag,
             ),
             (OverlayType::Widgets, false) => drag_state.resolve_icon_based(
                 ui,
@@ -248,6 +259,7 @@ impl<Tab> DockArea<'_, Tab> {
                 allowed_splits,
                 allowed_in_window,
                 window_bounds,
+                live_window_drag,
             ),
         }
     }

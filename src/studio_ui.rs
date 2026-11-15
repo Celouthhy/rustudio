@@ -94,6 +94,8 @@ pub struct UiState {
     pub popped: Vec<(String, Vec<Tab>)>,
     /// The tabs in the 3D view's tab group last frame.
     pub viewport_group: Vec<Tab>,
+    /// Another tab (a script) was in front of the 3D view last frame.
+    pub viewport_hidden: bool,
     /// How the panel windows were shown last frame (`Immediate`: real OS
     /// windows; `EmbeddedWindow`: the backend can't, so inside the main one).
     pub popped_class: Option<egui::ViewportClass>,
@@ -118,6 +120,7 @@ impl Default for UiState {
             dock_moves: Vec::new(),
             popped: Vec::new(),
             viewport_group: Vec::new(),
+            viewport_hidden: false,
             popped_class: None,
             zoom: 1.0,
             fullscreen: false,

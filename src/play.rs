@@ -162,6 +162,9 @@ pub struct PlaySession {
     /// The Player instance (server ref).
     pub player: Ref,
     respawn_at: Option<f64>,
+    /// The dead character's parts the server took over (lane DEATH): server part → the
+    /// client copy's interpolation buffer (physics::hum_body::Handover).
+    handover: HashMap<Ref, crate::physics::hum_body::Handover>,
     pub time: f64,
     keys_prev: HashSet<String>,
     /// Keys whose InputBegan was game-processed (pressed into a TextBox):
@@ -229,9 +232,28 @@ impl PlaySession {
     }
 }
 
-/// KeyCode names for the keys the play session reports to scripts.
-fn key_name(k: egui::Key) -> Option<&'static str> {
+/// KeyCode names for the keys the play session reports to scripts. `all`
+/// (no-UI runs, where the editor reserves no key) adds the keys the editor
+/// keeps for itself or never reported: F5–F15, Slash.
+fn key_name(k: egui::Key, all: bool) -> Option<&'static str> {
     use egui::Key::*;
+    if all {
+        match k {
+            F5 => return Some("F5"),
+            F6 => return Some("F6"),
+            F7 => return Some("F7"),
+            F8 => return Some("F8"),
+            F9 => return Some("F9"),
+            F10 => return Some("F10"),
+            F11 => return Some("F11"),
+            F12 => return Some("F12"),
+            F13 => return Some("F13"),
+            F14 => return Some("F14"),
+            F15 => return Some("F15"),
+            Slash => return Some("Slash"),
+            _ => {}
+        }
+    }
     Some(match k {
         A => "A",
         B => "B",
@@ -307,6 +329,10 @@ fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> 
     runtime
         .install_side()
         .map_err(|e| crate::runtime::describe_error(&e))?;
+    crate::load_trace::mark("runtime: side installed");
+    // --fixed-dt: this side's math.random / Random.new seeds, not the
+    // VM's address and the time (src/sim_clock.rs).
+    crate::sim_clock::seed_vm(&runtime.lua, if side == Side::Server { 1 } else { 2 });
     let mut world = World::new(Document::empty(), mode);
     world.doc = None;
     world.side = side;
@@ -320,6 +346,16 @@ fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> 
 impl Editor {
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
+    }
+
+    /// The edit document Play keeps while it runs (the plugin host's).
+    /// The edit document Play keeps aside while it runs.
+    pub fn play_saved_doc(&self) -> Option<&Document> {
+        self.play.as_ref()?.saved_doc.as_ref()
+    }
+
+    pub fn play_saved_doc_mut(&mut self) -> Option<&mut Document> {
+        self.play.as_mut()?.saved_doc.as_mut()
     }
 
     /// True while the editor shows the client of a Play session: mouse and
@@ -372,7 +408,7 @@ impl Editor {
     /// Runs `f` with one side's runtime entered (its DataModel lent to Lua).
     /// `peer` is the other side's DataModel. Must be called with the server
     /// in front. Output is tagged with the side.
-    fn with_side<R>(
+    pub(crate) fn with_side<R>(
         &mut self,
         side: Side,
         f: impl FnOnce(&Runtime, Option<&Document>, &mut RepMap) -> R,
@@ -381,7 +417,7 @@ impl Editor {
         let (result, output) = match side {
             Side::Server => {
                 let mut w = s.server.world.take()?;
-                w.doc = Some(std::mem::replace(&mut self.doc, Document::empty()));
+                w.doc = Some(std::mem::replace(&mut self.doc, Document::placeholder()));
                 s.server.runtime.enter(w);
                 let r = f(&s.server.runtime, s.other_doc.as_ref(), &mut s.map);
                 let mut w = s.server.runtime.leave();
@@ -435,11 +471,15 @@ impl Editor {
         if self.play.is_some() {
             return;
         }
+        crate::load_trace::mark("play: start asked");
         // Play on a place still loading waits for it (and so for its
         // PlaceId / GameId), as Studio's Play only runs a loaded DataModel.
         if self.defer_play_until_loaded(mode) {
             return;
         }
+        // rustudio's per-session physics options (solver, spin guard, client
+        // link): RUSTUDIO_* env, else the saved option, read once per Play.
+        let solver = crate::rustudio_settings::latch_for_play();
         // Studio Settings > Output > Clear Output On Start, for runs a person
         // drives (harness logs and --log keep everything).
         if self.harness.plain() && crate::studio_settings::flag("Studio", "Clear Output On Start", true) {
@@ -449,7 +489,10 @@ impl Editor {
         // The local player is the signed-in account (identity and avatar),
         // as in Studio: a session check still running at Play is waited for.
         if mode == RunMode::Play {
-            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20)) {
+            // (No character until a script asks, with CharacterAutoLoads
+            // off: the avatar download needn't hold Play's start.)
+            let avatar = self.character_auto_loads();
+            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), avatar) {
                 self.push_log(level, text);
             }
         }
@@ -471,9 +514,13 @@ impl Editor {
                 crate::app::Level::Warn,
                 format!(
                     "DataStores, MemoryStores and Messaging stay in memory for this Play \
-                     (universe {universe} is a published game; RUSTUDIO_LIVE_DATA=1 uses its real data)"
+                     (universe {universe} is a published game; Studio Settings > rustudio > \
+                     Use live DataStores uses its real data)"
                 ),
             );
+        }
+        if crate::rustudio_settings::live_data() {
+            self.info("DataStores: live");
         }
         let server = match new_side(mode, Side::Server, two) {
             Ok(s) => s,
@@ -493,6 +540,7 @@ impl Editor {
         } else {
             None
         };
+        crate::load_trace::mark("play: runtimes made");
         let label = if two { "Play" } else { "Run" };
         let mut server_doc = self
             .doc
@@ -546,6 +594,7 @@ impl Editor {
                 i.properties.insert(ustr("GameId"), Variant::Int64(universe as i64));
             }
         }
+        crate::load_trace::mark("play: server DataModel copied");
         let defaults = if two {
             crate::default_scripts::insert_player_scripts(&mut server_doc)
         } else {
@@ -560,9 +609,12 @@ impl Editor {
         } else {
             (None, RepMap::default())
         };
+        crate::load_trace::mark("play: client DataModel replicated");
         let saved_sel = std::mem::take(&mut self.doc.selection);
         let saved_doc = std::mem::replace(&mut self.doc, server_doc);
         let mut physics = Physics::new(&mut self.doc);
+        crate::load_trace::mark("play: physics built");
+        self.info(format!("Physics solver: {}", solver.name()));
         // One collision-group table for the session: the server's scripts
         // set it, the client's queries and the physics read it.
         let mut server = server;
@@ -592,6 +644,7 @@ impl Editor {
             character: None,
             player: Ref::none(),
             respawn_at: None,
+            handover: HashMap::default(),
             time: 0.0,
             keys_prev: HashSet::new(),
             keys_processed: HashSet::new(),
@@ -641,6 +694,7 @@ impl Editor {
         self.info(match mode {
             RunMode::Play => "▶ Play: a server and a client are running; WASD + Space to move, Shift+F5 to stop",
             RunMode::Run => "▶ Run: server scripts and physics running (no client, no character), Shift+F5 to stop",
+            RunMode::Edit => "",
         });
 
         let bind = |rt: &Runtime, _: Option<&Document>, _: &mut RepMap| {
@@ -655,7 +709,17 @@ impl Editor {
         if two {
             self.with_side(Side::Client, bind);
         }
+        crate::load_trace::mark("play: globals bound");
+        // Studio loads every plugin again in the Play server and client
+        // DataModels (measured: each copy runs with IsEdit false).
+        let host = std::mem::take(&mut self.plugins);
+        self.with_side(Side::Server, |rt, _, _| host.load_into_play(rt));
+        if two {
+            self.with_side(Side::Client, |rt, _, _| host.load_into_play(rt));
+        }
+        self.plugins = host;
         self.with_side(Side::Server, |rt, _, _| rt.warm_queries());
+        crate::load_trace::mark("play: server queries warmed");
         // Server scripts start first, as on a real server; the player joins
         // after (so Players:GetPlayers() is empty when they start).
         let server_scripts = self.server_scripts(None);
@@ -665,6 +729,7 @@ impl Editor {
             }
             rt.dispatch();
         });
+        crate::load_trace::mark("play: server scripts started");
         if two {
             self.create_player();
             let player = self
@@ -690,9 +755,13 @@ impl Editor {
                 }
                 rt.dispatch();
             });
+            crate::load_trace::mark("play: player added");
             self.replicate_now();
+            crate::load_trace::mark("play: replicated");
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
+            crate::load_trace::mark("play: client queries warmed");
             self.setup_client_player();
+            crate::load_trace::mark("play: client player set up");
             // Players.CharacterAutoLoads false: no character until a script
             // calls Player:LoadCharacter (the client's camera is the scripts').
             if self.character_auto_loads() {
@@ -704,6 +773,7 @@ impl Editor {
             }
         }
         self.start_autoplay_sounds();
+        crate::load_trace::mark("play: DataModels running");
     }
 
     /// Player.CharacterRemoving (on both sides) just before the old character
@@ -768,6 +838,12 @@ impl Editor {
         if self.play.is_some() {
             self.server_front();
             self.fire_player_removing();
+            // The Play DataModels' plugin copies unload with them, the
+            // client's first (measured in Studio: PlayClient, then PlayServer).
+            let host = std::mem::take(&mut self.plugins);
+            self.with_side(Side::Client, |rt, _, _| host.unload_from_play(rt));
+            self.with_side(Side::Server, |rt, _, _| host.unload_from_play(rt));
+            self.plugins = host;
         }
         crate::telemetry::flush();
         self.stop_all_sounds();
@@ -1066,8 +1142,10 @@ impl Editor {
                 for r in &fallen {
                     rt.note_orphan(*r);
                 }
+                // (Plugin roots and the objects plugins made stay: src/plugin_host.)
+                let plugin_pins = crate::plugin_host::vm::pinned(&rt.lua);
                 let freed = rt.collect(
-                    &|r| r == player || r == model || map.s2c.contains_key(&r),
+                    &|r| r == player || r == model || map.s2c.contains_key(&r) || plugin_pins.contains(&r),
                     crate::mech::GC_BUDGET,
                 );
                 (freed.len(), if due { rt.mem_stats() } else { String::new() })
@@ -1075,7 +1153,8 @@ impl Editor {
             .unwrap_or_default();
         let (client_freed, cli) = self
             .with_side(Side::Client, |rt, _, map| {
-                let freed = rt.collect(&|r| map.c2s.contains_key(&r), crate::mech::GC_BUDGET);
+                let plugin_pins = crate::plugin_host::vm::pinned(&rt.lua);
+                let freed = rt.collect(&|r| map.c2s.contains_key(&r) || plugin_pins.contains(&r), crate::mech::GC_BUDGET);
                 (freed.len(), if due { rt.mem_stats() } else { String::new() })
             })
             .unwrap_or_default();
@@ -1779,6 +1858,15 @@ impl Editor {
                 }
             }
             s.physics.skip.retain(|x| !parts.contains(x));
+            s.physics.dead_parts.extend(parts.iter().copied());
+            // The server takes the loose parts over; the client shows its copy through
+            // the interpolation buffer from now on (studio path).
+            if s.physics.studio.is_some() && s.client.is_some() {
+                for r in &parts {
+                    s.handover.insert(*r, Default::default());
+                    s.map.buffered.insert(*r);
+                }
+            }
             s.physics.refresh(parts.iter().copied());
         }
         for m in motors {
@@ -1796,6 +1884,58 @@ impl Editor {
                 self.player_name()
             ));
         }
+    }
+
+    /// The client copies of the parts the server took over (`kill_character`): once a
+    /// frame, after the frame's replication, the server's state goes into each part's
+    /// buffer and the client copy takes the buffer's pose (CHAR-NOTES round DEATH).
+    fn handover_frame(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        if s.handover.is_empty() {
+            return;
+        }
+        let now = s.time;
+        if s.other_doc.is_none() {
+            return;
+        }
+        let mut writes: Vec<(Ref, Xform)> = Vec::new();
+        let gone: Vec<Ref> = s.handover.keys().copied().filter(|r| self.doc.dom.get_by_ref(*r).is_none()).collect();
+        for r in gone {
+            s.handover.remove(&r);
+            s.map.buffered.remove(&r);
+        }
+        for (r, h) in s.handover.iter_mut() {
+            let (Some(c), Some(Variant::CFrame(cf))) = (s.map.s2c.get(r).copied(), self.doc.prop(*r, "CFrame")) else {
+                continue;
+            };
+            let owner = Xform::from_cframe(&cf);
+            let (v, w) = s.physics.part_motion(*r).unwrap_or((Vec3::ZERO, Vec3::ZERO));
+            let shown = s
+                .other_doc
+                .as_ref()
+                .and_then(|d| match d.prop(c, "CFrame") {
+                    Some(Variant::CFrame(x)) => Some(Xform::from_cframe(&x)),
+                    _ => None,
+                })
+                .unwrap_or(owner);
+            if let Some(x) = h.frame(now, (owner, v, w), shown) {
+                writes.push((c, x));
+            }
+        }
+        if writes.is_empty() {
+            return;
+        }
+        self.with_side(Side::Client, |rt, _, _| {
+            if let Some(mut w) = rt.world_mut() {
+                let d = w.dm();
+                for (c, x) in &writes {
+                    if let Some(i) = d.dom.get_by_ref_mut(*c) {
+                        i.properties.insert(ustr("CFrame"), Variant::CFrame(x.to_cframe()));
+                    }
+                    d.mark_prop(*c, ustr("CFrame"));
+                }
+            }
+        });
     }
 
     fn respawn(&mut self) {
@@ -2117,6 +2257,15 @@ impl Editor {
         let Some(mode) = self.play.as_ref().map(|p| p.mode) else {
             return;
         };
+        // An avatar that arrived after Play started (it wasn't waited for:
+        // CharacterAutoLoads off) is the next LoadCharacter's.
+        if let (Some(look), Some(s)) = (self.account.avatar(), self.play.as_mut()) {
+            for w in [s.server.world.as_mut(), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
+                if w.avatar.is_none() {
+                    w.avatar = Some(look.clone());
+                }
+            }
+        }
         // Roblox steps the game by at most 1/15 s a frame: slower frames slow
         // time(), physics and animations, while waits keep wall time (World::realtime).
         let realtime = self.fixed_dt.is_none();
@@ -2133,7 +2282,12 @@ impl Editor {
             use crate::runtime::domains::testing as t;
             if let Some(value) = t::take_end_request() {
                 self.stop_play();
-                t::report_test_run(&value, &self.log);
+                // (--no-ui / --result runs end there: Editor::finish_run)
+                if self.harness.ends_on_end_test() {
+                    self.harness.end_value = Some(value);
+                } else {
+                    t::report_test_run(&value, &self.log);
+                }
                 return;
             }
             t::set_editor_state(t::EditorState {
@@ -2173,6 +2327,8 @@ impl Editor {
         // The key positions are physical, like Roblox's KeyCodes: WASD moves
         // from the keys labelled ZQSD on AZERTY (src/keys.rs).
         let textbox = self.gui.focus.is_some();
+        // No-UI runs report every key Roblox has a KeyCode for (F5–F12, /).
+        let all_keys = self.harness.no_ui;
         let blocked = ctx.egui_wants_keyboard_input()
             || self.play.as_ref().is_some_and(|s| s.game.menu_open);
         let typing = blocked || textbox;
@@ -2182,7 +2338,7 @@ impl Editor {
             let mut k: HashSet<String> = self
                 .phys
                 .iter()
-                .filter_map(|k| key_name(k))
+                .filter_map(|k| key_name(k, all_keys))
                 .map(String::from)
                 .collect();
             // egui reports modifiers apart from keys (shift-lock is LeftShift).
@@ -2211,9 +2367,14 @@ impl Editor {
             // (processed when a TextBox had the keys as it was pressed, the
             // Enter that submits it included).
             let taps = std::mem::take(&mut s.game.key_taps);
-            if !blocked {
+            {
+                // (Escape only arrives here in no-UI runs, processed, and gets
+                // past the menu it just opened or closed.)
                 for (k, processed) in taps {
-                    let Some(k) = key_name(k) else { continue };
+                    if blocked && k != egui::Key::Escape {
+                        continue;
+                    }
+                    let Some(k) = key_name(k, all_keys) else { continue };
                     let k = k.to_string();
                     if !raw_keys.contains(&k)
                         && !s.keys_prev.contains(&k)
@@ -2223,6 +2384,8 @@ impl Editor {
                         e.push(k);
                     }
                 }
+            }
+            if !blocked {
                 // Shift has no key event in egui, only modifier state: a
                 // tap pressed and released between two frames (a hitch, a
                 // quick press) would never reach shift lock without this.
@@ -2266,6 +2429,14 @@ impl Editor {
             for (r, v) in vel {
                 s.physics.set_velocity(r, v);
             }
+            // The client's own loose parts near the character, in this world as
+            // stand-ins the character stands on and pushes (studio path,
+            // physics_client_link.rs).
+            if studio_path() && mode == RunMode::Play {
+                let _l = crate::bench::scope("p1b_client_link");
+                let model = s.character.as_ref().map(|c| c.model);
+                s.physics.link_client_bodies(&s.client_sim, &s.map.c2s, model);
+            }
             s.time += dt as f64;
         }
 
@@ -2277,7 +2448,9 @@ impl Editor {
         // Humanoid steps between PreAnimation and the Animator.
         {
             let _s = crate::bench::scope("p2a_lua_pre");
-            if mode == RunMode::Play {
+            // (CameraRelative's turn: on the studio path after the client's
+            // RenderStepped, at the end of the last frame, `hum_face_camera`.)
+            if mode == RunMode::Play && !studio_path() {
                 self.hum_face_camera();
             }
             self.lua_pre_physics(mode, dt, 0);
@@ -2551,7 +2724,7 @@ impl Editor {
         let server_out = self
             .with_side(Side::Server, |rt, _, _| {
                 if let Some(mut w) = rt.world_mut() {
-                    w.velocities = velocities.clone();
+                    w.velocities = velocities.iter().map(|(k, v)| (*k, *v)).collect();
                     w.humanoid_states = state_names
                         .iter()
                         .map(|(k, v)| (*k, v.to_string()))
@@ -2594,6 +2767,7 @@ impl Editor {
             s.map.begin_frame(dt as f64);
         }
         self.replicate();
+        self.handover_frame();
         drop(sc);
         let sc = crate::bench::scope("p6_client_lua");
         if mode == RunMode::Play {
@@ -2738,7 +2912,10 @@ impl Editor {
                     w.keys_down = keys.clone();
                     w.humanoid_states = client_states;
                     if !gui_layout.is_empty() {
-                        w.input.gui_layout = gui_layout;
+                        // (the client's plugin widgets keep their boxes:
+                        // plugin_host/widgets_ui.rs lays them out)
+                        let old = std::mem::replace(&mut w.input.gui_layout, gui_layout);
+                        crate::plugin_host::widgets_ui::keep_play_layout(&old, &mut w.input.gui_layout);
                     }
                     w.input.menu_open = menu_open;
                 }
@@ -2801,6 +2978,7 @@ impl Editor {
                 };
                 mouse_buttons(true);
                 game::fire_gui_events(rt, gui_events, gui_service);
+                game::step_smooth_scrolls(rt, dt);
                 if let Some(on) = window_focus_change {
                     rt.spawn_global("__rs_window_focus", vec![Value::Boolean(on)]);
                 }
@@ -2878,6 +3056,11 @@ impl Editor {
                             w.realtime = realtime;
                         }
                         rt.step(dt as f64);
+                        if studio_path() {
+                            if let Some(mut w) = rt.world_mut() {
+                                hum_glue::scriptable_camera_focus(w.dm());
+                            }
+                        }
                         rt.fire(rs, "RenderStepped", vec![d()]);
                         rt.fire(rs, "PreRender", vec![d()]);
                         rt.dispatch();
@@ -2895,6 +3078,11 @@ impl Editor {
             let req = crate::bench::scope("p6c_requests");
             self.game_requests(Side::Client);
             self.read_client_input_state();
+            // Shift lock / first person: the root turns to the camera RenderStepped
+            // left, before the frame is drawn (play_humanoid.rs `hum_face_camera`).
+            if mode == RunMode::Play && studio_path() {
+                self.hum_face_camera();
+            }
             self.deliver_remotes();
             drop(req);
             // The client's own assemblies (its simulation step in Studio).
@@ -2906,6 +3094,7 @@ impl Editor {
             }
             drop(_cj);
             let _cp = crate::bench::scope("p6e_client_physics");
+            let server_doc = self.doc.id;
             if let Some(s) = self.play.as_mut() {
                 // Velocities client scripts gave parts (the character's own
                 // stay for client_root_movers).
@@ -2921,8 +3110,58 @@ impl Editor {
                     }
                     None => Vec::new(),
                 };
+                // … and the assemblies this player owns besides its character
+                // (SetNetworkOwner(player)): in Studio the owning client simulates
+                // them, so its scripts' AssemblyLinearVelocity / AssemblyAngularVelocity
+                // writes and impulses move them for everyone (probe T23_kickvel /
+                // T23_kickimp: a client-owned swing set going by a LocalScript swings
+                // and carries the character standing on it). Here the server's world
+                // is the one simulation: they go there. (Replicated parts the client
+                // does not own stay as they were: Studio ignores those writes.)
+                // (RUSTUDIO_SOLVER=studio only: the rapier path keeps its behaviour.)
+                let player = s.player;
+                let roots: Vec<Ref> = if studio_path() {
+                    crate::runtime::domains::world::part::player_owned_roots_of(server_doc, player)
+                } else {
+                    Vec::new()
+                };
+                let owned = s.physics.owned_bodies(&roots);
+                s.physics.client_owned = owned.clone();
+                let vel: Vec<(Ref, glam::Vec3)> = if owned.is_empty() {
+                    vel
+                } else {
+                    let (mine, rest): (Vec<_>, Vec<_>) =
+                        vel.into_iter().partition(|(r, _)| s.map.c2s.get(r).is_some_and(|sr| s.physics.in_bodies(*sr, &owned)));
+                    for (r, v) in mine {
+                        if let Some(sr) = s.map.c2s.get(&r).copied() {
+                            s.physics.set_velocity(sr, v);
+                        }
+                    }
+                    if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
+                        let pick = |r: Ref| s.map.c2s.get(&r).is_some_and(|sr| s.physics.in_bodies(*sr, &owned));
+                        let sets = crate::physics::live::take_spin_sets_of(cid, pick);
+                        let adds = crate::physics::live::take_spins_of(cid, pick);
+                        for (r, w, add) in sets.into_iter().map(|(r, w)| (r, w, false)).chain(adds.into_iter().map(|(r, w)| (r, w, true))) {
+                            if let Some(sr) = s.map.c2s.get(&r).copied() {
+                                s.physics.set_spin(sr, w, add);
+                            }
+                        }
+                    }
+                    rest
+                };
+                // What the character's step did to those stand-ins goes to the bodies.
+                let linked = studio_path() && s.physics.link_active();
+                if linked {
+                    let kicks = s.physics.link_kicks();
+                    let bodies = s.physics.link_bodies();
+                    s.client_sim.kick(&kicks, &bodies);
+                }
                 if let Some(cd) = s.other_doc.as_mut() {
                     let out = s.client_sim.step(&s.physics, cd, &s.map.s2c, &s.map.c2s, &vel, dt);
+                    if linked {
+                        let motion = s.client_sim.link_motion();
+                        s.physics.link_note_motion(&motion, dt);
+                    }
                     for r in out.fallen {
                         cd.dom.transfer_within(r, Ref::none());
                         cd.mark_tree(r);
@@ -3064,6 +3303,50 @@ impl Editor {
         });
         self.shown_front();
         r.flatten()
+    }
+
+    /// `with_side` from outside the Play tick (the editor's UI, the plugin
+    /// host): the server is put in front first and the shown side back
+    /// after, so each side's runtime gets its own DataModel whichever side
+    /// the editor shows.
+    pub(crate) fn with_play_side<R>(
+        &mut self,
+        side: Side,
+        f: impl FnOnce(&Runtime, Option<&Document>, &mut RepMap) -> R,
+    ) -> Option<R> {
+        self.server_front();
+        let r = self.with_side(side, f);
+        self.shown_front();
+        r
+    }
+
+    /// The Play session's sides (server, and the client in Play).
+    pub(crate) fn play_sides(&self) -> Vec<Side> {
+        match self.play.as_ref() {
+            Some(s) if s.client.is_some() => vec![Side::Server, Side::Client],
+            Some(_) => vec![Side::Server],
+            None => Vec::new(),
+        }
+    }
+
+    /// A side's Lua state between frames (read its app data; don't call
+    /// into the runtime with it).
+    pub(crate) fn play_side_lua(&self, side: Side) -> Option<&mlua::Lua> {
+        let s = self.play.as_ref()?;
+        match side {
+            Side::Server => Some(&s.server.runtime.lua),
+            Side::Client => s.client.as_ref().map(|c| &c.runtime.lua),
+        }
+    }
+
+    /// A side's DataModel between frames (the shown one is `self.doc`).
+    pub(crate) fn play_side_doc_mut(&mut self, side: Side) -> Option<&mut Document> {
+        let s = self.play.as_mut()?;
+        if s.showing == side {
+            Some(&mut self.doc)
+        } else {
+            s.other_doc.as_mut()
+        }
     }
 
     /// The other side's DataModel while playing (the one not shown).
@@ -3209,4 +3492,11 @@ pub(crate) fn studio_collides(name: &str, rig: RigType) -> bool {
         RigType::R15 => matches!(name, "HumanoidRootPart" | "UpperTorso" | "LowerTorso" | "Head"),
         RigType::R6 => matches!(name, "Torso" | "Head"),
     }
+}
+
+/// RUSTUDIO_SOLVER=studio (or studio-nextgen): the Play-side changes that came with the
+/// Studio solver port (client-owned assemblies' script velocities, shift lock's turn
+/// before the frame is drawn) apply; the default rapier path keeps its old behaviour.
+fn studio_path() -> bool {
+    crate::solver::kind() != crate::solver::SolverKind::Rapier
 }

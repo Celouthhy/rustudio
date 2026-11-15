@@ -590,6 +590,59 @@ pub fn weld_accessory(dom: &mut WeakDom, model: Ref, acc: Ref) {
     );
 }
 
+/// Holds an accessory the way Studio's description loader does: a
+/// RigidConstraint "AccessoryRigidConstraint" in the Handle from its
+/// attachment to the body attachment of the same name, the Handle placed
+/// so the two coincide. Without a matching attachment: weld_accessory.
+pub fn hold_accessory(dom: &mut WeakDom, model: Ref, acc: Ref) {
+    use crate::math::Xform;
+    let ident = Xform { pos: glam::Vec3::ZERO, rot: glam::Mat3::IDENTITY };
+    let kids = |dom: &WeakDom, r: Ref| -> Vec<Ref> { dom.get_by_ref(r).map(|i| i.children().to_vec()).unwrap_or_default() };
+    let cf = |dom: &WeakDom, r: Ref, k: &str| match dom.get_by_ref(r).and_then(|i| i.properties.get(&ustr(k))) {
+        Some(Variant::CFrame(c)) => Xform::from_cframe(c),
+        _ => ident,
+    };
+    let Some(handle) = kids(dom, acc).into_iter().find(|c| {
+        dom.get_by_ref(*c).is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
+    }) else {
+        return;
+    };
+    let body: Vec<Ref> = kids(dom, model)
+        .into_iter()
+        .filter(|c| dom.get_by_ref(*c).is_some_and(|i| doc::is_a(&i.class, "BasePart")) && *c != handle)
+        .collect();
+    let found = kids(dom, handle)
+        .into_iter()
+        .filter(|a| dom.get_by_ref(*a).is_some_and(|i| i.class == "Attachment"))
+        .find_map(|a| {
+            let name = dom.get_by_ref(a)?.name.clone();
+            body.iter().find_map(|p| {
+                kids(dom, *p)
+                    .into_iter()
+                    .find(|b| dom.get_by_ref(*b).is_some_and(|i| i.class == "Attachment" && i.name == name))
+                    .map(|b| (*p, a, b))
+            })
+        });
+    let Some((part, a0, a1)) = found else {
+        weld_accessory(dom, model, acc);
+        return;
+    };
+    let (c0, c1, part_cf) = (cf(dom, a0, "CFrame"), cf(dom, a1, "CFrame"), cf(dom, part, "CFrame"));
+    let at = part_cf.apply(c1.pos);
+    let rot = part_cf.rot * c1.rot * c0.rot.transpose();
+    let world = Xform { pos: at - rot * c0.pos, rot };
+    if let Some(i) = dom.get_by_ref_mut(handle) {
+        i.properties.insert(ustr("CFrame"), Variant::CFrame(world.to_cframe()));
+    }
+    dom.insert(
+        handle,
+        InstanceBuilder::new("RigidConstraint")
+            .with_name("AccessoryRigidConstraint")
+            .with_property("Attachment0", Variant::Ref(a0))
+            .with_property("Attachment1", Variant::Ref(a1)),
+    );
+}
+
 /// A direct child by name.
 fn child_named(doc: &doc::Document, parent: Ref, name: &str) -> Option<Ref> {
     doc.dom
@@ -598,6 +651,44 @@ fn child_named(doc: &doc::Document, parent: Ref, name: &str) -> Option<Ref> {
         .iter()
         .copied()
         .find(|c| doc.dom.get_by_ref(*c).is_some_and(|i| i.name == name))
+}
+
+/// An accessory as Studio's avatar loader gets it: asset delivery's
+/// `avatar_meshpart_accessory` form (a hat's Part + SpecialMesh handle comes
+/// back as a MeshPart handle, as in Studio's CreateHumanoidModelFromDescription),
+/// asked anonymously and cached; None when that form isn't served.
+pub fn meshpart_accessory(id: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let cache = crate::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_accessory.bin"));
+    if let Ok(b) = std::fs::read(&cache) {
+        if !b.is_empty() {
+            return Some(b);
+        }
+    }
+    let agent = rustudio_account::api::agent();
+    let body = format!("[{{\"assetId\":{id},\"requestId\":\"0\",\"assetFormat\":\"avatar_meshpart_accessory\"}}]");
+    let mut r = agent
+        .post("https://assetdelivery.roblox.com/v1/assets/batch")
+        .header("Content-Type", "application/json")
+        .send(body.as_str())
+        .ok()?;
+    let text = r.body_mut().read_to_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let loc = v.pointer("/0/location")?.as_str()?.to_string();
+    let mut r = agent.get(&loc).header("Accept-Encoding", "gzip").call().ok()?;
+    let mut bytes = Vec::new();
+    r.body_mut().with_config().limit(64 << 20).reader().read_to_end(&mut bytes).ok()?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out).ok()?;
+        bytes = out;
+    }
+    decode_model(&bytes).ok()?;
+    if let Some(dir) = cache.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&cache, &bytes);
+    Some(bytes)
 }
 
 /// The head package for the avatar's rig. A head asset as served plainly is

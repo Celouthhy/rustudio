@@ -457,6 +457,14 @@ unsafe fn push_fv(
                 ffi::lua_pushlstring(l, t.as_ptr() as *const _, t.len());
                 Ok(true)
             }
+            Fv::CFrame(x) => {
+                ffi::luaL_checkstack(l, 3, std::ptr::null());
+                if lua.push_userdata_unref(l, crate::ltypes::LCFrame(x))? {
+                    return Ok(true);
+                }
+                let v = Value::UserData(lua.create_userdata(crate::ltypes::LCFrame(x))?);
+                Ok(push_value(lua, l, key, v))
+            }
             Fv::Insts(refs) => {
                 ffi::lua_createtable(l, refs.len() as _, 0);
                 ffi::luaL_checkstack(l, 2, std::ptr::null());

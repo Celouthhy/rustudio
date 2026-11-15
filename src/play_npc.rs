@@ -48,7 +48,8 @@ pub(super) enum NpcEvent {
 
 #[derive(Default)]
 pub(crate) struct Npcs {
-    by_model: HashMap<Ref, Npc>,
+    // (FxHash: NPCs step in this map's order; see physics.rs)
+    by_model: rustc_hash::FxHashMap<Ref, Npc>,
     scan_in: u32,
     pub(super) events: Vec<NpcEvent>,
 }

@@ -33,6 +33,8 @@ mod encoding;
 mod http;
 #[path = "services_reflect.rs"]
 mod reflect;
+#[path = "services_stream.rs"]
+pub(crate) mod stream;
 
 pub const METHODS: &[(&str, &str)] = &[
     ("IsPropertyModified", "Instance"),
@@ -135,6 +137,8 @@ pub const METHODS: &[(&str, &str)] = &[
     // Studio declares IsA on Object: the non-Instance objects (Logger,
     // EditableImage…) have it too (Instances take the core one).
     ("IsA", "Object"),
+    ("Send", "WebStreamClient"),
+    ("Close", "WebStreamClient"),
 ];
 
 /// Written in Luau (services.luau) because they yield or throw a table.
@@ -173,6 +177,12 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("ServiceRemoving", "ServiceProvider"),
     // Every property change of an instance in the DataModel (`item_changed`).
     ("ItemChanged", "DataModel"),
+    // HttpService:CreateWebStreamClient's client, from its connection's
+    // thread (services `step` drains them once a frame).
+    ("Opened", "WebStreamClient"),
+    ("MessageReceived", "WebStreamClient"),
+    ("Error", "WebStreamClient"),
+    ("Closed", "WebStreamClient"),
     // Never fired in a Play test, in Studio or here: there is nothing to
     // drive them (no fullscreen switch or Studio-mode change in a test
     // session, no live server lifecycle, restarts or memory warnings, the
@@ -212,6 +222,36 @@ struct State {
     heartbeat_time: f64,
     physics_prev: (f64, u64),
     physics_step: f64,
+    /// HttpService:CreateWebStreamClient's clients (their objects' Refs).
+    streams: Streams,
+}
+
+/// A WebStreamClient: its connection (`stream` module) and state.
+struct StreamObj {
+    kind: stream::Kind,
+    /// The connection, once started (a plugin's HTTP permission prompt
+    /// may still be up: `waiting`).
+    id: Option<u64>,
+    /// Enum.WebStreamClientState: Connecting 0, Open 1, Error 2, Closed 3.
+    state: u32,
+    /// The script that made it (its plugin's unload closes it).
+    owner: Option<Ref>,
+    /// (plugin Name, request) while the plugin's HTTP permission is pending.
+    waiting: Option<(String, stream::Request)>,
+}
+
+#[derive(Default)]
+struct Streams(HashMap<Ref, StreamObj>);
+
+impl Drop for Streams {
+    /// The VM went away: its connections end.
+    fn drop(&mut self) {
+        for o in self.0.values() {
+            if let Some(id) = o.id {
+                stream::forget(id);
+            }
+        }
+    }
 }
 
 fn state(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, State>> {
@@ -403,10 +443,46 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             arg_str(args, 1, "string")?;
             Err(rt_err("Can't find secret with given key"))
         }
-        ("HttpService", "CreateWebStreamClient") => {
-            enum_arg(args, 1, "WebStreamClientType")?;
-            http_enabled_check(lua, this)?;
-            Err(rt_err("WebStreamClient is not supported in this session"))
+        ("HttpService", "CreateWebStreamClient") => create_stream(lua, this, args),
+        ("WebStreamClient", "Send") => {
+            let data = match arg(args, 1) {
+                Value::Nil => return Err(rt_err("Argument 1 missing or nil")),
+                v @ (Value::String(_) | Value::Integer(_) | Value::Number(_)) => match lua.coerce_string(v)? {
+                    Some(d) => d.as_bytes().to_vec(),
+                    None => return Err(rt_err("Argument 1 missing or nil")),
+                },
+                v => return Err(rt_err(format!("Unable to cast {} to string", v.type_name()))),
+            };
+            let (kind, id, st) = {
+                let st = state(lua)?;
+                let o = st.streams.0.get(&this).ok_or_else(|| rt_err("WebStreamClient is not connected"))?;
+                (o.kind, o.id, o.state)
+            };
+            // (Both wordings are rustudio's: Studio's are not measured.)
+            if kind != stream::Kind::WebSocket {
+                return Err(rt_err("Send is only supported for WebSocket clients"));
+            }
+            match id {
+                Some(id) if st == 1 && stream::send(id, data) => nothing(),
+                _ => Err(rt_err("WebStreamClient is not connected")),
+            }
+        }
+        ("WebStreamClient", "Close") => {
+            let mut st = state(lua)?;
+            if let Some(o) = st.streams.0.get_mut(&this) {
+                match o.id {
+                    Some(id) if o.state <= 1 => stream::close(id, o.kind),
+                    // Never connected (permission prompt still up): closed now.
+                    None if o.state == 0 => {
+                        o.waiting = None;
+                        o.state = 3;
+                        drop(st);
+                        world(lua)?.fire(this, "Closed", vec![]);
+                    }
+                    _ => {}
+                }
+            }
+            nothing()
         }
 
         // ---------------------------------------------------- EncodingService
@@ -624,10 +700,7 @@ fn capture_output(lua: &Lua) -> mlua::Result<()> {
             .filter(|ls| w.listening.contains(ls));
         (fresh, ls)
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_millis() as f64) / 1000.0)
-        .unwrap_or(0.0);
+    let now = (crate::sim_clock::epoch_secs() * 1000.0).floor() / 1000.0;
     let mut lines = Vec::with_capacity(fresh.len());
     for (level, text) in &fresh {
         let mark = crate::output_panel::STACK_MARK;
@@ -688,7 +761,9 @@ pub fn on_leave(lua: &Lua) {
 
 fn http_enabled_check(lua: &Lua, hs: Ref) -> mlua::Result<()> {
     let on = matches!(world(lua)?.d().prop(hs, "HttpEnabled"), Some(Variant::Bool(true)));
-    if on {
+    // Plugins reach the web with HttpEnabled off (measured in Studio: a local
+    // plugin's GetAsync / RequestAsync worked, no prompt).
+    if on || crate::runtime::security::current(lua) == crate::runtime::security::PLUGIN_IDENT {
         return Ok(());
     }
     let first = {
@@ -703,9 +778,13 @@ fn http_enabled_check(lua: &Lua, hs: Ref) -> mlua::Result<()> {
 }
 
 /// `__svc_http_start(hs, method, url, headers, body)` → request id.
+/// `start(...)` → id; nil, message on an error; nil, nil while a plugin's
+/// HTTP permission prompt is unanswered (the Luau side waits and asks again,
+/// as Studio's request waits for the prompt).
 fn http_start(lua: &Lua, a: (LInst, String, Value, Option<Table>, Option<mlua::LuaString>)) -> mlua::Result<(Option<u64>, Option<String>)> {
     match http_start_inner(lua, a) {
         Ok(id) => Ok((Some(id), None)),
+        Err(e) if crate::plugin_host::permissions::is_pending(&e) => Ok((None, None)),
         Err(e) => Ok((None, Some(error_message(&e)))),
     }
 }
@@ -738,6 +817,8 @@ fn http_start_inner(lua: &Lua, (hs, method, url, headers, body): (LInst, String,
     if http::is_roblox_domain(&url) {
         return Err(rt_err("HttpService is not allowed to access that Roblox resource"));
     }
+    // A plugin's request asks the store's permission check (plugin_host).
+    crate::plugin_host::permissions::check_http(lua, &url)?;
     // Methods are case-sensitive ("get" fails the same way).
     if !matches!(method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE") {
         return Err(rt_err("HttpError: Aborted"));
@@ -783,6 +864,214 @@ fn http_poll(lua: &Lua, id: u64) -> mlua::Result<MultiValue> {
     Ok(out)
 }
 
+// ------------------------------------------------------------------ WebStreamClient
+
+/// Luau's name for a value in "Unable to cast X to Dictionary".
+fn cast_name(v: &Value) -> &'static str {
+    match v {
+        Value::Integer(_) | Value::Number(_) => "double",
+        Value::Boolean(_) => "bool",
+        Value::String(_) => "string",
+        v => v.type_name(),
+    }
+}
+
+/// The URL a plugin's HTTP permission is asked for (ws → http, the same host).
+fn permission_url(url: &str) -> String {
+    if let Some(r) = url.strip_prefix("ws://") {
+        format!("http://{r}")
+    } else if let Some(r) = url.strip_prefix("wss://") {
+        format!("https://{r}")
+    } else {
+        url.to_string()
+    }
+}
+
+fn place_id(lua: &Lua) -> mlua::Result<i64> {
+    let w = world(lua)?;
+    let d = w.d();
+    Ok(match d.prop(d.dom.root_ref(), "PlaceId") {
+        Some(Variant::Int64(n)) => n,
+        Some(Variant::Int32(n)) => n as i64,
+        _ => 0,
+    })
+}
+
+/// HttpService:CreateWebStreamClient(type, {Url, Method, Headers, Body}):
+/// the client object at once (ConnectionState Connecting); the connection
+/// opens on its own thread and Opened / MessageReceived / Error / Closed fire
+/// from `step`. The request options are checked with RequestAsync's
+/// wording (measured for RequestAsync in services_http.rs; reusing it here
+/// is an analogy, not a measurement of this API), then HttpEnabled (plugins
+/// skip it: F49, measured for RequestAsync), Roblox's domains, and a
+/// plugin's HTTP permission (its prompt may still be up: the client stays
+/// Connecting until it is answered). What is and isn't Studio-backed:
+/// services_stream.rs's header.
+fn create_stream(lua: &Lua, hs: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let kind = stream::Kind::from_value(enum_arg(args, 1, "WebStreamClientType")?);
+    let opts = match arg(args, 2) {
+        Value::Table(t) => t,
+        Value::Nil => return Err(rt_err("Argument 2 missing or nil")),
+        v => return Err(rt_err(format!("Unable to cast {} to Dictionary", cast_name(&v)))),
+    };
+    let url = match opts.get::<Value>("Url")? {
+        Value::String(u) => u.to_str()?.to_string(),
+        Value::Nil => return Err(rt_err("Invalid request options")),
+        _ => return Err(rt_err("Invalid URL type, URL should be a string or secret.")),
+    };
+    let method = match opts.get::<Value>("Method")? {
+        Value::Nil => "GET".to_string(),
+        v => lua.coerce_string(v)?.map(|m| m.to_string_lossy()).unwrap_or_default(),
+    };
+    let mut hv = Vec::new();
+    match opts.get::<Value>("Headers")? {
+        Value::Nil => {}
+        Value::Table(h) => {
+            for p in h.pairs::<String, Value>() {
+                let (k, v) = p?;
+                if http::restricted_header(&k) {
+                    return Err(rt_err(format!("Header \"{k}\" is not allowed!")));
+                }
+                let v = match v {
+                    Value::String(v) => v.to_str()?.to_string(),
+                    _ => return Err(rt_err(format!("Header {k} must have its value be a string or secret!"))),
+                };
+                hv.push((k, v));
+            }
+        }
+        _ => return Err(rt_err("Invalid request options")),
+    }
+    let body = match opts.get::<Value>("Body")? {
+        Value::Nil => None,
+        Value::String(b) => Some(b.as_bytes().to_vec()),
+        _ => return Err(rt_err("Invalid request options, Body should be a string")),
+    };
+    if body.is_some() && (method == "GET" || method == "HEAD") && kind != stream::Kind::WebSocket {
+        return Err(rt_err("Invalid request options, Body should be empty for 'GET' or 'HEAD' method"));
+    }
+    let schemes: &[&str] = match kind {
+        stream::Kind::WebSocket => &["ws://", "wss://", "http://", "https://"],
+        _ => &["http://", "https://"],
+    };
+    if !schemes.iter().any(|p| url.starts_with(p)) {
+        return Err(rt_err("URL must be http"));
+    }
+    http_enabled_check(lua, hs)?;
+    let purl = permission_url(&url);
+    if http::is_roblox_domain(&purl) {
+        return Err(rt_err("HttpService is not allowed to access that Roblox resource"));
+    }
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE") {
+        return Err(rt_err("HttpError: Aborted"));
+    }
+    use crate::plugin_host::permissions::{self, Decision};
+    let plugin = permissions::running_plugin(lua);
+    let decision = plugin.as_ref().and_then(|p| permissions::http_decision(p, &purl));
+    if let Some(Decision::Deny(m)) = &decision {
+        return Err(rt_err(m.clone()));
+    }
+    let req = stream::Request { kind, method, url, headers: http::studio_headers(hv, place_id(lua)?), body };
+    let r = ext::create_any(lua, "WebStreamClient")?;
+    if let Some(i) = world(lua)?.dm().dom.get_by_ref_mut(r) {
+        i.name = "WebStreamClient".to_string();
+    }
+    let owner = crate::runtime::running_script(lua);
+    let mut o = StreamObj { kind, id: None, state: 0, owner, waiting: None };
+    match (decision, plugin) {
+        (Some(Decision::Pending), Some(p)) => o.waiting = Some((p, req)),
+        _ => o.id = Some(stream::start(req)),
+    }
+    state(lua)?.streams.0.insert(r, o);
+    ok(inst_value(lua, r)?)
+}
+
+/// Once a frame: each client's new connection events become its signals.
+fn pump_streams(lua: &Lua) -> mlua::Result<()> {
+    use crate::plugin_host::permissions::{http_decision, Decision};
+    let refs: Vec<Ref> = state(lua)?.streams.0.keys().copied().collect();
+    if refs.is_empty() {
+        return Ok(());
+    }
+    // A client nothing holds any more (collected): its connection ends.
+    let dead: Vec<Ref> = {
+        let w = world(lua)?;
+        let d = w.d();
+        refs.iter().filter(|r| d.dom.get_by_ref(**r).is_none()).copied().collect()
+    };
+    let mut fires: Vec<(Ref, &'static str, Vec<Value>)> = Vec::new();
+    {
+        let mut st = state(lua)?;
+        for r in dead {
+            if let Some(o) = st.streams.0.remove(&r) {
+                if let Some(id) = o.id {
+                    stream::forget(id);
+                }
+            }
+        }
+        for (r, o) in st.streams.0.iter_mut() {
+            let answer = o.waiting.as_ref().map(|(plugin, req)| http_decision(plugin, &permission_url(&req.url)));
+            match answer {
+                None | Some(Some(Decision::Pending)) => {}
+                Some(Some(Decision::Deny(m))) => {
+                    o.waiting = None;
+                    o.state = 2;
+                    fires.push((*r, "Error", vec![Value::Integer(0), s(lua, m)?]));
+                }
+                Some(_) => {
+                    if let Some((_, req)) = o.waiting.take() {
+                        o.id = Some(stream::start(req));
+                    }
+                }
+            }
+            let Some(id) = o.id else { continue };
+            let mut ended = false;
+            for ev in stream::poll(id) {
+                match ev {
+                    stream::Event::Opened(code, headers) => {
+                        o.state = 1;
+                        fires.push((*r, "Opened", vec![Value::Integer(code as i64), s(lua, headers)?]));
+                    }
+                    stream::Event::Message(m) => fires.push((*r, "MessageReceived", vec![s(lua, m)?])),
+                    stream::Event::Error(code, m) => {
+                        o.state = 2;
+                        ended = true;
+                        fires.push((*r, "Error", vec![Value::Integer(code), s(lua, m)?]));
+                    }
+                    stream::Event::Closed => {
+                        o.state = 3;
+                        ended = true;
+                        fires.push((*r, "Closed", vec![]));
+                    }
+                }
+            }
+            if ended {
+                stream::forget(id);
+                o.id = None;
+            }
+        }
+    }
+    let mut w = world(lua)?;
+    for (r, name, args) in fires {
+        w.fire(r, name, args);
+    }
+    Ok(())
+}
+
+/// A plugin unloads: the clients its scripts made close (no events: none
+/// of its code runs after Unloading).
+pub fn close_streams_of(lua: &Lua, code: &HashSet<Ref>) {
+    let Ok(mut st) = state(lua) else { return };
+    for o in st.streams.0.values_mut() {
+        if o.owner.is_some_and(|s| code.contains(&s)) {
+            if let Some(id) = o.id.take() {
+                stream::forget(id);
+            }
+            o.waiting = None;
+            o.state = 3;
+        }
+    }
+}
+
 const HTTP_LUA: &str = r#"
 local start, poll = ...
 local M = __rs_lua_methods
@@ -806,12 +1095,20 @@ local function status_error(status, msg)
 	if msg == "" then return "HTTP " .. status end
 	return "HTTP " .. status .. " (" .. msg .. ")"
 end
+-- (nil, nil: a plugin's permission prompt is up; ask again each frame.)
+local function begin(self, method, url, h, body)
+	while true do
+		local id, err = start(self, method, url, h, body)
+		if id or err then return id, err end
+		task.wait()
+	end
+end
 local function simple(self, method, url, body, ct, compress, headers)
 	if headers ~= nil and type(headers) ~= "table" then fail("Unable to cast " .. cast_name(headers) .. " to Dictionary") end
 	local h = {}
 	if headers then for k, v in headers do h[k] = v end end
 	if method == "POST" and h["Content-Type"] == nil then h["Content-Type"] = content_type(ct) end
-	local id, err = start(self, method, url, h, body)
+	local id, err = begin(self, method, url, h, body)
 	if not id then fail(err) end
 	local okk, status, msg, _, resp = wait_for(id)
 	if not okk then fail(status) end
@@ -840,7 +1137,7 @@ M.RequestAsync = function(self, opts)
 	end
 	local h = {}
 	if opts.Headers then for k, v in opts.Headers do h[k] = v end end
-	local id, err = start(self, method, opts.Url, h, opts.Body)
+	local id, err = begin(self, method, opts.Url, h, opts.Body)
 	if not id then fail(err) end
 	local okk, status, msg, headers, body = wait_for(id)
 	if not okk then fail(status) end
@@ -861,7 +1158,18 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         }
         "GearGenreSetting" if class == "DataModel" => enum_val(lua, "GearGenreSetting", 0)?,
         "FrameNumber" if class == "RunService" => return Err(capability("read", key, "InternalTest")),
-        "RunState" if class == "RunService" => return Err(capability("read", key, "PluginOrOpenCloud")),
+        // Plugins and the command bar read it (measured in Studio: Stopped in
+        // the edit DataModel, Running in Play / Run).
+        "RunState" if class == "RunService" => {
+            if crate::runtime::security::current(lua) == crate::runtime::security::GAME {
+                return Err(capability("read", key, "PluginOrOpenCloud"));
+            }
+            let running = world(lua)?.mode != RunMode::Edit;
+            match crate::ltypes::LEnumItem::from_name("RunState", if running { "Running" } else { "Stopped" }) {
+                Some(item) => crate::ltypes::enum_value(lua, item)?,
+                None => Value::Nil,
+            }
+        }
         "SelectionThickness" if class == "Selection" => Value::Number(0.02f32 as f64),
         "FullPath" if class == "Logger" => {
             let p = state(lua)?.logger_paths.get(&r).cloned();
@@ -890,12 +1198,18 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         },
         // settings().Studio / Physics / Rendering / Network / Diagnostics:
         // the Studio Settings dialog's values (src/studio_settings.rs).
+        // settings().Studio.Theme: the StudioTheme object (GetColor) of the
+        // chosen theme (src/plugin_host/api_theme.rs).
+        "Theme" if class == "Studio" => crate::runtime::domains::plugin::theme::studio_theme(lua)?,
         _ if crate::studio_settings::is_item_class(class) => match crate::studio_settings::lua_get(lua, class, key)? {
             Some(v) => v,
             None => return Ok(None),
         },
         "ConnectionState" if class == "WebSocketClient" => enum_val(lua, "WebSocketState", 3)?,
-        "ConnectionState" if class == "WebStreamClient" => enum_val(lua, "WebStreamClientState", 3)?,
+        "ConnectionState" if class == "WebStreamClient" => {
+            let v = state(lua)?.streams.0.get(&r).map(|o| o.state).unwrap_or(3);
+            enum_val(lua, "WebStreamClientState", v)?
+        }
         "SchedulerDutyCycle" | "SchedulerRate" if class == "TaskScheduler" => Value::Number(0.0),
         "ThreadPoolSize" if class == "TaskScheduler" => Value::Integer(
             std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1),
@@ -1141,6 +1455,19 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             });
             Ok(true)
         }
+        // settings().Studio.Theme = a StudioTheme (GetAvailableThemes'):
+        // Changed + ThemeChanged when it changes the theme.
+        "Theme" if class == "Studio" => {
+            if crate::runtime::domains::plugin::theme::set_theme(lua, value)? {
+                let mut w = world(lua)?;
+                w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
+                w.fire(r, "Changed:Theme", vec![]);
+                w.fire(r, "ThemeChanged", vec![]);
+                drop(w);
+                crate::runtime::domains::plugin::theme::note_theme(lua);
+            }
+            Ok(true)
+        }
         // The Studio Settings store (see prop_get): Changed fires as for any
         // property; the identity check already ran.
         _ if crate::studio_settings::is_item_class(class) => {
@@ -1151,6 +1478,11 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                         let mut w = world(lua)?;
                         w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
                         w.fire(r, &format!("Changed:{key}"), vec![]);
+                        if class == "Studio" && key == "Theme" {
+                            w.fire(r, "ThemeChanged", vec![]);
+                            drop(w);
+                            crate::runtime::domains::plugin::theme::note_theme(lua);
+                        }
                     }
                     Ok(true)
                 }
@@ -1375,7 +1707,8 @@ fn fire_sync(lua: &Lua, r: Ref, name: &str, args: Vec<Value>) {
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
-    let now = Instant::now();
+    // (RunService.FrameTime: simulated under --fixed-dt)
+    let now = crate::sim_clock::now();
     let hooked = {
         let mut st = state(lua)?;
         if let Some(prev) = st.last_step.replace(now) {
@@ -1410,6 +1743,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     }
     tag_and_service_events(lua)?;
     flush_item_changed(lua)?;
+    pump_streams(lua)?;
     Ok(())
 }
 
@@ -1508,7 +1842,7 @@ pub fn on_fire(w: &World, r: Ref, name: &str, args: &[Value]) {
         });
         return;
     }
-    if !w.listening.contains(&root) {
+    if !w.item_changed {
         return;
     }
     // A ValueBase's Changed carries the new value: its property is Value.
@@ -1558,6 +1892,10 @@ fn flush_item_changed(lua: &Lua) -> mlua::Result<()> {
         let p = Value::String(lua.create_string(&prop)?);
         world(lua)?.fire(root, "ItemChanged", vec![v, p]);
     }
+    // Still connected to (or waited on)? Off again once nothing is: a
+    // connect turns it back on at once (runtime.rs rs_connect).
+    let on = crate::runtime::hears(lua, root, "ItemChanged");
+    world(lua)?.item_changed = on;
     Ok(())
 }
 

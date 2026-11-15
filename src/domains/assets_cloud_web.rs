@@ -22,7 +22,19 @@ pub const LUA_METHODS: &[(&str,&str)] = &[
     ("GetCollection","InsertService"),("GetBaseCategories","InsertService"),("GetUserCategories","InsertService"),
     ("GetAssetIdsForPackage","AssetService"),
     ("GetAssetIdsForPackageAsync","AssetService"),
+    ("GetObjects","DataModel"),
 ];
+/// An asset load's error as Studio gives it ("Request asset was not
+/// found"), tagged with the id for the Output warning Studio prints
+/// (`ContentId: rbxassetid://1 failed due to: …`): see `__ac_web_poll`.
+fn studio_asset_error(id: u64, e: &str) -> String {
+    let msg = e.rsplit_once("asset delivery: ").map(|(_, m)| m).unwrap_or(e);
+    let msg = match msg.rfind(" (HTTP ") {
+        Some(i) if msg.ends_with(')') => &msg[..i],
+        _ => msg,
+    };
+    format!("\u{1}{id}\u{1}{msg}")
+}
 pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.set_app_data(Jobs::default());
     lua.globals().set("__ac_web_begin",lua.create_function(|lua,(name,a):(String,mlua::Table)| {
@@ -67,7 +79,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                         let url=format!("https://assetdelivery.roblox.com/v1/asset/?assetversionid={id}&serverplaceid={place}&scriptinsert=1&clientinsert=0");
                         let (status,bytes)=c.session.fetch_bytes(&url,true).map_err(|e|e.to_string())?;
                         if !(200..300).contains(&status){return Err(format!("HTTP {status}"))} bytes
-                    } else { load::asset_bytes(id)? };
+                    } else { load::asset_bytes(id).map_err(|e|studio_asset_error(id,&e))? };
                     Ok(Reply::Asset(bytes,id))
                 } else {
                     let config=rustudio_account::AccountConfig::load().map_err(|e|e.to_string())?;
@@ -99,7 +111,13 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 super::scene::scan_access(lua,r)?;
                 (true,inst_value(lua,r)?,None)
             },
-            Err(e)=>(true,Value::Nil,Some(e)),
+            Err(e)=>match e.strip_prefix('\u{1}').and_then(|r|r.split_once('\u{1}')) {
+                Some((id,msg))=>{
+                    world(lua)?.output.push((crate::app::Level::Warn,format!("ContentId: rbxassetid://{id} failed due to: {msg}")));
+                    (true,Value::Nil,Some(msg.to_string()))
+                }
+                None=>(true,Value::Nil,Some(e)),
+            },
         })
     })?)?;
     lua.globals().set("__ac_pages",lua.create_function(|lua,(class,pages):(String,mlua::Table)| {
@@ -123,6 +141,19 @@ local function fetch(name,...)
 end
 for _,name in {'LoadAsset','LoadAssetVersion','LoadAssetAsync'} do
     M[name]=function(self,id) return fetch(name,id,game.PlaceId) end
+end
+-- game:GetObjects(content): the asset's top-level instances, parentless
+-- (Studio, plugins: {Accessory} for rbxassetid://125378389).
+M.GetObjects=function(self,url)
+    if url==nil then error('Argument 1 missing or nil',2) end
+    local raw=tostring(url)
+    local id=tonumber(raw:match('^rbxassetid://(%d+)') or raw:match('[?&][iI][dD]=(%d+)') or raw:match('^(%d+)$'))
+    if not id then error('Unable to load asset: '..raw,2) end
+    local m=fetch('LoadAsset',id,game.PlaceId)
+    local out=m:GetChildren()
+    for _,c in out do c.Parent=nil end
+    m:Destroy()
+    return out
 end
 local function audioSubtype(value)
     if type(value)=='number' then

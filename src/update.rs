@@ -82,8 +82,8 @@ pub enum Action {
 impl Updater {
     pub fn start() -> Self {
         let stage = Arc::new(Mutex::new(Stage::Checking));
-        let off = std::env::var_os("RUSTUDIO_NO_UPDATE_CHECK").is_some()
-            || std::env::var_os("RUSTUDIO_UI_SHOTS").is_some();
+        // RUSTUDIO_NO_UPDATE_CHECK / RUSTUDIO_UI_SHOTS, or the rustudio option.
+        let off = !crate::rustudio_settings::update_check();
         if off {
             *stage.lock().unwrap() = Stage::Current;
         } else {

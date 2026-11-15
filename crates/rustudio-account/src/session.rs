@@ -615,6 +615,19 @@ impl Session {
         body: &[u8],
         extra: &[(&str, &str)],
     ) -> Result<(u16, String)> {
+        self.post_csrf_with_timeout(url, content_type, body, extra, None)
+    }
+
+    /// As `post_csrf_with`, with a deadline shared by the CSRF retry.
+    pub fn post_csrf_with_timeout(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+        extra: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(u16, String)> {
+        let started = std::time::Instant::now();
         for _ in 0..=CSRF_MAX_RETRIES {
             let token = self.csrf.lock().ok().and_then(|g| g.clone());
             let mut req = self
@@ -628,6 +641,13 @@ impl Session {
             if let Some(t) = &token {
                 req = req.header("X-CSRF-TOKEN", t);
             }
+            if let Some(timeout) = timeout {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(Error::new("Request timed out"));
+                }
+                req = req.config().timeout_global(Some(remaining)).build();
+            }
             let r = req.send(body)?;
             let fresh = r
                 .headers()
@@ -639,6 +659,36 @@ impl Session {
                 Some(t)
                     if status == 403 && !t.is_empty() && token.as_deref() != Some(t.as_str()) =>
                 {
+                    if let Ok(mut g) = self.csrf.lock() {
+                        *g = Some(t);
+                    }
+                    continue;
+                }
+                _ => return Ok((status, text)),
+            }
+        }
+        Err(Error::new("Roblox kept refusing the CSRF token"))
+    }
+
+    /// A state-changing request of any method (POST / PATCH / PUT / DELETE)
+    /// with the CSRF dance of [`Session::post_csrf_with`].
+    pub fn send_csrf(&self, method: &str, url: &str, content_type: &str, body: &[u8]) -> Result<(u16, String)> {
+        for _ in 0..=CSRF_MAX_RETRIES {
+            let token = self.csrf.lock().ok().and_then(|g| g.clone());
+            let mut req = ureq::http::Request::builder()
+                .method(method)
+                .uri(url)
+                .header("Cookie", self.cookie.header())
+                .header("Content-Type", content_type);
+            if let Some(t) = &token {
+                req = req.header("X-CSRF-TOKEN", t);
+            }
+            let req = req.body(body).map_err(|_| Error::new("invalid HTTP request"))?;
+            let r = self.agent.run(req)?;
+            let fresh = r.headers().get("x-csrf-token").and_then(|v| v.to_str().ok()).map(str::to_string);
+            let (status, text) = text_of(r)?;
+            match fresh {
+                Some(t) if status == 403 && !t.is_empty() && token.as_deref() != Some(t.as_str()) => {
                     if let Ok(mut g) = self.csrf.lock() {
                         *g = Some(t);
                     }
@@ -774,6 +824,30 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csrf_post_deadline_stops_a_stalled_server() {
+        use std::{io::Read, net::TcpListener, time::{Duration, Instant}};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = [0; 4096];
+            let _ = stream.read(&mut bytes);
+            // Keep the connection open without ever replying.
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let session = Session::unchecked(Cookie::new("test-cookie").unwrap(),
+            Profile { id: 1, name: "test".into(), display_name: "test".into() });
+        let started = Instant::now();
+        let result = session.post_csrf_with_timeout(&url, "application/json", b"{}", &[],
+            Some(Duration::from_millis(100)));
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    }
 
     #[test]
     fn cookie_never_prints() {

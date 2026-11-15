@@ -2499,6 +2499,32 @@ impl Lua {
         f()
     }
 
+    /// rustudio: pushes `data` onto `state`'s stack as a new userdata of
+    /// its type, made as `create_userdata` makes it (same storage, same
+    /// metatable) but without a registry reference, for raw C functions
+    /// that return a value (rustudio's datatype fast paths). Returns false,
+    /// pushing nothing, when mlua has not made the type's metatable yet.
+    ///
+    /// # Safety
+    /// `state` must be a running thread of this Lua with a free stack slot
+    /// (two with the metatable).
+    #[doc(hidden)]
+    pub unsafe fn push_userdata_unref<T: UserData + MaybeSend + MaybeSync + 'static>(
+        &self,
+        state: *mut ffi::lua_State,
+        data: T,
+    ) -> Result<bool> {
+        let lua = self.lock();
+        let Some(&mt_id) = (*lua.extra.get()).registered_userdata_t.get(&TypeId::of::<T>()) else {
+            return Ok(false);
+        };
+        let protect = !lua.unlikely_memory_error();
+        crate::util::push_userdata(state, UserDataStorage::new(data), protect)?;
+        ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, mt_id as _);
+        ffi::lua_setmetatable(state, -2);
+        Ok(true)
+    }
+
     #[inline(always)]
     pub(crate) fn lock_arc(&self) -> LuaGuard {
         let guard = LuaGuard(self.raw.lock_arc());

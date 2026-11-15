@@ -159,8 +159,47 @@ static void publicenv(lua_State* L)
         lua_pop(L, 1);
 }
 
+// rustudio: getfenv(0) is the thread's environment as Roblox gives it: the
+// script whose code the thread runs (a ModuleScript while it is being
+// required, even from a helper another script defined: Moon Animator's
+// loader writes `getfenv(0).super`; measured in Studio,
+// checks/plugins/services/probes/SvcF_fenv.rbxmx). That is the env of the
+// outermost script frame above the innermost engine frame (require).
+static bool threadenv(lua_State* L)
+{
+    global_State* g = L->global;
+    LuaTable* found = NULL;
+    for (CallInfo* ci = L->ci; ci > L->base_ci; ci--)
+    {
+        if (!ttisfunction(ci->func))
+            continue;
+        Closure* cl = clvalue(ci->func);
+        if (cl->isC)
+            continue;
+        if (luaG_isengine(cl))
+        {
+            if (found)
+                break;
+            continue;
+        }
+        if (cl->env && g->mainthread && cl->env != g->mainthread->gt)
+            found = cl->env;
+    }
+    if (!found)
+        return false;
+    luaC_threadbarrier(L);
+    sethvalue(L, L->top, found);
+    incr_top(L);
+    return true;
+}
+
 static int luaB_getfenv(lua_State* L)
 {
+    if (lua_isnumber(L, 1) && lua_tonumber(L, 1) == 0 && threadenv(L))
+    {
+        lua_setsafeenv(L, -1, false);
+        return 1;
+    }
     getfunc(L, 1);
     if (lua_iscfunction(L, -1) || isengineat(L, -1)) // is a C function?
         lua_pushvalue(L, LUA_GLOBALSINDEX);          // return the thread's global env.

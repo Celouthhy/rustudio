@@ -52,6 +52,9 @@ pub enum RunMode {
     Play,
     /// F8: server scripts and physics only.
     Run,
+    /// The edit DataModel: only plugins run (src/plugin_host); RunService
+    /// answers Studio's edit values (IsEdit, IsClient and IsServer true).
+    Edit,
 }
 
 /// Which DataModel a runtime drives in a Play session.
@@ -189,6 +192,12 @@ pub struct World {
     pub avatar_descs: HashSet<Ref>,
     /// Instances with at least one connection or waiter (fires on others are dropped early).
     pub listening: rustc_hash::FxHashSet<Ref>,
+    /// Something connected to (or waits on) game.ItemChanged: every
+    /// property change then becomes a Changed fire and an ItemChanged
+    /// (services' `on_fire`). Set on connect, recomputed once a frame
+    /// (services `step`), so the DataModel merely being listened to (for
+    /// DescendantAdded, say) costs property writes nothing.
+    pub item_changed: bool,
     /// Native class filters on game.DescendantAdded / DescendantRemoving
     /// for engine domains (`class_signals`): (classes, class -> matches).
     pub class_watches: Vec<(Vec<String>, HashMap<rbx_dom_weak::Ustr, bool>)>,
@@ -218,6 +227,14 @@ pub struct World {
     /// last ran, and the listened GUI objects that were drawn then.
     pub listen_new: Vec<Ref>,
     pub abs_laid: HashSet<Ref>,
+    /// What scripts changed since the drawn layout was handed over (Studio
+    /// lays a GUI object out when it is read, so a box read right after a
+    /// script moved or resized it is the new one): the journal position read
+    /// up to, and the objects whose box (or text) may differ from the drawn
+    /// one (`ext::abs_now`). `abs_all`: the journal lost track, all may.
+    pub abs_scan: u64,
+    pub abs_dirty: HashSet<Ref>,
+    pub abs_all: bool,
     /// The collector (`Runtime::collect`): how many unparented instances
     /// were left watched after its last pass, and whether that pass saw new
     /// ones or freed any (`Runtime::gc_step` works faster then).
@@ -239,6 +256,11 @@ impl World {
         let enabled = !matches!(d.prop(r, "Disabled"), Some(Variant::Bool(true)))
             && !matches!(d.prop(r, "Enabled"), Some(Variant::Bool(false)));
         if !enabled || self.mode != RunMode::Play && self.side == Side::Client {
+            return false;
+        }
+        // In edit mode no place script runs; the plugin host starts plugin
+        // scripts itself (src/plugin_host).
+        if self.mode == RunMode::Edit {
             return false;
         }
         let ctx = crate::scene::enum_u32(d.prop(r, "RunContext")).unwrap_or(0);
@@ -354,13 +376,14 @@ struct Conn {
 
 #[derive(Default)]
 struct Signals {
-    conns: HashMap<(Ref, String), Vec<Conn>>,
-    waiters: HashMap<(Ref, String), Vec<(u64, Thread)>>,
+    // (Fx hashing: every fire on a listened instance looks these up.)
+    conns: rustc_hash::FxHashMap<(Ref, String), Vec<Conn>>,
+    waiters: rustc_hash::FxHashMap<(Ref, String), Vec<(u64, Thread)>>,
     next_id: u64,
     /// The signal names each instance has (or had) connections under in
     /// `conns`, so Destroy drops an instance's connections without a walk
     /// of every connection there is.
-    conn_names: HashMap<Ref, Vec<String>>,
+    conn_names: rustc_hash::FxHashMap<Ref, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -471,6 +494,21 @@ mod interrupt_watchdog {
 
 // ------------------------------------------------------------- utilities
 
+/// Fixed-step runs (a World that is not `realtime`, i.e. RUSTUDIO_FIXED_DT Play):
+/// a wall-clock epoch time (tick(), GetServerTimeNow) as a fixed epoch plus game
+/// time, so scripts that read it behave the same on every run. None otherwise.
+pub(crate) fn fixed_epoch_time(lua: &Lua) -> Option<f64> {
+    const EPOCH: f64 = 1_767_225_600.0; // 2026-01-01 00:00 UTC
+    let w = lua.app_data_ref::<World>()?;
+    (!w.realtime && fixed_dt_env()).then(|| EPOCH + w.time)
+}
+
+/// RUSTUDIO_FIXED_DT is set (test runs).
+fn fixed_dt_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FIXED_DT").is_some_and(|v| !v.is_empty()))
+}
+
 pub(crate) fn world(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, World>> {
     lua.app_data_mut::<World>()
         .ok_or_else(|| rt_err("the play session has ended"))
@@ -523,11 +561,15 @@ impl World {
             avatar: None,
             avatar_descs: HashSet::new(),
             listening: Default::default(),
+            item_changed: false,
             class_watches: Vec::new(),
             abs_seen: HashMap::new(),
             viewport_seen: None,
             listen_new: Vec::new(),
             abs_laid: HashSet::new(),
+            abs_scan: 0,
+            abs_dirty: HashSet::new(),
+            abs_all: true,
             orphans_seen: 0,
             gc_busy: true,
             requests: Default::default(),
@@ -1438,7 +1480,7 @@ pub fn class_signals(lua: &Lua, classes: Vec<String>) -> mlua::Result<(Value, Va
 
 /// Whether `r` has a connection or a waiter on `event` (true when the
 /// signal tables are busy: then the fire is made and sorted out later).
-fn hears(lua: &Lua, r: Ref, event: &str) -> bool {
+pub(crate) fn hears(lua: &Lua, r: Ref, event: &str) -> bool {
     let Ok(Some(s)) = lua.try_app_data_ref::<Signals>() else {
         return true;
     };
@@ -1519,6 +1561,8 @@ pub(crate) enum Fv {
     /// A string, pushed as is.
     Str(String),
     Static(&'static str),
+    /// A new CFrame, pushed without a registry reference.
+    CFrame(Xform),
 }
 
 fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv>, bool) {
@@ -1614,6 +1658,10 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
         Got::Parent(p) => {
             crate::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Inst(p)), quiet);
+        }
+        Got::Stored(Variant::CFrame(cf), _) => {
+            crate::telemetry::touch(class_u.as_str(), key);
+            return (Ok(Fv::CFrame(Xform::from_cframe(&cf))), quiet);
         }
         Got::Stored(v, en) => {
             crate::telemetry::touch(class_u.as_str(), key);
@@ -1774,6 +1822,14 @@ fn newindex_entry(lua: &Lua, r: Ref, key: &str, value: Value, atom: i32) -> mlua
     if rt.restricted {
         security::newindex_hook(lua, r, key)?;
     }
+    // A plugin writing a script's source asks the store's permission check
+    // (Studio's script-injection permission for installed plugins).
+    // (Unanswered: the write is held until the prompt's answer.)
+    if key == "Source" && security::current(lua) == security::PLUGIN_IDENT {
+        if crate::plugin_host::permissions::hold_source_write(lua, r, &value)? {
+            return Ok(());
+        }
+    }
     newindex_routed(lua, r, key, value, class_u, rt)
 }
 
@@ -1838,8 +1894,11 @@ fn index_routed(
         return Ok(v);
     }
     // Old lowercase spellings (sound:play, player:isFriendsWith) reach the
-    // real capitalised member before any stub of the deprecated name.
-    if let Some(cap) = capitalized(key).filter(|c| real_member(&class, c)) {
+    // real capitalised member before any stub of the deprecated name; only
+    // the ones Roblox has (in the API dump): `frame.transparency` is a child
+    // named "transparency" there (VFX Suite's buttons), not Transparency.
+    let api_alias = |c: &str| crate::api::get().map_or(true, |a| a.lookup(c, key).is_some());
+    if let Some(cap) = capitalized(key).filter(|c| real_member(&class, c) && api_alias(&class)) {
         return index(lua, r, &cap);
     }
     // A member rustudio has no behaviour for yet still exists (src/stubs.rs);
@@ -2137,9 +2196,21 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
                 return Err(rt_err("The new parent no longer exists"));
             }
         }
+        let was_in = w.mode == RunMode::Edit && w.d().records_change(r);
         w.dm().dom.transfer_within(r, new_parent);
         if new_parent.is_none() {
             w.orphans.insert(r);
+        }
+        if w.mode == RunMode::Edit {
+            let is_in = w.d().records_change(r);
+            if was_in || is_in {
+                let c = if is_in && !was_in {
+                    doc::Change::Enter { r, old, new: new_parent }
+                } else {
+                    doc::Change::Parent { r, old, new: new_parent }
+                };
+                w.dm().note_script_change(c);
+            }
         }
         w.record(RepOp::Parent(r));
         w.dm().mark_tree(r);
@@ -2160,6 +2231,59 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
         }
         (old, descendants)
     };
+    fire_parent_signals(lua, r, old, new_parent, descendants)
+}
+
+/// The signals of `r` having moved from `old` to `new_parent` (already done
+/// in the DOM): ChildRemoved / ChildAdded, DescendantRemoving / Added on
+/// the ancestors that listen, CollectionService's tag signals, Changed
+/// ("Parent") and AncestryChanged. Also used for edits made outside Lua
+/// (the editor, undo, Team Create) that the plugin host passes on.
+pub(crate) fn fire_parent_signals(
+    lua: &Lua,
+    r: Ref,
+    old: Ref,
+    new_parent: Ref,
+    descendants: Vec<Ref>,
+) -> mlua::Result<()> {
+    fire_parent_signals_opts(lua, r, old, new_parent, descendants, true)
+}
+
+/// DescendantRemoving alone, on `old`'s listening ancestors for `r` and its
+/// `descendants` (`r` still in place): the plugin host fires it before it
+/// takes an instance the editor removed out of the tree again, so handlers
+/// read its Parent as Studio's do (Immediate signals).
+pub(crate) fn fire_descendant_removing(lua: &Lua, old: Ref, descendants: &[Ref]) -> mlua::Result<()> {
+    let chain: Vec<Ref> = {
+        let w = world(lua)?;
+        let d = w.d();
+        let mut out = Vec::new();
+        let mut cur = old;
+        while cur.is_some() {
+            out.push(cur);
+            cur = d.dom.get_by_ref(cur).map(|i| i.parent()).unwrap_or_else(Ref::none);
+        }
+        out.into_iter().filter(|a| w.listening.contains(a) && hears(lua, *a, "DescendantRemoving")).collect()
+    };
+    for a in chain {
+        for d in descendants {
+            let v = inst_value(lua, *d)?;
+            world(lua)?.fire(a, "DescendantRemoving", vec![v]);
+        }
+    }
+    Ok(())
+}
+
+/// `fire_parent_signals`, DescendantRemoving left out when `removing` is
+/// false (already fired by `fire_descendant_removing`).
+pub(crate) fn fire_parent_signals_opts(
+    lua: &Lua,
+    r: Ref,
+    old: Ref,
+    new_parent: Ref,
+    descendants: Vec<Ref>,
+    removing: bool,
+) -> mlua::Result<()> {
     let me = inst_value(lua, r)?;
     let pname = Value::String(lua.create_string("Parent")?);
     // The ancestor chains the subtree left and joined, and whether each
@@ -2227,7 +2351,7 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
             .filter(|a| w.listening.contains(a) && hears(lua, *a, event))
             .collect())
     };
-    let old_listen = listening(&old_chain, "DescendantRemoving")?;
+    let old_listen = if removing { listening(&old_chain, "DescendantRemoving")? } else { Vec::new() };
     let new_listen = listening(&new_chain, "DescendantAdded")?;
     let mut fires: Vec<(Ref, &'static str, Value)> = Vec::new();
     for a in &old_listen {
@@ -2307,11 +2431,17 @@ fn store_prop(lua: &Lua, r: Ref, name: &str, v: Variant) -> mlua::Result<()> {
 fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlua::Result<()> {
     let name = key.as_str();
     let mut w = world(lua)?;
+    // A plugin's change of the edit DataModel goes into ChangeHistoryService
+    // (doc_history.rs; Source is the script editor's own undo, as Studio's).
+    let before = (w.mode == RunMode::Edit && name != "Source" && w.d().records_change(r))
+        .then(|| w.d().dom.get_by_ref(r).map(|i| i.properties.clone()))
+        .flatten();
     let changed = {
         let Some(inst) = w.dm().dom.get_by_ref_mut(r) else {
             return Err(rt_err("the Instance no longer exists"));
         };
         let old = inst.properties.insert(key, v.clone());
+        let unset = old.is_none();
         if let Some((twin, tv)) = doc::screen_insets_twin(inst.class.as_str(), name, &v) {
             inst.properties.insert(ustr(twin), tv);
         }
@@ -2333,8 +2463,26 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
                 inst.properties.remove(&ustr(legacy));
             }
         }
-        old.as_ref() != Some(&v)
+        (old.as_ref() != Some(&v), unset)
     };
+    // A property never set reads its default: writing that same value
+    // changes nothing and fires nothing (Studio: Anchored = false on a new
+    // Part fires no Changed, captures/misc2.txt).
+    let changed = match changed {
+        (true, true) => {
+            let d = w.d();
+            let class = d.class_of(r);
+            let dflt = class.and_then(|c| doc::studio_default(c.as_str(), name).or_else(|| {
+                let db = doc::db();
+                db.classes.get(c.as_str()).and_then(|cd| db.find_default_property(cd, name).cloned())
+            }));
+            dflt.as_ref() != Some(&v)
+        }
+        (c, _) => c,
+    };
+    if let Some(before) = before {
+        note_prop_changes(&mut w, r, &before);
+    }
     if changed {
         w.dm().mark_prop(r, key);
         w.record(RepOp::Prop(r, name.to_string()));
@@ -2342,10 +2490,13 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
         if physics_prop(name) && class.is_some_and(|c| doc::is_a(&c, "BasePart")) {
             w.dirty.insert(r);
         }
-        // Nobody listening to this instance or the DataModel (services'
-        // on_fire), telemetry off: both fires below would do nothing.
-        let root = w.d().dom.root_ref();
-        if !w.listening.contains(&r) && !w.listening.contains(&root) && !crate::telemetry::on() {
+        // A part's Size changes its mass: Studio fires Changed for Size,
+        // then AssemblyMass, then Mass (checks/plugins/services/captures/
+        // misc2.txt `part.size.changed`).
+        let mass_changed = name == "Size" && class.is_some_and(|c| doc::is_a(&c, "BasePart"));
+        // Nobody listening to this instance or to game.ItemChanged
+        // (services' on_fire), telemetry off: both fires below would do nothing.
+        if !w.listening.contains(&r) && !w.item_changed && !crate::telemetry::on() {
             return Ok(());
         }
         // Changed's argument: the property name, or a ValueBase's new value.
@@ -2359,8 +2510,64 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
         let mut w = world(lua)?;
         w.fire(r, "Changed", vec![pname]);
         w.fire(r, &format!("Changed:{name}"), vec![]);
+        if mass_changed {
+            for k in ["AssemblyMass", "Mass"] {
+                w.fire(r, "Changed", vec![Value::String(lua.create_string(k)?)]);
+                w.fire(r, &format!("Changed:{k}"), vec![]);
+            }
+        }
     }
     Ok(())
+}
+
+/// Changed(key) and Changed:key on `r` for a property set through another
+/// (Position through CFrame), made only when something could hear them:
+/// a connection on `r`, game.ItemChanged, or telemetry.
+fn fire_changed(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
+    {
+        let w = world(lua)?;
+        if !w.listening.contains(&r) && !w.item_changed && !crate::telemetry::on() {
+            return Ok(());
+        }
+    }
+    let pname = Value::String(lua.create_string(key)?);
+    let mut w = world(lua)?;
+    w.fire(r, "Changed", vec![pname]);
+    w.fire(r, &format!("Changed:{key}"), vec![]);
+    Ok(())
+}
+
+/// The change history's record of a script's property write: every
+/// property of `r` that differs from `before` (the written one and its
+/// twins).
+pub(crate) fn note_prop_changes(w: &mut World, r: Ref, before: &rbx_dom_weak::UstrMap<Variant>) {
+    let Some(inst) = w.d().dom.get_by_ref(r) else { return };
+    let mut changes = Vec::new();
+    for (k, nv) in inst.properties.iter() {
+        if before.get(k) != Some(nv) {
+            changes.push(doc::Change::Prop { r, name: *k, old: before.get(k).cloned(), new: Some(nv.clone()) });
+        }
+    }
+    for (k, ov) in before.iter() {
+        if !inst.properties.contains_key(k) {
+            changes.push(doc::Change::Prop { r, name: *k, old: Some(ov.clone()), new: None });
+        }
+    }
+    for c in changes {
+        w.dm().note_script_change(c);
+    }
+}
+
+/// A script's write of one property the runtime makes directly (Tags…),
+/// `old` its value before: into the change history as `store_prop` does.
+pub(crate) fn note_script_prop(w: &mut World, r: Ref, key: rbx_dom_weak::Ustr, old: Option<Variant>) {
+    if w.mode != RunMode::Edit || !w.d().records_change(r) {
+        return;
+    }
+    let new = w.d().dom.get_by_ref(r).and_then(|i| i.properties.get(&key).cloned());
+    if new != old {
+        w.dm().note_script_change(doc::Change::Prop { r, name: key, old, new });
+    }
 }
 
 fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
@@ -2428,8 +2635,12 @@ fn newindex_routed(
             };
             let pname = Value::String(lua.create_string("Name")?);
             let mut w = world(lua)?;
+            let rec = w.mode == RunMode::Edit && w.d().records_change(r);
             if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
-                i.name = s;
+                let old = std::mem::replace(&mut i.name, s.clone());
+                if rec && old != s {
+                    w.dm().note_script_change(doc::Change::Name { r, old, new: s });
+                }
             }
             w.dm().mark_prop(r, ustr("Name"));
             w.fire(r, "Changed", vec![pname]);
@@ -2486,6 +2697,16 @@ fn newindex_routed(
     }
     // Attachment world placement: stored as CFrame relative to the part (or
     // as given while it isn't on a part, like Roblox).
+    if rt.set_attachment && key == "Position" {
+        // (Only its own frame's turn is kept: the part's frame isn't needed.)
+        let v = opt_ud::<LVector3>(&value).ok_or_else(|| bad_assign(key, "Vector3", &value))?.0;
+        let rot = match world(lua)?.d().prop(r, "CFrame") {
+            Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf).rot,
+            _ => glam::Mat3::IDENTITY,
+        };
+        store_prop(lua, r, "CFrame", Variant::CFrame(Xform { pos: v, rot }.to_cframe()))?;
+        return fire_changed(lua, r, key);
+    }
     if rt.set_attachment {
         let (local, part) = attachment_frames(lua, r)?;
         let worldf = compose(&part, &local);
@@ -2551,11 +2772,7 @@ fn newindex_routed(
             }
         };
         store_prop(lua, r, "CFrame", Variant::CFrame(new_local.to_cframe()))?;
-        let pname = Value::String(lua.create_string(key)?);
-        let mut w = world(lua)?;
-        w.fire(r, "Changed", vec![pname]);
-        w.fire(r, &format!("Changed:{key}"), vec![]);
-        return Ok(());
+        return fire_changed(lua, r, key);
     }
     if rt.set_part {
         match key {
@@ -2572,11 +2789,7 @@ fn newindex_routed(
                     Xform::from_orientation_deg(xf.pos, v.0)
                 };
                 store_prop(lua, r, "CFrame", Variant::CFrame(nx.to_cframe()))?;
-                let pname = Value::String(lua.create_string(key)?);
-                let mut w = world(lua)?;
-                w.fire(r, "Changed", vec![pname]);
-                w.fire(r, &format!("Changed:{key}"), vec![]);
-                return Ok(());
+                return fire_changed(lua, r, key);
             }
             "BrickColor" => {
                 let b = opt_ud::<LBrickColor>(&value)
@@ -2675,6 +2888,20 @@ fn script_of_function(f: &Function) -> Option<Ref> {
     f.environment().and_then(|e| e.raw_get::<Value>("script").ok()).as_ref().and_then(opt_inst)
 }
 
+/// The script of the running code: the `script` of the nearest Lua
+/// function on the current thread's stack that has one (plugin_host's
+/// printidentity asset id).
+pub(crate) fn running_script(lua: &Lua) -> Option<Ref> {
+    for level in 0..32 {
+        match lua.inspect_stack(level, |d| script_of_function(&d.function())) {
+            Some(Some(r)) => return Some(r),
+            Some(None) => {}
+            None => break,
+        }
+    }
+    None
+}
+
 /// The script a suspended thread is running: the first Lua frame's.
 fn script_of_thread(lua: &Lua, th: &Thread) -> Option<Ref> {
     let info = lua.globals().get::<Table>("debug").and_then(|d| d.get::<Function>("info")).ok()?;
@@ -2731,6 +2958,69 @@ fn stop_script(lua: &Lua, r: Ref) {
     };
     timers.retain(|t| script_of_thread(lua, &t.thread) != Some(r));
     deferred.retain(|(th, _)| script_of_thread(lua, th) != Some(r));
+    if let Some(mut s) = lua.app_data_mut::<Sched>() {
+        timers.append(&mut s.timers);
+        deferred.append(&mut s.deferred);
+        s.timers = timers;
+        s.deferred = deferred;
+    }
+}
+
+/// Whether any Lua frame of a suspended thread runs code of one of `set`'s
+/// scripts (ModuleScripts included: a thread that yields inside a required
+/// module's function has the module's frame on top).
+fn thread_runs_any(lua: &Lua, th: &Thread, set: &HashSet<Ref>) -> bool {
+    let Ok(info) = lua.globals().get::<Table>("debug").and_then(|d| d.get::<Function>("info")) else { return false };
+    for level in 0..64 {
+        match info.call::<Option<Function>>((th.clone(), level, "f")) {
+            Ok(Some(f)) => {
+                if script_of_function(&f).is_some_and(|r| set.contains(&r)) {
+                    return true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+/// Ends every thread and connection running code of `set`'s scripts,
+/// wherever it yields (an unloaded plugin: Studio stops all of its code,
+/// including threads parked inside its ModuleScripts).
+fn stop_code_of(lua: &Lua, set: &HashSet<Ref>) {
+    if set.is_empty() {
+        return;
+    }
+    if let Ok(mut w) = world(lua) {
+        w.started.retain(|r| !set.contains(r));
+    }
+    let (mut conns, mut waiters) = match lua.app_data_mut::<Signals>() {
+        Some(mut s) => (std::mem::take(&mut s.conns), std::mem::take(&mut s.waiters)),
+        None => return,
+    };
+    for list in conns.values_mut() {
+        list.retain(|c| !script_of_function(&c.func).is_some_and(|r| set.contains(&r)));
+    }
+    for list in waiters.values_mut() {
+        list.retain(|(_, th)| !thread_runs_any(lua, th, set));
+    }
+    if let Some(mut s) = lua.app_data_mut::<Signals>() {
+        for (k, mut v) in std::mem::take(&mut s.conns) {
+            conns.entry(k).or_default().append(&mut v);
+        }
+        for (k, mut v) in std::mem::take(&mut s.waiters) {
+            waiters.entry(k).or_default().append(&mut v);
+        }
+        s.conns = conns;
+        s.waiters = waiters;
+    }
+    let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
+        Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
+        None => return,
+    };
+    timers.retain(|t| !thread_runs_any(lua, &t.thread, set));
+    deferred.retain(|(th, _)| !thread_runs_any(lua, th, set));
     if let Some(mut s) = lua.app_data_mut::<Sched>() {
         timers.append(&mut s.timers);
         deferred.append(&mut s.deferred);
@@ -2941,10 +3231,18 @@ fn opt_ref_value(lua: &Lua, r: Option<Ref>) -> mlua::Result<Value> {
 fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>> {
     // Studio-only services: GetService / FindService give game scripts nil
     // (measured in Studio, checks/parity/testing.md).
+    // (Plugins see them: measured, StudioService's Parent is the edit
+    // DataModel.)
     if matches!(
         class,
         "DebuggerManager" | "StudioService" | "DraggerService" | "LiveSyncService" | "TestCoordinatorService"
-    ) {
+    ) && security::current(lua) == security::GAME
+    {
+        return Ok(None);
+    }
+    // Studio's edit DataModel has no StudioPublishService: a plugin's
+    // GetService gets nil (checks/plugins/services/captures/history2.txt).
+    if class == "StudioPublishService" {
         return Ok(None);
     }
     let mut w = world(lua)?;
@@ -2988,6 +3286,21 @@ fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>
 
 /// A model's pivot: its PrimaryPart, else the centre of its parts.
 /// When this process started (os.clock's origin, as in Studio).
+/// RUSTUDIO_GAME_CLOCK: virtual script time spent this frame (os.clock calls), and what
+/// one call costs (10 µs).
+static GAME_CLOCK_SPENT: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
+const GAME_CLOCK_CALL: f64 = 1e-5;
+
+/// RUSTUDIO_GAME_CLOCK: the script time spent since the last call, in whole periods of a
+/// `hz` display (a frame's time is whole display periods), and starts the next frame's
+/// count. A frame whose scripts spun on os.clock for 0.083 s steps 5 periods more.
+pub fn take_game_clock_spent(hz: f32) -> f32 {
+    let mut e = GAME_CLOCK_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let n = (*e * hz as f64).round();
+    *e = 0.0;
+    (n / hz as f64) as f32
+}
+
 pub fn process_start() -> Instant {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *START.get_or_init(Instant::now)
@@ -3108,6 +3421,12 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         w.record(RepOp::Destroy(r));
     }
     set_parent(lua, r, Ref::none())?;
+    {
+        let mut w = world(lua)?;
+        if w.mode == RunMode::Edit {
+            w.dm().note_script_destroyed(r);
+        }
+    }
     // Destroy goes on to every descendant (Roblox: "calls Destroy on all
     // children"), so each fires its own Destroying too: a tool's cleanup
     // bound to it (LaserTag's bindToInstanceDestroyed) runs when the
@@ -3126,6 +3445,8 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         }
     }
     let order = detach_descendants(lua, r)?;
+    // A destroyed MeshPart made from an EditableMesh leaves the link table.
+    editable::forget_parts(std::iter::once(r).chain(order.iter().map(|x| x.0)));
     // Connections go only when something in the subtree has any (a walk of
     // every connection in the DataModel otherwise: 125 us per Destroy in
     // Place E, 1.6 ms in a live Place A match, whose effect parts and
@@ -3183,7 +3504,7 @@ fn detach_descendants(lua: &Lua, r: Ref) -> mlua::Result<Vec<(Ref, Ref)>> {
             .iter()
             .map(|(d, p)| w.listening.contains(d) || w.listening.contains(p))
             .collect();
-        let item_changed = w.listening.contains(&w.d().dom.root_ref());
+        let item_changed = w.item_changed;
         (order, listens, item_changed)
     };
     if !item_changed && !listens.iter().any(|x| *x) {
@@ -3504,7 +3825,15 @@ fn call_method_routed(
             none()
         }
         "GetFullName" => {
-            let s = world(lua)?.full_name(this);
+            // (game:GetFullName() is its Name: "Place1" in Studio's edit DataModel.)
+            let s = {
+                let w = world(lua)?;
+                if this == w.d().dom.root_ref() {
+                    w.d().dom.root().name.clone()
+                } else {
+                    w.full_name(this)
+                }
+            };
             one(Value::String(lua.create_string(&s)?))
         }
         "GetAttribute" => {
@@ -3725,11 +4054,17 @@ fn call_method_routed(
             world(lua)?.load_character.push(this);
             none()
         }
-        "IsClient" => one(Value::Boolean(world(lua)?.side == Side::Client)),
+        // Studio's edit DataModel (measured with a plugin, 0.747): IsEdit,
+        // IsClient, IsServer and IsStudio true, IsRunning and IsRunMode false.
+        "IsClient" => {
+            let w = world(lua)?;
+            one(Value::Boolean(w.side == Side::Client || w.mode == RunMode::Edit))
+        }
         "IsServer" => one(Value::Boolean(world(lua)?.side == Side::Server)),
-        "IsStudio" | "IsRunning" => one(Value::Boolean(true)),
+        "IsStudio" => one(Value::Boolean(true)),
+        "IsRunning" => one(Value::Boolean(world(lua)?.mode != RunMode::Edit)),
         "IsRunMode" => one(Value::Boolean(world(lua)?.mode == RunMode::Run)),
-        "IsEdit" => one(Value::Boolean(false)),
+        "IsEdit" => one(Value::Boolean(world(lua)?.mode == RunMode::Edit)),
         "IsKeyDown" => {
             let k = opt_ud::<LEnumItem>(&arg(&args, 1))
                 .ok_or_else(|| rt_err("Enum.KeyCode expected"))?;
@@ -3883,7 +4218,15 @@ local function require_impl(m, script)
     end
     -- false is asset id 0 (measured); the client may not load assets.
     if type(m) == "boolean" then m = 0 end
-    if type(m) == "number" and game:GetService("RunService"):IsClient() then
+    -- (The edit DataModel is client and server at once: plugins require
+    -- asset modules there, as F3X does; Studio measured "function".)
+    -- (IsEdit needs PluginOrOpenCloud: a game script that can't ask is not
+    -- a plugin in the edit DataModel.)
+    local function in_edit()
+        local ok, edit = pcall(function() return game:GetService("RunService"):IsEdit() end)
+        return ok and edit
+    end
+    if type(m) == "number" and game:GetService("RunService"):IsClient() and not in_edit() then
         error(string.format("require(assetId) cannot be called from a client.  assetId = %d", m), 0)
     end
     if type(m) == "number" then
@@ -4087,22 +4430,28 @@ impl Runtime {
     pub fn new() -> Result<Self, String> {
         luau_flags();
         let lua = Lua::new();
+        crate::load_trace::mark("runtime: Lua made");
+        // RUSTUDIO_DETERMINISTIC (test runs): Luau seeds math.random from the time and the
+        // state's address; the default Animate script rolls its weighted variants with it,
+        // and the chosen pose shapes the character. Seeded by creation order instead.
+        if rbx_dom_weak::deterministic() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let _ = lua.load(format!("math.randomseed({n})")).exec();
+        }
         routes::install_atoms(&lua);
+        crate::load_trace::mark("runtime: atoms");
         crate::globals_parity::init_vm(&lua);
+        crate::load_trace::mark("runtime: globals parity");
         // Studio compiles scripts at Luau -O1 (no inlining), so Output stacks
         // keep every frame; -O2 inlined local functions out of error stacks.
         // Studio's other compile options:
         // `Vector3.new` is Luau's vector constructor (the LBF_VECTOR fastcall:
         // no call into the engine for `Vector3.new(x, y, z)` with numbers),
         // and these globals stay mutable (not cached as imports).
-        lua.set_compiler(
-            mlua::chunk::Compiler::new()
-                .set_optimization_level(1)
-                .set_debug_level(1)
-                .set_vector_ctor("Vector3.new")
-                .set_vector_type("Vector3")
-                .set_mutable_globals(["Game", "Workspace", "game", "plugin", "script", "shared", "workspace"]),
-        );
+        // (bytecode_cache::compiler: the same settings for its cached scripts)
+        lua.set_compiler(crate::bytecode_cache::compiler());
         lua.set_app_data(Sched::default());
         lua.set_app_data(Signals::default());
         lua.set_app_data(signal_timing::Reentry::default());
@@ -4165,7 +4514,9 @@ impl Runtime {
         let shared = lua.create_table().map_err(|e| e.to_string())?;
         interrupt_watchdog::register(callbacks as *mut mlua::ffi::lua_Callbacks);
         let rt = Runtime { lua, shared, callbacks };
+        crate::load_trace::mark("runtime: hooks");
         rt.install().map_err(|e| describe_error(&e))?;
+        crate::load_trace::mark("runtime: installed");
         Ok(rt)
     }
 
@@ -4200,6 +4551,36 @@ impl Runtime {
                 inst_value(lua, r)
             })?,
         )?;
+        // Instance.fromExisting(x): a new instance of x's class with x's
+        // properties (not its children), parentless (Studio: Name and
+        // values kept, Parent nil).
+        inst.set(
+            "fromExisting",
+            lua.create_function(|lua, v: Value| {
+                let src = opt_inst(&v).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
+                let class = world(lua)?.d().class_of(src).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
+                security::check_create(lua, &class)?;
+                if !doc::is_script_creatable(&class) {
+                    return Err(rt_err(format!("Unable to create an Instance of type \"{class}\"")));
+                }
+                let r = {
+                    let mut w = world(lua)?;
+                    let (name, props) = {
+                        let i = w.d().dom.get_by_ref(src).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
+                        (i.name.clone(), i.properties.clone())
+                    };
+                    let mut b = InstanceBuilder::new(class.as_str()).with_name(name);
+                    for (k, v) in props {
+                        b.add_property(k, v);
+                    }
+                    let r = w.dm().dom.insert(Ref::none(), b);
+                    w.structure_changed = true;
+                    r
+                };
+                domains::assets_cloud::scene::track_instance(lua, r)?;
+                inst_value(lua, r)
+            })?,
+        )?;
         g.set("Instance", inst)?;
 
         let task = lua.create_table()?;
@@ -4231,7 +4612,7 @@ impl Runtime {
                 sched(lua)?.timers.push(Timer {
                     at: now + t,
                     started: now,
-                    wall: Instant::now(),
+                    wall: crate::sim_clock::now(),
                     thread: th.clone(),
                     args: Some(it.collect()),
                 });
@@ -4264,25 +4645,34 @@ impl Runtime {
                 sched(lua)?.timers.push(Timer {
                     at: now + t,
                     started: now,
-                    wall: Instant::now(),
+                    wall: crate::sim_clock::now(),
                     thread: th,
                     args: Some(vec![]),
                 });
                 Ok(())
             })?,
         )?;
-        g.set("time", lua.create_function(|lua, ()| Ok(world(lua)?.time))?)?;
+        // (time() stays 0 in Studio's edit DataModel: .)
+        g.set(
+            "time",
+            lua.create_function(|lua, ()| {
+                let w = world(lua)?;
+                Ok(if w.mode == RunMode::Edit { 0.0 } else { w.time })
+            })?,
+        )?;
         g.set(
             "elapsedTime",
             lua.create_function(|lua, ()| Ok(world(lua)?.time))?,
         )?;
         g.set(
             "tick",
-            lua.create_function(|_, ()| {
-                Ok(std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0))
+            lua.create_function(|lua, ()| {
+                // RUSTUDIO_FIXED_DT runs: game time from a fixed epoch; else
+                // --fixed-dt's simulated clock or the wall clock (sim_clock).
+                if let Some(t) = fixed_epoch_time(lua) {
+                    return Ok(t);
+                }
+                Ok(crate::sim_clock::epoch_secs())
             })?,
         )?;
         g.set("shared", lua.create_table()?)?;
@@ -4293,7 +4683,7 @@ impl Runtime {
             sched(lua)?.timers.push(Timer {
                 at: now + t.max(0.0),
                 started: now,
-                wall: Instant::now(),
+                wall: crate::sim_clock::now(),
                 thread: th,
                 args: None,
             });
@@ -4305,10 +4695,13 @@ impl Runtime {
                     let mut s = signals(lua)?;
                     s.next_id += 1;
                     let id = s.next_id;
+                    let item_changed = name == "ItemChanged";
                     s.waiters.entry((inst.0, name)).or_default().push((id, th));
-                    id
+                    (id, item_changed)
                 };
+                let (id, item_changed) = id;
                 let mut w = world(lua)?;
+                w.item_changed |= item_changed;
                 w.conn_seq = id;
                 if w.listening.insert(inst.0) && w.side == Side::Client {
                     w.listen_new.push(inst.0);
@@ -4352,8 +4745,12 @@ impl Runtime {
                 };
                 if let Some(mut w) = lua.app_data_mut::<World>() {
                     w.conn_seq = id;
-                    if w.listening.insert(inst.0) && w.side == Side::Client {
-                        w.listen_new.push(inst.0);
+                    w.item_changed |= name == "ItemChanged";
+                    if w.listening.insert(inst.0) {
+                        ext::seed_unlaid(&mut w, inst.0);
+                        if w.side == Side::Client {
+                            w.listen_new.push(inst.0);
+                        }
                     }
                 }
                 Ok(LConn {
@@ -4820,12 +5217,25 @@ impl Runtime {
         // RUSTUDIO_CPU_CLOCK=1 (benchmarks only): the calling thread's CPU
         // time instead, so per-call costs can be timed on a loaded machine.
         let cpu_clock = std::env::var_os("RUSTUDIO_CPU_CLOCK").is_some();
+        // RUSTUDIO_INSTR_CLOCK=1 (benchmarks only): the calling thread's
+        // user-space instructions retired, in billions (a loop's time per
+        // call in ns reads as instructions per call): stable under load
+        // (checks/call-costs).
+        let instr_clock = std::env::var_os("RUSTUDIO_INSTR_CLOCK").is_some();
         // RUSTUDIO_GAME_CLOCK=1 (tests only, with RUSTUDIO_FIXED_DT): the
         // game's time, so wall-clock probes are deterministic on a loaded machine.
-        let game_clock = std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some();
+        let game_clock = std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some() || crate::sim_clock::on();
         let clock = lua.create_function(move |lua, ()| {
             if game_clock {
-                return Ok(world(lua).map(|w| w.time).unwrap_or(0.0) + 1000.0);
+                // Each call costs GAME_CLOCK_CALL of virtual script time, so a script that
+                // waits by spinning on os.clock (the probes' frame cap) ends its wait, and
+                // the frame it spent goes into the next frame's step (`take_game_clock_spent`).
+                let mut e = GAME_CLOCK_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+                *e += GAME_CLOCK_CALL;
+                return Ok(world(lua).map(|w| w.time).unwrap_or(0.0) + 1000.0 + *e);
+            }
+            if instr_clock {
+                return Ok(crate::bench::instructions() as f64 * 1e-9);
             }
             // (Unix only; elsewhere the wall clock below.)
             #[cfg(unix)]
@@ -4851,6 +5261,29 @@ impl Runtime {
         })?;
         if let Ok(os) = g.get::<Table>("os") {
             os.set("clock", clock)?;
+            // --fixed-dt: os.time() (no table) and os.date(fmt) (no time)
+            // on the simulated clock.
+            if crate::sim_clock::on() {
+                let date: Function = os.get("date")?;
+                os.set(
+                    "date",
+                    lua.create_function(move |_, (fmt, t): (Value, Option<f64>)| {
+                        let t = t.unwrap_or_else(|| crate::sim_clock::epoch_secs().floor());
+                        date.call::<mlua::MultiValue>((fmt, t))
+                    })?,
+                )?;
+                let orig: Function = os.get("time")?;
+                os.set(
+                    "time",
+                    lua.create_function(move |_, t: mlua::MultiValue| {
+                        if t.is_empty() || matches!(t.front(), Some(Value::Nil)) {
+                            Ok(Value::Number(crate::sim_clock::epoch_secs().floor()))
+                        } else {
+                            orig.call::<Value>(t)
+                        }
+                    })?,
+                )?;
+            }
         }
         crate::globals_parity::sync(lua)?;
         Ok(())
@@ -4869,6 +5302,11 @@ impl Runtime {
 
     /// Starts a Script or LocalScript as a new coroutine.
     pub fn run_script(&self, r: Ref) {
+        self.run_script_as(r, security::GAME)
+    }
+
+    /// `run_script` at identity `ident` (plugins run at security::PLUGIN).
+    pub fn run_script_as(&self, r: Ref, ident: u8) {
         let lua = &self.lua;
         if let Ok(mut w) = world(lua) {
             if !w.started.insert(r) {
@@ -4891,7 +5329,7 @@ impl Runtime {
         }
         let started = compile_script(lua, r, &self.shared)
             .and_then(|f| domains::assets_cloud::scene::create_thread(lua,f))
-            .inspect(|th| security::set(th, security::GAME));
+            .inspect(|th| security::set(th, ident));
         match started {
             Ok(th) if crate::bench::lua_prof_on() => crate::bench::lua_timed(
                 th.to_pointer() as usize,
@@ -4954,6 +5392,8 @@ impl Runtime {
             w.time += dt;
             (w.time, w.realtime)
         };
+        // RUSTUDIO_FIXED_DT Play (test runs): no wall clock in what resumes when.
+        let fixed_step = !realtime && fixed_dt_env();
         {
             let _s = crate::bench::scope("rt_domains_step");
             let _ = domains::step(lua, dt);
@@ -4972,7 +5412,7 @@ impl Runtime {
                 .into_iter()
                 .partition(|t| {
                     t.at <= now + 1e-9
-                        || realtime && t.wall.elapsed().as_secs_f64() >= t.at - t.started
+                        || realtime && crate::sim_clock::since(t.wall).as_secs_f64() >= t.at - t.started
                 });
             s.timers = keep;
             due
@@ -4985,11 +5425,16 @@ impl Runtime {
             let args = t
                 .args
                 .unwrap_or_else(|| {
-                    let real = t.wall.elapsed().as_secs_f64();
+                    // (RUSTUDIO_FIXED_DT runs: game time only; the wall clock would make
+                    // the result depend on the machine's load. --fixed-dt: its simulated clock.)
+                    let real = if fixed_step { 0.0 } else { crate::sim_clock::since(t.wall).as_secs_f64() };
                     vec![Value::Number((now - t.started).max(real))]
                 });
             resume_thread_timed(lua, &t.thread, args);
-            if started.elapsed().as_secs_f64() * 1000.0 > mech::SCRIPT_FRAME_BUDGET_MS {
+            // The frame budget is wall time: fixed-step runs (RUSTUDIO_FIXED_DT or
+            // --fixed-dt) resume every due thread, so what runs in a frame doesn't
+            // depend on how fast the machine is.
+            if !fixed_step && !crate::sim_clock::on() && started.elapsed().as_secs_f64() * 1000.0 > mech::SCRIPT_FRAME_BUDGET_MS {
                 break;
             }
         }
@@ -5511,10 +5956,20 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     // envs are; Luau clears it itself if the script calls getfenv/setfenv.
     let _ = shared;
     let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
-    lua.load(source)
-        .set_name(place_chunk_name(&name))
-        .set_environment(env)
-        .into_function()
+    // A Script inside a loaded plugin's tree also gets `plugin`.
+    crate::plugin_host::vm::script_env(lua, r, &env)?;
+    // Big sources compile once (the other side of Play, the next run):
+    // bytecode_cache.rs.
+    match crate::bytecode_cache::get(&source) {
+        Some(b) => lua.load(&b[..]).set_mode(mlua::chunk::ChunkMode::Binary)
+            .set_name(place_chunk_name(&name))
+            .set_environment(env)
+            .into_function(),
+        None => lua.load(source)
+            .set_name(place_chunk_name(&name))
+            .set_environment(env)
+            .into_function(),
+    }
     })();
     domains::assets_cloud::scene::restore(lua,memory_category)?;
     result
@@ -5955,6 +6410,46 @@ impl Runtime {
         if let Err(e) = set_parent(&self.lua, r, parent) {
             report(&self.lua, &e);
         }
+    }
+
+    /// A property the editor (or undo, Team Create, a file sync) changed
+    /// outside Lua, already in the document: Changed (a ValueBase's new
+    /// value for Value) and its GetPropertyChangedSignal fire, as for a
+    /// script's write (the plugin host's edit sync).
+    pub fn notify_prop(&self, r: Ref, name: &str) {
+        notify_prop_in(&self.lua, r, name)
+    }
+
+    /// An instance the editor moved, created (`old` none) or removed (`new`
+    /// none) outside Lua, already done in the document: the hierarchy
+    /// signals fire as for a script's Parent write. `descendants`: the
+    /// moved subtree below `r`.
+    pub fn notify_parent(&self, r: Ref, old: Ref, new: Ref, descendants: Vec<Ref>) {
+        if let Ok(mut w) = world(&self.lua) {
+            if new.is_none() {
+                w.orphans.remove(&r);
+            }
+        }
+        if let Err(e) = fire_parent_signals(&self.lua, r, old, new, descendants) {
+            report(&self.lua, &e);
+        }
+    }
+
+    /// Ends a running script as disabling it does: its connections go and
+    /// its threads never resume (plugin unload).
+    pub fn stop_script(&self, r: Ref) {
+        stop_script(&self.lua, r);
+    }
+
+    /// Ends every thread and connection running code of these scripts
+    /// (ModuleScripts too), wherever on its stack (the plugin host's unload).
+    pub fn stop_code_of(&self, scripts: &HashSet<Ref>) {
+        stop_code_of(&self.lua, scripts);
+    }
+
+    /// Reports an error to Output as a script error is (the plugin host).
+    pub fn report_error(&self, e: &mlua::Error) {
+        report(&self.lua, e);
     }
 
     /// Replication: the server destroyed `r` (Destroying fires here too,
@@ -6741,3 +7236,31 @@ mod attachment_tests;
 #[cfg(test)]
 #[path = "selftest/bridge.rs"]
 mod bridge_tests;
+
+/// `Runtime::notify_prop` from inside Lua (ChangeHistoryService's undo,
+/// src/plugin_host/api_history.rs): Changed for a property changed outside
+/// the script's own write.
+pub(crate) fn notify_prop_in(lua: &Lua, r: Ref, name: &str) {
+    let Ok(mut w) = world(lua) else { return };
+    let root = w.d().dom.root_ref();
+    if !w.listening.contains(&r) && !w.listening.contains(&root) {
+        return;
+    }
+    let class = w.d().class_of(r);
+    let value_changed = name == "Value" && class.is_some_and(|c| doc::is_a(&c, "ValueBase"));
+    let v = if value_changed {
+        let v = w.d().prop(r, name);
+        drop(w);
+        v.and_then(|v| variant_to_lua(lua, &v, None).ok()).unwrap_or(Value::Nil)
+    } else {
+        drop(w);
+        match lua.create_string(name) {
+            Ok(s) => Value::String(s),
+            Err(_) => return,
+        }
+    };
+    if let Ok(mut w) = world(lua) {
+        w.fire(r, "Changed", vec![v]);
+        w.fire(r, &format!("Changed:{name}"), vec![]);
+    }
+}

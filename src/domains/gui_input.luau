@@ -218,7 +218,7 @@ methods["GuiService.GetInsetArea"] = function(_, insets)
         error("Unable to cast " .. typeof(insets) .. " to token", 0)
     end
     local w, h = G.view()
-    local inset = G.is_client() and 58 or 0
+    local inset = (G.is_client() and not G.is_edit()) and 58 or 0
     if insets == Enum.ScreenInsets.CoreUISafeInsets then
         return Rect.new(0, 0, w, h - inset)
     end
@@ -602,6 +602,12 @@ set["TextBox.SelectionStart"] = function(box, _, v)
     set_sel(box, math.clamp(v, -1, n + 1))
     return true
 end
+-- A TextBox in a plugin's dock widget: UserInputService doesn't hear of it
+-- (Studio 0.747: checks/plugins/widgets/captures/studio-widgets.txt).
+-- (Play's plugin copies too: their widgets are plugin GUIs as well)
+local function in_widget(box)
+    return box:FindFirstAncestorWhichIsA("PluginGui") ~= nil
+end
 local function gain(box)
     if box.ClearTextOnFocus then box.Text = "" end
     focused = box
@@ -609,7 +615,7 @@ local function gain(box)
     set_cursor(box, (utf8.len(box.Text) or #box.Text) + 1)
     set_sel(box, -1)
     fire(box, "Focused")
-    fire(svc("UserInputService"), "TextBoxFocused", box)
+    if not in_widget(box) then fire(svc("UserInputService"), "TextBoxFocused", box) end
 end
 local function lose(box, enter, input)
     if focused ~= box then return end
@@ -617,7 +623,7 @@ local function lose(box, enter, input)
     set_cursor(box, -1)
     set_sel(box, -1)
     fire(box, "FocusLost", enter == true, input)
-    fire(svc("UserInputService"), "TextBoxFocusReleased", box)
+    if not in_widget(box) then fire(svc("UserInputService"), "TextBoxFocusReleased", box) end
 end
 methods["TextBox.CaptureFocus"] = function(box)
     if focused == box or not G.is_client() then return end
@@ -1085,7 +1091,11 @@ local function ring_point(o, d, c, n)
     return o + d * t
 end
 local function step_adorns()
-    if next(tracked.Adorn) == nil then hover_a = nil press = nil return end
+    if next(tracked.Adorn) == nil then
+        if hover_a or press then G.set_adorn_hot(false) end
+        hover_a = nil press = nil
+        return
+    end
     local o, d = G.mouse_ray()
     if d.Magnitude < 0.5 then return end
     local best, ba, bp
@@ -1166,6 +1176,8 @@ local function step_adorns()
     elseif press and not G.buttons() then
         finish()
     end
+    local held = (press and press.a) or hover_a
+    G.set_adorn_hot(hover_a ~= nil or press ~= nil, held ~= nil and held:IsA("HandlesBase"))
 end
 
 -------------------------------------------------------------------- Styles
@@ -2335,6 +2347,25 @@ local function step_all(dt)
     step_mouse()
     step_prompts()
     step_styles()
+end
+
+-- The Play server's plugin widgets (plugin_host/widgets_ui.rs, GUI
+-- channel 2): their TextBoxes gain and lose focus, as a client's do in
+-- step_all (the server has no game GUI of its own to step).
+__rs_plugin_gui_step = function()
+    if G.is_client() then return end
+    local ok, err = pcall(step_focus)
+    if not ok then log("error", "gui_input: " .. tostring(err)) end
+end
+
+-- Focus changes queued by this frame's presses, fired before the frame's GUI
+-- events (a press elsewhere ends typing first: a TextBox's FocusLost comes
+-- before the pressed button's Activated, as Studio; Argon reads its port box
+-- on FocusLost and connects on Activated).
+function M.focus_now()
+    if not G.is_client() then return end
+    local ok, err = xpcall(step_focus, debug.traceback)
+    if not ok then log("error", "gui_input focus: " .. tostring(err):gsub("\n", " | ")) end
 end
 
 function M.step(dt)

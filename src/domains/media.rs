@@ -1769,6 +1769,11 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Sound.IsLoaded is false while the SoundId a script set is loading.
+pub fn sound_loading(lua: &Lua, r: Ref) -> mlua::Result<bool> {
+    Ok(media(lua)?.sound_loads.contains_key(&r))
+}
+
 fn sound_loads(lua: &Lua) -> mlua::Result<()> {
     let items: Vec<(Ref, String, Option<Load>)> = {
         let mut m = media(lua)?;

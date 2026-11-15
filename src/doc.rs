@@ -47,6 +47,19 @@ pub enum Change {
         r: Ref,
         parent: Ref,
     },
+    /// A script moved an instance from outside the DataModel (`old`, none
+    /// for a parentless one) into it (doc_history.rs): undo takes it out
+    /// again, keeping it alive for the script.
+    Enter {
+        r: Ref,
+        old: Ref,
+        new: Ref,
+    },
+    /// A script destroyed the instance: the step has it, but nothing can
+    /// bring it back (Studio's undo leaves Parent nil and locked).
+    Destroy {
+        r: Ref,
+    },
 }
 
 /// One entry in a document's change journal.
@@ -91,6 +104,18 @@ pub enum Reader {
     Anim = 13,
     /// GUI boxes scripts listen to (runtime_ext::fire_layout_changes).
     Layout = 14,
+    /// The studio solver's connector descriptions (physics_joints.rs studio_constraints).
+    SolverJoints = 15,
+    /// Parts inside drawn ViewportFrames (scene.rs `Scene::viewport_frames`).
+    VfScene = 16,
+    /// The edit-mode plugin runtime's view of edits made outside it
+    /// (src/plugin_host/edit_sync.rs).
+    Plugins = 17,
+    /// The plugins' GUIs: dock widgets and CoreGui in the edit viewport
+    /// (src/plugin_host/widgets_ui.rs).
+    PluginGui = 18,
+    /// The Highlights the editor's 3D view draws (src/viewport.rs).
+    Highlights = 19,
 }
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
@@ -105,7 +130,7 @@ struct Journal {
     base: u64,
     marks: Vec<Mark>,
     /// Next sequence number each reader wants; None = hasn't read yet.
-    read: [Option<u64>; 15],
+    read: [Option<u64>; 20],
     /// The joint graph's position (src/domains/world_part.rs), read through
     /// `&self`: 0 = not reading, else the next sequence number + 1.
     graph_pos: std::sync::atomic::AtomicU64,
@@ -123,6 +148,8 @@ pub struct Command {
     sel_before: Vec<Ref>,
     /// Selection right before it was undone; redo restores it.
     sel_after: Vec<Ref>,
+    /// A ChangeHistoryService recording's display name (the editor shows it).
+    display: Option<String>,
 }
 
 pub struct Document {
@@ -146,7 +173,13 @@ pub struct Document {
     /// Bumped when instances are added, moved, removed or renamed.
     pub tree_revision: u64,
     journal: Journal,
+    /// ChangeHistoryService's state (doc_history.rs).
+    history: history::History,
 }
+
+#[path = "doc_history.rs"]
+mod history;
+pub use history::{studio_step_name, FinishOp, HistoryEvent};
 
 /// Studio's default for a property missing from a place file, where it
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
@@ -161,6 +194,9 @@ pub(crate) fn studio_default(class: &str, name: &str) -> Option<Variant> {
         // Studio's UICorner default; the reflection database has none, and
         // files saved at the default leave it out (Place B's index UI).
         ("UICorner", "CornerRadius") => Some(Variant::UDim(rbx_dom_weak::types::UDim::new(0.0, 8))),
+        // Every instance's (a plugin reads false: ); the
+        // reflection database has no default.
+        (_, "RobloxLocked") => Some(Variant::Bool(false)),
         // Studio's Instance.new / Insert Part are Smooth on every face (the
         // API dump's default); the reflection database still has the old
         // Studs top / Inlet bottom, which put studs on every part a script
@@ -241,6 +277,27 @@ fn prop_plan(class: Ustr, key: Ustr) -> Option<std::rc::Rc<PropPlan>> {
 
 pub fn db() -> &'static rbx_reflection::ReflectionDatabase<'static> {
     rbx_reflection_database::get().unwrap_or_else(|_| rbx_reflection_database::get_bundled())
+}
+
+/// Services Studio keeps for the session only (never saved with the place):
+/// the plugin host puts plugin widgets and plugin GUI in them.
+pub const UNSAVED_SERVICES: &[&str] =
+    &["PluginGuiService", "CoreGui", "StudioService", "PluginDebugService", "ScriptEditorService"];
+
+/// Whether `r` is in (or is) one of the UNSAVED_SERVICES.
+pub fn in_unsaved_service(d: &Document, r: Ref) -> bool {
+    let root = d.dom.root_ref();
+    let mut cur = r;
+    while let Some(i) = d.dom.get_by_ref(cur) {
+        if i.parent() == root {
+            // (A service itself appearing, as GetService makes one a file
+            // left out, isn't an edit of the place either: Studio has them all.)
+            return UNSAVED_SERVICES.contains(&i.class.as_str()) || (cur == r && is_service(i.class.as_str()));
+        }
+        cur = i.parent();
+    }
+    // (Removed: no longer anywhere; limbo instances count as the place's.)
+    false
 }
 
 /// `Instance:IsA` against the reflection database.
@@ -343,9 +400,10 @@ impl Document {
             journal: Journal {
                 base: 0,
                 marks: Vec::new(),
-                read: [None; 15],
+                read: [None; 20],
                 graph_pos: std::sync::atomic::AtomicU64::new(0),
             },
+            history: Default::default(),
         }
     }
 
@@ -419,6 +477,18 @@ impl Document {
         out
     }
 
+    /// The journal's end: what the next mark's sequence number will be.
+    pub fn journal_end(&self) -> u64 {
+        self.journal.base + self.journal.marks.len() as u64
+    }
+
+    /// The marks from sequence number `pos` on, without moving any reader;
+    /// None when they were dropped already (or everything was marked).
+    pub fn marks_since(&self, pos: u64) -> Option<&[Mark]> {
+        let j = &self.journal;
+        (pos >= j.base).then(|| &j.marks[((pos - j.base) as usize).min(j.marks.len())..])
+    }
+
     /// The marks since the joint graph last looked (All the first time or
     /// after it fell behind). Works through `&self` so property reads can
     /// keep the graph current without a mutable document.
@@ -432,6 +502,32 @@ impl Document {
         };
         j.graph_pos.store(end + 1, Relaxed);
         out
+    }
+
+    /// Lends a removed instance (and its subtree) from the undo limbo back
+    /// to the DOM, parentless, so code reacting to its removal can still read
+    /// it (the plugin host's edit sync). `relimbo` takes it back.
+    pub fn unlimbo(&mut self, r: Ref) -> bool {
+        if self.limbo.get_by_ref(r).is_some() && r != self.limbo.root_ref() {
+            // (transfer needs a parent: in under the root, then out.)
+            let root = self.dom.root_ref();
+            self.limbo.transfer(r, &mut self.dom, root);
+            self.dom.transfer_within(r, Ref::none());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns an instance `unlimbo` lent, if it is still parentless (a
+    /// script that parented it somewhere keeps it there). (The plugin host
+    /// no longer returns them: a plugin may keep reading an instance the
+    /// person deleted, as in Studio, and undo / redo find it either way.)
+    pub fn relimbo(&mut self, r: Ref) {
+        if self.dom.get_by_ref(r).is_some_and(|i| i.parent().is_none()) && r != self.dom.root_ref() {
+            let lr = self.limbo.root_ref();
+            self.dom.transfer(r, &mut self.limbo, lr);
+        }
     }
 
     /// `r` and its descendants, whether in the DOM or removed (in limbo).
@@ -528,6 +624,13 @@ impl Document {
         Self::from_dom(dom, DocKind::Place, None, title)
     }
 
+    /// A placeholder while the real document is lent to a script world: its two
+    /// roots take refs outside the creation counter (RUSTUDIO_DETERMINISTIC), since how
+    /// many a frame makes depends on the frame's work.
+    pub fn placeholder() -> Self {
+        rbx_dom_weak::with_scratch_refs(Self::empty)
+    }
+
     pub fn empty() -> Self {
         Self::from_dom(
             WeakDom::new(InstanceBuilder::new("DataModel")),
@@ -541,7 +644,9 @@ impl Document {
     /// properties inside the copy point at the copied instances).
     pub fn clone_for_play(&self, title: String) -> Self {
         let root = self.dom.root();
-        let mut builder = InstanceBuilder::new(root.class).with_name(root.name.clone());
+        // (Play's DataModels are "Game" whatever the edit one is called:
+        // .)
+        let mut builder = InstanceBuilder::new(root.class).with_name("Game");
         for (k, v) in &root.properties {
             builder.add_property(*k, v.clone());
         }
@@ -581,7 +686,9 @@ impl Document {
         let (kind, _) = Self::kind_for(path)
             .ok_or("unsupported file type (use .rbxl, .rbxlx, .rbxm or .rbxmx)")?;
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        crate::load_trace::mark(&format!("place read ({:.1} MB)", bytes.len() as f64 / 1e6));
         let dom = Self::decode(&bytes)?;
+        crate::load_trace::mark("place parsed");
         let title = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -693,9 +800,18 @@ impl Document {
         Ok(out)
     }
 
-    /// The whole document in its file format (place or model).
+    /// The whole document in its file format (place or model). Studio's
+    /// session services that plugins fill (PluginGuiService's widgets,
+    /// CoreGui) aren't saved, as in Studio.
     pub fn encode_all(&self, xml: bool) -> Result<Vec<u8>, String> {
-        let top = self.dom.root().children().to_vec();
+        let top: Vec<Ref> = self
+            .dom
+            .root()
+            .children()
+            .iter()
+            .copied()
+            .filter(|c| !self.dom.get_by_ref(*c).is_some_and(|i| UNSAVED_SERVICES.contains(&i.class.as_str())))
+            .collect();
         self.encode(&top, xml)
     }
 
@@ -768,6 +884,27 @@ impl Document {
         self.dom.get_by_ref(r).is_some()
     }
 
+    /// Whether `r` is in the 3D world under Workspace `ws`: a descendant
+    /// not inside a ViewportFrame (whose parts, lights and effects are its
+    /// own, vf_render.rs, even on a SurfaceGui under Workspace).
+    pub fn in_world(&self, ws: Ref, r: Ref) -> bool {
+        let mut cur = self.dom.get_by_ref(r).map(|i| i.parent());
+        while let Some(p) = cur {
+            if p.is_none() {
+                return false;
+            }
+            if p == ws {
+                return true;
+            }
+            let i = self.dom.get_by_ref(p);
+            if i.is_some_and(|i| i.class == "ViewportFrame") {
+                return false;
+            }
+            cur = i.map(|i| i.parent());
+        }
+        false
+    }
+
     pub fn is_ancestor(&self, ancestor: Ref, of: Ref) -> bool {
         let mut cur = self.dom.get_by_ref(of).map(|i| i.parent());
         while let Some(p) = cur {
@@ -792,6 +929,11 @@ impl Document {
 
     pub fn class_of(&self, r: Ref) -> Option<Ustr> {
         self.dom.get_by_ref(r).map(|i| i.class)
+    }
+
+    /// `class_of`, also for an instance removed to limbo.
+    pub fn class_any(&self, r: Ref) -> Option<Ustr> {
+        self.dom.get_by_ref(r).or_else(|| self.limbo.get_by_ref(r)).map(|i| i.class)
     }
 
     /// Reads a property, falling back to the class default.
@@ -872,9 +1014,11 @@ impl Document {
         match c {
             Change::Prop { r, name, .. } => self.mark_prop(*r, *name),
             Change::Name { r, .. } => self.mark_prop(*r, ustr("Name")),
-            Change::Parent { r, .. } | Change::Create { r, .. } | Change::Remove { r, .. } => {
-                self.mark_tree(*r)
-            }
+            Change::Parent { r, .. }
+            | Change::Create { r, .. }
+            | Change::Remove { r, .. }
+            | Change::Enter { r, .. }
+            | Change::Destroy { r } => self.mark_tree(*r),
         }
     }
 
@@ -903,17 +1047,29 @@ impl Document {
                     inst.name = if forward { new.clone() } else { old.clone() };
                 }
             }
-            Change::Parent { r, old, new } => {
-                let to = if forward { *new } else { *old };
-                if self.exists(*r) && self.exists(to) {
+            Change::Parent { r, old, new } | Change::Enter { r, old, new } => {
+                let mut to = if forward { *new } else { *old };
+                // Undoing an arrival whose old (orphan) parent is gone leaves
+                // the DataModel parentless: Brushtool brushes clones through a
+                // temporary Model it destroys right after.
+                if !forward && matches!(c, Change::Enter { .. }) && to.is_some() && !self.exists(to) {
+                    to = Ref::none();
+                }
+                // (A script's instance can go back to no parent at all.)
+                if self.exists(*r) && (self.exists(to) || to.is_none()) && !(to.is_some() && self.is_ancestor(*r, to)) {
                     self.dom.transfer_within(*r, to);
                 }
             }
+            Change::Destroy { .. } => {}
             Change::Create { r, parent } | Change::Remove { r, parent } => {
                 let into_dom = matches!(c, Change::Create { .. }) == forward;
                 if into_dom {
                     if self.limbo.get_by_ref(*r).is_some() && self.exists(*parent) {
                         self.limbo.transfer(*r, &mut self.dom, *parent);
+                    } else if self.exists(*r) && self.exists(*parent) && !self.is_ancestor(*r, *parent) {
+                        // (Lent back to the document, parentless, because a
+                        // plugin still holds it: plugin_host/edit_sync.rs.)
+                        self.dom.transfer_within(*r, *parent);
                     }
                 } else if self.exists(*r) {
                     let lr = self.limbo.root_ref();
@@ -931,6 +1087,14 @@ impl Document {
         }
         for c in &changes {
             self.mark_change(c);
+        }
+        // What scripts changed since their last waypoint joins the
+        // person's step (Studio: Ctrl+Z after a plugin's change and a
+        // Delete reverts both).
+        let mut changes = changes;
+        let pending = self.take_pending_for_step();
+        if !pending.is_empty() {
+            changes.splice(0..0, pending);
         }
         self.redo.clear();
         let now = Instant::now();
@@ -959,6 +1123,7 @@ impl Document {
             at: now,
             sel_before,
             sel_after: Vec::new(),
+            display: None,
         });
         if self.undo.len() > mech::UNDO_LIMIT {
             self.undo.remove(0);
@@ -979,6 +1144,7 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> Option<String> {
+        self.history_undo_begin();
         let mut cmd = self.undo.pop()?;
         cmd.sel_after = self.selection.clone();
         for c in cmd.changes.iter().rev() {
@@ -987,7 +1153,8 @@ impl Document {
         self.revision += 1;
         self.selection = cmd.sel_before.clone();
         self.prune_selection();
-        let label = cmd.label.clone();
+        let label = cmd.display.clone().unwrap_or_else(|| cmd.label.clone());
+        self.history_after(true, &cmd);
         self.redo.push(cmd);
         Some(label)
     }
@@ -1000,8 +1167,9 @@ impl Document {
         self.revision += 1;
         self.selection = cmd.sel_after.clone();
         self.prune_selection();
-        let label = cmd.label.clone();
+        let label = cmd.display.clone().unwrap_or_else(|| cmd.label.clone());
         cmd.merge_key = None;
+        self.history_after(false, &cmd);
         self.undo.push(cmd);
         Some(label)
     }
@@ -1010,6 +1178,7 @@ impl Document {
     pub fn clear_history(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.chs_reset();
         self.saved_revision = self.revision;
     }
 
@@ -1218,6 +1387,26 @@ impl Document {
         }
         self.push(label, changes, None);
         roots
+    }
+
+    /// Inserts several groups of model bytes, each under its own parent,
+    /// as one undo step (the Toolbox's insert: a Sky goes to Lighting, the
+    /// rest to Workspace, one waypoint). Returns the new top-level refs.
+    pub fn paste_groups(&mut self, groups: Vec<(Vec<u8>, Ref)>, label: &str) -> Vec<Ref> {
+        let mut changes = Vec::new();
+        let mut out = Vec::new();
+        for (bytes, parent) in groups {
+            let Ok(mut tmp) = Self::decode(&bytes) else { continue };
+            let parent = if self.exists(parent) { parent } else { self.default_parent() };
+            let roots = tmp.root().children().to_vec();
+            for r in &roots {
+                tmp.transfer(*r, &mut self.dom, parent);
+                changes.push(Change::Create { r: *r, parent });
+            }
+            out.extend(roots);
+        }
+        self.push(label, changes, None);
+        out
     }
 
     /// Duplicates each instance next to the original.
@@ -1448,6 +1637,350 @@ mod tests {
         assert_eq!(d.prop(legacy, "ScreenInsets"), Some(Variant::Enum(Enum::from_u32(2))));
         d.set_props("t", vec![(legacy, ustr("ScreenInsets"), Variant::Enum(Enum::from_u32(0)))], None);
         assert_eq!(d.prop(legacy, "IgnoreGuiInset"), Some(Variant::Bool(true)));
+    }
+
+    /// A Toolbox model (a Model with a Part) inserted as one step, as the
+    /// Toolbox does: its roots and everything it made.
+    fn toolbox_insert(d: &mut Document, label: &str) -> (Vec<Ref>, std::collections::HashSet<Ref>) {
+        let ws = d.workspace().unwrap();
+        let mut tmp = rbx_dom_weak::WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = tmp.root_ref();
+        let m = tmp.insert(root, InstanceBuilder::new("Model").with_name("Dragged"));
+        tmp.insert(m, new_part("Inside", 1, glam::Vec3::new(0.0, 5.0, 0.0), glam::Vec3::ONE, [1, 2, 3]));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &tmp, &[m]).unwrap();
+        let roots = d.paste_groups(vec![(bytes, ws)], label);
+        let mut made: std::collections::HashSet<Ref> = roots.iter().copied().collect();
+        for r in &roots {
+            made.extend(d.dom.descendants_of(*r).map(|i| i.referent()));
+        }
+        (roots, made)
+    }
+
+    /// A plugin's change (applied, then noted for the next waypoint).
+    fn script_prop(d: &mut Document, r: Ref, name: &str, v: Variant) {
+        let name = ustr(name);
+        let old = d.dom.get_by_ref(r).and_then(|i| i.properties.get(&name).cloned());
+        d.set_prop_live(r, name, v.clone());
+        d.note_script_change(Change::Prop { r, name, old, new: Some(v) });
+    }
+
+    fn inside_of(d: &Document, made: &std::collections::HashSet<Ref>) -> Ref {
+        *made.iter().find(|r| d.dom.get_by_ref(**r).is_some_and(|i| i.class == "Part")).unwrap()
+    }
+
+    /// Dragged back out: the insert is gone with no undo / redo step left,
+    /// the step before it untouched; something never inserted isn't taken.
+    #[test]
+    fn retract_inserted_takes_back_only_the_insert() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let first = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        assert!(!d.retract_inserted(&[Ref::none()], &[Ref::none()].into_iter().collect()), "not an insert");
+        assert!(d.exists(first) && d.exists(roots[0]));
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(!d.exists(roots[0]));
+        assert!(d.exists(first));
+        assert_eq!(d.undo_len(), before);
+        assert_eq!(d.can_redo(), None);
+        assert!(d.selection.iter().all(|r| !made.contains(r)));
+    }
+
+    /// A script edit of something else between the insert and the drag-out
+    /// (and the plugin moving the dragged instance): the edit stays pending
+    /// and becomes the next waypoint; the dragged instance's changes go.
+    #[test]
+    fn retract_inserted_keeps_an_independent_script_edit() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let keep = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        let inside = inside_of(&d, &made);
+        script_prop(&mut d, keep, "Transparency", Variant::Float32(0.5));
+        script_prop(&mut d, inside, "Transparency", Variant::Float32(0.25));
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(!d.exists(roots[0]) && !d.exists(inside));
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert_eq!(d.undo_len(), before);
+        d.chs_set_waypoint("Plugin edit");
+        assert_eq!(d.undo_len(), before + 1);
+        assert_eq!(d.can_undo(), Some("Plugin edit"));
+        d.undo();
+        assert_ne!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert!(!d.exists(roots[0]), "undo of the edit doesn't bring the insert back");
+        d.redo();
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert!(!d.exists(roots[0]));
+    }
+
+    /// A script edit pending when the card entered (swept into the insert's
+    /// step) is pending again after the drag-out: not reverted, not lost.
+    #[test]
+    fn retract_inserted_returns_earlier_pending_edits() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let keep = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        script_prop(&mut d, keep, "Transparency", Variant::Float32(0.5));
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        assert!(d.retract_inserted(&roots, &made));
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert_eq!(d.undo_len(), before);
+        d.chs_set_waypoint("Plugin edit");
+        assert_eq!(d.undo_len(), before + 1);
+        d.undo();
+        assert_ne!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert!(!d.exists(roots[0]));
+    }
+
+    /// An undo step made on top of the insert mid-drag (the person's edit,
+    /// a plugin's waypoint) stays and still undoes / redoes; the insert
+    /// beneath it goes and never comes back.
+    #[test]
+    fn retract_inserted_under_another_step() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let keep = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        let inside = inside_of(&d, &made);
+        d.set_props("Transparency", vec![(keep, ustr("Transparency"), Variant::Float32(0.5))], None);
+        script_prop(&mut d, inside, "Reflectance", Variant::Float32(0.9));
+        script_prop(&mut d, keep, "Reflectance", Variant::Float32(0.3));
+        d.chs_set_waypoint("Plugin step");
+        assert_eq!(d.undo_len(), before + 3);
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(!d.exists(roots[0]));
+        assert_eq!(d.undo_len(), before + 2, "only the insert's step goes");
+        assert_eq!(d.can_undo(), Some("Plugin step"));
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        d.undo();
+        assert_ne!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+        d.undo();
+        assert_ne!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert!(!d.exists(roots[0]));
+        assert_eq!(d.undo_len(), before);
+        d.redo();
+        d.redo();
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert_eq!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+        assert!(!d.exists(roots[0]) && !d.exists(inside));
+        assert_eq!(d.can_redo(), None);
+    }
+
+    /// Ctrl+Z mid-drag took the insert to the redo stack: the drag-out
+    /// clears it there, so a redo can't put the leaked instance back.
+    #[test]
+    fn retract_inserted_after_its_undo() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        d.undo();
+        assert!(!d.exists(roots[0]));
+        assert!(d.can_redo().is_some());
+        assert!(d.retract_inserted(&roots, &made));
+        assert_eq!(d.can_redo(), None);
+        assert!(d.redo().is_none());
+        assert!(!d.exists(roots[0]));
+        assert_eq!(d.undo_len(), before);
+    }
+
+    /// Something a script moved into the dragged model mid-drag isn't taken
+    /// with it: it goes back where it was.
+    #[test]
+    fn retract_inserted_leaves_a_foreign_child() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let keep = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        d.dom.transfer_within(keep, roots[0]);
+        d.note_script_change(Change::Parent { r: keep, old: ws, new: roots[0] });
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(d.exists(keep));
+        assert_eq!(d.dom.get_by_ref(keep).unwrap().parent(), ws);
+    }
+
+    fn parent_of(d: &Document, r: Ref) -> Option<Ref> {
+        d.dom.get_by_ref(r).map(|i| i.parent())
+    }
+
+    fn in_place(d: &Document, r: Ref) -> bool {
+        d.is_ancestor(d.dom.root_ref(), r)
+    }
+
+    /// The finding: a plugin moves an inserted child out of the dragged
+    /// model (to Workspace, during DragEnter) and moves a foreign model
+    /// (with a part nested in it) into that child. The drag-out takes the
+    /// model and the child out of the DataModel; the foreign model survives
+    /// back where it was, its part still in it; no undo or redo brings the
+    /// model or the child back or puts the foreign model into them, also
+    /// while a plugin still holds them (lent back to the DOM parentless, as
+    /// plugin_host/edit_sync.rs does); unrelated steps still undo and redo.
+    #[test]
+    fn retract_inserted_takes_a_moved_out_child() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let keep = d.insert(ws, new_part("Keep", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let home = d.insert(ws, InstanceBuilder::new("Folder").with_name("Home"));
+        let foreign = d.insert(home, InstanceBuilder::new("Model").with_name("Foreign"));
+        let nested = d.insert(foreign, new_part("Nested", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        let m = roots[0];
+        let child = inside_of(&d, &made);
+        // DragEnter: the plugin takes the child out to Workspace, puts the
+        // foreign model under it and edits something else: one waypoint.
+        d.dom.transfer_within(child, ws);
+        d.note_script_change(Change::Parent { r: child, old: m, new: ws });
+        d.dom.transfer_within(foreign, child);
+        d.note_script_change(Change::Parent { r: foreign, old: home, new: child });
+        script_prop(&mut d, keep, "Transparency", Variant::Float32(0.5));
+        d.chs_set_waypoint("Plugin drag");
+        // the person's unrelated edit on top
+        d.set_props("Reflectance", vec![(keep, ustr("Reflectance"), Variant::Float32(0.3))], None);
+        assert_eq!(d.undo_len(), before + 3);
+
+        assert!(d.retract_inserted(&roots, &made));
+        for r in &made {
+            assert!(d.dom.get_by_ref(*r).is_none(), "every inserted instance left the DOM, the moved-out child too");
+        }
+        assert_eq!(parent_of(&d, foreign), Some(home), "the foreign model goes home");
+        assert_eq!(parent_of(&d, nested), Some(foreign), "with its part");
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        assert_eq!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+        assert_eq!(d.undo_len(), before + 2, "only the insert's step goes");
+
+        // A plugin still holding them: lent back, parentless.
+        assert!(d.unlimbo(m) && d.unlimbo(child));
+        let check = |d: &Document, what: &str| {
+            assert!(!in_place(d, m) && !in_place(d, child), "{what}: the insert stays out");
+            assert!(d.dom.get_by_ref(child).unwrap().children().is_empty(), "{what}: nothing goes into the child");
+            assert!(in_place(d, foreign), "{what}: the foreign model stays in the place");
+            assert_eq!(parent_of(d, foreign), Some(home), "{what}");
+            assert_eq!(parent_of(d, nested), Some(foreign), "{what}");
+        };
+        check(&d, "after the drag-out");
+        assert_eq!(d.can_undo(), Some("Reflectance"));
+        d.undo();
+        assert_ne!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+        check(&d, "undo of the person's edit");
+        assert_eq!(d.can_undo(), Some("Plugin drag"));
+        d.undo();
+        assert_ne!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        check(&d, "undo of the plugin's step");
+        assert_eq!(d.undo_len(), before);
+        d.redo();
+        assert_eq!(d.prop(keep, "Transparency"), Some(Variant::Float32(0.5)));
+        check(&d, "redo of the plugin's step");
+        d.redo();
+        assert_eq!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+        check(&d, "redo of the person's edit");
+        assert_eq!(d.can_redo(), None);
+        // (all the way back, the test's own setup steps too)
+        let out = |d: &Document, what: &str| {
+            assert!(!in_place(d, m) && !in_place(d, child), "{what}: the insert stays out");
+            assert!(d.dom.get_by_ref(child).unwrap().children().is_empty(), "{what}");
+            assert!(d.dom.get_by_ref(m).unwrap().children().is_empty(), "{what}");
+        };
+        while d.undo().is_some() {
+            out(&d, "undo all");
+        }
+        while d.redo().is_some() {
+            out(&d, "redo all");
+        }
+        check(&d, "after redo all");
+        assert_eq!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
+    }
+
+    /// The same left pending (no waypoint yet) and nobody holding the
+    /// instances: they stay in limbo, and the foreign move through the
+    /// child is no move at all.
+    #[test]
+    fn retract_inserted_takes_a_moved_out_child_pending() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let home = d.insert(ws, InstanceBuilder::new("Folder").with_name("Home"));
+        let other = d.insert(ws, InstanceBuilder::new("Folder").with_name("Other"));
+        let foreign = d.insert(home, InstanceBuilder::new("Model").with_name("Foreign"));
+        let before = d.undo_len();
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        let child = inside_of(&d, &made);
+        d.dom.transfer_within(child, other);
+        d.note_script_change(Change::Parent { r: child, old: roots[0], new: other });
+        d.dom.transfer_within(foreign, child);
+        d.note_script_change(Change::Parent { r: foreign, old: home, new: child });
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(made.iter().all(|r| d.dom.get_by_ref(*r).is_none()));
+        assert_eq!(parent_of(&d, foreign), Some(home));
+        d.chs_set_waypoint("Nothing left");
+        assert_eq!(d.undo_len(), before, "no step: nothing of it is left to record");
+        while d.undo().is_some() {}
+        while d.redo().is_some() {}
+        assert!(made.iter().all(|r| d.dom.get_by_ref(*r).is_none()));
+        assert_eq!(parent_of(&d, foreign), Some(home));
+    }
+
+    /// A foreign part moved into the dragged model and on out to B (two
+    /// steps): after the drag-out its history reads A to B, so undo and redo
+    /// never put it into the removed model, even one a plugin still holds.
+    #[test]
+    fn retract_inserted_rewrites_foreign_moves_through_it() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let a = d.insert(ws, InstanceBuilder::new("Folder").with_name("A"));
+        let b = d.insert(ws, InstanceBuilder::new("Folder").with_name("B"));
+        let f = d.insert(a, new_part("Foreign", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+        let m = roots[0];
+        d.dom.transfer_within(f, m);
+        d.note_script_change(Change::Parent { r: f, old: a, new: m });
+        d.chs_set_waypoint("Into the model");
+        d.dom.transfer_within(f, b);
+        d.note_script_change(Change::Parent { r: f, old: m, new: b });
+        d.chs_set_waypoint("Out to B");
+        assert!(d.retract_inserted(&roots, &made));
+        assert!(d.unlimbo(m), "a plugin still holds the model");
+        assert_eq!(parent_of(&d, f), Some(b));
+        assert_eq!(d.can_undo(), Some("Out to B"));
+        d.undo();
+        assert_eq!(parent_of(&d, f), Some(a), "undo: back to A, not into the model");
+        assert_ne!(d.can_undo(), Some("Into the model"), "that step moved only into the model: gone");
+        d.redo();
+        assert_eq!(parent_of(&d, f), Some(b));
+        while d.undo().is_some() {
+            assert!(!in_place(&d, m) && parent_of(&d, f) != Some(m));
+        }
+        while d.redo().is_some() {
+            assert!(!in_place(&d, m) && parent_of(&d, f) != Some(m));
+        }
+        assert_eq!(parent_of(&d, f), Some(b));
+    }
+
+    /// Entering, leaving, entering again: each drag-out takes back only its
+    /// own insert; a final drop stays as one undoable step.
+    #[test]
+    fn retract_inserted_repeated_reentry() {
+        let mut d = Document::new_place();
+        let before = d.undo_len();
+        for n in 0..3 {
+            let (roots, made) = toolbox_insert(&mut d, "After insert asset 5");
+            assert_eq!(d.undo_len(), before + 1, "entry {n}");
+            assert!(d.retract_inserted(&roots, &made));
+            assert!(!d.exists(roots[0]));
+            assert_eq!(d.undo_len(), before);
+            assert_eq!(d.can_redo(), None);
+        }
+        let (roots, _) = toolbox_insert(&mut d, "After insert asset 5");
+        assert_eq!(d.undo_len(), before + 1);
+        d.undo();
+        assert!(!d.exists(roots[0]));
+        d.redo();
+        assert!(d.exists(roots[0]));
     }
 
     #[test]

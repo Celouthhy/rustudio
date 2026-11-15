@@ -94,7 +94,7 @@ impl SignalMode {
 
 /// Immediate re-entrancy depth per (instance, event) while its handlers run.
 #[derive(Default)]
-pub struct Reentry(pub HashMap<(Ref, String), u32>);
+pub struct Reentry(pub rustc_hash::FxHashMap<(Ref, String), u32>);
 
 /// Whether every piece of runtime state a handler touches is free to borrow.
 fn state_free(lua: &Lua) -> bool {
@@ -250,6 +250,13 @@ fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
         }
         (funcs, now.into_iter().map(|(_, t)| t).collect::<Vec<Thread>>())
     };
+    // The edit DataModel (plugins) runs the most recently connected handler
+    // first, as Studio's (measured in Studio, checks/plugins/ui/README.md U14:
+    // two Click handlers of one PluginToolbarButton).
+    let mut funcs = funcs;
+    if world(lua).is_ok_and(|w| w.mode == RunMode::Edit) {
+        funcs.reverse();
+    }
     for (f, ident) in funcs {
         // A handler runs at its connector's identity, not the firer's.
         let th = domains::assets_cloud::scene::create_thread(lua, f.clone())

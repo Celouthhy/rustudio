@@ -6,7 +6,7 @@ use egui::{FontId, Shape, Stroke};
 
 use super::*;
 use crate::mech;
-use crate::scene::{vec3_of, xform_of};
+
 
 /// `rect` inside the UIPadding of `r` (a GuiObject or a LayerCollector:
 /// Studio pads a ScreenGui's children too, e.g. Laser Tag's 20 px HUD margin).
@@ -170,6 +170,8 @@ pub(super) struct Down {
     /// UIScale so far (offsets, text sizes and strokes grow with it).
     pub scale: f32,
     pub z: i32,
+    /// The ancestors' Rotation summed (AbsoluteRotation adds its own).
+    pub turn: f32,
 }
 
 impl Walk<'_, '_> {
@@ -284,15 +286,35 @@ impl Walk<'_, '_> {
                         content.width()
                     }
                     + pad[1] * dn.scale;
-                let sizes: Vec<egui::Vec2> = order
+                let mut sizes: Vec<egui::Vec2> = order
                     .iter()
                     .map(|k| self.own_size(*k, content, dn.scale, 0))
                     .collect();
-                let total: f32 = sizes
+                let mut total: f32 = sizes
                     .iter()
                     .map(|s| if vertical { s.y } else { s.x })
                     .sum::<f32>()
                     + gap * order.len().saturating_sub(1) as f32;
+                // UIFlexItem: Grow / Fill / Custom (GrowRatio) children share
+                // the room left on the fill axis by their ratio (Model
+                // Reflect's title label is Size (0, 28) and grows to the
+                // rest of its header row).
+                let room = if vertical { content.height() } else { content.width() } - total;
+                if room > 0.0 {
+                    let ratios: Vec<f32> = order.iter().map(|k| flex_grow(d, *k)).collect();
+                    let sum: f32 = ratios.iter().sum();
+                    if sum > 0.0 {
+                        for (s, r) in sizes.iter_mut().zip(&ratios) {
+                            let add = room * r / sum;
+                            if vertical {
+                                s.y += add;
+                            } else {
+                                s.x += add;
+                            }
+                        }
+                        total += room;
+                    }
+                }
                 let mut at = if vertical {
                     content.top()
                         + match valign {
@@ -387,7 +409,7 @@ impl Walk<'_, '_> {
         }
         let font = font_of(d, r);
         let family = self.gui.family(self.ctx, self.input.store, &font);
-        let size = num(d, r, "TextSize", 14.0) * scale;
+        let size = num(d, r, "TextSize", 14.0) * scale * legacy_text_scale(&font);
         let k = self.em_per_size(&family);
         let mut f = TextFormat::simple(FontId::new(size * k, family), Color32::WHITE);
         f.line_height = Some(size * num(d, r, "LineHeight", 1.0));
@@ -408,6 +430,20 @@ impl Walk<'_, '_> {
         scale: f32,
         auto: u32,
         depth: usize,
+    ) -> egui::Vec2 {
+        self.content_size_in(r, size, scale, auto, depth, f32::INFINITY)
+    }
+
+    /// `content_size`, a TextWrapped text growing on X wrapping at `room`
+    /// (the width its parent leaves it).
+    fn content_size_in(
+        &mut self,
+        r: Ref,
+        size: egui::Vec2,
+        scale: f32,
+        auto: u32,
+        depth: usize,
+        room: f32,
     ) -> egui::Vec2 {
         let d = self.input.doc;
         let pad = |name: &str, along: f32| {
@@ -430,8 +466,15 @@ impl Walk<'_, '_> {
         if d.class_of(r)
             .is_some_and(|c| matches!(c.as_str(), "TextLabel" | "TextButton" | "TextBox"))
         {
-            let wrap = if auto & 1 != 0 || !boolp(d, r, "TextWrapped", false) {
+            // A wrapped text growing on X grows up to the room its parent
+            // leaves, then wraps (Studio: Argon's error message, an
+            // AutomaticSize XY TextWrapped label in a ScrollingFrame, wraps in
+            // three lines in its 302 px window,
+            // checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
+            let wrap = if !boolp(d, r, "TextWrapped", false) {
                 f32::INFINITY
+            } else if auto & 1 != 0 {
+                (room - pl - pr).max(inner.width())
             } else {
                 inner.width()
             };
@@ -456,7 +499,7 @@ impl Walk<'_, '_> {
             let mut along = 0.0f32;
             let mut across = 0.0f32;
             for (i, k) in kids.iter().enumerate() {
-                let s = self.own_size(*k, inner, scale, depth + 1);
+                let s = self.auto_child_size(*k, inner, scale, auto, depth + 1);
                 along += if vertical { s.y } else { s.x } + if i > 0 { gap } else { 0.0 };
                 across = across.max(if vertical { s.x } else { s.y });
             }
@@ -510,7 +553,7 @@ impl Walk<'_, '_> {
             }
         } else {
             for k in kids {
-                let s = self.own_size(k, inner, scale, depth + 1);
+                let s = self.auto_child_size(k, inner, scale, auto, depth + 1);
                 let p = udim2(d, k, "Position");
                 let anchor = vec2(d, k, "AnchorPoint", [0.0, 0.0]);
                 let at = egui::vec2(
@@ -523,18 +566,60 @@ impl Walk<'_, '_> {
         egui::vec2(ext.x + pl + pr, ext.y + pt + pb)
     }
 
+    /// A child's size as its AutomaticSize parent (growing on `auto`'s axes)
+    /// measures it: a child sized by Scale on a growing axis would size
+    /// itself from the size being worked out, so it counts with what it
+    /// holds instead (its own content, the same way down), as Studio sizes
+    /// Archimedes' window (an AutomaticSize Y button whose content sits in a
+    /// `UDim2.new(1, 0, 1, -20)` frame: Studio shows the whole panel,
+    /// checks/plugins/ref/corpus/screens/archimedes-click-main.jpg).
+    fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
+        let mut s = self.own_size(k, inner, scale, depth);
+        if depth >= 8 {
+            return s;
+        }
+        let sz = udim2(self.input.doc, k, "Size");
+        let grows = |axis: u32, sc: f32| auto & axis != 0 && sc != 0.0;
+        let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
+        if gx || gy {
+            let axes = (gx as u32) | ((gy as u32) << 1);
+            let c = self.content_size(k, s, scale, axes, depth);
+            if gx {
+                s.x = s.x.max(c.x);
+            }
+            if gy {
+                s.y = s.y.max(c.y);
+            }
+        }
+        s
+    }
+
     /// A GuiObject's size from Size, AutomaticSize and its constraints (and UIScale).
     fn own_size(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+        self.own_size_signed(r, parent, scale, depth).max(egui::Vec2::ZERO)
+    }
+
+    /// `own_size` before negative sizes are clamped: Studio reports those
+    /// (AbsoluteSize -1, -1 for a Size of -1 px offset, the box placed with
+    /// it; Emitter2D's jitter fix makes them for particles near their end).
+    fn own_size_signed(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
         let d = self.input.doc;
         let s = udim2(d, r, "Size");
-        let mut size = egui::vec2(
-            s[0] * parent.width() + s[1] * scale,
-            s[2] * parent.height() + s[3] * scale,
-        );
+        // SizeConstraint (RelativeXY 0, RelativeXX 1, RelativeYY 2): the
+        // Size's scales both take the parent's width, or both its height
+        // (DataStore Editor's square check boxes: 0.6 of the row's height).
+        let (sw, sh) = match enum_u32(d.prop(r, "SizeConstraint")) {
+            Some(1) => (parent.width(), parent.width()),
+            Some(2) => (parent.height(), parent.height()),
+            _ => (parent.width(), parent.height()),
+        };
+        let mut size = egui::vec2(s[0] * sw + s[1] * scale, s[2] * sh + s[3] * scale);
         // AutomaticSize: None 0, X 1, Y 2, XY 3.
         let auto = enum_u32(d.prop(r, "AutomaticSize")).unwrap_or(0);
         if auto != 0 && depth < 8 {
-            let c = self.content_size(r, size, scale, auto, depth);
+            let px = udim2(d, r, "Position");
+            let room = parent.width() - (px[0] * parent.width() + px[1] * scale);
+            let c = self.content_size_in(r, size, scale, auto, depth, room);
             if auto & 1 != 0 {
                 size.x = size.x.max(c.x);
             }
@@ -566,7 +651,7 @@ impl Walk<'_, '_> {
         if let Some(sc) = child_of_class(d, r, "UIScale") {
             size *= num(d, sc, "Scale", 1.0);
         }
-        size.max(egui::Vec2::ZERO)
+        size
     }
 
     /// What a memo depends on besides the document: where and how the walk
@@ -686,7 +771,8 @@ impl Walk<'_, '_> {
                 }
             }
         }
-        let size = self.own_size(r, parent, dn.scale, 0);
+        let signed = self.own_size_signed(r, parent, dn.scale, 0);
+        let size = signed.max(egui::Vec2::ZERO);
         let rect = match laid {
             // Layouts own both position and size (UIGridLayout overrides Size).
             Some(l) => l,
@@ -714,20 +800,32 @@ impl Walk<'_, '_> {
         if rot.abs() > 1e-3 {
             me.aff = Aff::rotate_about(rect.center(), rot).then(&dn.aff);
         }
+        me.turn += rot;
         if class == "CanvasGroup" {
             me.alpha *= 1.0 - num(d, r, "GroupTransparency", 0.0);
             let c = color(d, r, "GroupColor3", [1.0, 1.0, 1.0]);
             me.tint = [me.tint[0] * c[0], me.tint[1] * c[1], me.tint[2] * c[2]];
         }
+        // Studio's box under turned ancestors: its centre turned with them,
+        // the size unturned; AbsoluteRotation is every Rotation summed.
+        // (a negative size is reported, and places the box, as in Studio)
+        let abs_size = match laid {
+            Some(_) => rect.size(),
+            None => signed,
+        };
+        let anchor = vec2(d, r, "AnchorPoint", [0.0, 0.0]);
+        let abs_min = rect.min + egui::vec2(anchor[0] * (size.x - abs_size.x), anchor[1] * (size.y - abs_size.y));
+        let centre = dn.aff.apply(abs_min + abs_size * 0.5);
         let mut gb = GuiBox {
             pos: [
-                rect.left() + self.abs_offset[0],
-                rect.top() + self.abs_offset[1],
+                centre.x - abs_size.x * 0.5 + self.abs_offset[0],
+                centre.y - abs_size.y * 0.5 + self.abs_offset[1],
             ],
-            size: [rect.width(), rect.height()],
-            rot,
+            size: [abs_size.x, abs_size.y],
+            rot: dn.turn + rot,
             text: None,
             canvas: None,
+            canvas_fit: None,
         };
 
         let items_before = self.items.len();
@@ -773,6 +871,10 @@ impl Walk<'_, '_> {
         let chat_style = matches!(frame_style, 1 | 4 | 5);
         if chat_style {
             self.chat_frame(frame_style, rect, &me);
+            bg_t = 1.0;
+        }
+        // A ViewportFrame's background is inside its image (vf_render.rs).
+        if class == "ViewportFrame" {
             bg_t = 1.0;
         }
         if bg_t < 1.0 && rect.width() > 0.0 && rect.height() > 0.0 {
@@ -932,25 +1034,33 @@ impl Walk<'_, '_> {
             // AutomaticCanvasSize (None 0, X 1, Y 2, XY 3) grows the canvas
             // to hold the children (Place A's admin panel: CanvasSize 0).
             let acs = enum_u32(d.prop(r, "AutomaticCanvasSize")).unwrap_or(0);
+            // The least canvas: the content area, and what an automatic axis holds.
+            let mut floor = content.size();
             if acs != 0 {
                 let held = self.content_size(r, rect.size(), me.scale, acs, 0)
                     - (rect.size() - content.size());
                 if acs & 1 != 0 {
                     canvas.x = canvas.x.max(held.x);
+                    floor.x = floor.x.max(held.x);
                 }
                 if acs & 2 != 0 {
                     canvas.y = canvas.y.max(held.y);
+                    floor.y = floor.y.max(held.y);
                 }
             }
             let canvas = canvas.max(content.size());
             // Recorded with the padding around it (the scroll range is this
             // less the frame's size).
-            let whole = canvas + (rect.size() - content.size());
+            let pad = rect.size() - content.size();
+            let whole = canvas + pad;
+            let fit = crate::gui::CanvasFit { pad: [pad.x, pad.y], floor: [floor.x, floor.y], scale: me.scale };
             if let Some(b) = self.gui.layout.get_mut(&r) {
                 b.canvas = Some([whole.x, whole.y]);
+                b.canvas_fit = Some(fit);
             }
             if let Some((_, b)) = self.boxes.iter_mut().rev().find(|(k, _)| *k == r) {
                 b.canvas = Some([whole.x, whole.y]);
+                b.canvas_fit = Some(fit);
             }
             self.children(
                 r,
@@ -963,33 +1073,67 @@ impl Walk<'_, '_> {
             let th = num(d, r, "ScrollBarThickness", 12.0) * me.scale;
             let st = num(d, r, "ScrollBarImageTransparency", 0.0);
             if th > 0.0 && st < 1.0 && canvas.y > content.height() + 0.5 {
-                let top = content.top() + (cp[1] / canvas.y) * content.height();
-                let bar = Rect::from_min_size(
-                    Pos2::new(rect.right() - th, top),
-                    egui::vec2(th, content.height() * content.height() / canvas.y),
-                );
-                let c = rgba(
-                    color(d, r, "ScrollBarImageColor3", [1.0, 1.0, 1.0]),
-                    (1.0 - st) * me.alpha,
-                );
-                self.push(
-                    Shape::Mesh(
-                        fill_mesh(
-                            &[
-                                bar.left_top(),
-                                bar.right_top(),
-                                bar.right_bottom(),
-                                bar.left_bottom(),
-                            ],
-                            &|_| c,
-                        )
-                        .into(),
-                    ),
-                    &me,
-                );
+                self.scroll_bar(r, rect, content, canvas.y, cp[1], th, st, &me);
             }
         } else {
             self.children(r, content, me);
+        }
+    }
+
+    /// A ScrollingFrame's vertical thumb as Studio draws it: TopImage,
+    /// MidImage and BottomImage (default the content's
+    /// textures/ui/Scroll/scroll-{top,middle,bottom}.png: white at half
+    /// alpha, rounded ends) tinted ScrollBarImageColor3, at the frame's right
+    /// edge, ScrollBarThickness wide. The ends are thickness-square images;
+    /// the thumb is the view's share of the canvas long and never shorter
+    /// than its two ends (Studio's WPixel capture: a 60 px view of a 300 px
+    /// canvas draws a 16 px thumb whose round caps meet at its middle,
+    /// checks/plugins/widgets/captures/studio-wleft.png).
+    #[allow(clippy::too_many_arguments)]
+    fn scroll_bar(&mut self, r: Ref, rect: Rect, content: Rect, canvas_h: f32, cp_y: f32, th: f32, st: f32, me: &Down) {
+        let d = self.input.doc;
+        let h = content.height();
+        let len = (h * h / canvas_h).max(2.0 * th).min(h);
+        let travel = (canvas_h - h).max(1e-3);
+        let top = content.top() + (cp_y / travel).clamp(0.0, 1.0) * (h - len);
+        let bar = Rect::from_min_size(Pos2::new(rect.right() - th, top), egui::vec2(th, len));
+        let ic = color(d, r, "ScrollBarImageColor3", [1.0, 1.0, 1.0]);
+        let tint = me.tint;
+        let c = rgba([ic[0] * tint[0], ic[1] * tint[1], ic[2] * tint[2]], (1.0 - st) * me.alpha);
+        let image = |prop: &str, dflt: &str| {
+            let has = d.dom.get_by_ref(r).is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(prop)));
+            if has { text_prop(d, r, prop) } else { dflt.to_string() }
+        };
+        let parts = [
+            (image("TopImage", "rbxasset://textures/ui/Scroll/scroll-top.png"), Rect::from_min_size(bar.min, egui::vec2(th, th))),
+            (
+                image("MidImage", "rbxasset://textures/ui/Scroll/scroll-middle.png"),
+                Rect::from_min_max(Pos2::new(bar.left(), bar.top() + th), Pos2::new(bar.right(), bar.bottom() - th)),
+            ),
+            (
+                image("BottomImage", "rbxasset://textures/ui/Scroll/scroll-bottom.png"),
+                Rect::from_min_max(Pos2::new(bar.left(), bar.bottom() - th), bar.max),
+            ),
+        ];
+        if parts.iter().all(|(id, _)| id.is_empty()) {
+            return;
+        }
+        let mut drew = false;
+        for (id, dst) in parts {
+            if id.is_empty() || dst.height() <= 0.0 {
+                continue;
+            }
+            let Some((tex, _)) = self.gui.texture(self.ctx, self.input.store, self.input.doc_dir, &id) else {
+                continue;
+            };
+            drew = true;
+            let full = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            self.push(Shape::Mesh(quad_mesh(dst, full, tex, &|_| c, 1).into()), me);
+        }
+        if !drew {
+            // No content folder: a plain bar.
+            let pts = [bar.left_top(), bar.right_top(), bar.right_bottom(), bar.left_bottom()];
+            self.push(Shape::Mesh(fill_mesh(&pts, &|_| c).into()), me);
         }
     }
 
@@ -1227,6 +1371,17 @@ impl Walk<'_, '_> {
         // Roblox sizes a font so a line (ascent + descent) is TextSize tall;
         // egui sizes by the em. This family's line height per em, measured once.
         let em_per_size = self.em_per_size(&family);
+        note_text_face(self.ctx, &font, &family, em_per_size);
+        // RichText <b>: the family's bold face (Studio draws SourceSans <b>
+        // with SourceSansPro 700: checks/plugins/widgets sheet probe-wpixel).
+        let bold_family = if rich && !bold_face && text.contains("<b") {
+            let bf = (font.0.clone(), 700, font.2);
+            let fam = self.gui.family(self.ctx, self.input.store, &bf);
+            let em = self.em_per_size(&fam);
+            Some((fam, em))
+        } else {
+            None
+        };
         let build = |size: f32, wrap: bool| -> LayoutJob {
             let mut job = LayoutJob::default();
             let runs = if rich {
@@ -1250,8 +1405,11 @@ impl Walk<'_, '_> {
                     [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]],
                     (1.0 - run.transparency.unwrap_or(tt)) * alpha,
                 );
-                let mut f =
-                    TextFormat::simple(FontId::new(rs * em_per_size, family.clone()), color);
+                let (fam, em) = match (&bold_family, run.bold) {
+                    (Some((bf, be)), true) => (bf.clone(), *be),
+                    _ => (family.clone(), em_per_size),
+                };
+                let mut f = TextFormat::simple(FontId::new(rs * em, fam), color);
                 f.line_height = Some(rs * line_height);
                 f.italics = run.italic;
                 if run.underline {
@@ -1260,7 +1418,7 @@ impl Walk<'_, '_> {
                 if run.strike {
                     f.strikethrough = Stroke::new((rs / 14.0).max(1.0), color);
                 }
-                if run.bold && !bold_face {
+                if run.bold && !bold_face && bold_family.is_none() {
                     // Faux bold: egui has no synthetic bold, so a little extra spacing.
                     f.extra_letter_spacing = rs * 0.04;
                 }
@@ -1282,12 +1440,15 @@ impl Walk<'_, '_> {
                 1 => egui::Align::RIGHT,
                 _ => egui::Align::Center,
             };
+            // A right or centred "1 " keeps its space's width (Studio:
+            // InCommand's line numbers, ref/corpus/screens/incommand-click-display.jpg).
+            job.keep_trailing_whitespace = true;
             job.round_output_to_gui = false;
             job
         };
         let ctx = self.ctx;
         let layout = |job: LayoutJob| ctx.fonts_mut(|f| f.layout_job(job));
-        let mut size = num(d, r, "TextSize", 14.0) * me.scale;
+        let mut size = num(d, r, "TextSize", 14.0) * me.scale * legacy_text_scale(&font);
         if scaled {
             let key = (
                 text.clone(),
@@ -1407,207 +1568,49 @@ impl Walk<'_, '_> {
         Some([galley.rect.width(), galley.rect.height()])
     }
 
-    /// Depth-tested offscreen scene, composited as a single GUI image.
+    /// A ViewportFrame: the renderer draws its parts (vf_render.rs, through
+    /// the world's own scene and part shader) into a texture, composited
+    /// here as one image tinted by ImageColor3 / ImageTransparency. The
+    /// walk only records the render size; the camera and lighting are read
+    /// each frame (`Gui::vf_requests`), so a moving camera or part doesn't
+    /// walk the GUI again.
+    ///
+    /// Studio 0.747 (checks/viewport-frame-render/studio): the background is
+    /// part of the image (the parts replace it; BackgroundTransparency is
+    /// its alpha), ImageColor3 tints and ImageTransparency fades the whole
+    /// image; a ViewportFrame in a SurfaceGui / BillboardGui under
+    /// Workspace draws nothing at all (one in PlayerGui / StarterGui with
+    /// an Adornee does).
     fn viewport_frame(&mut self, r: Ref, rect: Rect, me: &Down) {
         let d = self.input.doc;
-        let cam = match d.prop(r, "CurrentCamera") {
-            Some(Variant::Ref(c)) if d.exists(c) => c,
-            _ => return,
-        };
-        let Some(cxf) = xform_of(d, cam) else { return };
-        let fov = num(d, cam, "FieldOfView", 70.0).to_radians();
-        let amb = color(
-            d,
-            r,
-            "Ambient",
-            [200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0],
-        );
-        let light = color(
-            d,
-            r,
-            "LightColor",
-            [140.0 / 255.0, 140.0 / 255.0, 140.0 / 255.0],
-        );
-        let mut ldir = vec3_of(d.prop(r, "LightDirection"))
-            .unwrap_or(Vec3::splat(-1.0));
-        // Studio:
-        // near-zero directions reset to the default before shading.
-        let length2 = ldir.length_squared();
-        let tolerance = if (length2.abs() + 1.0).is_infinite() {
-            1.0e-5
-        } else {
-            (length2.abs() + 1.0) * 1.0e-5
-        };
-        if !(tolerance < length2.abs()) {
-            ldir = Vec3::splat(-1.0);
+        if d.workspace().is_some_and(|w| d.is_ancestor(w, r)) {
+            return;
         }
-        let ldir = ldir.normalize_or_zero();
         let it = num(d, r, "ImageTransparency", 0.0);
         let ic = color(d, r, "ImageColor3", [1.0, 1.0, 1.0]);
-        let inv = cxf.inverse();
-        let f = 1.0 / (fov * 0.5).tan();
-        let aspect = rect.width() / rect.height().max(1.0);
-        let Some(rs) = self.input.render_state else { return };
-        let size = [(rect.width() * self.ctx.pixels_per_point()).ceil().clamp(1.0, 1024.0) as u32,
-                    (rect.height() * self.ctx.pixels_per_point()).ceil().clamp(1.0, 1024.0) as u32];
-        // (a kept GUI is walked again while its ViewportFrames are dirty;
-        // anything under one, and its camera, is read)
+        // (no CurrentCamera: the background alone)
+        if !matches!(d.prop(r, "CurrentCamera"), Some(Variant::Ref(c)) if d.exists(c)) {
+            let bt = num(d, r, "BackgroundTransparency", 0.0);
+            let bg = color(d, r, "BackgroundColor3", [1.0, 1.0, 1.0]);
+            if bt < 1.0 {
+                let c = rgba(std::array::from_fn(|k| bg[k] * ic[k] * me.tint[k]), (1.0 - bt) * (1.0 - it) * me.alpha);
+                self.push(Shape::rect_filled(rect, 0.0, c), me);
+            }
+            return;
+        }
+        let size = [(rect.width() * self.ctx.pixels_per_point()).ceil().clamp(1.0, 4096.0) as u32,
+                    (rect.height() * self.ctx.pixels_per_point()).ceil().clamp(1.0, 4096.0) as u32];
         self.gui.walk_vfs.push(r);
-        self.gui.walk_reads.push((cam, r));
-        for x in d.subtree(r) {
-            self.gui.walk_reads.push((x, r));
-            self.gui.walk_kids.push(x);
-        }
-        if let Some(target) = self.gui.vf_targets.get_mut(&r) {
-            // (what changes is drawn again at most 15 times a second)
-            if target.size == size && (!target.dirty || target.at.elapsed().as_secs_f32() < 1.0 / 15.0) {
-                target.used = std::time::Instant::now();
-                let mut m = Mesh::with_texture(target.id);
-                m.add_rect_with_uv(rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), rgba(std::array::from_fn(|k| ic[k]*me.tint[k]), (1.0-it)*me.alpha));
-                let mut inside = *me;
-                inside.clip = me.clip.intersect(rect);
-                self.push(Shape::Mesh(m.into()), &inside);
-                return;
-            }
-        }
-        let _vfs = crate::bench::scope("vf_build");
-        let mut vertices = Vec::new();
-        // Still loading something it shows: draw it again when it may be in.
-        let mut pending = false;
-        let mut drawn = std::collections::HashSet::new();
-        let mut batches = Vec::new();
-        let parts: Vec<Ref> = d
-            .dom
-            .descendants_of(r)
-            .filter(|i| doc::is_a(&i.class, "BasePart"))
-            .map(|i| i.referent())
-            .take(400)
-            .collect();
-        for p in parts {
-            drawn.insert(p);
-            let Some(xf) = xform_of(d, p) else { continue };
-            let size = vec3_of(d.prop(p, "Size")).unwrap_or(Vec3::ONE);
-            let pt = num(d, p, "Transparency", 0.0);
-            if pt >= 1.0 {
-                continue;
-            }
-            let pc = color(d, p, "Color", [0.64, 0.64, 0.64]);
-            // Share scene selection: SpecialMesh, CharacterMesh and shipped R6
-            // geometry must have the same precedence in a ViewportFrame.
-            let Some(sp) = d.dom.get_by_ref(p).and_then(|inst| crate::scene::part_draw(d, inst)) else { continue };
-            if sp.draw.placeholder && sp.mesh_asset.is_none() { continue; }
-            let mut mesh_uvs = Vec::new();
-            let texture = sp.texture_id.as_deref().and_then(|id| {
-                let t = self.gui.texture(self.ctx, self.input.store, self.input.doc_dir, id).map(|t| t.0);
-                pending |= t.is_none() && !self.gui.images.contains_key(id);
-                t
-            }).unwrap_or_default();
-            let asset = sp.mesh_asset.as_ref();
-            let mesh = asset.and_then(|a| self.gui.vf_mesh(self.input.store, self.input.doc_dir, &a.id, a.fit_to_part));
-            // Pending/failed file meshes are invisible, just as in the scene.
-            if let (Some(a), None) = (asset, &mesh) {
-                pending |= !self.gui.vf_meshes.contains_key(&format!("{}|{}", a.fit_to_part, a.id));
-                continue;
-            }
-            let (mesh_size, mesh_xf) = match asset {
-                Some(a) if !a.fit_to_part => {
-                    let mut xf = sp.draw.xf;
-                    xf.pos += xf.rot * a.offset;
-                    (a.scale, xf)
-                }
-                _ => (sp.draw.size, sp.draw.xf),
-            };
-            let tri_list: Vec<[Vec3; 3]> = match mesh.as_ref()
-            {
-                Some(m) => m
-                    .iter()
-                    .map(|t| {
-                        mesh_uvs.push([t[0].1, t[1].1, t[2].1]);
-                        [
-                            mesh_xf.apply(t[0].0 * mesh_size),
-                            mesh_xf.apply(t[1].0 * mesh_size),
-                            mesh_xf.apply(t[2].0 * mesh_size),
-                        ]
-                    })
-                    .collect(),
-                None => {
-                    let h = size * 0.5;
-                    let c = |x: f32, y: f32, z: f32| xf.apply(Vec3::new(x * h.x, y * h.y, z * h.z));
-                    let faces = [
-                        [
-                            c(1., -1., -1.),
-                            c(1., 1., -1.),
-                            c(1., 1., 1.),
-                            c(1., -1., 1.),
-                        ],
-                        [
-                            c(-1., -1., 1.),
-                            c(-1., 1., 1.),
-                            c(-1., 1., -1.),
-                            c(-1., -1., -1.),
-                        ],
-                        [
-                            c(-1., 1., -1.),
-                            c(-1., 1., 1.),
-                            c(1., 1., 1.),
-                            c(1., 1., -1.),
-                        ],
-                        [
-                            c(-1., -1., 1.),
-                            c(-1., -1., -1.),
-                            c(1., -1., -1.),
-                            c(1., -1., 1.),
-                        ],
-                        [
-                            c(-1., -1., 1.),
-                            c(1., -1., 1.),
-                            c(1., 1., 1.),
-                            c(-1., 1., 1.),
-                        ],
-                        [
-                            c(1., -1., -1.),
-                            c(-1., -1., -1.),
-                            c(-1., 1., -1.),
-                            c(1., 1., -1.),
-                        ],
-                    ];
-                    faces
-                        .iter()
-                        .flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]])
-                        .collect()
-                }
-            };
-            let first = vertices.len() as u32;
-            for (tri_index, t) in tri_list.into_iter().enumerate() {
-                let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
-                let uv = mesh_uvs.get(tri_index).copied().unwrap_or([glam::Vec2::ZERO; 3]);
-                for i in 0..3 {
-                    let normal = mesh.as_ref().map(|m| {
-                        (mesh_xf.rot * (m[tri_index][i].2 / mesh_size)).normalize_or_zero()
-                    }).unwrap_or(n);
-                    let shaded = viewport_diffuse(amb, light, (-ldir).dot(normal), pc, [1.0;3], [1.0;3]);
-                    let v = inv.apply(t[i]);
-                    let z = -v.z;
-                    vertices.push(crate::gui_viewport::Vertex {
-                        clip: [v.x*f/aspect, v.y*f, (10000.0*z-500.0)/9999.95, z],
-                        uv: uv[i].to_array(), color: [shaded[0], shaded[1], shaded[2], 1.0-pt],
-                    });
-                }
-            }
-            batches.push((first..vertices.len() as u32, texture));
-        }
-        let gpu = self.gui.vf_gpu.get_or_insert_with(|| crate::gui_viewport::Gpu::new(&rs.device));
-        let target = self.gui.vf_targets.entry(r).or_insert_with(|| gpu.target(rs, size));
-        if target.size != size {
-            rs.renderer.write().free_texture(&target.id);
-            *target = gpu.target(rs, size);
-        }
-        gpu.render(rs, target, &vertices, &batches);
-        target.used = target.at;
-        target.dirty = pending;
-        target.cam = Some(cam);
-        target.parts = drawn;
-        let mut m = Mesh::with_texture(target.id);
+        self.gui.vf_live.insert(r);
+        self.gui.vf_size.insert(r, size);
+        let tex = self.gui.vf_tex.get(&r).filter(|t| t.1 == size).map(|t| t.0);
+        self.gui.vf_walked.insert(r, tex);
+        let Some(id) = tex else {
+            // (not drawn at this size yet: walked again next frame)
+            self.gui.no_cache = Some("viewport frame target");
+            return;
+        };
+        let mut m = Mesh::with_texture(id);
         m.add_rect_with_uv(rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), rgba(std::array::from_fn(|k| ic[k]*me.tint[k]), (1.0-it)*me.alpha));
         let mut inside = *me;
         inside.clip = me.clip.intersect(rect);
@@ -1615,31 +1618,20 @@ impl Walk<'_, '_> {
     }
 }
 
-// CPU ViewportFrame diffuse path. Keep image modulation after lighting so
-// changing ImageColor3 cannot change the directional response.
-fn viewport_diffuse(ambient: [f32; 3], light: [f32; 3], ndotl: f32,
-    surface: [f32; 3], image: [f32; 3], tint: [f32; 3]) -> [f32; 3] {
-    std::array::from_fn(|k| (ambient[k] + light[k] * ndotl.max(0.0)).min(1.0)
-        * surface[k] * image[k] * tint[k])
+/// A list child's UIFlexItem grow ratio: FlexMode Grow (1) and Fill (3)
+/// grow by 1, Custom (4) by its GrowRatio; None (0) and Shrink (2) don't.
+fn flex_grow(d: &Document, k: Ref) -> f32 {
+    let Some(f) = child_of_class(d, k, "UIFlexItem") else { return 0.0 };
+    match enum_u32(d.prop(f, "FlexMode")).unwrap_or(0) {
+        1 | 3 => 1.0,
+        4 => num(d, f, "GrowRatio", 0.0).max(0.0),
+        _ => 0.0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn viewport_lighting_selftest() {
-        let ambient = [0.2, 0.3, 0.4];
-        let light = [0.6, 0.4, 0.2];
-        let dark = viewport_diffuse(ambient, light, -1.0, [1.0; 3], [1.0; 3], [1.0; 3]);
-        assert_eq!(dark, ambient);
-        let lit = viewport_diffuse(ambient, light, 1.0, [0.5; 3], [0.25; 3], [1.0; 3]);
-        for (actual, expected) in lit.into_iter().zip([0.1, 0.0875, 0.075]) {
-            assert!((actual - expected).abs() < 1e-6);
-        }
-        assert_eq!(viewport_diffuse([0.8; 3], [0.6; 3], 1.0,
-            [0.5; 3], [1.0; 3], [1.0; 3]), [0.5; 3]);
-    }
 
     #[test]
     fn rotate_about_centre() {
@@ -1680,11 +1672,11 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 40.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
-            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0 });
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
             assert!(walk.boxes.iter().any(|(r, _)| *r == control), "nested Folder control was skipped");
             let boxes: Vec<_> = tabs.iter().map(|r| &walk.boxes.iter().find(|(k, _)| k == r).unwrap().1).collect();
             assert!((boxes[0].size[0] - 490.0).abs() < 0.01);
@@ -1693,4 +1685,131 @@ mod layout_tests {
         // (No renderer here: epaint asserts undelivered font-atlas updates.)
         out.textures_delta.clear();
     }
+
+    /// UIFlexItem in a horizontal UIListLayout: a Grow child takes the room
+    /// the others leave (Model Reflect's header: a 16 px button, a 28 px
+    /// logo and a Size (0, 28) title that grows); Custom grows by GrowRatio.
+    /// A wrapped AutomaticSize X label grows up to its parent's width and
+    /// wraps there (Argon's error message).
+    #[test]
+    fn flex_grow_and_wrapped_automatic_x() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(parent, InstanceBuilder::new("UIListLayout").with_property("FillDirection", Enum::from_u32(0)));
+        let fixed = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 0i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 40), UDim::new(0.0, 28))));
+        let grow = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 1i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 28))));
+        doc.dom.insert(grow, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(1)));
+        let custom = doc.dom.insert(parent, InstanceBuilder::new("Frame").with_property("LayoutOrder", 2i32)
+            .with_property("Size", UDim2::new(UDim::new(0.0, 10), UDim::new(0.0, 28))));
+        doc.dom.insert(custom, InstanceBuilder::new("UIFlexItem").with_property("FlexMode", Enum::from_u32(4)).with_property("GrowRatio", 3.0f32));
+        let holder = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let label = doc.dom.insert(holder, InstanceBuilder::new("TextLabel")
+            .with_property("Text", "word ".repeat(60))
+            .with_property("TextWrapped", true)
+            .with_property("AutomaticSize", Enum::from_u32(3)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(250.0, 30.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            let dn = Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 };
+            walk.children(parent, rect, dn);
+            walk.children(holder, rect, dn);
+            let b = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.clone();
+            // room 250 - 40 - 0 - 10 = 200: Grow 1 part (50), Custom 3 parts (150)
+            assert!((b(fixed).size[0] - 40.0).abs() < 0.01);
+            assert!((b(grow).size[0] - 50.0).abs() < 0.01 && (b(grow).pos[0] - 40.0).abs() < 0.01, "{:?}", b(grow).size);
+            assert!((b(custom).size[0] - 160.0).abs() < 0.01 && (b(custom).pos[0] - 90.0).abs() < 0.01, "{:?}", b(custom).size);
+            let l = b(label);
+            assert!(l.size[0] <= 250.0 && l.size[0] > 200.0 && l.size[1] > 40.0, "wrapped at the parent's width: {:?}", l.size);
+        });
+        out.textures_delta.clear();
+    }
+
+    /// SizeConstraint RelativeYY / RelativeXX: both scales take the parent's
+    /// height / width (DataStore Editor's check box: a 0.6-of-the-row square).
+    #[test]
+    fn size_constraint_relative_axes() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let yy = doc.dom.insert(parent, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.6, 0), UDim::new(1.0, 0)))
+            .with_property("SizeConstraint", Enum::from_u32(2)));
+        let xx = doc.dom.insert(parent, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.5, 0), UDim::new(0.25, 0)))
+            .with_property("SizeConstraint", Enum::from_u32(1)));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 30.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let size = |r: Ref| walk.boxes.iter().find(|(k, _)| *k == r).unwrap().1.size;
+            let a = size(yy);
+            assert!((a[0] - 18.0).abs() < 0.01 && (a[1] - 30.0).abs() < 0.01, "RelativeYY {a:?}");
+            let b = size(xx);
+            assert!((b[0] - 100.0).abs() < 0.01 && (b[1] - 50.0).abs() < 0.01, "RelativeXX {b:?}");
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A ScrollingFrame's recorded canvas can be worked out again for a new
+    /// CanvasSize (a glide re-reads its range each frame, before the next
+    /// layout): the same CanvasSize gives the laid-out canvas, padding
+    /// included; a smaller one shrinks it, never below the content area;
+    /// an AutomaticCanvasSize axis keeps what its children hold.
+    #[test]
+    fn scrolling_frame_canvas_for_new_canvas_size() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        let sf = doc.dom.insert(parent, InstanceBuilder::new("ScrollingFrame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+            .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 400))));
+        doc.dom.insert(sf, InstanceBuilder::new("UIPadding")
+            .with_property("PaddingTop", UDim::new(0.0, 5))
+            .with_property("PaddingBottom", UDim::new(0.0, 5)));
+        let auto = doc.dom.insert(parent, InstanceBuilder::new("ScrollingFrame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 100), UDim::new(0.0, 100)))
+            .with_property("CanvasSize", UDim2::new(UDim::new(0.0, 0), UDim::new(0.0, 0)))
+            .with_property("AutomaticCanvasSize", Enum::from_u32(2)));
+        doc.dom.insert(auto, InstanceBuilder::new("Frame")
+            .with_property("Size", UDim2::new(UDim::new(0.0, 50), UDim::new(0.0, 250))));
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 300.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let b = walk.boxes.iter().find(|(k, _)| *k == sf).unwrap().1;
+            let laid = b.canvas.unwrap();
+            assert_eq!(b.canvas_for([0.0, 0.0, 0.0, 400.0]), Some(laid), "same CanvasSize");
+            assert!((laid[1] - 410.0).abs() < 0.01, "400 + the padding: {laid:?}");
+            let small = b.canvas_for([0.0, 0.0, 0.0, 160.0]).unwrap();
+            assert!((small[1] - 170.0).abs() < 0.01, "shrunk: {small:?}");
+            let tiny = b.canvas_for([0.0, 0.0, 0.0, 10.0]).unwrap();
+            assert!((tiny[1] - 100.0).abs() < 0.01, "never below the frame: {tiny:?}");
+            let a = walk.boxes.iter().find(|(k, _)| *k == auto).unwrap().1;
+            let held = a.canvas_for([0.0, 0.0, 0.0, 0.0]).unwrap();
+            assert!((held[1] - 250.0).abs() < 0.01 && Some(held) == a.canvas, "automatic Y holds its child: {held:?}");
+        });
+        out.textures_delta.clear();
+    }
+
 }

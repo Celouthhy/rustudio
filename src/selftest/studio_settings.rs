@@ -49,12 +49,17 @@ impl SelfTest {
         let mut notes = Vec::new();
         if phase == "write" {
             match f {
-                // Filling the window, so every row this clicks is on screen.
+                // Filling the window; each row is scrolled into view before
+                // its click (a window smaller than asked for, as on a
+                // Windows host with an 800x600 desktop, cuts the page).
                 3 => ed.ui_action(&egui::Context::default(), "studio_settings_fill:Studio"),
+                4 => ed.ui.studio_settings.reveal = Some(row("Studio", "Camera Zoom to Mouse Position")),
                 6 => self.click_hit(ed, Hit::Value(row("Studio", "Camera Zoom to Mouse Position")), &mut notes),
+                7 => ed.ui.studio_settings.reveal = Some(row("Studio", "Camera Speed")),
                 9 => self.click_hit(ed, Hit::Value(row("Studio", "Camera Speed")), &mut notes),
                 12 => self.type_value("3"),
                 16 => self.click_hit(ed, Hit::Page(1), &mut notes),
+                17 => ed.ui.studio_settings.reveal = Some(row("Studio", "Selection Line Thickness")),
                 19 => self.click_hit(ed, Hit::Value(row("Studio", "Selection Line Thickness")), &mut notes),
                 22 => self.type_value("4"),
                 26 => {

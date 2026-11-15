@@ -533,7 +533,7 @@ pub fn build_default(
     let head_part = |n: &str| n == "Head";
     // Joint positions scale with the parts they join; the neck sits at the torso top.
     let joint_pos = |j: &JointSpec| -> Vec3 { scale_vec(v3(j.at), &s, false) };
-    let refs: HashMap<&str, Ref> = parts.iter().map(|p| (p.name, Ref::new())).collect();
+    let refs: HashMap<&str, Ref> = parts.iter().map(|p| (p.name, rbx_dom_weak::new_ref())).collect();
     let mut builders: HashMap<&str, InstanceBuilder> = HashMap::new();
     for p in parts {
         let color = match p.limb {
@@ -1889,7 +1889,55 @@ pub fn upgrade_rig(dom: &mut rbx_dom_weak::WeakDom, model: Ref) -> usize {
         dom.destroy(m);
         n += 1;
     }
+    if n > 0 {
+        add_r15_no_collisions(dom, model);
+    }
     n
+}
+
+/// The NoCollisionConstraints Studio's R15 avatar build puts beside the upgraded joints
+/// (read from Studio-11-13, CreateHumanoidModelFromDescription(default, R15)):
+/// `Part0/<Part1>NoCollision`, Part0 = its parent, all Enabled. They decide which body
+/// parts of a dead character push each other apart (solver/CHAR-NOTES, T14): the root
+/// part never collides with the UpperTorso or the Head it overlaps.
+pub const R15_NO_COLLISIONS: [(&str, &str); 19] = [
+    ("LeftUpperArm", "LeftHand"),
+    ("RightUpperArm", "RightHand"),
+    ("UpperTorso", "HumanoidRootPart"),
+    ("UpperTorso", "RightUpperLeg"),
+    ("UpperTorso", "LeftUpperLeg"),
+    ("UpperTorso", "LeftLowerLeg"),
+    ("UpperTorso", "RightLowerLeg"),
+    ("UpperTorso", "LeftLowerArm"),
+    ("UpperTorso", "RightLowerArm"),
+    ("LeftUpperLeg", "RightUpperLeg"),
+    ("LeftUpperLeg", "LeftFoot"),
+    ("LowerTorso", "LeftUpperArm"),
+    ("LowerTorso", "RightUpperArm"),
+    ("LowerTorso", "LeftLowerLeg"),
+    ("LowerTorso", "RightLowerLeg"),
+    ("RightUpperLeg", "RightFoot"),
+    ("Head", "HumanoidRootPart"),
+    ("Head", "LeftUpperArm"),
+    ("Head", "RightUpperArm"),
+];
+
+fn add_r15_no_collisions(dom: &mut rbx_dom_weak::WeakDom, model: Ref) {
+    for (a, b) in R15_NO_COLLISIONS {
+        let (Some(p0), Some(p1)) = (dom_child(dom, model, a), dom_child(dom, model, b)) else { continue };
+        let name = format!("{b}NoCollision");
+        if dom_child(dom, p0, &name).is_some() {
+            continue;
+        }
+        dom.insert(
+            p0,
+            InstanceBuilder::new("NoCollisionConstraint")
+                .with_name(name)
+                .with_property("Part0", Variant::Ref(p0))
+                .with_property("Part1", Variant::Ref(p1))
+                .with_property("Enabled", true),
+        );
+    }
 }
 
 /// A joint's two parts and frames, for every class that holds parts by a

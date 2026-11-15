@@ -56,6 +56,12 @@ fn editor() -> EditorState {
     EDITOR.read().ok().and_then(|e| *e).unwrap_or_default()
 }
 
+/// Studio's Join Surfaces toggle as the editor has it (Plugin:GetJoinMode,
+/// src/plugin_host/api.rs).
+pub fn editor_join_surfaces() -> bool {
+    editor().join_surfaces
+}
+
 fn num(x: f64) -> Value {
     Value::Number(x)
 }
@@ -83,7 +89,12 @@ fn color3(lua: &Lua, c: [f32; 3]) -> mlua::Result<Value> {
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
     let e = editor();
     let v = match (class, key) {
-        ("StudioService", "ActiveScript") => Value::Nil,
+        // The script whose tab is in front (plugin_host/script_docs.rs;
+        // ScriptEditorService / OpenScript set it too).
+        ("StudioService", "ActiveScript") => match crate::plugin_host::script_docs::active() {
+            Some(s) if world(lua)?.d().exists(s) => inst_value(lua, s)?,
+            _ => Value::Nil,
+        },
         ("StudioService", "DraggerSolveConstraints") => Value::Boolean(false),
         ("StudioService", "DrawConstraintsOnTop") => Value::Boolean(true),
         ("StudioService", "ShowConstraintDetails") => Value::Boolean(false),
@@ -164,6 +175,22 @@ fn type_err(key: &str, want: &str, v: &Value) -> mlua::Error {
 }
 
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
+    // StudioService's read-only members check the value's type first
+    // (api-walk: ActiveScript = {} → "Instance expected, got table",
+    // StudioLocaleId = {} → "string expected"; the right type → read only).
+    match (class, key) {
+        ("StudioService", "ActiveScript") if !matches!(value, Value::Nil) && opt_inst(value).is_none() => {
+            return Err(type_err(key, "Instance", value));
+        }
+        ("StudioService", "StudioLocaleId") if !matches!(value, Value::String(_) | Value::Integer(_) | Value::Number(_)) => {
+            return Err(type_err(key, "string", value));
+        }
+        // A bool setting takes any value as its truthiness (Studio).
+        ("StudioService", "UseLocalSpace") if !matches!(value, Value::Boolean(_)) => {
+            return newindex(lua, r, class, key, &Value::Boolean(!matches!(value, Value::Nil)));
+        }
+        _ => {}
+    }
     let want = match (class, key) {
         ("DraggerService", "AlignDraggedObjects" | "AngleSnapEnabled" | "AnimateHover"
             | "CollisionsEnabled" | "JointsEnabled" | "LinearSnapEnabled" | "ShowHover"
@@ -216,6 +243,8 @@ pub fn call(
             }
             ret1(enum_item(lua, "InstanceFileSyncStatus", 0)?)
         })(),
+        // The signed-in user's id (0 signed out), as plugin:GetStudioUserId.
+        "GetUserId" if class == "StudioService" => ret1(Value::Number(crate::plugin_host::settings::user_id() as f64)),
         // The widget's close callback (called when the widget closes; no
         // plugin widget ever closes in rustudio's play session).
         "BindToClose" if crate::doc::is_a(class, "PluginGui") => (|| {

@@ -21,6 +21,8 @@ pub enum Purpose {
     InsertModel,
     /// The selection when the dialog opened.
     SaveSelection(Vec<Ref>),
+    /// Plugins > Save as Local Plugin: the selection when the dialog opened.
+    SaveLocalPlugin(Vec<Ref>),
     /// Save as Project Folder: the "Create in" folder.
     ProjectParent,
     /// Terrain Editor > Import: a heightmap (true) or colormap image.

@@ -47,6 +47,52 @@ mod viewer;
 
 pub use rbx_types as types;
 
+/// A ref's value as a number (0 for none), for ordering: under
+/// `RUSTUDIO_DETERMINISTIC=1` ref order is creation order.
+pub fn ref_order(r: types::Ref) -> u128 {
+    // (Ref is a one-field struct around Option<NonZeroU128>: 0 = none.)
+    const _: () = assert!(std::mem::size_of::<types::Ref>() == 16);
+    unsafe { std::mem::transmute::<types::Ref, u128>(r) }
+}
+
+/// A new referent for an instance. Random (`Ref::new`), except under
+/// `RUSTUDIO_DETERMINISTIC=1` (test runs): then a process-wide counter, so
+/// refs follow creation order and are the same on every run of the same place.
+pub fn deterministic() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTUDIO_DETERMINISTIC").is_ok_and(|v| v == "1"))
+}
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` with refs that do not come from the counter (random, as without
+/// `RUSTUDIO_DETERMINISTIC`): for throwaway documents, so how many of them a
+/// frame makes does not shift the refs of the instances that follow.
+pub fn with_scratch_refs<T>(f: impl FnOnce() -> T) -> T {
+    SCRATCH.with(|c| c.set(c.get() + 1));
+    let out = f();
+    SCRATCH.with(|c| c.set(c.get() - 1));
+    out
+}
+
+/// See `deterministic`.
+pub fn new_ref() -> types::Ref {
+    if SCRATCH.with(|c| c.get()) > 0 {
+        return types::Ref::new();
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    if deterministic() {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        types::Ref::some((1u128 << 100) | n as u128)
+    } else {
+        types::Ref::new()
+    }
+}
+
 pub use ahash::AHashMap;
 pub use ustr::{ustr, Ustr, UstrMap, UstrSet};
 

@@ -407,17 +407,14 @@ pub fn sync(lua: &Lua) -> mlua::Result<()> {
     // elapsedTime: seconds since the process started (Studio's includes its
     // whole session), not game time; tick(): local wall time.
     let since = crate::runtime::process_start();
-    let elapsed = lua.create_function(move |_, ()| Ok(since.elapsed().as_secs_f64()))?;
+    // (--fixed-dt: both on the simulated clock, src/sim_clock.rs)
+    let elapsed = lua.create_function(move |_, ()| {
+        Ok(crate::sim_clock::seconds().unwrap_or_else(|| since.elapsed().as_secs_f64()))
+    })?;
     name_function(lua, &elapsed, "elapsedTime");
     public.raw_set("ElapsedTime", forwarder(lua, "ElapsedTime", elapsed.clone())?)?;
     public.raw_set("elapsedTime", elapsed)?;
-    let tick = lua.create_function(|_, ()| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        Ok(now + local_offset())
-    })?;
+    let tick = lua.create_function(|_, ()| Ok(crate::sim_clock::epoch_secs() + local_offset()))?;
     name_function(lua, &tick, "tick");
     public.raw_set("tick", tick)?;
     for (alias, of) in [("Spawn", "spawn"), ("Delay", "delay")] {

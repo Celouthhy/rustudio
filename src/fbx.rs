@@ -31,21 +31,21 @@ pub enum Prop {
 }
 
 impl Prop {
-    fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Prop::Int(i) => Some(*i as f64),
             Prop::Float(f) => Some(*f),
             _ => None,
         }
     }
-    fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             Prop::Int(i) => Some(*i),
             Prop::Float(f) => Some(*f as i64),
             _ => None,
         }
     }
-    fn as_str(&self) -> Option<&[u8]> {
+    pub(crate) fn as_str(&self) -> Option<&[u8]> {
         match self {
             Prop::Str(s) => Some(s),
             _ => None,
@@ -61,14 +61,14 @@ pub struct Node {
 }
 
 impl Node {
-    fn child(&self, name: &str) -> Option<&Node> {
+    pub(crate) fn child(&self, name: &str) -> Option<&Node> {
         self.kids.iter().find(|k| k.name == name)
     }
-    fn children<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
+    pub(crate) fn children<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
         self.kids.iter().filter(move |k| k.name == name)
     }
     /// Properties70 entries: name → values after the 4 header fields.
-    fn props70(&self) -> HashMap<String, Vec<Prop>> {
+    pub(crate) fn props70(&self) -> HashMap<String, Vec<Prop>> {
         let mut out = HashMap::new();
         if let Some(p) = self.child("Properties70") {
             for e in p.children("P") {
@@ -288,7 +288,7 @@ pub struct ImportNode {
     pub texture: Option<(String, Vec<u8>)>,
 }
 
-fn vec3_prop(p: &HashMap<String, Vec<Prop>>, name: &str, default: DVec3) -> DVec3 {
+pub(crate) fn vec3_prop(p: &HashMap<String, Vec<Prop>>, name: &str, default: DVec3) -> DVec3 {
     match p.get(name) {
         Some(v) if v.len() >= 3 => DVec3::new(
             v[0].as_f64().unwrap_or(default.x),
@@ -301,13 +301,32 @@ fn vec3_prop(p: &HashMap<String, Vec<Prop>>, name: &str, default: DVec3) -> DVec
 
 /// Euler angles (degrees) in FBX's default XYZ order: X applied first.
 fn euler(deg: DVec3) -> DMat4 {
-    let r = deg * (std::f64::consts::PI / 180.0);
-    DMat4::from_rotation_z(r.z) * DMat4::from_rotation_y(r.y) * DMat4::from_rotation_x(r.x)
+    euler_ordered(deg, 0)
 }
 
-/// A node's local transform (translation, pre-rotation, rotation, scaling and
-/// their pivots, as FBX defines them).
-fn local_matrix(p: &HashMap<String, Vec<Prop>>) -> DMat4 {
+/// Euler angles (degrees) in an FBX RotationOrder (0 XYZ, 1 XZY, 2 YZX,
+/// 3 YXZ, 4 ZXY, 5 ZYX): the order's first axis is applied first.
+pub(crate) fn euler_ordered(deg: DVec3, order: i64) -> DMat4 {
+    let r = deg * (std::f64::consts::PI / 180.0);
+    let (x, y, z) = (DMat4::from_rotation_x(r.x), DMat4::from_rotation_y(r.y), DMat4::from_rotation_z(r.z));
+    match order {
+        1 => y * z * x,
+        2 => x * z * y,
+        3 => z * x * y,
+        4 => y * x * z,
+        5 => x * y * z,
+        _ => z * y * x,
+    }
+}
+
+/// A node's local transform (translation, pre-rotation, rotation in the
+/// node's RotationOrder, scaling and their pivots, as FBX defines them).
+/// The RotationOrder counts only with RotationActive set, as in the FBX SDK
+/// (Studio's animation import, measured: a ZYX order without
+/// RotationActive is read as XYZ; src/fbx_anim.rs).
+pub(crate) fn local_matrix(p: &HashMap<String, Vec<Prop>>) -> DMat4 {
+    let active = p.get("RotationActive").and_then(|v| v.first()?.as_i64()).unwrap_or(0) != 0;
+    let order = if active { p.get("RotationOrder").and_then(|v| v.first()?.as_i64()).unwrap_or(0) } else { 0 };
     let t = vec3_prop(p, "Lcl Translation", DVec3::ZERO);
     let r = vec3_prop(p, "Lcl Rotation", DVec3::ZERO);
     let s = vec3_prop(p, "Lcl Scaling", DVec3::ONE);
@@ -321,7 +340,7 @@ fn local_matrix(p: &HashMap<String, Vec<Prop>>) -> DMat4 {
         * DMat4::from_translation(roff)
         * DMat4::from_translation(rpiv)
         * euler(pre)
-        * euler(r)
+        * euler_ordered(r, order)
         * euler(post).inverse()
         * DMat4::from_translation(-rpiv)
         * DMat4::from_translation(soff)

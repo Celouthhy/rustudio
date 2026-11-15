@@ -38,6 +38,10 @@ enum State {
     Pending,
     Ready(Hulls),
     Failed,
+    /// The mesh's bytes weren't there yet (still downloading at spawn: a character's
+    /// Head asked before its mesh arrived stayed a box for good): asked again after
+    /// a moment.
+    Missing(std::time::Instant),
 }
 
 struct Store {
@@ -293,12 +297,14 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
             Some(State::Ready(h)) => return Lookup::Ready(h.clone()),
             Some(State::Pending) => return Lookup::Pending,
             Some(State::Failed) => return Lookup::Unavailable,
-            None => {}
+            Some(State::Missing(t)) if t.elapsed() < std::time::Duration::from_millis(500) => return Lookup::Unavailable,
+            Some(State::Missing(_)) | None => {}
         }
         // Hull is cheap: do it here; decompositions go to the workers.
         if fidelity == FIDELITY_HULL {
             let st = match compute(id, fidelity) {
                 Some(h) => State::Ready(Arc::new(h)),
+                None if crate::assets::mesh_triangles(id).is_none() => State::Missing(std::time::Instant::now()),
                 None => State::Failed,
             };
             states.insert(key, st.clone());
@@ -308,7 +314,7 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
             };
         }
         if crate::assets::mesh_triangles(id).is_none() {
-            states.insert(key, State::Failed);
+            states.insert(key, State::Missing(std::time::Instant::now()));
             return Lookup::Unavailable;
         }
         states.insert(key.clone(), State::Pending);
@@ -322,10 +328,23 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
 #[allow(dead_code)]
 pub fn wait_ready(id: &str, fidelity: u32, timeout: std::time::Duration) -> Lookup {
     let start = std::time::Instant::now();
+    let mut fetched = false;
     loop {
         match hulls(id, fidelity) {
             Lookup::Pending if start.elapsed() < timeout => {
                 std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            // The mesh's bytes are not here yet (still downloading): fetch them now rather
+            // than taking the box and asking again 500 ms of wall clock later — that made a
+            // part change shape on a load-dependent tick (RUSTUDIO_DETERMINISTIC runs,
+            // CHAR-NOTES round CHAR-5 §4).
+            Lookup::Unavailable if !fetched && crate::assets::mesh_triangles(id).is_none() => {
+                fetched = true;
+                let _ = crate::assets::content_blocking(id);
+                if crate::assets::mesh_triangles(id).is_none() {
+                    return Lookup::Unavailable;
+                }
+                store().states.lock().expect("collision states").remove(&(id.to_string(), fidelity));
             }
             other => return other,
         }

@@ -17,6 +17,36 @@ use super::*;
 use crate::humanoid::{Floor, FrameIn, Humanoid, StepIn};
 use crate::physics::hum_body::HumCtl;
 
+/// Studio 0.747 puts a Scriptable camera's Focus this many studs ahead of its
+/// CFrame before each frame's RenderStepped (`scriptable_camera_focus`).
+const SCRIPTABLE_FOCUS_AHEAD: f32 = 20.0;
+
+/// Studio 0.747 puts a Scriptable CurrentCamera's Focus 20 studs ahead of its
+/// CFrame between a frame's Heartbeat and the next RenderStepped, whatever a
+/// script set it to (probe T24X_focus: Focus set 10 ahead at Heartbeat reads 20
+/// ahead at the next frame's first render step; CameraRelative turns the root
+/// toward it, `hum_face_camera`). Other camera types keep theirs (the camera
+/// scripts set it every frame).
+pub(super) fn scriptable_camera_focus(cd: &mut Document) {
+    let Some(ws) = cd.workspace() else { return };
+    let cam = match cd.prop(ws, "CurrentCamera") {
+        Some(Variant::Ref(r)) if cd.exists(r) => r,
+        _ => match cd.find_child(ws, "Camera") {
+            Some(c) => c,
+            None => return,
+        },
+    };
+    if crate::scene::enum_u32(cd.prop(cam, "CameraType")) != Some(6) {
+        return;
+    }
+    let Some(cf) = crate::scene::xform_of(cd, cam) else { return };
+    let f = Xform { pos: cf.pos + cf.rot * Vec3::new(0.0, 0.0, -SCRIPTABLE_FOCUS_AHEAD), rot: cf.rot };
+    if let Some(inst) = cd.dom.get_by_ref_mut(cam) {
+        inst.properties.insert(ustr("Focus"), Variant::CFrame(f.to_cframe()));
+    }
+    cd.mark_prop(cam, ustr("Focus"));
+}
+
 /// The controller's state between frames (also kept in the physics world's
 /// copy while the body exists; the world can be rebuilt under it).
 pub(crate) struct HumDyn {
@@ -142,14 +172,26 @@ impl Editor {
     }
 
     /// RotationType CameraRelative (shift lock, first person): the root
-    /// faces where the camera looks, at once. Measured in Studio 0.747
-    /// (checks/humanoid-physics/feel/traces/studio-yaw.log, studio-yaw2.log):
-    /// each frame, after RenderStepped and before PreAnimation, the root's
-    /// yaw is exactly the camera's (the yaw the camera had when RenderStepped
-    /// ended), its tilt and its angular velocity (0 while standing) are left
-    /// alone; with AutoRotate off or Sit on it isn't turned; it is in
-    /// Running, PlatformStanding, Physics, with an anchored root and in
-    /// first person alike. No servo is involved: the turn is a pose write.
+    /// faces the camera's way, at once. Measured in Studio 0.747
+    /// (checks/humanoid-physics/feel/traces/studio-yaw.log, studio-yaw2.log;
+    /// probes T24X_*): once a frame, after RenderStepped and before PreAnimation,
+    /// the root's yaw is set to the heading from Camera.CFrame's position to
+    /// Camera.Focus as they are when RenderStepped has ended (a camera script that
+    /// sets both, as the PlayerModule does, gets its look; a Scriptable camera's
+    /// Focus is the engine's, 20 studs ahead of the CFrame the frame began with,
+    /// `scriptable_camera_focus`: T24X_far / _at / _stand / _walk / _strafe lag
+    /// 1.0 / 1.0 / 0.5 / 0.492 / 0.232 of the frame's camera turn, T24X_focus 0);
+    /// its tilt and angular velocity are left alone; with AutoRotate off or Sit
+    /// on it isn't turned; it is in Running, Freefall, PlatformStanding, Physics,
+    /// with an anchored root and in first person alike. No servo is involved:
+    /// the turn is a pose write. It comes before the frame is drawn, so the drawn
+    /// character faces the drawn camera's way (done at the start of the next
+    /// frame, every drawn frame showed the root one frame of camera turn behind,
+    /// plus whatever the world steps turned it by, e.g. Freefall's air yaw toward
+    /// a strafe: 0.13 rad a 60 Hz frame, probe T24_shiftlock_strafe_*).
+    /// RUSTUDIO_SOLVER=studio: called right after the client's RenderStepped /
+    /// PreRender (play.rs), with the Focus heading; the rapier path keeps the old
+    /// call at the start of the next frame with the view camera's look.
     pub(super) fn hum_face_camera(&mut self) {
         let Some((humanoid, model)) = self.play.as_ref().and_then(|s| {
             let c = s.character.as_ref()?;
@@ -163,7 +205,12 @@ impl Editor {
         if !auto_rotate || sit {
             return;
         }
-        let look = self.cam.forward();
+        // (rapier path: the view camera's look, as before)
+        let look = if crate::solver::kind() != crate::solver::SolverKind::Rapier {
+            self.client_camera_heading().unwrap_or_else(|| self.cam.forward())
+        } else {
+            self.cam.forward()
+        };
         if look.x.abs() + look.z.abs() < 1e-4 {
             return;
         }
@@ -191,6 +238,30 @@ impl Editor {
             }
         }
         rig::write_pose(&mut self.doc, &pose, None);
+    }
+
+    /// The client's CurrentCamera: its CFrame and Focus.
+    fn client_camera(&self) -> Option<(Xform, Option<Xform>)> {
+        let cd = self.play.as_ref()?.other_doc.as_ref()?;
+        let ws = cd.workspace()?;
+        let cam = match cd.prop(ws, "CurrentCamera") {
+            Some(Variant::Ref(r)) if cd.exists(r) => r,
+            _ => cd.find_child(ws, "Camera")?,
+        };
+        let cf = crate::scene::xform_of(cd, cam)?;
+        let focus = match cd.prop(cam, "Focus") {
+            Some(Variant::CFrame(f)) => Some(Xform::from_cframe(&f)),
+            _ => None,
+        };
+        Some((cf, focus))
+    }
+
+    /// The heading CameraRelative turns the root to (`hum_face_camera`): from the
+    /// client camera's position to its Focus, else its look.
+    fn client_camera_heading(&self) -> Option<Vec3> {
+        let (cf, focus) = self.client_camera()?;
+        let d = focus.map(|f| f.pos - cf.pos).filter(|d| d.x.abs() + d.z.abs() > 1e-4);
+        Some(d.unwrap_or(-cf.rot.z_axis))
     }
 
     /// stepHumanoid: the body, the sensors, the
@@ -606,10 +677,21 @@ impl Editor {
         if died {
             // Dead (event 0): the server's Health follows and the assembly
             // splits (BreakJointsOnDeath).
-            if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
-                inst.properties.insert(ustr("Health"), Variant::Float32(0.0));
+            // Set the way a script would on the server, so its HealthChanged and Died
+            // fire there too (Studio: the server's Humanoid dies about two frames after
+            // the owner's, probe T14srv_parts, lane DEATH).
+            let set = self
+                .with_side(Side::Server, |rt, _, _| {
+                    rt.apply_prop(humanoid, "Health", Variant::Float32(0.0));
+                    rt.dispatch();
+                })
+                .is_some();
+            if !set {
+                if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
+                    inst.properties.insert(ustr("Health"), Variant::Float32(0.0));
+                }
+                self.doc.mark_prop(humanoid, ustr("Health"));
             }
-            self.doc.mark_prop(humanoid, ustr("Health"));
             self.record(RepOp::Prop(humanoid, "Health".into()));
             self.kill_character();
             return out;

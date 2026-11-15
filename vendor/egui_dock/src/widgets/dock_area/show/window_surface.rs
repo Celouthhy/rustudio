@@ -18,10 +18,24 @@ impl<Tab> DockArea<'_, Tab> {
         state: &mut State,
         fade_style: Option<(&Style, f32, SurfaceIndex)>,
     ) {
+        // Restored layouts can contain a window whose last tab was removed.
+        // Discard it before looking up a title or rendering its node tree.
+        if self.dock_state[surf_index].num_tabs() == 0 {
+            self.dock_state.remove_surface(surf_index);
+            return;
+        }
+
         // Construct egui window
         let id = format!("window {surf_index:?}").into();
         let bounds = self.window_bounds.unwrap();
         let open = true;
+        if let Some((surface, origin, pointer_origin)) = state.floating_drag
+            && surface == surf_index
+            && let Some(pointer) = ui.ctx().pointer_interact_pos()
+        {
+            self.dock_state.get_window_state_mut(surf_index).unwrap()
+                .set_position(origin + (pointer - pointer_origin));
+        }
         let window = self
             .dock_state
             .get_window_state_mut(surf_index)

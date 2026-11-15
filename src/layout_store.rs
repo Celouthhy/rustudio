@@ -34,6 +34,7 @@ pub enum SavedTab {
     Output,
     AvatarSettings,
     TerrainEditor,
+    Toolbox,
 }
 
 impl SavedTab {
@@ -45,7 +46,8 @@ impl SavedTab {
             Tab::Output => SavedTab::Output,
             Tab::AvatarSettings => SavedTab::AvatarSettings,
             Tab::TerrainEditor => SavedTab::TerrainEditor,
-            Tab::Script(_) => return None,
+            Tab::Toolbox => SavedTab::Toolbox,
+            Tab::Script(_) | Tab::Plugin(_) => return None,
         })
     }
     pub(crate) fn tab(self) -> Tab {
@@ -56,6 +58,7 @@ impl SavedTab {
             SavedTab::Output => Tab::Output,
             SavedTab::AvatarSettings => Tab::AvatarSettings,
             SavedTab::TerrainEditor => Tab::TerrainEditor,
+            SavedTab::Toolbox => Tab::Toolbox,
         }
     }
 }
@@ -140,6 +143,10 @@ impl Harness {
             && self.open_roblox.is_none()
             && self.roblox_picker.is_none()
             && !self.roblox_settings
+            && self.result.is_none()
+            && !self.fail_on_error
+            && self.end_after.is_none()
+            && !self.no_ui
     }
 }
 

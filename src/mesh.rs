@@ -63,7 +63,7 @@ pub struct SkinBone {
 }
 
 /// A skinned mesh's bones and, per corner of the triangle list, up to four
-/// (bone, weight) pairs (weights sum to 1).
+/// (bone, weight) pairs (the file's u8 weights / 255, normally summing to 1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skin {
     pub bones: Vec<SkinBone>,
@@ -106,9 +106,144 @@ pub fn parse(bytes: &[u8]) -> Result<MeshData, String> {
     }
 }
 
+/// Whether `bytes` are a mesh in one of Roblox's own formats (what Studio
+/// can load as a MeshId: .mesh 1.00-7.00, possibly gzip-wrapped, a
+/// PartOperationAsset, the CSG / solid-model formats), not one only rustudio
+/// reads for local files (Wavefront OBJ). The same dispatch as `parse`.
+pub fn studio_format(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut head = Vec::new();
+        let _ = flate2::read::GzDecoder::new(bytes).take(64).read_to_end(&mut head);
+        return studio_format(&head) || !head.is_empty() && head.starts_with(b"<roblox!");
+    }
+    bytes.starts_with(b"<roblox!")
+        || solid_mesh_start(bytes).is_some()
+        || is_csgmdl(bytes)
+        || bytes.starts_with(b"version ")
+}
+
 // ---------------------------------------------------------------------------
 // Roblox .mesh
 // ---------------------------------------------------------------------------
+
+/// A Roblox .mesh file's own vertices and LOD0 triangles as stored (not
+/// de-indexed): what AssetService:CreateEditableMeshAsync starts from.
+pub struct Stored {
+    /// The file's major version (1, 2, 3, 4, 5, 6, 7).
+    pub major: u32,
+    pub pos: Vec<Vec3>,
+    pub nrm: Vec<Vec3>,
+    pub uv: Vec<Vec2>,
+    pub col: Vec<[u8; 4]>,
+    pub faces: Vec<[u32; 3]>,
+}
+
+/// The stored vertices and faces of a binary Roblox mesh (2.00 to 7.00),
+/// None for anything else (text 1.xx, CSG, OBJ).
+pub fn stored(bytes: &[u8]) -> Option<Stored> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bytes).take(64 * 1024 * 1024).read_to_end(&mut decoded).ok()?;
+        return stored(&decoded);
+    }
+    let nl = bytes.iter().position(|&b| b == b'\n')?;
+    let line = std::str::from_utf8(&bytes[..nl]).ok()?;
+    let version = line.strip_prefix("version ")?.trim();
+    let body = &bytes[nl + 1..];
+    let major: u32 = version.split('.').next()?.parse().ok()?;
+    let (verts, faces): (Vec<Vertex>, Vec<[u32; 3]>) = match version {
+        "2.00" => {
+            let mut r = Reader::new(body);
+            let header_size = r.u16().ok()? as usize;
+            let vertex_size = r.u8().ok()? as usize;
+            let face_size = r.u8().ok()? as usize;
+            let nv = r.u32().ok()? as usize;
+            let nf = r.u32().ok()? as usize;
+            let (v, off) = read_vertices(body, header_size, nv, vertex_size).ok()?;
+            let (f, _) = read_faces(body, off, nf, face_size).ok()?;
+            (v, f)
+        }
+        "3.00" | "3.01" => {
+            let mut r = Reader::new(body);
+            let header_size = r.u16().ok()? as usize;
+            let vertex_size = r.u8().ok()? as usize;
+            let face_size = r.u8().ok()? as usize;
+            let lod_size = r.u16().ok()? as usize;
+            let nl = r.u16().ok()? as usize;
+            let nv = r.u32().ok()? as usize;
+            let nf = r.u32().ok()? as usize;
+            let (v, off) = read_vertices(body, header_size, nv, vertex_size).ok()?;
+            let (f, off) = read_faces(body, off, nf, face_size).ok()?;
+            let lods = read_lods(body, off, nl, lod_size).ok()?;
+            let f = lod0_faces(&f, &lods).to_vec();
+            (v, f)
+        }
+        "4.00" | "4.01" | "5.00" => {
+            let mut r = Reader::new(body);
+            let header_size = r.u16().ok()? as usize;
+            let _ = r.u16().ok()?;
+            let nv = r.u32().ok()? as usize;
+            let nf = r.u32().ok()? as usize;
+            let nl = r.u16().ok()? as usize;
+            let nb = r.u16().ok()? as usize;
+            let (v, mut off) = read_vertices(body, header_size, nv, 40).ok()?;
+            if nb > 0 {
+                off = span_end(body, off, nv, 8, "skinning data").ok()?;
+            }
+            let (f, off) = read_faces(body, off, nf, 12).ok()?;
+            let lods = read_lods(body, off, nl, 4).ok()?;
+            let f = lod0_faces(&f, &lods).to_vec();
+            (v, f)
+        }
+        "6.00" | "7.00" => {
+            let mut r = Reader::new(body);
+            let mut core = None;
+            let mut lods = Vec::new();
+            while r.pos < body.len() {
+                let header = r.take(16).ok()?;
+                let version = u32_at(header, 8);
+                let data = r.take(u32_at(header, 12) as usize).ok()?;
+                match &header[..8] {
+                    b"COREMESH" if version == 1 => {
+                        let mut c = Reader::new(data);
+                        let nv = c.u32().ok()? as usize;
+                        let (v, off) = read_vertices(data, c.pos, nv, 40).ok()?;
+                        let mut c = Reader { data, pos: off };
+                        let nf = c.u32().ok()? as usize;
+                        let (f, _) = read_faces(data, c.pos, nf, 12).ok()?;
+                        core = Some((v, f));
+                    }
+                    b"COREMESH" if version == 2 => core = Some(decode_draco_core(data).ok()?),
+                    b"LODS\0\0\0\0" if version == 1 => {
+                        let mut c = Reader::new(data);
+                        let _ = c.u16().ok()?;
+                        let _ = c.u8().ok()?;
+                        let nl = c.u32().ok()? as usize;
+                        lods = read_lods(data, c.pos, nl, 4).ok()?;
+                    }
+                    _ => {}
+                }
+            }
+            let (v, f) = core?;
+            let f = lod0_faces(&f, &lods).to_vec();
+            (v, f)
+        }
+        _ => return None,
+    };
+    if faces.iter().flatten().any(|&i| i as usize >= verts.len()) {
+        return None;
+    }
+    Some(Stored {
+        major,
+        pos: verts.iter().map(|v| v.pos).collect(),
+        nrm: verts.iter().map(|v| v.nrm).collect(),
+        uv: verts.iter().map(|v| v.uv).collect(),
+        col: verts.iter().map(|v| v.col).collect(),
+        faces,
+    })
+}
 
 /// Splits off the `version X.YY` line and dispatches on the version string.
 fn parse_roblox(bytes: &[u8]) -> Result<MeshData, String> {
@@ -353,11 +488,9 @@ fn read_skin(
                     sum += w;
                 }
             }
-            if sum > 0.0 {
-                for w in &mut ws {
-                    *w /= sum;
-                }
-            }
+            // Studio uses the u8 weights / 255 as they are (no renormalising:
+            // a vertex short of 255 is pulled toward the world origin, skin.rs).
+            let _ = sum;
             corner_bones.push(ids);
             corner_weights.push(ws);
         }

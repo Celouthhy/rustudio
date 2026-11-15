@@ -27,6 +27,13 @@ enum Show {
     Editor(&'static str),
     /// The Terrain Editor panel with this tool picked.
     Terrain(crate::terrain_editor::Tool),
+    /// RUSTUDIO_UI_SHOTS=plugins (src/plugin_host/ui_ribbon.rs): the
+    /// Plugins tab once its icons have loaded, a toolbar button's tooltip,
+    /// an open PluginMenu:ShowAsync popup, Customize Shortcuts.
+    PluginsTab,
+    PluginTip,
+    PluginPopup,
+    Shortcuts,
 }
 
 pub struct UiShots {
@@ -94,6 +101,18 @@ impl UiShots {
                 .into_iter()
                 .map(|(n, t)| (format!("terrain-{n}"), Show::Terrain(t)))
                 .collect();
+            return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
+        }
+        // RUSTUDIO_UI_SHOTS=plugins: plugin toolbars, menus, shortcuts.
+        if std::env::var("RUSTUDIO_UI_SHOTS").as_deref() == Ok("plugins") {
+            let _ = std::fs::create_dir_all(&dir);
+            let shots = vec![
+                ("plugins-tab".to_string(), Show::PluginsTab),
+                ("plugins-menu".to_string(), Show::Click("menu.Plugins")),
+                ("plugins-tip".to_string(), Show::PluginTip),
+                ("plugins-popup".to_string(), Show::PluginPopup),
+                ("plugins-shortcuts".to_string(), Show::Shortcuts),
+            ];
             return UiShots { dir, shots, i: 0, t: 0, queue: Vec::new(), asked: false, rects: Default::default(), view_baseline: None, done: false };
         }
         // RUSTUDIO_UI_SHOTS=output: the Output after Studio's test script.
@@ -201,6 +220,22 @@ impl Editor {
             ctx.request_repaint();
             self.harness.ui_shots = Some(s);
             return;
+        }
+        // Plugin shots wait (up to a minute) for the toolbars, their icons,
+        // and an open popup.
+        if s.t == 7 && self.harness.started.elapsed().as_secs() < 60 {
+            let ready = match show {
+                Show::PluginsTab | Show::PluginTip => {
+                    !self.plugin_bar.model.groups.is_empty() && !self.plugin_bar.icons.busy()
+                }
+                Show::PluginPopup => !self.plugin_bar.model.menus.is_empty(),
+                _ => true,
+            };
+            if !ready {
+                self.ui.tab = crate::studio_ui::RibbonTab::Plugins;
+                self.harness.ui_shots = Some(s);
+                return;
+            }
         }
         let click_at = |key: &str, ed: &Editor| ed.ui_rects.get(key).map(|r| r.center());
         match (s.t, show) {
@@ -310,6 +345,17 @@ impl Editor {
             }
             (5, Show::OutputRun) => self.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}')),
             (0, Show::Tab(t)) => self.ui.tab = *t,
+            (0, Show::PluginsTab | Show::PluginPopup) => self.ui.tab = RibbonTab::Plugins,
+            (0, Show::Shortcuts) => self.plugin_bar.shortcuts.open = true,
+            (0, Show::PluginTip) => {
+                self.ui.tab = RibbonTab::Plugins;
+                std::env::set_var("RUSTUDIO_PLUGIN_TIPS", "1");
+            }
+            (2..=7, Show::PluginTip) => {
+                if let Some((_, r)) = self.plugin_bar.rects.first() {
+                    s.queue.push(Event::PointerMoved(r.center()));
+                }
+            }
             (0, Show::Terrain(tool)) => {
                 self.ui.panel_requests.push((crate::app::Tab::TerrainEditor, Some(true)));
                 self.terrain_ed.tab = if crate::terrain_editor::Tool::CREATE.contains(tool) { 0 } else { 1 };
@@ -374,6 +420,19 @@ impl Editor {
                 }
             }
             info.insert("window".into(), serde_json::json!([image.size[0], image.size[1]]));
+            if matches!(show, Show::PluginsTab | Show::PluginTip) {
+                for (k, r) in &self.plugin_bar.rects {
+                    info.insert(format!("plugin.{k}"), rect_json(*r));
+                }
+            }
+            if matches!(show, Show::Click("menu.Plugins")) {
+                for (k, r) in &self.plugin_bar.menu_rects {
+                    info.insert(format!("plugins-menu.{k}"), rect_json(*r));
+                }
+            }
+            for (k, r) in &self.plugin_bar.popup_rects {
+                info.insert(format!("plugin-popup.{k}"), rect_json(*r));
+            }
             s.rects.insert(name, serde_json::Value::Object(info));
             // Close whatever opened, next picture.
             s.queue.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });

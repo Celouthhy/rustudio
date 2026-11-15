@@ -51,8 +51,8 @@ rustudio's own code.
 
 With the person's own Roblox session (`docs/AUTH.md`; signed in only), the same endpoint also gives assets Roblox serves to signed-in accounts: the current dynamic head of the R15 body file (mesh, cage, face), the person's avatar items (clothing, accessories, layered clothing), models a place loads with InsertService, and the person's own places. Those meshes are often Draco-compressed; they are decoded with the `draco-core` crate (Apache-2.0, a Rust reading of Google's Draco format). The self-test's "catalog-assets" step puts on Roblox's catalog item "Hooded Jacket - Gray" (8516620262). The place-upload route `/ide/publish/UploadExistingAsset` is the one Studio uses for publishing (`docs/AUTH.md`).
 
-Other files read at run time, outside the game's folder: the offline Studio's local asset
-store `~/.local/share/rustudio/assets/<id>[.ext]` and the person's rbxasset
+Other files read at run time, outside the game's folder: an optional local asset
+store (`RUSTUDIO_LOCAL_ASSETS=<folder>` of `<id>[.ext]` files, off by default) and the person's rbxasset
 upload ledger `~/.local/share/rbxasset/ledger.json` with the files it points
 at (FBX model uploads among them, imported in memory). All read only:
 rustudio writes nothing into either.

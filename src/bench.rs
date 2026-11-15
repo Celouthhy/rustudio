@@ -35,7 +35,7 @@ fn instr_on() -> bool {
 /// This thread's user-space instructions retired so far (perf_event_open
 /// on itself; 0 if unavailable).
 #[cfg(target_os = "linux")]
-fn instructions() -> u64 {
+pub(crate) fn instructions() -> u64 {
     thread_local! {
         static FD: i32 = unsafe {
             // struct perf_event_attr: type, size, config, …, flags.
@@ -58,9 +58,34 @@ fn instructions() -> u64 {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn instructions() -> u64 {
+/// Windows has no per-thread instruction counter without admin-only
+/// profilers: this thread's CPU cycles instead (QueryThreadCycleTime), which
+/// like instructions don't stretch while the thread waits for a core. The
+/// report says so (`work_unit`): cycles, not instructions.
+#[cfg(windows)]
+pub(crate) fn instructions() -> u64 {
+    use windows_sys::Win32::System::{Threading::GetCurrentThread, WindowsProgramming::QueryThreadCycleTime};
+    let mut cycles = 0u64;
+    // SAFETY: the current thread's pseudo-handle and a u64 out-pointer.
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+    cycles
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) fn instructions() -> u64 {
     0
+}
+
+/// What RUSTUDIO_BENCH_INSTR counts on this platform when it isn't Linux's
+/// instructions (None on Linux, or when the variable is unset).
+fn instr_note() -> Option<&'static str> {
+    if !instr_on() || cfg!(target_os = "linux") {
+        None
+    } else if cfg!(windows) {
+        Some("millions of CPU cycles (QueryThreadCycleTime): Windows counts cycles, not instructions")
+    } else {
+        Some("not supported on this platform: sections read 0")
+    }
 }
 
 impl Drop for Scope {
@@ -81,6 +106,11 @@ impl Drop for Scope {
             }
         });
     }
+}
+
+/// This thread's section totals so far (ms, or M instructions).
+pub fn totals() -> Vec<(&'static str, f64)> {
+    SECTIONS.with(|s| s.borrow().iter().map(|e| (e.0, e.1)).collect())
 }
 
 // ------------------------------------------------------------ Lua timing
@@ -329,6 +359,21 @@ fn take_lua() -> Vec<(String, f64, u64)> {
     v
 }
 
+/// This thread's work so far in the bench's unit (milliseconds since an
+/// arbitrary start, or millions of instructions under RUSTUDIO_BENCH_INSTR):
+/// differences of two reads go to `add` for sections timed in a loop.
+/// 0 while no bench is measuring (no clock read per loop item then).
+pub fn now() -> f64 {
+    thread_local! { static T0: Instant = Instant::now(); }
+    if !lua_prof_on() {
+        0.0
+    } else if instr_on() {
+        instructions() as f64 / 1e6
+    } else {
+        T0.with(|t| t.elapsed().as_secs_f64() * 1000.0)
+    }
+}
+
 /// Adds `ms` and `calls` to section `name` without a guard (for totals
 /// gathered in a loop, or counts with `ms` 0).
 /// Runs `f` and returns its result with the work it took on this thread:
@@ -381,6 +426,23 @@ fn thread_cpu_ms() -> f64 {
             return ts.tv_sec as f64 * 1000.0 + ts.tv_nsec as f64 / 1e6;
         }
     }
+    // (kernel + user time in 100 ns units, advanced at the scheduler's tick:
+    // fine for a bench's total, not for one frame)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (z, z, z, z);
+        // SAFETY: the current thread's pseudo-handle and four FILETIME out-pointers.
+        if unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) } != 0 {
+            let ms = |f: FILETIME| (((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64) as f64 / 1e4;
+            return ms(kernel) + ms(user);
+        }
+    }
+    // (NaN: null in the report, "not supported on this platform")
+    #[cfg(not(any(unix, windows)))]
+    return f64::NAN;
     0.0
 }
 
@@ -401,6 +463,10 @@ pub struct Bench {
     /// The slowest frames: (frame ms, its sections).
     worst: Vec<(f32, Vec<(&'static str, f64)>)>,
     pub done: bool,
+    /// RUSTUDIO_GPU_TIMING: each measured frame's GPU milliseconds (the sum
+    /// of the timed spans, gpu_timing.rs), in the order they finished.
+    gpu_frames: Vec<f64>,
+    timeline: Vec<[f32; 5]>,
     /// Lua time by connection / thread over the measured frames.
     lua: Vec<(String, f64, u64)>,
     /// Engine API time by member over the measured frames.
@@ -408,6 +474,11 @@ pub struct Bench {
     /// The main thread's CPU time when measuring began, and over the window.
     cpu0: f64,
     cpu_ms: f64,
+    /// Per measured frame: the main thread's instructions over the frame
+    /// (millions, 0 off Linux / without a counter) and its sections in the
+    /// bench's unit. Written beside the report as OUT.frames.json.
+    per_frame: Vec<(f64, f32, Vec<(&'static str, f64)>)>,
+    instr_last: u64,
 }
 
 impl Bench {
@@ -429,10 +500,14 @@ impl Bench {
             totals: Vec::new(),
             worst: Vec::new(),
             done: false,
+            gpu_frames: Vec::new(),
+            timeline: Vec::new(),
             lua: Vec::new(),
             api: Vec::new(),
             cpu0: 0.0,
             cpu_ms: 0.0,
+            per_frame: Vec::new(),
+            instr_last: 0,
         }
     }
 
@@ -440,29 +515,57 @@ impl Bench {
     /// Returns true when the measurement window is over.
     pub fn frame(&mut self, work_ms: f32) -> bool {
         let now = Instant::now();
-        let started = *self.started.get_or_insert(now);
+        // The window (warm-up, seconds) on the game's clock: under --fixed-dt
+        // the simulated one, so a window covers the same frames of a
+        // deterministic run however fast the machine is.
+        let clock = crate::sim_clock::now();
+        let started = *self.started.get_or_insert(clock);
         if self.measuring.is_none() {
-            if now.duration_since(started).as_secs_f32() < self.warmup {
+            if clock.duration_since(started).as_secs_f32() < self.warmup {
                 self.last = Some(now);
+                crate::gpu_timing::take();
                 return false;
             }
             // This frame's sections are partly from before: it isn't counted.
             take_sections();
+            crate::gpu_timing::take();
             take_lua();
             take_api();
             LUA_ON.with(|c| c.set(true));
             self.cpu0 = thread_cpu_ms();
-            self.measuring = Some(now);
+            if let Some(note) = instr_note() {
+                eprintln!("RUSTUDIO_BENCH_INSTR: sections are in {note}");
+            }
+            self.measuring = Some(clock);
             self.last = Some(now);
+            self.instr_last = instructions();
             return false;
         }
         let mut frame_sections = take_sections();
+        // GPU spans that finished since the last frame (a frame or two late),
+        // in GPU milliseconds whatever the bench's unit.
+        let (gpu, gpu_totals) = crate::gpu_timing::take();
+        frame_sections.extend(gpu.into_iter().map(|(n, ms)| (n, ms, 1)));
+        let gpu_last = gpu_totals.last().copied().unwrap_or(-1.0) as f32;
+        self.gpu_frames.extend(gpu_totals);
+        if let (Some(last), Some(m)) = (self.last, self.measuring) {
+            let rebuild = frame_sections.iter().filter(|e| e.0 == "render_static_rebuild").map(|e| e.1).sum::<f64>() as f32;
+            self.timeline.push([m.elapsed().as_secs_f32(), now.duration_since(last).as_secs_f32() * 1000.0, work_ms, rebuild, gpu_last]);
+        }
         if let Some(last) = self.last {
             let ms = now.duration_since(last).as_secs_f32() * 1000.0;
             self.intervals.push(ms);
             self.work.push(work_ms);
             // Time between frames outside the frame's own work (present, GPU waits).
             frame_sections.push(("between_frames", (ms - work_ms).max(0.0) as f64, 1));
+            let i = instructions();
+            let mi = i.saturating_sub(self.instr_last) as f64 / 1e6;
+            self.instr_last = i;
+            let mut keep: Vec<(&'static str, f64)> =
+                frame_sections.iter().filter(|e| e.1 > 0.0).map(|(n, t, _)| (*n, *t)).collect();
+            keep.sort_by(|a, b| b.1.total_cmp(&a.1));
+            keep.truncate(8);
+            self.per_frame.push((mi, ms, keep));
             for (n, t, c) in &frame_sections {
                 match self.totals.iter_mut().find(|e| e.0 == *n) {
                     Some(e) => {
@@ -482,7 +585,7 @@ impl Bench {
             }
         }
         self.last = Some(now);
-        if now.duration_since(self.measuring.unwrap()).as_secs_f32() >= self.seconds {
+        if clock.duration_since(self.measuring.unwrap()).as_secs_f32() >= self.seconds {
             self.done = true;
             self.cpu_ms = thread_cpu_ms() - self.cpu0;
             LUA_ON.with(|c| c.set(false));
@@ -493,7 +596,44 @@ impl Bench {
         self.done
     }
 
+    /// Every measured frame: [M instructions, ms, {top sections}].
+    pub fn frames_json(&self) -> serde_json::Value {
+        self.per_frame
+            .iter()
+            .map(|(mi, ms, secs)| {
+                let m: serde_json::Map<String, serde_json::Value> =
+                    secs.iter().map(|(n, t)| (n.to_string(), serde_json::json!((t * 100.0).round() / 100.0))).collect();
+                serde_json::json!([(mi * 100.0).round() / 100.0, (*ms * 100.0).round() / 100.0, m])
+            })
+            .collect()
+    }
+
     pub fn report(&self) -> serde_json::Value {
+        let mut report = self.report_base();
+        if let Some(p) = std::env::var_os("RUSTUDIO_BENCH_TIMELINE") {
+            let _ = std::fs::write(p, serde_json::to_string(&self.timeline).unwrap_or_default());
+        }
+        // Frame interval and work quantiles (ms), and RUSTUDIO_GPU_TIMING's
+        // GPU ms per frame over the timed encoders (per-pass figures are the
+        // "gpu: …" sections).
+        let q = |v: &[f64]| {
+            let mut v = v.to_vec();
+            v.sort_by(|a, b| a.total_cmp(b));
+            let at = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+            serde_json::json!({"median": at(0.5), "p90": at(0.9), "p99": at(0.99), "max": at(1.0), "n": v.len()})
+        };
+        if !self.intervals.is_empty() {
+            report["frame_ms"] = q(&self.intervals.iter().map(|v| *v as f64).collect::<Vec<_>>());
+            report["work_ms"] = q(&self.work.iter().map(|v| *v as f64).collect::<Vec<_>>());
+        }
+        if !self.gpu_frames.is_empty() {
+            report["gpu_frame_ms"] = q(&self.gpu_frames);
+            report["gpu_frame_ms"]["note"] = "sum of timed GPU spans (3D view, its extra submits, offscreen egui); not the windowed egui pass or present".into();
+        }
+        report
+    }
+
+    fn report_base(&self) -> serde_json::Value {
         let stats = |v: &[f32]| {
             if v.is_empty() {
                 return (0.0, 0.0);
@@ -515,7 +655,7 @@ impl Bench {
                 .map(|(n, ms, c)| serde_json::json!({"name": n, "ms_per_frame": ms / frames, "calls": c}))
                 .collect()
         };
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "label": self.label,
             "mode": if self.play { "play" } else { "edit" },
             "frames": self.intervals.len(),
@@ -554,6 +694,24 @@ impl Bench {
                     format!("{ms:.1} ms: {}", parts.join(", "))
                 })
                 .collect::<Vec<_>>(),
-        })
+        });
+        // Main-thread instructions per frame (millions): a spike in these is
+        // real work, not the machine's load. Median, p99, max, and the
+        // largest multiple of the median (a periodic stall shows here).
+        let mut mi: Vec<f64> = self.per_frame.iter().map(|f| f.0).collect();
+        if !mi.is_empty() && mi.iter().any(|v| *v > 0.0) {
+            mi.sort_by(|a, b| a.total_cmp(b));
+            let q = |p: f64| mi[((mi.len() - 1) as f64 * p).round() as usize];
+            let med = q(0.5);
+            report["frame_minstr"] = serde_json::json!({
+                "median": med, "p99": q(0.99), "max": q(1.0),
+                "max_over_median": if med > 0.0 { q(1.0) / med } else { 0.0 },
+            });
+        }
+        // Off Linux, what RUSTUDIO_BENCH_INSTR's section figures are.
+        if let Some(note) = instr_note() {
+            report["work_unit"] = note.into();
+        }
+        report
     }
 }

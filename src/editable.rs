@@ -852,19 +852,29 @@ fn mesh_from_uri(uri: &str) -> mlua::Result<Mesh> {
         .map(Ok)
         .unwrap_or_else(|| crate::assets::script_content_blocking(uri))
         .map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
+    if let Some(st) = crate::mesh::stored(&bytes) {
+        return Ok(Mesh::from_stored(&st));
+    }
     let d = crate::mesh::parse(&bytes).map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
     Ok(Mesh::from_mesh_data(&d))
 }
 
-/// The mesh registered as generated content (a new id per snapshot).
+/// The mesh registered as generated content: a new id when the mesh
+/// changed since its last snapshot, else that snapshot's (parts made from
+/// one unchanged mesh share one live copy).
 fn snapshot(r: Ref) -> Option<(String, Vec3, Vec3)> {
     let (bytes, lo, hi, id) = with(|s| {
         let mut m = lock(s.meshes.get(&r)?);
+        if let Some((id, lo, hi)) = live_reuse(r, &m) {
+            return Some((None, lo, hi, id));
+        }
         m.gen += 1;
         let (b, lo, hi) = m.to_mesh_bytes();
-        Some((b, lo, hi, format!("{MESH_PREFIX}mesh/{}@{}", m.n, m.gen)))
+        Some((Some(b), lo, hi, format!("{MESH_PREFIX}mesh/{}@{}", m.n, m.gen)))
     })?;
-    crate::assets::register_generated(&id, bytes);
+    if let Some(bytes) = bytes {
+        crate::assets::register_generated(&id, bytes);
+    }
     Some((id, lo, hi))
 }
 
@@ -879,15 +889,539 @@ pub fn mesh_part_source(c: &Content) -> Option<mlua::Result<(String, Vec3)>> {
     if hi.cmplt(lo).any() || lo == hi && lo == Vec3::ZERO && hi == Vec3::ZERO {
         return Some(Err(rt_err("CreateMeshPartAsync: the EditableMesh has no faces")));
     }
+    register_live(r, &id, lo, hi);
     Some(Ok((id, (hi - lo).max(Vec3::splat(0.001)))))
+}
+
+/// MeshParts made from an EditableMesh (CreateMeshPartAsync): part →
+/// (mesh, generated id). Keyed by part so a MeshContent read is one
+/// lookup; a part leaves it when destroyed (`forget_parts`).
+static LINKS: Mutex<Option<HashMap<Ref, (Ref, String)>>> = Mutex::new(None);
+
+/// Remembers that `part` shows the EditableMesh behind `c` through the
+/// generated mesh `id` (its CreateMeshPartAsync snapshot), which from now
+/// on follows the mesh's edits (`sync_live`).
+pub fn link(c: &Content, part: Ref, id: &str) {
+    let Some(em) = c.as_object() else { return };
+    LINKS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(part, (em, id.to_string()));
+}
+
+/// ApplyMesh: `to` now shows what `from` shows.
+pub fn link_like(from: Ref, to: Ref) {
+    let mut g = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = g.as_mut() else { return };
+    match map.get(&from).cloned() {
+        Some(l) => map.insert(to, l),
+        None => map.remove(&to),
+    };
+}
+
+/// Destroyed parts (and their descendants) leave the link table.
+pub fn forget_parts(parts: impl IntoIterator<Item = Ref>) {
+    let mut g = LINKS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = g.as_mut().filter(|m| !m.is_empty()) else { return };
+    for p in parts {
+        map.remove(&p);
+    }
+}
+
+/// Number of linked parts (checks).
+pub fn link_count() -> usize {
+    LINKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |m| m.len())
+}
+
+/// The EditableMesh a part made by CreateMeshPartAsync(Content.fromObject)
+/// was made from: Studio's MeshPart.MeshContent reads Content.fromObject(that
+/// mesh), even after the mesh is destroyed, and its MeshId "" (AUDIT.md (f);
+/// they read Content.none and the generated id here).
+pub fn linked_mesh(part: Ref) -> Option<Ref> {
+    LINKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&part).map(|l| l.0)
+}
+
+/// Parts drawn with another mesh than their own (a WrapDeformer's result):
+/// part → generated mesh id. Scripts still read the part's MeshId.
+static SHOWN: Mutex<Option<HashMap<Ref, String>>> = Mutex::new(None);
+
+/// The mesh a part is drawn with instead of its own, if any.
+pub fn shown_mesh(part: Ref) -> Option<String> {
+    SHOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&part).cloned()
+}
+
+/// Draws `part` with a snapshot of the EditableMesh `em` (mesh space,
+/// padded about `centre`, the part's own mesh's bounds centre, so it keeps
+/// the part's frame), or with its own mesh again (`em` None).
+pub fn show_mesh(lua: &Lua, part: Ref, em: Option<Ref>, centre: Vec3) -> mlua::Result<()> {
+    let id = match em {
+        Some(em) => {
+            let Some((bytes, id)) = with(|s| {
+                let mut m = lock(s.meshes.get(&em)?);
+                m.gen += 1;
+                let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
+                Some((b, format!("{MESH_PREFIX}shown/{}@{}", m.n, m.gen)))
+            }) else {
+                return Ok(());
+            };
+            crate::assets::register_generated(&id, bytes);
+            Some(id)
+        }
+        None => None,
+    };
+    {
+        let mut g = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(HashMap::new);
+        match id {
+            Some(id) => map.insert(part, id),
+            None => map.remove(&part),
+        };
+    }
+    let mut w = world(lua)?;
+    w.dm().mark_prop(part, rbx_dom_weak::ustr("MeshId"));
+    Ok(())
+}
+
+/// Whether the EditableMesh behind `c` has bones (its part is skinned).
+pub fn content_skinned(c: &Content) -> bool {
+    c.as_object().and_then(|r| with(|s| s.meshes.get(&r).map(|m| lock(m).skinned()))).unwrap_or(false)
+}
+
+fn mutates(name: &str) -> bool {
+    ["Add", "Set", "Remove", "BatchAdd", "BatchSet", "BatchRemove", "Merge", "Triangulate", "Clear", "Reset"]
+        .iter()
+        .any(|p| name.starts_with(p))
+}
+
+// ------------------------------------------------------------------ live meshes
+//
+// Studio's MeshPart from CreateMeshPartAsync(Content.fromObject(em)) keeps
+// drawing the EditableMesh: edits made after it (server or client, any
+// Set* / Add* / Remove*) show from the next frame (AUDIT.md (f)). Here the
+// snapshot's generated id stays the part's mesh and follows the mesh:
+// - each mutating call records what it changed in the mesh's journal
+//   (`em::note_edit`) and marks the mesh in CHANGED;
+// - once a frame the renderer (`sync_live`, viewport.rs) takes the changed
+//   meshes' journals: value edits (SetPosition, SetNormal, SetUV, SetColor,
+//   BatchSetValues) rewrite only the corners that use those ids (and the
+//   automatic normals of the triangles around moved vertices) in the GPU
+//   buffer in place; layout edits (faces, ids per corner, bones) rebuild the
+//   copy. Skinned meshes re-snapshot their bytes under the same id and
+//   their parts are redrawn (the skin path deforms from the bytes).
+// The copy is normalised by the bounds at CreateMeshPartAsync, so a vertex
+// moved past them draws there and the others don't shift (Studio).
+
+/// One generated mesh id that follows an EditableMesh.
+struct Live {
+    em: Ref,
+    /// The snapshot's bounds: the copy's normalisation (fixed).
+    lo: Vec3,
+    hi: Vec3,
+    /// Mesh edit count when the snapshot was made (`live_reuse`).
+    edits_at: u64,
+    skinned: bool,
+    /// The renderer's copy (non-skinned), None until loaded / after a
+    /// layout change.
+    copy: Option<Copy>,
+    /// Parts the renderer draws with this id (redrawn on a rebuild).
+    users: HashSet<Ref>,
+}
+
+/// The renderer's copy of a live mesh: per corner the ids behind it, ids →
+/// corners, and the vertices as uploaded.
+struct Copy {
+    ids: Vec<[u64; 4]>,
+    by_vertex: HashMap<u64, Vec<u32>>,
+    by_normal: HashMap<u64, Vec<u32>>,
+    by_uv: HashMap<u64, Vec<u32>>,
+    by_color: HashMap<u64, Vec<u32>>,
+    /// Vertex colours drawn (not all white when built).
+    tint: bool,
+    /// Faces of more than 3 vertices: automatic normals by face.
+    polys: bool,
+    verts: Vec<crate::render::Vertex>,
+}
+
+#[derive(Default)]
+struct LiveSet {
+    by_id: HashMap<String, Live>,
+    of_em: HashMap<Ref, Vec<String>>,
+    /// Meshes with journal entries since the last `sync_live`.
+    changed: HashSet<Ref>,
+    /// Edit counter per mesh (bumped by every drawn change).
+    edits: HashMap<Ref, u64>,
+    /// Destroyed meshes with edits the renderer hasn't taken yet: their
+    /// parts keep drawing the last state (Studio).
+    dying: HashMap<Ref, SharedMesh>,
+    /// Ids no drawn part uses any more: their copies are dropped (the
+    /// renderer forgets them too), so later edits don't patch them.
+    released: Vec<String>,
+    /// Part → the live id it is drawn with.
+    user_of: HashMap<Ref, String>,
+}
+
+static LIVE: Mutex<Option<LiveSet>> = Mutex::new(None);
+
+fn live<R>(f: impl FnOnce(&mut LiveSet) -> R) -> R {
+    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(LiveSet::default))
+}
+
+/// An earlier snapshot id of `em` still equal to the mesh (no drawn edit
+/// since): (id, lo, hi).
+fn live_reuse(em: Ref, m: &Mesh) -> Option<(String, Vec3, Vec3)> {
+    if !m.live || !m.journal.is_empty() {
+        return None;
+    }
+    live(|l| {
+        let now = l.edits.get(&em).copied().unwrap_or(0);
+        let id = l.of_em.get(&em)?.iter().rev().find(|id| l.by_id.get(*id).is_some_and(|x| x.edits_at == now))?;
+        let x = &l.by_id[id];
+        Some((id.clone(), x.lo, x.hi))
+    })
+}
+
+/// Makes generated mesh `id` (just snapshotted from `em`, bounds lo..hi)
+/// follow the mesh.
+fn register_live(em: Ref, id: &str, lo: Vec3, hi: Vec3) {
+    let skinned = with(|s| {
+        let m = s.meshes.get(&em)?;
+        let mut m = lock(m);
+        m.live = true;
+        Some(m.skinned())
+    });
+    let Some(skinned) = skinned else { return };
+    live(|l| {
+        if l.by_id.contains_key(id) {
+            return;
+        }
+        let edits_at = l.edits.get(&em).copied().unwrap_or(0);
+        l.by_id.insert(id.to_string(), Live { em, lo, hi, edits_at, skinned, copy: None, users: HashSet::new() });
+        l.of_em.entry(em).or_default().push(id.to_string());
+    });
+}
+
+/// Whether `id` is a live EditableMesh copy the renderer builds itself
+/// (`live_build`) rather than from its bytes.
+pub fn is_live(id: &str) -> bool {
+    id.starts_with(MESH_PREFIX) && live(|l| l.by_id.get(id).is_some_and(|x| !x.skinned))
+}
+
+/// The renderer draws `part` with mesh `id`.
+pub fn live_user(id: &str, part: Ref) {
+    if !id.starts_with(MESH_PREFIX) {
+        return;
+    }
+    live(|l| {
+        if let Some(x) = l.by_id.get_mut(id) {
+            if x.users.insert(part) {
+                l.user_of.insert(part, id.to_string());
+            }
+        }
+    });
+}
+
+/// The renderer stopped drawing these parts.
+pub fn live_users_gone(parts: &[Ref]) {
+    if parts.is_empty() {
+        return;
+    }
+    live(|l| {
+        if l.user_of.is_empty() {
+            return;
+        }
+        for p in parts {
+            let Some(id) = l.user_of.remove(p) else { continue };
+            let Some(x) = l.by_id.get_mut(&id) else { continue };
+            x.users.remove(p);
+            if x.users.is_empty() {
+                x.copy = None;
+                l.released.push(id);
+            }
+        }
+    });
+}
+
+/// (live ids, ids with users, total users, changed meshes): checks.
+pub fn live_stats() -> (usize, usize, usize, usize) {
+    live(|l| {
+        let used = l.by_id.values().filter(|x| !x.users.is_empty()).count();
+        let users = l.by_id.values().map(|x| x.users.len()).sum();
+        (l.by_id.len(), used, users, l.changed.len())
+    })
+}
+
+fn quant(x: f32) -> f32 {
+    (x.clamp(0.0, 1.0) * 255.0).round() / 255.0
+}
+
+/// One corner as the GPU holds a loaded 2.00 mesh (assets.rs
+/// `load_mesh_projected` of `to_mesh_bytes`): position in the unit box,
+/// unit normal (the triangle's when none) × extent, UV, colour bytes.
+fn gpu_vertex(
+    p: Vec3, n: Option<Vec3>, flat: Vec3, uv: Vec2, c: ([f32; 3], f32), tint: bool, centre: Vec3, extent: Vec3,
+) -> crate::render::Vertex {
+    let face = flat.try_normalize().unwrap_or(Vec3::Y);
+    let n = n.filter(|n| n.length_squared() > 1e-12).and_then(Vec3::try_normalize).unwrap_or(face);
+    let color = if tint { [quant(c.0[0]), quant(c.0[1]), quant(c.0[2]), -1.0 - quant(c.1)] } else { [0.0; 4] };
+    crate::render::Vertex {
+        pos: ((p - centre) / extent).to_array(),
+        normal: (n * extent).to_array(),
+        uv: uv.to_array(),
+        projection: extent.extend(0.0).to_array(),
+        color,
+    }
+}
+
+fn white(c: ([f32; 3], f32)) -> bool {
+    c.0.iter().chain(std::iter::once(&c.1)).all(|x| quant(*x) >= 1.0)
+}
+
+fn norm_box(lo: Vec3, hi: Vec3) -> (Vec3, Vec3) {
+    ((lo + hi) * 0.5, (hi - lo).max(Vec3::splat(1e-4)))
+}
+
+fn build_copy(m: &Mesh, lo: Vec3, hi: Vec3) -> Copy {
+    let corners = m.corners();
+    let ids = m.corner_ids();
+    let (centre, extent) = norm_box(lo, hi);
+    let tint = corners.iter().any(|k| k.3.iter().any(|x| quant(*x) < 1.0));
+    let mut by_vertex: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut by_normal: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut by_uv: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut by_color: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut verts = Vec::with_capacity(corners.len());
+    for (i, (k, id)) in corners.iter().zip(&ids).enumerate() {
+        let t = i / 3 * 3;
+        let flat = (corners[t + 1].0 - corners[t].0).cross(corners[t + 2].0 - corners[t].0);
+        verts.push(gpu_vertex(k.0, Some(k.1), flat, k.2, ([k.3[0], k.3[1], k.3[2]], k.3[3]), tint, centre, extent));
+        let c = i as u32;
+        by_vertex.entry(id[0]).or_default().push(c);
+        by_normal.entry(id[1]).or_default().push(c);
+        by_uv.entry(id[2]).or_default().push(c);
+        by_color.entry(id[3]).or_default().push(c);
+    }
+    let polys = m.faces.iter().any(|(_, f)| f.v.len() > 3);
+    Copy { ids, by_vertex, by_normal, by_uv, by_color, tint, polys, verts }
+}
+
+/// The renderer's first copy of live mesh `id`: (vertices, extent).
+pub fn live_build(id: &str) -> Option<(Vec<crate::render::Vertex>, Vec3)> {
+    let (em, lo, hi) = live(|l| l.by_id.get(id).map(|x| (x.em, x.lo, x.hi)))?;
+    let m = with(|s| s.meshes.get(&em).cloned());
+    let Some(m) = m else {
+        // The mesh is gone: its last state is in the bytes (`drop_live`).
+        return None;
+    };
+    let copy = build_copy(&lock(&m), lo, hi);
+    let verts = copy.verts.clone();
+    live(|l| {
+        if let Some(x) = l.by_id.get_mut(id) {
+            x.copy = Some(copy);
+        }
+    });
+    Some((verts, norm_box(lo, hi).1))
+}
+
+/// What the renderer does with a live id this frame.
+pub enum LivePatch {
+    /// Write these runs of vertices (first corner, vertices) in place.
+    Ranges(Vec<(u32, Vec<crate::render::Vertex>)>),
+    /// Build it again (`live_build`, or its re-registered bytes when
+    /// skinned) and redraw these parts.
+    Rebuild { users: Vec<Ref>, skinned: bool },
+}
+
+/// The corners of `copy` to rewrite for journal `j`, with the automatic
+/// normals they need recomputed. None: rebuild.
+fn patch_copy(m: &Mesh, copy: &mut Copy, j: &em::Journal, lo: Vec3, hi: Vec3) -> Option<Vec<(u32, u32)>> {
+    let mut corners: Vec<u32> = Vec::new();
+    let mut autos: HashSet<u64> = HashSet::new();
+    let tri_of = |c: u32| c / 3 * 3;
+    for v in &j.verts {
+        let Some(cs) = copy.by_vertex.get(v) else { continue };
+        for &c in cs {
+            let t = tri_of(c);
+            for k in t..t + 3 {
+                corners.push(k);
+                let n = copy.ids[k as usize][1];
+                if m.normal_is_auto(n) {
+                    autos.insert(n);
+                }
+            }
+        }
+    }
+    for n in &j.normals {
+        if let Some(cs) = copy.by_normal.get(n) {
+            corners.extend(cs);
+            if m.normal_is_auto(*n) {
+                autos.insert(*n);
+            }
+        }
+    }
+    for u in &j.uvs {
+        corners.extend(copy.by_uv.get(u).into_iter().flatten());
+    }
+    for c in &j.colors {
+        if let Some(cs) = copy.by_color.get(c) {
+            if !copy.tint && m.color(*c).is_some_and(|c| !white(c)) {
+                return None; // colours appear: every corner's encoding changes
+            }
+            corners.extend(cs);
+        }
+    }
+    if corners.is_empty() {
+        return Some(Vec::new());
+    }
+    // Automatic normals around what moved, from the triangles that use them.
+    let mut normal: HashMap<u64, Vec3> = HashMap::with_capacity(autos.len());
+    for n in autos {
+        let v = if copy.polys {
+            m.normal_value(n).unwrap_or(Vec3::ZERO)
+        } else {
+            let mut s = Vec3::ZERO;
+            for &c in copy.by_normal.get(&n).into_iter().flatten() {
+                let t = tri_of(c) as usize;
+                let p = [0, 1, 2].map(|k| m.pos(copy.ids[t + k][0]).unwrap_or(Vec3::ZERO));
+                let i = c as usize - t;
+                let fnm = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                s += fnm * em::corner_weight(p[i], p[(i + 1) % 3], p[(i + 2) % 3]);
+            }
+            s.normalize_or_zero()
+        };
+        normal.insert(n, v);
+    }
+    let (centre, extent) = norm_box(lo, hi);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    corners.sort_unstable();
+    corners.dedup();
+    for c in corners {
+        let id = copy.ids[c as usize];
+        let t = tri_of(c) as usize;
+        let p = [0, 1, 2].map(|k| m.pos(copy.ids[t + k][0]).unwrap_or(Vec3::ZERO));
+        let flat = (p[1] - p[0]).cross(p[2] - p[0]);
+        let n = normal.get(&id[1]).copied().or_else(|| m.normal_set(id[1]));
+        let uv = m.uv(id[2]).unwrap_or(Vec2::ZERO);
+        let col = m.color(id[3]).unwrap_or(([1.0; 3], 1.0));
+        let pos = m.pos(id[0]).unwrap_or(Vec3::ZERO);
+        let flat_n = if n.is_some_and(|n| n.length_squared() > 1e-12) { flat } else { flat.normalize_or_zero() };
+        copy.verts[c as usize] = gpu_vertex(pos, n, flat_n, uv, col, copy.tint, centre, extent);
+        // Runs of corners, joined over short gaps (one write each).
+        match runs.last_mut() {
+            Some(r) if c <= r.1 + 8 => r.1 = c,
+            _ => runs.push((c, c)),
+        }
+    }
+    Some(runs)
+}
+
+/// Once a frame, from the renderer: the live ids whose meshes changed and
+/// what to do with each (only ids of meshes edited since the last call are
+/// looked at).
+pub fn sync_live() -> Vec<(String, LivePatch)> {
+    let (changed, dying, released): (Vec<Ref>, HashMap<Ref, SharedMesh>, Vec<String>) =
+        live(|l| (l.changed.drain().collect(), std::mem::take(&mut l.dying), std::mem::take(&mut l.released)));
+    let mut out: Vec<(String, LivePatch)> =
+        released.into_iter().map(|id| (id, LivePatch::Rebuild { users: Vec::new(), skinned: false })).collect();
+    for em in changed {
+        let Some(m) = with(|s| s.meshes.get(&em).cloned()).or_else(|| dying.get(&em).cloned()) else { continue };
+        let mut g = lock(&m);
+        let j = std::mem::take(&mut g.journal);
+        if j.is_empty() {
+            continue;
+        }
+        let m: &Mesh = &g;
+        let mut resnap: Vec<(String, Vec3)> = Vec::new();
+        live(|l| {
+            *l.edits.entry(em).or_default() += 1;
+            let ids = l.of_em.get(&em).cloned().unwrap_or_default();
+            for id in ids {
+                let Some(x) = l.by_id.get_mut(&id) else { continue };
+                if x.skinned != m.skinned() || x.skinned {
+                    // Skinned (or became / stopped being): bytes again.
+                    x.skinned = m.skinned();
+                    x.copy = None;
+                    resnap.push((id.clone(), (x.lo + x.hi) * 0.5));
+                    out.push((id, LivePatch::Rebuild { users: x.users.iter().copied().collect(), skinned: true }));
+                    continue;
+                }
+                let Some(copy) = x.copy.as_mut() else { continue }; // not loaded: built when it is
+                let res = if j.layout { None } else { patch_copy(m, copy, &j, x.lo, x.hi) };
+                match res {
+                    Some(runs) if runs.is_empty() => {}
+                    Some(runs) => out.push((
+                        id,
+                        LivePatch::Ranges(
+                            runs.into_iter().map(|(a, b)| (a, copy.verts[a as usize..=b as usize].to_vec())).collect(),
+                        ),
+                    )),
+                    None => {
+                        x.copy = None;
+                        out.push((id, LivePatch::Rebuild { users: x.users.iter().copied().collect(), skinned: false }));
+                    }
+                }
+            }
+        });
+        for (id, centre) in resnap {
+            let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
+            crate::assets::register_generated(&id, b);
+        }
+    }
+    for (em, m) in dying {
+        drop_live(em, &lock(&m));
+    }
+    out
+}
+
+/// A destroyed EditableMesh: its parts keep drawing its last state
+/// (Studio), so each live id's bytes are brought up to date and the live
+/// bookkeeping goes.
+fn drop_live(em: Ref, m: &Mesh) {
+    let ids = live(|l| {
+        let now = l.edits.remove(&em).unwrap_or(0);
+        let ids = l.of_em.remove(&em).unwrap_or_default();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(x) = l.by_id.remove(&id) {
+                for u in &x.users {
+                    l.user_of.remove(u);
+                }
+                if x.edits_at != now || !m.journal.is_empty() {
+                    out.push((id, (x.lo + x.hi) * 0.5));
+                }
+            }
+        }
+        out
+    });
+    for (id, centre) in ids {
+        let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
+        crate::assets::register_generated(&id, b);
+    }
 }
 
 fn mesh_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
     if name == "Destroy" {
-        with(|s| s.meshes.remove(&this));
+        if let Some(m) = with(|s| s.meshes.remove(&this)) {
+            let g = lock(&m);
+            if g.live {
+                if g.journal.is_empty() {
+                    drop_live(this, &g);
+                } else {
+                    // The renderer takes the last edits first (`sync_live`).
+                    drop(g);
+                    live(|l| l.dying.insert(this, m.clone()));
+                }
+            }
+        }
         return none();
     }
     let m = with(|s| s.meshes.get(&this).cloned()).ok_or_else(|| rt_err("the EditableMesh was destroyed"))?;
     let mut g = lock(&m);
-    Ok(em::call(lua, &mut g, name, args)?.unwrap_or_default())
+    let r = em::call(lua, &mut g, name, args)?.unwrap_or_default();
+    if g.live && mutates(name) {
+        em::note_edit(&mut g, name, args);
+        if !g.journal.is_empty() {
+            drop(g);
+            live(|l| l.changed.insert(this));
+        }
+    }
+    Ok(r)
 }
+

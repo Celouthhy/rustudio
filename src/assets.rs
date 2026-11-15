@@ -91,24 +91,29 @@ pub fn cache_dir() -> PathBuf {
     crate::paths::cache().join("rustudio")
 }
 
-/// A local asset store: `<id>` or `<id>.<ext>` files, e.g. the one the
-/// offline Studio serves (~/.local/share/rustudio/assets). Read only.
+/// An optional local asset store: a folder of `<id>` or `<id>.<ext>` files,
+/// named by `RUSTUDIO_LOCAL_ASSETS`. Off unless that is set. Read only.
 pub fn local_assets_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RUSTUDIO_LOCAL_ASSETS") {
-        return (!p.is_empty()).then(|| PathBuf::from(p));
-    }
-    let p = crate::paths::data().join("rustudio/assets");
-    p.is_dir().then_some(p)
+    // (or the rustudio option: src/rustudio_settings.rs)
+    crate::rustudio_settings::local_assets()
 }
 
 fn local_asset(id: u64) -> Option<Vec<u8>> {
     local_asset_path(id).and_then(|p| std::fs::read(p).ok())
 }
 
-/// The file behind an asset id on this machine, looked up the way an offline Studio
-/// does: its asset folder, then the rbxasset upload ledger
+/// The file behind an asset id on this machine: the local store
+/// (`RUSTUDIO_LOCAL_ASSETS`, if set), then the rbxasset upload ledger
 /// (~/.local/share/rbxasset/ledger.json: your uploads → their original files).
 pub fn local_asset_path(id: u64) -> Option<PathBuf> {
+    local_store_path(id).or_else(|| ledger_path(id))
+}
+
+/// The local store's entry for `id` (`local_assets_dir`). Used for images only
+/// when Roblox's copy can't be had (`fetch_cached`): such a folder may hold
+/// stand-ins of another size, and a smaller image drawn in place of a sprite
+/// sheet puts every ImageRect frame in the wrong cell.
+fn local_store_path(id: u64) -> Option<PathBuf> {
     if let Some(dir) = local_assets_dir() {
         for ext in [
             "",
@@ -132,7 +137,7 @@ pub fn local_asset_path(id: u64) -> Option<PathBuf> {
             }
         }
     }
-    ledger_path(id)
+    None
 }
 
 /// An upload's source file on this machine: rbxasset's upload ledger
@@ -264,22 +269,27 @@ pub fn asset_ref(content: &str) -> Option<AssetRef> {
 /// (content/ or PlatformContent/pc) still wins.
 fn legacy_content(rest: &str) -> Option<u64> {
     static TABLE: std::sync::OnceLock<HashMap<String, u64>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let content = content_dir();
-        let platform = content
-            .canonicalize()
-            .ok()
-            .and_then(|c| c.parent().map(|p| p.join("PlatformContent/pc")));
-        include_str!("../assets/legacy-content.tsv")
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| l.split_once('\t'))
-            .filter(|(p, _)| {
-                !content.join(p).is_file() && !platform.as_ref().is_some_and(|d| d.join(p).is_file())
-            })
-            .filter_map(|(p, id)| Some((p.to_ascii_lowercase(), id.trim().parse().ok()?)))
-            .collect()
-    });
+    let table = TABLE.get_or_init(|| legacy_table(&content_dir()));
+    legacy_lookup(table, rest)
+}
+
+/// The legacy table less the files `content` (or its PlatformContent/pc)
+/// still has.
+fn legacy_table(content: &Path) -> HashMap<String, u64> {
+    let platform = content
+        .canonicalize()
+        .ok()
+        .and_then(|c| c.parent().map(|p| p.join("PlatformContent/pc")));
+    include_str!("../assets/legacy-content.tsv")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('\t'))
+        .filter(|(p, _)| !content.join(p).is_file() && !platform.as_ref().is_some_and(|d| d.join(p).is_file()))
+        .filter_map(|(p, id)| Some((p.to_ascii_lowercase(), id.trim().parse().ok()?)))
+        .collect()
+}
+
+fn legacy_lookup(table: &HashMap<String, u64>, rest: &str) -> Option<u64> {
     let key = rest.trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
     table.get(&key).copied()
 }
@@ -313,7 +323,7 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
             // replacement) for it; rustudio plays the classic Oof once fetched.
             if matches!(rest.to_ascii_lowercase().as_str(), "sounds/uuhhh.mp3" | "sounds/uuhhh.wav") {
                 let classic = crate::studio_content::classic_oof();
-                if classic.is_file() {
+                if classic.is_file() && crate::rustudio_settings::classic_death_sound_use() {
                     return Some(classic);
                 }
                 crate::studio_content::fetch_classic_oof_once();
@@ -371,6 +381,8 @@ pub struct AssetStore {
     /// Asked for while the session check was running, or failed before a
     /// sign-in: handed back from `poll` for the caches to retry.
     deferred: Vec<AssetRef>,
+    /// Results `wait_pending` took off the channel, for the next `poll`.
+    early: Vec<(AssetRef, Result<(), String>)>,
 }
 
 impl Default for AssetStore {
@@ -387,6 +399,7 @@ impl Default for AssetStore {
             messages: Vec::new(),
             auth_told: false,
             deferred: Vec::new(),
+            early: Vec::new(),
         }
     }
 }
@@ -463,9 +476,32 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     if let Ok(b) = std::fs::read(cache_path(a)) {
         return Ok(Arc::new(b));
     }
-    if let Some(b) = local.then(|| local_asset(id)).flatten() {
+    // The upload ledger's source files first (the person's own uploads);
+    // the local store only after Roblox's copy (see `local_store_path`).
+    if let Some(b) = local.then(|| ledger_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
         return Ok(Arc::new(b));
     }
+    let fetched = download_asset_bytes(id);
+    let b = match fetched {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(b) = local.then(|| local_store_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
+                return Ok(Arc::new(b));
+            }
+            return Err(e);
+        }
+    };
+    let path = cache_path(a);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &b);
+    Ok(Arc::new(b))
+}
+
+/// Roblox's copy of an asset: Studio's login session, else public asset
+/// delivery (waiting a little for a session check still running).
+fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
     // Prefer Studio's login session. Its downloader preserves Roblox-Place-Id,
     // which asset delivery requires for assets private to the current place.
     let client = session_client();
@@ -492,12 +528,7 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
             }
         }
     };
-    let path = cache_path(a);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&path, &b);
-    Ok(Arc::new(b))
+    Ok(b)
 }
 
 /// Any content id's bytes, blocking (background threads): generated
@@ -647,7 +678,8 @@ fn public_prefetch_inner(id: u64) -> Fetch {
     use std::sync::Mutex;
     static STATES: Mutex<Option<HashMap<u64, Option<Result<(), String>>>>> = Mutex::new(None);
     let a = AssetRef { id, version: None };
-    if cache_path(a).exists() || local_asset_path(id).is_some() {
+    // (a local store file isn't "on disk" here: Roblox's copy comes first)
+    if cache_path(a).exists() || ledger_path(id).is_some() {
         return match public_cached(id) {
             Ok(b) => Fetch::Ready(b),
             Err(e) => Fetch::Unavailable(e),
@@ -665,6 +697,20 @@ fn public_prefetch_inner(id: u64) -> Fetch {
         }
         Some(None) => return Fetch::Pending,
         None => {}
+    }
+    // --fixed-dt: fetched here and now, so a script polling for it (the
+    // animation library's task.wait loop) waits the same frames every run.
+    if crate::sim_clock::on() {
+        drop(g);
+        let r = public_cached(id);
+        content_track(&format!("rbxassetid://{id}"), if r.is_ok() { 2 } else { 3 });
+        if let Ok(mut g) = STATES.lock() {
+            g.get_or_insert_with(HashMap::new).insert(id, Some(r.as_ref().map(|_| ()).map_err(|e| e.clone())));
+        }
+        return match r {
+            Ok(b) => Fetch::Ready(b),
+            Err(e) => Fetch::Unavailable(e),
+        };
     }
     map.insert(id, None);
     std::thread::spawn(move || {
@@ -779,7 +825,9 @@ impl AssetStore {
             self.memory.insert(a, b.clone());
             return Fetch::Ready(b);
         }
-        if let Some(b) = local_asset(a.id) {
+        // The person's own upload's source file; the local store only once
+        // Roblox's copy failed (`poll`, `local_store_path`).
+        if let Some(b) = ledger_path(a.id).and_then(|p| std::fs::read(p).ok()) {
             let b = Arc::new(b);
             self.memory.insert(a, b.clone());
             return Fetch::Ready(b);
@@ -837,7 +885,9 @@ impl AssetStore {
         if !self.deferred.is_empty() && !CHECKING.load(std::sync::atomic::Ordering::SeqCst) {
             done.append(&mut self.deferred);
         }
-        while let Ok((a, r)) = self.rx.try_recv() {
+        let mut got = std::mem::take(&mut self.early);
+        got.extend(self.rx.try_iter());
+        for (a, r) in got {
             self.pending.retain(|p| *p != a);
             match r {
                 Ok(()) => {
@@ -845,6 +895,16 @@ impl AssetStore {
                     done.push(a);
                 }
                 Err(e) => {
+                    if let Some(b) = a
+                        .version
+                        .is_none()
+                        .then(|| local_store_path(a.id).and_then(|p| std::fs::read(p).ok()))
+                        .flatten()
+                    {
+                        self.memory.insert(a, Arc::new(b));
+                        done.push(a);
+                        continue;
+                    }
                     if !self.auth_told && (e.contains("Authentication required") || e.contains("not authorized")) {
                         self.auth_told = true;
                         self.messages.push(
@@ -865,6 +925,30 @@ impl AssetStore {
 
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// --fixed-dt (src/sim_clock.rs): waits until every download in flight
+    /// has finished (at most `max`), so an asset asked for in one frame is
+    /// handed out by the next `poll`, however slow the network or machine.
+    pub fn wait_pending(&mut self, max: std::time::Duration) {
+        let until = std::time::Instant::now() + max;
+        let mut left: HashSet<AssetRef> = self.pending.clone();
+        for (a, _) in &self.early {
+            left.remove(a);
+        }
+        while !left.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= until {
+                break;
+            }
+            match self.rx.recv_timeout(until - now) {
+                Ok(r) => {
+                    left.remove(&r.0);
+                    self.early.push(r);
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     /// Why a cloud asset isn't here (round 23's asset report): the
@@ -950,6 +1034,8 @@ pub type TextureUpload<'a> = dyn FnMut(&Rgba) -> u32 + 'a;
 #[derive(Default)]
 pub struct MeshCache {
     entries: HashMap<String, Option<LoadedMesh>>,
+    /// Per id: its bytes are in a Roblox mesh format (mesh::studio_format).
+    roblox_format: HashMap<String, bool>,
     /// Why an entry is None (fetch or parse error).
     reasons: HashMap<String, String>,
     /// Messages for the Output panel (one per new failure).
@@ -957,6 +1043,57 @@ pub struct MeshCache {
 }
 
 impl MeshCache {
+    /// `id`'s mesh; `colors` false: without its vertex colours when the
+    /// mesh is in a Roblox format (a SpecialMesh's, scene.rs
+    /// MeshAsset::vertex_colors: Studio drops them), cached apart. Decided
+    /// by the bytes, once per id: a local file only rustudio can read (OBJ)
+    /// keeps its colours (the exception noted at MeshAsset::vertex_colors).
+    pub fn get_colored(
+        &mut self,
+        id: &str,
+        colors: bool,
+        doc_dir: Option<&Path>,
+        store: &mut AssetStore,
+        upload: &mut MeshUpload,
+    ) -> Option<LoadedMesh> {
+        if colors {
+            return self.get(id, doc_dir, store, upload);
+        }
+        let roblox = match self.roblox_format.get(id) {
+            Some(r) => *r,
+            None => match store.content(id, doc_dir) {
+                Fetch::Ready(bytes) => {
+                    let r = crate::mesh::studio_format(&bytes);
+                    self.roblox_format.insert(id.to_string(), r);
+                    r
+                }
+                Fetch::Pending => return None,
+                // (`get` records the failure)
+                Fetch::Unavailable(_) => true,
+            },
+        };
+        if !roblox {
+            return self.get(id, doc_dir, store, upload);
+        }
+        let key = format!("{id}#novc");
+        if let Some(e) = self.entries.get(&key) {
+            return *e;
+        }
+        let mut dropped = |p: &[Vec3], n: &[Vec3], u: &[Vec2], _c: &[glam::Vec4], planes: &[glam::Vec4]| upload(p, n, u, &[], planes);
+        // (loaded apart from a MeshPart's coloured copy of the same mesh)
+        let had = self.entries.remove(id);
+        let got = self.get(id, doc_dir, store, &mut dropped);
+        let failed = self.entries.contains_key(id);
+        self.entries.remove(id);
+        if let Some(h) = had {
+            self.entries.insert(id.to_string(), h);
+        }
+        if got.is_some() || failed {
+            self.entries.insert(key, got);
+        }
+        got
+    }
+
     pub fn get(
         &mut self,
         id: &str,
@@ -1018,6 +1155,40 @@ impl MeshCache {
         loaded
     }
 
+    /// A live EditableMesh copy (runtime/editable.rs): built from the mesh
+    /// itself the first time, then patched in place by the viewport. None
+    /// when `id` isn't live (or its mesh is gone: then its bytes hold it).
+    pub fn live(&mut self, id: &str, upload: &mut dyn FnMut(&[crate::render::Vertex]) -> u32) -> Option<LoadedMesh> {
+        if !crate::runtime::editable::is_live(id) {
+            return None;
+        }
+        if let Some(Some(m)) = self.entries.get(id) {
+            return Some(*m);
+        }
+        let (verts, extent) = crate::runtime::editable::live_build(id)?;
+        if verts.is_empty() {
+            return None;
+        }
+        let m = LoadedMesh { index: upload(&verts), extent };
+        self.entries.insert(id.to_string(), Some(m));
+        Some(m)
+    }
+
+    /// Meshes asked for so far (loaded or failed).
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The loaded mesh of `id`, if any.
+    pub fn loaded(&self, id: &str) -> Option<LoadedMesh> {
+        self.entries.get(id).copied().flatten()
+    }
+
+    /// Drops `id` so it loads again.
+    pub fn forget(&mut self, id: &str) {
+        self.entries.remove(id);
+    }
+
     /// Forget entries for assets that just finished downloading.
     pub fn retry(&mut self, done: &[AssetRef]) {
         self.entries
@@ -1026,7 +1197,8 @@ impl MeshCache {
 
     /// Loaded (Ok), failed (Err with why), or never asked for (None).
     pub fn state(&self, id: &str) -> Option<Result<(), String>> {
-        match self.entries.get(id)? {
+        // (or its copy without vertex colours, `get_colored`)
+        match self.entries.get(id).or_else(|| self.entries.get(&format!("{id}#novc")))? {
             Some(_) => Some(Ok(())),
             None => Some(Err(self.reasons.get(id).cloned().unwrap_or_else(|| "failed".into()))),
         }
@@ -1036,6 +1208,29 @@ impl MeshCache {
 /// RUSTUDIO_SYNC_DECODE=1 decodes every texture in the frame that asks.
 /// Texture upload time per frame before further uploads wait a frame.
 const UPLOAD_BUDGET_MS: f32 = 6.0;
+
+/// Texture bytes (level 0 and mip chain) uploaded per frame before further
+/// uploads wait a frame. With the mip chains made on the decode workers an
+/// upload is only a copy, so the time budget alone let a map load push
+/// hundreds of MB through the upload staging memory in a few frames.
+/// RUSTUDIO_UPLOAD_BUDGET_MB overrides it (0: no byte budget).
+const UPLOAD_BUDGET_BYTES: usize = 16 << 20;
+
+fn upload_budget_bytes() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| parse_upload_budget(std::env::var("RUSTUDIO_UPLOAD_BUDGET_MB").ok().as_deref()))
+}
+
+/// At least 1 byte: a budget of 0 would hold every texture back for good
+/// (the first upload of a frame starts at 0 bytes), e.g. "1e-9" or "nan".
+fn parse_upload_budget(v: Option<&str>) -> usize {
+    match v.and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(mb) if mb.is_nan() => UPLOAD_BUDGET_BYTES,
+        Some(mb) if mb <= 0.0 => usize::MAX,
+        Some(mb) => ((mb * 1048576.0) as usize).max(1),
+        None => UPLOAD_BUDGET_BYTES,
+    }
+}
 
 fn sync_decode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1059,14 +1254,15 @@ pub struct TextureCache {
     pub messages: Vec<String>,
     /// Decodes running on worker threads, and finished ones not yet uploaded.
     decoding: std::collections::HashSet<String>,
-    decoded: HashMap<String, Result<Rgba, String>>,
+    decoded: HashMap<String, texture::Decoded>,
     /// Upload time spent this frame (mip chain + GPU copy), and whether a
     /// decoded texture was held back for the next frame by that budget.
     upload_ms: f32,
+    upload_bytes: usize,
     deferred: bool,
     decode_chan: Option<(
-        std::sync::mpsc::Sender<(String, Result<Rgba, String>)>,
-        std::sync::mpsc::Receiver<(String, Result<Rgba, String>)>,
+        std::sync::mpsc::Sender<(String, texture::Decoded)>,
+        std::sync::mpsc::Receiver<(String, texture::Decoded)>,
     )>,
     /// EditableImage textures and composites made from them, by key without
     /// generations (runtime/editable.rs): the generation they hold. A newer
@@ -1076,6 +1272,11 @@ pub struct TextureCache {
 }
 
 impl TextureCache {
+    /// (decoding or waiting to upload, asked for so far).
+    pub fn counts(&self) -> (usize, usize) {
+        (self.decoding.len() + self.decoded.len(), self.entries.len())
+    }
+
     /// An EditableImage's pixels (`rbxtemp://rustudio/editable/img/<n>@<gen>`),
     /// re-uploaded in place when they changed.
     fn editable_image(&mut self, id: &str, upload: &mut TextureUpload) -> Option<LoadedTexture> {
@@ -1133,7 +1334,7 @@ impl TextureCache {
                 }
                 // Small images decode here; bigger ones on the decode
                 // workers (the part waits and is redone on arrival).
-                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes)),
+                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None))),
                 Fetch::Ready(bytes) => {
                     let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
                     texture::decode_async(bytes, tx.clone(), id.to_string());
@@ -1142,7 +1343,10 @@ impl TextureCache {
                 }
             },
         };
-        if decoded.is_some() && self.upload_ms > UPLOAD_BUDGET_MS && !sync_decode() {
+        if decoded.is_some()
+            && (self.upload_ms > UPLOAD_BUDGET_MS || self.upload_bytes >= upload_budget_bytes())
+            && !sync_decode()
+        {
             // Over this frame's budget: upload it next frame.
             if let Some(d) = decoded {
                 self.decoded.insert(id.to_string(), d);
@@ -1153,9 +1357,11 @@ impl TextureCache {
         let loaded = match decoded {
             None => None,
             Some(result) => match result {
-                Ok(img) => {
+                Ok((img, mips)) => {
                     let t0 = std::time::Instant::now();
-                    let index = upload(&img);
+                    // (the chain holds level 0 too; made in add_texture otherwise)
+                    self.upload_bytes += mips.as_ref().map_or(img.pixels.len() * 4 / 3, |m| m.len());
+                    let index = crate::render::with_mips(&img.pixels, mips, || upload(&img));
                     self.upload_ms += t0.elapsed().as_secs_f32() * 1000.0;
                     Some(LoadedTexture {
                         index,
@@ -1177,6 +1383,7 @@ impl TextureCache {
     /// caller bumps its asset generation so waiting parts are redone).
     pub fn poll_decoded(&mut self) -> bool {
         self.upload_ms = 0.0;
+        self.upload_bytes = 0;
         let mut any = std::mem::take(&mut self.deferred);
         let Some((_, rx)) = &self.decode_chan else { return any };
         while let Ok((id, r)) = rx.try_recv() {
@@ -1798,6 +2005,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upload_budget_parse() {
+        assert_eq!(parse_upload_budget(None), UPLOAD_BUDGET_BYTES);
+        assert_eq!(parse_upload_budget(Some("x")), UPLOAD_BUDGET_BYTES);
+        assert_eq!(parse_upload_budget(Some("nan")), UPLOAD_BUDGET_BYTES);
+        assert_eq!(parse_upload_budget(Some("0")), usize::MAX);
+        assert_eq!(parse_upload_budget(Some("-3")), usize::MAX);
+        assert_eq!(parse_upload_budget(Some(" 2 ")), 2 << 20);
+        assert_eq!(parse_upload_budget(Some("1e-9")), 1);
+    }
+
+    #[test]
     fn asset_id_forms() {
         assert_eq!(
             asset_ref("rbxassetid://12345"),
@@ -1826,14 +2044,25 @@ mod tests {
     #[test]
     fn legacy_content_maps_to_asset_ids() {
         // Studio's LegacyContentTable: these files left content/ long ago.
-        let id = |s: &str| asset_ref(s).map(|a| a.id);
+        // (Against an empty content folder: a Studio content download that
+        // still ships one of them, as the Windows one does SwordTexture.png,
+        // wins over the table.)
+        let empty = std::env::temp_dir().join(format!("rustudio-legacy-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&empty);
+        let table = legacy_table(&empty);
+        let id = |s: &str| legacy_lookup(&table, s.strip_prefix("rbxasset://").unwrap());
         assert_eq!(id("rbxasset://fonts/sword.mesh"), Some(12221720));
         assert_eq!(id("rbxasset://Fonts/Torso.mesh"), Some(12221758));
         assert_eq!(id("rbxasset://textures/SwordTexture.png"), Some(12224218));
         assert_eq!(id("rbxasset://textures/rocketlaunchertex.png"), Some(12224070));
         assert_eq!(id("rbxasset://fonts/clonewand.mesh"), Some(12221344));
+        // A file the content folder has is not mapped.
+        let _ = std::fs::create_dir_all(empty.join("fonts"));
+        let _ = std::fs::write(empty.join("fonts/sword.mesh"), b"x");
+        assert_eq!(legacy_lookup(&legacy_table(&empty), "fonts/sword.mesh"), None);
+        let _ = std::fs::remove_dir_all(&empty);
         // Old models spell the query `?ID=`.
-        assert_eq!(id("http://www.roblox.com/asset/?ID=94746105"), Some(94746105));
+        assert_eq!(asset_ref("http://www.roblox.com/asset/?ID=94746105").map(|a| a.id), Some(94746105));
     }
 
     /// #16: while scripts run, a place's images and meshes come only from
@@ -1984,6 +2213,26 @@ mod tests {
 /// A mesh's triangles in its unit box (-0.5..0.5, stretched to a part's
 /// Size), read straight from local files (generated, local store / ledger,
 /// disk cache, content folder) for ray tests; None when it isn't here.
+/// A mesh's bounds size (its unit-box triangles × this = mesh space).
+pub fn mesh_extent(id: &str) -> Option<Vec3> {
+    static CACHE: Mutex<Option<HashMap<String, Vec3>>> = Mutex::new(None);
+    if let Some(hit) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(id) {
+        return Some(*hit);
+    }
+    mesh_triangles(id)?;
+    let bytes: Option<Vec<u8>> = generated(id)
+        .map(|b| b.to_vec())
+        .or_else(|| match asset_ref(id) {
+            Some(a) => local_asset(a.id).or_else(|| std::fs::read(cache_path(a)).ok()),
+            None => resolve(id, None).and_then(|p| std::fs::read(p).ok()),
+        });
+    let ext = bytes.and_then(|b| mesh::parse(&b).ok()).map(|m| (m.max - m.min).max(Vec3::splat(1e-4)))?;
+    if let Ok(mut g) = CACHE.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id.to_string(), ext);
+    }
+    Some(ext)
+}
+
 pub fn mesh_triangles(id: &str) -> Option<Arc<Vec<[Vec3; 3]>>> {
     static CACHE: Mutex<Option<HashMap<String, Option<Arc<Vec<[Vec3; 3]>>>>>> = Mutex::new(None);
     if !place_content_ok(id) {

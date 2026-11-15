@@ -41,6 +41,9 @@ pub enum Spot {
     Bottom,
     /// A narrow strip under everything, full width (the Command Bar).
     BottomFull,
+    /// Across the centre column, above the 3D view's tab group (a plugin
+    /// widget docked Top: ).
+    Top,
 }
 
 /// A spot relative to another panel (by key), tried before the side.
@@ -133,8 +136,30 @@ pub const PLACEMENTS: &[Placement] = &[
     float("version_history", "Version History"),
 ];
 
+/// Where Studio docks a plugin's DockWidgetPluginGui for its
+/// InitialDockState (measured in Studio, screen ui-docks-toolbars-main.jpg):
+/// Left in a group of its own at the bottom of the left column (under the
+/// Toolbox / Terrain Editor), Right under Properties, Top across the centre
+/// column above the 3D view, Bottom across the whole window under the
+/// panes, Float in its own window. Further widgets with the same state tab
+/// with the first (`place`).
+pub fn plugin_placement(key: &'static str, state: &str) -> Placement {
+    const LEFT: &[Near] = &[Below("terrain_editor", 0.62), Below("toolbox", 0.62)];
+    const RIGHT: &[Near] = &[Below("properties", 0.55)];
+    match state {
+        "Left" => row(key, "Plugin", Left, LEFT, 0.15),
+        "Right" => row(key, "Plugin", Right, RIGHT, 0.1),
+        "Top" => row(key, "Plugin", Spot::Top, &[], 0.16),
+        "Bottom" => row(key, "Plugin", BottomFull, &[], 0.16),
+        _ => float(key, "Plugin"),
+    }
+}
+
 /// The row for `key` (unknown keys dock at the bottom).
 pub fn placement(key: &str) -> Placement {
+    if let Some((k, state)) = crate::plugin_host::widgets_ui::slot_placement(key) {
+        return plugin_placement(k, &state);
+    }
     PLACEMENTS
         .iter()
         .copied()
@@ -152,7 +177,9 @@ impl Tab {
             Tab::Output => "output",
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
+            Tab::Toolbox => "toolbox",
             Tab::Script(_) => "script",
+            Tab::Plugin(n) => crate::plugin_host::widgets_ui::slot_key(*n),
         }
     }
 }
@@ -246,6 +273,20 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
         }
         _ => {}
     }
+    // A plugin widget joins another of the same InitialDockState.
+    if matches!(tab, Tab::Plugin(_)) {
+        let mate = tree.iter().enumerate().find_map(|(i, n)| {
+            let tabs = n.get_leaf()?.tabs();
+            tabs.iter()
+                .any(|t| matches!(t, Tab::Plugin(_)) && *t != tab && placement(t.key()).spot == p.spot && !placement(t.key()).floats)
+                .then_some(NodeIndex(i))
+        });
+        if let Some(n) = mate {
+            tree.set_focused_node(n);
+            tree.push_to_focused_leaf(tab);
+            return;
+        }
+    }
     // Next to the panels its row names.
     for near in p.near {
         match *near {
@@ -271,7 +312,7 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
         }
     }
     // A group already on its side (not the 3D view's, not the Command Bar's).
-    if p.spot != Spot::BottomFull {
+    if p.spot != Spot::BottomFull && p.spot != Spot::Top && !matches!(tab, Tab::Plugin(_)) {
         let side = tree.iter().enumerate().find_map(|(i, n)| {
             let tabs = n.get_leaf()?.tabs();
             let same = tabs.iter().any(|t| {
@@ -303,6 +344,9 @@ pub fn place(dock: &mut DockState<Tab>, tab: Tab, homes: &HashMap<String, Home>)
         }
         Spot::Bottom | Spot::Center => {
             tree.split_below(vp.unwrap_or(NodeIndex::root()), 1.0 - size, vec![tab]);
+        }
+        Spot::Top => {
+            tree.split_above(vp.unwrap_or(NodeIndex::root()), size, vec![tab]);
         }
     }
 }
@@ -447,13 +491,16 @@ pub struct Popped {
     /// the window shows up (src/hypr.rs).
     pub wm: Option<crate::hypr::Placement>,
     pub wm_restore: Option<crate::hypr::Placement>,
+    /// Frames in a row the window couldn't be shown (app.rs panel_windows
+    /// docks its tabs back after mech::PANEL_WINDOW_MAX_FAILS).
+    pub fails: u32,
 }
 
 impl Popped {
     pub fn new(key: String, dock: DockState<Tab>, size: [f32; 2], pos: Option<[f32; 2]>) -> Self {
         let size = sane_size(size);
         let pos = pos.filter(|p| p.iter().all(|v| v.is_finite()));
-        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, wm: None, wm_restore: None }
+        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, wm: None, wm_restore: None, fails: 0 }
     }
     pub fn viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("rustudio-panel", &self.key))
@@ -463,6 +510,9 @@ impl Popped {
     }
     /// The window title: the panel it was opened for.
     pub fn title(&self) -> String {
+        if let Some(t) = crate::plugin_host::widgets_ui::window_title(&self.key) {
+            return t;
+        }
         let base = self.key.split('-').next().unwrap_or(&self.key);
         format!("{} — rustudio", placement(base).title)
     }
@@ -717,9 +767,17 @@ impl Panels {
             .collect();
         for idx in floating.into_iter().rev() {
             let rect = dock.get_window_state(idx).and_then(|w| w.rect_or_next());
+            let only_plugins = {
+                let v: Vec<Tab> = dock[idx].tabs().copied().collect();
+                !v.is_empty() && v.iter().all(|t| matches!(t, Tab::Plugin(_)))
+            };
+            if only_plugins {
+                continue;
+            }
             let Some(surface) = dock.remove_surface(idx) else { continue };
             let Some(tree) = surface.node_tree() else { continue };
             let mut tabs: Vec<Tab> = tree.tabs().copied().collect();
+
             // The 3D view never leaves the main window.
             if let Some(i) = tabs.iter().position(|t| *t == Tab::Viewport) {
                 tabs.remove(i);

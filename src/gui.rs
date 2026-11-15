@@ -46,6 +46,34 @@ pub struct GuiBox {
     pub text: Option<[f32; 2]>,
     /// A ScrollingFrame's canvas (CanvasSize / AutomaticCanvasSize), pixels.
     pub canvas: Option<[f32; 2]>,
+    /// How that canvas was made, so the scroll range can be worked out again
+    /// from CanvasSize before the next layout (a glide re-reads it each frame).
+    pub canvas_fit: Option<CanvasFit>,
+}
+
+/// A ScrollingFrame's layout facts behind `GuiBox::canvas`: the canvas is
+/// max(CanvasSize.Scale x inner + Offset x scale, floor) + pad.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CanvasFit {
+    /// The frame's size less its content area (padding).
+    pub pad: [f32; 2],
+    /// The least canvas: the content area, or what AutomaticCanvasSize holds.
+    pub floor: [f32; 2],
+    /// The UI scale CanvasSize offsets were multiplied by.
+    pub scale: f32,
+}
+
+impl GuiBox {
+    /// The canvas a ScrollingFrame would get now with CanvasSize `cs`
+    /// (scale x, offset x, scale y, offset y), at its last laid-out size.
+    pub fn canvas_for(&self, cs: [f32; 4]) -> Option<[f32; 2]> {
+        let f = self.canvas_fit?;
+        let inner = [self.size[0] - f.pad[0], self.size[1] - f.pad[1]];
+        Some([
+            (cs[0] * inner[0] + cs[1] * f.scale).max(f.floor[0]) + f.pad[0],
+            (cs[2] * inner[1] + cs[3] * f.scale).max(f.floor[1]) + f.pad[1],
+        ])
+    }
 }
 
 /// What the viewport's GUI and the client's scripts tell each other between
@@ -85,6 +113,13 @@ pub struct GuiShare {
     pub inspect_closed: bool,
     /// UIPageLayout scroll: (page it leaves, page it goes to, tween alpha).
     pub pages: HashMap<Ref, (Ref, Ref, f32)>,
+    /// A handle adornment is hovered or held (the scripts' hit test).
+    pub adorn_hot: bool,
+    /// ... and it is a Handles / ArcHandles: the press is processed
+    /// (UserInputService gameProcessed, no PluginMouse Button1Down: Studio,
+    /// checks/plugins/widgets/captures/studio-core.txt). A HandleAdornment
+    /// (Model Reflect's plane marker under the cursor) leaves it unprocessed.
+    pub adorn_handles: bool,
 }
 
 /// What the inspect menu shows: "<name>'s Avatar", the Robux total of
@@ -99,9 +134,35 @@ pub struct InspectView {
     pub scroll: f32,
 }
 
+/// Three GUI channels: 0 the game's (the Play client and the viewport's
+/// GUIs, and the Play client's plugin widgets: one DataModel, one focused
+/// TextBox), 1 the edit DataModel's plugins (their dock widgets and
+/// CoreGui, src/plugin_host/widgets_ui.rs), 2 the Play server's plugin
+/// widgets. `share()` reads the channel this thread selected with
+/// `share_channel`; the plugin host selects 1 while the edit VM runs and
+/// while plugin GUIs are drawn.
 pub fn share() -> std::sync::MutexGuard<'static, GuiShare> {
-    static S: std::sync::OnceLock<std::sync::Mutex<GuiShare>> = std::sync::OnceLock::new();
-    S.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+    static S: std::sync::OnceLock<[std::sync::Mutex<GuiShare>; 3]> = std::sync::OnceLock::new();
+    let ch = SHARE_CHANNEL.with(|c| c.get()) as usize;
+    S.get_or_init(Default::default)[ch.min(2)].lock().unwrap_or_else(|e| e.into_inner())
+}
+
+thread_local! {
+    static SHARE_CHANNEL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Selects this thread's GUI channel (see `share`) until the guard drops.
+pub fn share_channel(ch: u8) -> ShareChannel {
+    ShareChannel(SHARE_CHANNEL.with(|c| c.replace(ch)))
+}
+
+pub struct ShareChannel(u8);
+
+impl Drop for ShareChannel {
+    fn drop(&mut self) {
+        let was = self.0;
+        SHARE_CHANNEL.with(|c| c.set(was));
+    }
 }
 
 /// Something for the game to hear about (fired on the client).
@@ -157,11 +218,21 @@ pub struct Gui {
     /// Where the game's mouse is when it isn't the pointer: the middle of
     /// the view while LockCenter holds the cursor (mouse_lock::game_pointer).
     pub pointer_override: Option<Pos2>,
+    /// The inset input positions are measured below (InputObject.Position,
+    /// MouseEnter's x, y): None, the game's top bar (GUI_TOP_INSET); a
+    /// plugin widget's or the edit viewport's CoreGui: 0.
+    pub input_inset: Option<f32>,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<crate::world_gui::GuiBatch>,
-    vf_gpu: Option<crate::gui_viewport::Gpu>,
-    vf_targets: HashMap<Ref, crate::gui_viewport::Target>,
+    /// ViewportFrames (drawn by the renderer, vf_render.rs): each one's
+    /// render size from its last walk, the texture the renderer drew it
+    /// into (`set_vf_textures`), the one that walk composited, and the
+    /// frames drawn this frame (walked or from a kept GUI).
+    vf_size: HashMap<Ref, [u32; 2]>,
+    vf_tex: HashMap<Ref, (egui::TextureId, [u32; 2])>,
+    vf_walked: HashMap<Ref, Option<egui::TextureId>>,
+    vf_live: HashSet<Ref>,
     images: HashMap<String, Img>,
     /// EditableImage textures (runtime/editable.rs) by id without the
     /// generation: the generation shown (updated in place when it moves on).
@@ -178,8 +249,6 @@ pub struct Gui {
     em_ratio: HashMap<String, f32>,
     /// TextScaled sizes: (text, family, box w, box h, wrapped) → size.
     scaled: HashMap<(String, String, i32, i32, bool), f32>,
-    /// ViewportFrame meshes: fit mode + content id → centered triangles.
-    vf_meshes: HashMap<String, Option<Arc<Vec<[(Vec3, glam::Vec2, Vec3); 3]>>>>,
     hits: Vec<Hit>,
     /// Layout of everything drawn last frame. Kept from frame to frame: a
     /// GUI walked again replaces its own entries (`layout_from`), one no
@@ -268,6 +337,22 @@ pub struct DrawIn<'a> {
     pub doc_dir: Option<&'a std::path::Path>,
     /// Play (the LocalPlayer's PlayerGui) or edit (StarterGui).
     pub playing: bool,
+    /// Which GUIs: the view's (above), or the edit DataModel's plugin GUIs.
+    pub roots: Roots,
+}
+
+/// The GUIs a `Gui` draws.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Roots {
+    /// The game's: PlayerGui / StarterGui ScreenGuis, Workspace's
+    /// SurfaceGuis / BillboardGuis, adornments while playing.
+    #[default]
+    View,
+    /// What plugins put in CoreGui (ScreenGuis, BillboardGuis /
+    /// SurfaceGuis, handle adornments), over the edit viewport.
+    CoreGui,
+    /// One DockWidgetPluginGui filling the rect (its panel's content).
+    Widget(Ref),
 }
 
 // ------------------------------------------------------------------ helpers
@@ -780,6 +865,18 @@ fn weight_of(w: rbx_dom_weak::types::FontWeight) -> u32 {
     }
 }
 
+/// How much bigger than its TextSize Studio draws the Legacy font (Arimo
+/// from fonts/families/LegacyArial.json): a default TextLabel (Font Legacy,
+/// TextSize 8) draws "row 1" 26 x 8 ink pixels in Studio's own capture
+/// checks/plugins/widgets/captures/studio-wleft.png, Arimo at TextSize 12.
+pub(crate) fn legacy_text_scale(font: &(String, u32, bool)) -> f32 {
+    if font.0.ends_with("/LegacyArial.json") {
+        crate::mech::GUI_LEGACY_TEXT_SCALE
+    } else {
+        1.0
+    }
+}
+
 /// A text object's font: family file, weight, italic. FontFace wins when set;
 /// a script that set the legacy Font enum gets that one.
 fn font_of(d: &Document, r: Ref) -> (String, u32, bool) {
@@ -787,7 +884,14 @@ fn font_of(d: &Document, r: Ref) -> (String, u32, bool) {
     let has = |n: &str| inst.is_some_and(|i| i.properties.contains_key(&rbx_dom_weak::ustr(n)));
     let face = || match d.prop(r, "FontFace") {
         Some(Variant::Font(f)) => Some((
-            f.family.clone(),
+            // Studio writes Gotham (Font.Gotham*) as GothamSSm.json, a family
+            // its content doesn't have; it draws Montserrat for it, as the
+            // legacy Gotham fonts here (`legacy_font`).
+            if f.family.ends_with("/GothamSSm.json") {
+                "rbxasset://fonts/families/Montserrat.json".to_string()
+            } else {
+                f.family.clone()
+            },
             weight_of(f.weight),
             matches!(f.style, rbx_dom_weak::types::FontStyle::Italic),
         )),
@@ -1253,44 +1357,59 @@ impl Gui {
         }
     }
 
-    /// Authored UVs with centered positions; fitted meshes use unit-box positions,
-    /// file SpecialMeshes preserve their authored dimensions before Scale.
-    fn vf_mesh(
-        &mut self,
-        store: &mut AssetStore,
-        doc_dir: Option<&std::path::Path>,
-        id: &str,
-        fit_to_part: bool,
-    ) -> Option<Arc<Vec<[(Vec3, glam::Vec2, Vec3); 3]>>> {
-        if !store.allows(id) {
-            return None;
+}
+
+impl Gui {
+    /// The ViewportFrames drawn this frame (their parts make up the
+    /// viewport's ViewportFrame scene).
+    pub fn viewport_frames(&self) -> &HashSet<Ref> {
+        &self.vf_live
+    }
+
+    /// What each ViewportFrame drawn this frame shows, read now: its size
+    /// from the last walk, its CurrentCamera, Ambient, LightColor and
+    /// LightDirection. Frames without a camera aren't drawn.
+    pub fn vf_requests(&self, d: &Document) -> HashMap<Ref, crate::render::vf::Request> {
+        let mut out = HashMap::new();
+        for &r in &self.vf_live {
+            let Some(&size) = self.vf_size.get(&r) else { continue };
+            let cam = match d.prop(r, "CurrentCamera") {
+                Some(Variant::Ref(c)) if d.exists(c) => c,
+                _ => continue,
+            };
+            let Some(xf) = crate::scene::xform_of(d, cam) else { continue };
+            let fov = f32_of(d.prop(cam, "FieldOfView")).unwrap_or(70.0).to_radians();
+            let ambient = color(d, r, "Ambient", [200.0 / 255.0; 3]);
+            let light = color(d, r, "LightColor", [140.0 / 255.0; 3]);
+            let mut ldir = crate::scene::vec3_of(d.prop(r, "LightDirection")).unwrap_or(Vec3::splat(-1.0));
+            // Near-zero directions reset to the default before shading
+            // (Studio's LightDirection setter).
+            let length2 = ldir.length_squared();
+            let tolerance = if (length2.abs() + 1.0).is_infinite() { 1.0e-5 } else { (length2.abs() + 1.0) * 1.0e-5 };
+            if !(tolerance < length2.abs()) {
+                ldir = Vec3::splat(-1.0);
+            }
+            let bg = color(d, r, "BackgroundColor3", [1.0; 3]);
+            let bt = f32_of(d.prop(r, "BackgroundTransparency")).unwrap_or(0.0).clamp(0.0, 1.0);
+            out.insert(r, crate::render::vf::Request {
+                size, cam: xf, fov_y: fov, ambient, light, light_dir: ldir.normalize_or_zero(),
+                background: [bg[0], bg[1], bg[2], 1.0 - bt],
+            });
         }
-        let cache_key = format!("{fit_to_part}|{id}");
-        if let Some(m) = self.vf_meshes.get(&cache_key) {
-            return m.clone();
+        out
+    }
+
+    /// The textures the renderer drew the ViewportFrames into.
+    pub fn set_vf_textures(&mut self, tex: impl Fn(Ref) -> Option<(egui::TextureId, [u32; 2])>) {
+        self.vf_tex.clear();
+        for &r in &self.vf_live {
+            if let Some(t) = tex(r) {
+                self.vf_tex.insert(r, t);
+            }
         }
-        let loaded = match store.content(id, doc_dir) {
-            Fetch::Ready(b) => crate::mesh::parse(&b).ok().map(|m| {
-                let ext = if fit_to_part { (m.max - m.min).max(Vec3::splat(1e-4)) } else { Vec3::ONE };
-                let c = (m.max + m.min) * 0.5;
-                let n = m.positions.len() / 3;
-                Arc::new(
-                    (0..n)
-                        .map(|t| {
-                            [
-                                ((m.positions[t * 3] - c) / ext, m.uvs.get(t * 3).copied().unwrap_or_default(), m.normals.get(t * 3).copied().unwrap_or(Vec3::Y) * ext),
-                                ((m.positions[t * 3 + 1] - c) / ext, m.uvs.get(t * 3 + 1).copied().unwrap_or_default(), m.normals.get(t * 3 + 1).copied().unwrap_or(Vec3::Y) * ext),
-                                ((m.positions[t * 3 + 2] - c) / ext, m.uvs.get(t * 3 + 2).copied().unwrap_or_default(), m.normals.get(t * 3 + 2).copied().unwrap_or(Vec3::Y) * ext),
-                            ]
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            }),
-            Fetch::Pending => return None,
-            Fetch::Unavailable(_) => None,
-        };
-        self.vf_meshes.insert(cache_key, loaded.clone());
-        loaded
+        let live = &self.vf_live;
+        self.vf_size.retain(|r, _| live.contains(r));
+        self.vf_walked.retain(|r, _| live.contains(r));
     }
 }
 
@@ -1568,6 +1687,83 @@ mod calibrate {
         });
         output.textures_delta.clear();
     }
+}
+
+/// Faces the GUI walk has drawn text with (font -> egui family, em per
+/// TextSize), and its egui context: what `text_bounds_now` measures with.
+type FaceKey = (String, u32, bool);
+static TEXT_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+static TEXT_FACES: std::sync::Mutex<Option<HashMap<FaceKey, (FontFamily, f32)>>> = std::sync::Mutex::new(None);
+
+pub(super) fn note_text_face(ctx: &egui::Context, font: &FaceKey, family: &FontFamily, em: f32) {
+    let _ = TEXT_CTX.set(ctx.clone());
+    let mut m = TEXT_FACES.lock().unwrap_or_else(|e| e.into_inner());
+    let m = m.get_or_insert_with(HashMap::new);
+    if *family != FontFamily::Proportional || !m.contains_key(font) {
+        m.insert(font.clone(), (family.clone(), em));
+    }
+}
+
+/// TextBounds of a text object that wasn't drawn with its current text or
+/// box (`size`, its AbsoluteSize): Studio measures on the read, so a script
+/// reading it right after the object appeared (the title templates'
+/// EmitterSize scripts) gets the text's size, not a guess. Measured like the
+/// walk does (TextScaled fitted to the box, wrapping, UITextSizeConstraint),
+/// with the face the walk last used for this font, else the default face.
+/// None before the GUI has drawn any text.
+pub fn text_bounds_now(d: &Document, r: Ref, size: [f32; 2], ui_scale: f32) -> Option<[f32; 2]> {
+    let ctx = TEXT_CTX.get()?;
+    let font = font_of(d, r);
+    let (family, em) = {
+        let m = TEXT_FACES.lock().unwrap_or_else(|e| e.into_inner());
+        let m = m.as_ref()?;
+        match m.get(&font) {
+            Some(f) => f.clone(),
+            None => m.iter().find(|(_, (f, _))| *f == FontFamily::Proportional).map(|(_, f)| f.clone())?,
+        }
+    };
+    let mut text = text_prop(d, r, "Text");
+    if boolp(d, r, "RichText", false) {
+        text = content_text(&text);
+    }
+    if text.is_empty() {
+        return Some([0.0, 0.0]);
+    }
+    let wrapped = boolp(d, r, "TextWrapped", false);
+    let scaled = boolp(d, r, "TextScaled", false);
+    let line_height = num(d, r, "LineHeight", 1.0);
+    let tsc = child_of_class(d, r, "UITextSizeConstraint");
+    let layout = |ts: f32, wrap: bool| {
+        let mut f = egui::TextFormat::simple(egui::FontId::new(ts * em, family.clone()), Color32::WHITE);
+        f.line_height = Some(ts * line_height);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&text, 0.0, f);
+        job.wrap.max_width = if wrap { size[0].max(1.0) } else { f32::INFINITY };
+        job.round_output_to_gui = false;
+        ctx.fonts_mut(|fo| fo.layout_job(job))
+    };
+    let mut ts = num(d, r, "TextSize", 14.0) * ui_scale * legacy_text_scale(&font);
+    if scaled {
+        let max = tsc.map(|c| num(d, c, "MaxTextSize", 100.0)).unwrap_or(100.0).min(100.0) * ui_scale.max(1.0);
+        let (mut lo, mut hi) = (1.0f32, max.max(1.0));
+        for _ in 0..10 {
+            let mid = (lo + hi) * 0.5;
+            let g = layout(mid, true);
+            if g.size().x <= size[0] + 0.5 && g.size().y <= size[1] + 0.5 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        ts = lo.floor().max(1.0);
+        if let Some(c) = tsc {
+            ts = ts.max(num(d, c, "MinTextSize", 1.0) * ui_scale);
+        }
+    } else if let Some(c) = tsc {
+        ts = ts.clamp(num(d, c, "MinTextSize", 1.0) * ui_scale, num(d, c, "MaxTextSize", 100.0) * ui_scale);
+    }
+    let g = layout(ts, wrapped || scaled);
+    Some([g.rect.width(), g.rect.height()])
 }
 
 /// What RichText leaves of a string once its tags are gone (ContentText).

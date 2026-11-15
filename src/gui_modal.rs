@@ -104,7 +104,7 @@ mod tests {
     use rbx_dom_weak::InstanceBuilder;
 
     fn gb(pos: [f32; 2], size: [f32; 2]) -> GuiBox {
-        GuiBox { pos, size, rot: 0.0, text: None, canvas: None }
+        GuiBox { pos, size, rot: 0.0, text: None, canvas: None, canvas_fit: None }
     }
 
     /// Studio's rules: Enabled collector, the Visible chain, an area left

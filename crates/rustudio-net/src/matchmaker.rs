@@ -149,8 +149,12 @@ impl<'a> Matchmaker<'a> {
     }
 
     fn post(&self, url: &str, body: &str) -> Result<(u16, String)> {
+        self.post_timeout(url, body, std::time::Duration::from_secs(10))
+    }
+
+    fn post_timeout(&self, url: &str, body: &str, timeout: std::time::Duration) -> Result<(u16, String)> {
         let uid = self.session.profile.id.to_string();
-        Ok(self.session.post_csrf_with(
+        Ok(self.session.post_csrf_with_timeout(
             url,
             "application/json",
             body.as_bytes(),
@@ -160,6 +164,7 @@ impl<'a> Matchmaker<'a> {
                 // InternalServerError [verified: live 2026-11-05].
                 ("User-Agent", "RobloxStudio/WinInet"),
             ],
+            Some(timeout),
         )?)
     }
 
@@ -201,6 +206,8 @@ impl<'a> Matchmaker<'a> {
         budget: PollBudget,
         progress: &mut dyn FnMut(u32, &str),
     ) -> Result<JoinResult> {
+        let started = std::time::Instant::now();
+        let total = std::time::Duration::from_secs(90);
         self.can_collaborate(universe_id)?;
         let attempt_id = new_attempt_id();
         let body = TeamCreateRequest::new(place_id, attempt_id.clone()).to_json();
@@ -210,12 +217,29 @@ impl<'a> Matchmaker<'a> {
         let mut last = String::new();
         for attempt in 0..budget.attempts {
             progress(attempt as u32 + 1, &last);
-            let (status, text) = self.post(GAMEJOIN_TEAM_CREATE, &body)?;
+            let remaining = total.saturating_sub(started.elapsed());
+            if remaining.is_zero() { break; }
+            let reply = self.post_timeout(GAMEJOIN_TEAM_CREATE, &body,
+                remaining.min(std::time::Duration::from_secs(10)));
+            let (status, text) = match reply {
+                Ok((status, _)) if retryable_http(status) => {
+                    last = format!("Temporary server error (HTTP {status}); retrying");
+                    progress(attempt + 1, &last);
+                    std::thread::sleep(std::time::Duration::from_millis(budget.delay_ms)
+                        .min(total.saturating_sub(started.elapsed())));
+                    continue;
+                }
+                Ok(reply) => reply,
+                Err(_) => {
+                    last = "Request timed out or connection failed; retrying".into();
+                    progress(attempt + 1, &last);
+                    std::thread::sleep(std::time::Duration::from_millis(budget.delay_ms)
+                        .min(total.saturating_sub(started.elapsed())));
+                    continue;
+                }
+            };
             if status != 200 {
-                return Err(NetError::Other(format!(
-                    "gamejoin /v1/team-create: HTTP {status}: {}",
-                    text.chars().take(300).collect::<String>()
-                )));
+                return Err(NetError::Http { what: "Team Create request".into(), status });
             }
             let resp: GameJoinResponse = serde_json::from_str(&text)?;
             if resp.is_ready() {
@@ -234,13 +258,18 @@ impl<'a> Matchmaker<'a> {
                 )));
             }
             last = resp.message.unwrap_or_default();
-            std::thread::sleep(std::time::Duration::from_millis(budget.delay_ms));
+            std::thread::sleep(std::time::Duration::from_millis(budget.delay_ms)
+                .min(total.saturating_sub(started.elapsed())));
         }
         if !last.is_empty() {
             eprintln!("rustudio: matchmaker still waiting: {last}");
         }
         Err(NetError::MatchmakerTimeout)
     }
+}
+
+fn retryable_http(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// A fresh GUID-shaped join-attempt id. Not a secret.
@@ -263,6 +292,12 @@ fn new_attempt_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_temporary_failures_but_not_permission_denials() {
+        for status in [408, 429, 500, 502, 503, 504] { assert!(retryable_http(status)); }
+        for status in [200, 400, 401, 403, 404] { assert!(!retryable_http(status)); }
+    }
 
     #[test]
     fn request_body_shape() {

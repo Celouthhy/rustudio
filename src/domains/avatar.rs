@@ -275,9 +275,26 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             },
         })
     })?;
+    // WrapDeformer's cage field (cage_rbf.rs): (reference cage, deformer
+    // cage, mesh vertices, points) as flat x, y, z lists, all in cage space;
+    // the points moved, or nil when the cages don't pair up.
+    let wrap_rbf = lua.create_function(|lua, (rest, goal, mesh, pts): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)| {
+        let v = |f: &[f32]| -> Vec<glam::Vec3> { f.chunks_exact(3).map(|c| glam::Vec3::new(c[0], c[1], c[2])).collect() };
+        match crate::cage_rbf::fit_points_near(&v(&rest), &v(&goal), &v(&mesh), &v(&pts)) {
+            Some(out) => Ok(Value::Table(lua.create_sequence_from(out.iter().flat_map(|p| [p.x, p.y, p.z]))?)),
+            None => Ok(Value::Nil),
+        }
+    })?;
+    // Draw a part with an EditableMesh's snapshot (a WrapDeformer's result),
+    // or with its own mesh again (nil): (part, mesh or nil, centre).
+    let wrap_show = lua.create_function(|lua, (part, em, centre): (Value, Value, Value)| {
+        let Some(part) = opt_inst(&part) else { return Ok(()) };
+        let c = opt_ud::<crate::runtime::LVector3>(&centre).map(|v| v.0).unwrap_or(glam::Vec3::ZERO);
+        crate::runtime::editable::show_mesh(lua, part, opt_inst(&em), c)
+    })?;
     lua.load(include_str!("avatar_apply.luau"))
         .set_name("=rustudio.avatar.apply")
-        .call::<()>((is_client, fire, load_start, load_poll))?;
+        .call::<()>((is_client, fire, load_start, load_poll, wrap_rbf, wrap_show))?;
     Ok(())
 }
 

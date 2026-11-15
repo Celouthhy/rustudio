@@ -13,7 +13,7 @@
 -- (Head / Torso / limbs ids) and Proportion / BodyType scales aren't
 -- rebuilt (they swap the rig's MeshParts); see checks/parity/avatar.md.
 
-local is_client, fire, load_start, load_poll = ...
+local is_client, fire, load_start, load_poll, wrap_rbf, wrap_show = ...
 local M = __rs_lua_methods
 
 local applied = setmetatable({}, { __mode = "k" }) -- AccessoryDescription / MakeupDescription → instance
@@ -472,6 +472,19 @@ local function apply(self, d, reset, name)
 			acc = first(m, "Accoutrement")
 			if acc then
 				acc.Parent = nil
+				-- As Studio's loader: the entry's type, and a layered one's
+				-- Order and Puffiness on its WrapLayer.
+				pcall(function()
+					acc.AccessoryType = a.AccessoryType
+				end)
+				local h = acc:FindFirstChild("Handle")
+				local wl = h and h:FindFirstChildOfClass("WrapLayer")
+				if a.IsLayered and wl then
+					if a.Order ~= nil then
+						wl.Order = a.Order
+					end
+					wl.Puffiness = math.clamp(a.Puffiness or 1, -1, 1)
+				end
 				acc:SetAttribute("RustudioAssetId", a.AssetId)
 				acc:SetAttribute("RustudioLayered", a.IsLayered or nil)
 				attach(char, acc, a)
@@ -620,6 +633,8 @@ local function editable(content)
 	return game:GetService("AssetService"):CreateEditableMeshAsync(content)
 end
 
+local show_deformed
+
 M.SetCageMeshContent = function(self, content, origin)
 	if content == nil then
 		error("Argument 1 missing or nil", 0)
@@ -628,48 +643,151 @@ M.SetCageMeshContent = function(self, content, origin)
 	if origin ~= nil then
 		self.CageOrigin = origin
 	end
+	show_deformed(self)
+end
+
+-- The cage the deformer's is compared with: the WrapLayer's / WrapTarget's
+-- own cage, as an EditableMesh (vertex order kept), and the part mesh.
+local function cage_object(content)
+	local ok, obj = pcall(function()
+		return content.Object
+	end)
+	if ok and obj ~= nil and typeof(obj) == "Instance" and obj:IsA("EditableMesh") then
+		return obj
+	end
+	return editable(content)
+end
+
+local function flat(em, offset)
+	local out = {}
+	for _, v in em:GetVertices() do
+		local p = em:GetPosition(v) - offset
+		out[#out + 1] = p.X
+		out[#out + 1] = p.Y
+		out[#out + 1] = p.Z
+	end
+	return out
+end
+
+-- The part mesh moved by the deformer's cage (Studio, measured through
+-- single moved cage vertices: cage_rbf.rs): the reference cage's field,
+-- evaluated in cage space (mesh space less the CageOrigin).
+local function deform_setup(self, name)
+	local target = deformer_check(self, name)
+	local part = self.Parent
+	local ok, ref, new, mesh = pcall(function()
+		return editable(target.CageMeshContent), cage_object(self.CageMeshContent), editable(part.MeshContent)
+	end)
+	if not ok then
+		error("WrapDeformer:" .. name .. "(): " .. tostring(ref), 0)
+	end
+	local o = target.CageOrigin.Position
+	return ref, new, mesh, o
+end
+
+-- Studio draws the part deformed by the cage (a WrapTarget's UpperTorso
+-- with its cage stretched 1.5x in X draws 1.5x wider): the part's own
+-- mesh (UVs and normals kept) moved by the cage field, shown in its
+-- place; scripts still read its MeshContent.
+show_deformed = function(self)
+	local part = self.Parent
+	if wrap_show and part and part:IsA("MeshPart") and wrap_sibling(self) then
+		pcall(function()
+			local ref, new, mesh, o = deform_setup(self, "SetCageMeshContent")
+			local lo, hi = Vector3.one * math.huge, -Vector3.one * math.huge
+			for _, v in mesh:GetVertices() do
+				local p = mesh:GetPosition(v)
+				lo, hi = lo:Min(p), hi:Max(p)
+			end
+			local pts = flat(mesh, o)
+			local out = wrap_rbf(flat(ref, Vector3.zero), flat(new, Vector3.zero), pts, pts)
+			if out == nil then
+				wrap_show(part, nil, Vector3.zero)
+				return
+			end
+			local k = 1
+			for _, v in mesh:GetVertices() do
+				mesh:SetPosition(v, Vector3.new(out[k], out[k + 1], out[k + 2]) + o)
+				k += 3
+			end
+			wrap_show(part, mesh, (lo + hi) / 2)
+		end)
+	end
+end
+
+-- The part mesh welded by position (the first of each kept, in the order
+-- the faces use them): Studio's WrapDeformer:CreateEditableMeshAsync hands
+-- back 929 vertices for a 1680-vertex part mesh (AssetService's loader keeps
+-- the file's vertices).
+local function welded(src)
+	local em = game:GetService("AssetService"):CreateEditableMesh()
+	local by, map = {}, {}
+	for _, f in src:GetFaces() do
+		for _, v in src:GetFaceVertices(f) do
+			if map[v] == nil then
+				local p = src:GetPosition(v)
+				local k = string.format("%.9g,%.9g,%.9g", p.X, p.Y, p.Z)
+				local id = by[k]
+				if id == nil then
+					id = em:AddVertex(p)
+					by[k] = id
+				end
+				map[v] = id
+			end
+		end
+	end
+	for _, f in src:GetFaces() do
+		local vs = src:GetFaceVertices(f)
+		pcall(function()
+			em:AddTriangle(map[vs[1]], map[vs[2]], map[vs[3]])
+		end)
+	end
+	return em
 end
 
 M.CreateEditableMeshAsync = function(self)
-	deformer_check(self, "CreateEditableMeshAsync")
-	return editable(self.CageMeshContent)
+	local ref, new, mesh, o = deform_setup(self, "CreateEditableMeshAsync")
+	mesh = welded(mesh)
+	local pts = flat(mesh, o)
+	local out = wrap_rbf(flat(ref, Vector3.zero), flat(new, Vector3.zero), pts, pts)
+	if out == nil then
+		return mesh
+	end
+	-- Re-centred on its bounds, as Studio hands it back.
+	local lo, hi = Vector3.one * math.huge, -Vector3.one * math.huge
+	for i = 1, #out, 3 do
+		local p = Vector3.new(out[i], out[i + 1], out[i + 2])
+		lo, hi = lo:Min(p), hi:Max(p)
+	end
+	local c = (lo + hi) / 2
+	local k = 1
+	for _, v in mesh:GetVertices() do
+		mesh:SetPosition(v, Vector3.new(out[k], out[k + 1], out[k + 2]) - c)
+		k += 3
+	end
+	return mesh
 end
 
 M.GetDeformedCFrameAsync = function(self, cf)
 	if cf == nil then
 		error("Argument 1 missing or nil", 0)
 	end
-	local target = deformer_check(self, "GetDeformedCFrameAsync")
-	if not has_content(target.CageMeshContent) then
-		return cf
+	local ref, new, mesh, o = deform_setup(self, "GetDeformedCFrameAsync")
+	-- In: the part's mesh space; out: the deformed point in cage space,
+	-- the rotation as given (Studio: an unmoved cage returns cf less the
+	-- CageOrigin).
+	local p = cf.Position - o
+	local out = wrap_rbf(flat(ref, Vector3.zero), flat(new, Vector3.zero), flat(mesh, o), { p.X, p.Y, p.Z })
+	local q = out and Vector3.new(out[1], out[2], out[3]) or p
+	return CFrame.new(q) * cf.Rotation
+end
+
+local stub_warned = {}
+local function stub_warn(name)
+	if not stub_warned[name] then
+		stub_warned[name] = true
+		warn("WrapTarget:" .. name .. " is a stub in rustudio: the texture comes back unchanged (not re-projected)")
 	end
-	local ok, a, b = pcall(function()
-		return editable(target.CageMeshContent), editable(self.CageMeshContent)
-	end)
-	if not ok then
-		error("WrapDeformer:GetDeformedCFrameAsync(): " .. tostring(a), 0)
-	end
-	local part = self.Parent
-	local p = (target.CageOrigin:Inverse() * part.CFrame:Inverse() * cf).Position
-	local best, bd = nil, math.huge
-	for _, v in a:GetVertices() do
-		local d = (a:GetPosition(v) - p).Magnitude
-		if d < bd then
-			best, bd = v, d
-		end
-	end
-	if best == nil then
-		return cf
-	end
-	local ids = b:GetVertices()
-	local av = a:GetVertices()
-	local index = table.find(av, best)
-	local other = index and ids[index]
-	if other == nil then
-		return cf
-	end
-	local delta = b:GetPosition(other) - a:GetPosition(best)
-	return cf + part.CFrame:VectorToWorldSpace(delta)
 end
 
 local function copy_image(img)
@@ -694,6 +812,7 @@ M.CreateTextureInCageSpaceAsync = function(self, texture, options)
 	if not ok then
 		error("CreateTextureInCageSpaceAsync: Failed to get mesh data for reference mesh part or cage.", 0)
 	end
+	stub_warn("CreateTextureInCageSpaceAsync")
 	return copy_image(texture)
 end
 
@@ -715,6 +834,7 @@ M.CreateTextureInTargetSpaceAsync = function(self, texture, transfer)
 	if not ok then
 		error("CreateTextureInTargetSpaceAsync failed: Failed to fetch required mesh data.", 0)
 	end
+	stub_warn("CreateTextureInTargetSpaceAsync")
 	return copy_image(texture)
 end
 

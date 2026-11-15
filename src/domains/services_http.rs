@@ -156,7 +156,7 @@ fn run(req: Request) -> Result<Response, String> {
 }
 
 /// Studio's wording for transport failures.
-fn describe(e: ureq::Error) -> String {
+pub(super) fn describe(e: ureq::Error) -> String {
     match e {
         ureq::Error::HostNotFound => "HttpError: DnsResolve".into(),
         ureq::Error::Timeout(_) => "HttpError: Timedout".into(),

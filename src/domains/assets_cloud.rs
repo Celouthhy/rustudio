@@ -30,6 +30,7 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetCollection","InsertService"),("GetBaseCategories","InsertService"),("GetUserCategories","InsertService"),
     ("GetAssetIdsForPackage","AssetService"),
     ("GetAssetIdsForPackageAsync","AssetService"),
+    ("GetObjects","DataModel"),
     ("CaptureScreenshot","CaptureService"),("TakeScreenshotCaptureAsync","CaptureService"),("StartVideoCaptureAsync","CaptureService"),("StopVideoCapture","CaptureService"),("ReadCapturesFromGalleryAsync","CaptureService"),("PromptSaveCapturesToGallery","CaptureService"),("PromptShareCapture","CaptureService"),
 
     ("CreateDataModelContentAsync","AssetService"),
@@ -250,6 +251,13 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     })
 }
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
+    // Studio 0.747 stores SurfaceAppearance.Color clamped to 0..1 per channel
+    // (Color3.new(2, 1.5, -1) reads back 1, 1, 0); the renderer takes it as is.
+    if class=="SurfaceAppearance" && key=="Color" {
+        let c=opt_ud::<LColor3>(value).ok_or_else(||rt_err(format!("Unable to assign property Color. Color3 expected, got {}",crate::cmeta::type_name(value))))?;
+        let [r_,g,b]=c.0.map(|v| if v.is_nan() {0.0} else {v.clamp(0.0,1.0)});
+        store_prop(lua,r,key,Variant::Color3(rbx_dom_weak::types::Color3::new(r_,g,b)))?;return Ok(true)
+    }
     if class=="SurfaceAppearance" && key=="SurfaceSlot" {
         let n=match value {Value::Integer(n)=>*n as i32,Value::Number(n)=>*n as i32,_=>return Err(rt_err("Unable to cast value to int"))};
         store_prop(lua,r,key,Variant::Int32(n))?;return Ok(true)
@@ -528,6 +536,7 @@ assert(meshResult==Enum.CreateContentResult.Success and meshSnapshot.SourceType=
 local meshCopy=asset:CreateEditableMeshAsync(meshSnapshot)
 assert(#meshCopy:GetVertices()==3 and #meshCopy:GetFaces()==1)
 print('assets-cloud-ok')
+__ac_test_done()
 "#
                 .to_string(),
             ),
@@ -537,10 +546,28 @@ print('assets-cloud-ok')
         rt.enter(World::new(d, RunMode::Run));
         rt.bind_globals().unwrap();
         rt.lua.globals().set("__ac_test_collect",rt.lua.create_function(|lua,()|lua.gc_collect()).unwrap()).unwrap();
+        // (the async calls answer from background threads: under a busy
+        // parallel test run that takes longer than a fixed frame count)
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        rt.lua
+            .globals()
+            .set("__ac_test_done", rt.lua.create_function(move |_, ()| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }).unwrap())
+            .unwrap();
         rt.run_script(script);
-        for _ in 0..120 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut frames = 0;
+        while (frames < 120 || !done.load(std::sync::atomic::Ordering::SeqCst)) && std::time::Instant::now() < deadline {
             rt.step(1.0 / 60.0);
-            std::thread::yield_now();
+            frames += 1;
+            if frames >= 120 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            } else {
+                std::thread::yield_now();
+            }
         }
         let output = rt.leave().output;
         assert!(

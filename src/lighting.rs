@@ -406,8 +406,12 @@ pub fn globals(
     let atmos = if override_flag("noatmos") { None } else { atmosphere(d) };
     // With an Atmosphere, Lighting's FogStart / FogEnd don't apply (Roblox
     // docs): objects fade into the sky behind them, e^(−k·d) (fog.z 3,
-    // exp2 form as Studio's FogParams).
-    let fog = match atmos {
+    // exp2 form as Studio's FogParams). Only with a Sky too: Studio's fog
+    // update (Windows 0.744 Studio) takes the Atmosphere's fog only
+    // when Lighting has both, else the FogStart / FogEnd fog
+    // (checks/fog-linear, 2026-11-14).
+    let has_sky = lighting.and_then(|l| sky_child(d, l)).is_some();
+    let fog = match atmos.filter(|_| has_sky) {
         Some(a) if a.fog_k > 0.0 => [0.0, a.fog_k / std::f32::consts::LN_2, 3.0, day],
         Some(_) => [0.0, 1e9, 0.0, day],
         None => [
@@ -625,7 +629,7 @@ impl LightCache {
                 for m in marks {
                     let doc::Mark::Tree(t) = m else { continue };
                     for r in d.subtree(t) {
-                        let keep = is_light(d, r) && ws.is_some_and(|w| d.is_ancestor(w, r));
+                        let keep = is_light(d, r) && ws.is_some_and(|w| d.in_world(w, r));
                         if keep && self.set.insert(r) {
                             self.lights.push(r);
                         } else if !keep && self.set.remove(&r) {
@@ -652,6 +656,7 @@ impl LightCache {
                     )
                 })
                 .map(|i| i.referent())
+                .filter(|r| d.in_world(ws, *r))
                 .collect(),
             None => Vec::new(),
         };

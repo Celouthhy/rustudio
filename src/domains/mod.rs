@@ -42,6 +42,7 @@ use rbx_dom_weak::types::Ref;
 #[path = "players_chat.rs"] pub mod players_chat;
 #[path = "assets_cloud.rs"] pub mod assets_cloud;
 #[path = "testing.rs"] pub mod testing;
+#[path = "../plugin_host/api.rs"] pub mod plugin;
 
 
 /// Every domain's (method, base class).
@@ -60,6 +61,7 @@ pub static METHODS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(
     v.extend_from_slice(players_chat::METHODS);
     v.extend_from_slice(assets_cloud::METHODS);
     v.extend_from_slice(testing::METHODS);
+    v.extend_from_slice(plugin::METHODS);
     v
 });
 
@@ -78,6 +80,7 @@ pub static LUA_METHODS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::
     v.extend_from_slice(geometry::LUA_METHODS);
     v.extend_from_slice(players_chat::LUA_METHODS);
     v.extend_from_slice(gui_input::LUA_METHODS);
+    v.extend_from_slice(plugin::LUA_METHODS);
     v
 });
 
@@ -96,6 +99,7 @@ pub static EVENTS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|
     v.extend_from_slice(players_chat::EVENTS);
     v.extend_from_slice(assets_cloud::EVENTS);
     v.extend_from_slice(testing::EVENTS);
+    v.extend_from_slice(plugin::EVENTS);
     v
 });
 
@@ -114,7 +118,7 @@ type PropGet = fn(&Lua, Ref, &str, &str) -> mlua::Result<Option<Value>>;
 
 /// The domains' prop_get, in chain order (bit i of a claim mask = entry i;
 /// the same order as `member_claims::CLAIMS`).
-static PROP_GETS: [(&str, PropGet); 13] = [
+static PROP_GETS: [(&str, PropGet); 14] = [
     ("pages", pages::prop_get),
     ("web_social", web_social::prop_get),
     ("avatar", avatar::prop_get),
@@ -128,6 +132,7 @@ static PROP_GETS: [(&str, PropGet); 13] = [
     ("players_chat", players_chat::prop_get),
     ("assets_cloud", assets_cloud::prop_get),
     ("testing", testing::prop_get),
+    ("plugin", plugin::prop_get),
 ];
 
 /// Whether `claimer`'s prop_get code names `key` for `class`: anywhere as
@@ -208,14 +213,14 @@ pub fn claims(class: &str, key: &str) -> u16 {
 
 /// Whether runtime_ext's prop_get (or editable's) can answer `key`.
 pub fn ext_claims(class: &str, key: &str) -> bool {
-    debug_assert_eq!(member_claims::CLAIMS[13].0, "ext");
-    claimed(13, class, key)
+    debug_assert_eq!(member_claims::CLAIMS[14].0, "ext");
+    claimed(14, class, key)
 }
 
 type NewIndex = fn(&Lua, Ref, &str, &str, &Value) -> mlua::Result<bool>;
 
 /// The domains' newindex (same order as PROP_GETS).
-static NEWINDEXES: [(&str, NewIndex); 13] = [
+static NEWINDEXES: [(&str, NewIndex); 14] = [
     ("pages", pages::newindex),
     ("web_social", web_social::newindex),
     ("avatar", avatar::newindex),
@@ -229,6 +234,7 @@ static NEWINDEXES: [(&str, NewIndex); 13] = [
     ("players_chat", players_chat::newindex),
     ("assets_cloud", assets_cloud::newindex),
     ("testing", testing::newindex),
+    ("plugin", plugin::newindex),
 ];
 
 /// Classes a domain's newindex acts on for any member (ANY_KEY's, for
@@ -282,7 +288,7 @@ pub fn newindex_claims(class: &str, key: &str) -> u16 {
 
 /// Whether runtime_ext's newindex can take `class.key = v`.
 pub fn ext_newindex_claims(class: &str, key: &str) -> bool {
-    claimed_in(member_claims::NEWINDEX_CLAIMS, member_claims::NEWINDEX_CLAIMS_PAIRS, 13, class, key)
+    claimed_in(member_claims::NEWINDEX_CLAIMS, member_claims::NEWINDEX_CLAIMS_PAIRS, 14, class, key)
 }
 
 /// `newindex` over the domains in `mask` only. (Check mode: over all of
@@ -314,7 +320,7 @@ type Call = fn(&Lua, &str, Ref, &MultiValue) -> Option<mlua::Result<MultiValue>>
 
 /// The domains' call, their METHODS and LUA_METHODS (same order as
 /// PROP_GETS).
-static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 13] = [
+static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 14] = [
     ("pages", pages::call, pages::METHODS, pages::LUA_METHODS),
     ("web_social", web_social::call, web_social::METHODS, web_social::LUA_METHODS),
     ("avatar", avatar::call, avatar::METHODS, avatar::LUA_METHODS),
@@ -328,6 +334,7 @@ static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 13] = [
     ("players_chat", players_chat::call, players_chat::METHODS, players_chat::LUA_METHODS),
     ("assets_cloud", assets_cloud::call, assets_cloud::METHODS, assets_cloud::LUA_METHODS),
     ("testing", testing::call, testing::METHODS, &[]),
+    ("plugin", plugin::call, plugin::METHODS, plugin::LUA_METHODS),
 ];
 
 /// Domain methods declared on a base class only for the objects the core
@@ -460,6 +467,7 @@ pub fn write_acts(class: &str, key: &str) -> bool {
         || players_chat::write_acts(class, key)
         || assets_cloud::write_acts(class, key)
         || testing::write_acts(class, key)
+        || plugin::write_acts(class, key)
 }
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
@@ -476,6 +484,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     players_chat::install(lua)?;
     assets_cloud::install(lua)?;
     testing::install(lua)?;
+    plugin::install(lua)?;
     Ok(())
 }
 
@@ -532,5 +541,6 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         let _s = crate::bench::scope("dstep_testing");
         testing::step(lua, dt)?;
     }
+    plugin::step(lua, dt)?;
     Ok(())
 }

@@ -562,9 +562,13 @@ mod tests {
 
 /// Decodes textures on a few worker threads (a map load asks for hundreds at
 /// once; decoding them in the frame that asked froze it for seconds).
-pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sender<(String, Result<Rgba, String>)>, id: String) {
+/// A decoded image and its mip chain (render::mip_chain), both made on a
+/// decode worker so the upload on the main thread only copies.
+pub type Decoded = Result<(Rgba, Option<Vec<u8>>), String>;
+
+pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sender<(String, Decoded)>, id: String) {
     use std::sync::{mpsc, Mutex, OnceLock};
-    type Job = (std::sync::Arc<Vec<u8>>, mpsc::Sender<(String, Result<Rgba, String>)>, String);
+    type Job = (std::sync::Arc<Vec<u8>>, mpsc::Sender<(String, Decoded)>, String);
     static POOL: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
     let pool = POOL.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Job>();
@@ -575,7 +579,11 @@ pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sende
             let _ = std::thread::Builder::new().name(format!("tex-decode-{i}")).spawn(move || loop {
                 let job = rx.lock().ok().and_then(|r| r.recv().ok());
                 let Some((bytes, done, id)) = job else { return };
-                let _ = done.send((id, decode(&bytes)));
+                let r = decode(&bytes).map(|img| {
+                    let mips = crate::render::mip_chain_for(&img);
+                    (img, mips)
+                });
+                let _ = done.send((id, r));
             });
         }
         Mutex::new(tx)

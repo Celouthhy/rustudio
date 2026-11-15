@@ -95,6 +95,10 @@ pub struct HumBody {
     arb: [u8; 2],
 }
 
+/// World ticks a loose floor keeps the character's level after the character's last
+/// floor reaction reached it (more than a level-4 solve's span; `Hums::floor_levels`).
+const FLOOR_LEVEL_KEEP: u64 = 8;
+
 /// The timestep arbiter's position-correction request (Studio, slot 6,
 /// from the factors Studio writes after each solve, Studio):
 /// a solve whose motion was more than DFIntSimArbiterPositionCorrection
@@ -184,7 +188,7 @@ pub(super) fn weights_data(friction_weight: f32, elasticity_weight: f32) -> u128
     (friction_weight.to_bits() as u128) << 32 | elasticity_weight.to_bits() as u128
 }
 
-fn weights_of(c: &rp::Collider) -> (f32, f32) {
+pub(super) fn weights_of(c: &rp::Collider) -> (f32, f32) {
     let d = c.user_data;
     if d == 0 {
         (1.0, 1.0)
@@ -214,7 +218,15 @@ struct Hit {
 
 /// Contact filtering across the ownership boundary (see `set_ownership_split`),
 /// and the allowed penetration of a character's contacts.
-pub(super) struct OwnerHooks<'a>(pub &'a HashMap<rp::ColliderHandle, OwnRole>, pub f32, pub &'a MidSolve);
+pub(super) struct OwnerHooks<'a>(
+    pub &'a HashMap<rp::ColliderHandle, OwnRole>,
+    pub f32,
+    pub &'a MidSolve,
+    /// The client's own bodies' stand-ins and the parts the client took away
+    /// (physics_client_link.rs).
+    pub &'a super::client_link::Link,
+    pub &'a rustc_hash::FxHashMap<rp::ColliderHandle, Ref>,
+);
 
 /// Characters between two solves of the timestep arbiter's level 2. Studio
 /// solves such an assembly on every 2nd 240 Hz tick, over 2h (Studio
@@ -234,17 +246,34 @@ pub(super) struct OwnerHooks<'a>(pub &'a HashMap<rp::ColliderHandle, OwnRole>, p
 pub struct MidSolve {
     /// The colliders of those characters.
     colliders: HashSet<rp::ColliderHandle>,
+    /// RUSTUDIO_SOLVER=studio (CHAR-3, T11): the other side's stand-ins touch this tick.
+    /// The network interpolator writes a remote assembly's pose once a frame, after the
+    /// frame's ticks (Studio → world vtbl[1] → …
+    /// Studio, STEP §7a), and setPV is a property wake (SLEEP §7.2); the copy is a
+    /// non-sim record at rest otherwise. Measured (Lab B, probes/studio/runs-T11B): the
+    /// client's NPC copy reads its replicated pose before and after every frame's ticks,
+    /// and the character pressed into it ends every frame at vz −9…−11 while moving
+    /// 0.01–0.05 a frame — one tick stopped, then three of the Humanoid's capped push
+    /// (3 × 839 h = 10.5); an anchored wall stops it every tick (−0.003). So the pair's
+    /// contact is solved on the first tick of a frame only. Always true under rapier.
+    pub remote_awake: bool,
 }
 
 impl rp::PhysicsHooks for OwnerHooks<'_> {
     fn filter_contact_pair(&self, c: &rp::PairFilterContext) -> Option<rp::SolverFlags> {
         use OwnRole::*;
+        if let Some(f) = self.3.filter(c, self.4) {
+            return f;
+        }
         let (a, b) = (self.0.get(&c.collider1).copied(), self.0.get(&c.collider2).copied());
         match (a, b) {
             // Each side meets the other's stand-in, never the body itself.
             (Some(Client), Some(Server)) | (Some(Server), Some(Client)) => None,
-            (Some(Client), Some(GhostOfServer)) | (Some(GhostOfServer), Some(Client)) => Some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES),
-            (Some(Server), Some(GhostOfClient)) | (Some(GhostOfClient), Some(Server)) => Some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES),
+            // (RUSTUDIO_SOLVER=studio: only on the tick the stand-in was written, see
+            // `MidSolve::remote_awake`.)
+            (Some(Client), Some(GhostOfServer)) | (Some(GhostOfServer), Some(Client)) | (Some(Server), Some(GhostOfClient)) | (Some(GhostOfClient), Some(Server)) => {
+                self.2.remote_awake.then_some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES)
+            }
             (Some(GhostOfClient | GhostOfServer), _) | (_, Some(GhostOfClient | GhostOfServer)) => None,
             _ => Some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES),
         }
@@ -310,16 +339,330 @@ pub struct Hums {
     pub fext: HashMap<rp::RigidBodyHandle, (Vec3, Vec3)>,
     /// See `MidSolve`.
     pub(super) mid: MidSolve,
+    /// RUSTUDIO_SOLVER=studio: loose floors under a character, with the world tick its
+    /// floor reaction last reached them (`humanoid_forces`: their slot-3 request is the
+    /// character's level meanwhile).
+    pub(super) floor_levels: HashMap<rp::RigidBodyHandle, u64>,
     /// Movers the owning client made on its character (only the client
     /// document has them; Place A's LinearVelocity / AlignOrientation), by client
     /// instance, their part mapped to the server's.
     pub(super) foreign: HashMap<Ref, Mover>,
     /// Their client-only attachments: (server part, CFrame in it).
     pub(super) foreign_att: HashMap<Ref, (Ref, Xform)>,
+    /// Movers of client-owned assemblies whose values came from the client document
+    /// (`set_owned_movers`): under RUSTUDIO_SOLVER=studio they push through
+    /// `apply_movers` (the solver's force item is built from the server's copy).
+    pub(super) owned_movers: HashSet<Ref>,
+    /// RUSTUDIO_SOLVER=studio: those movers' connector descriptions read from the client
+    /// document (the owner's DataModel drives the connector, T13 / movement-nova), and
+    /// the client part → server part map `studio_desc` resolves their attachments with.
+    pub(super) owned_descs: HashMap<Ref, crate::solver::joints::instance::Desc>,
+    pub(super) desc_remap: HashMap<Ref, Ref>,
     /// The ownership boundary (`set_ownership_split`): each collider's side,
     /// and the stand-ins by the body they copy.
     pub(super) roles: HashMap<rp::ColliderHandle, OwnRole>,
     pub(super) ghosts: HashMap<rp::RigidBodyHandle, Ghost>,
+    /// The coming world tick is the first of a frame (physics.rs `step`): the
+    /// network interpolator's once-per-frame write (STEP §7) is due.
+    pub(super) frame_start: bool,
+    /// RUSTUDIO_SOLVER=studio: each copied body's frame-start states (world tick, pose,
+    /// v, ω), oldest first; a stand-in is written from the one `repl_delay` old.
+    pub(super) history: HashMap<rp::RigidBodyHandle, std::collections::VecDeque<(u64, rp::Pose, Vec3, Vec3)>>,
+    /// RUSTUDIO_SOLVER=studio, `RUSTUDIO_REPL=interp` (default): the receiving side's
+    /// interpolation buffer of each copied body (`Repl`).
+    pub(super) repl: HashMap<rp::RigidBodyHandle, Repl>,
+}
+
+/// One replicated state of an assembly: the sender's stamp (its clock, s), pose, v, ω.
+#[derive(Clone, Copy)]
+pub(super) struct Sample {
+    t: f64,
+    pose: rp::Pose,
+    v: Vec3,
+    w: Vec3,
+}
+
+/// The receiver's per-primitive interpolation state (prim, ctor Studio), with
+/// the sender and the wire in front of it. Read (Windows 0.744), CHAR-NOTES round CHAR-5:
+/// * a packet's sample goes in Studio (clock offset, `offset`) and
+///   Studio (`interval`, the ring of ≤ 10 samples, the trim);
+/// * once a frame the interpolator Studio
+///   takes the target time Studio, the sample index Studio and the
+///   pose Studio (Hermite Studio, velocity Studio) and writes
+///   it with Primitive::setPV Studio.
+/// **Fitted** (the network, not in the binary): the sender's period and the wire's transit
+/// (`repl_net`), to Lab B's server copy (`probes/studio/runs-T11B/r1`).
+pub(super) struct Repl {
+    wire: std::collections::VecDeque<(f64, Sample)>,
+    buf: std::collections::VecDeque<Sample>,
+    /// The record before the first sample (buffer: the copy's PV when the first
+    /// sample came, at that frame's target time; Studio tail, count == 1).
+    first: Option<Sample>,
+    /// I: mean stamp gap (f32, 0.1 at construction).
+    interval: f32,
+    /// I: mean (arrival − stamp), 0 until the first packet.
+    offset: f64,
+    /// buffer /: the last frame's time and target time.
+    prev_now: f64,
+    prev_target: f64,
+    /// The pose / v / ω written last (buffer.., held while the target does not move).
+    out: Option<(rp::Pose, Vec3, Vec3)>,
+    frames: u64,
+    /// (index, alpha, gap) of the last interpolation (RUSTUDIO_REPL_DEBUG).
+    dbg: (usize, f32, f32),
+}
+
+impl Default for Repl {
+    fn default() -> Self {
+        Repl {
+            wire: Default::default(),
+            buf: Default::default(),
+            first: None,
+            interval: 0.1, // Studio: param_1[4] = 0x3dcccccd
+            offset: 0.0,
+            prev_now: 0.0,
+            prev_target: 0.0,
+            out: None,
+            frames: 0,
+            dbg: (0, 0.0, 0.0),
+        }
+    }
+}
+
+/// `RUSTUDIO_REPL`: `interp` (default: `Repl`), anything else: CHAR-4's fixed delay
+/// (`RUSTUDIO_REPL_DELAY`, default 0 = the owner's frame-start state every frame).
+pub(super) fn repl_mode() -> &'static str {
+    static M: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::env::var("RUSTUDIO_REPL").unwrap_or_else(|_| "interp".into()))
+}
+
+/// The network in front of the interpolator: (send period, transit) in seconds, for the
+/// server's copy of a client-owned body (`to_server`) or the client's copy of a
+/// server-owned one. **Fitted** (the binary does not fix the network) to the T11 rows of
+/// the full contact place (CHAR-NOTES round CHAR-5 §1): a sample every frame, no transit
+/// either way, passes all six; any transit (0.0167 s one way or the other, 0.05, 0.21) fails
+/// T11_push's root speed. Lab B's server copy trails its owner by 0.38 → 0.30 s, which the
+/// read structure reproduces only with a 0.21 s transit (`0.0333,0.2083,0`, 1 of 6 rows):
+/// the two recordings are not reconciled. `RUSTUDIO_REPL_NET=period,to_server,to_client`.
+fn repl_net(to_server: bool) -> (f64, f64) {
+    static N: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("RUSTUDIO_REPL_NET")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|x| x.trim().parse::<f64>().ok());
+                Some((it.next()??, it.next()??, it.next()??))
+            })
+            .unwrap_or((1.0 / 60.0, 0.0, 0.0))
+    });
+    (n.0, if to_server { n.1 } else { n.2 })
+}
+
+impl Repl {
+    // Live constants (Windows 0.744; StudioAppSettings of in a hidden Studio for the D-flags).
+    /// DFIntTargetTimeDelayFacctorTenths (default 10 at Studio, live 20) / 10.0.
+    const K: f32 = 2.0;
+    /// DFIntInterpolationAwareTargetTimeLerpHundredth 13 / 100.0.
+    const LERP: f32 = 0.13;
+    /// DFIntMaxAverageFrameDelayExceedFactor 3.
+    const EXCEED: f32 = 3.0;
+    /// DFIntInterpolationMaxDelayMSec 500 / 1000.0.
+    const MAX_GAP: f32 = 0.5;
+    /// The ring's capacity (Studio = 10) and NumFramesToKeepAfterInterpolation (1).
+    const CAP: usize = 10;
+    const KEEP: usize = 1;
+
+    /// Studio (InterpolationAwareTargetTime on): the time the copy is shown at.
+    fn target(&self, now: f64) -> f64 {
+        let iv = self.interval as f64;
+        let lag = if iv >= 1e-6 { (Self::K * self.interval) as f64 } else { 0.0 };
+        let raw = now - self.offset - lag;
+        if self.prev_target != 0.0 && self.prev_now != 0.0 {
+            let a = Self::LERP as f64;
+            let t = (((now - self.prev_now) as f32) as f64 + self.prev_target) * (1.0 - a) + a * raw;
+            if let Some(n) = self.buf.back() {
+                if t > n.t {
+                    return n.t;
+                }
+            }
+            if self.prev_target <= t {
+                return t;
+            }
+            return self.prev_target;
+        }
+        raw
+    }
+
+    /// Studio: the first sample whose stamp is not before `t` (len when none).
+    fn index(&self, t: f64) -> usize {
+        self.buf.iter().position(|s| !(s.t < t)).unwrap_or(self.buf.len())
+    }
+
+    /// One frame: send the owner's state, take what arrived, write the copy's state.
+    /// `owner` is the owner's frame-start state, `shown` the copy's current one.
+    fn frame(&mut self, now: f64, to_server: bool, owner: (rp::Pose, Vec3, Vec3), shown: (rp::Pose, Vec3, Vec3)) -> Option<(rp::Pose, Vec3, Vec3)> {
+        self.frame_net(now, repl_net(to_server), owner, shown)
+    }
+
+    /// `frame` with the network given: (send period, transit) in seconds.
+    fn frame_net(&mut self, now: f64, net: (f64, f64), owner: (rp::Pose, Vec3, Vec3), shown: (rp::Pose, Vec3, Vec3)) -> Option<(rp::Pose, Vec3, Vec3)> {
+        let (period, transit) = net;
+        let every = ((period * 60.0).round() as u64).max(1);
+        if self.frames % every == 0 {
+            self.wire.push_back((now + transit, Sample { t: now, pose: owner.0, v: owner.1, w: owner.2 }));
+        }
+        self.frames += 1;
+        while self.wire.front().is_some_and(|(at, _)| *at <= now + 1e-9) {
+            let (_, s) = self.wire.pop_front().unwrap();
+            // Studio: offset = first (arrival − stamp), then += 0.1·(new − offset).
+            let o = now - s.t;
+            self.offset = if self.offset != 0.0 { (o - self.offset) * 0.1 + self.offset } else { o };
+            // Studio: a sample later than the newest feeds the mean gap.
+            if let Some(n) = self.buf.back() {
+                let gap = s.t - n.t;
+                if gap < 0.0 {
+                    continue;
+                }
+                if gap <= 1e-6 {
+                    *self.buf.back_mut().unwrap() = Sample { t: n.t, ..s };
+                    continue;
+                }
+                self.interval = (gap as f32).min(Self::MAX_GAP) * 0.1 + self.interval * 0.9;
+            }
+            if self.buf.len() == Self::CAP {
+                self.buf.pop_front();
+            }
+            // Samples more than KEEP before the last target time go.
+            let mut i = self.index(self.prev_target);
+            while i > Self::KEEP && !self.buf.is_empty() {
+                self.buf.pop_front();
+                i -= 1;
+            }
+            self.buf.push_back(s);
+            if self.buf.len() == 1 {
+                self.prev_target = self.target(now);
+                self.first = Some(Sample { t: self.prev_target, pose: shown.0, v: shown.1, w: shown.2 });
+            }
+        }
+        if self.buf.is_empty() {
+            return None;
+        }
+        let t = self.target(now);
+        let newest = *self.buf.back().unwrap();
+        // Studio: past the newest sample the newest is held; a target that did not
+        // move keeps the last output (InterpolationAwareTargetTime).
+        let res = if t >= newest.t {
+            (newest.pose, newest.v, newest.w)
+        } else if t == self.prev_target && self.out.is_some() {
+            self.out.unwrap()
+        } else {
+            let i = self.index(t);
+            let mut p = if i == 0 { self.first.unwrap_or(newest) } else { self.buf[i - 1] };
+            let mut n = self.buf[i];
+            let mut g = (n.t - p.t) as f32;
+            // Studio: a gap over 3 mean gaps restarts from one frame back, at rest.
+            if self.interval * Self::EXCEED < g {
+                p.t = t - 0.0166;
+                p.v = Vec3::ZERO;
+                p.w = Vec3::ZERO;
+                n.v = Vec3::ZERO;
+                n.w = Vec3::ZERO;
+                g = (n.t - p.t) as f32;
+                if i == 0 {
+                    self.first = Some(p);
+                } else {
+                    self.buf[i - 1] = p;
+                }
+                self.buf[i] = n;
+            }
+            let a = if g > 1e-6 { ((t - p.t) / g as f64) as f32 } else { 1.0 };
+            self.dbg = (i, a, g);
+            let (a2, a3) = (a * a, a * a * a);
+            let h00 = 2.0 * a3 - 3.0 * a2 + 1.0;
+            let h01 = 3.0 * a2 - 2.0 * a3;
+            let h10 = a3 - 2.0 * a2 + a;
+            let h11 = a3 - a2;
+            // Studio: cubic Hermite of the positions with the sample velocities as
+            // tangents (× the gap); the rotation here is a slerp by h01 (Studio's own
+            // rotation blend through the angular velocities is not ported: the copies T11
+            // compares do not turn).
+            let pt = gv(p.pose.translation);
+            let nt = gv(n.pose.translation);
+            let pos = pt * h00 + nt * h01 + (p.v * h10 + n.v * h11) * g;
+            let mut pose = n.pose;
+            pose.translation = rv(pos);
+            pose.rotation = p.pose.rotation.slerp(n.pose.rotation, h01);
+            // Studio: v = v_n·s + v_p·(1 − s), s = 3a² − 2a³ (the samples' own
+            // velocities, not a pose difference).
+            let v = n.v * h01 + p.v * h00;
+            let w = n.w * h01 + p.w * h00;
+            // Studio: samples before i − 1 go.
+            for _ in 0..i.saturating_sub(1) {
+                self.buf.pop_front();
+            }
+            (pose, v, w)
+        };
+        self.prev_now = now;
+        self.prev_target = t;
+        self.out = Some(res);
+        Some(res)
+    }
+}
+
+/// The client's copy of a part the server took over (lane DEATH, CHAR-NOTES round DEATH): a
+/// dead character's loose parts are the server's from the frame its Humanoid dies there
+/// (Studio Play, probe T14srv_parts: GetNetworkOwner nil for every part, the client's
+/// ReceiveAge 0 for ~0.1 s, then ~0.08), and from then on the client only shows the
+/// server's copy through the receiver's interpolation buffer (`Repl`, STEP §7b): its view
+/// freezes for ~0.2 s and then trails the server by 0.18–0.20 s in all three recordings.
+/// **Fitted** (the binary does not fix the network): `RUSTUDIO_REPL_NET_HANDOVER=period,transit`,
+/// default 1/15 s and 0.03 s, fitted to the three recordings' Head / LowerTorso / LeftUpperArm
+/// heights (`target/death/fitdead.py`: 0.10 stud rms; CHAR-5's `RUSTUDIO_REPL_NET` stream,
+/// a sample every frame and no transit, gives 0.61 here). The two fits are of the same
+/// server → client stream and are not reconciled.
+#[derive(Default)]
+pub struct Handover {
+    repl: Repl,
+}
+
+fn handover_net() -> (f64, f64) {
+    static N: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("RUSTUDIO_REPL_NET_HANDOVER")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|x| x.trim().parse::<f64>().ok());
+                Some((it.next()??, it.next()??))
+            })
+            .unwrap_or((1.0 / 15.0, 0.03))
+    })
+}
+
+impl Handover {
+    /// One frame at game time `now`: the server's state of the part (CFrame, v, ω) goes on
+    /// the wire, the client's copy (now at `shown`) gets the buffer's pose, if any yet.
+    pub fn frame(&mut self, now: f64, owner: (Xform, Vec3, Vec3), shown: Xform) -> Option<Xform> {
+        let o = (pose(&owner.0), owner.1, owner.2);
+        let sh = (pose(&shown), owner.1, owner.2);
+        self.repl.frame_net(now, handover_net(), o, sh).map(|(p, _, _)| xform(&p))
+    }
+}
+
+/// CHAR-4's replication delay (`RUSTUDIO_REPL` other than `interp`): the stand-in is the owner's
+/// frame-start state `RUSTUDIO_REPL_DELAY=server,client` seconds old (default 0 0). Superseded
+/// by `Repl` (the buffer as read, STEP §7b); kept for comparison.
+fn repl_delay(role: OwnRole) -> f32 {
+    static D: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let d = *D.get_or_init(|| {
+        std::env::var("RUSTUDIO_REPL_DELAY")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|x| x.trim().parse::<f32>().ok());
+                Some((it.next()??, it.next()??))
+            })
+            .unwrap_or((0.0, 0.0))
+    });
+    if role == OwnRole::GhostOfClient { d.0 } else { d.1 }
 }
 
 impl Physics {
@@ -371,11 +714,16 @@ impl Physics {
                 .mass_properties(rp::MassProperties::default())
                 .friction(props.friction)
                 .restitution(props.elasticity)
-                .active_hooks(rp::ActiveHooks::MODIFY_SOLVER_CONTACTS)
+                // (rapier only: the slop / MidSolve emulation; the Studio solver reads
+                // the manifolds' points itself)
+                .active_hooks(if self.studio.is_some() { rp::ActiveHooks::empty() } else { rp::ActiveHooks::MODIFY_SOLVER_CONTACTS })
                 .user_data(weights_data(props.friction_weight, props.elasticity_weight))
                 .collision_groups(self.part_groups(doc, *r));
             let local = inv * pose(xf);
             let c = self.world.insert_collider(b.position(local * offset), Some(body));
+            if let Some(sv) = self.studio.as_mut() {
+                sv.note_character_collider(c);
+            }
             self.by_collider.insert(c, *r);
             self.hums.of_part.insert(*r, model);
             list.push(HumPart { part: *r, collider: c, offset, friction: props.friction, mp });
@@ -397,7 +745,7 @@ impl Physics {
                 eprintln!("HUMDBG   {name} {:?} doc {:.4}", p.mp.mass(), part_mass(doc, p.part).mass);
             }
         }
-        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::new(), sig: sig_hash, solve0: None, arb: [0, 0] });
+        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::default(), sig: sig_hash, solve0: None, arb: [0, 0] });
     }
 
     /// What a character's body depends on besides its pose: each part's
@@ -482,7 +830,7 @@ impl Physics {
     /// with the server bodies' stand-ins and they with its stand-in
     /// (`OwnerHooks`), never with each other directly.
     pub fn set_ownership_split(&mut self, client: Option<Ref>, server: &[Ref]) {
-        let mut want: HashMap<rp::RigidBodyHandle, OwnRole> = HashMap::new();
+        let mut want: HashMap<rp::RigidBodyHandle, OwnRole> = HashMap::default();
         if !server.is_empty() {
             if let Some(h) = client.and_then(|m| self.hums.by_model.get(&m)) {
                 want.insert(h.body, OwnRole::GhostOfClient);
@@ -505,6 +853,8 @@ impl Physics {
             .map(|(b, _)| *b)
             .collect();
         for b in gone {
+            self.hums.history.remove(&b);
+            self.hums.repl.remove(&b);
             if let Some(g) = self.hums.ghosts.remove(&b) {
                 for (_, gc) in &g.colliders {
                     self.by_collider.remove(gc);
@@ -512,13 +862,18 @@ impl Physics {
                 self.world.remove_body(g.body);
             }
         }
+        // (In body order: the stand-ins' arena slots, and with them the solver's body
+        // order, are then the same on every run.)
+        let mut want: Vec<(rp::RigidBodyHandle, OwnRole)> = want.into_iter().collect();
+        want.sort_unstable_by_key(|(b, _)| b.into_raw_parts());
         for (b, role) in &want {
             if self.hums.ghosts.contains_key(b) {
                 continue;
             }
             let Some(orig) = self.world.bodies.get(*b) else { continue };
             let list: Vec<rp::ColliderHandle> = orig.colliders().to_vec();
-            let ghost = self.world.insert_body(rp::RigidBodyBuilder::kinematic_position_based().pose(*orig.position()).build());
+            let builder = rp::RigidBodyBuilder::kinematic_position_based().pose(*orig.position());
+            let ghost = self.world.insert_body(builder.build());
             let mut colliders = Vec::new();
             for ch in list {
                 let Some(c) = self.world.colliders.get(ch) else { continue };
@@ -533,6 +888,9 @@ impl Physics {
                     .density(0.0)
                     .active_hooks(rp::ActiveHooks::FILTER_CONTACT_PAIRS);
                 let gc = self.world.insert_collider(copy, Some(ghost));
+                if let Some(sv) = self.studio.as_mut() {
+                    sv.note_character_collider(gc);
+                }
                 // Touching the stand-in is touching the part (Touched).
                 if let Some(part) = self.by_collider.get(&ch).copied() {
                     self.by_collider.insert(gc, part);
@@ -541,6 +899,7 @@ impl Physics {
             }
             self.hums.ghosts.insert(*b, Ghost { body: ghost, colliders, role: *role });
         }
+        self.hums.frame_start = true;
         // Every collider's side.
         self.hums.roles.clear();
         for (b, g) in &self.hums.ghosts {
@@ -582,25 +941,111 @@ impl Physics {
                 eprintln!("HUMGHOST step={} of {:?} colliders {} touching {} body at {:?} ghost at {:?}", self.steps, g.role as u8, g.colliders.len(), touching, at(*b), at(g.body));
             }
         }
+        let mut list = list;
+        list.sort_unstable_by_key(|(b, _)| b.into_raw_parts());
+        // RUSTUDIO_SOLVER=studio: the other side's copy takes the owner's pose and velocity
+        // once a frame, when the network interpolator writes it (Studio →
+        // world vtbl[1], after a frame's ticks, STEP §7); between, a copy is a
+        // non-sim record that keeps its pose (§7a step 5) and is touched only on the tick
+        // after the write (`MidSolve::remote_awake`). Under rapier the stand-ins follow
+        // every tick.
+        let frame = std::mem::take(&mut self.hums.frame_start);
+        let studio = self.studio.is_some();
+        self.hums.mid.remote_awake = frame || !studio;
         for (orig, ghost) in list {
-            let Some(p) = self.world.bodies.get(orig).map(|b| *b.position()) else { continue };
+            if studio && !frame {
+                self.ghost_shapes(orig);
+                continue;
+            }
+            let Some(mut p) = self.world.bodies.get(orig).map(|b| *b.position()) else { continue };
+            // The state the other side has now: the owner's frame-start state
+            // `repl_delay` ago (studio path; the newest one at least that old, else
+            // the oldest kept).
+            let mut delayed = None;
+            if studio && repl_mode() == "interp" {
+                let dt = self.world.integration_parameters.dt.max(1e-6) as f64;
+                let now = self.steps as f64 * dt;
+                let (v, w) = self.world.bodies.get(orig).map(|b| (gv(b.velocity_at_point(p.translation)), gv(b.angvel()))).unwrap_or_default();
+                let shown = self
+                    .world
+                    .bodies
+                    .get(ghost)
+                    .map(|g| (*g.position(), gv(g.linvel()), gv(g.angvel())))
+                    .unwrap_or((p, v, w));
+                let to_server = self.hums.ghosts.get(&orig).map(|g| g.role) == Some(OwnRole::GhostOfClient);
+                let r = self.hums.repl.entry(orig).or_default();
+                let res = r.frame(now, to_server, (p, v, w), shown);
+                if std::env::var_os("RUSTUDIO_REPL_DEBUG").is_some() {
+                    eprintln!(
+                        "REPL t={now:.4} owner z={:.3} vz={:.2} copy {:?} n={} iv={:.4} off={:.4} tgt={:.4} dbg {:?} n {}",
+                        p.translation.z,
+                        v.z,
+                        res.map(|(q, v, _)| (q.translation.z, v.z)),
+                        r.buf.len(),
+                        r.interval,
+                        r.offset,
+                        r.prev_target,
+                        r.dbg,
+                        r.buf.len()
+                    );
+                }
+                match res {
+                    Some((q, v, w)) => {
+                        p = q;
+                        delayed = Some((v, w));
+                    }
+                    None => {
+                        p = shown.0;
+                        delayed = Some((shown.1, shown.2));
+                    }
+                }
+            } else if studio {
+                let role = self.hums.ghosts.get(&orig).map(|g| g.role).unwrap_or(OwnRole::GhostOfServer);
+                let dt = self.world.integration_parameters.dt.max(1e-6);
+                let lag = (repl_delay(role) / dt).round() as u64;
+                let now = self.steps;
+                let (v, w) = self.world.bodies.get(orig).map(|b| (gv(b.velocity_at_point(p.translation)), gv(b.angvel()))).unwrap_or_default();
+                let hist = self.hums.history.entry(orig).or_default();
+                hist.push_back((now, p, v, w));
+                while hist.len() > 1 && now.saturating_sub(hist[1].0) >= lag {
+                    hist.pop_front();
+                }
+                let e = hist[0];
+                p = e.1;
+                delayed = Some((e.2, e.3));
+            }
             // Put there, not moved there: a stand-in has no velocity of its
             // own to hand over (the other side only knows where the body is;
             // moved kinematically it rammed the server's character away at
             // the player's walking speed).
+            // RUSTUDIO_SOLVER=studio: the other side's copy of an assembly is a
+            // non-simulated body of the batch at the velocity its PV holds (STEP §7a
+            // step 5: v = obj, ω = obj, infinite mass), the owner's velocity
+            // as replicated; its contact rows move at it (T11's creep). Under rapier
+            // the stand-in keeps no velocity (see above).
+            let vel = delayed;
             if let Some(g) = self.world.bodies.get_mut(ghost) {
                 if *g.position() != p {
                     g.set_position(p, true);
                 }
+                if let Some((v, w)) = vel {
+                    g.set_linvel(rv(v), true);
+                    g.set_angvel(rv(w), true);
+                }
             }
-            let pairs = self.hums.ghosts.get(&orig).map(|g| g.colliders.clone()).unwrap_or_default();
-            for (oc, gc) in pairs {
-                let Some(local) = self.world.colliders.get(oc).and_then(|c| c.position_wrt_parent().copied()) else { continue };
-                if let Some(c) = self.world.colliders.get_mut(gc) {
-                    let have = c.position_wrt_parent().copied().unwrap_or(rp::Pose::IDENTITY);
-                    if (local.translation - have.translation).length() > 1e-6 || local.rotation.angle_between(have.rotation) > 1e-6 {
-                        c.set_position_wrt_parent(local);
-                    }
+            self.ghost_shapes(orig);
+        }
+    }
+
+    /// A stand-in's shapes where its body's animated pose has them.
+    fn ghost_shapes(&mut self, orig: rp::RigidBodyHandle) {
+        let pairs = self.hums.ghosts.get(&orig).map(|g| g.colliders.clone()).unwrap_or_default();
+        for (oc, gc) in pairs {
+            let Some(local) = self.world.colliders.get(oc).and_then(|c| c.position_wrt_parent().copied()) else { continue };
+            if let Some(c) = self.world.colliders.get_mut(gc) {
+                let have = c.position_wrt_parent().copied().unwrap_or(rp::Pose::IDENTITY);
+                if (local.translation - have.translation).length() > 1e-6 || local.rotation.angle_between(have.rotation) > 1e-6 {
+                    c.set_position_wrt_parent(local);
                 }
             }
         }
@@ -626,7 +1071,7 @@ impl Physics {
 
     /// Each part's CanCollide as the document has it now: a collider
     /// collides or only senses accordingly.
-    pub fn sync_humanoid_collide(&mut self, model: Ref, collide: &HashMap<Ref, bool>) {
+    pub fn sync_humanoid_collide(&mut self, model: Ref, collide: &std::collections::HashMap<Ref, bool>) {
         let Some(h) = self.hums.by_model.get(&model) else { return };
         for p in &h.parts {
             let Some(on) = collide.get(&p.part) else { continue };
@@ -672,7 +1117,7 @@ impl Physics {
     /// root's frame while it idles, walks, runs and presses against a wall
     /// (hands up to 1.6 studs ahead, UpperTorso 0.26). A part outside the
     /// rig counts where its collider is.
-    fn humanoid_rest_mass(&mut self, model: Ref, rest: &HashMap<Ref, Xform>) {
+    fn humanoid_rest_mass(&mut self, model: Ref, rest: &std::collections::HashMap<Ref, Xform>) {
         let Some(h) = self.hums.by_model.get(&model) else { return };
         let total = h
             .parts
@@ -699,7 +1144,7 @@ impl Physics {
 
     /// Puts each part's collider where the animated pose has it: `local` =
     /// each part's pose relative to the root (C0·Transform·C1⁻¹ chained).
-    pub fn set_humanoid_pose(&mut self, model: Ref, local: &HashMap<Ref, Xform>, rest: &HashMap<Ref, Xform>) {
+    pub fn set_humanoid_pose(&mut self, model: Ref, local: &std::collections::HashMap<Ref, Xform>, rest: &std::collections::HashMap<Ref, Xform>) {
         self.humanoid_rest_mass(model, rest);
         let Some(h) = self.hums.by_model.get(&model) else { return };
         for p in &h.parts {
@@ -740,7 +1185,7 @@ impl Physics {
                 continue;
             }
             let own: HashSet<rp::ColliderHandle> = h.parts.iter().map(|p| p.collider).collect();
-            let mut seen: HashSet<(rp::ColliderHandle, rp::ColliderHandle)> = HashSet::new();
+            let mut seen: HashSet<(rp::ColliderHandle, rp::ColliderHandle)> = HashSet::default();
             for p in &h.parts {
                 let Some(c) = self.world.colliders.get(p.collider) else { continue };
                 if c.is_sensor() {
@@ -961,6 +1406,22 @@ impl Physics {
     /// After a world step: a character whose assembly has just finished a
     /// solve (every tick at level 1, every 2nd at level 2) shows that state.
     pub(super) fn humanoid_solved(&mut self) {
+        if self.studio.is_some() {
+            // RUSTUDIO_SOLVER=studio: the solver itself does what the rest of this
+            // function emulates on rapier (restitution rows, the 0.05 slop / 0.7
+            // depenetration, the level-2 2h solve with the assembly out of the solver
+            // in between, the arbiter's slots 0 / 6): solver/CHAR-NOTES.md "Retired".
+            // A body between its solves is not moved, so what scripts read is the body.
+            let all: Vec<Ref> = self.hums.by_model.keys().copied().collect();
+            for m in all {
+                let now = self.humanoid_root_now(m);
+                if let Some(h) = self.hums.by_model.get_mut(&m) {
+                    h.rose = false;
+                    h.shown = now;
+                }
+            }
+            return;
+        }
         // (`MidSolve`: the tick between two level-2 solves changed nothing)
         for hb in self.hums.by_model.values() {
             if let (Some((p, v, w)), Some(b)) = (hb.hold, self.world.bodies.get_mut(hb.body)) {
@@ -1172,7 +1633,7 @@ impl Physics {
 
     /// The owning client's movers on its character (read each frame from
     /// the client document; replicated ones are the server's already).
-    pub fn set_client_movers(&mut self, cd: &Document, c2s: &HashMap<Ref, Ref>, client_model: Ref) {
+    pub fn set_client_movers(&mut self, cd: &Document, c2s: &std::collections::HashMap<Ref, Ref>, client_model: Ref) {
         self.hums.foreign.clear();
         self.hums.foreign_att.clear();
         let Some(cws) = cd.workspace() else { return };
@@ -1213,7 +1674,8 @@ impl Physics {
     /// has, as in Studio, where the owner's own DataModel drives them (probe
     /// T13: the LocalScript sets the vehicle's VectorForce.Force; the server
     /// never sees it, and the vehicle accelerates at F / m all the same).
-    pub fn set_owned_movers(&mut self, cd: &Document, s2c: &HashMap<Ref, Ref>, c2s: &HashMap<Ref, Ref>, owned: &[Ref]) {
+    pub fn set_owned_movers(&mut self, cd: &Document, s2c: &std::collections::HashMap<Ref, Ref>, c2s: &std::collections::HashMap<Ref, Ref>, owned: &[Ref]) {
+        self.hums.owned_movers.clear();
         if owned.is_empty() {
             return;
         }
@@ -1244,7 +1706,34 @@ impl Physics {
             }
             if ok {
                 self.movers.insert(r, m);
+                self.hums.owned_movers.insert(r);
             }
+        }
+        // The solver's connector for each, from the client's values (studio_constraints).
+        self.hums.owned_descs.clear();
+        if self.studio.is_some() {
+            let owned: Vec<Ref> = self.hums.owned_movers.iter().copied().collect();
+            for r in owned {
+                let Some(cr) = s2c.get(&r).copied() else { continue };
+                self.hums.desc_remap.clear();
+                let parts = ["Attachment0", "Attachment1"]
+                    .iter()
+                    .filter_map(|n| match cd.prop(cr, n) {
+                        Some(rbx_dom_weak::types::Variant::Ref(a)) if !a.is_none() => cd.dom.get_by_ref(a).map(|i| i.parent()),
+                        _ => None,
+                    })
+                    .chain(cd.dom.get_by_ref(cr).map(|i| i.parent()))
+                    .collect::<Vec<_>>();
+                for cp in parts {
+                    if let Some(sp) = c2s.get(&cp) {
+                        self.hums.desc_remap.insert(cp, *sp);
+                    }
+                }
+                if let Some(d) = self.studio_desc(cd, cws, cr) {
+                    self.hums.owned_descs.insert(r, d);
+                }
+            }
+            self.hums.desc_remap.clear();
         }
     }
 
@@ -1275,11 +1764,31 @@ impl Physics {
                     None => {
                         if let Some(b) = self.world.bodies.get_mut(body) {
                             if !b.is_kinematic() {
+                                // Zeroed while still dynamic: rapier ignores set_linvel on a
+                                // position-based kinematic body and only its own step rewrites
+                                // it from the move, which RUSTUDIO_SOLVER=studio never runs —
+                                // the walk's velocity stayed through the seated phase and the
+                                // character left the seat with it (T12_seat103.5 / 104).
+                                b.set_linvel(rp::Vector::ZERO, true);
+                                b.set_angvel(rp::Vector::ZERO, true);
                                 b.set_body_type(rp::RigidBodyType::KinematicPositionBased, true);
                             }
                             b.set_next_kinematic_position(pose(&root_at));
                             b.set_linvel(rp::Vector::ZERO, true);
                             b.set_angvel(rp::Vector::ZERO, true);
+                        }
+                        // RUSTUDIO_SOLVER=studio: welded to an anchored seat the character is
+                        // part of the seat's anchored assembly, at seat · C0 · C1⁻¹. The
+                        // kinematic target alone never got there (the body stayed where Seated
+                        // began, 0.8 stud off the seat's centre on Seat_103, and left the seat
+                        // from there: SEATJUMP_103 landed with its outer floor rays on the
+                        // ground, 0.8 stud into the seat, T12_seat103.5 / 104).
+                        if self.studio.is_some() {
+                            if let Some(b) = self.world.bodies.get_mut(body) {
+                                if *b.position() != pose(&root_at) {
+                                    b.set_position(pose(&root_at), true);
+                                }
+                            }
                         }
                         if let Some(h) = self.hums.by_model.get_mut(&model) {
                             h.seat = Some((part, None));
@@ -1316,7 +1825,7 @@ impl Physics {
         let Some(h) = self.hums.by_model.get(&model) else { return Vec::new() };
         let own: HashSet<rp::ColliderHandle> = h.parts.iter().map(|p| p.collider).collect();
         let qp = self.world.query_pipeline();
-        let mut out: HashSet<Ref> = HashSet::new();
+        let mut out: HashSet<Ref> = HashSet::default();
         for p in &h.parts {
             let Some(c) = self.world.colliders.get(p.collider) else { continue };
             let aabb = rapier3d::parry::bounding_volume::BoundingVolume::loosened(&c.compute_aabb(), 0.1);
@@ -1378,9 +1887,24 @@ impl Physics {
         out
     }
 
-    /// Whether something that moves touches the character (the arbiter's
-    /// sensor list is empty only when nothing does).
+    /// Whether the Humanoid's sensor list (count) is non-empty: Studio
+    /// asks level 1 while it is, Studio puts slot 3 = 1 on each listed part's body
+    /// (STEP §3.7 [C3]/[C4]). Its writer is not found ([C4]: not the ladder sensor
+    /// Studio, not Studio). On the studio path it is taken as
+    /// empty: Studio's T10 pushes run at the pair's level-2 values (14.26 / 9.93 = the
+    /// port's 14.263 / 9.877 with the list empty; with "touching something that moves"
+    /// the character asks 1 and the pair runs at 14.81 / 11.91) — fitted to that
+    /// recording (CHAR-NOTES round CHAR-4). `RUSTUDIO_HUM_LIST=moving` restores the
+    /// stand-in there; the rapier path keeps it (`=ladder` empties it there too).
     pub fn humanoid_touching_moving(&self, model: Ref) -> bool {
+        static EMPTY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EMPTY.get_or_init(|| match std::env::var("RUSTUDIO_HUM_LIST").as_deref() {
+            Ok("ladder") => true,
+            Ok("moving") => false,
+            _ => crate::solver::kind() != crate::solver::SolverKind::Rapier,
+        }) {
+            return false;
+        }
         let Some(h) = self.hums.by_model.get(&model) else { return false };
         for p in &h.parts {
             for pair in self.world.narrow_phase.contact_pairs_with(p.collider) {
@@ -1465,6 +1989,107 @@ impl Physics {
             let Some(body) = self.humanoid_body(model) else { continue };
             let Some(hb) = self.hums.by_model.get_mut(&model) else { continue };
             let handle = hb.body;
+            if let Some(sv) = self.studio.as_mut() {
+                // RUSTUDIO_SOLVER=studio (solver/CHAR-NOTES.md): the Humanoid's level
+                // is its slot-3 request (Studio(body, req, 3), STEP
+                // §3.7); the solver's arbiter combines it with the body's own slots 0,
+                // 4, 6 and applies debounce and the rise rule. The forces are external
+                // forces on the root body's accumulator ( /) added only on
+                // the body's own solve tick (Studio, JOINT §3) and
+                // integrated over that solve's dt = L·h (STEP §4.1a): one force function
+                // call per own solve with k = L substeps of h (Studio; FInt
+                // SimAdaptiveHumanoidPDControllerSubstepMultiplier live 1).
+                // RUSTUDIO_SOLVER_LAB_SLOT3=L (harness, run_rustudio_play.py): Studio's tick
+                // labs step the world with workspace:StepPhysics from Edit, where the
+                // Humanoid's frame step does not refresh its slot-3 request: the recordings
+                // walk at level 2 throughout, also pressed against a moving block where the
+                // Play-mode arbiter (touching something that moves) asks for 1. L holds it.
+                static LAB: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+                let lab = *LAB.get_or_init(|| std::env::var("RUSTUDIO_SOLVER_LAB_SLOT3").ok().and_then(|v| v.parse().ok()));
+                let req = match (lab, hb.ctl.as_ref()) {
+                    (_, None) => 0,
+                    (Some(l), Some(_)) => l,
+                    (None, Some(c)) => c.level.max(1),
+                };
+                sv.set_level_request(handle, 3, req);
+                let (lvl, own) = sv.next_solve(handle);
+                hb.lvl = lvl;
+                hb.span = if own { lvl } else { 0 };
+                if !own {
+                    continue;
+                }
+                let Some(ctl) = hb.ctl.as_mut() else { continue };
+                let step = ctl.step;
+                if let Some(v) = ctl.swim {
+                    if let Some(b) = self.world.bodies.get_mut(handle) {
+                        b.set_linvel(rv(v), true);
+                        if b.gravity_scale() != 0.0 {
+                            b.set_gravity_scale(0.0, true);
+                        }
+                    }
+                    continue;
+                }
+                let f = ctl.hum.force(&body, &step, lvl as u32, h);
+                ctl.last = f;
+                if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+                    eprintln!(
+                        "HUMSTEP {} st={:?} lvl={} pos={:.3},{:.3},{:.3} v={:.4},{:.4},{:.4} F={:.1},{:.1},{:.1} dv={:.4},{:.4},{:.4}",
+                        self.steps, ctl.hum.state, lvl, body.pos.x, body.pos.y, body.pos.z, body.v.x, body.v.y, body.v.z,
+                        f.force.x, f.force.y, f.force.z, f.dv.x, f.dv.y, f.dv.z
+                    );
+                }
+                let floor_part = ctl.floor_part;
+                if let Some(b) = self.world.bodies.get_mut(handle) {
+                    if f.dv != Vec3::ZERO {
+                        let v = gv(b.linvel()) + f.dv;
+                        b.set_linvel(rv(v), true);
+                    }
+                    b.add_force(rv(f.force), true);
+                    b.add_torque(rv(f.torque), true);
+                    if b.gravity_scale() != 1.0 {
+                        b.set_gravity_scale(1.0, true);
+                    }
+                    self.pushed.insert(handle);
+                }
+                // The reaction on a loose floor: the same accumulator
+                // rule on the floor's body, i.e. only on the floor's own solve tick.
+                if let (Some((force, at)), Some(fp)) = (f.floor, floor_part) {
+                    if let Some(fb) = self.body_of(fp).filter(|fb| *fb != handle) {
+                        if let Some(sv) = self.studio.as_mut() {
+                            sv.floor_touched(fb);
+                        }
+                        // The loose floor is solved at the character's level while the
+                        // character stands on it: its slot-3 request is the character's
+                        // (withdrawn when no character's floor reaction reaches it, below).
+                        // **Fitted** to probe T23 (a 25.2 swing on four ropes with the R15
+                        // character on it, Studio 0.747): with the swing at its own level 4
+                        // the reaction landed on one tick in four and the swing lost speed
+                        // (peaks 17.02 / 16.32 / 15.69 / 15.12 against Studio's 18.03 / 17.92
+                        // / 17.80 / 17.70, a 0.05 s longer half-period, the root sliding 0.37
+                        // on it against 0.25); with the character's level, 18.04 / 17.92 /
+                        // 17.81 / 17.71 and 0.255. The empty swing matches Studio either way.
+                        // Not read: which native call raises the floor's level.
+                        if !self.hums.by_model.values().any(|h| h.body == fb) {
+                            if let Some(sv) = self.studio.as_mut() {
+                                sv.set_level_request(fb, 3, lvl);
+                            }
+                            self.hums.floor_levels.insert(fb, self.steps);
+                        }
+                        let due = self.studio.as_ref().is_some_and(|sv| sv.next_solve(fb).1);
+                        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+                            let fl = self.studio.as_ref().map(|sv| sv.next_solve(fb));
+                            let fv = self.world.bodies.get(fb).map(|b| gv(b.linvel()));
+                            eprintln!("HUMFLOORSV {} lvl={} floor={:?} due={} F={:.1},{:.1},{:.1} at={:.2},{:.2},{:.2} floor_v={:?} step_v={:?}", self.steps, lvl, fl, due,
+                                force.x, force.y, force.z, at.x, at.y, at.z, fv, step.floor.map(|f| f.v));
+                        }
+                        if let Some(b) = self.world.bodies.get_mut(fb).filter(|b| b.is_dynamic() && due) {
+                            b.add_force_at_point(rv(force), rv(at), true);
+                            self.pushed.insert(fb);
+                        }
+                    }
+                }
+                continue;
+            }
             // The level the frame's arbiter asked for takes effect at once
             // when it is lower (Studio, which arms the debounce) and,
             // when higher, on a tick the new level divides
@@ -1567,6 +2192,19 @@ impl Physics {
                 }
             }
         }
+        // A floor no character has stood on for a while (its level-1 solves span
+        // one tick, its level-2 two): its slot-3 request goes (`floor_levels`).
+        if !self.hums.floor_levels.is_empty() {
+            let now = self.steps;
+            let gone: Vec<rp::RigidBodyHandle> =
+                self.hums.floor_levels.iter().filter(|(_, t)| now.saturating_sub(**t) > FLOOR_LEVEL_KEEP).map(|(b, _)| *b).collect();
+            for b in gone {
+                self.hums.floor_levels.remove(&b);
+                if let Some(sv) = self.studio.as_mut() {
+                    sv.set_level_request(b, 3, 0);
+                }
+            }
+        }
         self.hums.fext.clear();
     }
 
@@ -1580,7 +2218,7 @@ impl Physics {
         rot: Quat,
         sh: &HumShape,
         had_floor: bool,
-        own: &HashSet<Ref>,
+        own: &std::collections::HashSet<Ref>,
     ) -> Option<(Floor, Option<Ref>)> {
         let f = self.find_floor(root, rot, sh, had_floor, own)?;
         let (v, w) = match f.part {
@@ -1628,7 +2266,7 @@ impl Physics {
 const SOLID_FLOOR_MASS_MULT: f32 = crate::humanoid::SOLID_FLOOR_MASS_MULT;
 
 /// A body's inverse inertia tensor in world axes.
-fn world_inv_inertia(b: &rp::RigidBody) -> Mat3 {
+pub(super) fn world_inv_inertia(b: &rp::RigidBody) -> Mat3 {
     let li = b.mass_properties().local_mprops.reconstruct_inertia_matrix();
     let li = Mat3::from_cols(
         Vec3::new(li.x_axis.x, li.x_axis.y, li.x_axis.z),

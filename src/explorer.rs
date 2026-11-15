@@ -65,6 +65,13 @@ fn expanded_key(st: &ExplorerState) -> u64 {
 #[derive(Clone)]
 struct DragRefs(Vec<Ref>);
 
+/// An Explorer drag of instances is under way (also on the frame it is let
+/// go; egui drops the payload on Escape). Plugin widgets hear it as a
+/// PluginDrag* drag (plugin_host/widgets_ui.rs `explorer_drag_widget`).
+pub fn explorer_drag_active(ctx: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<DragRefs>(ctx)
+}
+
 /// Where a drop lands relative to the row under the pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drop {
@@ -106,6 +113,12 @@ fn sorted_children(doc: &Document, r: Ref) -> Vec<Ref> {
         .children()
         .iter()
         .filter_map(|c| doc.dom.get_by_ref(*c))
+        // CoreGui / PluginGuiService (what plugins draw) aren't listed, as
+        // with Studio's defaults "Show Core GUI in Explorer while Playing" /
+        // "Show Plugin GUI Service in Explorer" off (Studio 0.747, slot 3,
+        // 2026-11-15: the Explorer of an edit place with plugin widgets and
+        // CoreGui ScreenGuis lists neither).
+        .filter(|i| r != doc.dom.root_ref() || !matches!(i.class.as_str(), "CoreGui" | "PluginGuiService" | "PluginDebugService" | "StudioService"))
         .map(|i| (crate::studio_panels::explorer_order(i.class.as_str()), i.name.to_lowercase(), i.referent()))
         .collect();
     kids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -538,9 +551,28 @@ impl Editor {
             }
         }
         if resp.drag_started() {
-            // Several selected objects drag together (Studio).
+            // Several selected objects drag together (Studio). An unselected
+            // row becomes the selection as its drag starts: Studio selects the
+            // pressed row, and a drop on a plugin widget carries no instances
+            // (Data "", MimeType "roblox/selection"), so plugins read Selection
+            // (checks/plugins/ref/captures/xdrag.txt S1, S5, S7).
             let refs = if selected { self.doc.selection.clone() } else { vec![r] };
+            if !selected && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                actions.push(RowAction::Click(r, false, false));
+            }
             resp.dnd_set_drag_payload(DragRefs(refs));
+        }
+        // A Toolbox card dropped on this row: inserted into it.
+        if resp.dnd_hover_payload::<crate::toolbox::ui::ToolboxDrag>().is_some() {
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, crate::theme::SELECT), egui::StrokeKind::Inside);
+        }
+        // (egui's dnd_release_payload takes whatever payload there is, of
+        // any type: ask only for the kind being carried, or an Explorer drag
+        // released here would be eaten by the Toolbox's check)
+        if egui::DragAndDrop::has_payload_of_type::<crate::toolbox::ui::ToolboxDrag>(ui.ctx()) {
+            if let Some(p) = resp.dnd_release_payload::<crate::toolbox::ui::ToolboxDrag>() {
+                self.toolbox_insert(p.0, crate::toolbox::insert::Target::Parent(r));
+            }
         }
         if let Some(p) = resp.dnd_release_payload::<DragRefs>() {
             let target = match drop.unwrap_or(Drop::Into) {

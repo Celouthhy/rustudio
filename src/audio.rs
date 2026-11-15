@@ -5,7 +5,8 @@
 //! owns one rodio `Player` connected to a shared mixer. The output device is opened lazily on
 //! the first `play()` from a helper thread, so `Audio::new()` never blocks or panics. When
 //! `RUSTUDIO_NO_AUDIO` is set, or no device can be opened, the engine runs silently: it still
-//! decodes (so bad data is reported), tracks pause/speed/loop state and times every sound with
+//! opens and pulls the same stream a device would play (so a sound that can't play fails the
+//! same way in headless runs), tracks pause/speed/loop state and times every sound with
 //! its decoded length and `Instant`, so `TimePosition`, `IsPlaying`, `Ended` and `DidLoop` keep
 //! working in tests and headless runs.
 //!
@@ -225,8 +226,15 @@ impl Iterator for LoopSource {
 }
 
 impl Source for LoopSource {
+    // One span for the whole stream: a file keeps its channels and rate, and the
+    // decoder's own figure is wrong for a converter downstream. rodio's
+    // symphonia decoder reports its whole packet buffer (not what is left of
+    // it), and Some(0) before the first packet is decoded, which Ogg Vorbis
+    // always is (its first audio packet has no output frames):
+    // UniformSourceIterator then reads a zero-length span and ends the sound
+    // at once, so every .ogg was silent and its Sound stopped at 0.0.
     fn current_span_len(&self) -> Option<usize> {
-        self.inner.current_span_len()
+        None
     }
     fn channels(&self) -> ChannelCount {
         self.inner.channels()
@@ -239,6 +247,34 @@ impl Source for LoopSource {
     }
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
         self.inner.try_seek(pos)
+    }
+}
+
+/// A stream with its first sample already pulled (to check it plays).
+struct Primed<S> {
+    first: Option<rodio::Sample>,
+    inner: S,
+}
+
+impl<S: Source> Iterator for Primed<S> {
+    type Item = rodio::Sample;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.first.take().or_else(|| self.inner.next())
+    }
+}
+
+impl<S: Source> Source for Primed<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> SampleRate {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -605,11 +641,47 @@ impl Audio {
             let _ = len.secs.set(d.as_secs_f64());
         }
 
+        // The same stream (decoder, seek, loop wrapper, resampler, effects)
+        // is opened with or without a device and must yield audio, so a
+        // sound that would play nothing fails here, and headless runs
+        // (RUSTUDIO_NO_AUDIO) fail the same way a real run does.
+        let per_sec = dec.sample_rate().get() as f64 * dec.channels().get() as f64;
+        let pos = seek_to(&mut dec, start);
+        let ctl = Arc::new(Ctl {
+            looped: AtomicBool::new(looped),
+            loops: AtomicU64::new(0),
+        });
+        let (bus, control) = self
+            .routes
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| (0, Arc::new(Mutex::new(Settings::default()))));
+        let mut source = rodio::source::UniformSourceIterator::new(
+            LoopSource {
+                inner: dec,
+                bytes: bytes.clone(),
+                ctl: ctl.clone(),
+                region,
+                pos,
+                per_sec,
+            },
+            ChannelCount::new(2).unwrap(),
+            SampleRate::new(dsp::RATE).unwrap(),
+        );
+        let first = source.next();
+        if first.is_none() && start <= 0.0 {
+            return Err(format!(
+                "cannot decode sound ({} bytes, looks like {}): the stream has no audio frames",
+                bytes.len(),
+                sniff(&bytes)
+            ));
+        }
+
         let (player, ctl) = match self.mixer() {
             None => {
                 if len.secs.get().is_none() {
                     // Silent timing needs the length now: count the decoded frames.
-                    match length_of(dec) {
+                    match decoder(&bytes).ok().and_then(length_of) {
                         Some(l) => {
                             let _ = len.secs.set(l);
                         }
@@ -635,17 +707,6 @@ impl Audio {
                             }
                         });
                 }
-                let per_sec = dec.sample_rate().get() as f64 * dec.channels().get() as f64;
-                let pos = seek_to(&mut dec, start);
-                let ctl = Arc::new(Ctl {
-                    looped: AtomicBool::new(looped),
-                    loops: AtomicU64::new(0),
-                });
-                let (bus, control) = self
-                    .routes
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| (0, Arc::new(Mutex::new(Settings::default()))));
                 let target = self.buses.get(&bus).map(|b| &b.0).unwrap_or(&mixer);
                 let (player, output) = Player::new();
                 player.set_volume(volume_gain(volume) * out_gain());
@@ -653,19 +714,10 @@ impl Audio {
                 if speed <= 0.0 {
                     player.pause();
                 }
-                let source = LoopSource {
-                    inner: dec,
-                    bytes: bytes.clone(),
-                    ctl: ctl.clone(),
-                    region,
-                    pos,
-                    per_sec,
+                let source = Primed {
+                    first,
+                    inner: source,
                 };
-                let source = rodio::source::UniformSourceIterator::new(
-                    source,
-                    ChannelCount::new(2).unwrap(),
-                    SampleRate::new(dsp::RATE).unwrap(),
-                );
                 player.append(Process::new(source, control, false).tagged(key));
                 target.add(output);
                 (Some(player), Some(ctl))
@@ -680,7 +732,7 @@ impl Audio {
             looped,
             paused: false,
             base: start,
-            anchor: Instant::now(),
+            anchor: crate::sim_clock::now(),
             wraps: 0,
             wraps_reported: 0,
             region,
@@ -741,7 +793,7 @@ impl Audio {
                         s.volume,
                         s.speed,
                         s.looped,
-                        s.position(Instant::now()),
+                        s.position(crate::sim_clock::now()),
                         s.region,
                         s.paused,
                     )
@@ -753,6 +805,23 @@ impl Audio {
                 }
             }
         }
+    }
+
+    /// Sound.TimePosition set while it plays or is paused: go on from `t`
+    /// (a paused sound stays paused). False when `key` isn't playing here.
+    pub fn seek(&mut self, key: u64, t: f64) -> bool {
+        let Some((bytes, volume, speed, looped, region, paused)) = self
+            .sounds
+            .get(&key)
+            .map(|s| (s.bytes.clone(), s.volume, s.speed, s.looped, s.region, s.paused))
+        else {
+            return false;
+        };
+        let ok = self.play(key, bytes, volume, speed, looped, t, region).is_ok();
+        if ok && paused {
+            self.pause(key);
+        }
+        ok
     }
 
     pub fn stop(&mut self, key: u64) {
@@ -779,7 +848,7 @@ impl Audio {
     pub fn pause(&mut self, key: u64) {
         if let Some(s) = self.sounds.get_mut(&key) {
             if !s.paused {
-                s.rebase(Instant::now());
+                s.rebase(crate::sim_clock::now());
                 s.paused = true;
                 s.apply();
             }
@@ -790,7 +859,7 @@ impl Audio {
     pub fn resume(&mut self, key: u64) {
         if let Some(s) = self.sounds.get_mut(&key) {
             if s.paused {
-                s.rebase(Instant::now());
+                s.rebase(crate::sim_clock::now());
                 s.paused = false;
                 s.apply();
             }
@@ -808,7 +877,7 @@ impl Audio {
     /// Roblox Sound.PlaybackSpeed (also shifts pitch, like Roblox). 0 holds the sound in place.
     pub fn set_speed(&mut self, key: u64, sp: f32) {
         if let Some(s) = self.sounds.get_mut(&key) {
-            s.rebase(Instant::now());
+            s.rebase(crate::sim_clock::now());
             s.speed = sane_speed(sp);
             s.apply();
         }
@@ -816,7 +885,7 @@ impl Audio {
 
     pub fn set_looped(&mut self, key: u64, l: bool) {
         if let Some(s) = self.sounds.get_mut(&key) {
-            s.rebase(Instant::now());
+            s.rebase(crate::sim_clock::now());
             s.looped = l;
             if let Some(c) = &s.ctl {
                 c.looped.store(l, Ordering::Relaxed);
@@ -825,7 +894,7 @@ impl Audio {
     }
 
     pub fn is_playing(&self, key: u64) -> bool {
-        let now = Instant::now();
+        let now = crate::sim_clock::now();
         self.sounds
             .get(&key)
             .is_some_and(|s| !s.paused && !s.finished(now))
@@ -835,7 +904,7 @@ impl Audio {
     pub fn position(&self, key: u64) -> f64 {
         self.sounds
             .get(&key)
-            .map_or(0.0, |s| s.position(Instant::now()))
+            .map_or(0.0, |s| s.position(crate::sim_clock::now()))
     }
 
     /// Sound.TimeLength: from the container headers, or by decoding when they don't say.
@@ -846,7 +915,7 @@ impl Audio {
     /// Keys of sounds that reached their end (not looped) since the last call, for
     /// Sound.Ended. Finished sounds are dropped, so they read as stopped afterwards.
     pub fn poll_finished(&mut self) -> Vec<u64> {
-        let now = Instant::now();
+        let now = crate::sim_clock::now();
         let mut done: Vec<u64> = self
             .sounds
             .iter()
@@ -864,7 +933,7 @@ impl Audio {
     /// Keys of looped sounds that wrapped around since the last call (Sound.DidLoop), best
     /// effort: the decoder's wrap count with a device, the clock in silent mode.
     pub fn looped_since_poll(&mut self) -> Vec<u64> {
-        let now = Instant::now();
+        let now = crate::sim_clock::now();
         let mut out = Vec::new();
         for (k, s) in self.sounds.iter_mut() {
             let total = match &s.ctl {
@@ -882,7 +951,7 @@ impl Audio {
 
     /// How many sounds are playing now (measurement).
     pub fn playing_count(&self) -> usize {
-        let now = Instant::now();
+        let now = crate::sim_clock::now();
         self.sounds
             .values()
             .filter(|s| !s.paused && !s.finished(now))
@@ -1196,6 +1265,49 @@ mod tests {
 
     /// A clip picked out of a sheet by PlaybackRegion ends at the region's
     /// end (Place A's SoundBank), not at the end of the file.
+    /// Ogg Vorbis through the device path (decoder, loop wrapper, resampler):
+    /// the decoder reports a zero-length span before its first packet, which
+    /// once ended every .ogg before its first sample.
+    #[test]
+    fn audio_ogg_vorbis_plays_on_the_device_path() {
+        let ogg = Arc::new(include_bytes!("../tests/fixtures/tail-padded-22050.ogg").to_vec());
+        let (mixer, mut out) = rodio::mixer::mixer(
+            ChannelCount::new(2).unwrap(),
+            SampleRate::new(dsp::RATE).unwrap(),
+        );
+        let mut a = Audio::with_mixer(mixer);
+        a.play(1, ogg.clone(), 1.0, 1.0, false, 0.0, Region::default()).unwrap();
+        a.play(2, ogg, 1.0, 1.0, true, 0.03, Region::default()).unwrap();
+        let mut loud = 0usize;
+        for _ in 0..(dsp::RATE as usize / 25) * 2 {
+            if out.next().is_some_and(|s| s.abs() > 1e-4) {
+                loud += 1;
+            }
+        }
+        assert!(loud > 0, "the Ogg produced only silence");
+        assert!(a.poll_finished().is_empty(), "the Ogg drained at once");
+        assert!(a.is_playing(1) && a.is_playing(2));
+    }
+
+    /// The silent engine opens the same stream: an Ogg with headers and no
+    /// audio fails there as it would with a device.
+    #[test]
+    fn audio_silent_engine_rejects_an_empty_ogg() {
+        let ogg = include_bytes!("../tests/fixtures/tail-padded-22050.ogg");
+        let pages: Vec<usize> = ogg.windows(4).enumerate().filter(|(_, w)| *w == b"OggS").map(|(i, _)| i).collect();
+        // Page 0: identification header; page 1: comment + setup headers.
+        let headers = Arc::new(ogg[..pages[2]].to_vec());
+        let mut a = Audio::silent();
+        let e = a.play(1, headers.clone(), 1.0, 1.0, false, 0.0, Region::default()).unwrap_err();
+        assert!(e.starts_with("cannot decode sound"), "{e}");
+        let (mixer, _out) = rodio::mixer::mixer(
+            ChannelCount::new(2).unwrap(),
+            SampleRate::new(dsp::RATE).unwrap(),
+        );
+        let mut d = Audio::with_mixer(mixer);
+        assert!(d.play(1, headers, 1.0, 1.0, false, 0.0, Region::default()).is_err());
+    }
+
     #[test]
     fn audio_playback_region_ends_at_region_end() {
         let mut a = Audio::silent();
@@ -1322,9 +1434,20 @@ fn ogg_vorbis_frames(b: &[u8]) -> Option<usize> {
     if !b.starts_with(b"OggS") || !head.windows(7).any(|w| w == b"\x01vorbis") {
         return None;
     }
-    let i = b.windows(4).rposition(|w| w == b"OggS")?;
-    let g = i64::from_le_bytes(b.get(i + 6..i + 14)?.try_into().ok()?);
-    (g > 0).then_some(g as usize)
+    // The last page of the first logical stream: the decoder plays only that
+    // one, and a chained file's later streams count at their own rates.
+    let serial = b.get(14..18)?;
+    let mut end = b.len();
+    while let Some(i) = b[..end].windows(4).rposition(|w| w == b"OggS") {
+        if b.get(i + 14..i + 18) == Some(serial) {
+            let g = i64::from_le_bytes(b.get(i + 6..i + 14)?.try_into().ok()?);
+            if g != -1 {
+                return (g > 0).then_some(g as usize);
+            }
+        }
+        end = i;
+    }
+    None
 }
 
 /// AudioDeviceOutput's device: the Audio* graph's interleaved stereo 48 kHz

@@ -5,6 +5,7 @@ use crate::{Style, SurfaceIndex};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct State {
+    pub floating_drag: Option<(SurfaceIndex, Pos2, Pos2)>,
     pub drag_start: Option<Pos2>,
     pub last_hover_pos: Option<Pos2>,
     pub dnd: Option<DragDropState>,
@@ -15,6 +16,7 @@ impl State {
     #[inline(always)]
     pub(super) fn load(ctx: &Context, id: Id) -> Self {
         ctx.data_mut(|d| d.get_temp(id)).unwrap_or(Self {
+            floating_drag: None,
             drag_start: None,
             last_hover_pos: None,
             dnd: None,
@@ -28,6 +30,7 @@ impl State {
     }
 
     pub(super) fn reset_drag(&mut self) {
+        self.floating_drag = None;
         self.dnd = None;
         self.window_fade = None;
         self.drag_start = None;

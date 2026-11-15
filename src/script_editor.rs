@@ -240,6 +240,11 @@ pub struct ScriptBuf {
     pub error: Option<(usize, String)>,
     checked: Option<String>,
     edited: Instant,
+    /// Plugins' ScriptEditorService analysis results (line, message) and
+    /// autocomplete items (label, text) for the text they were made for.
+    plugin_diags: Vec<(i64, String)>,
+    plugin_checked: Option<String>,
+    completions: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -269,11 +274,18 @@ impl Editor {
         };
         let full_name = self.full_name(r);
         let follow_live_source=self.live_script_has_draft(r)==Some(false);
+        // A tab on screen is an open ScriptEditorService document.
+        if !crate::plugin_host::script_docs::is_open(r) {
+            crate::plugin_host::script_docs::open(r, None, true);
+        }
         let buf = self.scripts.bufs.entry(r).or_insert_with(|| ScriptBuf {
             text: source.clone(),
             error: None,
             checked: None,
             edited: Instant::now(),
+            plugin_diags: Vec::new(),
+            plugin_checked: None,
+            completions: Vec::new(),
         });
         let editor_id = egui::Id::new(("script_text", r));
         let focused = ui.ctx().memory(|m| m.has_focus(editor_id));
@@ -289,6 +301,28 @@ impl Editor {
             buf.error = runtime::check_syntax(&buf.text, &full_name);
             buf.checked = Some(buf.text.clone());
         }
+        // Plugins' script analysis callbacks (ScriptEditorService), once
+        // typing pauses too.
+        let analyze = buf.plugin_checked.as_deref() != Some(buf.text.as_str())
+            && buf.edited.elapsed() > Duration::from_millis(250);
+        if analyze {
+            buf.plugin_checked = Some(buf.text.clone());
+            let diags = self
+                .plugins
+                .with_edit(&mut self.doc, |rt| {
+                    let lua = &rt.lua;
+                    if crate::runtime::domains::plugin::script_editor::has_callbacks(lua).1 {
+                        crate::runtime::domains::plugin::script_editor::analyze(lua, r).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_default();
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.plugin_diags = diags;
+            }
+        }
+        let Some(buf) = self.scripts.bufs.get_mut(&r) else { return };
 
         ui.horizontal(|ui| {
             icons::class_icon(ui, &class, 16.0);
@@ -311,6 +345,21 @@ impl Editor {
                 }
             }
         });
+        for (line, msg) in &buf.plugin_diags {
+            ui.label(RichText::new(format!("⚠ line {line}: {msg}")).small().color(theme::ERROR));
+        }
+        // Plugins' autocomplete items for the word at the cursor: a click
+        // puts the item in place of the word.
+        let mut accept: Option<String> = None;
+        if !buf.completions.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (label, insert) in buf.completions.iter().take(12) {
+                    if ui.small_button(label).clicked() {
+                        accept = Some(insert.clone());
+                    }
+                }
+            });
+        }
         ui.separator();
 
         // Studio Settings > Script Editor > Font (size), Background Color,
@@ -383,13 +432,71 @@ impl Editor {
                     }
                 });
             });
+        // The cursor / selection as the plugins' ScriptDocument sees it
+        // (Studio's 1-based line, character), and selections they set.
+        let mut state = egui::TextEdit::load_state(ui.ctx(), editor_id);
+        let mut word_end: Option<usize> = None;
+        if let Some(st) = state.as_mut() {
+            if let Some(cr) = st.cursor.char_range() {
+                let (a, b) = (cr.primary.index.0, cr.secondary.index.0);
+                let pa = crate::plugin_host::script_docs::pos_of(&buf.text, a);
+                let pb = crate::plugin_host::script_docs::pos_of(&buf.text, b);
+                crate::plugin_host::script_docs::set_selection(r, (pa.0, pa.1, pb.0, pb.1), true);
+                if a == b {
+                    word_end = Some(a);
+                }
+            }
+        }
+        if let Some((sel, mut st)) = crate::plugin_host::script_docs::take_selection_request(r).zip(state) {
+            let a = crate::plugin_host::script_docs::index_of(&buf.text, sel.0, sel.1);
+            let b = crate::plugin_host::script_docs::index_of(&buf.text, sel.2, sel.3);
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(b), egui::text::CCursor::new(a))));
+            st.store(ui.ctx(), editor_id);
+        }
+        if let (Some(insert), Some(end)) = (accept, word_end) {
+            let chars: Vec<char> = buf.text.chars().collect();
+            let mut start = end;
+            while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+                start -= 1;
+            }
+            buf.text = chars[..start].iter().chain(insert.chars().collect::<Vec<_>>().iter()).chain(chars[end..].iter()).collect();
+            buf.completions.clear();
+            changed = true;
+        }
         if changed {
             let text = buf.text.clone();
+            // ScriptEditorService's TextDocumentDidChange for the person's typing.
+            if let Some(c) = crate::plugin_host::script_docs::diff(&source, &text) {
+                crate::plugin_host::script_docs::changed(r, vec![c]);
+            }
+            // Plugins' autocomplete for the word being typed.
+            let pos = word_end.map(|i| crate::plugin_host::script_docs::pos_of(&text, i));
             self.doc.set_props(
                 "Edit script",
-                vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text))],
+                vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
                 Some(format!("source:{r:?}")),
             );
+            let typing_word = word_end.is_some_and(|i| {
+                let c: Vec<char> = text.chars().collect();
+                i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.' || c[i - 1] == ':')
+            });
+            let items = match (pos, typing_word) {
+                (Some((line, ch)), true) => self
+                    .plugins
+                    .with_edit(&mut self.doc, |rt| {
+                        let lua = &rt.lua;
+                        if crate::runtime::domains::plugin::script_editor::has_callbacks(lua).0 {
+                            crate::runtime::domains::plugin::script_editor::autocomplete(lua, r, line, ch).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            if let Some(b) = self.scripts.bufs.get_mut(&r) {
+                b.completions = items;
+            }
         }
         if buf_needs_repaint(self.scripts.bufs.get(&r)) {
             ui.ctx().request_repaint_after(Duration::from_millis(300));

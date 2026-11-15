@@ -175,7 +175,9 @@ pub fn scratch_universe() -> u64 {
 
 /// Whether this Play keeps DataStores, MemoryStores and Messaging in memory.
 /// A published place other than the scratch experience does, unless the
-/// user opts in with RUSTUDIO_LIVE_DATA=1: a Play of a live game must never
+/// user opts in (RUSTUDIO_LIVE_DATA=1 or Studio Settings > rustudio > Use
+/// live DataStores, src/rustudio_settings.rs; latched at Play start). RUSTUDIO_LOCAL_DATASTORE=1
+/// (a test aid) keeps everything in memory regardless: a Play of a live game must never
 /// read-modify-write real players' saves (the local player's own save
 /// included) or publish to its live servers.
 pub fn local_mode_for(universe: u64) -> bool {
@@ -185,7 +187,7 @@ pub fn local_mode_for(universe: u64) -> bool {
     let scratch = scratch_universe();
     universe != 0
         && (scratch == 0 || universe != scratch)
-        && std::env::var("RUSTUDIO_LIVE_DATA").as_deref() != Ok("1")
+        && !crate::rustudio_settings::live_data()
 }
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {

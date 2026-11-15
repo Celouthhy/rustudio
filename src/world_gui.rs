@@ -194,6 +194,32 @@ pub struct GuiBatch {
 
 /// Appends a mesh's triangles, starting a new batch when the texture changes
 /// (so later items stay over earlier ones).
+/// Textures egui only knows by bind group (`register_native_texture`
+/// keeps no texture): ViewportFrame images (vf_render.rs), with a count
+/// bumped each time one is drawn again. Without this a SurfaceGui's or
+/// BillboardGui's ViewportFrame drew only its background.
+static NATIVE: std::sync::Mutex<Option<std::collections::HashMap<egui::TextureId, (wgpu::Texture, u64)>>> = std::sync::Mutex::new(None);
+
+pub fn register_native(id: egui::TextureId, tex: wgpu::Texture) {
+    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id, (tex, 0));
+}
+
+pub fn native_changed(id: egui::TextureId) {
+    if let Some((_, g)) = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.get_mut(&id)) {
+        *g += 1;
+    }
+}
+
+pub fn unregister_native(id: egui::TextureId) {
+    if let Some(m) = NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.remove(&id);
+    }
+}
+
+fn native(id: egui::TextureId) -> Option<(wgpu::Texture, u64)> {
+    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&id).cloned()
+}
+
 pub fn push(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, vertices: Vec<GuiVertex>, indices: &[u32]) {
     push_wrap(batches, texture, false, vertices, indices);
 }
@@ -521,8 +547,8 @@ fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
     return o;
 }
 
-// shader.wgsl fog_amount: Lighting's linear fog, under water Studio's exp2, or
-// Atmosphere's exp2 (fog.z 3).
+// shader.wgsl fog_amount: Lighting's FogStart / FogEnd fog (exp2, not linear),
+// under water Studio's exp2, or Atmosphere's exp2 (fog.z 3).
 fn fog_amount(d: f32) -> f32 {
     if (tone.fog.z > 2.5) {
         return 1.0 - clamp(exp2(tone.fog.x - tone.fog.y * d), 0.0, 1.0);
@@ -530,7 +556,7 @@ fn fog_amount(d: f32) -> f32 {
     if (tone.fog.z > 1.5) {
         return 1.0 - clamp(exp2(tone.fog.x - tone.fog.y * d) - 1.0, 0.0, 1.0);
     }
-    return clamp((d - tone.fog.x) / max(tone.fog.y - tone.fog.x, 1e-3), 0.0, 1.0);
+    return 1.0 - clamp(exp2((tone.fog.y - d) / max(tone.fog.y - tone.fog.x, 1e-3)) - 1.0, 0.0, 1.0);
 }
 
 // The scene's tone curve (shader.wgsl tonemap: y = x(ax+b)/(x(ax+c)+d)·e),
@@ -753,6 +779,8 @@ pub struct WorldGuiPass {
     /// Texture bind groups by egui id and wrap: the egui texture they were
     /// made for, and the frame each was last used.
     tex_groups: std::collections::HashMap<(egui::TextureId, bool), (wgpu::Texture, wgpu::BindGroup, u64)>,
+    /// Each native texture's draw count when its copy was last refilled.
+    native_seen: std::collections::HashMap<egui::TextureId, u64>,
     /// Untextured effects: one white texel.
     white: wgpu::BindGroup,
     fx_bgl: wgpu::BindGroupLayout,
@@ -1178,6 +1206,7 @@ impl WorldGuiPass {
             bufs: Default::default(),
             glass: Default::default(),
             tex_groups: Default::default(),
+            native_seen: Default::default(),
             fx_bgl,
             fx_in,
             fx_out,
@@ -1288,7 +1317,7 @@ impl WorldGuiPass {
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        queue.submit([enc.finish()]);
+        crate::gpu_timing::submit(device, queue, "gpu: world gui mips", [enc.finish()]);
         if let Some((_, view)) = reuse {
             return view;
         }
@@ -1372,10 +1401,18 @@ impl WorldGuiPass {
         // same one: making the bind groups again each frame was most of
         // this pass's CPU time)
         let group = |this: &mut Self, id: egui::TextureId, wrap: bool| -> Option<wgpu::BindGroup> {
-            let tex = egui.texture(&id).and_then(|t| t.texture.clone())?;
+            let (tex, native_gen) = match egui.texture(&id).and_then(|t| t.texture.clone()) {
+                Some(t) => (t, None),
+                None => {
+                    let (t, g) = native(id)?;
+                    (t, Some(g))
+                }
+            };
             let mipped = tex.size().width.max(tex.size().height) > 1;
-            // (the font atlas changes in place: its copy is refilled once a frame)
-            let live = id == egui::TextureId::default();
+            // (the font atlas changes in place: its copy is refilled once a
+            // frame; a ViewportFrame's image when it was drawn again)
+            let native_new = native_gen.is_some_and(|g| this.native_seen.insert(id, g) != Some(g));
+            let live = id == egui::TextureId::default() || native_new;
             let kept = match this.tex_groups.get_mut(&(id, wrap)) {
                 Some((t, bg, used)) if *t == tex => Some((bg.clone(), std::mem::replace(used, frame) != frame)),
                 _ => None,
@@ -1510,7 +1547,7 @@ impl WorldGuiPass {
             });
             self.record(&mut pass, &self.pipeline, &up);
         }
-        rs.queue.submit([enc.finish()]);
+        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui", [enc.finish()]);
     }
 
     /// Draws world GUIs and effects into the scene's HDR image `hdr`
@@ -1592,7 +1629,7 @@ impl WorldGuiPass {
             p.draw(0..3, 0..1);
         });
         drop(step);
-        rs.queue.submit([enc.finish()]);
+        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [enc.finish()]);
         true
     }
 }

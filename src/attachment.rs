@@ -20,9 +20,12 @@ pub fn local(d: &Document, r: Ref, transformed: bool) -> Xform {
 pub fn parent(d: &Document, r: Ref, transformed: bool) -> Option<Xform> {
     let mut chain = Vec::new();
     let mut cur = d.dom.get_by_ref(r)?.parent();
-    let mut visited = std::collections::HashSet::new();
+    // (a parent cycle can't be built through Parent; the bound stands in
+    // for the visited set, which was an allocation per read)
+    let mut steps = 0u32;
     while let Some(i) = d.dom.get_by_ref(cur) {
-        if !visited.insert(cur) { return None; }
+        steps += 1;
+        if steps > 4096 { return None; }
         if doc::is_a(&i.class, "Attachment") {
             chain.push(cur);
             cur = i.parent();

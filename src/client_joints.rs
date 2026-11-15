@@ -83,9 +83,20 @@ impl ClientJoints {
         self.pose_rigs(cd, c2s);
         let marks = cd.marks_for(doc::Reader::ClientJoints);
         let ws = cd.find_child(cd.dom.root_ref(), "Workspace");
-        let wanted = |cd: &Document, r: Ref| {
-            !c2s.contains_key(&r) && is_joint(cd, r) && ws.is_some_and(|w| cd.is_ancestor(w, r))
+        // Under Workspace, or under a WorldModel (a ViewportFrame's world:
+        // Studio solves joints and plays animations there, not elsewhere
+        // in a ViewportFrame).
+        let in_world = |cd: &Document, r: Ref| {
+            let mut cur = r;
+            while let Some(i) = cd.dom.get_by_ref(cur) {
+                if Some(cur) == ws || i.class == "WorldModel" {
+                    return true;
+                }
+                cur = i.parent();
+            }
+            false
         };
+        let wanted = |cd: &Document, r: Ref| !c2s.contains_key(&r) && is_joint(cd, r) && in_world(cd, r);
         match marks {
             doc::Marks::Some(marks) if cd.id == self.doc_id => {
                 for m in marks {
@@ -101,16 +112,13 @@ impl ClientJoints {
             }
             _ => {
                 self.doc_id = cd.id;
-                self.joints = match ws {
-                    Some(ws) => cd
-                        .dom
-                        .descendants_of(ws)
-                        .filter(|i| joint_class(i.class.as_str()))
-                        .map(|i| i.referent())
-                        .filter(|r| !c2s.contains_key(r))
-                        .collect(),
-                    None => HashSet::new(),
-                };
+                self.joints = cd
+                    .dom
+                    .descendants_of(cd.dom.root_ref())
+                    .filter(|i| joint_class(i.class.as_str()))
+                    .map(|i| i.referent())
+                    .filter(|r| wanted(cd, *r))
+                    .collect();
             }
         }
         if self.welds.len() > self.joints.len() * 2 + 64 {

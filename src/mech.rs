@@ -493,8 +493,9 @@ pub const FX_LIGHT_CAP: f32 = 1.0; // the luminance an effect's ambient + local 
 pub const FX_LIGHT_CLAMP: f32 = 4.5; // an effect's linear light is held to this (ParticleCustomFS sqrt(clamp(lin × exposure))) before it joins the scene's light, so Studio's bloom sees no more of it (measured: calibration b, white squares glow the same at Brightness 4, 10 and 100: the halo 1.8–3.5 studs out reads 8.8 / 10.0 / 12.4 levels; rustudio unclamped 8.9 / 28.7 / 96.3, clamped 9.1 / 11.0 / 10.9)
 
 // GUI (gui.rs)
-pub const GUI_TOP_INSET: f32 = 58.0; // GuiService:GetGuiInset() in Studio's Play (offline Studio, 863x675 view): ScreenGuis without IgnoreGuiInset start this far down
-pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in an offline Studio)
+pub const GUI_TOP_INSET: f32 = 58.0; // GuiService:GetGuiInset() in Studio's Play (Studio, 863x675 view): ScreenGuis without IgnoreGuiInset start this far down
+pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in Studio)
+pub const GUI_LEGACY_TEXT_SCALE: f32 = 1.5; // Font.Legacy (Arimo) is drawn at TextSize x this: a default TextLabel (Legacy 8) in Studio 0.747 draws "row 1" 26 px wide, 8 px tall (checks/plugins/widgets/captures/studio-wleft.png), Arimo at TextSize 12; other sizes not measured
 pub const GUI_BUTTON_HOVER_DARKEN: f32 = 0.3; // AutoButtonColor: background darkened this much under the mouse (estimated)
 pub const GUI_BUTTON_PRESS_DARKEN: f32 = 0.5; // ... and while pressed (estimated)
 pub const GUI_SELECTION_RGB: [u8; 3] = [0, 162, 255]; // GuiService.SelectedObject outline (estimated)
@@ -502,7 +503,9 @@ pub const GUI_VIEWPORT_MAX_TRIS: usize = 3000; // ViewportFrame meshes are thinn
 pub const GUI_SURFACE_LIFT: f32 = 0.01; // SurfaceGuis sit this far off the face (studs, estimated)
 pub const GUI_SURFACE_AFFINE_ERR_PX: f32 = 0.5; // SurfaceGui triangles whose colour / texture varies are split until screen-space (affine) interpolation is within this many pixels of perspective-correct; flat-colour ones never (projection keeps their edges exact). Round 20: the old fixed 40 px split made 2.1M triangles per Place B frame
 pub const GUI_SCROLL_PX_PER_POINT: f32 = 1.0; // ScrollingFrame: CanvasPosition pixels per pixel of the scroll event
-pub const GUI_SCROLL_PX_PER_NOTCH: f32 = 100.0; // FInt ScrollWheelDeltaAmount default
+pub const GUI_SCROLL_EASE_PULL: f32 = 0.21; // ScrollingFrame wheel glide, per 60 Hz frame: the speed wanted is this share of the distance left …
+pub const GUI_SCROLL_EASE_BLEND: f32 = 0.5; // … and the speed moves this far toward it (fitted to Studio 0.747's CanvasPosition per frame for two notches, checks/plugins/widgets/captures/studio-widgets.txt: 0,8,24,42,56,68,77,84,89,92 | 103,120,139,154 … 200; within 3 px)
+pub const GUI_SCROLL_PX_PER_NOTCH: f32 = 100.0; // FInt ScrollWheelDeltaAmount default (.data Studio, registered by Studio, used at Studio)
 pub const QUERY_GRID_CELL: f32 = 16.0; // studs: spatial grid cell for Raycast / GetPartBoundsInBox / GetPartsInPart
 pub const QUERY_GRID_MAX_CELLS: usize = 512; // parts spanning more cells than this are always tested
 pub const QUERY_GRID_SCAN_CELLS: usize = 4096; // queries covering more cells than this scan every part
@@ -962,3 +965,7 @@ pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
     [-0.6272973418235779, -0.9061756730079651],
     [0.5390124320983887, -0.3205811679363251],
 ];
+
+/// A panel window (src/panels.rs) eframe couldn't show this many frames in
+/// a row is docked back into the main window (app.rs panel_windows).
+pub const PANEL_WINDOW_MAX_FAILS: u32 = 30;

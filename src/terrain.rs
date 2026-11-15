@@ -500,6 +500,38 @@ impl Voxels {
         })
     }
 
+    /// World-space (studs) box enclosing every voxel whose solid material or
+    /// occupancy differs between `self` and `other` (what `same_solid` compares);
+    /// None when they are the same.
+    pub fn solid_diff_world_bounds(&self, other: &Voxels) -> Option<([f32; 3], [f32; 3])> {
+        let solid = |c: Option<&Chunk>, i: usize| match c {
+            Some(c) if c.mat[i] != 0 && c.mat[i] != WATER => (c.mat[i], c.occ[i]),
+            _ => (0, 0),
+        };
+        let mut lo = [i32::MAX; 3];
+        let mut hi = [i32::MIN; 3];
+        let keys: std::collections::HashSet<&[i32; 3]> = self.chunks.keys().chain(other.chunks.keys()).collect();
+        for k in keys {
+            let (a, b) = (self.chunks.get(k), other.chunks.get(k));
+            let base = k.map(|c| c << CHUNK_SHIFT);
+            for y in 0..CS {
+                for z in 0..CS {
+                    for x in 0..CS {
+                        let i = lidx(x, y, z);
+                        if solid(a, i) != solid(b, i) {
+                            let v = [base[0] + x as i32, base[1] + y as i32, base[2] + z as i32];
+                            for j in 0..3 {
+                                lo[j] = lo[j].min(v[j]);
+                                hi[j] = hi[j].max(v[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (lo[0] <= hi[0]).then(|| (lo.map(|c| c as f32 * VOXEL), hi.map(|c| (c + 1) as f32 * VOXEL)))
+    }
+
     /// A reader for many nearby `get`s (ray marches): it keeps the last
     /// chunk it looked up, so neighbouring voxels cost no hash lookup.
     pub fn sampler(&self) -> Sampler<'_> {

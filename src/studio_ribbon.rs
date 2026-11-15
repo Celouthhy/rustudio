@@ -2,7 +2,7 @@
 //! account) and the ribbon tabs' buttons, as in an offline Studio
 //! (checks/ui/studio/ribbon-*.png).
 
-use egui::{Color32, Rect, RichText, Sense, Vec2};
+use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::app::{Editor, Tool};
 use crate::studio_ui::{run_type_key, tab_rect_key, RibbonTab, RunType};
@@ -213,6 +213,9 @@ impl Editor {
     pub fn studio_ribbon(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut act: Option<String> = None;
+        if self.ui.tab != RibbonTab::Plugins {
+            self.plugins_tab_hidden();
+        }
         let a = &mut act;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
@@ -318,11 +321,9 @@ impl Editor {
                     self.rb(ui, "chart-bar", "Analysis", "script_analysis", false, a);
                     self.rb(ui, "activity", "Script Activity", "script_activity", false, a);
                 }
-                RibbonTab::Plugins => {
-                    self.rb(ui, "plug", "Manage Plugins", "manage_plugins", false, a);
-                    self.rb(ui, "folder", "Plugins Folder", "plugins_folder", false, a);
-                    ui.label(RichText::new("rustudio doesn't run Studio plugins yet").color(theme::TEXT_DIM).small());
-                }
+                // Only plugin toolbars, as Studio's (Manage Plugins and
+                // Plugins Folder are in the Plugins menu): src/plugin_host/ui_ribbon.rs.
+                RibbonTab::Plugins => self.plugins_ribbon(ui),
             }
         });
         self.ribbon_color_popup(&ctx);

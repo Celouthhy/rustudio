@@ -24,8 +24,15 @@ ypcall = pcall
 Spawn = spawn
 Delay = delay
 ElapsedTime = elapsedTime
-function version() return "0.1.0 (rustudio)" end
-function printidentity(prefix) print((prefix or "Current identity is") .. " " .. rs_identity()) end
+function version() return "0.2.0 (rustudio)" end
+-- A plugin's thread (identity 5) also prints its asset id: -2 for a local
+-- plugin (measured in Studio 0.747).
+local rs_plugin_asset = __rs_plugin_asset
+function printidentity(prefix)
+    local id = rs_identity()
+    print((prefix or "Current identity is") .. " " .. id)
+    if id == 5 then print("Current asset id is " .. rs_plugin_asset()) end
+end
 function LoadLibrary(name)
     error("LoadLibrary is no longer available in Roblox ('" .. tostring(name) .. "' can't be loaded)", 2)
 end
@@ -847,6 +854,34 @@ function InputObject:IsModifierKeyDown(m)
     if n == "Alt" then return uis:IsKeyDown(Enum.KeyCode.LeftAlt) or uis:IsKeyDown(Enum.KeyCode.RightAlt) end
     return false
 end
+-- Changed / GetPropertyChangedSignal (Studio's InputObject is an Instance;
+-- Rojo's buttons watch UserInputState to end their ripple): one signal per
+-- object and property, fired once when the engine writes a new value.
+local IO_PROPS = { Delta = true, KeyCode = true, Position = true, UserInputState = true, UserInputType = true }
+local io_signals = setmetatable({}, { __mode = "k" })
+local function io_signal(io, key)
+    local per = io_signals[io]
+    if not per then per = {} io_signals[io] = per end
+    local s = per[key]
+    if not s then s = LuaSignal.new() per[key] = s end
+    return s
+end
+function InputObject:GetPropertyChangedSignal(prop)
+    if type(prop) ~= "string" or not IO_PROPS[prop] then
+        error(tostring(prop) .. " is not a valid property name.", 2)
+    end
+    return io_signal(self, "Changed:" .. prop)
+end
+function __rs_input_changed_signal(io) return io_signal(io, "Changed") end
+local function io_changed(io, key)
+    if type(key) ~= "string" or not IO_PROPS[key] then return end
+    local per = io_signals[io]
+    if not per then return end
+    local s = per["Changed:" .. key]
+    if s then s:Fire() end
+    s = per.Changed
+    if s then s:Fire(key) end
+end
 local input_objects = {}
 -- KeyCode 0 (Unknown) for mouse input, whatever the reflection data calls it.
 local keycode_unknown = nil
@@ -862,7 +897,7 @@ local function new_input_object(fields)
         Delta = Vector3.zero,
     }
     for k, v in fields or {} do d[k] = v end
-    return __rs_make_input_object(d, InputObject)
+    return __rs_make_input_object(d, InputObject, io_changed)
 end
 __rs_new_input_object = new_input_object
 local mouse_delta = Vector2.zero
@@ -934,8 +969,16 @@ function M.GetUserCFrameEnabled() return false end
 function M.RecenterUserHeadCFrame() end
 function M.RequestNavigation() end
 function M.IsTenFootInterface() return false end
--- Studio's Play reports a 58 px top bar (offline Studio, GuiService:GetGuiInset()).
-function M.GetGuiInset() return Vector2.new(0, 58), Vector2.zero end
+-- Studio's Play reports a 58 px top bar (Studio, GuiService:GetGuiInset());
+-- the edit DataModel has none (plugins: src/plugin_host/widgets_ui.rs).
+local function edit_dm()
+    local ok, e = pcall(function() return game:GetService("RunService"):IsEdit() end)
+    return ok and e
+end
+function M.GetGuiInset()
+    if edit_dm() then return Vector2.zero, Vector2.zero end
+    return Vector2.new(0, 58), Vector2.zero
+end
 function M.GetEmotesMenuOpen() return false end
 function M.GetInspectMenuEnabled() return false end
 -- PlayerScripts: the camera / movement mode lists shown in the settings menu.
@@ -981,7 +1024,7 @@ function M.ViewportPointToRay(self, x, y, depth)
     local dir = (cf.RightVector * nx + cf.UpVector * ny + cf.LookVector).Unit
     return Ray.new(cf.Position + dir * (tonumber(depth) or 0), dir)
 end
-function M.ScreenPointToRay(self, x, y, depth) return M.ViewportPointToRay(self, x, y + INSET, depth) end
+function M.ScreenPointToRay(self, x, y, depth) return M.ViewportPointToRay(self, x, y + (edit_dm() and 0 or INSET), depth) end
 function M.WorldToViewportPoint(self, p)
     local cf, vs, th, asp = cam_basis(self)
     local lp = cf:PointToObjectSpace(p)
@@ -999,7 +1042,7 @@ function M.WorldToViewportPoint(self, p)
 end
 function M.WorldToScreenPoint(self, p)
     local v, on = M.WorldToViewportPoint(self, p)
-    return Vector3.new(v.X, v.Y - INSET, v.Z), on
+    return Vector3.new(v.X, v.Y - (edit_dm() and 0 or INSET), v.Z), on
 end
 function M.GetRenderCFrame(self) return self.CFrame end
 function M.GetPartsObscuringTarget(self, points, ignore)

@@ -14,7 +14,8 @@
 //! (1 − LightEmission), which under premultiplied blending is Studio's
 //! "additive" blend.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, Mutex};
 
 use egui::{Rect, TextureId};
@@ -764,8 +765,31 @@ struct BeamCfg {
 }
 
 fn beam_cfg(d: &Document, r: Ref) -> BeamCfg {
+    let enabled = flag(d, r, "Enabled", true);
+    if !enabled {
+        // (a disabled Beam draws nothing and reads nothing: pools of
+        // switched-off Beams cost no property reads or pose; any write,
+        // Enabled included, reads it all again)
+        return BeamCfg {
+            enabled,
+            a0: None,
+            a1: None,
+            curve: (0.0, 0.0),
+            segments: 1,
+            width: (0.0, 0.0),
+            face_camera: false,
+            color: CSeq::default(),
+            transparency: Seq::default(),
+            texture: None,
+            tex_length: 1.0,
+            tex_mode: 0,
+            tex_speed: 0.0,
+            zoffset: 0.0,
+            look: Look { influence: 0.0, brightness: 0.0, emission: 0.0, alpha: 0.0 },
+        };
+    }
     BeamCfg {
-        enabled: flag(d, r, "Enabled", true),
+        enabled,
         a0: reference(d, r, "Attachment0"),
         a1: reference(d, r, "Attachment1"),
         curve: (num(d, r, "CurveSize0", 0.0), num(d, r, "CurveSize1", 0.0)),
@@ -1700,13 +1724,13 @@ impl TrailState {
 pub struct Effects {
     doc_id: u64,
     list: Vec<Ref>,
-    set: HashSet<Ref>,
+    set: FxHashSet<Ref>,
     /// Properties, read again when the journal says one changed.
-    cfg: HashMap<Ref, Cfg>,
-    emitters: HashMap<Ref, EmitterState>,
-    trails: HashMap<Ref, TrailState>,
+    cfg: FxHashMap<Ref, Cfg>,
+    emitters: FxHashMap<Ref, EmitterState>,
+    trails: FxHashMap<Ref, TrailState>,
     /// Beam:SetTextureOffset: (offset, effects time it was set).
-    beam_phase: HashMap<Ref, (f32, f64)>,
+    beam_phase: FxHashMap<Ref, (f32, f64)>,
     time: f64,
     /// `glass`: the see-through parts' indices in the scene, and the
     /// (document, revision, part count) they were found for.
@@ -1718,10 +1742,10 @@ pub struct Effects {
     fresh: bool,
     /// Where each effect is, and per instance the effects whose pose reads
     /// it (dropped when the journal marks it).
-    poses: HashMap<Ref, Pose>,
-    pose_deps: HashMap<Ref, Vec<Ref>>,
+    poses: FxHashMap<Ref, Pose>,
+    pose_deps: FxHashMap<Ref, FxHashSet<Ref>>,
     /// Beams' kept strips (dropped with their pose).
-    kept: HashMap<Ref, Kept>,
+    kept: FxHashMap<Ref, Kept>,
 }
 
 fn is_effect(d: &Document, r: Ref) -> bool {
@@ -1821,7 +1845,7 @@ impl Effects {
     }
 
     /// Effect `r`'s pose, read from the document when not kept.
-    fn pose(poses: &mut HashMap<Ref, Pose>, pose_deps: &mut HashMap<Ref, Vec<Ref>>, d: &Document, r: Ref, cfg: &Cfg) -> Pose {
+    fn pose(poses: &mut FxHashMap<Ref, Pose>, pose_deps: &mut FxHashMap<Ref, FxHashSet<Ref>>, d: &Document, r: Ref, cfg: &Cfg) -> Pose {
         if let Some(p) = poses.get(&r) {
             if pose_check() {
                 // (RUSTUDIO_FX_POSE_CHECK: the kept pose against a fresh read)
@@ -1878,10 +1902,9 @@ impl Effects {
             Cfg::Constraint(_) => Pose::Ends(None, None),
         };
         for dep in deps {
-            let list = pose_deps.entry(dep).or_default();
-            if !list.contains(&r) {
-                list.push(r);
-            }
+            // (a set: thousands of Beams' Attachments can share one part,
+            // and a list scanned per pose was quadratic in them)
+            pose_deps.entry(dep).or_default().insert(r);
         }
         poses.insert(r, pose);
         pose
@@ -1899,7 +1922,7 @@ impl Effects {
                             self.unpose(t);
                             for r in d.subtree(t) {
                                 self.unpose(r);
-                                let keep = is_effect(d, r) && ws.is_some_and(|w| d.is_ancestor(w, r));
+                                let keep = is_effect(d, r) && ws.is_some_and(|w| d.in_world(w, r));
                                 self.cfg.remove(&r);
                                 if keep && self.set.insert(r) {
                                     self.list.push(r);
@@ -1922,6 +1945,12 @@ impl Effects {
                     self.list.retain(|r| set.contains(r));
                     self.emitters.retain(|r, _| set.contains(r));
                     self.trails.retain(|r, _| set.contains(r));
+                    self.poses.retain(|r, _| set.contains(r));
+                    self.beam_phase.retain(|r, _| set.contains(r));
+                    self.pose_deps.retain(|_, l| {
+                        l.retain(|r| set.contains(r));
+                        !l.is_empty()
+                    });
                 }
                 return;
             }
@@ -1933,6 +1962,7 @@ impl Effects {
                 .descendants_of(ws)
                 .filter(|i| CLASSES.contains(&i.class.as_str()))
                 .map(|i| i.referent())
+                .filter(|r| d.in_world(ws, *r))
                 .collect(),
             None => Vec::new(),
         };
@@ -1950,7 +1980,10 @@ impl Effects {
     /// repainting).
     pub fn frame(&mut self, f: FrameIn<'_>) -> bool {
         let _p = crate::bench::scope("fx");
-        self.refresh(f.doc);
+        {
+            let _r = crate::bench::scope("fx_refresh");
+            self.refresh(f.doc);
+        }
         let d: &Document = f.doc;
         let dt = f.dt.clamp(0.0, mech::FX_DT_MAX);
         self.time += dt as f64;
@@ -1958,7 +1991,7 @@ impl Effects {
 
         // Scripts' Emit / Clear for this document (and, on the client in
         // Play, the server's for their client copies).
-        let mut emits: HashMap<Ref, u32> = HashMap::new();
+        let mut emits: FxHashMap<Ref, u32> = FxHashMap::default();
         if let Ok(mut q) = REQUESTS.lock() {
             q.retain(|(id, r, req)| {
                 let r = if *id == d.id {
@@ -2007,11 +2040,25 @@ impl Effects {
         };
         view.glass_idx.borrow_mut().clear();
 
+        // (one lookup per texture per frame: the GUI's texture map is keyed
+        // by the id string, and thousands of Beams share a few textures)
+        let mut tex_cache: FxHashMap<String, Option<TextureId>> = FxHashMap::default();
+        let load = f.texture;
+        let mut texture = |id: &str| -> Option<TextureId> {
+            if let Some(t) = tex_cache.get(id) {
+                return *t;
+            }
+            let t = load(id);
+            tex_cache.insert(id.to_string(), t);
+            t
+        };
         let wind = d.workspace().and_then(|w| vec3_of(d.prop(w, "GlobalWind"))).unwrap_or(Vec3::ZERO);
         let mut draws: Vec<Draw> = Vec::new();
         let mut live = false;
         let mut n_particles = 0usize;
-        let (mut t_sim, mut t_strip) = (0.0f64, 0.0f64);
+        let (mut t_sim, mut t_strip, mut t_cfg, mut t_pose) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut t_trail, mut t_con) = (0.0f64, 0.0f64);
+        let _l = crate::bench::scope("fx_loop");
         let (mut n_beams, mut n_kept) = (0u64, 0u64);
         // Emitters nearest first get the particle budget.
         let mut emitters: Vec<(f32, Ref, Xform, Vec3)> = Vec::new();
@@ -2019,6 +2066,7 @@ impl Effects {
             if !d.exists(r) {
                 continue;
             }
+            let t0 = crate::bench::now();
             let cfg = self.cfg.entry(r).or_insert_with(|| {
                 match d.class_of(r).as_deref() {
                     Some("ParticleEmitter") => Cfg::Emitter(Box::new(emitter_cfg(d, r))),
@@ -2028,12 +2076,17 @@ impl Effects {
                     _ => Cfg::Trail(Box::new(trail_cfg(d, r))),
                 }
             });
+            let t1 = crate::bench::now();
+            t_cfg += t1 - t0;
             let pose = Self::pose(&mut self.poses, &mut self.pose_deps, d, r, cfg);
+            t_pose += crate::bench::now() - t1;
             match cfg {
                 Cfg::Constraint(r) => {
+                    let t0 = crate::bench::now();
                     if let Some(dr) = constraints::draw(d, *r, &view) {
                         if dr.dist < mech::FX_MAX_DIST { draws.push(dr); }
                     }
+                    t_con += crate::bench::now() - t0;
                 }
                 Cfg::Emitter(c) => {
                     let Pose::Host(Some((xf, size)), moving) = pose else { continue };
@@ -2047,9 +2100,9 @@ impl Effects {
                         continue;
                     }
                     let st = self.emitters.entry(r).or_default();
-                    let t0 = std::time::Instant::now();
+                    let t0 = crate::bench::now();
                     st.step(c, r, &xf, size, dt, emits.remove(&r).unwrap_or(0), moving, wind);
-                    t_sim += t0.elapsed().as_secs_f64();
+                    t_sim += crate::bench::now() - t0;
                     if !st.particles.is_empty() {
                         live = true;
                         emitters.push((dist, r, xf, size));
@@ -2059,11 +2112,11 @@ impl Effects {
                     if !c.enabled || c.a0.is_none() || c.a1.is_none() {
                         continue;
                     }
-                    let Some(tex) = texture_id(&c.texture, f.texture) else { continue };
+                    let t0 = crate::bench::now();
+                    let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
                     if c.tex_speed != 0.0 {
                         live = true;
                     }
-                    let t0 = std::time::Instant::now();
                     let Pose::Ends(x0, x1) = pose else { continue };
                     // (kept while nothing it reads changes: the light, the
                     // glass, FaceCamera's side and the scroll are the GPU's)
@@ -2092,7 +2145,7 @@ impl Effects {
                                 eprintln!("[fx pose check] beam {r:?} kept a stale strip");
                             }
                         }
-                        t_strip += t0.elapsed().as_secs_f64();
+                        t_strip += crate::bench::now() - t0;
                         if far < mech::FX_MAX_DIST {
                             draws.push(Draw { dist: far, texture: tex.0, wrap: tex.1, geom: Geom::Kept(r) });
                         }
@@ -2106,7 +2159,7 @@ impl Effects {
                             }
                         }
                     }
-                    t_strip += t0.elapsed().as_secs_f64();
+                    t_strip += crate::bench::now() - t0;
                     if let Some(dr) = dr {
                         if dr.dist < mech::FX_MAX_DIST {
                             draws.push(dr);
@@ -2115,6 +2168,7 @@ impl Effects {
                 }
                 Cfg::Trail(c) => {
                     let Pose::Ends(Some(x0), Some(x1)) = pose else { continue };
+                    let t0 = crate::bench::now();
                     let st = self.trails.entry(r).or_default();
                     st.step(c, x0.pos, x1.pos, now);
                     if st.points.len() < 2 && !c.enabled {
@@ -2123,17 +2177,24 @@ impl Effects {
                     if !st.points.is_empty() {
                         live = true;
                     }
-                    let Some(tex) = texture_id(&c.texture, f.texture) else { continue };
+                    let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
                     if let Some(dr) = st.draw(c, Some((x0.pos, x1.pos)), &view, now, tex) {
                         if dr.dist < mech::FX_MAX_DIST {
                             draws.push(dr);
                         }
                     }
+                    t_trail += crate::bench::now() - t0;
                 }
             }
         }
-        crate::bench::add("fx_sim", t_sim * 1e3, 1);
-        crate::bench::add("fx_beams", t_strip * 1e3, n_beams);
+        drop(_l);
+        crate::bench::add("fx_sim", t_sim, 1);
+        crate::bench::add("fx_cfg", t_cfg, 1);
+        crate::bench::add("fx_pose", t_pose, 1);
+        crate::bench::add("fx_trails", t_trail, 1);
+        crate::bench::add("fx_constraints", t_con, 1);
+        crate::bench::add("fx_list", 0.0, self.list.len() as u64);
+        crate::bench::add("fx_beams", t_strip, n_beams);
         crate::bench::add("fx_beams_kept", 0.0, n_kept);
         let _pd = crate::bench::scope("fx_pdraw");
         emitters.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2148,14 +2209,14 @@ impl Effects {
             if c.texture.is_none() {
                 continue;
             }
-            let Some(tex) = texture_id(&c.texture, f.texture) else { continue };
+            let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
             if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
                 draws.push(dr);
             }
         }
         crate::bench::add("fx_particles", 0.0, n_particles as u64);
         if std::env::var_os("RUSTUDIO_FX_TRACE").is_some() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
-            eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim_ms={:.3}", mech::FX_PARTICLES_MAX - budget, t_sim * 1e3);
+            eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim={:.3}", mech::FX_PARTICLES_MAX - budget, t_sim);
         }
 
         drop(_pd);

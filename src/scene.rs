@@ -1,6 +1,6 @@
 //! Turns the document into renderable parts and lighting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glam::{Mat3, Vec3, Vec4};
 use rbx_dom_weak::types::{BrickColor, Ref, Variant};
@@ -50,6 +50,9 @@ pub struct ScenePart {
     /// Children / siblings whose changes alter this part's look (meshes,
     /// decals, clothing).
     pub deps: Vec<Ref>,
+    /// A MeshPart with Bones / FaceControls (deps from skin.rs): redone
+    /// when the rig changes.
+    pub skinned: bool,
     /// Offset of the drawn shape from the part (mesh Offset), in part space.
     pub draw_offset: Vec3,
     /// Extra rotation of the drawn shape (vertical cylinder meshes).
@@ -59,6 +62,9 @@ pub struct ScenePart {
     /// The part as Studio's light grid voxelizes it (lightgrid.rs); None
     /// when it doesn't (CastShadow off, fully transparent, file meshes).
     pub light: Option<crate::lightgrid::Prim>,
+    /// The ViewportFrame it is drawn in (`Scene::viewport_frames`), None
+    /// in the 3D world.
+    pub layer: Option<Ref>,
 }
 
 /// A Decal or Texture on one face of a part.
@@ -126,11 +132,37 @@ fn surface_emissive(doc: &Document, inst: &Instance) -> Option<(String, [f32; 3]
     ))
 }
 
-/// Decals, Textures and SurfaceAppearance of a part.
+/// A SurfaceAppearance's Color as its shader takes it: sRGB, each channel
+/// clamped to 0..1 (Studio 0.747: Color 2 or 3 draws as 1, -1 as 0; default
+/// white).
+fn surface_tint(doc: &Document, sa: Ref) -> [f32; 3] {
+    match doc.prop(sa, "Color") {
+        Some(Variant::Color3(c)) => [c.r, c.g, c.b].map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 1.0 }),
+        Some(Variant::Color3uint8(c)) => [c.r, c.g, c.b].map(|v| v as f32 / 255.0),
+        _ => [1.0; 3],
+    }
+}
+
+/// The Color of the SurfaceAppearance a part is drawn with (the last one
+/// with a ColorMap, as [`surface_details`] picks it); None without one.
+fn part_surface_tint(doc: &Document, part: Ref) -> Option<[f32; 3]> {
+    let mut tint = None;
+    for c in doc.dom.get_by_ref(part)?.children() {
+        if doc.class_of(*c).is_some_and(|k| k == "SurfaceAppearance") && !sa_unloaded(doc, *c) {
+            tint = (content_string(doc.prop(*c, "ColorMap")).is_some()
+                || content_string(doc.prop(*c, "ColorMapContent")).is_some())
+            .then(|| surface_tint(doc, *c));
+        }
+    }
+    tint
+}
+
+/// Decals, Textures and SurfaceAppearance of a part: the SurfaceAppearance's
+/// ColorMap (how it covers the part, its Color) and the decals.
 fn surface_details(
     doc: &Document,
     inst: &Instance,
-) -> (Option<(String, crate::render::TexMode)>, Vec<DecalDesc>) {
+) -> (Option<(String, crate::render::TexMode, [f32; 3])>, Vec<DecalDesc>) {
     let mut texture = None;
     let mut decals = Vec::new();
     for c in inst.children() {
@@ -140,15 +172,18 @@ fn surface_details(
         match child.class.as_str() {
             "SurfaceAppearance" if sa_unloaded(doc, *c) => {}
             "SurfaceAppearance" => {
-                // AlphaMode: Overlay 0 (alpha blends over Color), Transparency 1.
-                let kind = if enum_u32(doc.prop(*c, "AlphaMode")) == Some(1) {
-                    crate::render::TexMode::Cutout
-                } else {
-                    crate::render::TexMode::Over
+                // AlphaMode: Overlay 0 (alpha blends over Color), Transparency 1,
+                // TintMask 2 (alpha says where Color tints).
+                let kind = match enum_u32(doc.prop(*c, "AlphaMode")) {
+                    Some(1) => crate::render::TexMode::Cutout,
+                    Some(2) => crate::render::TexMode::TintMask,
+                    _ => crate::render::TexMode::Over,
                 };
+                // Without a ColorMap the SurfaceAppearance changes nothing:
+                // its Color tints neither TextureID nor the part (Studio).
                 texture = content_string(doc.prop(*c, "ColorMap"))
                     .or_else(|| content_string(doc.prop(*c, "ColorMapContent")))
-                    .map(|t| (t, kind));
+                    .map(|t| (t, kind, surface_tint(doc, *c)));
             }
             "Decal" | "Texture" => {
                 let Some(id) = content_string(doc.prop(*c, "Texture"))
@@ -303,7 +338,7 @@ pub(crate) fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
         if matches!(doc.prop(r, "UsePartColor"), Some(Variant::Bool(true))) {
             id.push_str("#partcolor");
         }
-        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO });
+        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true });
     };
     if std::env::var_os("RUSTUDIO_UNION_DENSITY_TRACE").is_some() {
         static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
@@ -332,6 +367,7 @@ pub(crate) fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
         fit_to_part: true,
         scale: Vec3::ONE,
         offset: Vec3::ZERO,
+        vertex_colors: true,
     })
 }
 
@@ -343,6 +379,13 @@ pub struct MeshAsset {
     pub fit_to_part: bool,
     pub scale: Vec3,
     pub offset: Vec3,
+    /// The mesh's own vertex colours are drawn. False for a SpecialMesh
+    /// FileMesh: Studio 0.747 never draws a SpecialMesh's mesh colours
+    /// (textured or not, any VertexColor, world and ViewportFrames; a
+    /// MeshPart of the same mesh shows them: checks/viewport-frame-render/
+    /// studio/specialmesh). Applied by the mesh cache (MeshCache::get_colored)
+    /// only to meshes in a Roblox format; see the exception there.
+    pub vertex_colors: bool,
 }
 
 /// The MaterialVariant a part is drawn with: its MaterialVariant name, else
@@ -474,6 +517,12 @@ pub struct Scene {
     changes: SceneChanges,
     /// The voxel terrain needs re-meshing.
     pub terrain_dirty: bool,
+    /// Some: this is the parts inside these drawn ViewportFrames (each part
+    /// in its nearest ViewportFrame's layer), not the 3D world. The world
+    /// leaves out everything inside a ViewportFrame: Studio draws a
+    /// ViewportFrame's parts only in the frame, wherever it is (a SurfaceGui
+    /// on a Workspace part too).
+    vf_roots: Option<HashSet<Ref>>,
 }
 
 /// A colour channel in linear light the way Studio's shaders take it:
@@ -545,9 +594,89 @@ impl Scene {
         }
     }
 
+    /// A scene of the parts inside the given ViewportFrames (see `vf_roots`).
+    pub fn viewport_frames() -> Self {
+        Scene { vf_roots: Some(HashSet::new()), ..Default::default() }
+    }
+
+    /// The ViewportFrames drawn (a ViewportFrame scene only): parts of
+    /// frames no longer drawn go, those of new ones come in.
+    pub fn set_viewport_frames(&mut self, doc: &Document, roots: &HashSet<Ref>) {
+        let Some(old) = self.vf_roots.as_ref() else { return };
+        if old == roots {
+            return;
+        }
+        let gone: Vec<Ref> = old.difference(roots).copied().collect();
+        let added: Vec<Ref> = roots.difference(old).copied().collect();
+        self.vf_roots = Some(roots.clone());
+        if self.doc_id != doc.id {
+            // (the next sync rebuilds)
+            return;
+        }
+        let drop: Vec<Ref> = self.parts.iter().filter(|p| p.layer.is_some_and(|l| gone.contains(&l))).map(|p| p.r).collect();
+        for r in drop {
+            if self.remove(r) {
+                self.changes.removed.push(r);
+            }
+        }
+        for vf in added {
+            let refs: Vec<Ref> = doc.dom.descendants_of(vf).map(|i| i.referent()).collect();
+            for r in refs {
+                self.add(doc, r);
+            }
+        }
+    }
+
+    /// Whether `r` (a part) is in this scene: Some(layer) (None = the 3D
+    /// world, Some(frame) = in that ViewportFrame), or None.
+    fn membership(&self, doc: &Document, root: Option<Ref>, r: Ref) -> Option<Option<Ref>> {
+        let mut vf = None;
+        let mut in_root = false;
+        let mut cur = doc.dom.get_by_ref(r)?.parent();
+        while let Some(i) = doc.dom.get_by_ref(cur) {
+            if vf.is_none() && i.class == "ViewportFrame" {
+                vf = Some(cur);
+                if self.vf_roots.is_some() {
+                    break;
+                }
+            }
+            if Some(cur) == root {
+                in_root = true;
+                break;
+            }
+            cur = i.parent();
+        }
+        match (&self.vf_roots, vf) {
+            (Some(roots), Some(v)) if roots.contains(&v) => Some(Some(v)),
+            (None, None) if in_root => Some(None),
+            _ => None,
+        }
+    }
+
+    /// Reads part `r` in if it belongs here (rebuild / new frame).
+    fn add(&mut self, doc: &Document, r: Ref) {
+        let Some(inst) = doc.dom.get_by_ref(r) else { return };
+        if !self.is_part_class(inst.class) {
+            return;
+        }
+        let root = Self::root(doc);
+        let Some(layer) = self.membership(doc, root, r) else { return };
+        if let Some(mut p) = part_draw(doc, inst) {
+            p.layer = layer;
+            self.insert(p);
+            self.changes.changed.push(r);
+        }
+    }
+
     /// Brings the part list up to date with the document.
     pub fn sync(&mut self, doc: &mut Document) {
-        let marks = doc.marks_for(doc::Reader::Scene);
+        // A ViewportFrame scene with no frame drawn reads no marks (it
+        // rebuilds from scratch when a frame comes back).
+        if self.vf_roots.as_ref().is_some_and(|r| r.is_empty()) && self.parts.is_empty() {
+            self.doc_id = 0;
+            return;
+        }
+        let marks = doc.marks_for(if self.vf_roots.is_some() { doc::Reader::VfScene } else { doc::Reader::Scene });
         let marks = if self.doc_id != doc.id {
             doc::Marks::All
         } else {
@@ -560,12 +689,18 @@ impl Scene {
         }
     }
 
+    /// Parts removed since `take_changes`, without taking them.
+    pub fn peek_removed(&self) -> Vec<Ref> {
+        self.changes.removed.clone()
+    }
+
     /// Changes since the last call.
     pub fn take_changes(&mut self) -> SceneChanges {
         std::mem::take(&mut self.changes)
     }
 
     fn rebuild(&mut self, doc: &Document) {
+        crate::skin::rig_changed();
         self.doc_id = doc.id;
         self.parts.clear();
         self.index.clear();
@@ -575,20 +710,19 @@ impl Scene {
             full: true,
             ..Default::default()
         };
-        self.terrain_dirty = true;
-        let Some(root) = Self::root(doc) else { return };
-        let refs: Vec<Ref> = doc.dom.descendants_of(root).map(|i| i.referent()).collect();
-        for r in refs {
-            let Some(inst) = doc.dom.get_by_ref(r) else {
-                continue;
-            };
-            if !self.is_part_class(inst.class) {
-                continue;
-            }
-            if let Some(p) = part_draw(doc, inst) {
-                self.insert(p);
+        self.terrain_dirty = self.vf_roots.is_none();
+        let roots: Vec<Ref> = match &self.vf_roots {
+            Some(v) => v.iter().copied().filter(|r| doc.exists(*r)).collect(),
+            None => Self::root(doc).into_iter().collect(),
+        };
+        for root in roots {
+            let refs: Vec<Ref> = doc.dom.descendants_of(root).map(|i| i.referent()).collect();
+            for r in refs {
+                self.add(doc, r);
             }
         }
+        // (a rebuild hands over everything as `full`)
+        self.changes.changed.clear();
     }
 
     fn insert(&mut self, p: ScenePart) {
@@ -624,24 +758,21 @@ impl Scene {
         true
     }
 
-    fn under(doc: &Document, root: Ref, r: Ref) -> bool {
-        let mut cur = r;
-        while let Some(i) = doc.dom.get_by_ref(cur) {
-            if cur == root {
-                return true;
-            }
-            cur = i.parent();
-        }
-        false
-    }
-
     /// Applies journal marks: re-reads only the parts they touch.
     fn apply(&mut self, doc: &Document, marks: &[doc::Mark]) {
-        let Some(root) = Self::root(doc) else { return };
+        let root = Self::root(doc);
+        if root.is_none() && self.vf_roots.is_none() {
+            return;
+        }
         let mut full: std::collections::HashSet<Ref> = Default::default();
         let mut moved: std::collections::HashSet<Ref> = Default::default();
         let mut restyled: std::collections::HashSet<Ref> = Default::default();
+        // Parts whose SurfaceAppearance Color changed: only the tint is re-read.
+        let mut retinted: std::collections::HashSet<Ref> = Default::default();
         let cframe = rbx_dom_weak::ustr("CFrame");
+        // A Bone / joint / FaceControls added, removed, renamed or re-pointed:
+        // skinned parts look their Bones up again and are redrawn.
+        let mut rig = false;
         let marks_scope = crate::bench::scope("ss_marks");
         for m in marks {
             match *m {
@@ -659,6 +790,11 @@ impl Scene {
                     self.terrain_dirty = true;
                 }
                 doc::Mark::Prop(r, name) => {
+                    if matches!(name.as_str(), "Name" | "Part0" | "Part1" | "Enabled")
+                        && doc.class_of(r).is_some_and(|c| crate::skin::rig_class(&c))
+                    {
+                        rig = true;
+                    }
                     if self.index.contains_key(&r) {
                         if name == cframe {
                             moved.insert(r);
@@ -671,11 +807,20 @@ impl Scene {
                         full.insert(r);
                     }
                     if let Some(o) = self.owners.get(&r) {
-                        full.extend(o.iter().copied());
+                        // A SurfaceAppearance's Color is instance data in Studio
+                        // (a per-frame tint re-reads no textures or meshes).
+                        if name.as_str() == "Color" && doc.class_of(r).is_some_and(|c| c == "SurfaceAppearance") {
+                            retinted.extend(o.iter().copied());
+                        } else {
+                            full.extend(o.iter().copied());
+                        }
                     }
                 }
                 doc::Mark::Tree(r) => {
                     for d in doc.subtree(r) {
+                        if !rig && doc.class_any(d).is_some_and(|c| crate::skin::rig_class(&c)) {
+                            rig = true;
+                        }
                         if self.index.contains_key(&d)
                             || doc.class_of(d).is_some_and(|c| self.is_part_class(c))
                         {
@@ -711,14 +856,26 @@ impl Scene {
             }
         }
         drop(marks_scope);
+        if rig {
+            crate::skin::rig_changed();
+            for p in &self.parts {
+                if p.skinned {
+                    full.insert(p.r);
+                }
+            }
+        }
         let _draws_scope = crate::bench::scope("ss_part_draw");
         crate::bench::add("ss_full_count", 0.0, full.len() as u64);
         for r in full.iter().copied() {
-            let keep = doc
+            let layer = doc
                 .dom
                 .get_by_ref(r)
-                .filter(|i| self.is_part_class(i.class) && Self::under(doc, root, r));
-            let p = keep.and_then(|inst| part_draw(doc, inst));
+                .filter(|i| self.is_part_class(i.class))
+                .and_then(|_| self.membership(doc, root, r));
+            let p = layer.and_then(|l| part_draw(doc, doc.dom.get_by_ref(r)?).map(|mut p| {
+                p.layer = l;
+                p
+            }));
             match p {
                 Some(p) => {
                     self.insert(p);
@@ -736,7 +893,11 @@ impl Scene {
                 continue;
             }
             // (still a part under the root: a removal comes as a Tree mark)
-            let p = doc.dom.get_by_ref(r).and_then(|inst| part_draw(doc, inst));
+            let layer = self.get(r).and_then(|p| p.layer);
+            let p = doc.dom.get_by_ref(r).and_then(|inst| part_draw(doc, inst)).map(|mut p| {
+                p.layer = layer;
+                p
+            });
             match p {
                 Some(p) => {
                     self.insert(p);
@@ -747,6 +908,18 @@ impl Scene {
                         self.changes.removed.push(r);
                     }
                 }
+            }
+        }
+        for r in retinted {
+            if full.contains(&r) || restyled.contains(&r) {
+                continue;
+            }
+            let Some(&i) = self.index.get(&r) else { continue };
+            let tint = part_surface_tint(doc, r);
+            let p = &mut self.parts[i];
+            if p.draw.surface_tint != tint {
+                p.draw.surface_tint = tint;
+                self.changes.restyled.push(r);
             }
         }
         for r in moved {
@@ -913,6 +1086,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         crate::render::TexMode::Opaque
     };
     let mut tex_kind = sa_texture.as_ref().map(|t| t.1).unwrap_or(mesh_kind);
+    let surface_tint = sa_texture.as_ref().map(|t| t.2);
     let mut texture_id = sa_texture.map(|t| t.0);
     let mut texture_tint = None;
     if class == "MeshPart" && texture_id.is_none() {
@@ -940,6 +1114,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 fit_to_part: true,
                 scale: Vec3::ONE,
                 offset: Vec3::ZERO,
+                vertex_colors: true,
             })
     } else if matches!(class, "UnionOperation" | "IntersectOperation" | "NegateOperation" | "PartOperation") {
         union_mesh(doc, r)
@@ -986,7 +1161,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                     _ => content_string(doc.prop(*c, "MeshContent")),
                 };
                 if let Some(id) = id {
-                    mesh_asset = Some(MeshAsset { id, fit_to_part: false, scale: Vec3::ONE, offset: Vec3::ZERO });
+                    mesh_asset = Some(MeshAsset { id, fit_to_part: false, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true });
                     placeholder = true;
                 }
             }
@@ -998,6 +1173,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             fit_to_part: true,
             scale: Vec3::ONE,
             offset: Vec3::ZERO,
+            vertex_colors: true,
         });
     }
     // Default R6 body geometry comes from Studio's shipped avatar meshes.
@@ -1027,6 +1203,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 fit_to_part: true,
                 scale: Vec3::ONE,
                 offset: Vec3::ZERO,
+                vertex_colors: true,
             });
             placeholder = true;
         }
@@ -1105,6 +1282,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                             fit_to_part: true,
                             scale: Vec3::ONE,
                             offset: Vec3::ZERO,
+                            vertex_colors: true,
                         });
                         placeholder = true;
                     } else {
@@ -1145,6 +1323,13 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                             fit_to_part: false,
                             scale: vec3_of(doc.prop(*c, "Scale")).unwrap_or(Vec3::ONE),
                             offset: vec3_of(doc.prop(*c, "Offset")).unwrap_or(Vec3::ZERO),
+                            // Studio draws a SpecialMesh without its mesh's vertex
+                            // colours. TEMPORARY EXCEPTION (MeshCache::get_colored):
+                            // a local mesh file in a format Studio can't load as a
+                            // MeshId at all (OBJ) keeps them, for a port that uses
+                            // local OBJ scenery with light baked into the colours;
+                            // remove it once that port has moved to MeshParts.
+                            vertex_colors: false,
                         });
                 }
                 // Prism, Pyramid, ramps: no shape of their own yet.
@@ -1228,7 +1413,10 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     } else {
         0
     };
+    let skin_deps = (class == "MeshPart")
+        .then(|| crate::skin::deps_of(doc, r, mesh_asset.as_ref().map(|a| a.id.as_str())));
     Some(ScenePart {
+        layer: None,
         r,
         xf,
         size,
@@ -1245,9 +1433,21 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         decal_size: if head_mesh || legacy_shape { draw_size } else { size },
         decal_offset: if legacy_shape { draw_offset } else { Vec3::ZERO },
         // A skinned MeshPart redraws when a Bone or its FaceControls changes (skin.rs).
+        skinned: skin_deps.as_ref().is_some_and(|d| !d.is_empty()),
         deps: if class == "MeshPart" {
             let mut deps = deps;
-            deps.extend(crate::skin::deps_of(doc, r));
+            deps.extend(skin_deps.unwrap_or_default());
+            // The body part that draws a fitted garment redraws when the
+            // other body parts move (the garment is skinned to them, wrap.rs).
+            if crate::wrap::draws_garment(doc, inst.parent(), r) {
+                if let Some(m) = doc.dom.get_by_ref(inst.parent()) {
+                    for c in m.children() {
+                        if *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| i.children().iter().any(|k| doc.class_of(*k).is_some_and(|x| x == "WrapTarget"))) {
+                            deps.push(*c);
+                        }
+                    }
+                }
+            }
             deps
         } else {
             deps
@@ -1285,6 +1485,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             surfaces,
             material_id,
             mat_layer: -1,
+            surface_tint,
             cast_shadow,
         },
     })

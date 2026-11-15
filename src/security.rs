@@ -38,6 +38,9 @@ pub const COMMAND: u8 = 1;
 /// Roblox's own CoreScripts (the in-game menu's Settings writing
 /// UserGameSettings: MasterVolume and friends are RobloxScript members).
 pub const CORE: u8 = 4;
+/// Studio plugins (printidentity prints 5 in a local plugin's Script, its
+/// ModuleScripts and spawned threads: measured in Studio 0.747, 2026-11-14).
+pub const PLUGIN_IDENT: u8 = 5;
 
 // Legacy capability bits.
 const PLUGIN: u8 = 0x1;
@@ -71,6 +74,12 @@ fn legacy_granted(id: u8) -> u8 {
         // Players); game scripts measured without it.
         COMMAND => PLUGIN | LOCAL_USER | WRITE_PLAYER,
         CORE => PLUGIN | LOCAL_USER | WRITE_PLAYER | ROBLOX_SCRIPT,
+        // Measured for a plugin: settings(), PluginManager, CoreGui,
+        // StudioService, RobloxLocked, GetDebugId (Plugin) are granted;
+        // UsesAssetInsertionDrag / SourceAssetId (RobloxScript) and
+        // ScriptContext.ScriptsDisabled (LocalUser) are refused
+        //. WritePlayer: unmeasured, left out.
+        PLUGIN_IDENT => PLUGIN,
         _ => 0,
     }
 }
@@ -84,7 +93,8 @@ fn legacy_granted(id: u8) -> u8 {
 fn sandbox_denied(id: u8) -> u8 {
     let _ = (SB_INTERNAL_TEST, SB_REMOTE_COMMAND, SB_ASSISTANT);
     match id {
-        COMMAND => 0,
+        // (A plugin reads RunService.RunState: measured.)
+        COMMAND | PLUGIN_IDENT => 0,
         _ => SB_PLUGIN_OR_OPEN_CLOUD,
     }
 }
@@ -471,7 +481,23 @@ pub fn index_hook(lua: &Lua, r: Ref, key: &str) -> mlua::Result<Option<Value>> {
     let (class, _) = inst_class(lua, r)?;
     let Some(rule) = rule(class.as_str(), key) else { return Ok(None) };
     if rule.not_scriptable {
-        return if internal(lua) { Ok(None) } else { Err(not_member(lua, r, class.as_str(), key)) };
+        if internal(lua) {
+            return Ok(None);
+        }
+        // Not a member for scripts: a child of that name answers, as in
+        // Studio (Moon Animator's `model.Origin`, PVInstance.Origin being
+        // NotScriptable).
+        let child = {
+            let w = world(lua)?;
+            let d = w.d();
+            d.dom.get_by_ref(r).and_then(|i| {
+                i.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|ci| ci.name == key))
+            })
+        };
+        return match child {
+            Some(c) => Ok(Some(inst_value(lua, c)?)),
+            None => Err(not_member(lua, r, class.as_str(), key)),
+        };
     }
     match rule.kind {
         MKind::Property => {
@@ -509,6 +535,9 @@ pub fn newindex_hook(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
         Some(rule) if rule.not_scriptable && !internal(lua) => Err(not_member(lua, r, class.as_str(), key)),
         Some(rule) if rule.not_scriptable => Ok(()),
         Some(rule) if rule.kind == MKind::Property => check(lua, "write", key, Some(rule.read), rule.write),
+        // A secured callback (Plugin.ProcessAssetInsertionDrag): "cannot
+        // assign" as Studio (api-walk callback-set).
+        Some(rule) if rule.kind == MKind::Callback => check(lua, "assign", key, None, rule.read),
         _ => Ok(()),
     }
 }
@@ -581,6 +610,11 @@ pub fn install_globals(lua: &Lua) -> mlua::Result<()> {
         }
     }
     g.set("__rs_sec_event_names", names)?;
+    // printidentity's second line in a plugin thread (src/plugin_host).
+    g.set(
+        "__rs_plugin_asset",
+        lua.create_function(|lua, ()| Ok(crate::plugin_host::vm::running_asset_id(lua)))?,
+    )?;
     Ok(())
 }
 
@@ -600,20 +634,12 @@ pub fn seal(lua: &Lua) -> mlua::Result<()> {
         checked(lua, r)
     })?;
     g.set("settings", crate::cmeta::wrap(lua, settings, true)?)?;
-    let pm: Table = lua
-        .load(
-            r#"
-            local pm = setmetatable({}, { __tostring = function() return "PluginManager" end, __type = "Instance" })
-            function pm:CreatePlugin()
-                return setmetatable({}, { __tostring = function() return "Plugin" end })
-            end
-            return pm
-            "#,
-        )
-        .set_name("=rustudio.security")
-        .eval()?;
+    // PluginManager(): Studio's PluginManagerInterface instance (one per
+    // DataModel; src/plugin_host/api_studio_service.rs).
     let plugin_manager = lua.create_function(move |lua, ()| {
-        let r = check_global(lua, "PluginManager").map(|_| MultiValue::from_iter([Value::Table(pm.clone())]));
+        let r = check_global(lua, "PluginManager").and_then(|_| {
+            crate::runtime::domains::plugin::studio_service::plugin_manager(lua).map(|v| MultiValue::from_iter([v]))
+        });
         checked(lua, r)
     })?;
     g.set("PluginManager", crate::cmeta::wrap(lua, plugin_manager, true)?)?;
@@ -642,7 +668,7 @@ pub fn seal(lua: &Lua) -> mlua::Result<()> {
             inst.raw_set("new", crate::cmeta::wrap(lua, f, false)?)?;
         }
     }
-    for k in ["__rs_identity", "__rs_sec_event", "__rs_sec_event_names"] {
+    for k in ["__rs_identity", "__rs_sec_event", "__rs_sec_event_names", "__rs_plugin_asset"] {
         g.raw_set(k, Value::Nil)?;
     }
     Ok(())
@@ -790,7 +816,7 @@ mod tests {
         for want in [
             "Current identity is 1",
             "settings true",
-            "pm PluginManager",
+            "pm PluginManagerInterface", // Studio 0.747 (checks/plugins/ref/captures/load-run1.txt)
             "datacost true",
             "src false The current thread cannot read 'SourceAssetId' (lacking capability RobloxScript)",
             "spawned 1",

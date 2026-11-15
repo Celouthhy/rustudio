@@ -216,13 +216,16 @@ impl AccountUi {
     /// Before Play: lets a session check still running finish, then the
     /// avatar load, up to `max` (Studio only plays signed in, and its first
     /// character already wears the account's avatar). Returns the log lines.
-    pub fn settle_for_play(&mut self, max: std::time::Duration) -> Vec<(Level, String)> {
+    /// `avatar`: wait for the avatar too (a character spawns at once);
+    /// otherwise the session's identity is enough and the avatar reaches the
+    /// running Play when it arrives (Editor::play_tick).
+    pub fn settle_for_play(&mut self, max: std::time::Duration, avatar: bool) -> Vec<(Level, String)> {
         let t0 = std::time::Instant::now();
         let mut logs = Vec::new();
         loop {
             logs.extend(self.poll());
             let checking = matches!(self.state, SessionState::Checking(_)) && self.restored;
-            let avatar_pending = self.signed_in() && self.avatar.is_none() && self.busy();
+            let avatar_pending = avatar && self.signed_in() && self.avatar.is_none() && self.busy();
             if !(checking || avatar_pending) || t0.elapsed() >= max {
                 return logs;
             }

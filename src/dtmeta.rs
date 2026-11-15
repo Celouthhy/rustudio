@@ -381,12 +381,18 @@ fn probe_cframe(lua: &Lua) -> Option<(usize, u64, usize)> {
 
 /// The CFrame at 1 (self already known to be one).
 unsafe fn cframe_at(l: *mut ffi::lua_State) -> Option<crate::math::Xform> {
+    unsafe { cframe_idx(l, 1) }
+}
+
+/// The CFrame at `i` (known to be one: its metatable checked), read from
+/// mlua's block as probed; None if the block doesn't look as probed.
+unsafe fn cframe_idx(l: *mut ffi::lua_State, i: c_int) -> Option<crate::math::Xform> {
     let (len, w0, at) = (*CFRAME_UD.get()?)?;
     unsafe {
-        if ffi::lua_objlen(l, 1) as usize != len {
+        if ffi::lua_objlen(l, i) as usize != len {
             return None;
         }
-        let p = ffi::lua_touserdata(l, 1) as *const u64;
+        let p = ffi::lua_touserdata(l, i) as *const u64;
         if p.read_unaligned() != w0 {
             return None;
         }
@@ -594,6 +600,11 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
             drop(msg);
             ffi::lua_error(l);
         }
+        if meta.name == "CFrame" && DT_FAST.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(r) = cf_method_fast(l, CStr::from_ptr(name).to_bytes(), n) {
+                return r;
+            }
+        }
         ffi::lua_remove(l, n + 1);
         ffi::lua_insert(l, 1);
         if ffi::lua_pcall(l, n, ffi::LUA_MULTRET, 0) != 0 {
@@ -603,12 +614,210 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
     }
 }
 
+// ------------------------------------------------------- CFrame fast paths
+//
+// The commonest CFrame constructors, operators and methods answered in the
+// C function itself: the arguments read off the stack, the result pushed as
+// the same mlua userdata `create_userdata` makes (`push_userdata_unref`).
+// Only exact cases (the argument types and counts the Rust implementation
+// accepts, finite numbers): anything else, errors included, goes through the
+// implementation as before. The arithmetic is the implementation's own
+// (ltypes cf_mul / cf_inv / look_at_legacy, glam's euler / slerp).
+
+/// Whether the fast paths are on (RUSTUDIO_NO_DT_FAST=1 turns them off: the
+/// implementation answers everything, for comparisons).
+static DT_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn dt_fast() -> bool {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        if std::env::var_os("RUSTUDIO_NO_DT_FAST").is_some() {
+            DT_FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    DT_FAST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The fast constructor for `CFrame.<f>` (0 none).
+fn ctor_fast_id(ty: &str, f: &str) -> i32 {
+    if !dt_fast() {
+        return 0;
+    }
+    match (ty, f) {
+        ("CFrame", "new") => 1,
+        ("CFrame", "Angles" | "fromEulerAnglesXYZ") => 2,
+        ("CFrame", "fromOrientation" | "fromEulerAnglesYXZ") => 3,
+        _ => 0,
+    }
+}
+
+/// A finite number at `i` (that converts to f32 as mlua converts it).
+unsafe fn num_at(l: *mut ffi::lua_State, i: c_int) -> Option<f32> {
+    unsafe {
+        if ffi::lua_type(l, i) != ffi::LUA_TNUMBER {
+            return None;
+        }
+        let x = ffi::lua_tonumber(l, i);
+        (x.is_finite() && x.abs() <= f32::MAX as f64).then_some(x as f32)
+    }
+}
+
+unsafe fn vec_at(l: *mut ffi::lua_State, i: c_int) -> Option<glam::Vec3> {
+    unsafe {
+        if ffi::lua_type(l, i) != ffi::LUA_TVECTOR {
+            return None;
+        }
+        let p = ffi::lua_tovector(l, i);
+        Some(glam::Vec3::new(*p, *p.add(1), *p.add(2)))
+    }
+}
+
+/// The CFrame at `i` when its metatable is the one at `mt` (a stack index).
+unsafe fn cframe_with_mt(l: *mut ffi::lua_State, i: c_int, mt: c_int) -> Option<crate::math::Xform> {
+    unsafe {
+        if ffi::lua_type(l, i) != ffi::LUA_TUSERDATA || ffi::lua_getmetatable(l, i) == 0 {
+            return None;
+        }
+        let same = ffi::lua_rawequal(l, -1, mt) != 0;
+        ffi::lua_pop(l, 1);
+        if !same {
+            return None;
+        }
+        cframe_idx(l, i)
+    }
+}
+
+/// Pushes a new CFrame; false (nothing pushed) if it can't be made here.
+unsafe fn push_cframe(l: *mut ffi::lua_State, x: crate::math::Xform) -> bool {
+    unsafe {
+        if ffi::lua_checkstack(l, 3) == 0 {
+            return false;
+        }
+        let lua = Lua::get_or_init_from_ptr(l);
+        matches!(lua.push_userdata_unref(l, crate::ltypes::LCFrame(x)), Ok(true))
+    }
+}
+
+unsafe fn cf_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -> Option<crate::math::Xform> {
+    use crate::math::Xform;
+    use glam::{EulerRot, Mat3, Vec3};
+    unsafe {
+        match (id, n) {
+            (1, 0) => Some(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }),
+            (1, 1) => Some(Xform { pos: vec_at(l, 1)?, rot: Mat3::IDENTITY }),
+            (1, 2) => Some(crate::ltypes::look_at_legacy(vec_at(l, 1)?, vec_at(l, 2)?)),
+            (1, 3) => Some(Xform { pos: Vec3::new(num_at(l, 1)?, num_at(l, 2)?, num_at(l, 3)?), rot: Mat3::IDENTITY }),
+            (1, 12) => {
+                let mut c = [0f32; 12];
+                for (k, v) in c.iter_mut().enumerate() {
+                    *v = num_at(l, k as c_int + 1)?;
+                }
+                Some(Xform {
+                    pos: Vec3::new(c[0], c[1], c[2]),
+                    rot: Mat3::from_cols(
+                        Vec3::new(c[3], c[6], c[9]),
+                        Vec3::new(c[4], c[7], c[10]),
+                        Vec3::new(c[5], c[8], c[11]),
+                    ),
+                })
+            }
+            (2, 3) => {
+                let (x, y, z) = (num_at(l, 1)?, num_at(l, 2)?, num_at(l, 3)?);
+                Some(Xform { pos: Vec3::ZERO, rot: Mat3::from_euler(EulerRot::XYZ, x, y, z) })
+            }
+            (3, 3) => {
+                let (x, y, z) = (num_at(l, 1)?, num_at(l, 2)?, num_at(l, 3)?);
+                Some(Xform { pos: Vec3::ZERO, rot: Mat3::from_euler(EulerRot::YXZ, y, x, z) })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// CFrame `*` / `+` / `-` (op 1 / 2 / 3) on the two operands; the number
+/// of results pushed, None to take the implementation.
+unsafe fn cf_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_int> {
+    use crate::math::Xform;
+    unsafe {
+        let mt = ffi::lua_upvalueindex(4);
+        if ffi::lua_type(l, mt) != ffi::LUA_TTABLE {
+            return None;
+        }
+        let a = cframe_with_mt(l, 1, mt)?;
+        let out = match op {
+            1 => {
+                if let Some(v) = vec_at(l, 2) {
+                    let p = a.pos + a.rot * v;
+                    ffi::lua_pushvector(l, p.x, p.y, p.z);
+                    return Some(1);
+                }
+                crate::ltypes::cf_mul(&a, &cframe_with_mt(l, 2, mt)?)
+            }
+            2 => Xform { pos: a.pos + vec_at(l, 2)?, rot: a.rot },
+            3 => Xform { pos: a.pos - vec_at(l, 2)?, rot: a.rot },
+            _ => return None,
+        };
+        push_cframe(l, out).then_some(1)
+    }
+}
+
+/// `cf:Method(...)` for the commonest methods (self at 1, `n` values on the
+/// stack before the method name pushed at n + 1).
+unsafe fn cf_method_fast(l: *mut ffi::lua_State, name: &[u8], n: c_int) -> Option<c_int> {
+    use crate::ltypes::{cf_inv, cf_mul};
+    use crate::math::Xform;
+    use glam::Quat;
+    unsafe {
+        let a = cframe_idx(l, 1)?;
+        // A CFrame argument: its metatable is self's.
+        let other = |i: c_int| -> Option<Xform> {
+            if ffi::lua_getmetatable(l, 1) == 0 {
+                return None;
+            }
+            let top = ffi::lua_gettop(l);
+            let x = cframe_with_mt(l, i, top);
+            ffi::lua_pop(l, 1);
+            x
+        };
+        let vec_out = |v: glam::Vec3| {
+            ffi::lua_pushvector(l, v.x, v.y, v.z);
+            Some(1)
+        };
+        let cf_out = match (name, n) {
+            (b"Inverse" | b"inverse", 1) => cf_inv(&a),
+            (b"ToWorldSpace" | b"toWorldSpace", 2) => cf_mul(&a, &other(2)?),
+            (b"ToObjectSpace" | b"toObjectSpace", 2) => cf_mul(&cf_inv(&a), &other(2)?),
+            (b"PointToWorldSpace" | b"pointToWorldSpace", 2) => return vec_out(a.pos + a.rot * vec_at(l, 2)?),
+            (b"PointToObjectSpace" | b"pointToObjectSpace", 2) => {
+                return vec_out(a.rot.transpose() * (vec_at(l, 2)? - a.pos))
+            }
+            (b"VectorToWorldSpace" | b"vectorToWorldSpace", 2) => return vec_out(a.rot * vec_at(l, 2)?),
+            (b"VectorToObjectSpace" | b"vectorToObjectSpace", 2) => return vec_out(a.rot.transpose() * vec_at(l, 2)?),
+            (b"Lerp" | b"lerp", 3) => {
+                let o = other(2)?;
+                let t = num_at(l, 3)?;
+                let q = Quat::from_mat3(&a.rot).slerp(Quat::from_mat3(&o.rot), t);
+                Xform { pos: a.pos.lerp(o.pos, t), rot: glam::Mat3::from_quat(q) }
+            }
+            _ => return None,
+        };
+        push_cframe(l, cf_out).then_some(1)
+    }
+}
+
 // ------------------------------------------------------------ operators
 
-/// An operator. Upvalues: 1 the implementation, 2 errtext.
+/// An operator. Upvalues: 1 the implementation, 2 errtext, 3 its fast path
+/// (0 none, CFrame 1 `*`, 2 `+`, 3 `-`), 4 the type's metatable.
 unsafe extern "C-unwind" fn op_fn(l: *mut ffi::lua_State) -> c_int {
     unsafe {
         let n = ffi::lua_gettop(l);
+        let fast = ffi::lua_tointegerx(l, ffi::lua_upvalueindex(3), std::ptr::null_mut());
+        if fast != 0 && n == 2 {
+            if let Some(r) = cf_op_fast(l, fast) {
+                return r;
+            }
+        }
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(1));
         ffi::lua_insert(l, 1);
         if ffi::lua_pcall(l, n, ffi::LUA_MULTRET, 0) != 0 {
@@ -883,9 +1092,18 @@ fn install_parts(
         let v: Value = mt.raw_get(*op)?;
         let Value::Function(f) = v else { continue };
         if keep.contains(op) {
+            // CFrame's * + -: a fast path for CFrame and Vector3 operands
+            // (upvalue 3 which operator, 4 the type's metatable).
+            let fast: i32 = match (meta.name, *op) {
+                _ if !dt_fast() => 0,
+                ("CFrame", "__mul") => 1,
+                ("CFrame", "__add") => 2,
+                ("CFrame", "__sub") => 3,
+                _ => 0,
+            };
             let w = unsafe {
-                lua.exec_raw::<Function>((f, errtext.clone()), |l| {
-                    ffi::lua_pushcclosurek(l, op_fn, std::ptr::null(), 2, None)
+                lua.exec_raw::<Function>((f, errtext.clone(), fast, self_mt.clone()), |l| {
+                    ffi::lua_pushcclosurek(l, op_fn, std::ptr::null(), 4, None)
                 })?
             };
             mt.raw_set(*op, w)?;
@@ -901,6 +1119,79 @@ fn install_parts(
 mod tests {
     use super::*;
 
+    /// The CFrame fast paths (constructors, * + -, methods) give exactly
+    /// what the Rust implementation gives, bit for bit, errors included.
+    #[test]
+    fn cframe_fast_paths_match_the_implementation() {
+        let src = r#"
+            local out = {}
+            local function bits(v)
+                if typeof(v) == "CFrame" then return "CF(" .. table.concat({ v:GetComponents() }, ",") .. ")" end
+                if typeof(v) == "Vector3" then return "V(" .. v.X .. "," .. v.Y .. "," .. v.Z .. ")" end
+                return typeof(v) .. ":" .. tostring(v)
+            end
+            local function try(name, f)
+                local ok, v = pcall(f)
+                table.insert(out, name .. "=" .. (ok and bits(v) or ("ERR " .. tostring(v))))
+            end
+            local xs = { 0, 1, -2.5, 1 / 3, 1e7, -1e-7, 123.456, math.pi, 1e39, -1e39, 0 / 0, math.huge }
+            for i, x in xs do
+                local y, z = xs[(i % #xs) + 1], xs[((i + 4) % #xs) + 1]
+                try("new3 " .. i, function() return CFrame.new(x, y, z) end)
+                try("angles " .. i, function() return CFrame.Angles(x, y, z) end)
+                try("xyz " .. i, function() return CFrame.fromEulerAnglesXYZ(z, x, y) end)
+                try("orient " .. i, function() return CFrame.fromOrientation(x, y, z) end)
+                try("yxz " .. i, function() return CFrame.fromEulerAnglesYXZ(y, z, x) end)
+                try("new12 " .. i, function() return CFrame.new(x, y, z, 1, 0, 0, 0, z, 1, y, 0, x) end)
+            end
+            local a = CFrame.new(1, 2, 3) * CFrame.Angles(0.1, 0.2, 0.3)
+            local b = CFrame.fromEulerAnglesYXZ(0.5, -0.4, 1.2) + Vector3.new(4, -5, 6)
+            local v = Vector3.new(1.5, -2.25, 3)
+            try("new0", function() return CFrame.new() end)
+            try("new1", function() return CFrame.new(v) end)
+            try("new2", function() return CFrame.new(v, Vector3.new(-4, 5, 9)) end)
+            try("new2 up", function() return CFrame.new(v, v + Vector3.new(0, 5, 0)) end)
+            try("new7", function() return CFrame.new(1, 2, 3, 0, 0, 0, 1) end)
+            try("new str", function() return CFrame.new("1", 2, 3) end)
+            try("new bad", function() return CFrame.new(1, 2) end)
+            try("new nil", function() return CFrame.new(1, nil, 3) end)
+            try("angles 2", function() return CFrame.Angles(1, 2) end)
+            try("angles 4", function() return CFrame.Angles(1, 2, 3, 4) end)
+            try("mul", function() return a * b end)
+            try("mul v", function() return a * v end)
+            try("mul n", function() return a * 2 end)
+            try("mul s", function() return a * "x" end)
+            try("add", function() return a + v end)
+            try("sub", function() return a - v end)
+            try("add cf", function() return a + b end)
+            try("v add", function() return v + a end)
+            try("inverse", function() return a:Inverse() end)
+            try("inverse 2", function() return a:Inverse(b) end)
+            try("tows", function() return a:ToWorldSpace(b) end)
+            try("toos", function() return a:ToObjectSpace(b) end)
+            try("toos v", function() return a:ToObjectSpace(v) end)
+            try("ptws", function() return a:PointToWorldSpace(v) end)
+            try("ptos", function() return a:PointToObjectSpace(v) end)
+            try("vtws", function() return a:VectorToWorldSpace(v) end)
+            try("vtos", function() return a:VectorToObjectSpace(v) end)
+            try("ptos cf", function() return a:PointToObjectSpace(b) end)
+            try("lerp", function() return a:Lerp(b, 0.3) end)
+            try("lerp str", function() return a:Lerp(b, "0.3") end)
+            try("lerp v", function() return a:Lerp(v, 0.3) end)
+            try("lower", function() return a:toObjectSpace(b) * a:inverse() end)
+            return table.concat(out, "\n")
+        "#;
+        let fast = run(&lua(), src);
+        DT_FAST.store(false, std::sync::atomic::Ordering::Relaxed);
+        let slow = run(&lua(), src);
+        DT_FAST.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (f, s) in fast.lines().zip(slow.lines()) {
+            assert_eq!(f, s);
+        }
+        assert_eq!(fast.lines().count(), slow.lines().count());
+        assert!(fast.contains("new3 2=CF(1,-2.5,"), "{fast}");
+    }
+
     fn lua() -> Lua {
         let lua = Lua::new();
         crate::ltypes::install(&lua, &lua.globals()).unwrap();
@@ -912,7 +1203,21 @@ mod tests {
         lua.load(src).set_name("=T").eval::<String>().unwrap_or_else(|e| panic!("{src}: {e}"))
     }
 
-    /// Studio probes rows read / write / writeX / namecall / *.info.
+    /// DateTime local time is the machine's zone (Argon names its undo
+    /// steps with FormatLocalTime("LTS")).
+    #[test]
+    fn date_time_local_time_uses_the_machine_zone() {
+        use chrono::{Local, TimeZone};
+        let lua = lua();
+        let ms: i64 = 1_763_215_200_000; // 2025-11-15 14:00:00 UTC
+        let off = Local.timestamp_millis_opt(ms).single().unwrap().offset().local_minus_utc() as i64;
+        let got = run(&lua, &format!("local d = DateTime.fromUnixTimestampMillis({ms}) local l, u = d:ToLocalTime(), d:ToUniversalTime() return ((l.Day * 24 + l.Hour) * 60 + l.Minute) - ((u.Day * 24 + u.Hour) * 60 + u.Minute) .. '|' .. d:FormatUniversalTime('LTS', 'en-us')"));
+        assert_eq!(got, format!("{}|2:00:00 PM", off / 60));
+        let want = (Local.timestamp_millis_opt(ms).single().unwrap()).format("%-I:%M:%S %p").to_string();
+        assert_eq!(run(&lua, &format!("return DateTime.fromUnixTimestampMillis({ms}):FormatLocalTime('LTS', 'en-us')")), want);
+    }
+
+    /// RE-DATATYPES.md rows read / write / writeX / namecall / *.info.
     #[test]
     fn members_and_raisers_like_studio() {
         let lua = lua();
@@ -977,6 +1282,13 @@ mod tests {
         assert_eq!(e("(function() Vector3.foo = 1 end)()"), "false|string|T:1: attempt to modify a readonly table");
         assert_eq!(run(&lua, "return debug.info(Vector3.new, 'n') .. debug.info(PhysicalProperties.new, 'n')"), "newnewPhysicalPropertiesWithClampedMsgClosure");
         assert_eq!(e("tostring(Vector2.new('a').X + UDim2.new({}).X.Offset + Color3.new(nil).R)"), "true|string|0");
+        // OverlapParams.IncludeInstances / ExcludeInstances (Brushtool's sweeps)
+        assert_eq!(
+            e("(function() local o = OverlapParams.new() o.IncludeInstances = {1, 2} local a = o.FilterType.Name .. #o.FilterDescendantsInstances .. #o.ExcludeInstances o.ExcludeInstances = {3} return a .. o.FilterType.Name .. #o.IncludeInstances end)()"),
+            "true|string|Include20Exclude0"
+        );
+        // UDim2.new(UDim, UDim) (Archimedes' scroll frame sizes its clip area so)
+        assert_eq!(e("tostring(UDim2.new(UDim.new(1, -16), UDim.new(0.5, 3)))"), "true|string|{1, -16}, {0.5, 3}");
         assert_eq!(e("CFrame.new('a')"), "false|string|T:1: invalid argument #1 to 'new' (Vector3 expected, got string)");
         assert_eq!(e("CFrame.new(1, 2)"), "false|string|T:1: invalid argument #1 to 'new' (Vector3 expected, got number)");
         assert_eq!(e("Random.new('a')"), "false|string|T:1: invalid argument #1 to 'new' (number expected, got string)");
@@ -1206,11 +1518,26 @@ fn ctor_name(ty: &str, f: &str) -> Option<&'static CStr> {
 }
 
 /// A constructor. Upvalues: 1 the implementation, 2 errtext, 3 lenient
-/// (non-numbers become 0). Argument errors get the function's name.
+/// (non-numbers become 0), 4 its fast path (`ctor_fast_id`, 0 none).
+/// Argument errors get the function's name.
 unsafe extern "C-unwind" fn ctor_fn(l: *mut ffi::lua_State) -> c_int {
     unsafe {
         let n = ffi::lua_gettop(l);
-        if ffi::lua_toboolean(l, ffi::lua_upvalueindex(3)) != 0 {
+        let fast = ffi::lua_tointegerx(l, ffi::lua_upvalueindex(4), std::ptr::null_mut());
+        if fast != 0 {
+            if let Some(x) = cf_ctor_fast(l, fast, n) {
+                if push_cframe(l, x) {
+                    return 1;
+                }
+            }
+        }
+        let mode = ffi::lua_tointegerx(l, ffi::lua_upvalueindex(3), std::ptr::null_mut());
+        // UDim2.new(UDim, UDim) keeps its two UDims (Archimedes' scroll frame).
+        let udim_pair = mode == 2
+            && n == 2
+            && ffi::lua_type(l, 1) == ffi::LUA_TUSERDATA
+            && ffi::lua_type(l, 2) == ffi::LUA_TUSERDATA;
+        if mode != 0 && !udim_pair {
             for i in 1..=n {
                 if ffi::lua_type(l, i) != ffi::LUA_TNUMBER {
                     let mut ok = 0;
@@ -1285,16 +1612,22 @@ pub fn install_constructors(lua: &Lua) -> mlua::Result<()> {
         }
         for (k, f) in fns {
             let key = k.to_string_lossy();
-            let lenient = lenient(ty, &key);
+            // 0 strict, 1 lenient, 2 lenient but UDim2.new(UDim, UDim).
+            let lenient: i32 = match (lenient(ty, &key), *ty, &*key) {
+                (false, ..) => 0,
+                (true, "UDim2", "new") => 2,
+                (true, ..) => 1,
+            };
+            let fast = ctor_fast_id(ty, &key);
             let w = unsafe {
-                lua.exec_raw::<Function>((f, errtext.clone(), lenient, k.clone()), |l| {
+                lua.exec_raw::<Function>((f, errtext.clone(), lenient, fast, k.clone()), |l| {
                     // The key string lives as long as the (frozen) table.
                     let name = match ctor_name(ty, &key) {
                         Some(n) => n.as_ptr(),
                         None => ffi::lua_tolstring(l, -1, std::ptr::null_mut()),
                     };
                     ffi::lua_pop(l, 1);
-                    ffi::lua_pushcclosurek(l, ctor_fn, name, 3, None);
+                    ffi::lua_pushcclosurek(l, ctor_fn, name, 4, None);
                 })?
             };
             t.raw_set(k, w)?;

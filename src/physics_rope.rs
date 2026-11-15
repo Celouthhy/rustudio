@@ -47,7 +47,8 @@ impl Physics {
     }
 
     pub(super) fn apply_ropes(&mut self, doc: &Document, dt: f32) {
-        if self.ropes.is_empty() { return; }
+        // RUSTUDIO_SOLVER=studio: ropes and rods are the solver's rows (studio_constraints)
+        if self.ropes.is_empty() || self.studio.is_some() { return; }
         let ropes: Vec<Ref> = self.ropes.iter().copied().collect();
         for r in ropes {
             if matches!(doc.prop(r, "Enabled"), Some(Variant::Bool(false))) { continue; }

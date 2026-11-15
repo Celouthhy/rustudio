@@ -54,7 +54,8 @@ gone:Destroy()
 local t = os.clock()
 while os.clock() - t < 1.2 do
 	local p = once.TimePosition
-	if p < last - 1e-6 then wrapped = true end
+	-- (at the end TimePosition goes back to 0 with Playing false: not a wrap)
+	if once.IsPlaying and p < last - 1e-6 then wrapped = true end
 	last = p
 	task.wait()
 end

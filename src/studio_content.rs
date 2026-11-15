@@ -147,8 +147,9 @@ pub fn classic_oof() -> PathBuf {
 /// Fetch the classic Oof in the background, once, unless it is already here.
 pub fn fetch_classic_oof_once() {
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // (RUSTUDIO_NO_STUDIO_FETCH or the rustudio option turns it off)
     if cfg!(test)
-        || std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some()
+        || !crate::rustudio_settings::classic_death_sound_fetch()
         || classic_oof().is_file()
         || STARTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {

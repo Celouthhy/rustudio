@@ -1,14 +1,19 @@
 //! Skinned MeshParts: the mesh's bones and weights (mesh.rs `Skin`) driven
-//! by the Bone instances in the part, as Roblox skins them. Each mesh bone
-//! is matched by name with a Bone under the MeshPart; its current frame in
-//! part space is the chain of Bone.CFrame × Bone.Transform from the part
-//! (a mesh bone with no Bone instance follows its parent bone rigidly), its
-//! bind frame is the mesh's own bone frame (mesh space, centred and scaled
-//! to the part like the vertices). Every corner moves by the weighted sum of
-//! (current × bind⁻¹) over its bones; normals turn with the rotations.
-//! Done on the CPU when a part's bones move (a dynamic head is a few
-//! thousand triangles), and only for parts that have Bones: a skinned mesh
-//! whose bones are all at rest draws the shared mesh untouched.
+//! by Bone instances, as Studio 0.747 skins them (measured with marker
+//! captures, checks/mesh-deform/AUDIT.md):
+//! - Each mesh bone is matched by name with a Bone under the MeshPart, else
+//!   under another part of its assembly (jointed: Weld, WeldConstraint,
+//!   Motor6D, …; an importer's "Bones under the root part" rig). Its current
+//!   frame is the Bone's TransformedWorldCFrame (CFrame × Transform up the
+//!   chain); a mesh bone with no Bone follows its parent bone rigidly.
+//! - Its bind frame is the mesh's own bone frame, centred like the vertices,
+//!   position scaled by Size / InitialSize, rotation as is.
+//! - Linear blend: each vertex moves by Σ wᵢ (currentᵢ × bindᵢ⁻¹), with the
+//!   file's u8 weights / 255 NOT renormalised, blended in world space, so
+//!   weight missing from 255 pulls the vertex toward the world origin.
+//! Deformed on the GPU (skin_gpu.rs) when a part's bones move; a skinned
+//! mesh whose bones are all at rest (and whose weights are whole) draws the
+//! shared mesh untouched.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,6 +39,9 @@ pub struct Base {
     pub corner_unique: Vec<u32>,
     /// The mesh's FACS rig (dynamic heads), posed by a FaceControls child.
     pub facs: Option<crate::runtime::domains::avatar::face::Facs>,
+    /// Every corner's weights sum to 255/255 (else even the rest pose
+    /// moves: Studio pulls the missing weight toward the world origin).
+    pub whole: bool,
 }
 
 /// Parsed skinned meshes by content id (None: not skinned / unreadable).
@@ -57,7 +65,9 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
         let center = (m.max + m.min) * 0.5;
         let colors = m.gpu_colors();
         let (firsts, corner_unique) = uniques(&skin.corner_vertex, m.positions.len());
+        let whole = skin.corner_weights.iter().all(|w| (w.iter().sum::<f32>() - 1.0).abs() < 1e-3);
         Some(Arc::new(Base {
+            whole,
             firsts,
             corner_unique,
             positions: m.positions.iter().map(|p| (*p - center) / extent).collect(),
@@ -74,6 +84,31 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
         g.insert(id.to_string(), b.clone());
     }
     b
+}
+
+/// The skinned base of a mesh already parsed by `base`, without its bytes.
+/// Drops the skin base of `id` (its bytes changed: a live EditableMesh).
+pub fn forget_base(id: &str) {
+    if let Ok(mut b) = BASES.lock() {
+        b.remove(id);
+    }
+    rig_changed();
+}
+
+pub fn cached_base(id: &str) -> Option<Arc<Base>> {
+    BASES.lock().ok()?.get(id).cloned().flatten()
+}
+
+/// A skinned part's triangles as drawn this frame (unit box, like
+/// assets::mesh_triangles), or None at rest / not skinned.
+pub fn posed_triangles(doc: &Document, part: Ref, id: &str) -> Option<Vec<[Vec3; 3]>> {
+    let base = cached_base(id)?;
+    if !has_bones(doc, part) {
+        return None;
+    }
+    let (mats, scale, origin) = pose(doc, part, &base)?;
+    let (p, _) = deform(&base, &mats, scale, origin);
+    Some(p.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect())
 }
 
 /// Groups corners by mesh vertex: (first corner of each vertex, corner →
@@ -95,19 +130,161 @@ fn uniques(corner_vertex: &[u32], corners: usize) -> (Vec<u32>, Vec<u32>) {
     (firsts, map)
 }
 
-/// Whether a part has Bones under it or a FaceControls child (only those
-/// parts are skinned).
-pub fn has_bones(doc: &Document, part: Ref) -> bool {
-    doc.dom.descendants_of(part).any(|i| i.class == "Bone" || i.class == "FaceControls")
+/// The parts whose Bones skin `part`: itself, then the parts jointed to it
+/// (its assembly: Studio finds an importer rig's Bones under the root part).
+pub fn bone_hosts(doc: &Document, part: Ref) -> Vec<Ref> {
+    let mut hosts = vec![part];
+    let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
+        doc.class_of(*m).is_some_and(|c| crate::doc::is_a(&c, "Model"))
+    }) else {
+        return hosts;
+    };
+    let mut edges = Vec::new();
+    for i in doc.dom.descendants_of(model) {
+        if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(doc, i.referent()) {
+            if let Some(e) = crate::physics::joint_parts(doc, i.referent()) {
+                edges.push(e);
+            }
+        }
+    }
+    let mut at = 0;
+    while at < hosts.len() {
+        let h = hosts[at];
+        for (a, b) in &edges {
+            for (x, y) in [(*a, *b), (*b, *a)] {
+                if x == h && !hosts.contains(&y) {
+                    hosts.push(y);
+                }
+            }
+        }
+        at += 1;
+    }
+    hosts
 }
 
-/// What a skinned part redraws on: its Bones and FaceControls.
-pub fn deps_of(doc: &Document, part: Ref) -> Vec<Ref> {
-    doc.dom
-        .descendants_of(part)
-        .filter(|i| i.class == "Bone" || i.class == "FaceControls")
-        .map(|i| i.referent())
-        .collect()
+/// Whether a part is skinned by Bones (its own or its assembly's) or has a
+/// FaceControls child (only those parts are skinned).
+/// `has_bones` from the cached bone lookup once the mesh is parsed (the
+/// assembly walk then runs only when the rig changes).
+pub fn part_has_bones(doc: &Document, part: Ref, mesh: &str) -> bool {
+    match cached_base(mesh) {
+        Some(base) => lookup(doc, part, &base).any,
+        None => has_bones(doc, part),
+    }
+}
+
+pub fn has_bones(doc: &Document, part: Ref) -> bool {
+    doc.dom.descendants_of(part).any(|i| i.class == "Bone" || i.class == "FaceControls")
+        || bone_hosts(doc, part)[1..].iter().any(|h| doc.dom.descendants_of(*h).any(|i| i.class == "Bone"))
+}
+
+/// What a skinned part redraws on: its FaceControls and the Bones that
+/// skin it. With its mesh's skeleton known (`mesh`'s base parsed): only the
+/// Bones its mesh bones resolve to and the Bones / Attachments above them
+/// (a Bone the mesh doesn't use moving doesn't redraw it); else every Bone
+/// of its assembly.
+pub fn deps_of(doc: &Document, part: Ref, mesh: Option<&str>) -> Vec<Ref> {
+    if let Some(base) = mesh.and_then(cached_base) {
+        return lookup(doc, part, &base).deps.clone();
+    }
+    let mut out = face_controls(doc, part);
+    out.extend(bones_of(doc, part));
+    out
+}
+
+fn face_controls(doc: &Document, part: Ref) -> Vec<Ref> {
+    doc.dom.descendants_of(part).filter(|i| i.class == "FaceControls").map(|i| i.referent()).collect()
+}
+
+/// Bumped when Bones, rigid joints or FaceControls are added, removed,
+/// renamed or re-pointed (scene.rs sees the marks): cached bone lookups
+/// are rebuilt after it.
+static RIG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn rig_changed() {
+    RIG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether instances of this class change which Bones skin a part.
+pub fn rig_class(class: &str) -> bool {
+    matches!(class, "Bone" | "FaceControls") || crate::physics::is_rigid_joint(class)
+}
+
+/// A part's mesh bones resolved to Bone instances (by mesh bone index),
+/// and what it redraws on.
+pub struct Lookup {
+    gen: u64,
+    doc: u64,
+    pub bones: Vec<Option<Ref>>,
+    pub deps: Vec<Ref>,
+    /// The part is skinned: Bones (its own or its assembly's) or FaceControls.
+    pub any: bool,
+}
+
+static LOOKUPS: std::sync::LazyLock<Mutex<HashMap<Ref, (usize, Arc<Lookup>)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The part's bone lookup for this mesh (cached until the rig changes):
+/// mesh bone name → the part's own Bone of that name, else one of its
+/// assembly's (the first by name wins).
+pub fn lookup(doc: &Document, part: Ref, base: &Base) -> Arc<Lookup> {
+    let gen = RIG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    let key = base as *const Base as usize;
+    if let Some((k, l)) = LOOKUPS.lock().ok().and_then(|m| m.get(&part).cloned()) {
+        if k == key && l.gen == gen && l.doc == doc.id && l.bones.len() == base.skin.bones.len() {
+            return l;
+        }
+    }
+    let _s = crate::bench::scope("skin_lookup");
+    let mut by_name: HashMap<&str, Ref> = HashMap::new();
+    fn own<'d>(doc: &'d Document, h: Ref, by_name: &mut HashMap<&'d str, Ref>) {
+        for i in doc.dom.descendants_of(h) {
+            if i.class == "Bone" {
+                by_name.entry(i.name.as_str()).or_insert(i.referent());
+            }
+        }
+    }
+    own(doc, part, &mut by_name);
+    // The assembly's only when some mesh bone has no Bone here (the BFS
+    // over the model's joints is the costly part).
+    if base.skin.bones.iter().any(|b| !by_name.contains_key(b.name.as_str())) {
+        for h in bone_hosts(doc, part).into_iter().skip(1) {
+            own(doc, h, &mut by_name);
+        }
+    }
+    let bones: Vec<Option<Ref>> = base.skin.bones.iter().map(|b| by_name.get(b.name.as_str()).copied()).collect();
+    let mut deps = face_controls(doc, part);
+    let any = !deps.is_empty() || !by_name.is_empty() || has_bones(doc, part);
+    let mut seen: std::collections::HashSet<Ref> = deps.iter().copied().collect();
+    for b in bones.iter().flatten() {
+        // The Bone and the Bones / Attachments above it (its frame's chain).
+        let mut cur = *b;
+        while let Some(i) = doc.dom.get_by_ref(cur) {
+            if crate::doc::is_a(&i.class, "BasePart") || !seen.insert(cur) {
+                break;
+            }
+            if i.class == "Bone" || crate::doc::is_a(&i.class, "Attachment") {
+                deps.push(cur);
+            }
+            cur = i.parent();
+        }
+    }
+    let l = Arc::new(Lookup { gen, doc: doc.id, bones, deps, any });
+    if let Ok(mut m) = LOOKUPS.lock() {
+        m.insert(part, (key, l.clone()));
+    }
+    l
+}
+
+/// A destroyed / redrawn-without-skin part's cached lookups and last
+/// palettes go.
+pub fn forget_part(part: Ref) {
+    if let Ok(mut m) = LOOKUPS.lock() {
+        m.remove(&part);
+    }
+    if let Ok(mut m) = LAST.lock() {
+        m.remove(&(part, 0));
+    }
 }
 
 /// FACS offsets (bone name → local frame) from the part's FaceControls.
@@ -136,12 +313,12 @@ fn facs_offsets(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> HashMap<
     out
 }
 
-/// The Bones under a part (descendants), by name: first one wins.
+/// The Bones that may skin a part: its own descendants first, then the
+/// other parts of its assembly's (by name, the first one wins).
 pub fn bones_of(doc: &Document, part: Ref) -> Vec<Ref> {
-    doc.dom
-        .descendants_of(part)
-        .filter(|i| i.class == "Bone")
-        .map(|i| i.referent())
+    bone_hosts(doc, part)
+        .into_iter()
+        .flat_map(|h| doc.dom.descendants_of(h).filter(|i| i.class == "Bone").map(|i| i.referent()).collect::<Vec<_>>())
         .collect()
 }
 
@@ -161,36 +338,68 @@ fn inv(a: &Xform) -> Xform {
     Xform { pos: -(rt * a.pos), rot: rt }
 }
 
-/// A Bone's current frame in its part's space: Bone.CFrame × Transform up
-/// the chain of parent Bones.
-fn bone_now(doc: &Document, part: Ref, b: Ref) -> Xform {
-    let mut chain = Vec::new();
-    let mut at = b;
-    while at.is_some() && at != part {
-        let Some(i) = doc.dom.get_by_ref(at) else { break };
-        if i.class == "Bone" {
-            chain.push(mul(&cf(doc, at, "CFrame"), &cf(doc, at, "Transform")));
-        } else if i.class == "Attachment" {
-            chain.push(cf(doc, at, "CFrame"));
+/// TransformedWorldCFrames of Bones, memoised up the chain (one pass per
+/// part per frame rather than a walk to the part for every Bone): the
+/// parent's (Bone / Attachment: its transformed frame; BasePart: CFrame)
+/// × CFrame × Transform, as attachment.rs composes them.
+struct Frames<'a> {
+    doc: &'a Document,
+    memo: &'a mut rustc_hash::FxHashMap<Ref, Xform>,
+}
+
+/// Bone frames computed this frame, shared by every part that reads them
+/// (a character's MeshParts over one skeleton evaluate it once), valid
+/// while the document's revision holds.
+struct WorldMemo {
+    doc: u64,
+    revision: u64,
+    memo: rustc_hash::FxHashMap<Ref, Xform>,
+}
+
+static WORLD: std::sync::LazyLock<Mutex<WorldMemo>> =
+    std::sync::LazyLock::new(|| Mutex::new(WorldMemo { doc: 0, revision: 0, memo: Default::default() }));
+
+impl Frames<'_> {
+    fn world(&mut self, r: Ref) -> Xform {
+        if let Some(x) = self.memo.get(&r) {
+            return *x;
         }
-        at = i.parent();
+        let doc = self.doc;
+        let id = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        let Some(i) = doc.dom.get_by_ref(r) else { return id };
+        let mut local = cf(doc, r, "CFrame");
+        if i.class == "Bone" {
+            local = mul(&local, &cf(doc, r, "Transform"));
+        }
+        // The nearest Attachment / BasePart above (Models and folders skipped).
+        let mut up = i.parent();
+        let parent = loop {
+            let Some(p) = doc.dom.get_by_ref(up) else { break id };
+            if crate::doc::is_a(&p.class, "Attachment") {
+                break self.world(up);
+            }
+            if crate::doc::is_a(&p.class, "BasePart") {
+                break if p.class == "Terrain" { id } else { cf(doc, up, "CFrame") };
+            }
+            up = p.parent();
+        };
+        let w = mul(&parent, &local);
+        self.memo.insert(r, w);
+        w
     }
-    chain
-        .iter()
-        .rev()
-        .fold(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }, |acc, x| mul(&acc, x))
 }
 
 /// The skinning matrices (current × bind⁻¹, in part space), or None when
 /// every bone is at its bind pose.
 pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<Vec<Xform>> {
-    let bones = bones_of(doc, part);
-    let mut by_name: HashMap<&str, Ref> = HashMap::new();
-    for b in &bones {
-        if let Some(i) = doc.dom.get_by_ref(*b) {
-            by_name.entry(i.name.as_str()).or_insert(*b);
-        }
+    let look = lookup(doc, part, base);
+    let mut world = WORLD.lock().unwrap_or_else(|e| e.into_inner());
+    if world.doc != doc.id || world.revision != doc.revision {
+        world.doc = doc.id;
+        world.revision = doc.revision;
+        world.memo.clear();
     }
+    let mut frames = Frames { doc, memo: &mut world.memo };
     let n = base.skin.bones.len();
     let bind: Vec<Xform> = base
         .skin
@@ -198,7 +407,9 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
         .iter()
         .map(|b| Xform { pos: (b.pos - base.center) * scale, rot: b.rot })
         .collect();
-    let facs = facs_offsets(doc, part, base, scale);
+    let bind_inv: Vec<Xform> = bind.iter().map(inv).collect();
+    let facs = if base.facs.is_some() { facs_offsets(doc, part, base, scale) } else { HashMap::new() };
+    let part_inv = inv(&cf(doc, part, "CFrame"));
     let mut now: Vec<Option<Xform>> = vec![None; n];
     // Parents come before children in Roblox meshes; resolve in passes.
     for _ in 0..n.max(1) {
@@ -208,8 +419,8 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
                 continue;
             }
             let sb = &base.skin.bones[i];
-            if let Some(&b) = by_name.get(sb.name.as_str()) {
-                now[i] = Some(bone_now(doc, part, b));
+            if let Some(b) = look.bones[i] {
+                now[i] = Some(mul(&part_inv, &frames.world(b)));
                 progress = true;
             } else {
                 // No Bone instance: the bind frame relative to its parent,
@@ -225,7 +436,7 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
                     }
                     Some(p) => {
                         if let Some(pn) = now[p] {
-                            let rest = mul(&pn, &mul(&inv(&bind[p]), &bind[i]));
+                            let rest = mul(&pn, &mul(&bind_inv[p], &bind[i]));
                             now[i] = Some(match local {
                                 Some(l) => mul(&rest, &l),
                                 None => rest,
@@ -241,17 +452,19 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
         }
     }
     let mats: Vec<Xform> = (0..n)
-        .map(|i| mul(&now[i].unwrap_or(bind[i]), &inv(&bind[i])))
+        .map(|i| mul(&now[i].unwrap_or(bind[i]), &bind_inv[i]))
         .collect();
     let rest = mats
         .iter()
         .all(|m| m.pos.length_squared() < 1e-10 && m.rot.abs_diff_eq(Mat3::IDENTITY, 1e-5));
-    (!rest).then_some(mats)
+    (!rest || !base.whole).then_some(mats)
 }
 
 /// Deformed positions and normals (normalized space) for the matrices:
-/// each mesh vertex once, copied to its corners.
-pub fn deform(base: &Base, mats: &[Xform], scale: Vec3) -> (Vec<Vec3>, Vec<Vec3>) {
+/// each mesh vertex once, copied to its corners. `origin` is the world
+/// origin in part space (studs): the weight a vertex lacks from 1 pulls it
+/// there, as Studio blends in world space.
+pub fn deform(base: &Base, mats: &[Xform], scale: Vec3, origin: Vec3) -> (Vec<Vec3>, Vec<Vec3>) {
     let to_part = base.extent * scale;
     let from_part = Vec3::ONE / to_part.max(Vec3::splat(1e-6));
     let one = |i: usize| -> (Vec3, Vec3) {
@@ -273,9 +486,10 @@ pub fn deform(base: &Base, mats: &[Xform], scale: Vec3) -> (Vec<Vec3>, Vec<Vec3>
                 total += w;
             }
         }
-        if total <= 0.0 {
-            q = pp;
-            m = n;
+        // (u8 weights: a real shortfall is ≥ 1/255; below 1e-4 it is rounding.)
+        let short = 1.0 - total;
+        if short.abs() > 1e-4 {
+            q += origin * short;
         }
         (q * from_part, m.normalize_or_zero() * base.extent)
     };
@@ -284,8 +498,6 @@ pub fn deform(base: &Base, mats: &[Xform], scale: Vec3) -> (Vec<Vec3>, Vec<Vec3>
     let mut nrm = Vec::with_capacity(base.positions.len());
     for (c, u) in base.corner_unique.iter().enumerate() {
         match verts.get(*u as usize) {
-            // A corner whose own normal differs (flat-shaded fallback) keeps
-            // its own normal, turned like its vertex.
             Some((p, n)) => {
                 pos.push(*p);
                 nrm.push(*n);
@@ -298,6 +510,11 @@ pub fn deform(base: &Base, mats: &[Xform], scale: Vec3) -> (Vec<Vec3>, Vec<Vec3>
         }
     }
     (pos, nrm)
+}
+
+/// The world origin in a part's space (studs).
+pub fn origin_of(doc: &Document, part: Ref) -> Vec3 {
+    inv(&cf(doc, part, "CFrame")).pos
 }
 
 /// The part's Size / InitialSize (mesh units → studs), else Size / extent.
@@ -313,31 +530,163 @@ pub fn scale_of(doc: &Document, part: Ref, base: &Base) -> Vec3 {
     }
 }
 
-/// Per-part mesh slots holding deformed copies.
-static SLOTS: std::sync::LazyLock<Mutex<HashMap<Ref, (u32, usize)>>> =
+/// Per-part mesh slots holding deformed copies (index, corner count), by
+/// part and tag (0: the part's mesh, DECAL_TAG + face: its decals).
+static SLOTS: std::sync::LazyLock<Mutex<HashMap<(Ref, u32), (u32, usize)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The renderer mesh to draw a skinned part with this frame: a deformed
-/// copy in the part's own slot (uploaded with `upload(slot, …)`, `slot` None
-/// for a new one), or None to draw the shared mesh.
+/// The palette each part's slot was last skinned with (part, tag): a part
+/// redone with the same pose skips the skinning pass.
+static LAST: std::sync::LazyLock<Mutex<HashMap<(Ref, u32), (usize, Vec<Xform>, Vec3, Vec3)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether slot (`part`, `tag`) already holds this pose of `base`; if not,
+/// remembers it as the one about to be drawn.
+pub fn same_pose(part: Ref, tag: u32, base: &Base, palette: &[Xform], scale: Vec3, origin: Vec3) -> bool {
+    let Ok(mut m) = LAST.lock() else { return false };
+    let key = base as *const Base as usize;
+    let eq = |a: &Xform, b: &Xform| a.pos == b.pos && a.rot == b.rot;
+    if let Some((k, p, s, o)) = m.get(&(part, tag)) {
+        if *k == key && *s == scale && *o == origin && p.len() == palette.len() && p.iter().zip(palette).all(|(a, b)| eq(a, b)) {
+            return true;
+        }
+    }
+    m.insert((part, tag), (key, palette.to_vec(), scale, origin));
+    false
+}
+
+/// Slot tag of a skinned part's decal copy for a face (`slot_of_tag`).
+pub const DECAL_TAG: u32 = 16;
+
+/// RUSTUDIO_SKIN_CPU=1: deform on the CPU and re-upload (the old path,
+/// kept for comparison and for machines without compute).
+pub fn cpu_skinning() -> bool {
+    static CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CPU.get_or_init(|| std::env::var_os("RUSTUDIO_SKIN_CPU").is_some_and(|v| v != "0"))
+}
+
+/// This frame's pose of a skinned part: the palette (current × bind⁻¹ per
+/// mesh bone, part space) and the part's scale, or None at rest.
+pub fn pose(doc: &Document, part: Ref, base: &Base) -> Option<(Vec<Xform>, Vec3, Vec3)> {
+    let scale = scale_of(doc, part, base);
+    let _sc = crate::bench::scope("skin_matrices");
+    let mats = matrices(doc, part, base, scale)?;
+    Some((mats, scale, origin_of(doc, part)))
+}
+
+/// The part's deformed-copy slot from an earlier frame.
+pub fn slot_of(part: Ref, corners: usize) -> Option<u32> {
+    slot_of_tag(part, 0, corners)
+}
+
+pub fn set_slot(part: Ref, idx: u32, corners: usize) {
+    set_slot_tag(part, 0, idx, corners)
+}
+
+pub fn slot_of_tag(part: Ref, tag: u32, corners: usize) -> Option<u32> {
+    SLOTS.lock().ok()?.get(&(part, tag)).copied().filter(|(_, len)| *len == corners).map(|(i, _)| i)
+}
+
+pub fn set_slot_tag(part: Ref, tag: u32, idx: u32, corners: usize) {
+    if let Ok(mut s) = SLOTS.lock() {
+        s.insert((part, tag), (idx, corners));
+    }
+}
+
+/// Decal / Texture on a skinned MeshPart, as Studio 0.747 draws it
+/// (checks/mesh-deform/AUDIT.md (g), tools/decalprobe.py): the image is
+/// projected in bind pose onto the mesh triangles whose geometric normal
+/// (mesh space, unscaled; vertex normals don't count) points most along
+/// the face's axis, planar over the part's box face, and those triangles
+/// then deform with the skin. The projection is from the mesh file's own
+/// coordinates (a mesh not centred on its bounds takes the image off
+/// centre, clamped at its edges). The copy shares the mesh's bones, so the
+/// part's skin palette drives it. None: no triangle faces that way.
+pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
+    static DECALS: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let k = format!("{key}|decal{face}");
+    if let Some(b) = DECALS.lock().ok()?.get(&k) {
+        return b.clone();
+    }
+    let mut out = Base {
+        positions: Vec::new(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        colors: Vec::new(),
+        extent: base.extent,
+        center: base.center,
+        skin: crate::mesh::Skin {
+            bones: base.skin.bones.clone(),
+            corner_bones: Vec::new(),
+            corner_weights: Vec::new(),
+            corner_vertex: Vec::new(),
+        },
+        firsts: Vec::new(),
+        corner_unique: Vec::new(),
+        facs: None,
+        whole: base.whole,
+    };
+    let with_ids = base.skin.corner_vertex.len() == base.positions.len();
+    for t in 0..base.positions.len() / 3 {
+        let p: [Vec3; 3] = std::array::from_fn(|k| base.positions[t * 3 + k]);
+        // (normalized positions × extent = mesh space)
+        let geo = (p[1] - p[0]).cross(p[2] - p[0]) * Vec3::new(
+            base.extent.y * base.extent.z,
+            base.extent.x * base.extent.z,
+            base.extent.x * base.extent.y,
+        );
+        if crate::viewport::decal_face_of(geo) != Some(face) {
+            continue;
+        }
+        let n_norm = ((p[1] - p[0]).cross(p[2] - p[0])).normalize_or_zero();
+        for (k, v) in p.iter().enumerate() {
+            let c = t * 3 + k;
+            out.positions.push(*v + n_norm * 0.0005);
+            out.normals.push(geo.normalize_or_zero() * base.extent);
+            // (from the mesh file's own coordinates, not re-centred on its
+            // bounds: Studio's rows on the minifig, bounds centre y 2.95,
+            // sit 2.95 studs off a centred projection; past the image's
+            // edge it clamps)
+            out.uvs.push(crate::viewport::decal_face_uv(face, *v + base.center / base.extent));
+            out.skin.corner_bones.push(base.skin.corner_bones[c]);
+            out.skin.corner_weights.push(base.skin.corner_weights[c]);
+            if with_ids {
+                out.skin.corner_vertex.push(base.skin.corner_vertex[c]);
+            }
+        }
+    }
+    let b = (!out.positions.is_empty()).then(|| {
+        let (firsts, corner_unique) = uniques(&out.skin.corner_vertex, out.positions.len());
+        out.firsts = firsts;
+        out.corner_unique = corner_unique;
+        Arc::new(out)
+    });
+    if let Ok(mut g) = DECALS.lock() {
+        g.insert(k, b.clone());
+    }
+    b
+}
+
+/// The renderer mesh to draw a skinned part with this frame on the CPU
+/// path: a deformed copy in the part's own slot (uploaded with
+/// `upload(slot, …)`, `slot` None for a new one), or None at rest.
 pub fn skinned_mesh(
     doc: &Document,
     part: Ref,
     base: &Base,
     upload: &mut dyn FnMut(Option<u32>, &[Vec3], &[Vec3], &[Vec2], &[Vec4]) -> u32,
 ) -> Option<u32> {
-    let scale = scale_of(doc, part, base);
-    let sc = crate::bench::scope("skin_matrices");
-    let mats = matrices(doc, part, base, scale)?;
-    drop(sc);
+    let (mats, scale, origin) = pose(doc, part, base)?;
     let sc = crate::bench::scope("skin_deform");
-    let (p, n) = deform(base, &mats, scale);
+    let (p, n) = deform(base, &mats, scale, origin);
     drop(sc);
-    let mut slots = SLOTS.lock().ok()?;
-    let have = slots.get(&part).copied().filter(|(_, len)| *len == p.len()).map(|(i, _)| i);
+    let have = slot_of(part, p.len());
     let _sc = crate::bench::scope("skin_upload");
     let idx = upload(have, &p, &n, &base.uvs, &base.colors);
-    slots.insert(part, (idx, p.len()));
+    // Bench: vertex bytes sent (a full Vertex per corner).
+    crate::bench::add("skin_upload_bytes", 0.0, p.len() as u64 * 64);
+    set_slot(part, idx, p.len());
     Some(idx)
 }
 
@@ -356,6 +705,7 @@ mod tests {
             extent: Vec3::ONE,
             center: Vec3::ZERO,
             facs: None,
+            whole: true,
             firsts: vec![0, 1],
             corner_unique: vec![0, 1],
             skin: Skin {
@@ -380,7 +730,7 @@ mod tests {
         let jaw_now = Xform { pos: Vec3::new(0.0, -0.5, 0.0), rot: Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2) };
         let bind_jaw = Xform { pos: Vec3::new(0.0, -0.5, 0.0), rot: Mat3::IDENTITY };
         let mats = vec![Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }, mul(&jaw_now, &inv(&bind_jaw))];
-        let (p, _) = deform(&b2, &mats, Vec3::ONE);
+        let (p, _) = deform(&b2, &mats, Vec3::ONE, Vec3::ZERO);
         assert!(p[0].abs_diff_eq(Vec3::new(0.0, 0.5, 0.0), 1e-5));
         // (0,0,0.25) relative to the jaw turned 90° about X → (0,-0.25,0).
         assert!(p[1].abs_diff_eq(Vec3::new(0.0, -0.75, 0.0), 1e-5), "{:?}", p[1]);
@@ -404,12 +754,14 @@ mod tests {
         b.positions[1] = Vec3::new(0.0, -0.5, 0.25);
         assert!(has_bones(&doc, part));
         let mats = matrices(&doc, part, &b, Vec3::ONE).expect("a moved bone");
-        let (p, _) = deform(&b, &mats, Vec3::ONE);
+        let (p, _) = deform(&b, &mats, Vec3::ONE, Vec3::ZERO);
         assert!(p[0].abs_diff_eq(Vec3::new(0.0, 0.5, 0.0), 1e-5));
         assert!(p[1].abs_diff_eq(Vec3::new(0.0, -0.75, 0.0), 1e-5), "{:?}", p[1]);
         // Back at rest: the shared mesh draws.
         let jaw = doc.dom.get_by_ref(part).unwrap().children()[0];
         doc.dom.get_by_ref_mut(jaw).unwrap().properties.insert(rbx_dom_weak::ustr("Transform"), Variant::CFrame(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }.to_cframe()));
+        // A property write is journalled (it bumps the revision the Bone frame memo keys on).
+        doc.mark_prop(jaw, rbx_dom_weak::ustr("Transform"));
         assert!(matrices(&doc, part, &b, Vec3::ONE).is_none());
     }
 }

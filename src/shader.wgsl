@@ -224,7 +224,7 @@ fn sky_color_lod(dir: vec3<f32>, lod: f32) -> vec3<f32> {
 /// y the sky mesh's height there, and the FS squares it (c0, c1 the
 /// SkyGradientTop / Bottom levels, unsquared). The mesh's height isn't read
 /// from Studio; y / 1700 = SKY_LEVEL_Q0 + dir.y was fitted to a Vinegar
-/// Studio (2026-11-15: Find the Fennecs' Afternoon Sky alone,
+/// Studio (2026-11-15: a game's afternoon sky alone,
 /// EnvironmentDiffuseScale 0, 14:00 / 18:00 / 19:00 / 20:30, camera
 /// pitched 5° and 40°: mean error under 0.6 of 255 per channel; the level
 /// is the same at camera heights 0 to 1400, so the mesh moves with the

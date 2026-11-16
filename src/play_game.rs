@@ -90,7 +90,7 @@ pub struct GameState {
     equipped: Option<Equipped>,
     /// A Tool only the client has, equipped by a client script (client refs): Studio's
     /// client welds it to its own character's hand and the server never hears of it
-    /// (FtF's realm hands out its Lantern and Fox Bell that way).
+    /// (a game's script hands out its tools that way).
     client_tool: Option<Equipped>,
     /// Tools on the hotbar (server refs), in slot order.
     pub slots: Vec<Ref>,
@@ -1178,7 +1178,7 @@ impl Editor {
         s.game.client_tool = Some(Equipped { tool, offsets, client_told: true });
         let mouse = s.client.as_ref().and_then(|c| c.world.as_ref()).and_then(|w| w.input.mouse);
         // In the hand before Equipped fires: Roblox has the grip made by then, so a script
-        // that reads Handle.CFrame there (the Arachnec lantern's, building on it) gets the hand.
+        // that reads Handle.CFrame there (a hanging lantern's, building on it) gets the hand.
         self.place_client_tool_now();
         self.with_side(Side::Client, |rt, _, _| {
             if !in_hand {
@@ -1223,7 +1223,7 @@ impl Editor {
     }
 
     /// Parts welded to the held client-only Tool's handle since it was equipped follow
-    /// the hand with it (one assembly with the character in Roblox): the Arachnec
+    /// the hand with it (one assembly with the character in Roblox): a hanging
     /// lantern welds its Top to the Handle on Equipped and hangs the rest from Top on
     /// ropes. Parts no longer in the tool are let go.
     fn follow_client_tool_welds(&mut self) {

@@ -2,7 +2,7 @@
 //! (round HANG, solver/JOINTS-NOTES.md).
 //!
 //! A LocalScript that clones a part, destroys the original and unanchors the clone
-//! makes a part only the client has (FtF's ClientObjectScripts: the JToH rope
+//! makes a part only the client has (client-side object scripts: a rope
 //! platforms, the spawn lanterns). Studio's client simulates it in the same world
 //! as its character: the character stands on it, pushes it and is pushed back, and
 //! the original it destroyed is gone from that world.
@@ -29,7 +29,7 @@
 //!   contacts skip it. The server's own bodies still meet it.
 //!
 //! * the client's own anchored parts near the character (an island a LocalScript
-//!   cloned into Workspace: FtF's IslandManager puts the Graveyard there on the
+//!   cloned into Workspace: a game's island loader puts an island there on the
 //!   client only) get a fixed copy here that only the player's character meets
 //!   (`link_client_statics`): its floor, walls and touches. Studio's client owns
 //!   its character and simulates it in the client's world, where those parts are;
@@ -330,7 +330,7 @@ impl Physics {
         // The client's own part, anchored, in its Workspace (cp builds only those).
         let own_static = |r: &Ref, pb: &PartBody| pb.asm.is_none() && !cp.external.contains(r) && !c2s.contains_key(r);
         // (Rescanned at once after a jump of half the margin: a teleport into an island
-        // the client cloned, FtF's Graveyard, otherwise dropped the character through
+        // the client cloned, a test place's graveyard island, otherwise dropped the character through
         // its ground for the frames until the next scan; with the realm's scripts
         // loading, 6 frames were ~0.3 s, a 40-stud fall.)
         let centre = gv(pbb.center().into());
@@ -340,7 +340,7 @@ impl Physics {
             self.link.statics_at = Some(centre);
             let area = pbb.loosened(STATIC_MARGIN + pspeed * STATIC_LEAD_S);
             // (The client world's broad phase: a walk over every part was ~5 ms a
-            // scan with FtF's Graveyard, 20k parts, on the client.)
+            // scan with a test place's graveyard island, 20k parts, on the client.)
             let mut found: Vec<(Ref, rp::ColliderHandle)> = Vec::new();
             for (ch, _) in cp.world.query_pipeline().intersect_aabb_conservative(area) {
                 let Some(r) = cp.by_collider.get(&ch) else { continue };
@@ -573,7 +573,7 @@ impl Physics {
             // Only the linear part goes over: the solver turns a torque into spin through
             // its geometric-stiffness inertia and angular damping (step.rs
             // `free_velocity`), which no prediction here matches, and the miss came back
-            // as next frame's kick: a thin light part (FtF's grave nails, 0.85×0.05×0.05,
+            // as next frame's kick: a thin light part (small nails, 0.85×0.05×0.05,
             // 0.02 mass) spun up without bound beside the character (10¹⁸ rad/s, flung
             // 10⁵ studs). The stand-in takes the body's spin anew every frame; between, it
             // keeps it. (Linear motion has neither term: its prediction is exact.)
@@ -599,7 +599,7 @@ impl Physics {
 /// solver's record (note_mass, the client body's Studio mass, solver/body.rs `gather`:
 /// Iw⁻¹ = R·I⁻¹·Rᵀ) where it has one, else rapier's. The force and torque that carry the
 /// client world's motion over, and the motion they are predicted to cause, must use the
-/// one the solver integrates with: with rapier's, a thin light part (FtF's grave nails,
+/// one the solver integrates with: with rapier's, a thin light part (small nails,
 /// 0.85×0.05×0.05, 0.02 mass) got back a kick of (I_studio⁻¹·I_rapier − 1)·Δω every frame
 /// and spun up without bound beside the character (10¹⁸ rad/s, flung 10⁵ studs).
 fn solver_mass(studio: Option<&crate::solver::StudioSolver>, h: rp::RigidBodyHandle, b: &rp::RigidBody) -> (f32, Mat3, Mat3) {

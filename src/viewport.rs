@@ -1681,7 +1681,7 @@ impl Editor {
                             // differs from InitialSize; unchanged unions retain authored UVs.
                             // A union with no UVs (every SolidMesh: its UV array is
                             // empty) has none to keep and takes the plane projection
-                            // at any Size, as Studio draws it: FtF's Graveyard Slate
+                            // at any Size, as Studio draws it: a test place's Slate
                             // rock and Ground cliff unions show their material maps in
                             // Studio 0.747 (2026-11-15) and drew one
                             // flat texel here.

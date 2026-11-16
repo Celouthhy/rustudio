@@ -1054,7 +1054,7 @@ pub struct MeshCache {
     reasons: HashMap<String, String>,
     /// Loaded ids whose mesh carries no UVs (every corner at 0,0): a
     /// SolidMesh union stores none (its UV array is empty in all 5658 of
-    /// Find the Fennecs' SolidMeshHolders), so there are none to keep.
+    /// a game's solid mesh holders), so there are none to keep.
     uvless: std::collections::HashSet<String>,
     /// Messages for the Output panel (one per new failure).
     pub messages: Vec<String>,

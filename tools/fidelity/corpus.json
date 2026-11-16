@@ -57,7 +57,7 @@
     "about": "Place B, the person's project folder over its og.rbxl: copied to /tmp; rustudio opens the folder, Studio the place rustudio --build makes of it (argon can't put a project over a place)",
     "studio_build": "rustudio",
     "errors_as_studio": true,
-    "why_errors_as_studio": "its scripts error in Studio as well (DataStore in an unpublished place, JToH kit remotes never placed, a require of a private asset id): only errors Studio doesn't show fail the gate",
+    "why_errors_as_studio": "its scripts error in Studio as well (DataStore in an unpublished place, obby kit remotes never placed, a require of a private asset id): only errors Studio doesn't show fail the gate",
     "pixel_gate": false,
     "why_pixel_gate": "round 23: the reference Studio can't download most of the place's assets (Roblox wants a signed-in session; the offline mock serves none), while rustudio draws the ones in its cache (pumpkins, trees), and Studio's chat window opens at random; the asset audit, errors, empty views and the render score's drop check still gate",
     "reference_limits": "round 27: the offline reference Studio can't download this place's custom Sky faces (not in an offline Studio's asset store) and draws its default sky; rustudio draws the real faces since 0a673f4, so the render score under-credits the sky. Not a rustudio regression; don't re-break the sky to match."

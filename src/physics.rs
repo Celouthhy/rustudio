@@ -188,7 +188,7 @@ fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
         // A union collides with the convex pieces Studio stored in its
         // PhysicalConfigData, at the fidelity they were made for (the file
         // has no CollisionFidelity for unions either), anchored or not. Its
-        // own decomposition of the render mesh at Default turned FtF's
+        // own decomposition of the render mesh at Default turned a test place's
         // Graveyard ground (stored: PreciseConvexDecomposition, 22 pieces)
         // into one convex blob 63 studs across, on which its loose stones
         // never came to rest.

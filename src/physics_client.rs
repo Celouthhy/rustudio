@@ -1,6 +1,6 @@
 //! The client's own simulation. Studio's client simulates the instances
-//! only it has: parts a LocalScript made or cloned. Place E's ClientObjectScripts
-//! clone the spawn lantern and its ropes and the JToH rope platform, then
+//! only it has: parts a LocalScript made or cloned. Place E's client object scripts
+//! clone the spawn lantern and its ropes and a rope platform, then
 //! unanchor the clones, and PotOfStew clones the Ingredients folder whose
 //! orbit ingredients the airstream script ropes to tweened anchors; nothing
 //! moved any of them here, so they hung stiff.
@@ -54,7 +54,7 @@ pub struct ClientSim {
     hold_changes: Vec<(Ref, bool)>,
     /// The held Tool's loose parts (hung from it on ropes or joints): kept awake while
     /// it's held, since the hand moving their held end is no contact or write that
-    /// would wake them (the Arachnec lantern stayed hanging where it fell asleep).
+    /// would wake them (a hanging lantern stayed hanging where it fell asleep).
     keep_awake: Vec<Ref>,
 }
 

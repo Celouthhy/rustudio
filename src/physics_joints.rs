@@ -521,7 +521,7 @@ impl Physics {
             // Constraints outside Workspace (a character's ragdoll sockets kept in a
             // Model, a destroyed original) are no connectors: forgotten here, or every
             // frame finds them "new" and walks the Workspace again (round HANG: the
-            // client's world in FtF, 330k instances, every frame it stepped). A tree
+            // client's world in a test place, 330k instances, every frame it stepped). A tree
             // mark brings one back if it is ever parented in (`note_other`).
             if refs.len() < seen.len() {
                 let inside: HashSet<Ref> = refs.iter().copied().collect();

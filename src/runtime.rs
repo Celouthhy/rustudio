@@ -2249,7 +2249,7 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
 /// Workspace. A WeldConstraint keeps its offset (the hidden CFrame0 =
 /// Part0⁻¹ · Part1, saved and cloned with it) and the assembly is built from
 /// it: a part a script moved while the tree was out of the Workspace goes
-/// back where its weld holds it. Find the Fennecs' Arachnec lantern clones
+/// back where its weld holds it. A game's hand lantern clones
 /// its LanternAssets, sets every part's CFrame to the tool's Handle and only
 /// then parents it; in Roblox the lantern still comes out whole. Parts
 /// outside the tree stay put and the tree's parts are placed outward from
@@ -2339,7 +2339,7 @@ fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
 /// Model.PrimaryPart to nil at once (the model in the DataModel or not), and
 /// the model's pivot stays where the part's pivot was: GetPivot and
 /// WorldPivot both read the old PrimaryPart.CFrame · PivotOffset after, so a
-/// later PivotTo measures from there. Find the Fennecs' teleport menu
+/// later PivotTo measures from there. A game's teleport menu
 /// clones its sky box, destroys the box's Center (its PrimaryPart) and then
 /// PivotTo's the box onto the camera every frame.
 fn primary_parts_leaving(w: &World, r: Ref, old: Ref, new_parent: Ref) -> Vec<(Ref, Xform)> {
@@ -3539,7 +3539,7 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
     // moved; without one the pivot is the model's own WorldPivotData, so it
     // moves too (a model that had none, pivoting on its parts' bounds, gets
     // one). Left behind, every PivotTo measured its delta from the stale
-    // pivot: Find the Fennecs' teleport menu PivotTo's its sky box (a
+    // pivot: a game's teleport menu PivotTo's its sky box (a
     // Model, no PrimaryPart) onto the camera every RenderStepped and the
     // box ran off by the same offset each frame (-89600 studs in 6 s), so
     // its Beam sky never showed.

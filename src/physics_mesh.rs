@@ -451,7 +451,7 @@ pub fn ray(p: &Pieces, xf: &crate::math::Xform, scale: Vec3, o: Vec3, dir: Vec3,
 /// collides with these, not with a decomposition of the render mesh), as a
 /// compound; flat pieces and the explicit triangles are left out of a
 /// moving part (they hold no volume), an anchored one (`fixed`) keeps the
-/// triangles (a union's thin skins are stored that way: FtF's Graveyard
+/// triangles (a union's thin skins are stored that way: a test place's graveyard island
 /// ground has some). With `touch_only`, one hull around every piece (a
 /// moving CanCollide=false part only reports touches). Cached.
 pub fn collider_shape(id: u32, scale: Vec3, touch_only: bool, fixed: bool) -> Option<rapier3d::prelude::SharedShape> {

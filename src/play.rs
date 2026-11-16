@@ -190,7 +190,7 @@ pub struct PlaySession {
     client_sim: crate::physics::client::ClientSim,
     /// Touch changes between the client world's parts (client refs), fired on
     /// the client in its next script phase: Studio fires Touched where the
-    /// part is simulated, so a LocalScript's clones (FtF's pot lid and
+    /// part is simulated, so a LocalScript's clones (a pot lid and
     /// ingredients) touch on their client.
     client_touches: Vec<(Ref, Ref, bool)>,
     /// Humanoid state transitions so far (shown in Output, read by the self-test).

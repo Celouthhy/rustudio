@@ -520,7 +520,7 @@ pub fn globals(
             // w: 1 = the drawn sky takes Studio's time-of-day sky levels
             // (shader.wgsl sky_level): a custom Sky's faces dim and redden
             // at dusk and go dark at night as in Studio (they were drawn at
-            // full day brightness at any ClockTime, so Find the Fennecs'
+            // full day brightness at any ClockTime, so a game's
             // graveyard night, ClockTime 2.8, kept the afternoon sky). 0 =
             // Studio's default sky, dimmed by sky_tint (rustudio's stand-in
             // for its night faces) instead.

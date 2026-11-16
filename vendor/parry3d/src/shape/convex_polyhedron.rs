@@ -981,7 +981,7 @@ impl PolygonalFeatureMap for ConvexPolyhedron {
     /// missed the place a small body rests on, the clipping then kept no point
     /// and the contact fell back to the single GJK point: a stone on a convex
     /// piece of a union's ground balanced on one point and rocked forever (Find
-    /// the Fennecs' Graveyard; Studio's stones there sleep at once).
+    /// a test place's graveyard; Studio's stones there sleep at once).
     fn local_support_feature_toward(&self, dir: Vector, hint: Vector, out_feature: &mut PolygonalFeature) {
         let mut best_fid = 0;
         let mut best_dot = self.faces[0].normal.dot(dir);

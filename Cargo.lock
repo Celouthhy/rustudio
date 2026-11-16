@@ -4046,7 +4046,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "0.3.0"
+version = "0.2.1"
 dependencies = [
  "blake2",
  "blake3",
@@ -4096,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "0.3.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -4113,7 +4113,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "0.3.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "blake2",

@@ -7,6 +7,7 @@ mod ui_pointer;
 mod offscreen;
 mod sim_clock;
 mod bytecode_cache;
+mod heap;
 mod load_trace;
 mod update;
 mod env_probe;
@@ -229,6 +230,7 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --type TEXT@S        type TEXT at S seconds (into a focused TextBox)
   --rdrag DX,DY@S      right-drag over the 3D view by DX,DY pixels
   --ldrag X1,Y1>X2,Y2@S  left-drag in the 3D view between view positions
+  --lhold X,Y@S:HOLD   press the left button at X,Y at S seconds, let go HOLD seconds later
   --click X,Y@S        click the 3D view at X,Y (pixels) S seconds after start
   --key NAME@S         press a key (egui name, e.g. Enter, B) S seconds after start
   --window WxH         window size for test runs
@@ -487,6 +489,12 @@ fn main() -> eframe::Result<()> {
         // errors about its own config to a run that presents nothing.)
         if headless && std::env::var_os("DISABLE_LSFGVK").is_none() {
             std::env::set_var("DISABLE_LSFGVK", "1");
+        }
+        // No update check (and so no "Update available" notice in the
+        // corner) in headless and harness runs: their captures are compared
+        // picture by picture.
+        if (headless || is_test_run(&argv)) && std::env::var_os("RUSTUDIO_NO_UPDATE_CHECK").is_none() {
+            std::env::set_var("RUSTUDIO_NO_UPDATE_CHECK", "1");
         }
     }
     restore_parent_fds();
@@ -781,6 +789,13 @@ fn main() -> eframe::Result<()> {
                 match app::HarnessAction::parse_ldrag(&v) {
                     Some(list) => actions.extend(list),
                     None => eprintln!("--ldrag: can't read {v:?} (X1,Y1>X2,Y2@SECONDS)"),
+                }
+            }
+            "--lhold" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_lhold(&v) {
+                    Some(list) => actions.extend(list),
+                    None => eprintln!("--lhold: can't read {v:?} (X,Y@SECONDS:HOLD)"),
                 }
             }
             "--rdrag" => {

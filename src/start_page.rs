@@ -505,6 +505,7 @@ impl Editor {
         ui.add_space(4.0);
         let mut entries: Vec<(String, String, bool)> = vec![
             ("recent".into(), "Recent".into(), false),
+            ("files".into(), "Recent Files".into(), false),
             ("mine".into(), "My Experiences".into(), false),
             ("shared".into(), "Shared with Me".into(), false),
         ];
@@ -521,7 +522,6 @@ impl Editor {
                 }
             }
         }
-        entries.push(("files".into(), "Recent Files".into(), false));
         egui::ScrollArea::vertical().id_salt("start_nav_scroll").max_height(ui.available_height() - 24.0).show(ui, |ui| {
             let mut groups_said = false;
             for (key, label, indent) in entries {
@@ -741,6 +741,12 @@ impl Editor {
             ui.add_space(8.0);
         }
 
+        let files = self.ui.recent.iter().filter(|p| self.matches(&p.display().to_string())).count();
+        if !(searching && files == 0) && self.fold_header(ui, "files", "Recent Files", Some(files.to_string()), todo) {
+            self.start_files(ui, usize::MAX, todo);
+            ui.add_space(8.0);
+        }
+
         // My Experiences, Shared with Me, then each group.
         let mut lists: Vec<(String, String, ExperienceSource, String)> = vec![
             ("mine".into(), "My Experiences".into(), ExperienceSource::Mine, "This account owns no experiences.".into()),
@@ -783,10 +789,6 @@ impl Editor {
             }
         }
 
-        let files = self.ui.recent.iter().filter(|p| self.matches(&p.display().to_string())).count();
-        if !(searching && files == 0) && self.fold_header(ui, "files", "Recent Files", Some(files.to_string()), todo) {
-            self.start_files(ui, usize::MAX, todo);
-        }
         ui.add_space(24.0);
     }
 

@@ -186,11 +186,8 @@ pub fn replicated(server: &Document, r: Ref) -> bool {
 
 fn builder_of(dom: &WeakDom, r: Ref) -> Option<InstanceBuilder> {
     let i = dom.get_by_ref(r)?;
-    let mut b = InstanceBuilder::new(i.class).with_name(i.name.clone());
-    for (k, v) in &i.properties {
-        b.add_property(*k, v.clone());
-    }
-    Some(b)
+    // (the map itself: the copy keeps sharing its class's common values)
+    Some(InstanceBuilder::new(i.class).with_name(i.name.clone()).with_prop_map(i.properties.clone()))
 }
 
 /// Copies a server subtree into the client DOM (parent `parent`, may be
@@ -240,14 +237,23 @@ fn remap_refs(server: Option<&Document>, dst: &mut WeakDom, created: &[Ref], map
         let Some(i) = dst.get_by_ref_mut(*c) else {
             continue;
         };
-        for (k, v) in i.properties.iter_mut() {
-            if let Variant::Ref(t) = v {
-                let target = *t;
-                *t = map.s2c.get(&target).copied().unwrap_or_else(Ref::none);
+        // (collected, then set: walking the values mutably would copy the
+        // class's shared values into every instance)
+        let mut changes = Vec::new();
+        for (k, v) in i.properties.iter() {
+            if let Variant::Ref(target) = v {
+                let target = *target;
+                let t = map.s2c.get(&target).copied().unwrap_or_else(Ref::none);
                 if t.is_none() && target.is_some() && server.is_some_and(|s| replicated(s, target)) {
                     map.pending_refs.entry(target).or_default().push((*c, k.to_string()));
                 }
+                if t != target {
+                    changes.push((*k, t));
+                }
             }
+        }
+        for (k, t) in changes {
+            i.properties.insert(k, Variant::Ref(t));
         }
     }
 }

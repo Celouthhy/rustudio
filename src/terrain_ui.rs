@@ -444,7 +444,7 @@ fn textured_ball(ctx: &egui::Context, m: u8) -> Option<egui::TextureHandle> {
     }
     let mat = crate::terrain_mat::material(m, use2022)?;
     let pack = mat.faces[0].as_ref().map(|t| t.pack).filter(|p| *p != 0)?;
-    let maps = match crate::matpack::terrain_pack_maps(pack, 0xff80_8080) {
+    let maps = match crate::matpack::terrain_pack_preview(pack, 0xff80_8080) {
         crate::matpack::Lookup::Ready(maps) => maps,
         crate::matpack::Lookup::Pending => {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -452,7 +452,7 @@ fn textured_ball(ctx: &egui::Context, m: u8) -> Option<egui::TextureHandle> {
         }
         crate::matpack::Lookup::Unavailable(_) => return None,
     };
-    let image = ball_image(&maps.albedo, BALL_PX);
+    let image = ball_image(&maps.preview, BALL_PX);
     let tex = ctx.load_texture(format!("terrain-ball-{m}-{use2022}"), image, egui::TextureOptions::LINEAR);
     cache.lock().ok()?.insert((m, use2022), tex.clone());
     Some(tex)
@@ -466,7 +466,7 @@ const BALL_PX: usize = 96;
 /// the upper left; anti-aliased edge.
 fn ball_image(albedo: &[u8], px: usize) -> egui::ColorImage {
     // The mip about 2 texels per screen pixel across one wrap.
-    let levels = crate::matpack::mip_levels();
+    let levels = crate::matpack::preview_levels();
     let want = (px as u32).max(1);
     let (off, size) = levels.iter().copied().find(|(_, s)| *s <= want).unwrap_or(levels[0]);
     let size = size as usize;

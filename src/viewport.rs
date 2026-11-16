@@ -640,6 +640,40 @@ impl Editor {
                     }
                     redo.extend(users);
                 }
+                LivePatch::SkinAttrs { users, colors, uvs } => {
+                    // In place: the skin base, the shared rest mesh and
+                    // each posed part's slot (its compute pass runs again).
+                    // (a part without Bone instances never asked for the
+                    // base: parse it now, the bytes are still current)
+                    if crate::skin::cached_base(&id).is_none() {
+                        if let Some(bytes) = crate::assets::generated(&id) {
+                            crate::skin::base(&id, &bytes);
+                        }
+                    }
+                    let done = match (crate::skin::patch_base(&id, &colors, &uvs), self.renderer.as_mut(), &queue) {
+                        (Some(b), Some(r), Some(q)) if !crate::skin::cpu_skinning() => {
+                            let plane = b.extent.extend(0.0).to_array();
+                            let shared = self.meshes.loaded(&id).is_none_or(|m| {
+                                r.rewrite_mesh(q, m.index, &b.positions, &b.normals, &b.uvs, &b.colors, plane)
+                            });
+                            shared
+                                && users.iter().all(|u| {
+                                    crate::skin::slot_of(*u, b.positions.len()).is_none_or(|slot| {
+                                        r.rewrite_mesh(q, slot, &b.positions, &b.normals, &b.uvs, &b.colors, plane)
+                                    })
+                                })
+                        }
+                        _ => false,
+                    };
+                    if done {
+                        patched = true;
+                    } else {
+                        let users = editable::live_resnap(&id);
+                        self.meshes.forget(&id);
+                        crate::skin::forget_base(&id);
+                        redo.extend(users);
+                    }
+                }
             }
         }
         (redo, patched)
@@ -890,6 +924,8 @@ impl Editor {
             // inside: at rest), for its decals.
             let mut skin_base: Option<(String, std::sync::Arc<crate::skin::Base>)> = None;
             let mut skin_pose: Option<Option<(Vec<Xform>, Vec3, Vec3)>> = None;
+            // The drawn mesh has UVs of its own (MeshCache::authored_uvs).
+            let mut mesh_uvs = true;
             if let Some(asset) = &sp.mesh_asset {
                 waiting = true;
                 let sd = crate::bench::scope("sd_mesh_get");
@@ -905,6 +941,7 @@ impl Editor {
                 drop(sd);
                 if let Some(m) = got {
                     waiting = false;
+                    mesh_uvs = meshes.authored_uvs(mesh_id);
                     d.custom_mesh = Some(m.index);
                     d.placeholder = false;
                     if { static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *TRACE.get_or_init(|| std::env::var_os("RUSTUDIO_MESH_DENSITY_TRACE").is_some()) } && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart") {
@@ -986,15 +1023,40 @@ impl Editor {
             }
             let sd_tex = crate::bench::scope("sd_texture");
             if let Some(tid) = &sp.texture_id {
+                // A SurfaceAppearance's composite is made from its images'
+                // pixels: kept past their upload until it is made (other
+                // textures' pixels go once they are on the GPU).
+                let surface = crate::scene::surface_maps(&self.doc, r).map(|ids| {
+                    let mut ids = ids.to_vec();
+                    ids.push(sp.emissive.as_ref().map(|(id, _)| id.clone()));
+                    let key = format!("surface|{tid}|{ids:?}");
+                    (ids, key)
+                });
+                let emissive_key = match (&surface, &sp.emissive) {
+                    (None, Some((mask_id, _))) => Some(format!("emissive|{tid}|{mask_id}")),
+                    _ => None,
+                };
+                if let Some((ids, key)) = &surface {
+                    if textures.composite_index(key).is_none() {
+                        textures.want_pixels(tid);
+                        for id in ids.iter().flatten() {
+                            textures.want_pixels(id);
+                        }
+                    }
+                }
+                if let (Some(key), Some((mask_id, _))) = (&emissive_key, &sp.emissive) {
+                    if textures.composite_index(key).is_none() {
+                        textures.want_pixels(tid);
+                        textures.want_pixels(mask_id);
+                    }
+                }
                 match textures.image(tid, dir, assets, &mut |img| {
                     renderer.add_texture(&device, &queue, img.width, img.height, &img.pixels)
                 }) {
                     Some(t) => {
                         d.texture = Some(t.index);
                         d.tex_mode = sp.tex_kind;
-                        if let Some(ids) = crate::scene::surface_maps(&self.doc, r) {
-                            let mut ids = ids.to_vec();
-                            ids.push(sp.emissive.as_ref().map(|(id, _)| id.clone()));
+                        if let Some((ids, key)) = surface {
                             let mut maps = Vec::new();
                             for id in &ids {
                                 maps.push(id.as_ref().and_then(|id| textures.image(id, dir, assets, &mut |img| {
@@ -1002,28 +1064,36 @@ impl Editor {
                                 })));
                             }
                             waiting |= ids.iter().zip(&maps).any(|(id, im)| id.as_ref().is_some_and(|id| !textures.failed(id)) && im.is_none());
-                            let key = format!("surface|{tid}|{ids:?}");
-                            let (w, h) = (t.image.width.max(2), t.image.height.max(2));
+                            let (w, h) = (t.width.max(2), t.height.max(2));
                             if !waiting {
                                 // The packed normal/roughness/metalness map is
                                 // built only when the composite isn't cached
                                 // (it was built per part: a full-size pixel
                                 // loop for every SurfaceAppearance part).
-                                if let Some(index) = textures.composite(&key, || Some((*t.image).clone()), &mut |im| {
-                                    let mut packed = vec![0; (w * h * 4) as usize];
-                                    for y in 0..h { for x in 0..w {
-                                        let at = ((y * w + x) * 4) as usize;
-                                        packed[at..at+4].copy_from_slice(&[128,128,255,0]);
-                                        for (k, im) in maps.iter().take(3).enumerate() { if let Some(im) = im {
-                                            let im = &im.image;
-                                            let q = (((y * im.height / h) * im.width + x * im.width / w) * 4) as usize;
-                                            if k == 0 { packed[at..at+2].copy_from_slice(&im.pixels[q..q+2]); }
-                                            else { packed[at+1+k] = im.pixels[q]; }
+                                let made = textures.composite_index(&key);
+                                let index = if made.is_some() { made } else {
+                                    let base = textures.pixels(tid, dir, assets);
+                                    let px: Vec<Option<std::sync::Arc<crate::texture::Rgba>>> = ids.iter().zip(&maps)
+                                        .map(|(id, m)| id.as_ref().filter(|_| m.is_some()).and_then(|id| textures.pixels(id, dir, assets)))
+                                        .collect();
+                                    let index = textures.composite(&key, || base.as_deref().cloned(), &mut |im| {
+                                        let mut packed = vec![0; (w * h * 4) as usize];
+                                        for y in 0..h { for x in 0..w {
+                                            let at = ((y * w + x) * 4) as usize;
+                                            packed[at..at+4].copy_from_slice(&[128,128,255,0]);
+                                            for (k, im) in px.iter().take(3).enumerate() { if let Some(im) = im {
+                                                let q = (((y * im.height / h) * im.width + x * im.width / w) * 4) as usize;
+                                                if k == 0 { packed[at..at+2].copy_from_slice(&im.pixels[q..q+2]); }
+                                                else { packed[at+1+k] = im.pixels[q]; }
+                                            }}
                                         }}
-                                    }}
-                                    renderer.add_texture_surface(&device, &queue, im.width, im.height, &im.pixels,
-                                        maps[3].as_ref().map(|m| (m.image.width, m.image.height, m.image.pixels.as_slice())), Some((w,h,&packed)))
-                                }) { d.texture = Some(index); }
+                                        renderer.add_texture_surface(&device, &queue, im.width, im.height, &im.pixels,
+                                            px[3].as_ref().map(|m| (m.width, m.height, m.pixels.as_slice())), Some((w,h,&packed)))
+                                    });
+                                    textures.release_pixels(std::iter::once(tid.as_str()).chain(ids.iter().flatten().map(|i| i.as_str())));
+                                    index
+                                };
+                                if let Some(index) = index { d.texture = Some(index); }
                                 if let Some((_, strength)) = &sp.emissive { d.emissive = *strength; }
                             }
                         }
@@ -1038,23 +1108,33 @@ impl Editor {
                                     &img.pixels,
                                 )
                             }) {
-                                Some(m) => {
+                                Some(_) => {
                                     let key = format!("emissive|{tid}|{mask_id}");
-                                    let mask = m.image.clone();
-                                    if let Some(i) = textures.composite(
-                                        &key,
-                                        || Some((*t.image).clone()),
-                                        &mut |im| {
-                                            renderer.add_texture_emissive(
-                                                &device,
-                                                &queue,
-                                                im.width,
-                                                im.height,
-                                                &im.pixels,
-                                                Some((mask.width, mask.height, &mask.pixels)),
-                                            )
-                                        },
-                                    ) {
+                                    let made = textures.composite_index(&key);
+                                    let index = if made.is_some() { made } else {
+                                        let base = textures.pixels(tid, dir, assets);
+                                        let mask = textures.pixels(mask_id, dir, assets);
+                                        let index = match (base, mask) {
+                                            (Some(base), Some(mask)) => textures.composite(
+                                                &key,
+                                                || Some((*base).clone()),
+                                                &mut |im| {
+                                                    renderer.add_texture_emissive(
+                                                        &device,
+                                                        &queue,
+                                                        im.width,
+                                                        im.height,
+                                                        &im.pixels,
+                                                        Some((mask.width, mask.height, &mask.pixels)),
+                                                    )
+                                                },
+                                            ),
+                                            _ => None,
+                                        };
+                                        textures.release_pixels([tid.as_str(), mask_id.as_str()]);
+                                        index
+                                    };
+                                    if let Some(i) = index {
                                         d.texture = Some(i);
                                         d.emissive = *strength;
                                     }
@@ -1147,9 +1227,15 @@ impl Editor {
                             return None;
                         }
                         let key = format!("r15|{shirt:?}|{pants:?}|{}", look.key());
+                        if let Some(i) = textures.composite_index(&key) {
+                            return Some(i);
+                        }
+                        // (clothing images are small: decoded again here)
+                        let spx = s.and(shirt.as_ref()).and_then(|id| textures.pixels(id, dir, assets));
+                        let ppx = p.and(pants.as_ref()).and_then(|id| textures.pixels(id, dir, assets));
                         textures.composite(
                             &key,
-                            || crate::assets::r15_composite(&look, s.as_ref().map(|t| &*t.image), p.as_ref().map(|t| &*t.image)),
+                            || crate::assets::r15_composite(&look, spx.as_deref(), ppx.as_deref()),
                             &mut |im| renderer.add_texture(&device, &queue, im.width, im.height, &im.pixels),
                         )
                     });
@@ -1158,14 +1244,14 @@ impl Editor {
                         ClothingLayer::Pants => p.as_ref().map(|t| t.index),
                         ClothingLayer::Torso => {
                             let key = format!("torso|{shirt:?}|{pants:?}");
+                            let made = textures.composite_index(&key);
+                            let (sp, pp) = if made.is_some() { (None, None) } else {
+                                (s.and(shirt.as_ref()).and_then(|id| textures.pixels(id, dir, assets)),
+                                 p.and(pants.as_ref()).and_then(|id| textures.pixels(id, dir, assets)))
+                            };
                             textures.composite(
                                 &key,
-                                || {
-                                    composite_over(
-                                        p.as_ref().map(|t| &*t.image),
-                                        s.as_ref().map(|t| &*t.image),
-                                    )
-                                },
+                                || composite_over(pp.as_deref(), sp.as_deref()),
                                 &mut |im| {
                                     renderer.add_texture(
                                         &device, &queue, im.width, im.height, &im.pixels,
@@ -1211,8 +1297,9 @@ impl Editor {
             let variant_maps = match sp.variant_pack {
                 Some((pack, _)) if d.texture.is_none() && !d.placeholder && d.material < 0.5 => {
                     match crate::matpack::pack_maps(pack, 0xffff_ffff) {
-                        crate::matpack::Lookup::Ready(m) => Some(Some(m)),
-                        crate::matpack::Lookup::Pending => {
+                        crate::matpack::Lookup::Ready(m) if renderer.material_layer(&device, &queue, &m) >= 0 => Some(Some(m)),
+                        // (loading, or its released maps on their way back)
+                        crate::matpack::Lookup::Ready(_) | crate::matpack::Lookup::Pending => {
                             waiting = true;
                             Some(None)
                         }
@@ -1558,7 +1645,7 @@ impl Editor {
                 let union_projection = self.doc.class_of(sp.r).is_some_and(|c|
                     matches!(c.as_str(), "UnionOperation" | "NegateOperation" | "PartOperation"));
                 let meshpart_projection = d.custom_mesh.is_some() && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart");
-                let union_authored = union_projection && match self.doc.prop(sp.r, "InitialSize") {
+                let union_authored = union_projection && mesh_uvs && match self.doc.prop(sp.r, "InitialSize") {
                     Some(rbx_dom_weak::types::Variant::Vector3(v)) =>
                         d.size == glam::Vec3::new(v.x, v.y, v.z),
                     _ => false,
@@ -1571,6 +1658,8 @@ impl Editor {
             if d.texture.is_none() && !d.placeholder && !sp.variant && d.material < 0.5 {
                 if let Some(e) = crate::matpack::entry(d.material_id, use2022) {
                     match crate::matpack::maps(e) {
+                        // (a pack whose maps were released comes back like a loading one)
+                        crate::matpack::Lookup::Ready(m) if renderer.material_layer(&device, &queue, &m) < 0 => waiting = true,
                         crate::matpack::Lookup::Ready(m) => {
                             d.mat_layer = renderer.material_layer(&device, &queue, &m);
                             // The maps carry the material's colour now.
@@ -1590,7 +1679,13 @@ impl Editor {
                             let meshpart_projection = d.custom_mesh.is_some() && self.doc.class_of(sp.r).is_some_and(|c| c == "MeshPart");
                             // Studio only regenerates CSG UVs when Size
                             // differs from InitialSize; unchanged unions retain authored UVs.
-                            let union_authored = union_projection && match self.doc.prop(sp.r, "InitialSize") {
+                            // A union with no UVs (every SolidMesh: its UV array is
+                            // empty) has none to keep and takes the plane projection
+                            // at any Size, as Studio draws it: FtF's Graveyard Slate
+                            // rock and Ground cliff unions show their material maps in
+                            // Studio 0.747 (2026-11-15) and drew one
+                            // flat texel here.
+                            let union_authored = union_projection && mesh_uvs && match self.doc.prop(sp.r, "InitialSize") {
                                 Some(rbx_dom_weak::types::Variant::Vector3(v)) =>
                                     d.size == glam::Vec3::new(v.x, v.y, v.z),
                                 _ => false,
@@ -1622,6 +1717,7 @@ impl Editor {
                                 match crate::matpack::pack_maps(e.detail, 0xffff_ffff) {
                                     crate::matpack::Lookup::Ready(dm) => {
                                         detail = renderer.material_layer(&device, &queue, &dm) as f32;
+                                        waiting |= detail < 0.0;
                                     }
                                     crate::matpack::Lookup::Pending => waiting = true,
                                     crate::matpack::Lookup::Unavailable(_) => {}
@@ -1990,6 +2086,7 @@ impl Editor {
                     match crate::matpack::terrain_pack_maps(tex.pack, 0xff80_8080) {
                         crate::matpack::Lookup::Ready(maps) => {
                             layer = renderer.material_layer(&device, &queue, &maps) as f32;
+                            waiting |= layer < 0.0;
                             if is_override {
                                 blade_base = Some(crate::matpack::mean_albedo(&maps));
                             }

@@ -2158,7 +2158,7 @@ fn prop_get_plain(
 }
 
 fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
-    let (old, descendants) = {
+    let (old, descendants, lost, snaps) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -2197,6 +2197,9 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
             }
         }
         let was_in = w.mode == RunMode::Edit && w.d().records_change(r);
+        let in_ws = |d: &Document, p: Ref| p.is_some() && d.workspace().is_some_and(|ws| p == ws || d.is_ancestor(ws, p));
+        let enters_ws = w.mode != RunMode::Edit && !in_ws(w.d(), old) && in_ws(w.d(), new_parent);
+        let lost = primary_parts_leaving(&w, r, old, new_parent);
         w.dm().dom.transfer_within(r, new_parent);
         if new_parent.is_none() {
             w.orphans.insert(r);
@@ -2229,9 +2232,151 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
         for d in &descendants {
             w.dirty.insert(*d);
         }
-        (old, descendants)
+        let snaps = if enters_ws { weld_snaps(w.d(), r) } else { Vec::new() };
+        (old, descendants, lost, snaps)
     };
+    for (model, pivot) in lost {
+        store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
+        store_prop(lua, model, "WorldPivotData", Variant::OptionalCFrame(Some(pivot.to_cframe())))?;
+    }
+    for (part, xf) in snaps {
+        store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
+    }
     fire_parent_signals(lua, r, old, new_parent, descendants)
+}
+
+/// Parts of `r`'s tree that its saved WeldConstraints place as it enters the
+/// Workspace. A WeldConstraint keeps its offset (the hidden CFrame0 =
+/// Part0⁻¹ · Part1, saved and cloned with it) and the assembly is built from
+/// it: a part a script moved while the tree was out of the Workspace goes
+/// back where its weld holds it. Find the Fennecs' Arachnec lantern clones
+/// its LanternAssets, sets every part's CFrame to the tool's Handle and only
+/// then parents it; in Roblox the lantern still comes out whole. Parts
+/// outside the tree stay put and the tree's parts are placed outward from
+/// them (else from the first weld's Part0).
+fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
+    let inside: HashSet<Ref> = std::iter::once(r).chain(d.dom.descendants_of(r).map(|i| i.referent())).collect();
+    let cf = |x: Ref| match d.prop(x, "CFrame") {
+        Some(Variant::CFrame(c)) => Some(Xform::from_cframe(&c)),
+        _ => None,
+    };
+    let part = |x: Option<Variant>| match x {
+        Some(Variant::Ref(p)) if p.is_some() && d.class_of(p).is_some_and(|c| doc::is_a(&c, "BasePart")) => Some(p),
+        _ => None,
+    };
+    // (Part0, Part1, Part0⁻¹ · Part1) for each saved, enabled weld.
+    let mut welds: Vec<(Ref, Ref, Xform)> = Vec::new();
+    for x in &inside {
+        let Some(i) = d.dom.get_by_ref(*x) else { continue };
+        if i.class != "WeldConstraint" || !crate::physics::joint_enabled(d, *x) {
+            continue;
+        }
+        let Some(Variant::CFrame(c0)) = d.prop(*x, "CFrame0") else { continue };
+        if let Some((p0, p1)) = crate::physics::joint_parts(d, *x) {
+            // (a weld to a part outside the Workspace holds nothing: a clone's weld to
+            // its template's part, still in ReplicatedStorage)
+            let live = |p: Ref| part(Some(Variant::Ref(p))).is_some() && d.workspace().is_some_and(|ws| d.is_ancestor(ws, p));
+            if p0 != p1 && live(p0) && live(p1) {
+                welds.push((p0, p1, Xform::from_cframe(&c0)));
+            }
+        }
+    }
+    if welds.is_empty() {
+        return Vec::new();
+    }
+    welds.sort_by_key(|(a, b, _)| (format!("{a:?}"), format!("{b:?}")));
+    let mut at: HashMap<Ref, Xform> = HashMap::new();
+    let mut queue: VecDeque<Ref> = VecDeque::new();
+    for (p0, p1, _) in &welds {
+        for p in [*p0, *p1] {
+            if !inside.contains(&p) && !at.contains_key(&p) {
+                if let Some(x) = cf(p) {
+                    at.insert(p, x);
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let inv = |x: &Xform| Xform { rot: x.rot.transpose(), pos: -(x.rot.transpose() * x.pos) };
+    loop {
+        while let Some(p) = queue.pop_front() {
+            let px = at[&p];
+            for (p0, p1, off) in &welds {
+                let (q, step) = if *p0 == p {
+                    (*p1, *off)
+                } else if *p1 == p {
+                    (*p0, inv(off))
+                } else {
+                    continue;
+                };
+                if at.contains_key(&q) {
+                    continue;
+                }
+                let want = compose(&px, &step);
+                at.insert(q, want);
+                queue.push_back(q);
+                if let Some(cur) = cf(q) {
+                    if (cur.pos - want.pos).length() > 1e-3 || !cur.rot.abs_diff_eq(want.rot, 1e-4) {
+                        out.push((q, want));
+                    }
+                }
+            }
+        }
+        // A tree of its own: placed from its first weld's Part0, which stays.
+        let Some(start) = welds.iter().map(|w| w.0).find(|p| !at.contains_key(p)) else { break };
+        let Some(x) = cf(start) else { break };
+        at.insert(start, x);
+        queue.push_back(start);
+    }
+    out
+}
+
+/// The Models (among `old` and its ancestors) whose PrimaryPart leaves them
+/// when `r` moves from `old` to `new_parent`, each with the pivot it had.
+/// Studio (checked in a Studio-11-15, execute_luau in Edit):
+/// destroying the PrimaryPart, or parenting it out of the model, sets
+/// Model.PrimaryPart to nil at once (the model in the DataModel or not), and
+/// the model's pivot stays where the part's pivot was: GetPivot and
+/// WorldPivot both read the old PrimaryPart.CFrame · PivotOffset after, so a
+/// later PivotTo measures from there. Find the Fennecs' teleport menu
+/// clones its sky box, destroys the box's Center (its PrimaryPart) and then
+/// PivotTo's the box onto the camera every frame.
+fn primary_parts_leaving(w: &World, r: Ref, old: Ref, new_parent: Ref) -> Vec<(Ref, Xform)> {
+    let d = w.d();
+    let mut out = Vec::new();
+    let mut cur = old;
+    while cur.is_some() {
+        let Some(i) = d.dom.get_by_ref(cur) else { break };
+        let pp = if doc::is_a(&i.class, "Model") {
+            match d.prop(cur, "PrimaryPart") {
+                Some(Variant::Ref(pp)) => pp,
+                _ => Ref::none(),
+            }
+        } else {
+            Ref::none()
+        };
+        {
+            if pp.is_some()
+                && (pp == r || d.is_ancestor(r, pp))
+                && !(new_parent == cur || d.is_ancestor(cur, new_parent))
+            {
+                let pivot = match d.prop(pp, "CFrame") {
+                    Some(Variant::CFrame(cf)) => {
+                        let off = match d.prop(pp, "PivotOffset") {
+                            Some(Variant::CFrame(o)) => Xform::from_cframe(&o),
+                            _ => Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY },
+                        };
+                        compose(&Xform::from_cframe(&cf), &off)
+                    }
+                    _ => model_pivot(w, cur),
+                };
+                out.push((cur, pivot));
+            }
+        }
+        cur = i.parent();
+    }
+    out
 }
 
 /// The signals of `r` having moved from `old` to `new_parent` (already done
@@ -2540,7 +2685,7 @@ fn fire_changed(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
 /// The change history's record of a script's property write: every
 /// property of `r` that differs from `before` (the written one and its
 /// twins).
-pub(crate) fn note_prop_changes(w: &mut World, r: Ref, before: &rbx_dom_weak::UstrMap<Variant>) {
+pub(crate) fn note_prop_changes(w: &mut World, r: Ref, before: &rbx_dom_weak::PropMap) {
     let Some(inst) = w.d().dom.get_by_ref(r) else { return };
     let mut changes = Vec::new();
     for (k, nv) in inst.properties.iter() {
@@ -3388,6 +3533,24 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
             "CFrame",
             Variant::CFrame(cf_mul(&delta, &xf).orthonormalized().to_cframe()),
         )?;
+    }
+    // Roblox: after PivotTo the model's pivot *is* the target (GetPivot
+    // returns it). With a PrimaryPart that follows from the part having
+    // moved; without one the pivot is the model's own WorldPivotData, so it
+    // moves too (a model that had none, pivoting on its parts' bounds, gets
+    // one). Left behind, every PivotTo measured its delta from the stale
+    // pivot: Find the Fennecs' teleport menu PivotTo's its sky box (a
+    // Model, no PrimaryPart) onto the camera every RenderStepped and the
+    // box ran off by the same offset each frame (-89600 studs in 6 s), so
+    // its Beam sky never showed.
+    let primary_moves = {
+        let w = world(lua)?;
+        let d = w.d();
+        matches!(d.prop(r, "PrimaryPart"), Some(Variant::Ref(pp))
+            if pp.is_some() && matches!(d.prop(pp, "CFrame"), Some(Variant::CFrame(_))))
+    };
+    if !primary_moves && doc::is_a(&class, "Model") {
+        store_prop(lua, r, "WorldPivotData", Variant::OptionalCFrame(Some(target.to_cframe())))?;
     }
     Ok(())
 }
@@ -4569,10 +4732,7 @@ impl Runtime {
                         let i = w.d().dom.get_by_ref(src).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
                         (i.name.clone(), i.properties.clone())
                     };
-                    let mut b = InstanceBuilder::new(class.as_str()).with_name(name);
-                    for (k, v) in props {
-                        b.add_property(k, v);
-                    }
+                    let b = InstanceBuilder::new(class.as_str()).with_name(name).with_prop_map(props);
                     let r = w.dm().dom.insert(Ref::none(), b);
                     w.structure_changed = true;
                     r
@@ -6566,6 +6726,34 @@ mod tests {
             out[4].0 == Level::Error && out[4].1.contains("ServerScriptService.T:14: boom"),
             "{out:?}"
         );
+    }
+
+    /// Model pivots as a Studio gave them (2026-11-15, the same
+    /// script in execute_luau): a PrimaryPart destroyed or parented out of
+    /// its model is cleared at once and the pivot stays where the part's
+    /// was; PivotTo then moves the WorldPivot with the parts.
+    #[test]
+    fn pivot_follows_pivot_to_and_lost_primary_part() {
+        let out = run("local m = Instance.new(\"Model\")\n\
+            local c = Instance.new(\"Part\") c.Name = \"Center\" c.Anchored = true c.Position = Vector3.new(0, 900, 0) c.Parent = m\n\
+            local a = Instance.new(\"Part\") a.Anchored = true a.Position = Vector3.new(0, 900, 60) a.Parent = m\n\
+            m.PrimaryPart = c m.Parent = workspace\n\
+            local k = m:Clone() k.Parent = workspace\n\
+            k.Center:Destroy()\n\
+            print(\"A\", k.PrimaryPart, k:GetPivot().Position)\n\
+            k:PivotTo(CFrame.new(0, 400, 300))\n\
+            k:PivotTo(CFrame.new(10, 400, 300))\n\
+            print(\"B\", k:GetPivot().Position, k.Part.Position)\n\
+            local k2 = m:Clone() k2.Parent = workspace\n\
+            k2.Center.Parent = workspace\n\
+            print(\"C\", k2.PrimaryPart, k2:GetPivot().Position)\n\
+            local k3 = m:Clone() k3.Center:Destroy()\n\
+            print(\"D\", k3.PrimaryPart)\n");
+        let text: Vec<&str> = out.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(text[0].starts_with("A nil 0, 900, 0"), "{text:?}");
+        assert!(text[1].starts_with("B 10, 400, 300 10, 400, 360"), "{text:?}");
+        assert!(text[2].starts_with("C nil 0, 900, 0"), "{text:?}");
+        assert!(text[3].starts_with("D nil"), "{text:?}");
     }
 
     /// An error lists its Luau frames the way Studio's Output does.

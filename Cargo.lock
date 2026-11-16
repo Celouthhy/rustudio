@@ -3205,8 +3205,6 @@ dependencies = [
 [[package]]
 name = "parry3d"
 version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b626edc0b497dba4bdf6e1e0797895294ed9f61dac2bd28cb5d34d37ad2ca7e"
 dependencies = [
  "approx",
  "arrayvec",
@@ -4048,7 +4046,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake2",
  "blake3",
@@ -4098,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -4115,7 +4113,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "blake2",

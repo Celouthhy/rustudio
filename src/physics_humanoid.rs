@@ -2250,6 +2250,10 @@ impl Physics {
                 .map(crate::terrain::material_name)
                 .unwrap_or("Grass");
             crate::ltypes::LPhysicalProperties::for_material(name)
+        } else if let Some((f, w)) = self.link.friction_of(part) {
+            // A client part's stand-in or copy (physics_client_link.rs): the server's
+            // document doesn't have it.
+            crate::ltypes::LPhysicalProperties { friction: f, friction_weight: w, ..crate::ltypes::LPhysicalProperties::for_material("Plastic") }
         } else {
             crate::runtime::domains::world::part::phys_props(doc, part)
         };

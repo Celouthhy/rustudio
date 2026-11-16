@@ -740,6 +740,8 @@ fn fit(job: &Job) -> Result<Fitted, String> {
                     corner_bones,
                     corner_weights,
                     corner_vertex: (0..n as u32).collect(),
+                    vertex_bones: Vec::new(),
+                    vertex_weights: Vec::new(),
                 },
                 firsts: (0..n as u32).collect(),
                 corner_unique: (0..n as u32).collect(),

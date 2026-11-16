@@ -247,6 +247,14 @@ impl SkinGpu {
         }
     }
 
+    /// Queues `slot` again with the palette and parameters it already
+    /// holds (its vertex buffer was rewritten with the rest pose).
+    pub fn again(&mut self, slot: u32) {
+        if self.jobs.contains_key(&slot) && !self.due.contains(&slot) {
+            self.due.push(slot);
+        }
+    }
+
     /// Forgets a part's job (its slot went back to the shared mesh or away).
     pub fn drop_slot(&mut self, slot: u32) {
         self.jobs.remove(&slot);

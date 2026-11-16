@@ -188,6 +188,11 @@ pub struct PlaySession {
     client_joints: crate::client_joints::ClientJoints,
     /// The client DataModel's own simulation (src/physics_client.rs).
     client_sim: crate::physics::client::ClientSim,
+    /// Touch changes between the client world's parts (client refs), fired on
+    /// the client in its next script phase: Studio fires Touched where the
+    /// part is simulated, so a LocalScript's clones (FtF's pot lid and
+    /// ingredients) touch on their client.
+    client_touches: Vec<(Ref, Ref, bool)>,
     /// Humanoid state transitions so far (shown in Output, read by the self-test).
     pub state_log: Vec<String>,
     /// Clicks, chat, tools, sounds and other in-game interaction.
@@ -658,6 +663,7 @@ impl Editor {
             memstats_worst: 0.0,
             client_joints: Default::default(),
             client_sim: Default::default(),
+            client_touches: Vec::new(),
             state_log: Vec::new(),
             game: Default::default(),
             mouse_delta: glam::Vec2::ZERO,
@@ -1944,6 +1950,7 @@ impl Editor {
         }
         // The tool it held goes with it (it isn't put back in the Backpack).
         self.drop_equipped();
+        self.unequip_client_tool_dropped();
         // Roblox destroys the old character (Destroying on it and all it
         // holds; a no-op when a script destroyed it already).
         if let Some(old) = self.play.as_mut().and_then(|s| s.character.take()) {
@@ -2535,21 +2542,26 @@ impl Editor {
         drop(sc);
         // Touch events (CanTouch parts only).
         let sc = crate::bench::scope("p3b_touch_prep");
-        let can_touch =
-            |doc: &Document, r: Ref| !matches!(doc.prop(r, "CanTouch"), Some(Variant::Bool(false)));
+        // (A part only the client has, met by its character (physics_client_link.rs),
+        // is read from the client's document.)
+        let client_doc = self.play.as_ref().and_then(|s| s.other_doc.as_ref());
+        let can_touch = |doc: &Document, r: Ref| {
+            let v = doc.prop(r, "CanTouch").or_else(|| {
+                doc.dom.get_by_ref(r).is_none().then(|| client_doc.and_then(|cd| cd.prop(r, "CanTouch"))).flatten()
+            });
+            !matches!(v, Some(Variant::Bool(false)))
+        };
         let part_touches: Vec<(Ref, Ref, bool)> = result
             .touches
             .iter()
             .copied()
             .filter(|(a, b, _)| can_touch(&self.doc, *a) && can_touch(&self.doc, *b))
             .collect();
+        let char_now: HashSet<Ref> = char_touches.into_iter().filter(|r| can_touch(&self.doc, *r)).collect();
         let (char_began, char_ended): (Vec<Ref>, Vec<Ref>) =
             match self.play.as_mut().and_then(|s| s.character.as_mut()) {
                 Some(ch) if char_part.is_some() => {
-                    let now: HashSet<Ref> = char_touches
-                        .into_iter()
-                        .filter(|r| can_touch(&self.doc, *r))
-                        .collect();
+                    let now = char_now;
                     let b = now.difference(&ch.touching).copied().collect();
                     let e = ch.touching.difference(&now).copied().collect();
                     ch.touching = now;
@@ -2557,6 +2569,13 @@ impl Editor {
                 }
                 _ => (Vec::new(), Vec::new()),
             };
+        // The character's touches of parts only its client has: they fire there.
+        let client_only: HashSet<Ref> = char_began
+            .iter()
+            .chain(char_ended.iter())
+            .copied()
+            .filter(|r| self.doc.dom.get_by_ref(*r).is_none())
+            .collect();
         let velocities = self
             .play
             .as_ref()
@@ -2624,8 +2643,8 @@ impl Editor {
         // 4. Server scripts.
         let fire_touches = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
             let m = |r: Ref| match map {
-                Some(m) => m.get(&r).copied(),
-                None => Some(r),
+                Some(m) => m.get(&r).copied().or_else(|| client_only.contains(&r).then_some(r)),
+                None => (!client_only.contains(&r)).then_some(r),
             };
             for (a, b, started) in &part_touches {
                 let ev = if *started { "Touched" } else { "TouchEnded" };
@@ -2806,6 +2825,12 @@ impl Editor {
                 None => (None, None),
             };
             self.game_client_inputs();
+            self.check_client_tool();
+            let client_touches = self
+                .play
+                .as_mut()
+                .map(|s| std::mem::take(&mut s.client_touches))
+                .unwrap_or_default();
             let humanoid_client = humanoid_server.and_then(|h| map_s2c.get(&h).copied());
             let client_states: HashMap<Ref, String> = state_names
                 .iter()
@@ -3005,6 +3030,16 @@ impl Editor {
                 // Button releases after the GUI's events (Up / Click / Activated).
                 mouse_buttons(false);
                 fire_touches(rt, Some(&map_s2c));
+                for (a, b, started) in &client_touches {
+                    let (ev, twin) = if *started { ("Touched", "LocalSimulationTouched") } else { ("TouchEnded", "StoppedTouching") };
+                    rt.fire(*a, ev, vec![rt.inst(*b)]);
+                    rt.fire(*b, ev, vec![rt.inst(*a)]);
+                    if *started {
+                        crate::rig::fire_humanoid_touched(rt, *a, *b);
+                    }
+                    rt.fire(*a, twin, vec![rt.inst(*b)]);
+                    rt.fire(*b, twin, vec![rt.inst(*a)]);
+                }
                 fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
                 fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
@@ -3162,6 +3197,9 @@ impl Editor {
                         let motion = s.client_sim.link_motion();
                         s.physics.link_note_motion(&motion, dt);
                     }
+                    let can_touch = |r: Ref| !matches!(cd.prop(r, "CanTouch"), Some(Variant::Bool(false)));
+                    s.client_touches
+                        .extend(out.touches.into_iter().filter(|(a, b, _)| can_touch(*a) && can_touch(*b)));
                     for r in out.fallen {
                         cd.dom.transfer_within(r, Ref::none());
                         cd.mark_tree(r);

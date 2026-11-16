@@ -564,7 +564,31 @@ mod tests {
 /// once; decoding them in the frame that asked froze it for seconds).
 /// A decoded image and its mip chain (render::mip_chain), both made on a
 /// decode worker so the upload on the main thread only copies.
-pub type Decoded = Result<(Rgba, Option<Vec<u8>>), String>;
+pub type Decoded = Result<(Rgba, Option<Vec<u8>>, Option<Waiting>), String>;
+
+/// Bytes decoded by the workers and not uploaded yet. The workers pause
+/// above WAITING_LIMIT: they decode faster than frames upload, and a map
+/// load's hundreds of images (each with its mip chain, ~10 MB at 1024²)
+/// otherwise all sat in memory at once.
+static WAITING_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const WAITING_LIMIT: usize = 192 << 20;
+
+/// A decoded image's share of WAITING_BYTES, given back when it is dropped
+/// (uploaded, or its cache gone).
+pub struct Waiting(usize);
+
+impl Waiting {
+    fn new(bytes: usize) -> Self {
+        WAITING_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Waiting(bytes)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        WAITING_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sender<(String, Decoded)>, id: String) {
     use std::sync::{mpsc, Mutex, OnceLock};
@@ -579,9 +603,16 @@ pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sende
             let _ = std::thread::Builder::new().name(format!("tex-decode-{i}")).spawn(move || loop {
                 let job = rx.lock().ok().and_then(|r| r.recv().ok());
                 let Some((bytes, done, id)) = job else { return };
+                // (at most 15 s: images nothing asks for again, their parts
+                // gone, must not stop the loading for good)
+                let t0 = std::time::Instant::now();
+                while WAITING_BYTES.load(std::sync::atomic::Ordering::Relaxed) > WAITING_LIMIT && t0.elapsed().as_secs() < 15 {
+                    std::thread::sleep(std::time::Duration::from_millis(4));
+                }
                 let r = decode(&bytes).map(|img| {
                     let mips = crate::render::mip_chain_for(&img);
-                    (img, mips)
+                    let waiting = Waiting::new(img.pixels.len() + mips.as_ref().map_or(0, |m| m.len()));
+                    (img, mips, Some(waiting))
                 });
                 let _ = done.send((id, r));
             });

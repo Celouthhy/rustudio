@@ -26,7 +26,7 @@ struct Globals {
     sun_casc: array<mat4x4<f32>, 4>, // the sun's shadow cascades: world to the tile's (u, v, depth)
     sun_sphere: array<vec4<f32>, 4>, // each cascade's sphere: centre, radius squared
     sun_rect: array<vec4<f32>, 4>,   // each tile in the atlas: corner, size (UV)
-    sky_rot: vec4<f32>,      // x stars (0/1), y blur size
+    sky_rot: vec4<f32>,      // x stars (0/1), y blur size, z debug view, w 1 = the drawn sky takes the time-of-day levels (a custom Sky)
     env: array<vec4<f32>, 6>, // skybox irradiance x EnvironmentDiffuseScale (+X, -X, +Y, -Y, +Z, -Z)
     sky_tint: vec4<f32>,     // the sky (and its light) by time of day: 1 by day, a dim blue at dusk, 0 deep at night
     lightgrid: vec4<f32>,    // xyz Studio's light grid's first voxel, w studs out along the normal (0 = none yet)
@@ -215,11 +215,38 @@ fn sky_rough(dir: vec3<f32>, rough: f32) -> vec3<f32> {
 }
 
 fn sky_color_lod(dir: vec3<f32>, lod: f32) -> vec3<f32> {
+    return sky_color_lod_k(dir, lod, vec3<f32>(1.0));
+}
+
+/// The drawn sky's time-of-day level in this direction, squared (1 for
+/// Studio's default sky, which sky_tint dims instead): Studio's SkyVS /
+/// AdvSkyVS multiply the skybox texel by mix(c1, c0, clamp(y / 1700, 0, 1)),
+/// y the sky mesh's height there, and the FS squares it (c0, c1 the
+/// SkyGradientTop / Bottom levels, unsquared). The mesh's height isn't read
+/// from Studio; y / 1700 = SKY_LEVEL_Q0 + dir.y was fitted to a Vinegar
+/// Studio (2026-11-15: Find the Fennecs' Afternoon Sky alone,
+/// EnvironmentDiffuseScale 0, 14:00 / 18:00 / 19:00 / 20:30, camera
+/// pitched 5° and 40°: mean error under 0.6 of 255 per channel; the level
+/// is the same at camera heights 0 to 1400, so the mesh moves with the
+/// camera). Below that height the sky takes c1 (rows under the horizon
+/// match Studio's to the level).
+const SKY_LEVEL_Q0: f32 = 0.27;
+fn sky_level(dir: vec3<f32>) -> vec3<f32> {
+    if (g.sky_rot.w <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let q = clamp(SKY_LEVEL_Q0 + dir.y, 0.0, 1.0);
+    let l = mix(sqrt(max(g.sky_grad[1].rgb, vec3<f32>(0.0))), sqrt(max(g.sky_grad[0].rgb, vec3<f32>(0.0))), q);
+    return l * l;
+}
+
+/// sky_color_lod with the skybox's texels (before any haze) times `k`.
+fn sky_color_lod_k(dir: vec3<f32>, lod: f32, k: vec3<f32>) -> vec3<f32> {
     var c: vec3<f32>;
     if (g.params.w > 0.5) {
         // Skybox faces (Sky or Studio's default), dimmed at night.
         let t = textureSampleLevel(sky_tex, sky_sampler, dir, lod).rgb;
-        c = sq(t) * select(vec3<f32>(1.0), g.sky_tint.rgb, g.sky_tint.w > 0.5);
+        c = sq(t) * k * select(vec3<f32>(1.0), g.sky_tint.rgb, g.sky_tint.w > 0.5);
     } else {
         let h = clamp(dir.y, -1.0, 1.0);
         c = mix(g.sky_horizon.rgb, g.sky_top.rgb, pow(clamp(h, 0.0, 1.0), 0.55));
@@ -313,7 +340,7 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     // (subtracting a far-out cam_pos here made the sky wobble as it moved).
     let far = g.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w);
-    var c = sky_color(dir);
+    var c = sky_color_lod_k(dir, 0.0, sky_level(dir));
     if (under_water()) {
         return vec4<f32>(fog_rgb(), 1.0);
     }

@@ -2525,6 +2525,33 @@ impl Lua {
         Ok(true)
     }
 
+    /// rustudio: a copy of the `T` userdata at `idx` of `state`, read in
+    /// place (no reference into the registry); None when the value there
+    /// is not a `T` made by this Lua, or is mutably borrowed.
+    ///
+    /// # Safety
+    /// `state` must be a running thread of this Lua with two free stack slots.
+    #[doc(hidden)]
+    pub unsafe fn peek_userdata_copy<T: UserData + Copy + 'static>(
+        &self,
+        state: *mut ffi::lua_State,
+        idx: c_int,
+    ) -> Option<T> {
+        let lua = self.lock();
+        let &mt_id = (*lua.extra.get()).registered_userdata_t.get(&TypeId::of::<T>())?;
+        if ffi::lua_type(state, idx) != ffi::LUA_TUSERDATA || ffi::lua_getmetatable(state, idx) == 0 {
+            return None;
+        }
+        ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, mt_id as _);
+        let same = ffi::lua_rawequal(state, -1, -2) != 0;
+        ffi::lua_pop(state, 2);
+        if !same {
+            return None;
+        }
+        let ud = crate::util::get_userdata::<UserDataStorage<T>>(state, idx);
+        (*ud).try_borrow_scoped(|v| *v).ok()
+    }
+
     #[inline(always)]
     pub(crate) fn lock_arc(&self) -> LuaGuard {
         let guard = LuaGuard(self.raw.lock_arc());

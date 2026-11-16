@@ -95,6 +95,34 @@ pub fn forget_base(id: &str) {
     rig_changed();
 }
 
+/// A live skinned EditableMesh's colour / UV edits written into its parsed
+/// base in place (corner of the mesh file, value; colours RGBA 0..1): the
+/// base as it now is, or None when there is nothing to patch in place (not
+/// parsed yet, held elsewhere right now, no vertex colours in it, or the
+/// corners don't line up) and the caller rebuilds from fresh bytes.
+pub fn patch_base(id: &str, colors: &[(u32, [f32; 4])], uvs: &[(u32, [f32; 2])]) -> Option<Arc<Base>> {
+    let mut g = BASES.lock().ok()?;
+    let arc = g.get_mut(id)?.as_mut()?;
+    let b = Arc::get_mut(arc)?;
+    let n = b.positions.len();
+    // (corner i of the file is corner i here: one file vertex per corner)
+    let lined = |i: u32| (i as usize) < n && b.skin.corner_vertex.get(i as usize) == Some(&i);
+    if (!colors.is_empty() && b.colors.len() != n) || (!uvs.is_empty() && b.uvs.len() != n) {
+        return None;
+    }
+    if !colors.iter().all(|c| lined(c.0)) || !uvs.iter().all(|u| lined(u.0)) {
+        return None;
+    }
+    for (i, c) in colors {
+        // (`MeshData::gpu_colors`: a vertex colour tint, alpha −1 − a)
+        b.colors[*i as usize] = Vec4::new(c[0], c[1], c[2], -1.0 - c[3]);
+    }
+    for (i, u) in uvs {
+        b.uvs[*i as usize] = Vec2::from_array(*u);
+    }
+    Some(arc.clone())
+}
+
 pub fn cached_base(id: &str) -> Option<Arc<Base>> {
     BASES.lock().ok()?.get(id).cloned().flatten()
 }
@@ -174,9 +202,121 @@ pub fn part_has_bones(doc: &Document, part: Ref, mesh: &str) -> bool {
 }
 
 pub fn has_bones(doc: &Document, part: Ref) -> bool {
-    doc.dom.descendants_of(part).any(|i| i.class == "Bone" || i.class == "FaceControls")
-        || bone_hosts(doc, part)[1..].iter().any(|h| doc.dom.descendants_of(*h).any(|i| i.class == "Bone"))
+    let gen = RIG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    let mut all = RIG_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    if all.len() > 8 && !all.contains_key(&doc.id) {
+        all.clear();
+    }
+    let index = all.entry(doc.id).or_default();
+    if index.gen != gen {
+        *index = RigIndex::build(doc, gen);
+    }
+    // No Bone or FaceControls anywhere (most places): nothing to walk. The
+    // assembly walk below ran per mesh part on every redo of the draws,
+    // seconds a frame in a place with thousands of jointed mesh parts.
+    if index.bone_above.is_empty() && index.face_above.is_empty() {
+        return false;
+    }
+    if index.face_above.contains(&part) || index.bone_above.contains(&part) {
+        return true;
+    }
+    if index.bone_above.is_empty() {
+        return false;
+    }
+    // A Bone under another part of its assembly (`bone_hosts`): the joints
+    // under its model, grouped once per model.
+    let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
+        doc.class_of(*m).is_some_and(|c| crate::doc::is_a(&c, "Model"))
+    }) else {
+        return false;
+    };
+    if !index.models.contains_key(&model) {
+        let rig = ModelRig::build(doc, model, &index.bone_above);
+        index.models.insert(model, rig);
+    }
+    let rig = &index.models[&model];
+    rig.group.get(&part).is_some_and(|g| rig.with_bones[*g as usize])
 }
+
+/// Where a document's Bones and FaceControls are (for `has_bones`), valid
+/// until the rig changes, as the bone lookups are.
+#[derive(Default)]
+struct RigIndex {
+    gen: u64,
+    /// Every instance with a Bone / a FaceControls below it.
+    bone_above: std::collections::HashSet<Ref>,
+    face_above: std::collections::HashSet<Ref>,
+    models: HashMap<Ref, ModelRig>,
+}
+
+/// The rigid joints under one model as groups of jointed parts (what
+/// `bone_hosts` walks, for every part of the model at once).
+struct ModelRig {
+    group: HashMap<Ref, u32>,
+    /// Per group: some part of it has a Bone below it.
+    with_bones: Vec<bool>,
+}
+
+impl ModelRig {
+    fn build(doc: &Document, model: Ref, bone_above: &std::collections::HashSet<Ref>) -> Self {
+        let mut slot: HashMap<Ref, u32> = HashMap::new();
+        let mut parent: Vec<u32> = Vec::new();
+        fn find(parent: &mut [u32], mut i: u32) -> u32 {
+            while parent[i as usize] != i {
+                parent[i as usize] = parent[parent[i as usize] as usize];
+                i = parent[i as usize];
+            }
+            i
+        }
+        for i in doc.dom.descendants_of(model) {
+            if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(doc, i.referent()) {
+                if let Some((a, b)) = crate::physics::joint_parts(doc, i.referent()) {
+                    let mut at = |r: Ref| {
+                        *slot.entry(r).or_insert_with(|| {
+                            parent.push(parent.len() as u32);
+                            parent.len() as u32 - 1
+                        })
+                    };
+                    let (a, b) = (at(a), at(b));
+                    let (a, b) = (find(&mut parent, a), find(&mut parent, b));
+                    parent[a as usize] = b;
+                }
+            }
+        }
+        let mut with_bones = vec![false; parent.len()];
+        let mut group = HashMap::with_capacity(slot.len());
+        for (r, i) in slot {
+            let g = find(&mut parent, i);
+            group.insert(r, g);
+            with_bones[g as usize] |= bone_above.contains(&r);
+        }
+        ModelRig { group, with_bones }
+    }
+}
+
+impl RigIndex {
+    fn build(doc: &Document, gen: u64) -> Self {
+        let mut index = RigIndex { gen, ..Default::default() };
+        for i in doc.dom.descendants() {
+            let set = match i.class.as_str() {
+                "Bone" => &mut index.bone_above,
+                "FaceControls" => &mut index.face_above,
+                _ => continue,
+            };
+            let mut cur = i.parent();
+            while let Some(p) = doc.dom.get_by_ref(cur) {
+                if !set.insert(cur) {
+                    break;
+                }
+                cur = p.parent();
+            }
+        }
+        index
+    }
+}
+
+static RIG_INDEX: std::sync::LazyLock<Mutex<HashMap<u64, RigIndex>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// What a skinned part redraws on: its FaceControls and the Bones that
 /// skin it. With its mesh's skeleton known (`mesh`'s base parsed): only the
@@ -621,6 +761,8 @@ pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
             corner_bones: Vec::new(),
             corner_weights: Vec::new(),
             corner_vertex: Vec::new(),
+            vertex_bones: Vec::new(),
+            vertex_weights: Vec::new(),
         },
         firsts: Vec::new(),
         corner_unique: Vec::new(),
@@ -716,6 +858,8 @@ mod tests {
                 corner_bones: vec![[0, 0, 0, 0], [1, 0, 0, 0]],
                 corner_weights: vec![[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
                 corner_vertex: vec![0, 1],
+                vertex_bones: Vec::new(),
+                vertex_weights: Vec::new(),
             },
         }
     }

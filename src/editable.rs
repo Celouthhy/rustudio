@@ -445,6 +445,10 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
     if !names().contains(name) {
         return None;
     }
+    // (an EditableMesh is known by its entry: no class lookup per call)
+    if with(|s| s.meshes.contains_key(&this)) {
+        return Some(mesh_call(lua, name, this, args));
+    }
     let class = world(lua).ok()?.d().class_of(this)?;
     match class.as_str() {
         "AssetService" => Some(asset_call(lua, name, args)),
@@ -853,7 +857,8 @@ fn mesh_from_uri(uri: &str) -> mlua::Result<Mesh> {
         .unwrap_or_else(|| crate::assets::script_content_blocking(uri))
         .map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
     if let Some(st) = crate::mesh::stored(&bytes) {
-        return Ok(Mesh::from_stored(&st));
+        let skin = if st.major >= 4 { crate::mesh::parse(&bytes).ok().and_then(|d| d.skin) } else { None };
+        return Ok(Mesh::from_stored(&st, skin.as_ref()));
     }
     let d = crate::mesh::parse(&bytes).map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
     Ok(Mesh::from_mesh_data(&d))
@@ -1003,8 +1008,11 @@ fn mutates(name: &str) -> bool {
 //   BatchSetValues) rewrite only the corners that use those ids (and the
 //   automatic normals of the triangles around moved vertices) in the GPU
 //   buffer in place; layout edits (faces, ids per corner, bones) rebuild the
-//   copy. Skinned meshes re-snapshot their bytes under the same id and
-//   their parts are redrawn (the skin path deforms from the bytes).
+//   copy. Skinned meshes: colour / UV edits go into the renderer's copies
+//   in place (`LivePatch::SkinAttrs`: the skin base, the shared rest mesh,
+//   each posed part's slot, which the compute pass skins again); any other
+//   edit re-snapshots their bytes under the same id and their parts are
+//   redrawn (the skin path deforms from the bytes).
 // The copy is normalised by the bounds at CreateMeshPartAsync, so a vertex
 // moved past them draws there and the others don't shift (Studio).
 
@@ -1022,6 +1030,34 @@ struct Live {
     copy: Option<Copy>,
     /// Parts the renderer draws with this id (redrawn on a rebuild).
     users: HashSet<Ref>,
+    /// Skinned: colour / UV id → the corners (of `Mesh::corners`, which is
+    /// the snapshot's vertex order) using it; None until the first
+    /// value-only edit and after any rebuild.
+    skin_ids: Option<SkinIds>,
+    /// Skinned: the registered bytes are behind the mesh (colour / UV edits
+    /// went straight to the renderer's copies, `LivePatch::SkinAttrs`).
+    bytes_stale: bool,
+}
+
+struct SkinIds {
+    by_uv: HashMap<u64, Vec<u32>>,
+    by_color: HashMap<u64, Vec<u32>>,
+    /// Each corner's colour id (a frame that rewrites most colours reads
+    /// them all in corner order instead of id by id).
+    corner_color: Vec<u64>,
+    colors: usize,
+}
+
+fn build_skin_ids(m: &Mesh) -> SkinIds {
+    let mut by_uv: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut by_color: HashMap<u64, Vec<u32>> = HashMap::new();
+    let ids = m.corner_ids();
+    for (i, id) in ids.iter().enumerate() {
+        by_uv.entry(id[2]).or_default().push(i as u32);
+        by_color.entry(id[3]).or_default().push(i as u32);
+    }
+    let colors = by_color.len();
+    SkinIds { by_uv, by_color, corner_color: ids.iter().map(|id| id[3]).collect(), colors }
 }
 
 /// The renderer's copy of a live mesh: per corner the ids behind it, ids →
@@ -1093,7 +1129,7 @@ fn register_live(em: Ref, id: &str, lo: Vec3, hi: Vec3) {
             return;
         }
         let edits_at = l.edits.get(&em).copied().unwrap_or(0);
-        l.by_id.insert(id.to_string(), Live { em, lo, hi, edits_at, skinned, copy: None, users: HashSet::new() });
+        l.by_id.insert(id.to_string(), Live { em, lo, hi, edits_at, skinned, copy: None, users: HashSet::new(), skin_ids: None, bytes_stale: false });
         l.of_em.entry(em).or_default().push(id.to_string());
     });
 }
@@ -1149,7 +1185,8 @@ pub fn live_stats() -> (usize, usize, usize, usize) {
 }
 
 fn quant(x: f32) -> f32 {
-    (x.clamp(0.0, 1.0) * 255.0).round() / 255.0
+    // (round half up of a value in 0..255: no libm call per vertex)
+    ((x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32) as f32 / 255.0
 }
 
 /// One corner as the GPU holds a loaded 2.00 mesh (assets.rs
@@ -1227,6 +1264,31 @@ pub enum LivePatch {
     /// Build it again (`live_build`, or its re-registered bytes when
     /// skinned) and redraw these parts.
     Rebuild { users: Vec<Ref>, skinned: bool },
+    /// A skinned mesh whose colours / UVs changed and nothing else: these
+    /// corners' new values (corner of the snapshot, RGBA / UV), written
+    /// into the renderer's copies in place (the shared rest mesh, the skin
+    /// base and each posed part's slot); no bytes, no reparse, no redraw of
+    /// the parts. The renderer answers with `live_resnap` when it has no
+    /// copy to patch.
+    SkinAttrs { users: Vec<Ref>, colors: Vec<(u32, [f32; 4])>, uvs: Vec<(u32, [f32; 2])> },
+}
+
+/// The fallback of `LivePatch::SkinAttrs`: the skinned mesh's bytes brought
+/// up to date under `id` (then rebuilt from them as before); its parts.
+pub fn live_resnap(id: &str) -> Vec<Ref> {
+    let Some((em, centre, users)) = live(|l| {
+        let x = l.by_id.get_mut(id)?;
+        x.skin_ids = None;
+        x.bytes_stale = false;
+        Some((x.em, (x.lo + x.hi) * 0.5, x.users.iter().copied().collect::<Vec<_>>()))
+    }) else {
+        return Vec::new();
+    };
+    if let Some(m) = with(|s| s.meshes.get(&em).cloned()) {
+        let (b, _, _) = lock(&m).to_mesh_bytes_about(Some(centre));
+        crate::assets::register_generated(id, b);
+    }
+    users
 }
 
 /// The corners of `copy` to rewrite for journal `j`, with the automatic
@@ -1334,10 +1396,47 @@ pub fn sync_live() -> Vec<(String, LivePatch)> {
             let ids = l.of_em.get(&em).cloned().unwrap_or_default();
             for id in ids {
                 let Some(x) = l.by_id.get_mut(&id) else { continue };
+                if x.skinned && m.skinned() && !j.layout && j.verts.is_empty() && j.normals.is_empty() {
+                    // Colours / UVs only: straight into the renderer's copies.
+                    let ids = x.skin_ids.get_or_insert_with(|| build_skin_ids(m));
+                    // (an id set several times since the last frame counts once)
+                    let once = |l: &Vec<u64>| {
+                        let mut l = l.clone();
+                        l.sort_unstable();
+                        l.dedup();
+                        l
+                    };
+                    let mut colors = Vec::new();
+                    let q = |v: ([f32; 3], f32)| [quant(v.0[0]), quant(v.0[1]), quant(v.0[2]), quant(v.1)];
+                    if j.colors.len() * 2 >= ids.colors {
+                        // Most of them: every corner, in order.
+                        colors.reserve(ids.corner_color.len());
+                        for (k, c) in ids.corner_color.iter().enumerate() {
+                            if let Some(v) = m.color(*c) {
+                                colors.push((k as u32, q(v)));
+                            }
+                        }
+                    } else {
+                        for c in &once(&j.colors) {
+                            let Some(v) = m.color(*c) else { continue };
+                            colors.extend(ids.by_color.get(c).into_iter().flatten().map(|k| (*k, q(v))));
+                        }
+                    }
+                    let mut uvs = Vec::new();
+                    for u in &once(&j.uvs) {
+                        let Some(v) = m.uv(*u) else { continue };
+                        uvs.extend(ids.by_uv.get(u).into_iter().flatten().map(|k| (*k, v.to_array())));
+                    }
+                    x.bytes_stale = true;
+                    out.push((id, LivePatch::SkinAttrs { users: x.users.iter().copied().collect(), colors, uvs }));
+                    continue;
+                }
                 if x.skinned != m.skinned() || x.skinned {
                     // Skinned (or became / stopped being): bytes again.
                     x.skinned = m.skinned();
                     x.copy = None;
+                    x.skin_ids = None;
+                    x.bytes_stale = false;
                     resnap.push((id.clone(), (x.lo + x.hi) * 0.5));
                     out.push((id, LivePatch::Rebuild { users: x.users.iter().copied().collect(), skinned: true }));
                     continue;
@@ -1383,7 +1482,7 @@ fn drop_live(em: Ref, m: &Mesh) {
                 for u in &x.users {
                     l.user_of.remove(u);
                 }
-                if x.edits_at != now || !m.journal.is_empty() {
+                if x.edits_at != now || !m.journal.is_empty() || x.bytes_stale {
                     out.push((id, (x.lo + x.hi) * 0.5));
                 }
             }
@@ -1394,6 +1493,24 @@ fn drop_live(em: Ref, m: &Mesh) {
         let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
         crate::assets::register_generated(&id, b);
     }
+}
+
+/// `em:SetColor(id, Color3)` straight from the namecall fast path
+/// (runtime_routes.rs): a per-frame vertex painter calls it thousands of
+/// times a frame. False: not an EditableMesh or not its colour id (the
+/// normal path answers, with its errors).
+pub fn set_color_fast(this: Ref, id: f64, rgb: [f32; 3]) -> bool {
+    let Some(m) = with(|s| s.meshes.get(&this).cloned()) else { return false };
+    let mut g = lock(&m);
+    let was_empty = g.journal.is_empty();
+    if !g.set_color_rgb(id, rgb) {
+        return false;
+    }
+    if was_empty && !g.journal.is_empty() {
+        drop(g);
+        live(|l| l.changed.insert(this));
+    }
+    true
 }
 
 fn mesh_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
@@ -1416,8 +1533,11 @@ fn mesh_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resul
     let mut g = lock(&m);
     let r = em::call(lua, &mut g, name, args)?.unwrap_or_default();
     if g.live && mutates(name) {
+        // (a journal with entries is already in `changed`: every taker of
+        // the journal drains `changed` first, `sync_live`)
+        let was_empty = g.journal.is_empty();
         em::note_edit(&mut g, name, args);
-        if !g.journal.is_empty() {
+        if was_empty && !g.journal.is_empty() {
             drop(g);
             live(|l| l.changed.insert(this));
         }

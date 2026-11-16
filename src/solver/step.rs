@@ -440,6 +440,21 @@ impl StudioSolver {
         self.sleep.regions.push((lo, hi));
     }
 
+    /// A property write that wakes `body`'s assembly as Studio's do (sleep.rs `poked`: the
+    /// Studio path, depth OptimizedContactWakeDepth) even when it changed neither the
+    /// body's velocity nor its pose: a mover appearing or changing (physics.rs `wake_part`).
+    /// Studio, Vinegar 2026-11-15 (FtF Graveyard bottles asleep on their ropes): an
+    /// AlignPosition created at its part's own position and then given a Position 3 studs
+    /// up moved the bottle the 3 studs, as did one created 3 studs off; rapier's own wake
+    /// was undone here (`resleep`: no velocity or pose change), so FtF's grabbed bottles
+    /// never left their branch.
+    pub fn property_wake(&mut self, body: rp::RigidBodyHandle) {
+        let (i, g) = body.into_raw_parts();
+        if let Some(p) = self.bodies.persist.get_mut(i as usize).filter(|p| p.live && p.generation == g) {
+            p.sleep.poked = true;
+        }
+    }
+
     /// A Humanoid's floor reaction lands on `body` this frame (sleep.rs `floor_wake`).
     pub fn floor_touched(&mut self, body: rp::RigidBodyHandle) {
         let (i, g) = body.into_raw_parts();

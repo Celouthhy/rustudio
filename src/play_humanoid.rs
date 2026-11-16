@@ -232,9 +232,11 @@ impl Editor {
         ch.yaw = cam_yaw;
         let mut pose = ch.rig.solve(xf, &ch.dynamic.transforms);
         pose.extend(self.tool_pose(&pose));
+        let client_tool = self.client_tool_pose(&pose);
         if let Some(s) = self.play.as_mut() {
             if let Some(cdoc) = s.other_doc.as_mut() {
                 rig::write_pose(cdoc, &pose, Some(&s.map.s2c));
+                rig::write_pose(cdoc, &client_tool, None);
             }
         }
         rig::write_pose(&mut self.doc, &pose, None);
@@ -833,7 +835,10 @@ impl Editor {
                 .and_then(|m| crate::ltypes::LEnumItem::from_name("Material", crate::terrain::material_name(m)))
                 .map(|e| e.value)
                 .unwrap_or(256),
-            Some(p) => crate::scene::enum_u32(self.doc.prop(p, "Material")).unwrap_or(256),
+            // (A part only the client has: its document's.)
+            Some(p) => crate::scene::enum_u32(self.doc.prop(p, "Material"))
+                .or_else(|| s.other_doc.as_ref().and_then(|cd| crate::scene::enum_u32(cd.prop(p, "Material"))))
+                .unwrap_or(256),
         };
         if floor != ch.floor_material {
             ch.floor_material = floor;
@@ -849,9 +854,11 @@ impl Editor {
         let fell = root_xf.pos.y < mech::FALLEN_PARTS_HEIGHT;
         let mut pose = pose;
         pose.extend(self.tool_pose(&pose));
+        let client_tool = self.client_tool_pose(&pose);
         if let Some(s) = self.play.as_mut() {
             if let Some(cdoc) = s.other_doc.as_mut() {
                 rig::write_pose(cdoc, &pose, Some(&s.map.s2c));
+                rig::write_pose(cdoc, &client_tool, None);
             }
         }
         rig::write_pose(&mut self.doc, &pose, None);

@@ -197,6 +197,10 @@ pub struct Mesh {
     facs: BTreeMap<u32, Vec<(u64, Xform)>>,
     /// Sorted FacsActionUnit values (2 or 3) → pose.
     correctives: Vec<(Vec<u32>, Vec<(u64, Xform)>)>,
+    /// Vertex → the faces using it, in face order (`vertex_corners`: one
+    /// GetVertexColors per vertex of a 7000-face mesh was 0.3 s). Built on
+    /// first use; dropped by every call that can change a face (`call`).
+    vert_faces: std::cell::OnceCell<HashMap<u64, Vec<u64>>>,
 }
 
 /// sin² of the angle at `p` between `a - p` and `b - p`: a corner's weight
@@ -243,6 +247,7 @@ impl Default for Mesh {
             colors: Slab::new(K_COLOR),
             faces: Slab::new(K_FACE),
             bones: Slab::new(K_BONE),
+            vert_faces: Default::default(),
             facs: BTreeMap::new(),
             correctives: Vec::new(),
         }
@@ -431,6 +436,20 @@ impl Mesh {
             }
         }
         out
+    }
+
+    /// SetColor without the generic call path: false when `id` is not one
+    /// of its colours (the caller then takes the normal path for the error).
+    pub fn set_color_rgb(&mut self, id: f64, rgb: [f32; 3]) -> bool {
+        if !matches!(parse(id), Some((K_COLOR, _, _))) {
+            return false;
+        }
+        let Some(x) = self.colors.get_mut(id as u64) else { return false };
+        x.0 = rgb;
+        if self.live && !self.journal.layout {
+            self.journal.colors.push(id as u64);
+        }
+        true
     }
 
     /// Whether it has bones (its snapshot is then a skinned 4.00 mesh).
@@ -660,8 +679,31 @@ impl Mesh {
     ///   colour bytes stay two: 4949).
     /// Ids are numbered as Studio's (kind << 32 | index), so scripts that
     /// edit by id or by list index reach the same vertices.
-    pub fn from_stored(d: &crate::mesh::Stored) -> Mesh {
+    ///
+    /// A skinned file (4.00+, `skin`) keeps its skeleton, as in Studio 0.747
+    /// (checks/mesh-deform/AUDIT.md (f), "EditableMesh from a skinned file"):
+    /// the bones in file order (name, mesh-space bind CFrame, parent, not
+    /// virtual; a root's parent reads 0) and every vertex's four envelope
+    /// slots as stored, zero weights included. A MeshPart made from it is
+    /// skinned and deforms with Bones named like the mesh's.
+    pub fn from_stored(d: &crate::mesh::Stored, skin: Option<&crate::mesh::Skin>) -> Mesh {
         let mut m = Mesh::default();
+        let bone_ids: Vec<u64> = match skin {
+            Some(sk) if d.major >= 4 && sk.vertex_bones.len() == d.pos.len() => {
+                let ids: Vec<u64> = sk
+                    .bones
+                    .iter()
+                    .map(|b| m.bones.add(Bone { name: b.name.clone(), cf: Xform { pos: b.pos, rot: b.rot }, parent: 0, virt: false }))
+                    .collect();
+                for (b, id) in sk.bones.iter().zip(&ids) {
+                    if let (Some(p), Some(x)) = (b.parent.and_then(|p| ids.get(p).copied()), m.bones.get_mut(*id)) {
+                        x.parent = p;
+                    }
+                }
+                ids
+            }
+            _ => Vec::new(),
+        };
         let mut own = |m: &mut Mesh, i: usize| -> (u64, u64, u64, u64) {
             let v = m.add_vertex(d.pos[i]);
             let n = m.normals.add(Normal { v: d.nrm[i], auto: false });
@@ -699,7 +741,23 @@ impl Mesh {
             }
             map
         } else {
-            (0..d.pos.len()).map(|i| Some(own(&mut m, i))).collect()
+            (0..d.pos.len())
+                .map(|i| {
+                    let x = own(&mut m, i);
+                    if let (false, Some(sk)) = (bone_ids.is_empty(), skin) {
+                        let (bs, ws) = (sk.vertex_bones[i], sk.vertex_weights[i]);
+                        if let Some(v) = m.verts.get_mut(x.0) {
+                            for k in 0..4 {
+                                if let Some(b) = bone_ids.get(bs[k] as usize) {
+                                    v.bones.push(*b);
+                                    v.weights.push(ws[k]);
+                                }
+                            }
+                        }
+                    }
+                    Some(x)
+                })
+                .collect()
         };
         for f in &d.faces {
             let c: Vec<(u64, u64, u64, u64)> = f.iter().filter_map(|&i| ids[i as usize]).collect();
@@ -1050,8 +1108,20 @@ impl Mesh {
     }
 
     fn vertex_corners(&self, v: u64, which: usize) -> Vec<u64> {
+        let index = self.vert_faces.get_or_init(|| {
+            let mut m: HashMap<u64, Vec<u64>> = HashMap::new();
+            for (id, f) in self.faces.iter() {
+                for x in &f.v {
+                    let l = m.entry(*x).or_default();
+                    if l.last() != Some(&id) {
+                        l.push(id);
+                    }
+                }
+            }
+            m
+        });
         let mut out = Vec::new();
-        for (_, f) in self.faces.iter() {
+        for f in index.get(&v).into_iter().flatten().filter_map(|id| self.faces.get(*id)) {
             for (k, x) in f.v.iter().enumerate() {
                 if *x == v {
                     out.push(corner_list(f, which)[k]);
@@ -1178,6 +1248,28 @@ pub fn note_edit(m: &mut Mesh, name: &str, args: &MultiValue) {
 }
 
 pub fn call(lua: &Lua, m: &mut Mesh, name: &str, args: &MultiValue) -> mlua::Result<Option<MultiValue>> {
+    // The call a per-frame vertex painter makes thousands of times: no
+    // argument copies, no walk down the name list.
+    if name == "SetColor" {
+        if let (Some(Value::Number(id)), Some(Value::UserData(u))) = (args.get(1), args.get(2)) {
+            if let (Ok(c), Some((K_COLOR, _, _))) = (u.borrow::<LColor3>(), parse(*id)) {
+                if let Some(x) = m.colors.get_mut(*id as u64) {
+                    x.0 = c.0;
+                    return Ok(Some(MultiValue::new()));
+                }
+            }
+        }
+    }
+    // (anything but a read or a plain value write may change which faces
+    // use a vertex)
+    if !(name.starts_with("Get")
+        || name.starts_with("BatchGet")
+        || name.starts_with("Find")
+        || name.starts_with("Raycast")
+        || matches!(name, "SetPosition" | "SetNormal" | "ResetNormal" | "SetUV" | "SetColor" | "SetColorAlpha"))
+    {
+        m.vert_faces = Default::default();
+    }
     let a1 = arg(args, 1);
     let a2 = arg(args, 2);
     let a3 = arg(args, 3);
@@ -1982,3 +2074,41 @@ fn pose_out(lua: &Lua, pose: &[(u64, Xform)]) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_iter([Value::Table(bs), Value::Table(cs)]))
 }
 
+
+#[cfg(test)]
+mod skinned_file_tests {
+    use super::*;
+
+    /// Studio 0.747, CreateEditableMeshAsync on the probe minifig
+    /// (a generated 23-bone test mesh): 23 bones in file order, roots'
+    /// parent 0, none virtual, each vertex's four stored slots as they are.
+    #[test]
+    fn skinned_file_keeps_its_skeleton() {
+        for bytes in [
+            &include_bytes!("../checks/mesh-deform/meshes/minifig-v400.mesh")[..],
+            &include_bytes!("../checks/mesh-deform/meshes/minifig-v600.mesh")[..],
+        ] {
+            let st = crate::mesh::stored(bytes).unwrap();
+            let skin = crate::mesh::parse(bytes).unwrap().skin;
+            let m = Mesh::from_stored(&st, skin.as_ref());
+            let bones = m.bones.ids();
+            assert_eq!(bones.len(), 23);
+            assert_eq!(bones[0], (K_BONE << 32) | 1);
+            let index = |b: u64| bones.iter().position(|x| *x == b).map(|i| i + 1).unwrap_or(0);
+            let parents: Vec<usize> = bones[..6].iter().map(|b| index(m.bones.get(*b).unwrap().parent)).collect();
+            assert_eq!(parents, [0, 1, 2, 3, 4, 5]);
+            let hips = m.bones.get(bones[1]).unwrap();
+            assert_eq!((hips.name.as_str(), hips.cf.pos, hips.virt), ("Hips", Vec3::new(0.0, 2.4, 0.0), false));
+            let verts = m.verts.ids();
+            assert_eq!(verts.len(), 1006);
+            let slots = |i: usize| {
+                let v = m.verts.get(verts[i - 1]).unwrap();
+                (v.bones.iter().map(|b| index(*b)).collect::<Vec<_>>(), v.weights.clone())
+            };
+            assert_eq!(slots(1), (vec![12, 1, 2, 1], vec![220, 20, 15, 0]));
+            assert_eq!(slots(500), (vec![16, 4, 5, 1], vec![246, 5, 4, 0]));
+            assert_eq!(slots(1000), (vec![22, 23, 21, 1], vec![112, 65, 65, 13]));
+            assert!(m.skinned());
+        }
+    }
+}

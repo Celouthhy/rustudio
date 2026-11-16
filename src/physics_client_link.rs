@@ -28,6 +28,14 @@
 //!   no longer holds up or stops the player's character (`hidden`): floor rays and
 //!   contacts skip it. The server's own bodies still meet it.
 //!
+//! * the client's own anchored parts near the character (an island a LocalScript
+//!   cloned into Workspace: FtF's IslandManager puts the Graveyard there on the
+//!   client only) get a fixed copy here that only the player's character meets
+//!   (`link_client_statics`): its floor, walls and touches. Studio's client owns
+//!   its character and simulates it in the client's world, where those parts are;
+//!   the server never has them, so its bodies and NPCs pass through the copies and
+//!   their queries skip them (`hides_from`).
+//!
 //! The rapier path keeps its old behaviour (none of this runs there).
 use super::*;
 use rapier3d::geometry::BoundingVolume;
@@ -47,6 +55,21 @@ pub fn off() -> bool {
     !crate::rustudio_settings::client_link()
 }
 const NEAR_LEAD_S: f32 = 0.25;
+/// Studs around the character within which a client part's static copy is kept,
+/// plus this many seconds of its speed; rescanned every `STATIC_EVERY` frames and
+/// kept `STATIC_KEEP` frames after leaving (a fall or a run outpaces neither).
+const STATIC_MARGIN: f32 = 24.0;
+const STATIC_LEAD_S: f32 = 0.5;
+const STATIC_EVERY: u64 = 6;
+const STATIC_KEEP: u64 = 30;
+
+/// The fixed copy of one of the client's own anchored parts.
+struct StaticCopy {
+    /// Its collider in the client's world (a rebuild there makes a new one).
+    client: rp::ColliderHandle,
+    mirror: rp::ColliderHandle,
+    seen: u64,
+}
 
 struct Proxy {
     body: rp::RigidBodyHandle,
@@ -79,11 +102,18 @@ pub struct Link {
     hidden: HashMap<Ref, Ref>,
     /// The player's character body (the only thing a stand-in touches).
     pub(super) player: Option<rp::RigidBodyHandle>,
+    /// Its HumanoidRootPart (a query by the character has it in `own`).
+    player_root: Option<Ref>,
+    /// Client part → the fixed copy of it here (`link_client_statics`).
+    statics: HashMap<Ref, StaticCopy>,
+    frames: u64,
+    /// The character's box centre at the last scan for copies.
+    statics_at: Option<Vec3>,
 }
 
 impl Link {
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.hidden.is_empty()
+        self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty()
     }
 
     pub(super) fn body_of(&self, r: Ref) -> Option<rp::RigidBodyHandle> {
@@ -97,9 +127,19 @@ impl Link {
         self.friction.get(&r).copied()
     }
 
-    /// Whether a query by the player's character should skip this collider.
-    pub(super) fn hides(&self, h: rp::ColliderHandle, by_collider: &rustc_hash::FxHashMap<rp::ColliderHandle, Ref>) -> bool {
-        !self.hidden.is_empty() && by_collider.get(&h).is_some_and(|r| self.hidden.contains_key(r))
+    /// Whether a query by a character (its parts `own`) should skip this collider:
+    /// the player's character skips what its client took out of Workspace, every
+    /// other one (NPCs, the server's) skips what only the client has.
+    pub(super) fn hides_from(&self, h: rp::ColliderHandle, by_collider: &rustc_hash::FxHashMap<rp::ColliderHandle, Ref>, own: &std::collections::HashSet<Ref>) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let player = self.player_root.is_some_and(|r| own.contains(&r));
+        if player {
+            !self.hidden.is_empty() && by_collider.get(&h).is_some_and(|r| self.hidden.contains_key(r))
+        } else {
+            self.proxy_colliders.contains(&h)
+        }
     }
 
     /// The pair rule (`OwnerHooks`): Some(answer) for the pairs this decides.
@@ -168,6 +208,7 @@ impl Physics {
         }
         let player = player_model.and_then(|m| self.hums.by_model.get(&m)).map(|h| h.body);
         self.link.player = player;
+        self.link.player_root = player_model.and_then(|m| self.hums.by_model.get(&m)).map(|h| h.root);
         let mut want: Vec<rp::RigidBodyHandle> = Vec::new();
         let region = player.and_then(|b| self.world.bodies.get(b)).and_then(|b| {
             let mut bb: Option<rp::Aabb> = None;
@@ -222,6 +263,11 @@ impl Physics {
         for k in gone {
             self.drop_proxy(k);
         }
+        if let Some(cp) = cs.physics() {
+            self.link_client_statics(cp, c2s, region);
+        } else if !self.link.statics.is_empty() {
+            self.drop_statics(|_| true);
+        }
         let Some(cp) = cs.physics() else { return };
         for cb in want {
             let Some(b) = cp.world.bodies.get(cb) else { continue };
@@ -265,6 +311,132 @@ impl Physics {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The client's own anchored parts near the player's character, as fixed
+    /// copies only it meets (see the module notes). `region`: the character's box
+    /// and speed (None: no character, every copy goes).
+    fn link_client_statics(&mut self, cp: &Physics, c2s: &std::collections::HashMap<Ref, Ref>, region: Option<(rp::Aabb, f32)>) {
+        self.link.frames += 1;
+        let frame = self.link.frames;
+        let Some((pbb, pspeed)) = region else {
+            if !self.link.statics.is_empty() {
+                self.drop_statics(|_| true);
+            }
+            return;
+        };
+        // The client's own part, anchored, in its Workspace (cp builds only those).
+        let own_static = |r: &Ref, pb: &PartBody| pb.asm.is_none() && !cp.external.contains(r) && !c2s.contains_key(r);
+        // (Rescanned at once after a jump of half the margin: a teleport into an island
+        // the client cloned, FtF's Graveyard, otherwise dropped the character through
+        // its ground for the frames until the next scan; with the realm's scripts
+        // loading, 6 frames were ~0.3 s, a 40-stud fall.)
+        let centre = gv(pbb.center().into());
+        let jumped = self.link.statics_at.is_none_or(|c| (c - centre).length() > STATIC_MARGIN * 0.5);
+        if frame % STATIC_EVERY == 1 || self.link.statics.is_empty() || jumped {
+            let _s = crate::bench::scope("pl_static_scan");
+            self.link.statics_at = Some(centre);
+            let area = pbb.loosened(STATIC_MARGIN + pspeed * STATIC_LEAD_S);
+            // (The client world's broad phase: a walk over every part was ~5 ms a
+            // scan with FtF's Graveyard, 20k parts, on the client.)
+            let mut found: Vec<(Ref, rp::ColliderHandle)> = Vec::new();
+            for (ch, _) in cp.world.query_pipeline().intersect_aabb_conservative(area) {
+                let Some(r) = cp.by_collider.get(&ch) else { continue };
+                let Some(pb) = cp.parts.get(r) else { continue };
+                if pb.collider == ch && own_static(r, pb) {
+                    found.push((*r, ch));
+                }
+            }
+            found.sort_unstable_by_key(|(r, _)| rbx_dom_weak::ref_order(*r));
+            for (r, ch) in found {
+                match self.link.statics.get_mut(&r) {
+                    Some(sc) if sc.client == ch => sc.seen = frame,
+                    _ => self.make_static(cp, r, ch, frame),
+                }
+            }
+            self.drop_statics(|sc| frame - sc.seen > STATIC_KEEP);
+        }
+        // Copies whose part went (or changed in the client's world): gone or rebuilt;
+        // the rest where the part is now (a tweened anchored part).
+        let _t = crate::bench::scope("pl_static_track");
+        crate::bench::add("pl_statics", 0.0, self.link.statics.len() as u64);
+        let mut stale: Vec<Ref> = Vec::new();
+        for (r, sc) in &self.link.statics {
+            match cp.parts.get(r) {
+                Some(pb) if pb.collider == sc.client && own_static(r, pb) => {
+                    let (Some(c), Some(m)) = (cp.world.colliders.get(pb.collider), self.world.colliders.get(sc.mirror)) else {
+                        stale.push(*r);
+                        continue;
+                    };
+                    if c.position() != m.position() {
+                        let at = *c.position();
+                        if let Some(m) = self.world.colliders.get_mut(sc.mirror) {
+                            m.set_position(at);
+                        }
+                    }
+                }
+                _ => stale.push(*r),
+            }
+        }
+        if !stale.is_empty() {
+            let set: HashSet<Ref> = stale.iter().copied().collect();
+            self.drop_statics_of(&set);
+            for r in stale {
+                if let Some(pb) = cp.parts.get(&r).filter(|pb| own_static(&r, pb)) {
+                    self.make_static(cp, r, pb.collider, frame);
+                }
+            }
+        }
+    }
+
+    fn make_static(&mut self, cp: &Physics, r: Ref, ch: rp::ColliderHandle, frame: u64) {
+        if let Some(old) = self.link.statics.remove(&r) {
+            self.remove_static_copy(&old);
+        }
+        let Some(c) = cp.world.colliders.get(ch) else { return };
+        let sensor = c.is_sensor();
+        let mut copy = rp::ColliderBuilder::new(c.shared_shape().clone())
+            .position(*c.position())
+            .friction(c.friction())
+            .restitution(c.restitution())
+            .friction_combine_rule(c.friction_combine_rule())
+            .restitution_combine_rule(c.restitution_combine_rule())
+            .collision_groups(c.collision_groups())
+            .user_data(c.user_data)
+            .sensor(sensor);
+        // (A CanCollide=false part only reports touches: the query that finds the
+        // character's touches sees it, nothing collides with it.)
+        if !sensor {
+            copy = copy.active_hooks(rp::ActiveHooks::FILTER_CONTACT_PAIRS);
+        }
+        let gc = self.world.insert_collider(copy, None);
+        if let Some(sv) = self.studio.as_mut() {
+            sv.note_collider(gc, r, c.shape());
+        }
+        self.by_collider.insert(gc, r);
+        self.link.proxy_colliders.insert(gc);
+        self.link.friction.insert(r, (c.friction(), hum_body::weights_of(c).0));
+        self.link.statics.insert(r, StaticCopy { client: ch, mirror: gc, seen: frame });
+    }
+
+    fn remove_static_copy(&mut self, sc: &StaticCopy) {
+        self.by_collider.remove(&sc.mirror);
+        self.link.proxy_colliders.remove(&sc.mirror);
+        self.world.remove_collider(sc.mirror);
+    }
+
+    fn drop_statics(&mut self, f: impl Fn(&StaticCopy) -> bool) {
+        let gone: HashSet<Ref> = self.link.statics.iter().filter(|(_, sc)| f(sc)).map(|(r, _)| *r).collect();
+        self.drop_statics_of(&gone);
+    }
+
+    fn drop_statics_of(&mut self, gone: &HashSet<Ref>) {
+        for r in gone {
+            if let Some(sc) = self.link.statics.remove(r) {
+                self.remove_static_copy(&sc);
+                self.link.friction.remove(r);
             }
         }
     }
@@ -369,6 +541,7 @@ impl Physics {
         if self.link.proxies.is_empty() {
             return;
         }
+        let studio = self.studio.as_deref();
         for p in self.link.proxies.values_mut() {
             if p.force == Vec3::ZERO && p.torque == Vec3::ZERO {
                 continue;
@@ -376,11 +549,11 @@ impl Physics {
             let Some(b) = self.world.bodies.get_mut(p.body) else { continue };
             b.add_force(rv(p.force), true);
             b.add_torque(rv(p.torque), true);
-            let m = b.mass();
+            let (m, inv, _) = solver_mass(studio, p.body, b);
             if m > 0.0 {
                 p.pred_v += p.force / m * h;
             }
-            p.pred_w += hum_body::world_inv_inertia(b) * p.torque * h;
+            p.pred_w += inv * p.torque * h;
             self.pushed.insert(p.body);
         }
     }
@@ -391,13 +564,21 @@ impl Physics {
         if dt <= 0.0 {
             return;
         }
+        let studio = self.studio.as_deref();
         for (cb, dv, dw) in motion {
             let Some(p) = self.link.proxies.get_mut(cb) else { continue };
             let Some(b) = self.world.bodies.get(p.body) else { continue };
-            p.force = *dv * b.mass() / dt;
-            let inv = hum_body::world_inv_inertia(b);
-            let i = if inv.determinant().abs() > 1e-12 { inv.inverse() } else { Mat3::ZERO };
-            p.torque = i * *dw / dt;
+            let (m, _, _) = solver_mass(studio, p.body, b);
+            p.force = *dv * m / dt;
+            // Only the linear part goes over: the solver turns a torque into spin through
+            // its geometric-stiffness inertia and angular damping (step.rs
+            // `free_velocity`), which no prediction here matches, and the miss came back
+            // as next frame's kick: a thin light part (FtF's grave nails, 0.85×0.05×0.05,
+            // 0.02 mass) spun up without bound beside the character (10¹⁸ rad/s, flung
+            // 10⁵ studs). The stand-in takes the body's spin anew every frame; between, it
+            // keeps it. (Linear motion has neither term: its prediction is exact.)
+            let _ = dw;
+            p.torque = Vec3::ZERO;
         }
     }
 
@@ -412,6 +593,26 @@ impl Physics {
         v.sort_unstable_by_key(|b| b.into_raw_parts());
         v
     }
+}
+
+/// The mass, world inverse inertia and world inertia a stand-in is integrated with: the
+/// solver's record (note_mass, the client body's Studio mass, solver/body.rs `gather`:
+/// Iw⁻¹ = R·I⁻¹·Rᵀ) where it has one, else rapier's. The force and torque that carry the
+/// client world's motion over, and the motion they are predicted to cause, must use the
+/// one the solver integrates with: with rapier's, a thin light part (FtF's grave nails,
+/// 0.85×0.05×0.05, 0.02 mass) got back a kick of (I_studio⁻¹·I_rapier − 1)·Δω every frame
+/// and spun up without bound beside the character (10¹⁸ rad/s, flung 10⁵ studs).
+fn solver_mass(studio: Option<&crate::solver::StudioSolver>, h: rp::RigidBodyHandle, b: &rp::RigidBody) -> (f32, Mat3, Mat3) {
+    if let Some(sm) = studio.and_then(|sv| sv.body_notes(h).0) {
+        let i = sm.inertia();
+        if sm.mass > 0.0 && i.determinant().is_finite() && i.determinant().abs() > 1e-20 {
+            let r = Mat3::from_quat(glam::Quat::from_xyzw(b.rotation().x, b.rotation().y, b.rotation().z, b.rotation().w));
+            return (sm.mass, r * i.inverse() * r.transpose(), r * i * r.transpose());
+        }
+    }
+    let inv = hum_body::world_inv_inertia(b);
+    let i = if inv.determinant().abs() > 1e-12 { inv.inverse() } else { Mat3::ZERO };
+    (b.mass(), inv, i)
 }
 
 impl client::ClientSim {

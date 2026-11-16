@@ -47,6 +47,15 @@ pub struct ClientSim {
     /// Bodies with a stand-in in the server's world: their velocities when this
     /// frame's step began (physics_client_link.rs).
     pub(super) link_start: HashMap<rp::RigidBodyHandle, (Vec3, Vec3)>,
+    /// Parts out of this world while their client holds them (an equipped Tool only the
+    /// client has: its parts follow the hand, play_game.rs `equip_client_tool`), and the
+    /// changes to apply at the next step.
+    held: HashSet<Ref>,
+    hold_changes: Vec<(Ref, bool)>,
+    /// The held Tool's loose parts (hung from it on ropes or joints): kept awake while
+    /// it's held, since the hand moving their held end is no contact or write that
+    /// would wake them (the Arachnec lantern stayed hanging where it fell asleep).
+    keep_awake: Vec<Ref>,
 }
 
 impl ClientSim {
@@ -59,6 +68,25 @@ impl ClientSim {
     }
 
     /// Whether this world has bodies of its own to step.
+    /// Takes `parts` out of this world (`on`) or puts them back.
+    pub fn hold(&mut self, parts: &[Ref], on: bool) {
+        for r in parts {
+            if on == self.held.contains(r) {
+                continue;
+            }
+            if on {
+                self.held.insert(*r);
+            } else {
+                self.held.remove(r);
+            }
+            self.hold_changes.push((*r, on));
+        }
+    }
+
+    pub fn set_keep_awake(&mut self, parts: Vec<Ref>) {
+        self.keep_awake = parts;
+    }
+
     pub fn has_bodies(&self) -> bool {
         self.physics.as_ref().is_some_and(|p| !p.asms.is_empty())
     }
@@ -122,9 +150,20 @@ impl ClientSim {
             p
         });
         p.char_group = server.char_group.clone();
+        for (r, on) in std::mem::take(&mut self.hold_changes) {
+            if on {
+                p.skip.insert(r);
+            } else {
+                p.skip.remove(&r);
+            }
+            p.queued.insert(r);
+        }
         let sc = crate::bench::scope("pc_sync");
         p.sync(cd);
         drop(sc);
+        for r in &self.keep_awake {
+            p.wake_part(*r);
+        }
         let _ex = crate::bench::scope("pc_near");
         let mut requeue: Vec<Ref> = Vec::new();
         // A new body of the client's gets its neighbourhood before it moves
@@ -254,8 +293,14 @@ impl ClientSim {
                 p.set_velocity(*r, *v);
             }
         }
-        // Nothing of its own to move: skip the solver (the usual case).
+        // Nothing of its own to move: skip the solver (the usual case). Its broad
+        // phase still takes the parts that came or moved: the player's character
+        // finds the client's own anchored parts near it there (physics_client_link.rs).
         if p.asms.is_empty() {
+            if !p.parts.is_empty() {
+                let _b = crate::bench::scope("pc_broad");
+                p.world.detect_collisions(&(), &());
+            }
             return StepResult::default();
         }
         let _sc = crate::bench::scope("pc_step");

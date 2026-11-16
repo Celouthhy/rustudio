@@ -647,6 +647,7 @@ fn ctor_fast_id(ty: &str, f: &str) -> i32 {
         ("CFrame", "new") => 1,
         ("CFrame", "Angles" | "fromEulerAnglesXYZ") => 2,
         ("CFrame", "fromOrientation" | "fromEulerAnglesYXZ") => 3,
+        ("Color3", "new") => 4,
         _ => 0,
     }
 }
@@ -1524,7 +1525,21 @@ unsafe extern "C-unwind" fn ctor_fn(l: *mut ffi::lua_State) -> c_int {
     unsafe {
         let n = ffi::lua_gettop(l);
         let fast = ffi::lua_tointegerx(l, ffi::lua_upvalueindex(4), std::ptr::null_mut());
-        if fast != 0 {
+        if fast == 4 {
+            // Color3.new(r, g, b), three plain numbers (a vertex painter
+            // makes one per vertex per frame): no call into the Rust
+            // implementation. Anything else takes the path below.
+            if n == 3 {
+                if let (Some(r), Some(g), Some(b)) = (num_at(l, 1), num_at(l, 2), num_at(l, 3)) {
+                    let lua = Lua::get_or_init_from_ptr(l);
+                    if ffi::lua_checkstack(l, 3) != 0
+                        && matches!(lua.push_userdata_unref(l, crate::ltypes::LColor3([r, g, b])), Ok(true))
+                    {
+                        return 1;
+                    }
+                }
+            }
+        } else if fast != 0 {
             if let Some(x) = cf_ctor_fast(l, fast, n) {
                 if push_cframe(l, x) {
                     return 1;

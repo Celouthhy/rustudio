@@ -382,7 +382,19 @@ pub fn new_part(
 }
 
 impl Document {
-    fn from_dom(dom: WeakDom, kind: DocKind, path: Option<PathBuf>, title: String) -> Self {
+    fn from_dom(mut dom: WeakDom, kind: DocKind, path: Option<PathBuf>, title: String) -> Self {
+        // Instances of a class share their common property values from here
+        // on (rbx_dom_weak's PropMap): ~1 GB less on a 180 000 instance place.
+        // RUSTUDIO_NO_SHARE_PROPS=1 leaves every instance with its own
+        // values, to rule the sharing in or out of a property bug.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*OFF.get_or_init(|| std::env::var_os("RUSTUDIO_NO_SHARE_PROPS").is_some()) {
+            // (a place's worth: the full-size maps the file was read into
+            // are free now, and go back to the system)
+            if dom.share_properties() >= 10_000 {
+                crate::heap::trim();
+            }
+        }
         Document {
             dom,
             limbo: limbo_dom(),
@@ -781,9 +793,12 @@ impl Document {
                         key("LightingStyle"),
                         Variant::Enum(rbx_dom_weak::types::Enum::from_u32(u32::from(soft))),
                     );
-                    i.properties
-                        .entry(key("PrioritizeLightingQuality"))
-                        .or_insert(Variant::Bool(mech::TECHNOLOGY_QUALITY.contains(&t)));
+                    if !i.properties.contains_key(&key("PrioritizeLightingQuality")) {
+                        i.properties.insert(
+                            key("PrioritizeLightingQuality"),
+                            Variant::Bool(mech::TECHNOLOGY_QUALITY.contains(&t)),
+                        );
+                    }
                 }
             }
         }

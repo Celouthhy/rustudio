@@ -72,6 +72,14 @@ pub struct Skin {
     /// The mesh vertex each corner came from (corners of one vertex skin
     /// alike, so a deformer works per vertex and copies to corners).
     pub corner_vertex: Vec<u32>,
+    /// Per stored vertex, the file's four envelope slots as stored: bone
+    /// index (subset table applied, 0xFFFF when out of range) and raw u8
+    /// weight, zero-weight slots included. AssetService:CreateEditableMeshAsync
+    /// hands these to the EditableMesh as they are (Studio 0.747: a vertex
+    /// weighted 255 to bone 15 lists bones {15, 15, 15, 15}, weights {1, 0, 0, 0}).
+    /// Empty for skins not read from a file.
+    pub vertex_bones: Vec<[u16; 4]>,
+    pub vertex_weights: Vec<[u8; 4]>,
 }
 
 /// Parses Roblox mesh bytes (versions 1.00, 1.01, 2.00, 3.00, 3.01, 4.00, 4.01,
@@ -465,6 +473,23 @@ fn read_skin(
             0xFFFF
         }
     };
+    let mut vertex_bones = Vec::with_capacity(num_verts);
+    let mut vertex_weights = Vec::with_capacity(num_verts);
+    for v in 0..num_verts {
+        let e = &data[envelopes + v * 8..envelopes + v * 8 + 8];
+        let mut ids = [0xFFFFu16; 4];
+        for k in 0..4 {
+            let id = match table.get(v).copied().flatten() {
+                Some(s) => subset_bone(s, e[k]),
+                None => e[k] as u16,
+            };
+            if (id as usize) < num_bones {
+                ids[k] = id;
+            }
+        }
+        vertex_bones.push(ids);
+        vertex_weights.push([e[4], e[5], e[6], e[7]]);
+    }
     let mut corner_bones = Vec::with_capacity(faces.len() * 3);
     let mut corner_weights = Vec::with_capacity(faces.len() * 3);
     let mut corner_vertex = Vec::with_capacity(faces.len() * 3);
@@ -495,7 +520,7 @@ fn read_skin(
             corner_weights.push(ws);
         }
     }
-    Some(Skin { bones, corner_bones, corner_weights, corner_vertex })
+    Some(Skin { bones, corner_bones, corner_weights, corner_vertex, vertex_bones, vertex_weights })
 }
 
 /// Versions 6.00/7.00: a sequence of chunks, each an 8-byte ASCII type, u32

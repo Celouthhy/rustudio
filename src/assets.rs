@@ -633,8 +633,22 @@ const LOCAL_IN_PLAY: &str = "local files aren't place content while scripts run 
 /// [`content_blocking`] for a running script that gets back what it loads
 /// (EditableImage pixels, EditableMesh vertices, video frames): Roblox content
 /// only. `file://` and plain paths would let a place's scripts read the
-/// person's own files.
+/// person's own files. One exception (rustudio only; Roblox has no local files):
+/// a file inside the folder of an opened place that carries
+/// [`LOCAL_CONTENT_MARKER`], named as its MeshId / TextureId would name it
+/// (a path relative to that folder, or absolute inside it). The same folders
+/// already load as place content in Play; nothing else on disk is reachable
+/// (`..` out of the folder and symlinks pointing out are refused by the
+/// canonical-prefix check in [`opted_in_file`]).
 pub fn script_content_blocking(id: &str) -> Result<Arc<Vec<u8>>, String> {
+    if is_local_path(id) {
+        if let Some(p) = opted_in_file(id) {
+            content_track(id, 1);
+            let r = std::fs::read(&p).map(Arc::new).map_err(|e| format!("{}: {e}", p.display()));
+            content_track(id, if r.is_ok() { 2 } else { 3 });
+            return r;
+        }
+    }
     content_tracked(id, false)
 }
 
@@ -1038,6 +1052,10 @@ pub struct MeshCache {
     roblox_format: HashMap<String, bool>,
     /// Why an entry is None (fetch or parse error).
     reasons: HashMap<String, String>,
+    /// Loaded ids whose mesh carries no UVs (every corner at 0,0): a
+    /// SolidMesh union stores none (its UV array is empty in all 5658 of
+    /// Find the Fennecs' SolidMeshHolders), so there are none to keep.
+    uvless: std::collections::HashSet<String>,
     /// Messages for the Output panel (one per new failure).
     pub messages: Vec<String>,
 }
@@ -1138,6 +1156,9 @@ impl MeshCache {
                     if id.ends_with("#partcolor") {
                         colors.clear();
                     }
+                    if uv.iter().all(|t| *t == Vec2::ZERO) {
+                        self.uvless.insert(id.to_string());
+                    }
                     Some(LoadedMesh {
                         index: upload(&pos, &nrm, &uv, &colors, &planes),
                         extent,
@@ -1174,6 +1195,11 @@ impl MeshCache {
         Some(m)
     }
 
+    /// Whether `id`'s loaded mesh has UVs of its own (not all at 0,0).
+    pub fn authored_uvs(&self, id: &str) -> bool {
+        !self.uvless.contains(id)
+    }
+
     /// Meshes asked for so far (loaded or failed).
     pub fn count(&self) -> usize {
         self.entries.len()
@@ -1187,6 +1213,7 @@ impl MeshCache {
     /// Drops `id` so it loads again.
     pub fn forget(&mut self, id: &str) {
         self.entries.remove(id);
+        self.uvless.remove(id);
     }
 
     /// Forget entries for assets that just finished downloading.
@@ -1238,11 +1265,18 @@ fn sync_decode() -> bool {
 }
 
 /// A texture on the GPU plus its pixels (clothing compositing reads them).
-#[derive(Clone)]
+/// A texture on the GPU. Its pixels are not kept in memory after the upload
+/// (a place's few hundred 1024² images held 4 MB each for good): what needs
+/// them again asks [`TextureCache::pixels`].
+#[derive(Clone, Copy)]
 pub struct LoadedTexture {
     pub index: u32,
-    pub image: Arc<Rgba>,
+    pub width: u32,
+    pub height: u32,
 }
+
+/// Released pixels kept around for the next composite that shares them.
+const LOOSE_PIXELS_BYTES: usize = 64 << 20;
 
 #[derive(Default)]
 pub struct TextureCache {
@@ -1269,6 +1303,13 @@ pub struct TextureCache {
     /// one is uploaded into the same GPU slot.
     editable_gens: HashMap<String, u64>,
     editable_composites: HashMap<String, (String, u32)>,
+    /// Decoded pixels still wanted after their upload: of ids a composite is
+    /// about to be made from (`pinned`), and released ones up to
+    /// LOOSE_PIXELS_BYTES, oldest dropped first (`loose`).
+    pixels: HashMap<String, Arc<Rgba>>,
+    pinned: std::collections::HashSet<String>,
+    loose: std::collections::VecDeque<String>,
+    loose_bytes: usize,
 }
 
 impl TextureCache {
@@ -1294,8 +1335,8 @@ impl TextureCache {
             crate::render::reuse_texture_slot(old.index);
         }
         let index = upload(&img);
-        let t = LoadedTexture { index, image: Arc::new(img) };
-        self.entries.insert(base.to_string(), Some(t.clone()));
+        let t = LoadedTexture { index, width: img.width, height: img.height };
+        self.entries.insert(base.to_string(), Some(t));
         self.editable_gens.insert(base.to_string(), now.max(gen));
         Some(t)
     }
@@ -1314,7 +1355,7 @@ impl TextureCache {
             return None;
         }
         if let Some(e) = self.entries.get(id) {
-            return e.clone();
+            return *e;
         }
         if self.decoding.contains(id) {
             return None;
@@ -1334,7 +1375,7 @@ impl TextureCache {
                 }
                 // Small images decode here; bigger ones on the decode
                 // workers (the part waits and is redone on arrival).
-                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None))),
+                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => Some(texture::decode(&bytes).map(|i| (i, None, None))),
                 Fetch::Ready(bytes) => {
                     let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
                     texture::decode_async(bytes, tx.clone(), id.to_string());
@@ -1357,16 +1398,17 @@ impl TextureCache {
         let loaded = match decoded {
             None => None,
             Some(result) => match result {
-                Ok((img, mips)) => {
+                Ok((img, mips, _waiting)) => {
                     let t0 = std::time::Instant::now();
                     // (the chain holds level 0 too; made in add_texture otherwise)
                     self.upload_bytes += mips.as_ref().map_or(img.pixels.len() * 4 / 3, |m| m.len());
                     let index = crate::render::with_mips(&img.pixels, mips, || upload(&img));
                     self.upload_ms += t0.elapsed().as_secs_f32() * 1000.0;
-                    Some(LoadedTexture {
-                        index,
-                        image: Arc::new(img),
-                    })
+                    let t = LoadedTexture { index, width: img.width, height: img.height };
+                    if self.pinned.contains(id) {
+                        self.pixels.insert(id.to_string(), Arc::new(img));
+                    }
+                    Some(t)
                 }
                 Err(e) => {
                     self.messages.push(format!("Texture {id} not loaded: {e}"));
@@ -1375,8 +1417,61 @@ impl TextureCache {
                 }
             },
         };
-        self.entries.insert(id.to_string(), loaded.clone());
+        self.entries.insert(id.to_string(), loaded);
         loaded
+    }
+
+    /// Keep `id`'s pixels when it is uploaded: a composite will be made from
+    /// them (ask before `image`; `release_pixels` once it is made).
+    pub fn want_pixels(&mut self, id: &str) {
+        if !self.pinned.contains(id) {
+            self.pinned.insert(id.to_string());
+        }
+    }
+
+    /// The composite is made: the pixels wait a while for another one that
+    /// shares them, then go.
+    pub fn release_pixels<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            if self.pinned.remove(id) {
+                if let Some(px) = self.pixels.get(id) {
+                    self.loose_bytes += px.pixels.len();
+                    self.loose.push_back(id.to_string());
+                }
+            }
+        }
+        while self.loose_bytes > LOOSE_PIXELS_BYTES {
+            let Some(id) = self.loose.pop_front() else {
+                self.loose_bytes = 0;
+                break;
+            };
+            let Some(px) = self.pixels.get(&id) else { continue };
+            self.loose_bytes = self.loose_bytes.saturating_sub(px.pixels.len());
+            // (pinned again since, or queued twice: the later entry decides)
+            if !self.pinned.contains(&id) && !self.loose.contains(&id) {
+                self.pixels.remove(&id);
+            }
+        }
+    }
+
+    /// A loaded texture's pixels: the kept ones, else decoded again from its
+    /// file (in this frame: rare, a composite made after its inputs went).
+    pub fn pixels(&mut self, id: &str, doc_dir: Option<&Path>, store: &mut AssetStore) -> Option<Arc<Rgba>> {
+        if id.starts_with("rbxtemp://rustudio/editable/") {
+            return crate::runtime::editable::image_pixels(id).map(|(_, img)| Arc::new(img));
+        }
+        if let Some(px) = self.pixels.get(id) {
+            return Some(px.clone());
+        }
+        let Fetch::Ready(bytes) = store.content(id, doc_dir) else { return None };
+        let px = Arc::new(texture::decode(&bytes).ok()?);
+        self.pixels.insert(id.to_string(), px.clone());
+        if !self.pinned.contains(id) {
+            self.loose_bytes += px.pixels.len();
+            self.loose.push_back(id.to_string());
+            self.release_pixels([]);
+        }
+        Some(px)
     }
 
     /// Collects finished background decodes; true when any arrived (the
@@ -1424,6 +1519,15 @@ impl TextureCache {
             return false;
         }
         !asset_ref(id).is_some_and(|a| store.pending.contains(&a))
+    }
+
+    /// The composite `key`, if it is made already.
+    pub fn composite_index(&self, key: &str) -> Option<u32> {
+        if let Some(i) = self.composites.get(key) {
+            return Some(*i);
+        }
+        let base = crate::runtime::editable::strip_generations(key)?;
+        self.editable_composites.get(&base).filter(|(full, _)| full == key).map(|(_, i)| *i)
     }
 
     /// A cached composite, building it the first time.
@@ -2149,6 +2253,13 @@ mod tests {
         assert!(!place_content_allowed(&format!("file://{}", plain.join("b.obj").display()), true)
             || local_content_opt_in());
         assert!(!place_content_allowed("../plain/b.obj", true) || local_content_opt_in());
+        // Scripts (CreateEditableMeshAsync / ImageAsync) read the marked
+        // folder's files, by relative or absolute path, and nothing else.
+        assert_eq!(script_content_blocking("meshes/marked-a.obj").unwrap().as_slice(), b"v 0 0 0");
+        assert!(script_content_blocking(&abs).is_ok());
+        assert!(script_content_blocking("../plain/b.obj").is_err());
+        assert!(script_content_blocking(&format!("file://{}", plain.join("b.obj").display())).is_err());
+        assert!(script_content_blocking("meshes/../../plain/b.obj").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

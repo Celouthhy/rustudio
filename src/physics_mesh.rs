@@ -449,14 +449,16 @@ pub fn ray(p: &Pieces, xf: &crate::math::Xform, scale: Vec3, o: Vec3, dir: Vec3,
 /// Physics' collider from the pieces registered under `id`, stretched by
 /// `scale` (Size / InitialSize): Studio's own convex pieces (its physics
 /// collides with these, not with a decomposition of the render mesh), as a
-/// compound; flat pieces and the explicit triangles are left out (they hold
-/// no volume). With `touch_only`, one hull around every piece (a moving
-/// CanCollide=false part only reports touches). Cached.
-pub fn collider_shape(id: u32, scale: Vec3, touch_only: bool) -> Option<rapier3d::prelude::SharedShape> {
+/// compound; flat pieces and the explicit triangles are left out of a
+/// moving part (they hold no volume), an anchored one (`fixed`) keeps the
+/// triangles (a union's thin skins are stored that way: FtF's Graveyard
+/// ground has some). With `touch_only`, one hull around every piece (a
+/// moving CanCollide=false part only reports touches). Cached.
+pub fn collider_shape(id: u32, scale: Vec3, touch_only: bool, fixed: bool) -> Option<rapier3d::prelude::SharedShape> {
     use rapier3d::prelude::{Pose, SharedShape, Vector};
-    type Key = (u32, [u32; 3], bool);
+    type Key = (u32, [u32; 3], bool, bool);
     static SHAPES: OnceLock<Mutex<HashMap<Key, Option<SharedShape>>>> = OnceLock::new();
-    let key = (id, scale.to_array().map(f32::to_bits), touch_only);
+    let key = (id, scale.to_array().map(f32::to_bits), touch_only, fixed);
     let cache = SHAPES.get_or_init(Default::default);
     if let Some(s) = cache.lock().ok()?.get(&key) {
         return s.clone();
@@ -473,6 +475,9 @@ pub fn collider_shape(id: u32, scale: Vec3, touch_only: bool) -> Option<rapier3d
             .filter_map(|h| SharedShape::convex_hull(&h.points.iter().map(v).collect::<Vec<_>>()))
             .map(|s| (Pose::IDENTITY, s))
             .collect();
+        if fixed {
+            parts.extend(p.tris.iter().map(|t| (Pose::IDENTITY, SharedShape::triangle(v(&t[0]), v(&t[1]), v(&t[2])))));
+        }
         match parts.len() {
             0 => None,
             1 => parts.pop().map(|(_, s)| s),

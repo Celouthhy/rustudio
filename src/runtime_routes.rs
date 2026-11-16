@@ -740,6 +740,21 @@ unsafe fn fast_namecall(
         let lua = Lua::get_or_init_from_ptr(l);
         // (mlua's current thread: the caller, as in its own callbacks)
         lua.with_current_state(l, || {
+            // EditableMesh:SetColor(id, Color3): thousands a frame from a
+            // vertex painter (Studio: ~0.1 µs each), answered here.
+            static SET_COLOR: LazyLock<i32> = LazyLock::new(|| ATOMS.by_name.get(&b"SetColor"[..]).copied().unwrap_or(-1) as i32);
+            if n == 3
+                && atom == *SET_COLOR
+                && ffi::lua_type(l, 2) == ffi::LUA_TNUMBER
+                && !domains::route_check_on()
+            {
+                if let (Some(r), Some(c)) = (self_ref(l, 4), lua.peek_userdata_copy::<crate::ltypes::LColor3>(l, 3)) {
+                    if editable::set_color_fast(r, ffi::lua_tonumber(l, 2), c.0) {
+                        ffi::lua_pushboolean(l, 1);
+                        return 0;
+                    }
+                }
+            }
             // A native method (`native_call`): plain arguments off the stack.
             if n <= 4 && !domains::route_check_on() {
                 let mut nargs: [NArg; 3] = [NArg::Other, NArg::Other, NArg::Other];

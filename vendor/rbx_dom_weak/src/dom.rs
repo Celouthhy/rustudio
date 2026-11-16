@@ -33,6 +33,29 @@ impl WeakDom {
         dom
     }
 
+    /// Makes instances of one class share the property values most of them
+    /// have in common (see `PropMap`): a real place's instances then hold a
+    /// handful of values each instead of ~45. Nothing a caller reads
+    /// changes. Only instances not sharing yet take part, so calling it
+    /// again (after a load, for a copy made for Play) is cheap. Returns how
+    /// many instances started sharing.
+    pub fn share_properties(&mut self) -> usize {
+        let mut by_class: ustr::UstrMap<Vec<&mut crate::props::PropMap>> = Default::default();
+        for inst in self.instances.values_mut() {
+            if !inst.properties.is_shared() {
+                by_class.entry(inst.class).or_default().push(&mut inst.properties);
+            }
+        }
+        let mut shared = 0;
+        for (_, mut maps) in by_class {
+            if maps.len() >= 8 {
+                crate::props::share(&mut maps);
+                shared += maps.iter().filter(|m| m.is_shared()).count();
+            }
+        }
+        shared
+    }
+
     /// Constructs a new `WeakDom` that contains the provides `instances` with
     /// `root_ref` at the root. The `root_ref` must be included in `instances`.
     ///
@@ -211,7 +234,13 @@ impl WeakDom {
                     parent,
                     name: builder.name,
                     class: builder.class,
-                    properties: builder.properties.into_iter().collect(),
+                    properties: match builder.shared {
+                        None => builder.properties.into_iter().collect(),
+                        Some(mut map) => {
+                            map.extend(builder.properties);
+                            map
+                        }
+                    },
                 },
             );
 
@@ -594,18 +623,24 @@ impl CloneContext {
                 .get_by_ref_mut(*new_ref)
                 .expect("Cannot rewrite refs on an instance that does not exist");
 
-            for prop_value in instance.properties.values_mut() {
+            // (collected, then set one by one: walking the values mutably
+            // would end the map's sharing of its class's common values)
+            let mut changes = Vec::new();
+            for (name, prop_value) in instance.properties.iter() {
                 if let Variant::Ref(original_ref) = prop_value {
                     if let Some(new_ref) = self.ref_rewrites.get(original_ref) {
                         // If the ref points to an instance contained within the
                         // cloned subtree, rewrite it as the corresponding new ref
-                        *prop_value = Variant::Ref(*new_ref);
-                    } else if !existing_dest_refs.contains(original_ref) {
+                        changes.push((*name, *new_ref));
+                    } else if !existing_dest_refs.contains(original_ref) && original_ref.is_some() {
                         // If the ref points to an instance that does not exist
                         // in the destination WeakDom, rewrite it as none
-                        *prop_value = Variant::Ref(Ref::none())
+                        changes.push((*name, Ref::none()));
                     }
                 }
+            }
+            for (name, value) in changes {
+                instance.properties.insert(name, Variant::Ref(value));
             }
         }
     }
@@ -623,7 +658,7 @@ impl CloneContext {
 
         let builder = InstanceBuilder::new(instance.class)
             .with_name(instance.name.to_string())
-            .with_properties(instance.properties.clone());
+            .with_prop_map(instance.properties.clone());
 
         let new_ref = builder.referent;
 

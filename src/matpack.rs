@@ -343,21 +343,108 @@ pub fn parse_pack(xml: &str) -> Result<Pack, String> {
     })
 }
 
-/// A decoded pack: two RGBA8 mip chains and a scalar emission mip chain.
-/// `albedo`: colour RGB and its alpha tint mask (not height). `surface`:
-/// normal X/Y (OpenGL convention), roughness, metalness.
-#[derive(Clone)]
-pub struct Maps {
-    pub pack: u64,
-    pub tiling: f32,
+/// A pack's decoded maps: two RGBA8 mip chains and scalar height and
+/// emission mip chains. `albedo`: colour RGB and its alpha tint mask (not
+/// height). `surface`: normal X/Y (OpenGL convention), roughness, metalness.
+pub struct Pixels {
     pub albedo: Vec<u8>,
     pub surface: Vec<u8>,
     /// Linear height mip chain, independent of the part tint mask.
     pub height: Vec<u8>,
     /// Scalar emissive mask, linear R8 mip chain.
     pub emissive: Vec<u8>,
+    _held: Held,
+}
+
+/// Built maps not released yet, counted: the pack workers pause above
+/// HELD_LIMIT packs (a long first frame otherwise had every pack of the
+/// place built and waiting for its upload, most of a GB).
+static HELD: AtomicU64 = AtomicU64::new(0);
+const HELD_LIMIT: u64 = 8;
+
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::Relaxed);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A built pack. Its maps (14 MB at 1024²) stay in memory only until the
+/// renderer has them in its texture arrays (`release_pixels`); what needs
+/// them again asks `request_pixels` and the pack is built again from the
+/// asset cache. A place with terrain and a few dozen materials held 1 GB of
+/// them for good. The small `preview` and `mean` always stay.
+pub struct Maps {
+    pub pack: u64,
+    pub tiling: f32,
     /// Which maps the pack had: colour, normal, roughness, metalness, height.
     pub found: [bool; 5],
+    /// The colour chain from its PREVIEW_SIZE² level down (`preview_levels`).
+    pub preview: Vec<u8>,
+    /// Mean colour of the top level (gamma 2.2 mean), for `mean_albedo`.
+    pub mean: [f32; 3],
+    color: u32,
+    pixels: Mutex<Option<Arc<Pixels>>>,
+}
+
+/// Side of the largest colour level kept in `Maps::preview`.
+pub const PREVIEW_SIZE: u32 = 256;
+
+/// Byte offset and size of each level in `Maps::preview`.
+pub fn preview_levels() -> Vec<(usize, u32)> {
+    let levels = mip_levels();
+    let first = levels.iter().position(|(_, s)| *s <= PREVIEW_SIZE).unwrap_or(0);
+    levels[first..].iter().map(|(at, s)| (at - levels[first].0, *s)).collect()
+}
+
+impl Maps {
+    fn new(pack: u64, found: [bool; 5], color: u32, pixels: Pixels) -> Maps {
+        let from = mip_levels().into_iter().find(|(_, s)| *s <= PREVIEW_SIZE).map_or(0, |(at, _)| at);
+        Maps {
+            pack,
+            // Texture-pack <tiling> is a 0..2 layout enum, not a UV scale
+            //. In particular legacy Wang packs use 2.
+            // Repeat density comes from uvScale and PartMaterialConsts instead.
+            tiling: 1.0,
+            found,
+            preview: pixels.albedo.get(from..).unwrap_or_default().to_vec(),
+            mean: top_level_mean(&pixels.albedo),
+            color,
+            pixels: Mutex::new(Some(Arc::new(pixels))),
+        }
+    }
+
+    /// The maps, while they are held (see `Maps`).
+    pub fn pixels(&self) -> Option<Arc<Pixels>> {
+        self.pixels.lock().expect("pack pixels").clone()
+    }
+
+    /// The maps are on the GPU: drop them here.
+    pub fn release_pixels(&self) {
+        self.pixels.lock().expect("pack pixels").take();
+    }
+}
+
+/// Builds a released pack's maps again (nothing when they are held or
+/// already on their way); `generation` changes when they are back.
+pub fn request_pixels(maps: &Maps) {
+    if maps.pixels.lock().expect("pack pixels").is_some() {
+        return;
+    }
+    let s = store();
+    if !s.rebuilding.lock().expect("material rebuilds").insert(maps.pack) {
+        return;
+    }
+    s.queue.lock().expect("material queue").push_back((maps.pack, maps.color, true));
+    s.wake.notify_one();
 }
 
 #[derive(Clone)]
@@ -369,7 +456,13 @@ enum State {
 
 struct Store {
     states: Mutex<HashMap<u64, State>>,
-    queue: Mutex<VecDeque<(u64, u32)>>,
+    /// (pack, colour, keep the maps for the renderer)
+    queue: Mutex<VecDeque<(u64, u32, bool)>>,
+    /// Packs first asked for their preview only, then by the renderer
+    /// while still being built.
+    wanted: Mutex<std::collections::HashSet<u64>>,
+    /// Released packs being built again (`request_pixels`).
+    rebuilding: Mutex<std::collections::HashSet<u64>>,
     wake: Condvar,
     /// Bumped whenever a pack finishes (or fails), so draws are rebuilt.
     generation: AtomicU64,
@@ -382,7 +475,7 @@ fn store() -> &'static Store {
             std::thread::Builder::new()
                 .name("material packs".into())
                 .spawn(|| loop {
-                    let (pack, color) = {
+                    let (pack, color, keep) = {
                         let s = store();
                         let mut q = s.queue.lock().expect("material queue");
                         loop {
@@ -392,12 +485,34 @@ fn store() -> &'static Store {
                             q = s.wake.wait(q).expect("material queue");
                         }
                     };
-                    let st = match build(pack, color) {
-                        Ok(m) => State::Ready(Arc::new(m)),
-                        Err(e) => State::Failed(e),
-                    };
+                    // (at most 3 s: maps nothing uploads, as in tests or with
+                    // their parts gone, must not hold up the rest)
+                    let t0 = std::time::Instant::now();
+                    while !cfg!(test) && HELD.load(Ordering::Relaxed) >= HELD_LIMIT && t0.elapsed().as_secs() < 3 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    let built = build(pack, color);
                     let s = store();
-                    s.states.lock().expect("material states").insert(pack, st);
+                    let keep = s.wanted.lock().expect("material wants").remove(&pack) | keep;
+                    let again = s.rebuilding.lock().expect("material rebuilds").remove(&pack);
+                    let mut states = s.states.lock().expect("material states");
+                    match (built, states.get(&pack)) {
+                        // Built again for the renderer: the same Maps gets its pixels back.
+                        (Ok(m), Some(State::Ready(old))) if again => {
+                            *old.pixels.lock().expect("pack pixels") = m.pixels();
+                        }
+                        (Err(_), Some(State::Ready(_))) if again => {}
+                        (Ok(m), _) => {
+                            if !keep {
+                                m.release_pixels();
+                            }
+                            states.insert(pack, State::Ready(Arc::new(m)));
+                        }
+                        (Err(e), _) => {
+                            states.insert(pack, State::Failed(e));
+                        }
+                    }
+                    drop(states);
                     s.generation.fetch_add(1, Ordering::Relaxed);
                 })
                 .ok();
@@ -405,6 +520,8 @@ fn store() -> &'static Store {
         Store {
             states: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
+            wanted: Mutex::new(Default::default()),
+            rebuilding: Mutex::new(Default::default()),
             wake: Condvar::new(),
             generation: AtomicU64::new(0),
         }
@@ -426,6 +543,16 @@ pub fn maps(e: &Entry) -> Lookup {
 /// A pack's maps by id (terrain packs, round 21): as `maps`; `color` stands
 /// in for a pack without a colour map.
 pub fn pack_maps(pack: u64, color: u32) -> Lookup {
+    lookup(pack, color, true)
+}
+
+/// As `pack_maps` for what only reads `Maps::preview` / `mean` (thumbnails):
+/// the full maps are not kept for it.
+pub fn pack_preview(pack: u64, color: u32) -> Lookup {
+    lookup(pack, color, false)
+}
+
+fn lookup(pack: u64, color: u32, keep: bool) -> Lookup {
     if PACKS_OFF.load(Ordering::Relaxed) {
         return Lookup::Unavailable("material packs are switched off".into());
     }
@@ -437,7 +564,12 @@ pub fn pack_maps(pack: u64, color: u32) -> Lookup {
     let mut states = s.states.lock().expect("material states");
     match states.get(&e.pack) {
         Some(State::Ready(m)) => Lookup::Ready(m.clone()),
-        Some(State::Pending) => Lookup::Pending,
+        Some(State::Pending) => {
+            if keep {
+                s.wanted.lock().expect("material wants").insert(e.pack);
+            }
+            Lookup::Pending
+        }
         Some(State::Failed(why)) => Lookup::Unavailable(why.clone()),
         None => {
             states.insert(e.pack, State::Pending);
@@ -445,7 +577,7 @@ pub fn pack_maps(pack: u64, color: u32) -> Lookup {
             s.queue
                 .lock()
                 .expect("material queue")
-                .push_back((e.pack, e.color));
+                .push_back((e.pack, e.color, keep));
             s.wake.notify_one();
             Lookup::Pending
         }
@@ -521,12 +653,32 @@ fn resized(img: crate::texture::Rgba, size: u32) -> crate::texture::Rgba {
 }
 
 fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
+    let (found, pixels) = build_pixels(pack_id, color)?;
+    Ok(Maps::new(pack_id, found, color, pixels))
+}
+
+/// Key bit: the terrain view of a pack (`terrain_pack_maps`).
+const TERRAIN_BIT: u64 = 1 << 63;
+
+fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String> {
+    if pack_id & TERRAIN_BIT != 0 {
+        let (found, mut terrain) = build_pixels(pack_id & !TERRAIN_BIT, color)?;
+        // The tint mask (colour alpha) moves to the surface map's alpha
+        // (metalness, unused by terrain) for CB4's tint form.
+        for (s, a) in terrain.surface.chunks_exact_mut(4).zip(terrain.albedo.chunks_exact(4)) {
+            s[3] = a[3];
+        }
+        for (pixel, height) in terrain.albedo.chunks_exact_mut(4).zip(&terrain.height) {
+            pixel[3] = *height;
+        }
+        return Ok((found, terrain));
+    }
     if pack_id & ACR_BIT != 0 {
         // Studio's own terrain textures, else the pack's maps.
         let base = pack_id & !ACR_BIT;
         return build_acr(base).or_else(|why| {
             eprintln!("terrain pack {base}: {why}; using its maps");
-            build(base, color).map(|m| Maps { pack: pack_id, ..m })
+            build_pixels(base, color)
         });
     }
     let registered = variant_packs().lock().expect("variant packs").get(&pack_id).cloned();
@@ -569,18 +721,13 @@ fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
         surface[i * 4 + 2] = px(&rough, 0, 255);
         surface[i * 4 + 3] = px(&metal, 0, 0);
     }
-    Ok(Maps {
-        pack: pack_id,
-        // Texture-pack <tiling> is a 0..2 layout enum, not a UV scale
-        // (as Studio reads it). In particular legacy Wang packs use 2.
-        // Repeat density comes from uvScale and PartMaterialConsts instead.
-        tiling: 1.0,
+    Ok((found, Pixels {
         albedo: mip_chain(&albedo, true),
         surface: mip_chain(&surface, false),
         height: height_chain(height.as_ref()),
         emissive: mip_chain(&emissive, false).into_iter().step_by(4).collect(),
-        found,
-    })
+        _held: Held::new(),
+    }))
 }
 
 /// Keep height linear through every mip; colour alpha remains a part tint mask.
@@ -598,32 +745,21 @@ fn height_chain(image: Option<&crate::texture::Rgba>) -> Vec<u8> {
 /// Terrain uses height in albedo alpha, while parts use the original tint mask.
 /// Give this view a separate atlas cache key so sharing a pack cannot change parts.
 pub fn terrain_pack_maps(pack: u64, color: u32) -> Lookup {
+    pack_maps(terrain_key(pack), color)
+}
+
+/// `terrain_pack_maps` for a thumbnail (`pack_preview`).
+pub fn terrain_pack_preview(pack: u64, color: u32) -> Lookup {
+    pack_preview(terrain_key(pack), color)
+}
+
+fn terrain_key(pack: u64) -> u64 {
     // Table packs come as Studio's KTX2 textures; MaterialVariant packs
-    // (registered, bit 62) only have their maps.
+    // (registered, bit 62) only have their maps. The terrain view is built
+    // on the pack workers (it was a second copy of every pack's maps made
+    // and kept on the main thread).
     let pack = if acr_enabled() && pack & (1u64 << 62) == 0 { pack | ACR_BIT } else { pack };
-    match pack_maps(pack, color) {
-        Lookup::Ready(maps) => {
-            static TERRAIN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, Arc<Maps>>>> = std::sync::OnceLock::new();
-            let mut cache = TERRAIN.get_or_init(Default::default).lock().expect("terrain maps");
-            if let Some(terrain) = cache.get(&pack) {
-                return Lookup::Ready(terrain.clone());
-            }
-            let mut terrain = (*maps).clone();
-            terrain.pack |= 1u64 << 63;
-            // The tint mask (colour alpha) moves to the surface map's alpha
-            // (metalness, unused by terrain) for CB4's tint form.
-            for (s, a) in terrain.surface.chunks_exact_mut(4).zip(terrain.albedo.chunks_exact(4)) {
-                s[3] = a[3];
-            }
-            for (pixel, height) in terrain.albedo.chunks_exact_mut(4).zip(&terrain.height) {
-                pixel[3] = *height;
-            }
-            let terrain = Arc::new(terrain);
-            cache.insert(pack, terrain.clone());
-            Lookup::Ready(terrain)
-        }
-        other => other,
-    }
+    pack | TERRAIN_BIT
 }
 
 /// LAYER_SIZE² RGBA8 plus its mips down to 1×1. `squared`: RGB averaged as
@@ -833,22 +969,21 @@ pub fn register_terrain_variant(pack: Pack) -> u64 {
 /// (194, 196, 188) (checks/grass-parity/findings.txt). A MaterialVariant on
 /// Grass has no table entry, so its own ColorMap's mean is the base.
 pub fn mean_albedo(maps: &Maps) -> [f32; 3] {
-    static MEANS: OnceLock<Mutex<HashMap<u64, [f32; 3]>>> = OnceLock::new();
-    if let Some(m) = MEANS.get_or_init(Default::default).lock().expect("albedo means").get(&maps.pack) {
-        return *m;
-    }
+    maps.mean
+}
+
+fn top_level_mean(albedo: &[u8]) -> [f32; 3] {
     let n = (LAYER_SIZE * LAYER_SIZE) as usize;
-    let lut: Vec<f64> = (0..256).map(|v| (v as f64 / 255.0).powf(2.2)).collect();
+    static LUT: OnceLock<Vec<f64>> = OnceLock::new();
+    let lut = LUT.get_or_init(|| (0..256).map(|v| (v as f64 / 255.0).powf(2.2)).collect());
     let mut sum = [0f64; 3];
-    for px in maps.albedo[..(n * 4).min(maps.albedo.len())].chunks_exact(4) {
+    for px in albedo[..(n * 4).min(albedo.len())].chunks_exact(4) {
         for c in 0..3 {
             sum[c] += lut[px[c] as usize];
         }
     }
-    let count = (maps.albedo.len() / 4).min(n).max(1) as f64;
-    let mean = sum.map(|s| (s / count).powf(1.0 / 2.2) as f32);
-    MEANS.get_or_init(Default::default).lock().expect("albedo means").insert(maps.pack, mean);
-    mean
+    let count = (albedo.len() / 4).min(n).max(1) as f64;
+    sum.map(|s| (s / count).powf(1.0 / 2.2) as f32)
 }
 
 // ------------------------------------------------- terrain packs as Studio has them
@@ -1080,7 +1215,7 @@ fn acr_level(levels: &[(u32, Vec<u8>)], size: u32) -> Vec<u8> {
 /// A terrain pack's maps from its KTX2 representations, laid out like
 /// `build`'s (albedo sRGB RGB, surface normal X / Y / roughness / 0, linear
 /// height and emissive), one mip chain level per KTX2 level.
-fn build_acr(pack: u64) -> Result<Maps, String> {
+fn build_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
     let reps = (0..3).map(|i| acr_bytes(pack, i).and_then(|b| ktx2_levels(&b)))
         .collect::<Result<Vec<_>, _>>()?;
     let (mut albedo, mut surface, mut height, mut emissive) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1101,7 +1236,7 @@ fn build_acr(pack: u64) -> Result<Maps, String> {
             emissive.push(s[2]);
         }
     }
-    Ok(Maps { pack: pack | ACR_BIT, tiling: 1.0, albedo, surface, height, emissive, found: [true, true, true, false, true] })
+    Ok(([true, true, true, false, true], Pixels { albedo, surface, height, emissive, _held: Held::new() }))
 }
 
 #[cfg(test)]

@@ -517,7 +517,14 @@ pub fn globals(
                 Some("sky-raw") => 11.0,
                 _ => 0.0,
             },
-            0.0,
+            // w: 1 = the drawn sky takes Studio's time-of-day sky levels
+            // (shader.wgsl sky_level): a custom Sky's faces dim and redden
+            // at dusk and go dark at night as in Studio (they were drawn at
+            // full day brightness at any ClockTime, so Find the Fennecs'
+            // graveyard night, ClockTime 2.8, kept the afternoon sky). 0 =
+            // Studio's default sky, dimmed by sky_tint (rustudio's stand-in
+            // for its night faces) instead.
+            if default_sky { 0.0 } else { 1.0 },
         ],
         // AmbientCube[0..5] + [6..11] as Studio builds them:
         // the sky's irradiance per axis × EnvironmentDiffuseScale × the sky
@@ -544,8 +551,8 @@ pub fn globals(
             [0.5 * f / aspect, 0.5 * f, mech::NEAR, if cam.ortho.is_some() { 0.0 } else { 1.0 }]
         },
         // w: 1 dims the drawn skybox by the tint (Studio's default sky, whose
-        // night faces rustudio stands in for); a custom Sky's faces are drawn
-        // as they are at any time of day (Place D's night skybox, round 27).
+        // night faces rustudio stands in for); a custom Sky's faces take
+        // Studio's time-of-day levels in the shader instead (sky_rot.w).
         sky_tint: sky_tint(sun.y).extend(if default_sky { 1.0 } else { 0.0 }).to_array(),
         lightgrid: [0.0; 4],
         // w 1 = an Atmosphere: rgb its haze toward the horizon (world GUI fog).

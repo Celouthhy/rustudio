@@ -943,7 +943,8 @@ impl MaterialArrays {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                // (COPY_SRC: growing the arrays copies the layers across)
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             })
         };
@@ -977,7 +978,28 @@ impl MaterialArrays {
         }
     }
 
-    fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Maps) {
+    /// Copies `from`'s first `layers` layers (every mip) into these arrays.
+    fn copy_layers(&self, device: &wgpu::Device, queue: &wgpu::Queue, from: &MaterialArrays, layers: u32) {
+        if layers == 0 || from.size != self.size {
+            return;
+        }
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("material arrays grow") });
+        for (src, dst) in [(&from.albedo, &self.albedo), (&from.surface, &self.surface), (&from.emission, &self.emission)] {
+            for mip in 0..mip_levels(self.size, self.size) {
+                let side = (self.size >> mip).max(1);
+                let at = |texture| wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                };
+                enc.copy_texture_to_texture(at(src), at(dst), wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers });
+            }
+        }
+        queue.submit(Some(enc.finish()));
+    }
+
+    fn upload(&self, queue: &wgpu::Queue, layer: u32, maps: &crate::matpack::Pixels) {
         for (tex, data, channels) in [(&self.albedo, &maps.albedo, 4), (&self.surface, &maps.surface, 4), (&self.emission, &maps.emissive, 1)] {
             for (mip, (at, size)) in crate::matpack::mip_levels().into_iter().enumerate() {
                 let at = at / (4 / channels) as usize;
@@ -3113,7 +3135,9 @@ impl Renderer {
     }
 
     /// The texture array layer of a material pack, uploading it (and
-    /// growing the arrays) the first time.
+    /// growing the arrays) the first time. -1 while its maps are not in
+    /// memory (released after another renderer's upload): they are asked
+    /// for, and `matpack::generation` changes when they are back.
     pub fn material_layer(
         &mut self,
         device: &wgpu::Device,
@@ -3123,6 +3147,10 @@ impl Renderer {
         if let Some(l) = self.materials.layers.get(&maps.pack) {
             return *l as i32;
         }
+        let Some(pixels) = maps.pixels() else {
+            crate::matpack::request_pixels(maps);
+            return -1;
+        };
         let layer = self.materials.cpu.len() as u32;
         self.materials.cpu.push(maps.clone());
         self.materials.layers.insert(maps.pack, layer);
@@ -3132,14 +3160,15 @@ impl Renderer {
             let mut grown = MaterialArrays::with_params(device, crate::matpack::LAYER_SIZE, cap, params);
             grown.layers = std::mem::take(&mut self.materials.layers);
             grown.cpu = std::mem::take(&mut self.materials.cpu);
-            for (i, m) in grown.cpu.iter().enumerate() {
-                grown.upload(queue, i as u32, m);
-            }
+            // The layers already there are copied on the GPU (their maps
+            // are no longer in memory).
+            grown.copy_layers(device, queue, &self.materials, layer);
             self.materials = grown;
             self.rebind_globals(device);
-        } else {
-            self.materials.upload(queue, layer, maps);
         }
+        self.materials.upload(queue, layer, &pixels);
+        // On the GPU now: the 14 MB of maps go (see matpack::Maps).
+        maps.release_pixels();
         layer as i32
     }
 
@@ -4857,6 +4886,40 @@ impl Renderer {
         true
     }
 
+    /// Rewrites loaded mesh `index` whole from these arrays (the same
+    /// layout `add_mesh_projected` builds), in place. A skinning slot gets
+    /// its rest pose here and is queued for the compute pass again with the
+    /// palette it already holds. False when the sizes differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rewrite_mesh(
+        &mut self, queue: &wgpu::Queue, index: u32, positions: &[Vec3], normals: &[Vec3],
+        uvs: &[glam::Vec2], colors: &[glam::Vec4], projection: [f32; 4],
+    ) -> bool {
+        let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
+        if m.count as usize != positions.len() || normals.len() != positions.len() {
+            return false;
+        }
+        let projection = if m.storage { [0.0; 4] } else { projection };
+        let verts: Vec<Vertex> = positions
+            .iter()
+            .zip(normals)
+            .enumerate()
+            .map(|(i, (p, n))| Vertex {
+                pos: p.to_array(),
+                normal: n.to_array(),
+                projection,
+                uv: uvs.get(i).map(|u| u.to_array()).unwrap_or([0.0, 0.0]),
+                color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
+            })
+            .collect();
+        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+        crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+        if m.storage {
+            self.skin.again(index);
+        }
+        true
+    }
+
     /// A skinned part's mesh slot deformed on the GPU (skin_gpu.rs): the
     /// slot `index` when it is one made for skinning with the same corner
     /// count, else a new one holding the mesh at rest (uvs, colours); then
@@ -5567,7 +5630,16 @@ fn mip_chain(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     static TH: OnceLock<[f32; 255]> = OnceLock::new();
     let th = TH.get_or_init(|| std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2)));
     let to_srgb = |v: f32| th.partition_point(|&t| t <= v) as u8;
-    let mut out = rgba.to_vec();
+    // (exactly the chain's size: growing a Vec of level 0 by doubling held
+    // half as much again as the chain needs)
+    let mut total = rgba.len();
+    let (mut cw, mut ch) = (w, h);
+    while cw > 1 || ch > 1 {
+        (cw, ch) = ((cw / 2).max(1), (ch / 2).max(1));
+        total += (cw * ch * 4) as usize;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(rgba);
     let (mut cw, mut ch) = (w, h);
     let mut prev = rgba.to_vec();
     while cw > 1 || ch > 1 {

@@ -185,8 +185,21 @@ fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
         )
     } else if doc::is_a(class.as_str(), "PartOperation") {
         let mesh = crate::scene::union_mesh(doc, r).map(|m| std::sync::Arc::from(m.id));
-        let fid = enum_u32(doc.prop(r, "CollisionFidelity"))
-            .unwrap_or(crate::collision::FIDELITY_DEFAULT);
+        // A union collides with the convex pieces Studio stored in its
+        // PhysicalConfigData, at the fidelity they were made for (the file
+        // has no CollisionFidelity for unions either), anchored or not. Its
+        // own decomposition of the render mesh at Default turned FtF's
+        // Graveyard ground (stored: PreciseConvexDecomposition, 22 pieces)
+        // into one convex blob 63 studs across, on which its loose stones
+        // never came to rest.
+        let fid = crate::physics_mesh::fidelity(doc, r).unwrap_or(crate::collision::FIDELITY_DEFAULT);
+        if let Some((crate::physics_mesh::Geometry::Pieces(p), pid)) = crate::physics_mesh::of_part_id(doc, r) {
+            if p.fidelity == fid && pid != 0 {
+                pieces = pid;
+                let initial = vec3_of(doc.prop(r, "InitialSize")).unwrap_or(size);
+                piece_scale = crate::physics_mesh::scale(initial, size);
+            }
+        }
         (mesh, fid)
     } else {
         (None, crate::collision::FIDELITY_BOX)
@@ -303,7 +316,7 @@ fn collider(sig: &Sig) -> (rp::ColliderBuilder, rp::Pose, bool) {
     // that way, 0.6 ms as hulls.
     // (A Box fidelity, or a mesh the caller dropped, keeps the box.)
     let stored = (sig.pieces != 0 && sig.mesh.is_some() && sig.fidelity != crate::collision::FIDELITY_BOX)
-        .then(|| crate::physics_mesh::collider_shape(sig.pieces, sig.piece_scale, !sig.collide))
+        .then(|| crate::physics_mesh::collider_shape(sig.pieces, sig.piece_scale, !sig.collide, sig.anchored))
         .flatten();
     let mesh = if let Some(s) = stored {
         Some((if sig.collide { s } else { crate::collision::touch_hull(&s) }, false))
@@ -3102,6 +3115,9 @@ impl Physics {
             if let Some(b) = self.world.bodies.get_mut(body) {
                 b.wake_up(true);
             }
+            if let Some(sv) = self.studio.as_mut() {
+                sv.property_wake(body);
+            }
         }
     }
 
@@ -3305,7 +3321,7 @@ impl Physics {
         let lo = Vec3::new(centre.x - r, root.y - max_drop, centre.z - r);
         let hi = Vec3::new(centre.x + r, root.y + mech::CLIMB_QUERY_TOP, centre.z + r);
         let candidates: HashSet<rp::ColliderHandle> = {
-            let not_own = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !self.link.hides(h, by_collider);
+            let not_own = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !self.link.hides_from(h, by_collider, own);
             let qp = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors().predicate(&not_own));
             qp.intersect_aabb_conservative(rp::Aabb::new(rv(lo), rv(hi)))
                 .filter(|(_, co)| {
@@ -3761,7 +3777,7 @@ impl Physics {
         let groups = self.interaction(&self.char_group);
         let by_collider = &self.by_collider;
         let link = &self.link;
-        let keep = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !link.hides(h, by_collider);
+        let keep = |h: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !link.hides_from(h, by_collider, own);
         let qp = self.world.query_pipeline_with_filter(rp::QueryFilter::default().exclude_sensors().groups(groups).predicate(&keep));
         let hit = |local: Vec3| {
             let ray = rp::Ray::new(rv(root + rot * local), rp::Vector::new(0.0, 1.0, 0.0));
@@ -3783,7 +3799,7 @@ impl Physics {
             let mut inside: Vec<rp::ColliderHandle> = Vec::new();
             for _ in 0..4 {
                 let keep = |h: rp::ColliderHandle, _: &rp::Collider| {
-                    by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !inside.contains(&h) && !self.link.hides(h, by_collider)
+                    by_collider.get(&h).is_none_or(|r| !own.contains(r)) && !inside.contains(&h) && !self.link.hides_from(h, by_collider, own)
                 };
                 let qp = self.world.query_pipeline_with_filter(
                     rp::QueryFilter::default().exclude_sensors().groups(groups).predicate(&keep),
@@ -4105,7 +4121,7 @@ impl Physics {
             let center = root + rot * mid;
             let at = rp::Pose::from_parts(rv(center), yaw_rot(*yaw));
             let by_collider = &self.by_collider;
-            let not_own = |hd: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&hd).is_none_or(|r| !own.contains(r)) && !self.link.hides(hd, by_collider);
+            let not_own = |hd: rp::ColliderHandle, _: &rp::Collider| by_collider.get(&hd).is_none_or(|r| !own.contains(r)) && !self.link.hides_from(hd, by_collider, own);
             let qp = self.world.query_pipeline_with_filter(
                 rp::QueryFilter::default().exclude_sensors().groups(groups).predicate(&not_own),
             );

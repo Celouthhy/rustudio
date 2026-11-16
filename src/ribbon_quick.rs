@@ -35,14 +35,15 @@ fn thumb(ctx: &egui::Context, material: u32, use2022: bool) -> Option<egui::Text
         return Some(t);
     }
     let e = crate::matpack::entry(material, use2022)?;
-    let crate::matpack::Lookup::Ready(m) = crate::matpack::maps(e) else {
+    // (the preview only: the full maps are not kept for a tile image)
+    let crate::matpack::Lookup::Ready(m) = crate::matpack::pack_preview(e.pack, e.color) else {
         return None;
     };
-    let src = crate::matpack::LAYER_SIZE as usize;
-    if m.albedo.len() < src * src * 4 {
+    let src = crate::matpack::PREVIEW_SIZE as usize;
+    if m.preview.len() < src * src * 4 {
         return None;
     }
-    // Box-filter the first mip level down to 64×64, tinted by nothing (the
+    // Box-filter the preview level down to 64×64, tinted by nothing (the
     // map's own colours, as Studio's tiles show them).
     const N: usize = 64;
     let step = src / N;
@@ -51,12 +52,12 @@ fn thumb(ctx: &egui::Context, material: u32, use2022: bool) -> Option<egui::Text
         for x in 0..N {
             let mut acc = [0u32; 3];
             let mut cnt = 0u32;
-            for sy in (0..step).step_by(4) {
-                for sx in (0..step).step_by(4) {
+            for sy in 0..step {
+                for sx in 0..step {
                     let i = ((y * step + sy) * src + x * step + sx) * 4;
-                    acc[0] += m.albedo[i] as u32;
-                    acc[1] += m.albedo[i + 1] as u32;
-                    acc[2] += m.albedo[i + 2] as u32;
+                    acc[0] += m.preview[i] as u32;
+                    acc[1] += m.preview[i + 1] as u32;
+                    acc[2] += m.preview[i + 2] as u32;
                     cnt += 1;
                 }
             }

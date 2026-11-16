@@ -1,5 +1,7 @@
 use rbx_types::{Ref, Variant};
-use ustr::{Ustr, UstrMap};
+use ustr::Ustr;
+
+use crate::props::PropMap;
 
 /**
 Represents an instance that can be turned into a new
@@ -36,6 +38,9 @@ pub struct InstanceBuilder {
     pub(crate) name: String,
     pub(crate) class: Ustr,
     pub(crate) properties: Vec<(Ustr, Variant)>,
+    /// A whole property map to start from (`with_prop_map`); `properties`
+    /// are set over it.
+    pub(crate) shared: Option<PropMap>,
     pub(crate) children: Vec<InstanceBuilder>,
 }
 
@@ -51,6 +56,7 @@ impl InstanceBuilder {
             name,
             class,
             properties: Vec::new(),
+            shared: None,
             children: Vec::new(),
         }
     }
@@ -66,6 +72,7 @@ impl InstanceBuilder {
             name,
             class,
             properties: Vec::with_capacity(capacity),
+            shared: None,
             children: Vec::new(),
         }
     }
@@ -77,6 +84,7 @@ impl InstanceBuilder {
             name: String::new(),
             class: Ustr::default(),
             properties: Vec::new(),
+            shared: None,
             children: Vec::new(),
         }
     }
@@ -135,6 +143,15 @@ impl InstanceBuilder {
     pub fn has_property<K: Into<Ustr>>(&self, key: K) -> bool {
         let key = key.into();
         self.properties.iter().any(|(k, _)| *k == key)
+            || self.shared.as_ref().is_some_and(|m| m.contains_key(&key))
+    }
+
+    /// Start from a copy of another instance's property map: it keeps
+    /// sharing its class's common values (`WeakDom::share_properties`),
+    /// where `with_properties` would copy every value.
+    pub fn with_prop_map(mut self, map: PropMap) -> Self {
+        self.shared = Some(map);
+        self
     }
 
     /// Add multiple properties to the `InstanceBuilder` at once.
@@ -211,7 +228,7 @@ pub struct Instance {
     pub class: Ustr,
 
     /// Any properties stored on the object that are not `Name` or `ClassName`.
-    pub properties: UstrMap<Variant>,
+    pub properties: PropMap,
 }
 
 impl Instance {

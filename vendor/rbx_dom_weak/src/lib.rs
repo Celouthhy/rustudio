@@ -43,6 +43,7 @@
 
 mod dom;
 mod instance;
+mod props;
 mod viewer;
 
 pub use rbx_types as types;
@@ -99,6 +100,7 @@ pub use ustr::{ustr, Ustr, UstrMap, UstrSet};
 pub use crate::{
     dom::WeakDom,
     instance::{Instance, InstanceBuilder},
+    props::PropMap,
     viewer::{DomViewer, ViewedInstance},
 };
 

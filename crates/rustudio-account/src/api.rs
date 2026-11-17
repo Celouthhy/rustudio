@@ -16,15 +16,77 @@ pub const DEVELOP_URL: &str = "https://develop.roblox.com/v1/universes";
 /// with JSON `locations`, each a CDN URL whose body is often gzip.
 pub const PUBLIC_ASSET_DELIVERY_URL: &str = "https://assetdelivery.roblox.com/v2/assetId";
 
+/// An asset delivery failure with retry information from the HTTP response.
+#[derive(Debug)]
+pub enum AssetDownloadError {
+    Transient {
+        status: u16,
+        retry_after: Option<ureq::http::HeaderValue>,
+        error: Error,
+    },
+    Other(Error),
+}
+
+impl AssetDownloadError {
+    pub(crate) fn transient_response(
+        asset_id: u64,
+        stage: &str,
+        response: &ureq::http::Response<ureq::Body>,
+    ) -> Option<Self> {
+        let status = response.status().as_u16();
+        if !matches!(status, 429 | 502 | 503) {
+            return None;
+        }
+        let retry_after = response.headers().get("retry-after").cloned();
+        Some(Self::Transient {
+            status,
+            retry_after,
+            error: Error(format!("asset {asset_id}: {stage} returned HTTP {status}")),
+        })
+    }
+}
+
+impl std::fmt::Display for AssetDownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient { error, .. } | Self::Other(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AssetDownloadError {}
+
+impl From<Error> for AssetDownloadError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<AssetDownloadError> for Error {
+    fn from(error: AssetDownloadError) -> Self {
+        match error {
+            AssetDownloadError::Transient { error, .. } | AssetDownloadError::Other(error) => error,
+        }
+    }
+}
+
 /// Downloads a public asset anonymously: GET the v2 descriptor, then its
 /// first location; gzip bodies are inflated. No cookie, key or token is
 /// sent, so only assets Roblox serves to anyone come back.
 pub fn public_asset(asset_id: u64) -> Result<Vec<u8>> {
+    public_asset_typed(asset_id).map_err(Error::from)
+}
+
+/// Like [`public_asset`], with HTTP retry information for download scheduling.
+pub fn public_asset_typed(asset_id: u64) -> std::result::Result<Vec<u8>, AssetDownloadError> {
     let a = agent();
     let url = format!("{PUBLIC_ASSET_DELIVERY_URL}/{asset_id}");
-    let mut r = a.get(&url).call()?;
+    let mut r = a.get(&url).call().map_err(Error::from)?;
+    if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
+        return Err(error);
+    }
     let status = r.status().as_u16();
-    let text = r.body_mut().read_to_string()?;
+    let text = r.body_mut().read_to_string().map_err(Error::from)?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
         Error(format!(
             "asset {asset_id}: public asset delivery returned HTTP {status}"
@@ -40,29 +102,70 @@ pub fn public_asset(asset_id: u64) -> Result<Vec<u8>> {
             .pointer("/errors/0/message")
             .and_then(|m| m.as_str())
             .unwrap_or("no download location");
+        // v2 answers 200 with the refusal in the body: naming that status
+        // only reads as a contradiction.
+        let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
         return Err(Error(format!(
-            "asset {asset_id}: public asset delivery: {why} (HTTP {status})"
-        )));
+            "asset {asset_id}: public asset delivery: {why}{http}"
+        )).into());
     };
-    let mut r = a.get(location).header("Accept-Encoding", "gzip").call()?;
+    let mut r = a.get(location)
+        .header("Accept-Encoding", "gzip")
+        .call()
+        .map_err(Error::from)?;
+    if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &r) {
+        return Err(error);
+    }
     if !r.status().is_success() {
         return Err(Error(format!(
             "asset {asset_id}: download returned HTTP {}",
             r.status().as_u16()
-        )));
+        )).into());
     }
     let mut bytes = Vec::new();
     r.body_mut()
         .with_config()
         .limit(256 << 20)
         .reader()
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(Error::from)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out)?;
+        flate2::read::GzDecoder::new(&bytes[..])
+            .read_to_end(&mut out)
+            .map_err(Error::from)?;
         bytes = out;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    #[test]
+    fn asset_delivery_classifies_transient_http_responses() {
+        for status in [401, 404, 429, 502, 503] {
+            let response = ureq::http::Response::builder()
+                .status(status)
+                .header("retry-after", "9")
+                .body(ureq::Body::builder().data(Vec::new()))
+                .unwrap();
+            let error = AssetDownloadError::transient_response(42, "asset delivery", &response);
+            if matches!(status, 429 | 502 | 503) {
+                assert!(matches!(
+                    error,
+                    Some(AssetDownloadError::Transient {
+                        status: code,
+                        retry_after: Some(header),
+                        ..
+                    }) if code == status && header == "9"
+                ));
+            } else {
+                assert!(error.is_none());
+            }
+        }
+    }
 }
 
 pub fn agent() -> ureq::Agent {

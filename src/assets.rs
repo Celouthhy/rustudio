@@ -13,7 +13,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use rustudio_account::api::{public_asset_typed, AssetDownloadError};
 
 use glam::{Vec2, Vec3};
 
@@ -499,36 +502,200 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     Ok(Arc::new(b))
 }
 
+const MAX_ASSET_DOWNLOADS: usize = 12;
+const ASSET_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    let delay = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        // Retry-After can also be an HTTP date.
+        let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        SystemTime::from(date)
+            .duration_since(now)
+            .unwrap_or_default()
+    };
+    Some(delay.min(MAX_RETRY_AFTER))
+}
+
+type DownloadResult = Result<Vec<u8>, AssetDownloadError>;
+type DownloadJob = Box<dyn FnOnce() + Send>;
+
+// Only queued jobs use these workers. Blocking callers use the same
+// download permits directly, including when waiting out a shared pause.
+static ASSET_WORKERS: LazyLock<Sender<DownloadJob>> = LazyLock::new(|| {
+    let (send, receive) = channel::<DownloadJob>();
+    let receive = Arc::new(Mutex::new(receive));
+    for _ in 0..MAX_ASSET_DOWNLOADS {
+        let receive = receive.clone();
+        std::thread::spawn(move || loop {
+            let job = receive.lock().unwrap().recv();
+            match job {
+                Ok(job) => job(),
+                Err(_) => break,
+            }
+        });
+    }
+    send
+});
+
+static ASSET_DOWNLOADS: LazyLock<AssetDownloads> =
+    LazyLock::new(|| AssetDownloads::new(ASSET_BACKOFF));
+
+struct AssetDownloads {
+    state: Mutex<DownloadState>,
+    changed: Condvar,
+    backoff: [Duration; ASSET_BACKOFF.len()],
+}
+
+struct DownloadState {
+    active: usize,
+    not_before: Instant,
+}
+
+struct DownloadPermit<'a> {
+    downloads: &'a AssetDownloads,
+    pause_until: Option<Instant>,
+}
+
+impl Drop for DownloadPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.downloads.state.lock().unwrap();
+        if let Some(until) = self.pause_until {
+            state.not_before = state.not_before.max(until);
+        }
+        state.active -= 1;
+        self.downloads.changed.notify_all();
+    }
+}
+
+impl AssetDownloads {
+    fn new(backoff: [Duration; ASSET_BACKOFF.len()]) -> Self {
+        Self {
+            state: Mutex::new(DownloadState {
+                active: 0,
+                not_before: Instant::now(),
+            }),
+            changed: Condvar::new(),
+            backoff,
+        }
+    }
+
+    fn acquire(&self, ready_at: Instant) -> DownloadPermit<'_> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.active == MAX_ASSET_DOWNLOADS {
+                state = self.changed.wait(state).unwrap();
+                continue;
+            }
+            let wait = state
+                .not_before
+                .max(ready_at)
+                .saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                state.active += 1;
+                return DownloadPermit {
+                    downloads: self,
+                    pause_until: None,
+                };
+            }
+            (state, _) = self.changed.wait_timeout(state, wait).unwrap();
+        }
+    }
+
+    fn retry(&self, mut download: impl FnMut() -> DownloadResult) -> DownloadResult {
+        let mut ready_at = Instant::now();
+        for attempt in 0..=self.backoff.len() {
+            let mut permit = self.acquire(ready_at);
+            let result = download();
+            let Err(AssetDownloadError::Transient {
+                status,
+                retry_after,
+                ..
+            }) = &result
+            else {
+                return result;
+            };
+            // Even a 429 on the last attempt pauses everyone else.
+            let backoff = self.backoff[attempt.min(self.backoff.len() - 1)];
+            let delay = retry_after
+                .as_ref()
+                .and_then(|header| header.to_str().ok())
+                .and_then(|value| retry_after_delay(value, SystemTime::now()))
+                .map_or(backoff, |delay| backoff.max(delay));
+            ready_at = Instant::now() + delay;
+            if *status == 429 {
+                permit.pause_until = Some(ready_at);
+            }
+            if attempt == self.backoff.len() {
+                return result;
+            }
+        }
+        unreachable!()
+    }
+
+    fn editor_download(
+        &self,
+        version: Option<u64>,
+        account: Option<impl FnMut() -> DownloadResult>,
+        public: impl FnMut() -> DownloadResult,
+    ) -> Result<Vec<u8>, String> {
+        match account.map(|download| self.retry(download)) {
+            Some(Ok(bytes)) => Ok(bytes),
+            Some(Err(error @ AssetDownloadError::Transient { .. })) => Err(error.to_string()),
+            Some(Err(error)) if version.is_some() => Err(error.to_string()),
+            Some(Err(error)) => self
+                .retry(public)
+                .map_err(|public| format!("{error}; {public}")),
+            None if version.is_some() => Err("sign in (Account) to download asset versions".into()),
+            None => self.retry(public).map_err(|error| error.to_string()),
+        }
+    }
+}
+
 /// Roblox's copy of an asset: Studio's login session, else public asset
 /// delivery (waiting a little for a session check still running).
 fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
     // Prefer Studio's login session. Its downloader preserves Roblox-Place-Id,
     // which asset delivery requires for assets private to the current place.
-    let client = session_client();
-    let b = if let Some(c) = client {
+    let public = || ASSET_DOWNLOADS.retry(|| public_asset_typed(id));
+    let result = if let Some(c) = session_client() {
         let downloader = {
             let guard = c.lock().map_err(|_| "account busy".to_string())?;
             guard.as_ref().map(|c| c.session.downloader())
         };
         match downloader {
-            Some(d) => d.download_asset(id, None).map_err(|e| e.to_string())?,
-            None => rustudio_account::public_asset(id).map_err(|e| e.to_string())?,
+            Some(d) => ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None)),
+            None => public(),
         }
     } else {
-        match rustudio_account::public_asset(id) {
-            Ok(b) => b,
-            Err(public) => {
-                let c = wait_for_session(std::time::Duration::from_secs(30))
-                    .then(session_client).flatten().ok_or_else(|| public.to_string())?;
+        match public() {
+            Err(AssetDownloadError::Other(error)) => {
+                let c = wait_for_session(Duration::from_secs(30))
+                    .then(session_client)
+                    .flatten()
+                    .ok_or_else(|| error.to_string())?;
                 let d = {
                     let guard = c.lock().map_err(|_| "account busy".to_string())?;
-                    guard.as_ref().ok_or_else(|| public.to_string())?.session.downloader()
+                    guard
+                        .as_ref()
+                        .ok_or_else(|| error.to_string())?
+                        .session
+                        .downloader()
                 };
-                d.download_asset(id, None).map_err(|e| e.to_string())?
+                ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None))
             }
+            result => result,
         }
     };
-    Ok(b)
+    result.map_err(|error| error.to_string())
 }
 
 /// Any content id's bytes, blocking (background threads): generated
@@ -857,39 +1024,40 @@ impl AssetStore {
             }
             return Fetch::Pending;
         }
-        // Signed in: the account's Open Cloud download first; anything it
-        // refuses (and everything when signed out) from public asset
-        // delivery, which serves public assets anonymously (docs/MATERIALS.md).
+        // Try the account first when signed in. Unversioned assets can
+        // also use anonymous delivery after a non-transient refusal.
         // The check's worker sets SESSION a frame before `set_client` runs.
         let client = self.client.clone().or_else(session_client);
         self.pending.insert(a);
         let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<(), String> {
-                // Copy the session out so downloads run side by side.
-                let account = client
-                    .and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()))
-                    .map(|d| d.download_asset(a.id, a.version).map_err(|e| e.to_string()));
-                let bytes = match account {
-                    Some(Ok(b)) => b,
-                    Some(Err(e)) if a.version.is_some() => return Err(e),
-                    Some(Err(e)) => {
-                        rustudio_account::public_asset(a.id).map_err(|p| format!("{e}; {p}"))?
+        ASSET_WORKERS
+            .send(Box::new(move || {
+                let result = (|| -> Result<(), String> {
+                    // Copy the session out so downloads run side by side.
+                    let downloader = client
+                        .and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()));
+                    let bytes = ASSET_DOWNLOADS.editor_download(
+                        a.version,
+                        downloader.map(|d| move || d.download_asset_typed(a.id, a.version)),
+                        || public_asset_typed(a.id),
+                    )?;
+                    let path = cache_path(a);
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                     }
-                    None if a.version.is_some() => {
-                        return Err("sign in (Account) to download asset versions".into())
-                    }
-                    None => rustudio_account::public_asset(a.id).map_err(|e| e.to_string())?,
-                };
-                let path = cache_path(a);
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&path, bytes).map_err(|e| e.to_string())
-            })();
-            content_track(&format!("rbxassetid://{}{}",a.id,a.version.map(|v|format!("?version={v}")).unwrap_or_default()),if result.is_ok(){2}else{3});
-            let _ = tx.send((a, result));
-        });
+                    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+                })();
+                content_track(
+                    &format!(
+                        "rbxassetid://{}{}",
+                        a.id,
+                        a.version.map(|v| format!("?version={v}")).unwrap_or_default()
+                    ),
+                    if result.is_ok() { 2 } else { 3 },
+                );
+                let _ = tx.send((a, result));
+            }))
+            .expect("asset workers stopped");
         Fetch::Pending
     }
 
@@ -919,7 +1087,7 @@ impl AssetStore {
                         done.push(a);
                         continue;
                     }
-                    if !self.auth_told && (e.contains("Authentication required") || e.contains("not authorized")) {
+                    if !self.auth_told && self.client.is_none() && (e.contains("Authentication required") || e.contains("not authorized")) {
                         self.auth_told = true;
                         self.messages.push(
                             "Roblox only gives most assets to a signed-in session: sign in (Account) \
@@ -2118,6 +2286,193 @@ pub fn composite_over(under: Option<&Rgba>, over: Option<&Rgba>) -> Option<Rgba>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transient(status: u16, retry_after: Option<&str>) -> AssetDownloadError {
+        AssetDownloadError::Transient {
+            status,
+            retry_after: retry_after.map(|value| value.parse().unwrap()),
+            error: rustudio_account::Error::new(format!("HTTP {status}")),
+        }
+    }
+
+    #[test]
+    fn download_retries_then_succeeds() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        let mut tries = 0;
+        let result = downloads.retry(|| {
+            tries += 1;
+            match tries {
+                1 => Err(transient(502, None)),
+                2 => Err(transient(503, None)),
+                _ => Ok(vec![42]),
+            }
+        });
+        assert_eq!(result.unwrap(), vec![42]);
+        assert_eq!(tries, 3);
+    }
+
+    #[test]
+    fn download_gives_up_after_last_try() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        let mut tries = 0;
+        let result = downloads.retry(|| {
+            tries += 1;
+            Err(transient(503, None))
+        });
+        assert!(matches!(
+            result,
+            Err(AssetDownloadError::Transient { status: 503, .. })
+        ));
+        assert_eq!(tries, ASSET_BACKOFF.len() + 1);
+    }
+
+    #[test]
+    fn download_retry_after_pauses_the_whole_queue() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        std::thread::scope(|scope| {
+            let (send, receive) = channel();
+            let downloads = &downloads;
+            let retry = scope.spawn(move || {
+                let mut tries = 0;
+                let mut pause_started = None;
+                downloads
+                    .retry(|| {
+                        tries += 1;
+                        if tries <= ASSET_BACKOFF.len() {
+                            return Err(transient(429, None));
+                        }
+                        pause_started = Some(Instant::now());
+                        Err(transient(429, Some("1")))
+                    })
+                    .unwrap_err();
+                // The terminal 429 must still pause an unrelated download.
+                send.send(pause_started.unwrap()).unwrap();
+            });
+            let start = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            downloads
+                .retry(|| {
+                    assert!(start.elapsed() >= Duration::from_secs(1));
+                    Ok(vec![])
+                })
+                .unwrap();
+            retry.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn download_retry_honors_retry_after_and_clamps_it() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        let start = Instant::now();
+        let mut tries = 0;
+        downloads
+            .retry(|| {
+                tries += 1;
+                if tries == 1 {
+                    return Err(transient(503, Some("1")));
+                }
+                assert!(start.elapsed() >= Duration::from_secs(1));
+                Ok(vec![])
+            })
+            .unwrap();
+        assert_eq!(tries, 2);
+        assert_eq!(
+            retry_after_delay("120", SystemTime::UNIX_EPOCH),
+            Some(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            retry_after_delay("Thu, 01 Jan 1970 00:00:02 GMT", SystemTime::UNIX_EPOCH),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn editor_download_does_not_fall_back_after_a_transient_failure() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        for status in [429, 502, 503] {
+            let mut tries = 0;
+            let error = downloads
+                .editor_download(
+                    None,
+                    Some(|| {
+                        tries += 1;
+                        Err(transient(status, None))
+                    }),
+                    || panic!("transient failure must not use public delivery"),
+                )
+                .unwrap_err();
+            assert_eq!(error, format!("HTTP {status}"));
+            assert_eq!(tries, ASSET_BACKOFF.len() + 1);
+        }
+    }
+
+    #[test]
+    fn editor_download_falls_back_on_auth_refusal_only_for_unversioned_assets() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        let auth = || Err(rustudio_account::Error::new("Authentication required").into());
+        assert_eq!(
+            downloads
+                .editor_download(None, Some(auth), || Ok(vec![42]))
+                .unwrap(),
+            vec![42]
+        );
+        assert_eq!(
+            downloads
+                .editor_download(Some(3), Some(auth), || panic!(
+                    "versioned asset used public delivery"
+                ))
+                .unwrap_err(),
+            "Authentication required"
+        );
+    }
+
+    #[test]
+    fn download_concurrency_is_capped_across_callers() {
+        let downloads = AssetDownloads::new([Duration::ZERO; ASSET_BACKOFF.len()]);
+        let (entered_tx, entered_rx) = channel();
+        let release = (Mutex::new(false), Condvar::new());
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::Ordering::Relaxed;
+
+        std::thread::scope(|scope| {
+            for index in 0..2 * MAX_ASSET_DOWNLOADS {
+                let download = || {
+                    let count = active.fetch_add(1, Relaxed) + 1;
+                    peak.fetch_max(count, Relaxed);
+                    entered_tx.send(()).unwrap();
+                    let _released = release
+                        .1
+                        .wait_while(release.0.lock().unwrap(), |released| !*released)
+                        .unwrap();
+                    active.fetch_sub(1, Relaxed);
+                    Ok(vec![])
+                };
+                let downloads = &downloads;
+                scope.spawn(move || {
+                    if index % 2 == 0 {
+                        downloads
+                            .editor_download(None, Some(download), || unreachable!())
+                            .unwrap();
+                    } else {
+                        downloads.retry(download).unwrap();
+                    }
+                });
+            }
+
+            let filled = (0..MAX_ASSET_DOWNLOADS)
+                .all(|_| entered_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+            let exceeded = filled && entered_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+            *release.0.lock().unwrap() = true;
+            release.1.notify_all();
+            assert!(filled, "cap was never reached");
+            assert!(
+                !exceeded,
+                "another caller started while all permits were held"
+            );
+        });
+        assert_eq!(peak.load(Relaxed), MAX_ASSET_DOWNLOADS);
+        assert_eq!(entered_rx.try_iter().count(), MAX_ASSET_DOWNLOADS);
+    }
 
     #[test]
     fn abandoned_decode_results_expire_but_recent_results_survive() {

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use ureq::ResponseExt;
 use sha2::{Digest, Sha256};
 
+use crate::api::AssetDownloadError;
 use crate::{Error, Result};
 
 pub const AUTHENTICATED_URL: &str = "https://users.roblox.com/v1/users/authenticated";
@@ -686,6 +687,16 @@ impl Session {
 
     /// GET returning bytes (assets), gzip bodies inflated.
     fn get_bytes(&self, url: &str, with_cookie: bool) -> Result<(u16, Vec<u8>)> {
+        let response = self.get_bytes_response(url, with_cookie)?;
+        let status = response.status().as_u16();
+        Ok((status, Self::read_bytes(response)?))
+    }
+
+    fn get_bytes_response(
+        &self,
+        url: &str,
+        with_cookie: bool,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         let mut req = self.agent.get(url).header("Accept-Encoding", "gzip");
         if with_cookie {
             req = req.header("Cookie", &self.held().header());
@@ -694,11 +705,14 @@ impl Session {
                 req = req.header("Roblox-Place-Id", &place.to_string());
             }
         }
-        let mut r = req.call()?;
+        let r = req.call()?;
         if with_cookie {
             self.apply_rotation(&r);
         }
-        let status = r.status().as_u16();
+        Ok(r)
+    }
+
+    fn read_bytes(mut r: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         r.body_mut()
             .with_config()
@@ -710,7 +724,7 @@ impl Session {
             flate2::read::GzDecoder::new(&bytes[..]).read_to_end(&mut out)?;
             bytes = out;
         }
-        Ok((status, bytes))
+        Ok(bytes)
     }
 
     /// Engine data requests over the login session, preserving object metadata
@@ -893,8 +907,17 @@ impl Session {
     /// served the same asset]. So a refusal asks the identity endpoint for
     /// the rotation once and retries.
     pub fn download_asset(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
+        self.download_asset_typed(asset_id, version).map_err(Error::from)
+    }
+
+    /// Like [Self::download_asset], with HTTP retry information for scheduling.
+    pub fn download_asset_typed(
+        &self,
+        asset_id: u64,
+        version: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
         let first = self.download_asset_at(asset_id, version);
-        if let Err(e) = &first {
+        if let Err(AssetDownloadError::Other(e)) = &first {
             if e.0.contains("Authentication required") && self.refresh_cookie().unwrap_or(false) {
                 return self.download_asset_at(asset_id, version);
             }
@@ -914,7 +937,11 @@ impl Session {
     }
 
     /// One asset delivery attempt.
-    fn download_asset_at(&self, asset_id: u64, version: Option<u64>) -> Result<Vec<u8>> {
+    fn download_asset_at(
+        &self,
+        asset_id: u64,
+        version: Option<u64>,
+    ) -> std::result::Result<Vec<u8>, AssetDownloadError> {
         let url = match version {
             Some(v) => format!("{ASSET_V2_URL}/{asset_id}/version/{v}"),
             None => format!("{ASSET_V2_URL}/{asset_id}"),
@@ -927,8 +954,11 @@ impl Session {
         if place != 0 {
             req = req.header("Roblox-Place-Id", &place.to_string());
         }
-        let r = req.call()?;
+        let r = req.call().map_err(Error::from)?;
         self.apply_rotation(&r);
+        if let Some(error) = AssetDownloadError::transient_response(asset_id, "asset delivery", &r) {
+            return Err(error);
+        }
         let (status, text) = text_of(r)?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
             Error(format!(
@@ -940,15 +970,22 @@ impl Session {
                 .pointer("/errors/0/message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("no download location");
+            // v2 answers 200 with the refusal in the body (see `public_asset_typed`).
+            let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
             return Err(Error(format!(
-                "asset {asset_id}: asset delivery: {why} (HTTP {status})"
-            )));
+                "asset {asset_id}: asset delivery: {why}{http}"
+            )).into());
         };
-        let (status, bytes) = self.get_bytes(location, false)?;
+        let response = self.get_bytes_response(location, false)?;
+        if let Some(error) = AssetDownloadError::transient_response(asset_id, "download", &response) {
+            return Err(error);
+        }
+        let status = response.status().as_u16();
+        let bytes = Self::read_bytes(response)?;
         if !(200..300).contains(&status) {
             return Err(Error(format!(
                 "asset {asset_id}: download returned HTTP {status}"
-            )));
+            )).into());
         }
         Ok(bytes)
     }

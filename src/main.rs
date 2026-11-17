@@ -1,5 +1,8 @@
 //! rustudio: a native Linux editor for Roblox place and model files.
 
+// Launch as a GUI application on Windows without opening a console window.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod grass_stream;
 mod plugin_store;
 mod toolbox;

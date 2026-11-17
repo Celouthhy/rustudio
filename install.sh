@@ -1,8 +1,8 @@
 #!/bin/sh
-# Install rustudio for the current user on Linux: builds the release binary,
+# Install rustudio for the current user on Linux: uses a bundled binary or builds,
 # then adds it to your PATH, your app launcher and your icon theme.
 #
-#   ./install.sh               build and install into ~/.local
+#   ./install.sh               install bundle (or build source) into ~/.local
 #   ./install.sh --no-build    install the binary already in target/release
 #   ./install.sh --prefix DIR  install somewhere else (default: ~/.local)
 #   ./install.sh --uninstall   remove everything this script installed
@@ -19,6 +19,8 @@ fi
 
 prefix="$HOME/.local"
 build=1
+repo=$(cd "$(dirname "$0")" && pwd)
+[ ! -f "$repo/rustudio" ] || build=0
 uninstall=0
 
 while [ $# -gt 0 ]; do
@@ -34,7 +36,15 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-repo=$(cd "$(dirname "$0")" && pwd)
+case "$prefix" in
+    /*) ;;
+    *) prefix="$PWD/$prefix" ;;
+esac
+# Reject characters that cannot safely appear in the generated launcher.
+case "$prefix" in
+    *'"'*|*'$'*|*'`'*|*'\'*|*'%'*|*'
+'*) echo "unsupported character in installation prefix" >&2; exit 1 ;;
+esac
 bindir="$prefix/bin"
 libdir="$prefix/lib/rustudio"
 appdir="$prefix/share/applications"
@@ -53,7 +63,8 @@ refresh() {
 
 if [ "$uninstall" = 1 ]; then
     rm -f "$bindir/rustudio" "$appdir/rustudio.desktop"
-    rm -rf "$libdir"
+    rm -f "$libdir/rustudio" "$libdir/api-dump.json"
+    rmdir "$libdir" 2>/dev/null || true
     for s in $sizes; do rm -f "$icondir/${s}x${s}/apps/rustudio.png"; done
     rm -f "$icondir/scalable/apps/rustudio.svg"
     refresh
@@ -72,6 +83,7 @@ if [ "$build" = 1 ]; then
 fi
 
 bin="$repo/target/release/rustudio"
+[ ! -f "$repo/rustudio" ] || bin="$repo/rustudio"
 if [ ! -x "$bin" ]; then
     echo "no build found at $bin (run without --no-build)" >&2
     exit 1
@@ -80,7 +92,8 @@ fi
 # The binary and the API dump it reads at runtime live together, so the
 # install keeps working after this folder is moved or deleted.
 mkdir -p "$bindir" "$libdir" "$appdir"
-install -m 755 "$bin" "$libdir/rustudio"
+install -m 755 "$bin" "$libdir/rustudio.new"
+mv -f "$libdir/rustudio.new" "$libdir/rustudio"
 install -m 644 "$repo/api-dump.json" "$libdir/api-dump.json"
 
 cat > "$bindir/rustudio" <<EOF
@@ -99,7 +112,12 @@ install -D -m 644 "$repo/assets/icons/rustudio.svg" "$icondir/scalable/apps/rust
 
 # Point the launcher at the full path, so it works even when $bindir
 # isn't on the desktop session's PATH.
-sed "s|^Exec=rustudio|Exec=\"$bindir/rustudio\"|" "$repo/assets/linux/rustudio.desktop" > "$appdir/rustudio.desktop"
+while IFS= read -r line; do
+    case "$line" in
+        Exec=rustudio*) printf 'Exec="%s/rustudio"%s\n' "$bindir" "${line#Exec=rustudio}" ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+done < "$repo/assets/linux/rustudio.desktop" > "$appdir/rustudio.desktop"
 chmod 644 "$appdir/rustudio.desktop"
 
 refresh

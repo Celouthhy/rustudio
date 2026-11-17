@@ -115,6 +115,14 @@ fn list(name: &str, doc: &str, set: &BTreeSet<String>) -> String {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/icons/rustudio.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set_icon("assets/icons/rustudio.ico")
+            .compile()
+            .expect("compile Windows application icon");
+    }
+
     let (mut reads, mut fires) = (BTreeSet::new(), BTreeSet::new());
     scan(Path::new("src"), &mut reads, &mut fires);
     let code = list("ENGINE_READS", "Property names the engine reads", &reads)

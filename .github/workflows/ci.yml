@@ -82,10 +82,9 @@ jobs:
       - run: cargo build --release
       - name: Package
         run: |
-          d=rustudio-linux-x86_64
-          mkdir -p dist/$d
-          cp target/release/rustudio api-dump.json LICENSE-MIT LICENSE-APACHE README.md dist/$d/
-          tar -C dist -czf dist/$d.tar.gz $d
+          tools/linux/package.sh target/release/rustudio dist/rustudio-linux-x86_64.tar.gz
+      - name: Verify Linux installation
+        run: python3 tools/linux/test-package.py dist/rustudio-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: rustudio-linux-x86_64
@@ -104,7 +103,11 @@ jobs:
           $d = "dist/rustudio-windows-x64"
           New-Item -ItemType Directory -Force $d | Out-Null
           Copy-Item target/release/rustudio.exe, api-dump.json, LICENSE-MIT, LICENSE-APACHE, README.md $d
+          Copy-Item tools/windows/install.ps1, tools/windows/install.cmd, tools/windows/uninstall.cmd $d
           Compress-Archive -Path $d -DestinationPath dist/rustudio-windows-x64.zip
+      - name: Verify Windows installation
+        shell: pwsh
+        run: tools/windows/test-package.ps1 -Archive dist/rustudio-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: rustudio-windows-x64
@@ -132,8 +135,8 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber ||
             gh release create "$GITHUB_REF_NAME" dist/* --title "rustudio $GITHUB_REF_NAME" --notes-file - <<'NOTES'
           Downloads:
-          - Linux x86_64: rustudio-linux-x86_64.tar.gz (unpack, run ./rustudio)
-          - Windows x64: rustudio-windows-x64.zip (unzip, run rustudio.exe)
+          - Linux x86_64: rustudio-linux-x86_64.tar.gz (unpack, run ./install.sh, then launch rustudio from the applications menu)
+          - Windows x64: rustudio-windows-x64.zip (unzip, run install.cmd for a Start menu shortcut, or run rustudio.exe portably)
           - macOS (Apple Silicon and Intel): unzip, move rustudio.app to Applications, and the first time right-click it > Open (it isn't notarized).
 
           SHA256SUMS lists each file's checksum.

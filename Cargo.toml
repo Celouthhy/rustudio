@@ -135,3 +135,6 @@ rapier3d = { path = "vendor/rapier3d" }
 inherits = "release"
 incremental = true
 codegen-units = 256
+
+[build-dependencies]
+winresource = "0.1.34"

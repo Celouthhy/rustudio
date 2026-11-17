@@ -52,9 +52,44 @@ quite yet.
 
 **Download:** prebuilt Linux (x86_64), Windows (x64) and macOS (Apple Silicon
 and Intel) builds are on the
-[releases page](https://github.com/rippelz/rustudio/releases). Unpack and run
-`rustudio` (`rustudio.exe` on Windows); on a Mac, move `rustudio.app` to
+[releases page](https://github.com/rippelz/rustudio/releases). On Linux, unpack and run
+`./install.sh` inside the extracted folder; on Windows run `install.cmd` (or `rustudio.exe` for portable use).
+On a Mac, move `rustudio.app` to
 Applications and the first time right-click it > Open (it isn't notarized).
+### Installing a prebuilt Windows download
+
+Extract the Windows ZIP and double-click `install.cmd`. The install dialog lets
+you choose a folder and whether to create a Start menu shortcut. It defaults to
+`%LOCALAPPDATA%\Programs\rustudio` for your account. No administrator rights or Rust toolchain are needed.
+The executable contains the icon, so Explorer and shortcuts can display it too.
+
+Close rustudio before upgrading, then run `install.cmd` from the new download.
+To remove the installation, run `uninstall.cmd` in the installed folder.
+Uninstall preserves projects, settings, sign-in and downloaded Studio content.
+The ZIP also supports portable use: run `rustudio.exe` directly without installing.
+
+### Installing a prebuilt Linux download
+
+Extract the Linux release archive, open a terminal in the extracted folder,
+and run `./install.sh`. No Rust, Cargo, or source checkout is needed.
+The installer puts the executable and API data in `~/.local/lib/rustudio`,
+a command in `~/.local/bin`, and the launcher and icons in `~/.local/share`.
+Launch **rustudio** from your applications menu; this works even if
+`~/.local/bin` is absent from your session's PATH. The extracted folder can
+then be removed.
+
+To upgrade, extract the new archive and run its `./install.sh` again.
+To uninstall, run `./install.sh --uninstall` from an extracted archive or
+source checkout. Projects, settings, sign-in data, and downloaded content
+are preserved. `--prefix /absolute/path` selects another installation root;
+use the same prefix when upgrading or uninstalling. Custom prefixes may
+need to be added to the desktop's data search path for menu discovery.
+
+From a source checkout, `./install.sh` still builds with Cargo;
+`./install.sh --no-build` installs `target/release/rustudio`.
+Release maintainers can package a built executable with
+`tools/linux/package.sh target/release/rustudio rustudio-linux.tar.gz`.
+
 A downloaded copy checks for a newer release when it starts and can update
 itself (each download is checked against the release's `SHA256SUMS`); set
 `RUSTUDIO_NO_UPDATE_CHECK=1` to turn that off.

@@ -404,9 +404,14 @@ pub fn inactive(o: &Opt) -> Option<&'static str> {
     (o.key == "spin_guard" && solver_now() == crate::solver::SolverKind::Rapier).then_some("Legacy solver")
 }
 
+/// The default of an on/off option (only Use live DataStores starts off).
+pub fn bool_default(key: &str) -> bool {
+    key != "live_data"
+}
+
 /// The dialog writes a value: defaults are removed from the file.
 pub fn set_bool(key: &str, b: bool) {
-    set(key, (!b).then_some(Value::Bool(false)));
+    set(key, (b != bool_default(key)).then_some(Value::Bool(b)));
 }
 
 pub fn set_choice(key: &str, v: &str, default: &str) {
@@ -456,6 +461,18 @@ mod tests {
         assert_eq!(resolve_local_assets(None, Some(&json!("/a"))), Some(PathBuf::from("/a")));
         assert_eq!(resolve_local_assets(Some(""), Some(&json!("/a"))), None);
         assert_eq!(resolve_local_assets(Some("/b"), Some(&json!("/a"))), Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn set_bool_saves_non_defaults() {
+        set_bool("live_data", true);
+        assert_eq!(saved("live_data"), Some(json!(true)));
+        set_bool("live_data", false);
+        assert_eq!(saved("live_data"), None);
+        set_bool("update_check", false);
+        assert_eq!(saved("update_check"), Some(json!(false)));
+        set_bool("update_check", true);
+        assert_eq!(saved("update_check"), None);
     }
 
     #[test]

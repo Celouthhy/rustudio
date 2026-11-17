@@ -137,4 +137,6 @@ jobs:
           - macOS (Apple Silicon and Intel): unzip, move rustudio.app to Applications, and the first time right-click it > Open (it isn't notarized).
 
           SHA256SUMS lists each file's checksum.
+
+          rustudio is made by @rippelz.
           NOTES

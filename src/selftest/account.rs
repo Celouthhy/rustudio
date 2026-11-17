@@ -3,9 +3,9 @@
 //! - "account-session": the session cookie (login keyring, else the import
 //!   file) is checked with Roblox; signed in shows the profile; the display
 //!   cache is keyed to the cookie (another cookie misses it); a made-up
-//!   cookie reports "signed out" without echoing it; a state-changing POST
-//!   gets its X-CSRF-TOKEN (asset 0, so nothing is written); the cookie
-//!   appears in no Output line and no result.
+//!   cookie reports "signed out" without echoing it; a local place upload
+//!   retries PATCH with X-CSRF-TOKEN and polls the operation with the session
+//!   cookie; the login cookie appears in no Output line and no result.
 //! - "rig-picker": with the place set to R15, picking R6 gives an R6
 //!   character in Play (and says the picker won); Auto gives the place's R15.
 //! - "catalog-assets": signed in, an R15 character keeps Roblox's current
@@ -227,19 +227,6 @@ impl SelfTest {
                     "profile + avatar cached under the cookie's key: {cache_ok}"
                 ));
                 ok &= cache_ok;
-                let csrf = ed.account.with_client(|cl| {
-                    let r = cl.session.post_csrf(
-                        &format!("{}?assetid=0", session::UPLOAD_URL),
-                        "application/octet-stream",
-                        b"",
-                    );
-                    (r.map(|x| x.0).ok(), cl.session.csrf_token_held())
-                });
-                let token = csrf.is_some_and(|(_, t)| t);
-                notes.push(format!(
-                    "POST with the session got an X-CSRF-TOKEN and retried with it: {token} (asset 0, nothing written)"
-                ));
-                ok &= token;
             }
             (Some(_), other) => {
                 ok = false;
@@ -253,6 +240,9 @@ impl SelfTest {
                 notes.push(format!("no cookie, but the state is {other:?}"));
             }
         }
+        let upload = super::cloud::mock_session_upload();
+        notes.push(format!("local place upload: cookie authentication, CSRF retry, revision poll and exact bytes: {upload}"));
+        ok &= upload;
         // A cookie Roblox doesn't know: "signed out", never echoed, and the
         // display cache doesn't answer for it.
         let fake_value = "rustudio-selftest-not-a-real-session-0123456789";

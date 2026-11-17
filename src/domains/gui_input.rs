@@ -437,6 +437,112 @@ pub fn write_acts(class: &str, key: &str) -> bool {
 }
 
 /// The library's InputObject maker, for Rust callers.
+/// Every GuiObject drawn at (x, y) in GUI coordinates (AbsolutePosition's)
+/// in `guis` (LayerCollectors, top-most first), top-most first: ZIndexBehavior's
+/// order inside each, clipped by ClipsDescendants and ScrollingFrames. Boxes
+/// are AbsolutePosition / AbsoluteSize as a script reads them (abs_now).
+fn objects_at(w: &mut World, guis: &[Ref], x: f32, y: f32) -> Vec<Ref> {
+    use crate::doc::is_a;
+    fn class(w: &World, r: Ref) -> Option<&str> {
+        w.d().dom.get_by_ref(r).map(|i| i.class.as_str())
+    }
+    fn boolp(w: &World, r: Ref, name: &str, default: bool) -> bool {
+        match w.d().prop(r, name) {
+            Some(Variant::Bool(b)) => b,
+            _ => default,
+        }
+    }
+    fn zindex(w: &World, r: Ref) -> i64 {
+        match w.d().prop(r, "ZIndex") {
+            Some(Variant::Int32(z)) => z as i64,
+            Some(Variant::Int64(z)) => z,
+            _ => 1,
+        }
+    }
+    // GuiObject children, a Folder's taken in its place.
+    fn kids(w: &World, p: Ref, out: &mut Vec<Ref>) {
+        let Some(i) = w.d().dom.get_by_ref(p) else { return };
+        for &c in i.children() {
+            match class(w, c) {
+                Some(k) if is_a(k, "GuiObject") => out.push(c),
+                Some(k) if is_a(k, "Folder") => kids(w, c, out),
+                _ => {}
+            }
+        }
+    }
+    let (x, y) = (x as f64, y as f64);
+    let inside = |w: &mut World, o: Ref| {
+        let b = crate::runtime::ext::abs_now(w, o);
+        let (px, py, sx, sy) = (b.pos[0] as f64, b.pos[1] as f64, b.size[0] as f64, b.size[1] as f64);
+        x >= px && y >= py && x < px + sx && y < py + sy
+    };
+    // One walk in draw order (ZIndex then child order: among siblings, or
+    // across the whole GUI for a Global ScreenGui). An invisible object's
+    // subtree is never drawn, so it isn't walked. `clip_ok`: every GuiObject
+    // above (up to the first non-GuiObject: a Folder ends the climb) that
+    // clips (ClipsDescendants, ScrollingFrame) holds the point.
+    struct Walk<'a> {
+        global: bool,
+        all: Vec<(Ref, i64, usize)>,
+        inside: &'a dyn Fn(&mut World, Ref) -> bool,
+    }
+    fn walk(w: &mut World, st: &mut Walk, p: Ref, p_gui: bool, clip_ok: bool) {
+        let mut list = Vec::new();
+        {
+            let w = &*w;
+            kids(w, p, &mut list);
+        }
+        // Children reached through a Folder have it as their parent: the climb stops there.
+        let mut keyed: Vec<(i64, usize, Ref, bool)> = list
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let direct = w.d().dom.get_by_ref(c).is_some_and(|k| k.parent() == p);
+                (zindex(w, c), i, c, direct)
+            })
+            .collect();
+        if !st.global {
+            keyed.sort_unstable_by_key(|e| (e.0, e.1));
+        }
+        let mine = p_gui && clip_ok && {
+            let clips = class(w, p).is_some_and(|k| is_a(k, "ScrollingFrame")) || boolp(w, p, "ClipsDescendants", false);
+            !clips || (st.inside)(w, p)
+        };
+        for (z, _, c, direct) in keyed {
+            if !boolp(w, c, "Visible", true) {
+                continue;
+            }
+            let ok = if direct { if p_gui { mine } else { true } } else { true };
+            let seq = st.all.len();
+            st.all.push((if ok { c } else { Ref::none() }, z, seq));
+            walk(w, st, c, true, ok);
+        }
+    }
+    let mut res = Vec::new();
+    for &g in guis {
+        let global = class(w, g) == Some("ScreenGui")
+            && matches!(w.d().prop(g, "ZIndexBehavior"), Some(Variant::Enum(e)) if e.to_u32() == 0);
+        // (every object's climb ends at this LayerCollector: drawn while it's Enabled)
+        if !boolp(w, g, "Enabled", true) {
+            continue;
+        }
+        let mut st = Walk { global, all: Vec::new(), inside: &inside };
+        walk(w, &mut st, g, false, true);
+        let mut all = st.all;
+        if global {
+            all.sort_unstable_by_key(|e| (e.1, e.2));
+        }
+        let mut here = Vec::new();
+        for (o, _, _) in all {
+            if !o.is_none() && inside(w, o) {
+                here.push(o);
+            }
+        }
+        res.extend(here.into_iter().rev());
+    }
+    res
+}
+
 fn input_object(lua: &Lua, fields: Table) -> mlua::Result<Value> {
     let f: Function = lua.globals().get("__rs_new_input_object")?;
     f.call(fields)
@@ -562,6 +668,25 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 }
                 None => MultiValue::new(),
             })
+        })?,
+    )?;
+    // objects_at({LayerCollector…}, x, y): GetGuiObjectsAtPosition's walk
+    // (gui_input.luau), native: FtF's PlayerGui has ~4,600 GuiObjects and
+    // Kohl's Admin asks on every mouse move over its buttons; walked in Luau
+    // through the engine that was 80+ ms a call.
+    g.set(
+        "objects_at",
+        lua.create_function(|lua, (guis, x, y): (Vec<Value>, f64, f64)| {
+            let guis: Vec<Ref> = guis.iter().filter_map(opt_inst).collect();
+            let hits = {
+                let mut w = world(lua)?;
+                objects_at(&mut w, &guis, x as f32, y as f32)
+            };
+            let out = lua.create_table_with_capacity(hits.len(), 0)?;
+            for (i, r) in hits.into_iter().enumerate() {
+                out.raw_set(i + 1, inst_value(lua, r)?)?;
+            }
+            Ok(out)
         })?,
     )?;
     // The viewport GUI's shared state (src/gui.rs GuiShare).

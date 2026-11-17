@@ -83,7 +83,9 @@ impl BroadPhaseBvh {
                     && co.changes.intersects(
                         ColliderChanges::PARENT
                             | ColliderChanges::PARENT_EFFECTIVE_DOMINANCE
-                            | ColliderChanges::GROUPS,
+                            | ColliderChanges::GROUPS
+                            // (sensor <-> solid: a pair `touch_wanted` dropped may be wanted now)
+                            | ColliderChanges::TYPE,
                     )
                     && self.tree.leaf_node(leaf_index).is_some()
                 {
@@ -106,7 +108,9 @@ impl BroadPhaseBvh {
             if !collider.is_enabled()
                 || !(collider.changes.needs_broad_phase_update()
                     || collider.changes.intersects(
-                        ColliderChanges::PARENT_EFFECTIVE_DOMINANCE | ColliderChanges::GROUPS,
+                        ColliderChanges::PARENT_EFFECTIVE_DOMINANCE
+                            | ColliderChanges::GROUPS
+                            | ColliderChanges::TYPE,
                     ))
             {
                 return None;
@@ -392,6 +396,10 @@ impl BroadPhaseBvh {
                         .collision_groups
                         .test(collider2.flags.collision_groups)
                     {
+                        return None;
+                    }
+
+                    if !collider1.touch_wanted(collider2) {
                         return None;
                     }
 

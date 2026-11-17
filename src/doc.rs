@@ -116,6 +116,8 @@ pub enum Reader {
     PluginGui = 18,
     /// The Highlights the editor's 3D view draws (src/viewport.rs).
     Highlights = 19,
+    /// The Humanoids Play drives besides the player's (src/play_npc.rs).
+    Npcs = 20,
 }
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
@@ -130,7 +132,7 @@ struct Journal {
     base: u64,
     marks: Vec<Mark>,
     /// Next sequence number each reader wants; None = hasn't read yet.
-    read: [Option<u64>; 20],
+    read: [Option<u64>; 21],
     /// The joint graph's position (src/domains/world_part.rs), read through
     /// `&self`: 0 = not reading, else the next sequence number + 1.
     graph_pos: std::sync::atomic::AtomicU64,
@@ -412,7 +414,7 @@ impl Document {
             journal: Journal {
                 base: 0,
                 marks: Vec::new(),
-                read: [None; 20],
+                read: [None; 21],
                 graph_pos: std::sync::atomic::AtomicU64::new(0),
             },
             history: Default::default(),
@@ -819,15 +821,25 @@ impl Document {
     /// session services that plugins fill (PluginGuiService's widgets,
     /// CoreGui) aren't saved, as in Studio.
     pub fn encode_all(&self, xml: bool) -> Result<Vec<u8>, String> {
-        let top: Vec<Ref> = self
-            .dom
+        self.encode(&self.save_roots(), xml)
+    }
+
+    /// Copies the saveable tree so background serialization sees the revision
+    /// that was submitted, while the editor keeps working on the original.
+    pub(crate) fn save_snapshot(&self) -> (WeakDom, Vec<Ref>) {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let roots = self.dom.clone_multiple_into_external(&self.save_roots(), &mut dom);
+        (dom, roots)
+    }
+
+    fn save_roots(&self) -> Vec<Ref> {
+        self.dom
             .root()
             .children()
             .iter()
             .copied()
             .filter(|c| !self.dom.get_by_ref(*c).is_some_and(|i| UNSAVED_SERVICES.contains(&i.class.as_str())))
-            .collect();
-        self.encode(&top, xml)
+            .collect()
     }
 
     pub fn save_to(&mut self, path: &Path) -> Result<(), String> {

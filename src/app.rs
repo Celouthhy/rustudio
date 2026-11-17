@@ -893,6 +893,7 @@ impl Editor {
 
 impl Editor {
     pub fn set_document(&mut self, doc: Document) {
+        self.reset_cloud_save_dialogs();
         // Another document closes the open project (open_project sets it again).
         self.project = None;
         crate::project_config::set_active(None);
@@ -1165,7 +1166,7 @@ impl Editor {
             };
         }
         // A place opened from Roblox: Ctrl+S is Save to Roblox, as in Studio.
-        if self.doc.cloud.is_some() {
+        if self.doc.cloud.is_some() || self.live_team_create_ids().is_some() {
             return self.save_cloud(rustudio_account::VersionType::Saved, false);
         }
         match self.doc.path.clone() {

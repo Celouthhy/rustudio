@@ -492,8 +492,6 @@ pub struct PublishRequest {
 
 pub const USER_AUTH_ASSETS_URL: &str = "https://apis.roblox.com/assets/user-auth/v1/assets";
 pub const USER_AUTH_OPERATIONS_URL: &str = "https://apis.roblox.com/assets/user-auth/v1/operations";
-const BOUNDARY: &str = "----rustudio-plugin-upload-7c1f";
-
 impl PublishRequest {
     /// The method and URL: POST …/assets (new) or PATCH …/assets/{id}.
     pub fn target(&self) -> (&'static str, String) {
@@ -524,13 +522,7 @@ impl PublishRequest {
 
     /// multipart/form-data body: `request` (JSON) and `fileContent` (the model).
     pub fn body(&self, user_id: u64, rbxm: &[u8]) -> (String, Vec<u8>) {
-        let mut b = Vec::new();
-        b.extend_from_slice(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
-        b.extend_from_slice(self.request_json(user_id).to_string().as_bytes());
-        b.extend_from_slice(format!("\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"fileContent\"; filename=\"asset.rbxm\"\r\nContent-Type: model/x-rbxm\r\n\r\n").as_bytes());
-        b.extend_from_slice(rbxm);
-        b.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
-        (format!("multipart/form-data; boundary={BOUNDARY}"), b)
+        crate::asset_upload::multipart(&self.request_json(user_id), "asset.rbxm", "model/x-rbxm", rbxm)
     }
 }
 
@@ -546,23 +538,18 @@ pub fn publish(s: &Session, req: &PublishRequest, rbxm: &[u8]) -> std::result::R
     if !(200..300).contains(&st) {
         return Err(Failure::from_reply(st, &t));
     }
-    let mut op: Value = serde_json::from_str(&t).map_err(|_| Failure::Other(format!("upload answered: {}", t.chars().take(160).collect::<String>())))?;
-    for _ in 0..60 {
-        if op.get("done").and_then(|d| d.as_bool()) == Some(true) {
-            break;
-        }
-        let Some(path) = op.get("path").and_then(|p| p.as_str()).or_else(|| op.get("operationId").and_then(|p| p.as_str())) else { break };
-        let id = path.rsplit('/').next().unwrap_or(path);
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let (st, t) = s.get(&format!("{USER_AUTH_OPERATIONS_URL}/{id}")).map_err(http_err)?;
-        if st != 200 {
-            return Err(Failure::from_reply(st, &t));
-        }
-        op = serde_json::from_str(&t).map_err(|e| Failure::Other(e.to_string()))?;
-    }
-    if let Some(e) = op.get("error") {
-        return Err(Failure::Other(format!("upload failed: {e}")));
-    }
+    let op = crate::asset_upload::wait_for_operation(
+        &t,
+        USER_AUTH_OPERATIONS_URL,
+        |url| {
+            let (status, body) = s.get(url).map_err(http_err)?;
+            if status != 200 {
+                return Err(Failure::from_reply(status, &body));
+            }
+            Ok(body)
+        },
+        Failure::Other,
+    )?;
     let id = op
         .pointer("/response/assetId")
         .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))

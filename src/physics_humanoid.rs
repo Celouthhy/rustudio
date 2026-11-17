@@ -736,7 +736,7 @@ impl Physics {
             b.set_additional_mass_properties(total, true);
             b.recompute_mass_properties_from_colliders(&self.world.colliders);
         }
-        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+        if crate::physics::hum_debug() {
             let m = self.world.bodies.get(body).map(|b| b.mass());
             let head = list.iter().find(|p| doc.dom.get_by_ref(p.part).is_some_and(|i| i.name == "Head")).and_then(|p| self.world.colliders.get(p.collider));
             eprintln!("HUMDBG body built: mass {m:?}, head {:?} mass {:?}", head.map(|c| c.shape().shape_type()), head.map(|c| c.mass()));
@@ -780,6 +780,61 @@ impl Physics {
         h.finish()
     }
 
+    /// The character's body (a new one each time it is built).
+    pub fn humanoid_body_handle(&self, model: Ref) -> Option<rp::RigidBodyHandle> {
+        self.hums.by_model.get(&model).map(|h| h.body)
+    }
+
+    /// The signature the character's body was built with (`humanoid_sig`).
+    pub fn humanoid_sig_of(&self, model: Ref) -> Option<u64> {
+        self.hums.by_model.get(&model).map(|h| h.sig)
+    }
+
+    /// Whether everything `humanoid_sig` reads from these parts is final:
+    /// no mesh whose collision shape or (a Head's) mass still waits for its
+    /// download or decomposition. Until then the signature can change
+    /// without any property changing, so it has to be checked every frame.
+    pub fn humanoid_parts_settled(doc: &Document, parts: &[Ref]) -> bool {
+        use crate::collision::{self as col, Lookup};
+        let mesh_id = |r: Ref| match doc.prop(r, "MeshId") {
+            Some(Variant::ContentId(c)) => c.as_str().to_string(),
+            Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+            Some(Variant::String(s)) => s,
+            _ => String::new(),
+        };
+        for r in parts {
+            let Some((_, sig)) = part_sig(doc, *r) else { continue };
+            let Some(inst) = doc.dom.get_by_ref(*r) else { continue };
+            // A character's MeshPart Head weighs its collision mesh (part_mass).
+            if inst.class == "MeshPart" && inst.name == "Head" {
+                let id = mesh_id(*r);
+                if !id.is_empty() {
+                    let fid = enum_u32(doc.prop(*r, "CollisionFidelity")).unwrap_or(col::FIDELITY_DEFAULT);
+                    if !matches!(col::hulls(&id, fid), Lookup::Ready(_)) {
+                        return false;
+                    }
+                }
+            }
+            let Some(id) = sig.mesh.as_deref() else { continue };
+            // (As add_humanoid builds it: body parts as their box.)
+            if inst.name != "Head" && crate::rig::is_body_part_name(&inst.name) {
+                continue;
+            }
+            // Stored pieces (PhysicalConfigData) and a Box fidelity don't wait.
+            if sig.pieces != 0 || sig.fidelity == col::FIDELITY_BOX {
+                continue;
+            }
+            if inst.class != "MeshPart" {
+                return false;
+            }
+            let fid = if !sig.collide && !sig.anchored { col::FIDELITY_HULL } else { sig.fidelity };
+            if !matches!(col::hulls(id, fid), Lookup::Ready(_)) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// The character's parts changed (an avatar's scale or meshes arrived, a
     /// script resized a limb): the body is built again where it is, keeping
     /// its velocity, its controller and its seat. Studio's assembly takes
@@ -807,7 +862,7 @@ impl Physics {
                 b.set_angvel(w, true);
             }
         }
-        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+        if crate::physics::hum_debug() {
             eprintln!("HUMDBG body rebuilt: mass {:?}", self.humanoid_mass(model));
         }
         if let Some(seat) = seat {
@@ -927,7 +982,7 @@ impl Physics {
             return;
         }
         let list: Vec<(rp::RigidBodyHandle, rp::RigidBodyHandle)> = self.hums.ghosts.iter().map(|(b, g)| (*b, g.body)).collect();
-        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() && self.steps % 60 == 0 {
+        if crate::physics::hum_debug() && self.steps % 60 == 0 {
             for (b, g) in &self.hums.ghosts {
                 let touching: usize = g
                     .colliders
@@ -1145,7 +1200,17 @@ impl Physics {
     /// Puts each part's collider where the animated pose has it: `local` =
     /// each part's pose relative to the root (C0·Transform·C1⁻¹ chained).
     pub fn set_humanoid_pose(&mut self, model: Ref, local: &std::collections::HashMap<Ref, Xform>, rest: &std::collections::HashMap<Ref, Xform>) {
-        self.humanoid_rest_mass(model, rest);
+        self.set_humanoid_pose_with(model, local, Some(rest));
+    }
+
+    /// `set_humanoid_pose`; `rest` None leaves the mass alone (the caller
+    /// set it from the same rest pose on this same body already: the mass
+    /// depends only on the rest pose and the colliders outside the rig,
+    /// which no pose moves).
+    pub fn set_humanoid_pose_with(&mut self, model: Ref, local: &std::collections::HashMap<Ref, Xform>, rest: Option<&std::collections::HashMap<Ref, Xform>>) {
+        if let Some(rest) = rest {
+            self.humanoid_rest_mass(model, rest);
+        }
         let Some(h) = self.hums.by_model.get(&model) else { return };
         for p in &h.parts {
             let Some(xf) = local.get(&p.part) else { continue };
@@ -1276,7 +1341,7 @@ impl Physics {
             if rows.is_empty() {
                 continue;
             }
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+            if crate::physics::hum_debug() {
                 eprintln!("HUMBOUNCE {} rows {:?}", self.steps, rows.iter().map(|r| (r.0, r.3)).collect::<Vec<_>>());
             }
             for _ in 0..8 {
@@ -1451,7 +1516,7 @@ impl Physics {
         let all: Vec<Ref> = self.hums.by_model.keys().copied().collect();
         for m in all {
             let now = self.humanoid_root_now(m);
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+            if crate::physics::hum_debug() {
                 if let (Some((xf, _, w)), Some(v)) = (now, self.humanoid_com_velocity(m)) {
                     // (after the tick, as Studio's StepPhysics shows it:
                     // checks/humanoid-physics/ticks)
@@ -1530,7 +1595,7 @@ impl Physics {
             } else {
                 1
             };
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+            if crate::physics::hum_debug() {
                 eprintln!("HUMARB {} span={} factor={factor:.4} cfl={cfl:.6} slot0={slot0} slot6={slot6}", self.steps, hb.span);
             }
             if let Some(hb) = self.hums.by_model.get_mut(&model) {
@@ -2031,7 +2096,7 @@ impl Physics {
                 }
                 let f = ctl.hum.force(&body, &step, lvl as u32, h);
                 ctl.last = f;
-                if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+                if crate::physics::hum_debug() {
                     eprintln!(
                         "HUMSTEP {} st={:?} lvl={} pos={:.3},{:.3},{:.3} v={:.4},{:.4},{:.4} F={:.1},{:.1},{:.1} dv={:.4},{:.4},{:.4}",
                         self.steps, ctl.hum.state, lvl, body.pos.x, body.pos.y, body.pos.z, body.v.x, body.v.y, body.v.z,
@@ -2076,7 +2141,7 @@ impl Physics {
                             self.hums.floor_levels.insert(fb, self.steps);
                         }
                         let due = self.studio.as_ref().is_some_and(|sv| sv.next_solve(fb).1);
-                        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+                        if crate::physics::hum_debug() {
                             let fl = self.studio.as_ref().map(|sv| sv.next_solve(fb));
                             let fv = self.world.bodies.get(fb).map(|b| gv(b.linvel()));
                             eprintln!("HUMFLOORSV {} lvl={} floor={:?} due={} F={:.1},{:.1},{:.1} at={:.2},{:.2},{:.2} floor_v={:?} step_v={:?}", self.steps, lvl, fl, due,
@@ -2153,7 +2218,7 @@ impl Physics {
             }
             let (f, scale) = if two { (ctl.hum.force(&body, &step, 2, h), 2.0) } else { (ctl.hum.force(&body, &step, 1, h), 1.0) };
             ctl.last = f;
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+            if crate::physics::hum_debug() {
                 eprintln!(
                     "HUMSTEP {} st={:?} lvl={} pos={:.3},{:.3},{:.3} v={:.4},{:.4},{:.4} F={:.1},{:.1},{:.1} s={} w={:.4},{:.4},{:.4} up={:.4},{:.4},{:.4}",
                     self.steps, ctl.hum.state, lvl, body.pos.x, body.pos.y, body.pos.z, body.v.x, body.v.y, body.v.z,
@@ -2174,7 +2239,7 @@ impl Physics {
                 self.pushed.insert(handle);
             }
             let f = crate::humanoid::Force { floor: f.floor.map(|(fl, at)| (fl * scale, at)), ..f };
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() && self.steps % 120 == 0 {
+            if crate::physics::hum_debug() && self.steps % 120 == 0 {
                 let fb = floor_part.and_then(|fp| self.body_of(fp));
                 eprintln!("HUMFLOOR step={} floor={:?} part={:?} body={:?} dyn={:?}", self.steps, f.floor, floor_part, fb,
                     fb.and_then(|b| self.world.bodies.get(b)).map(|b| (b.is_dynamic(), b.mass())));
@@ -2210,7 +2275,7 @@ impl Physics {
 
     /// The floor under a character for the controller (Studio via
     /// `find_floor`) with the floor's velocity, friction mix and solidity.
-    pub fn humanoid_floor(
+    pub fn humanoid_floor<S: std::hash::BuildHasher>(
         &self,
         doc: &Document,
         model: Ref,
@@ -2218,7 +2283,7 @@ impl Physics {
         rot: Quat,
         sh: &HumShape,
         had_floor: bool,
-        own: &std::collections::HashSet<Ref>,
+        own: &std::collections::HashSet<Ref, S>,
     ) -> Option<(Floor, Option<Ref>)> {
         let f = self.find_floor(root, rot, sh, had_floor, own)?;
         let (v, w) = match f.part {

@@ -52,6 +52,9 @@ pub struct ColliderSet {
     pub(crate) colliders: Arena<Collider>,
     pub(crate) modified_colliders: ModifiedColliders,
     pub(crate) removed_colliders: Vec<ColliderHandle>,
+    /// Colliders inserted so far (never decreases).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    inserted: u64,
 }
 
 impl ColliderSet {
@@ -61,6 +64,7 @@ impl ColliderSet {
             colliders: Arena::new(),
             modified_colliders: Default::default(),
             removed_colliders: Vec::new(),
+            inserted: 0,
         }
     }
 
@@ -72,7 +76,13 @@ impl ColliderSet {
             colliders: Arena::with_capacity(capacity),
             modified_colliders: ModifiedColliders::with_capacity(capacity),
             removed_colliders: Vec::new(),
+            inserted: 0,
         }
+    }
+
+    /// How many colliders were ever inserted into this set (a change counter).
+    pub fn inserted_count(&self) -> u64 {
+        self.inserted
     }
 
     /// Fetch the set of colliders modified since the last call to
@@ -172,6 +182,7 @@ impl ColliderSet {
         // if this rigid-body was obtained by cloning another one.
         coll.reset_internal_references();
         coll.parent = None;
+        self.inserted += 1;
         let handle = ColliderHandle(self.colliders.insert(coll));
         // NOTE: we push unchecked because this is a brand-new collider
         //       so it was initialized with the changed flag but isn’t in
@@ -224,6 +235,7 @@ impl ColliderSet {
         let parent = bodies
             .get_mut_internal_with_modification_tracking(parent_handle)
             .expect("Parent rigid body not found.");
+        self.inserted += 1;
         let handle = ColliderHandle(self.colliders.insert(coll));
         let coll = self.colliders.get_mut(handle.0).unwrap();
         // NOTE: we push unchecked because this is a brand-new collider

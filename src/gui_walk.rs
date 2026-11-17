@@ -963,7 +963,15 @@ impl Walk<'_, '_> {
                     rect.expand(th * 0.5),
                     corner.map(|c| c + th * 0.5).unwrap_or(0.0),
                 );
-                self.push(Shape::closed_line(outer, Stroke::new(th, c)), &me);
+                // A UIGradient under the UIStroke colours the stroke.
+                match child_of_class(d, s, "UIGradient") {
+                    Some(g) => {
+                        let gl = GradLut::new(d, g, rect);
+                        let ps = egui::epaint::PathStroke::new_uv(th, move |_, p| gl.tint(p, c));
+                        self.push(Shape::closed_line(outer, ps), &me);
+                    }
+                    None => self.push(Shape::closed_line(outer, Stroke::new(th, c)), &me),
+                }
             }
         }
         if matches!(class.as_str(), "ImageLabel" | "ImageButton") {
@@ -980,7 +988,11 @@ impl Walk<'_, '_> {
             // Text is laid out inside the object's UIPadding (Studio: Laser
             // Tag's right-aligned timer sits 16 px in from the box's right).
             let text_rect = padded(d, r, rect, me.scale);
-            gb.text = self.text(r, &class, text_rect, &me, stroke.filter(|_| stroke_on_text));
+            // A UIGradient on a text object colours its text over the
+            // object's box (its Contextual UIStroke keeps its own colour,
+            // or its own UIGradient's).
+            let fill_grad = gradient.map(|g| GradLut::new(d, g, rect));
+            gb.text = self.text(r, &class, text_rect, &me, stroke.filter(|_| stroke_on_text), fill_grad, rect);
         }
         // ParticleEmitter2D children, over the object, under its children.
         self.particles(r, rect, &me);
@@ -1343,6 +1355,8 @@ impl Walk<'_, '_> {
         rect: Rect,
         me: &Down,
         ui_stroke: Option<Ref>,
+        fill_grad: Option<GradLut>,
+        box_rect: Rect,
     ) -> Option<[f32; 2]> {
         let d = self.input.doc;
         let mut text = text_prop(d, r, "Text");
@@ -1510,6 +1524,7 @@ impl Walk<'_, '_> {
         };
         let pos = Pos2::new(x, y);
         let mut outline: Option<(f32, Color32)> = None;
+        let mut outline_grad: Option<GradLut> = None;
         let stroke_t = num(d, r, "TextStrokeTransparency", 1.0);
         if stroke_t < 1.0 {
             outline = Some((
@@ -1531,25 +1546,30 @@ impl Walk<'_, '_> {
                         (1.0 - st) * (1.0 - tt) * me.alpha,
                     ),
                 ));
+                outline_grad = child_of_class(d, s, "UIGradient").map(|g| GradLut::new(d, g, box_rect));
             }
         }
         if let Some((th, c)) = outline {
+            let tinted = outline_grad.as_ref().map(|gl| recolor_galley(&galley, pos, |p, _| gl.tint(p, c)));
             for k in 0..8 {
                 let a = std::f32::consts::TAU * k as f32 / 8.0;
-                let mut ts =
-                    TextShape::new(pos + egui::vec2(a.cos(), a.sin()) * th, galley.clone(), c);
-                ts.override_text_color = Some(c);
+                let at = pos + egui::vec2(a.cos(), a.sin()) * th;
+                let ts = match &tinted {
+                    Some(g) => TextShape::new(at, g.clone(), c),
+                    None => {
+                        let mut ts = TextShape::new(at, galley.clone(), c);
+                        ts.override_text_color = Some(c);
+                        ts
+                    }
+                };
                 self.push(Shape::Text(ts), me);
             }
         }
-        self.push(
-            Shape::Text(TextShape::new(
-                pos,
-                galley.clone(),
-                rgba(col, (1.0 - tt) * me.alpha),
-            )),
-            me,
-        );
+        let fill = match &fill_grad {
+            Some(gl) => recolor_galley(&galley, pos, |p, c| gl.tint(p, c)),
+            None => galley.clone(),
+        };
+        self.push(Shape::Text(TextShape::new(pos, fill, rgba(col, (1.0 - tt) * me.alpha))), me);
         // Caret in the focused TextBox (blinking).
         if focused { self.gui.no_cache = Some("focused textbox"); }
         if focused && (self.ctx.input(|i| i.time) * 2.0) as i64 % 2 == 0 {

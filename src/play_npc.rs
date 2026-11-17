@@ -38,6 +38,39 @@ pub(crate) struct Npc {
     /// Humanoid.Jump / :ChangeState(Jumping) asked for a jump.
     jump: bool,
     parts: Vec<Ref>,
+    /// What the body is made of as the document had it when last looked at
+    /// (None: look again). Kept until the change journal says something it
+    /// was read from changed (`Npcs::journal`).
+    view: Option<NpcView>,
+    /// The rig's own pose (no Transforms), relative to the root: fixed for
+    /// the rig read at the start.
+    rest: Option<HashMap<Ref, Xform>>,
+    /// The body `transforms` were last put on (`npc_pose`): the same
+    /// Transforms on the same body put every collider where it already is.
+    posed_on: Option<rapier3d::prelude::RigidBodyHandle>,
+}
+
+/// One character's parts and the values read from them, cached between
+/// frames: the walk over its descendants, the part signature hash
+/// (`Physics::refresh_humanoid`) and the CanCollide map were ~200 000
+/// instructions per character per frame on a 230-NPC place (the NPC test place).
+struct NpcView {
+    /// Every BasePart of the model (descendant order).
+    parts: Vec<Ref>,
+    own: std::collections::HashSet<Ref, rustc_hash::FxBuildHasher>,
+    collide: HashMap<Ref, bool>,
+    legs: f32,
+    head: Option<Ref>,
+    /// Every descendant of the model (parts and the rest), to see which
+    /// character a change journal entry is about.
+    members: Vec<Ref>,
+    /// The body's signature as `refresh_humanoid` last found it matching
+    /// the document, when everything it hashes is final (no mesh still
+    /// loading or being decomposed): the check can be skipped while the
+    /// body still carries it and nothing changed.
+    verified: Option<u64>,
+    /// The journal says something it was read from changed.
+    stale: bool,
 }
 
 pub(super) enum NpcEvent {
@@ -52,6 +85,8 @@ pub(crate) struct Npcs {
     by_model: rustc_hash::FxHashMap<Ref, Npc>,
     scan_in: u32,
     pub(super) events: Vec<NpcEvent>,
+    /// Descendant of a driven model → (the model, whether it is a BasePart).
+    member_of: rustc_hash::FxHashMap<Ref, (Ref, bool)>,
 }
 
 impl Npcs {
@@ -150,8 +185,11 @@ impl Editor {
                 floor_material: mech::MATERIAL_AIR,
                 jump: false,
                 parts: parts.clone(),
+                view: None,
+                rest: None,
+                posed_on: None,
             };
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+            if crate::physics::hum_debug() {
                 let name = |r: Ref| self.doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
                 eprintln!("HUMDBG npc added: {} {:?} at {:?} (player's character: {:?})", name(model), model, crate::scene::xform_of(&self.doc, root).map(|x| x.pos), mine.map(name));
             }
@@ -170,6 +208,11 @@ impl Editor {
     fn npc_remove(&mut self, model: Ref) {
         let Some(s) = self.play.as_mut() else { return };
         let Some(n) = s.npcs.by_model.remove(&model) else { return };
+        if let Some(v) = &n.view {
+            for m in &v.members {
+                s.npcs.member_of.remove(m);
+            }
+        }
         let v = s.physics.humanoid_root(model).map(|(_, v, _)| v);
         s.physics.remove_humanoid(model);
         s.physics.skip.retain(|x| !n.parts.contains(x));
@@ -194,6 +237,7 @@ impl Editor {
                 s.npcs.scan_in -= 1;
             }
         }
+        self.npc_journal();
         let models: Vec<Ref> = self.play.as_ref().map(|s| s.npcs.by_model.keys().copied().collect()).unwrap_or_default();
         let gravity = self.play.as_ref().map(|s| s.physics.gravity).unwrap_or(mech::GRAVITY);
         // The ownership boundary: characters a script kept on the server
@@ -227,32 +271,41 @@ impl Editor {
                 self.npc_remove(model);
                 continue;
             }
-            // The body, at the parts' poses.
-            let parts: Vec<(Ref, Xform)> = self
-                .doc
-                .dom
-                .descendants_of(model)
-                .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .filter_map(|i| crate::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
-                .collect();
+            if self.play.as_ref().and_then(|s| s.npcs.by_model.get(&model)).is_some_and(|n| n.view.as_ref().is_none_or(|v| v.stale)) {
+                if let Some(s) = self.play.as_mut() {
+                    npc_view(&self.doc, &mut s.npcs, model);
+                }
+            }
             let doc_root = crate::scene::xform_of(&self.doc, root);
+            // The body, at the parts' poses (only when it is built or its
+            // parts may have changed).
+            let posed = |doc: &Document, list: &[Ref]| -> Vec<(Ref, Xform)> {
+                list.iter().filter_map(|r| crate::scene::xform_of(doc, *r).map(|x| (*r, x))).collect()
+            };
             {
                 let s = self.play.as_mut().expect("playing");
+                let Some(n) = s.npcs.by_model.get_mut(&model) else { continue };
+                let view = n.view.as_mut().expect("npc view");
                 if !s.physics.has_humanoid(model) {
+                    let parts = posed(&self.doc, &view.parts);
                     s.physics.add_humanoid(&self.doc, model, root, &parts);
-                    if let Some(n) = s.npcs.by_model.get_mut(&model) {
-                        n.last_root = doc_root;
-                    }
+                    view.verified = None;
+                    n.last_root = doc_root;
                 } else {
-                    s.physics.refresh_humanoid(&self.doc, model, root, &parts);
+                    let sig = s.physics.humanoid_sig_of(model);
+                    if view.verified.is_none() || view.verified != sig {
+                        let parts = posed(&self.doc, &view.parts);
+                        s.physics.refresh_humanoid(&self.doc, model, root, &parts);
+                        view.verified = crate::physics::Physics::humanoid_parts_settled(&self.doc, &view.parts)
+                            .then(|| s.physics.humanoid_sig_of(model))
+                            .flatten();
+                    }
                     // A script moved the root: the whole assembly goes there.
-                    let last = s.npcs.by_model.get(&model).and_then(|n| n.last_root);
+                    let last = n.last_root;
                     if let (Some(last), Some(xf)) = (last, doc_root) {
                         if (xf.pos - last.pos).length() > 1e-4 || !(xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) {
                             s.physics.teleport_humanoid(model, &xf);
-                            if let Some(n) = s.npcs.by_model.get_mut(&model) {
-                                n.last_root = Some(xf);
-                            }
+                            n.last_root = Some(xf);
                         }
                     }
                 }
@@ -275,27 +328,12 @@ impl Editor {
                 _ => Vec3::ZERO,
             };
             let move_dir = if move_dir.is_finite() { move_dir.clamp_length_max(1.0) } else { Vec3::ZERO };
-            let legs = |d: &Document, r6: bool| {
-                if r6 {
-                    ["Left Leg", "Right Leg"]
-                        .iter()
-                        .filter_map(|n| d.find_named(model, n))
-                        .filter_map(|r| crate::scene::vec3_of(d.prop(r, "Size")))
-                        .map(|s| s.y)
-                        .fold(0.0f32, f32::max)
-                } else {
-                    0.0
-                }
-            };
-            let own: HashSet<Ref> = parts.iter().map(|p| p.0).collect();
-            let mut collide: HashMap<Ref, bool> = HashMap::new();
-            for (r, _) in &parts {
-                collide.insert(*r, !matches!(self.doc.prop(*r, "CanCollide"), Some(Variant::Bool(false))));
-            }
-            let head = self.doc.find_named(model, "Head");
             let s = self.play.as_mut().expect("playing");
             let doc = &self.doc;
             let Some(n) = s.npcs.by_model.get_mut(&model) else { continue };
+            // (Out while the rest of the frame borrows the maps; back at the end.)
+            let Some(view) = n.view.take() else { continue };
+            let (own, collide, head, legs) = (&view.own, &view.collide, view.head, view.legs);
             let Some((root_xf, root_v, root_w)) = s.physics.humanoid_root(model) else { continue };
             if let Some(c) = s.physics.humanoid_ctl(model) {
                 n.hum = c.hum.clone();
@@ -316,13 +354,13 @@ impl Editor {
             let state = n.hum.state;
             let rot = glam::Quat::from_mat3(&root_xf.rot);
             let floor = if senses_floor(state) {
-                s.physics.humanoid_floor(doc, model, root_xf.pos, rot, &n.shape, n.had_floor, &own)
+                s.physics.humanoid_floor(doc, model, root_xf.pos, rot, &n.shape, n.had_floor, own)
             } else {
                 None
             };
             n.had_floor = floor.is_some();
             n.floor_part = floor.and_then(|f| f.1);
-            let full_hip = n.shape.root_size.y * 0.5 + legs(doc, n.r6) + hip_height;
+            let full_hip = n.shape.root_size.y * 0.5 + legs + hip_height;
             let jump = std::mem::take(&mut n.jump) || jump_prop;
             let inp = FrameIn {
                 dt,
@@ -388,7 +426,70 @@ impl Editor {
             s.physics.set_humanoid_ctl(model, Some(ctl));
             let air_parts: Vec<Ref> = [head, Some(root)].into_iter().flatten().collect();
             s.physics.humanoid_air_friction(model, &air_parts, freefall);
-            s.physics.sync_humanoid_collide(model, &collide);
+            s.physics.sync_humanoid_collide(model, collide);
+            if let Some(n) = s.npcs.by_model.get_mut(&model) {
+                n.view = Some(view);
+            }
+        }
+    }
+
+    /// What changed in the document since the last frame: the characters
+    /// whose parts (or anything read from them) it touched look again.
+    /// Motion (CFrame, velocities, joint transforms) and looks don't change
+    /// what a body is made of; anything else on a part, a rename of any
+    /// descendant, and any tree change inside a model does.
+    fn npc_journal(&mut self) {
+        let marks = self.doc.marks_for(doc::Reader::Npcs);
+        let Some(s) = self.play.as_mut() else { return };
+        let npcs = &mut s.npcs;
+        let mut dirty: Vec<Ref> = Vec::new();
+        match marks {
+            doc::Marks::All => dirty.extend(npcs.by_model.keys().copied()),
+            doc::Marks::Some(list) => {
+                thread_local! {
+                    static MOTION: Vec<rbx_dom_weak::Ustr> = [
+                        "CFrame", "Velocity", "RotVelocity", "AssemblyLinearVelocity", "AssemblyAngularVelocity",
+                        "Position", "Orientation", "Rotation", "Transform", "LocalTransparencyModifier",
+                        "Transparency", "Color", "BrickColor", "Color3uint8", "Reflectance", "CastShadow", "Locked",
+                    ]
+                    .iter()
+                    .map(|n| ustr(n))
+                    .collect();
+                }
+                let name_key = ustr("Name");
+                MOTION.with(|motion| {
+                    for m in list {
+                        match m {
+                            doc::Mark::Prop(r, name) => {
+                                let Some(&(model, part)) = npcs.member_of.get(&r) else { continue };
+                                let relevant = if part { !motion.contains(&name) } else { name == name_key };
+                                if relevant {
+                                    dirty.push(model);
+                                }
+                            }
+                            doc::Mark::Tree(r) => {
+                                if let Some(&(model, _)) = npcs.member_of.get(&r) {
+                                    dirty.push(model);
+                                }
+                                // Something new under a model (or moved into one).
+                                let mut cur = r;
+                                while let Some(i) = self.doc.dom.get_by_ref(cur) {
+                                    if npcs.by_model.contains_key(&cur) {
+                                        dirty.push(cur);
+                                    }
+                                    cur = i.parent();
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        for m in dirty {
+            // (npc_view reads it again; the members map follows there.)
+            if let Some(v) = npcs.by_model.get_mut(&m).and_then(|n| n.view.as_mut()) {
+                v.stale = true;
+            }
         }
     }
 
@@ -397,16 +498,25 @@ impl Editor {
     pub(super) fn npc_pose(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
         let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        let key = ustr("Transform");
         for (model, n) in s.npcs.by_model.iter_mut() {
             let mut transforms = HashMap::new();
             for j in &n.rig.joints {
-                if let Some(Variant::CFrame(cf)) = self.doc.dom.get_by_ref(j.motor).and_then(|i| i.properties.get(&ustr("Transform")).cloned()) {
-                    transforms.insert(j.motor, Xform::from_cframe(&cf));
+                if let Some(Variant::CFrame(cf)) = self.doc.dom.get_by_ref(j.motor).and_then(|i| i.properties.get(&key)) {
+                    transforms.insert(j.motor, Xform::from_cframe(cf));
                 }
             }
+            let body = s.physics.humanoid_body_handle(*model);
+            // (Unchanged: set_humanoid_pose would find every collider and
+            // the mass already where they are.)
+            if body.is_some() && n.posed_on == body && transforms == n.transforms {
+                continue;
+            }
             let local: HashMap<Ref, Xform> = n.rig.solve(ident, &transforms).into_iter().collect();
-            let rest: HashMap<Ref, Xform> = n.rig.solve(ident, &HashMap::new()).into_iter().collect();
-            s.physics.set_humanoid_pose(*model, &local, &rest);
+            let rest = n.rest.get_or_insert_with(|| n.rig.solve(ident, &HashMap::new()).into_iter().collect());
+            // (The rest mass once per body.)
+            s.physics.set_humanoid_pose_with(*model, &local, (n.posed_on != body || body.is_none()).then_some(&*rest));
+            n.posed_on = body;
             n.transforms = transforms;
         }
     }
@@ -453,4 +563,42 @@ impl Editor {
             }
         }
     }
+}
+
+/// Reads a character's parts into its `NpcView`.
+fn npc_view(doc: &Document, npcs: &mut Npcs, model: Ref) {
+    let Some(n) = npcs.by_model.get_mut(&model) else { return };
+    let mut members = Vec::new();
+    let mut parts = Vec::new();
+    for i in doc.dom.descendants_of(model) {
+        let r = i.referent();
+        let part = doc::is_a(&i.class, "BasePart");
+        members.push(r);
+        npcs.member_of.insert(r, (model, part));
+        // (A part without a pose isn't part of the body.)
+        if part && crate::scene::xform_of(doc, r).is_some() {
+            parts.push(r);
+        }
+    }
+    if let Some(old) = n.view.take() {
+        for m in old.members {
+            if !members.contains(&m) && npcs.member_of.get(&m).is_some_and(|(o, _)| *o == model) {
+                npcs.member_of.remove(&m);
+            }
+        }
+    }
+    let legs = if n.r6 {
+        ["Left Leg", "Right Leg"]
+            .iter()
+            .filter_map(|name| doc.find_named(model, name))
+            .filter_map(|r| crate::scene::vec3_of(doc.prop(r, "Size")))
+            .map(|s| s.y)
+            .fold(0.0f32, f32::max)
+    } else {
+        0.0
+    };
+    let own: std::collections::HashSet<Ref, rustc_hash::FxBuildHasher> = parts.iter().copied().collect();
+    let collide: HashMap<Ref, bool> = parts.iter().map(|r| (*r, !matches!(doc.prop(*r, "CanCollide"), Some(Variant::Bool(false))))).collect();
+    let head = doc.find_named(model, "Head");
+    n.view = Some(NpcView { parts, own, collide, legs, head, members, verified: None, stale: false });
 }

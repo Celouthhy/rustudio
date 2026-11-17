@@ -192,6 +192,13 @@ pub struct World {
     pub avatar_descs: HashSet<Ref>,
     /// Instances with at least one connection or waiter (fires on others are dropped early).
     pub listening: rustc_hash::FxHashSet<Ref>,
+    /// Instances something ever connected to (or waited on) for a touch event
+    /// (`TOUCH_EVENTS`): Studio gives such a part a TouchTransmitter and only then
+    /// tests its overlaps; a Humanoid here wants its limbs' touches (Humanoid.Touched).
+    /// Kept after a disconnect (testing a pair nobody hears changes nothing).
+    pub touch_refs: rustc_hash::FxHashSet<Ref>,
+    /// Bumped when `touch_refs` grows.
+    pub touch_rev: u64,
     /// Something connected to (or waits on) game.ItemChanged: every
     /// property change then becomes a Changed fire and an ItemChanged
     /// (services' `on_fire`). Set on connect, recomputed once a frame
@@ -561,6 +568,8 @@ impl World {
             avatar: None,
             avatar_descs: HashSet::new(),
             listening: Default::default(),
+            touch_refs: Default::default(),
+            touch_rev: 0,
             item_changed: false,
             class_watches: Vec::new(),
             abs_seen: HashMap::new(),
@@ -598,6 +607,14 @@ impl World {
     pub fn record(&mut self, op: RepOp) {
         if self.side == Side::Server && self.has_peer {
             self.rep.push(op);
+        }
+    }
+
+    /// A connection or waiter on `r`'s event `name`: a touch event marks `r` as
+    /// wanting its overlaps tested (`touch_refs`).
+    pub fn note_touch_interest(&mut self, r: Ref, name: &str) {
+        if TOUCH_EVENTS.contains(&name) && self.touch_refs.insert(r) {
+            self.touch_rev += 1;
         }
     }
 
@@ -1480,6 +1497,11 @@ pub fn class_signals(lua: &Lua, classes: Vec<String>) -> mlua::Result<(Value, Va
 
 /// Whether `r` has a connection or a waiter on `event` (true when the
 /// signal tables are busy: then the fire is made and sorted out later).
+/// The events a part's touches fire (play.rs `fire_touches`, rig.rs
+/// `fire_humanoid_touched`): connecting to one is what makes Studio test the part's
+/// overlaps (its TouchTransmitter).
+pub const TOUCH_EVENTS: [&str; 4] = ["Touched", "TouchEnded", "LocalSimulationTouched", "StoppedTouching"];
+
 pub(crate) fn hears(lua: &Lua, r: Ref, event: &str) -> bool {
     let Ok(Some(s)) = lua.try_app_data_ref::<Signals>() else {
         return true;
@@ -4856,13 +4878,17 @@ impl Runtime {
                     s.next_id += 1;
                     let id = s.next_id;
                     let item_changed = name == "ItemChanged";
+                    let touch = crate::runtime::TOUCH_EVENTS.contains(&name.as_str());
                     s.waiters.entry((inst.0, name)).or_default().push((id, th));
-                    (id, item_changed)
+                    (id, item_changed, touch)
                 };
-                let (id, item_changed) = id;
+                let (id, item_changed, touch) = id;
                 let mut w = world(lua)?;
                 w.item_changed |= item_changed;
                 w.conn_seq = id;
+                if touch {
+                    w.note_touch_interest(inst.0, "Touched");
+                }
                 if w.listening.insert(inst.0) && w.side == Side::Client {
                     w.listen_new.push(inst.0);
                 }
@@ -4906,6 +4932,7 @@ impl Runtime {
                 if let Some(mut w) = lua.app_data_mut::<World>() {
                     w.conn_seq = id;
                     w.item_changed |= name == "ItemChanged";
+                    w.note_touch_interest(inst.0, &name);
                     if w.listening.insert(inst.0) {
                         ext::seed_unlaid(&mut w, inst.0);
                         if w.side == Side::Client {

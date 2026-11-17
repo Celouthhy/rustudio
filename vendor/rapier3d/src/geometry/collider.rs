@@ -418,7 +418,7 @@ impl Collider {
     /// Does nothing if the collider has no parent.
     pub fn set_translation_wrt_parent(&mut self, translation: Vector) {
         if let Some(parent) = self.parent.as_mut() {
-            self.changes.insert(ColliderChanges::PARENT);
+            self.changes.insert(ColliderChanges::PARENT_OFFSET);
             parent.pos_wrt_parent.translation = translation;
         }
     }
@@ -428,7 +428,7 @@ impl Collider {
     /// Rotates the collider relative to its parent. Does nothing if no parent.
     pub fn set_rotation_wrt_parent(&mut self, rotation: AngVector) {
         if let Some(parent) = self.parent.as_mut() {
-            self.changes.insert(ColliderChanges::PARENT);
+            self.changes.insert(ColliderChanges::PARENT_OFFSET);
             parent.pos_wrt_parent.rotation = rotation_from_angle(rotation);
         }
     }
@@ -438,7 +438,7 @@ impl Collider {
     /// Does nothing if the collider is not attached to a rigid-body.
     pub fn set_position_wrt_parent(&mut self, pos_wrt_parent: Pose) {
         if let Some(parent) = self.parent.as_mut() {
-            self.changes.insert(ColliderChanges::PARENT);
+            self.changes.insert(ColliderChanges::PARENT_OFFSET);
             parent.pos_wrt_parent = pos_wrt_parent;
         }
     }
@@ -458,6 +458,29 @@ impl Collider {
             self.changes.insert(ColliderChanges::GROUPS);
             self.flags.collision_groups = groups;
         }
+    }
+
+    /// Whether nobody needs this collider's sensor overlaps (see `ColliderFlags::touch_quiet`).
+    pub fn touch_quiet(&self) -> bool {
+        self.flags.touch_quiet
+    }
+
+    /// Marks this collider's sensor overlaps as unneeded (or needed again). A change
+    /// re-pairs the collider like a collision-groups change.
+    pub fn set_touch_quiet(&mut self, quiet: bool) {
+        if self.flags.touch_quiet != quiet {
+            self.changes.insert(ColliderChanges::GROUPS);
+            self.flags.touch_quiet = quiet;
+        }
+    }
+
+    /// Whether an intersection pair between these two colliders is wanted: false when
+    /// one of them is a sensor and both are quiet.
+    #[inline]
+    pub fn touch_wanted(&self, other: &Collider) -> bool {
+        !(self.flags.touch_quiet
+            && other.flags.touch_quiet
+            && (self.is_sensor() || other.is_sensor()))
     }
 
     /// The solver groups for this collider (advanced collision filtering).
@@ -1494,6 +1517,7 @@ impl ColliderBuilder {
             } else {
                 ColliderEnabled::Disabled
             },
+            touch_quiet: false,
         };
         let changes = ColliderChanges::all();
         let pos = ColliderPosition(self.position);

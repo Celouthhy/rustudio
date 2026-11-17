@@ -35,6 +35,13 @@ bitflags::bitflags! {
         /// following its particles): BF & NF updates, no NF pair workspace invalidation, never
         /// recycled.
         const DEFORMED = 1 << 9;
+        /// Flag indicating that only the collider's offset from its (unchanged) parent body
+        /// was modified (`set_position_wrt_parent` & co.): BF & NF updates like a move, but
+        /// no forced broad-phase re-insertion or solver-color reassignment (the pair-filter
+        /// inputs and the bodies of its pairs are the same), and no parent mass-properties
+        /// recomputation for a massless collider (its offset adds nothing to them).
+        /// (rustudio: an animated character re-poses every limb collider each frame.)
+        const PARENT_OFFSET = 1 << 10;
     }
 }
 
@@ -49,6 +56,7 @@ impl ColliderChanges {
     pub fn needs_broad_phase_update(self) -> bool {
         self.intersects(
             ColliderChanges::PARENT
+                | ColliderChanges::PARENT_OFFSET
                 | ColliderChanges::POSITION
                 | ColliderChanges::SHAPE
                 | ColliderChanges::ENABLED_OR_DISABLED
@@ -117,6 +125,18 @@ impl From<MassProperties> for ColliderMassProps {
 }
 
 impl ColliderMassProps {
+    /// Whether this collider adds nothing to its parent's mass properties (no mass, no
+    /// inertia), whatever its shape and offset.
+    pub fn is_massless(&self) -> bool {
+        match self {
+            ColliderMassProps::Density(density) => *density == 0.0,
+            ColliderMassProps::Mass(mass) => *mass == 0.0,
+            ColliderMassProps::MassProperties(mp) => {
+                mp.inv_mass == 0.0 && mp.inv_principal_inertia == Default::default()
+            }
+        }
+    }
+
     /// The mass-properties of this collider.
     ///
     /// If `self` is the `Density` variant, then this computes the mass-properties based
@@ -393,6 +413,10 @@ pub struct ColliderFlags {
     pub active_events: ActiveEvents,
     /// Whether or not the collider is enabled.
     pub enabled: ColliderEnabled,
+    /// Nobody needs this collider's sensor overlaps (rustudio: no Touched listener on its
+    /// part). An intersection (sensor) pair whose two colliders are both quiet is never
+    /// created nor tested; contact pairs are unaffected.
+    pub touch_quiet: bool,
 }
 
 impl Default for ColliderFlags {
@@ -404,6 +428,7 @@ impl Default for ColliderFlags {
             active_hooks: ActiveHooks::empty(),
             active_events: ActiveEvents::empty(),
             enabled: ColliderEnabled::Enabled,
+            touch_quiet: false,
         }
     }
 }

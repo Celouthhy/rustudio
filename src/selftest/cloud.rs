@@ -10,7 +10,9 @@
 //!   CreatorType, PlaceVersion).
 //! - Ctrl+S against a local mock of Roblox (nothing is sent to Roblox):
 //!   someone saved in between, so it stops with the conflict; Overwrite
-//!   saves the next version; without a publishing key it says why.
+//!   saves the next revision, then Publish sends a published revision.
+//! - Publish As relinks the document and saves only the submitted snapshot.
+//!   The next Save sends the edits made while Publish As was pending.
 //! - Signed out, the cached copy reopens.
 //!
 //! Signed out, the Baseplate part is skipped and a made-up origin is used.
@@ -31,8 +33,14 @@ use crate::doc::Document;
 const BASEPLATE: u64 = 95206881;
 const BASEPLATE_UNIVERSE: u64 = 28220420;
 const TEMPLATES: u64 = 998796;
+const AS_PLACE: u64 = 101;
+const AS_UNIVERSE: u64 = 102;
 /// Another account's private place.
 const NO_ACCESS: u64 = 100000005;
+const MOCK_COOKIE: &str = ".ROBLOSECURITY=rustudio-selftest-mock-session";
+const MOCK_CSRF: &str = "rustudio-selftest-csrf";
+const ASSETS: &str = "/apis/assets/user-auth/v1/assets";
+const OPERATIONS: &str = "/apis/assets/user-auth/v1/operations";
 
 #[derive(Default)]
 pub(super) struct CloudTest {
@@ -45,42 +53,134 @@ pub(super) struct CloudTest {
     /// The version Baseplate opened at.
     version: u64,
     mock: Option<MockServer>,
-    server_version: Option<Arc<Mutex<u64>>>,
 }
 
-fn mock_api(base: &str, key: Option<&str>) -> crate::cloud_ui::ApiFactory {
+fn mock_api(base: &str) -> crate::cloud_ui::ApiFactory {
     let base = base.to_string();
-    let key = key.map(str::to_string);
     Arc::new(move || {
-        let s = Session::unchecked(
-            Cookie::new("rustudio-selftest-mock-session")?,
+        let session = Session::unchecked(
+            Cookie::new(MOCK_COOKIE)?,
             Profile {
                 id: 1,
                 name: "selftest".into(),
                 display_name: "selftest".into(),
             },
         );
-        Some(CloudApi::new(s, Endpoints::mock(&base), key.clone()))
+        Some(CloudApi::new(session, Endpoints::mock(&base), None))
     })
 }
 
-/// A pretend Roblox for the save: asset delivery reports `server`,
-/// Place Publishing answers the next version.
-fn mock_roblox(place: u64, universe: u64, server: Arc<Mutex<u64>>) -> Option<MockServer> {
+fn session_authenticated(r: &MockRequest) -> bool {
+    r.header("cookie") == Some(MOCK_COOKIE)
+        && r.header("x-api-key").is_none()
+}
+
+fn upload_parts(r: &MockRequest) -> Option<(serde_json::Value, &[u8])> {
+    let boundary = r.header("content-type")?
+        .strip_prefix("multipart/form-data; boundary=")?
+        .trim_matches('"');
+    let separator = format!("\r\n--{boundary}\r\n");
+    let body = r.body.strip_prefix(format!("--{boundary}\r\n").as_bytes())?
+        .strip_suffix(format!("\r\n--{boundary}--\r\n").as_bytes())?;
+    let split = body.windows(separator.len()).position(|w| w == separator.as_bytes())?;
+    let part = |bytes: &'_ [u8]| {
+        bytes.windows(4).position(|w| w == b"\r\n\r\n")
+    };
+    let request = &body[..split];
+    let file = &body[split + separator.len()..];
+    let (request_head, file_head) = (part(request)?, part(file)?);
+    if !std::str::from_utf8(&request[..request_head]).ok()?.contains("name=\"request\"")
+        || !std::str::from_utf8(&file[..file_head]).ok()?.contains("name=\"fileContent\"")
+    {
+        return None;
+    }
+    Some((serde_json::from_slice(&request[request_head + 4..]).ok()?, &file[file_head + 4..]))
+}
+
+fn operation_id(revision: u64, published: bool) -> String {
+    format!("{revision}-{published}")
+}
+
+/// Loopback asset delivery, place upload and operation polling.
+fn mock_roblox(place: u64, version: u64) -> Option<MockServer> {
+    let server = Mutex::new((version, None));
     MockServer::start(Arc::new(move |r: &MockRequest| {
-        let v = *server.lock().unwrap();
+        let mut state = server.lock().unwrap();
+        let (revision, last_published) = &mut *state;
         if r.path.starts_with(&format!("/assetdelivery/v2/assetId/{place}")) {
             return MockReply::json(200, r#"{"locations":[{"location":"http://127.0.0.1:9/none"}]}"#)
-                .with_header("roblox-assetversionnumber", &v.to_string());
+                .with_header("roblox-assetversionnumber", &revision.to_string());
         }
-        if r.method == "POST" && r.path.starts_with(&format!("/apis/universes/v1/{universe}/places/{place}/versions")) {
-            let mut g = server.lock().unwrap();
-            *g += 1;
-            return MockReply::json(200, &format!("{{\"versionNumber\":{}}}", *g));
+        if r.path == format!("/apis/universes/v1/places/{AS_PLACE}/universe") {
+            return MockReply::json(200, &format!(r#"{{"universeId":{AS_UNIVERSE}}}"#));
+        }
+        if r.path == format!("/develop/v1/universes/{AS_UNIVERSE}") {
+            return MockReply::json(200, &format!(r#"{{"id":{AS_UNIVERSE},"name":"Upload destination","rootPlaceId":{AS_PLACE}}}"#));
+        }
+        if r.path.starts_with(&format!("/assetdelivery/v2/assetId/{AS_PLACE}")) {
+            return MockReply::json(200, r#"{"locations":[{"location":"http://127.0.0.1:9/none"}]}"#)
+                .with_header("roblox-assetversionnumber", &revision.to_string());
+        }
+        let upload = r.method == "PATCH"
+            && (r.path == format!("{ASSETS}/{place}") || r.path == format!("{ASSETS}/{AS_PLACE}"));
+        let poll = r.method == "GET" && r.path.starts_with(&format!("{OPERATIONS}/"));
+        if (upload || poll) && !session_authenticated(r) {
+            return MockReply::json(401, r#"{"message":"mock: session required"}"#);
+        }
+        if upload {
+            if r.header("x-csrf-token") != Some(MOCK_CSRF) {
+                return MockReply::json(403, r#"{"message":"mock: CSRF token required"}"#)
+                    .with_header("x-csrf-token", MOCK_CSRF);
+            }
+            if let Some(published) = upload_parts(r).and_then(|(metadata, _)| metadata["published"].as_bool()) {
+                *revision += 1;
+                *last_published = Some(published);
+                let id = operation_id(*revision, published);
+                return MockReply::json(200, &format!(r#"{{"path":"operations/{id}","done":false}}"#));
+            }
+            return MockReply::json(400, r#"{"message":"mock: expected multipart place upload with published flag"}"#);
+        }
+        if let Some(published) = *last_published {
+            if poll && r.path == format!("{OPERATIONS}/{}", operation_id(*revision, published)) {
+                return MockReply::json(200, &format!(
+                    r#"{{"done":true,"response":{{"revisionId":"{revision}","isPublished":{published}}}}}"#
+                ));
+            }
         }
         MockReply::json(404, r#"{"errors":[{"code":0,"message":"mock: no route"}]}"#)
     }))
     .ok()
+}
+
+/// Checks the write, its CSRF retry, and the authenticated operation poll in order.
+fn uploaded_bytes(requests: &[MockRequest], place: u64, revision: u64, published: bool) -> Option<&[u8]> {
+    let [initial, retry, poll] = requests else { return None };
+    let path = format!("{ASSETS}/{place}");
+    if initial.method != "PATCH" || retry.method != "PATCH"
+        || initial.path != path || retry.path != path
+        || initial.header("x-csrf-token").is_some()
+        || retry.header("x-csrf-token") != Some(MOCK_CSRF)
+        || initial.body != retry.body
+        || poll.method != "GET"
+        || poll.path != format!("{OPERATIONS}/{}", operation_id(revision, published))
+        || !requests.iter().all(session_authenticated)
+    {
+        return None;
+    }
+    let (metadata, bytes) = upload_parts(retry)?;
+    (metadata["assetType"].as_str() == Some("Place")
+        && metadata["assetId"].as_u64() == Some(place)
+        && metadata["published"].as_bool() == Some(published))
+        .then_some(bytes)
+}
+
+pub(super) fn mock_session_upload() -> bool {
+    let Some(mock) = mock_roblox(AS_PLACE, 1) else { return false };
+    let Some(api) = mock_api(&mock.base)() else { return false };
+    let bytes = b"<roblox!\x00\xff";
+    let revision = api.upload_place(AS_UNIVERSE, AS_PLACE, bytes, false, VersionType::Saved);
+    matches!(revision, Ok(2))
+        && uploaded_bytes(&mock.requests(), AS_PLACE, 2, false) == Some(bytes.as_slice())
 }
 
 impl SelfTest {
@@ -242,15 +342,13 @@ impl SelfTest {
                 self.cloud_note(line.as_deref().is_some_and(|l| l.contains(&want)), format!("Play printed {line:?}"));
                 ed.stop_play();
                 // Ctrl+S with someone else's newer version on (mock) Roblox.
-                let server = Arc::new(Mutex::new(self.cloud.version + 1));
-                self.cloud.mock = mock_roblox(BASEPLATE, BASEPLATE_UNIVERSE, server.clone());
-                self.cloud.server_version = Some(server);
+                self.cloud.mock = mock_roblox(BASEPLATE, self.cloud.version + 1);
                 let Some(base) = self.cloud.mock.as_ref().map(|m| m.base.clone()) else {
                     self.cloud_note(false, "the mock server didn't start".into());
                     self.cloud_next(f, 9);
                     return false;
                 };
-                ed.cloud.api_override = Some(mock_api(&base, Some("selftest-key")));
+                ed.cloud.api_override = Some(mock_api(&base));
                 ed.cloud.conflict = None;
                 ed.cloud.last_saved = None;
                 ed.run_action("save");
@@ -260,11 +358,11 @@ impl SelfTest {
                 if ed.cloud.conflict.is_none() && ed.cloud.save_error.is_none() && waited < 20 {
                     return false;
                 }
-                let posts = self.mock_posts();
+                let uploads = self.mock_upload_requests();
                 let c = ed.cloud.conflict;
                 self.cloud_note(
-                    c.is_some_and(|c| c.opened == self.cloud.version && c.server == self.cloud.version + 1) && posts.is_empty(),
-                    format!("Ctrl+S after someone saved: conflict {c:?} (asked the user; {} upload(s) sent)", posts.len()),
+                    c.is_some_and(|c| c.opened == self.cloud.version && c.server == self.cloud.version + 1) && uploads.is_empty(),
+                    format!("Ctrl+S after someone saved: conflict {c:?} (asked the user; {} upload(s) sent)", uploads.len()),
                 );
                 // "Overwrite".
                 ed.cloud.conflict = None;
@@ -275,35 +373,38 @@ impl SelfTest {
                 if ed.cloud.last_saved.is_none() && ed.cloud.save_error.is_none() && waited < 20 {
                     return false;
                 }
-                let posts = self.mock_posts();
+                let uploads = self.mock_upload_requests();
                 let want = self.cloud.version + 2;
                 let v = ed.doc.cloud.as_ref().map(|o| o.version);
+                let upload = uploaded_bytes(&uploads, BASEPLATE, want, false);
+                let bytes_ok = upload.and_then(|bytes| Document::from_place_bytes(bytes, String::new()).ok())
+                    .is_some_and(|doc| doc.dom.descendants().any(|i| i.name == "CloudIds"));
                 let ok = ed.cloud.last_saved == Some((want, VersionType::Saved))
                     && v == Some(want)
                     && !ed.doc.dirty()
-                    && posts.len() == 1
-                    && posts[0].path.ends_with(&format!("/universes/v1/{BASEPLATE_UNIVERSE}/places/{BASEPLATE}/versions?versionType=Saved"))
-                    && posts[0].header("x-api-key") == Some("selftest-key");
+                    && bytes_ok;
                 self.cloud_note(ok, format!(
-                    "Overwrite: saved version {:?}, document at version {v:?}, unsaved changes {}, {} upload(s) to the mock ({:?}); error {:?}",
-                    ed.cloud.last_saved, ed.doc.dirty(), posts.len(), posts.first().map(|p| p.path.clone()), ed.cloud.save_error
+                    "Overwrite: saved revision {:?}, document at {v:?}, dirty={}, session upload snapshot={bytes_ok}, error {:?}",
+                    ed.cloud.last_saved, ed.doc.dirty(), ed.cloud.save_error
                 ));
-                // Without a publishing key.
-                let base = self.cloud.mock.as_ref().map(|m| m.base.clone()).unwrap_or_default();
-                ed.cloud.api_override = Some(mock_api(&base, None));
-                ed.cloud.save_error = None;
                 ed.ui_action(&egui::Context::default(), "publish");
                 self.cloud_next(f, 8);
             }
             8 => {
-                if ed.cloud.save_error.is_none() && waited < 20 {
+                let want = self.cloud.version + 3;
+                let complete = ed.cloud.last_saved == Some((want, VersionType::Published));
+                if !complete && ed.cloud.save_error.is_none() && waited < 20 {
                     return false;
                 }
-                let e = ed.cloud.save_error.take().unwrap_or_default();
-                let posts = self.mock_posts();
+                let uploads = self.mock_upload_requests();
+                let published = uploads.get(3..)
+                    .and_then(|requests| uploaded_bytes(requests, BASEPLATE, want, true))
+                    .is_some();
+                let version = ed.doc.cloud.as_ref().map(|o| o.version);
                 self.cloud_note(
-                    e.contains("Open Cloud API key") && posts.len() == 1,
-                    format!("Publish without a key: {:?}…; nothing more sent: {}", e.chars().take(90).collect::<String>(), posts.len() == 1),
+                    complete && published && version == Some(want) && !ed.doc.dirty(),
+                    format!("Publish: session upload and poll={published}, result={:?}, document at {version:?}, error {:?}",
+                        ed.cloud.last_saved, ed.cloud.save_error),
                 );
                 // Signed out: the cached copy reopens.
                 ed.cloud.api_override = Some(Arc::new(|| None));
@@ -322,10 +423,69 @@ impl SelfTest {
                 if self.cloud.mock.is_some() {
                     let v = ed.doc.cloud.as_ref().map(|o| o.version);
                     self.cloud_note(
-                        reopened && v == Some(self.cloud.version + 2),
+                        reopened && v == Some(self.cloud.version + 3),
                         format!("signed out, reopened from the cache: {reopened} (version {v:?}); error {:?}", ed.cloud.open_error),
                     );
                 }
+                if let Some(base) = self.cloud.mock.as_ref().map(|m| m.base.clone()) {
+                    ed.cloud.api_override = Some(mock_api(&base));
+                    let ctx = egui::Context::default();
+                    ed.ui_action(&ctx, "save_roblox_as");
+                    let saved_mode = ed.cloud_upload_mode() == Some(VersionType::Saved);
+                    ed.ui_action(&ctx, "publish_as");
+                    let published_mode = ed.cloud_upload_mode() == Some(VersionType::Published);
+                    let accepted = ed.submit_cloud_upload(AS_UNIVERSE, AS_PLACE, VersionType::Published);
+                    self.cloud_note(saved_mode && published_mode && accepted.is_ok() && ed.cloud_upload_pending(),
+                        format!("As routes: Saved={saved_mode}, Published={published_mode}, submission={accepted:?}"));
+                    ed.doc.insert(ed.doc.dom.root_ref(), InstanceBuilder::new("Folder").with_name("EditAfterSubmit"));
+                    self.cloud_next(f, 10);
+                    return false;
+                }
+                self.cloud_next(f, 12);
+            }
+            10 => {
+                if ed.cloud_upload_pending() && waited < 20 {
+                    return false;
+                }
+                let want = self.cloud.version + 4;
+                let linked = ed.doc.cloud.as_ref().is_some_and(|o|
+                    (o.universe_id, o.place_id, o.version) == (AS_UNIVERSE, AS_PLACE, want));
+                let recent = ed.cloud.cache.recent().first().is_some_and(|r| r.origin.place_id == AS_PLACE);
+                let uploads = self.mock_upload_requests();
+                let bytes = uploads.get(6..)
+                    .and_then(|requests| uploaded_bytes(requests, AS_PLACE, want, true));
+                let cached = ed.cloud.cache.load(AS_PLACE, Some(want))
+                    .is_some_and(|(_, cached, _)| bytes == Some(cached.as_slice()));
+                let snapshot = bytes.and_then(|bytes| Document::from_place_bytes(bytes, String::new()).ok())
+                    .is_some_and(|doc| {
+                        doc.dom.descendants().any(|i| i.name == "CloudIds")
+                            && !doc.dom.descendants().any(|i| i.name == "EditAfterSubmit")
+                    });
+                self.cloud_note(linked && recent && cached && snapshot && ed.doc.dirty()
+                    && ed.cloud_upload_result() == Some(&Ok(Some(want))),
+                    format!("Publish As: relinked={linked}, recent={recent}, cached upload bytes={cached}, published snapshot={snapshot}, dirty={}, result={:?}",
+                        ed.doc.dirty(), ed.cloud_upload_result()));
+                ed.close_cloud_upload();
+                ed.ui_action(&egui::Context::default(), "save_roblox");
+                self.cloud_next(f, 11);
+            }
+            11 => {
+                if ed.cloud_upload_pending() && waited < 20 {
+                    return false;
+                }
+                let uploads = self.mock_upload_requests();
+                let want = self.cloud.version + 5;
+                let saved = uploads.get(9..)
+                    .and_then(|requests| uploaded_bytes(requests, AS_PLACE, want, false))
+                    .and_then(|bytes| Document::from_place_bytes(bytes, String::new()).ok())
+                    .is_some_and(|doc| doc.dom.descendants().any(|i| i.name == "EditAfterSubmit"));
+                let linked = ed.doc.cloud.as_ref().is_some_and(|o|
+                    (o.universe_id, o.place_id, o.version) == (AS_UNIVERSE, AS_PLACE, want));
+                self.cloud_note(saved && linked && ed.cloud.last_saved == Some((want, VersionType::Saved))
+                    && !ed.doc.dirty(), format!("Save after relinking: saved later edit={saved}, linked={linked}, dirty={}", ed.doc.dirty()));
+                self.cloud_next(f, 12);
+            }
+            12 => {
                 ed.cloud.api_override = None;
                 self.cloud.mock = None;
                 self.steps.push(Step {
@@ -341,11 +501,17 @@ impl SelfTest {
         false
     }
 
-    fn mock_posts(&self) -> Vec<MockRequest> {
+    fn mock_upload_requests(&self) -> Vec<MockRequest> {
         self.cloud
             .mock
             .as_ref()
-            .map(|m| m.requests().into_iter().filter(|r| r.method == "POST").collect())
+            .map(|m| {
+                m.requests().into_iter().filter(|r| {
+                    r.method == "PATCH"
+                        || r.path.starts_with(OPERATIONS)
+                        || (r.method == "POST" && r.path.contains("/versions"))
+                }).collect()
+            })
             .unwrap_or_default()
     }
 }

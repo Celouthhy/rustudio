@@ -324,6 +324,8 @@ pub struct ContactStore {
     /// This tick's touch transitions of the pairs narrow.rs makes alone (collider 1, 2,
     /// started), handed to rapier's event handler by step.rs.
     pub events: Vec<(rp::ColliderHandle, rp::ColliderHandle, bool)>,
+    /// `class_of`: collider index → (generation, narrow.rs class).
+    classes: Vec<(u32, u8)>,
 }
 
 fn cidx(c: rp::ColliderHandle) -> u32 {
@@ -362,6 +364,10 @@ impl ContactStore {
             }
             let Some(b) = rb.get(bodies.handle[s]) else { continue };
             for &ch in b.colliders() {
+                // (A sensor's pairs are intersection pairs: it has no contact pair.)
+                if colliders.get(ch).is_none_or(|c| c.is_sensor()) {
+                    continue;
+                }
                 for pair in np.contact_pairs_with(ch) {
                     // Each pair once: from its lower awake dynamic slot.
                     let other = if pair.collider1 == ch { pair.collider2 } else { pair.collider1 };
@@ -444,7 +450,10 @@ impl ContactStore {
         };
         let (h1, h2) = (co1.parent(), co2.parent());
         let (s1, s2) = (h1.map(|h| bodies.slot(h)).unwrap_or(NONE), h2.map(|h| bodies.slot(h)).unwrap_or(NONE));
-        let (g1, g2) = (narrow::shape_of(co1, bodies), narrow::shape_of(co2, bodies));
+        // Only a pair narrow.rs handles needs its shapes and frames (a mesh's class
+        // scans its hull: once per collider, `class_of`).
+        let handled = self.class_of(pair.collider1, co1) != 0 && self.class_of(pair.collider2, co2) != 0;
+        let (g1, g2) = if handled { (narrow::shape_of(co1, bodies), narrow::shape_of(co2, bodies)) } else { (None, None) };
         if let (Some(g1), Some(g2)) = (g1, g2) {
             if narrow::handles(&g1, &g2) {
                 // Studio's own narrow phase (narrow.rs, GEOM.md): one Contact per pair.
@@ -493,6 +502,11 @@ impl ContactStore {
         self.list.pairs += 1;
         for m in manifolds {
             if !m.data.solver_flags.contains(rp::SolverFlags::COMPUTE_RIGID_IMPULSES) {
+                continue;
+            }
+            // No points and no state from earlier ticks: nothing to place (the check
+            // below, without the poses).
+            if m.points.is_empty() && !self.map.contains_key(&ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: m.subshape1, sub2: m.subshape2 }) {
                 continue;
             }
             let wp1 = match m.subshape_pos1() {
@@ -556,6 +570,21 @@ impl ContactStore {
             }
         }
         self.flush_keys();
+    }
+
+    /// narrow.rs's class of a collider's shape (`narrow::handled_class`, 0 = not
+    /// narrow.rs's), kept per collider: physics.rs never changes a collider's shape in
+    /// place (a new shape is a new collider), and a reused index has a new generation.
+    fn class_of(&mut self, c: rp::ColliderHandle, co: &rp::Collider) -> u8 {
+        let (i, g) = c.into_raw_parts();
+        let i = i as usize;
+        if self.classes.len() <= i {
+            self.classes.resize(i + 1, (u32::MAX, 0));
+        }
+        if self.classes[i].0 != g {
+            self.classes[i] = (g, narrow::handled_class(co.shape()));
+        }
+        self.classes[i].1
     }
 
     /// The persistent state of a manifold key (created on first use).

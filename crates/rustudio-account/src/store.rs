@@ -1,11 +1,5 @@
-//! The publishing key in the system keyring (Secret Service on Linux,
-//! Credential Manager on Windows), and the entries the session cookie and
-//! saved accounts use (see [`crate::session`]).
-//!
-//! The session cookie is the only sign-in (docs/AUTH.md). This Open Cloud API key
-//! is kept only for publishing places, because Roblox doesn't accept the
-//! cookie for uploading a place version yet (docs/MECHANICS.md, "Account"); it
-//! goes once publishing over the cookie works.
+//! System keyring entries for the signed-in session and saved accounts.
+//! Legacy publishing-key entries remain accessible for older clients.
 
 use crate::{Error, Result};
 

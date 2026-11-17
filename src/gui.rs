@@ -487,6 +487,60 @@ fn sample_gradient(d: &Document, g: Ref, t: f32) -> ([f32; 3], f32) {
     (c, a)
 }
 
+/// A UIGradient over a rect, owned (sampled into a table), for text glyphs
+/// and stroke paths whose colour callbacks outlive the walk's borrow.
+#[derive(Clone)]
+struct GradLut {
+    lut: Arc<Vec<([f32; 3], f32)>>,
+    rect: Rect,
+    dir: egui::Vec2,
+    offset: [f32; 2],
+}
+
+impl GradLut {
+    const STEPS: usize = 256;
+    fn new(d: &Document, g: Ref, rect: Rect) -> GradLut {
+        let rot = num(d, g, "Rotation", 0.0).to_radians();
+        GradLut {
+            lut: Arc::new((0..Self::STEPS).map(|i| sample_gradient(d, g, i as f32 / (Self::STEPS - 1) as f32)).collect()),
+            rect,
+            dir: egui::vec2(rot.cos(), rot.sin()),
+            offset: vec2(d, g, "Offset", [0.0, 0.0]),
+        }
+    }
+    fn at(&self, p: Pos2) -> ([f32; 3], f32) {
+        let u = (p.x - self.rect.center().x) / self.rect.width().max(1e-3) - self.offset[0];
+        let v = (p.y - self.rect.center().y) / self.rect.height().max(1e-3) - self.offset[1];
+        let t = (u * self.dir.x + v * self.dir.y + 0.5).clamp(0.0, 1.0);
+        self.lut[(t * (Self::STEPS - 1) as f32).round() as usize]
+    }
+    /// A premultiplied colour times the gradient at p.
+    fn tint(&self, p: Pos2, c: Color32) -> Color32 {
+        let (g, t) = self.at(p);
+        let k = 1.0 - t;
+        let m = |x: u8, f: f32| (x as f32 * f * k).round().clamp(0.0, 255.0) as u8;
+        Color32::from_rgba_premultiplied(m(c.r(), g[0]), m(c.g(), g[1]), m(c.b(), g[2]), m(c.a(), 1.0))
+    }
+}
+
+/// A copy of a laid-out galley drawn at `pos` with every vertex colour
+/// replaced by `f(screen position, colour)` (UIGradient over text).
+fn recolor_galley(
+    galley: &Arc<egui::Galley>,
+    pos: Pos2,
+    f: impl Fn(Pos2, Color32) -> Color32,
+) -> Arc<egui::Galley> {
+    let mut g = (**galley).clone();
+    for pr in &mut g.rows {
+        let off = pos.to_vec2() + pr.pos.to_vec2();
+        let row = Arc::make_mut(&mut pr.row);
+        for v in &mut row.visuals.mesh.vertices {
+            v.color = f(v.pos + off, v.color);
+        }
+    }
+    Arc::new(g)
+}
+
 /// A UIGradient over a rect: point → (colour, transparency).
 struct Grad<'a> {
     d: &'a Document,
@@ -1024,6 +1078,26 @@ pub(crate) fn fallback_fonts() -> &'static [&'static [u8]] {
 }
 
 impl Gui {
+    /// Faces that weren't there, looked for again once a second: true when
+    /// one has turned up (what was drawn without it must be walked again).
+    /// A GUI with text in a missing face (the test place's 200 NPC name tags)
+    /// was walked every frame so that `family` would ask again.
+    pub(crate) fn retry_missing_faces(&mut self, store: &mut AssetStore) -> bool {
+        let due: Vec<(String, u32, bool)> = self
+            .faces
+            .iter()
+            .filter(|(k, (p, at))| p.is_none() && at.elapsed().as_secs_f32() >= 1.0 && store.allows(&k.0))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut found = false;
+        for key in due {
+            let p = face_file(store, &key.0, key.1, key.2, &self.fonts_failed);
+            found |= p.is_some();
+            self.faces.insert(key, (p, std::time::Instant::now()));
+        }
+        found
+    }
+
     /// The egui family for a font (Studio's file for the nearest available
     /// face); egui's default font until the file has been added (next frame).
     fn family(
@@ -1048,8 +1122,8 @@ impl Gui {
             }
         };
         let Some(path) = path else {
-            // (looked for again in a second)
-            self.no_cache = Some("font face missing");
+            // (looked for again in a second, by `retry_missing_faces`: GUIs
+            // drawn without it are kept until it turns up)
             return FontFamily::Proportional;
         };
         if !store.allows(&path) {

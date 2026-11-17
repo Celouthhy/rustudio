@@ -76,7 +76,10 @@ impl Editor {
         let open = |n: &str| Some(self.ui.panels_open.contains(n));
         match a {
             "new" | "open" | "open_roblox" | "open_folder" | "close_place" | "import_model" => (edit, None),
-            "save" | "save_as" | "save_roblox" | "publish" => (edit, None),
+            "save" | "save_as" => (edit, None),
+            "save_roblox" | "save_roblox_as" | "publish" | "publish_as" => {
+                (edit && self.doc.kind == crate::doc::DocKind::Place, None)
+            }
             "export_project" => (edit, None),
             "project_settings" => (edit && self.project.is_some(), None),
             "experience_settings" | "account" | "add_account" => (true, None),
@@ -209,26 +212,26 @@ impl Editor {
             a if a.starts_with("character:") => self.character_action(&a["character:".len()..]),
             // "Save to File": a place from Roblox goes to a file too (Ctrl+S
             // saves it to Roblox).
-            "save" if self.doc.cloud.is_some() => match self.doc.path.clone() {
+            "save" if self.doc.cloud.is_some() || self.live_team_create_ids().is_some() => match self.doc.path.clone() {
                 Some(p) => self.save_to(p),
                 None => self.save_as(),
             },
             "save" => self.save(),
             "save_as" => self.save_as(),
-            "save_roblox" | "publish" if self.doc.cloud.is_some() => {
-                let vt = if a == "publish" {
-                    rustudio_account::VersionType::Published
-                } else {
-                    rustudio_account::VersionType::Saved
+            "save_roblox" | "save_roblox_as" | "publish" | "publish_as" => {
+                use rustudio_account::VersionType;
+                let vt = match a {
+                    "publish" | "publish_as" => VersionType::Published,
+                    _ => VersionType::Saved,
                 };
-                if self.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
+                let linked = self.doc.cloud.is_some() || self.live_team_create_ids().is_some();
+                if matches!(a, "save_roblox_as" | "publish_as") || !linked {
+                    self.open_roblox_destination(vt);
+                } else if self.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
                     self.cloud.confirm_copy_save = Some(vt);
                 } else {
                     self.save_cloud(vt, false);
                 }
-            }
-            "save_roblox" | "publish" => {
-                self.account.show_publish = true;
             }
             "account" => self.account.open = true,
             "add_account" => {

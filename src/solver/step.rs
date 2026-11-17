@@ -1450,3 +1450,82 @@ mod gyro_guard_tests {
         assert_eq!(a.1, b.1);
     }
 }
+
+/// The collision pipeline changes behind the default solver (vendored rapier):
+/// touch-quiet sensor pairs and offset-only collider moves.
+#[cfg(test)]
+mod collision_change_tests {
+    use rapier3d::prelude as rp;
+
+    fn world() -> (rp::PhysicsWorld, rp::ColliderHandle) {
+        let mut w = rp::PhysicsWorld::new();
+        let ground = w.insert_collider(rp::ColliderBuilder::cuboid(10.0, 0.5, 10.0), None);
+        (w, ground)
+    }
+
+    fn detect(w: &mut rp::PhysicsWorld) {
+        w.detect_collisions(&(), &());
+    }
+
+    /// A sensor pair is made and tested unless both colliders are touch-quiet; a quiet
+    /// collider gaining interest again re-pairs. Contact pairs ignore the flag.
+    #[test]
+    fn quiet_sensor_pairs_are_skipped() {
+        let (mut w, ground) = world();
+        let b = w.insert_body(rp::RigidBodyBuilder::dynamic().translation(rp::Vector::new(0.0, 0.6, 0.0)).build());
+        let sensor = w.insert_collider(rp::ColliderBuilder::ball(0.5).sensor(true), Some(b));
+        let solid = w.insert_collider(rp::ColliderBuilder::cuboid(0.4, 0.4, 0.4), Some(b));
+        detect(&mut w);
+        assert_eq!(w.narrow_phase.intersection_pair(sensor, ground), Some(true));
+        for c in [sensor, ground, solid] {
+            w.colliders.get_mut(c).unwrap().set_touch_quiet(true);
+        }
+        detect(&mut w);
+        assert_ne!(w.narrow_phase.intersection_pair(sensor, ground), Some(true), "both quiet: no overlap test");
+        assert!(w.narrow_phase.contact_pair(solid, ground).is_some_and(|p| p.has_any_active_contact()), "contacts unaffected");
+        w.colliders.get_mut(ground).unwrap().set_touch_quiet(false);
+        detect(&mut w);
+        assert_eq!(w.narrow_phase.intersection_pair(sensor, ground), Some(true), "interest back: pair again");
+        let before = w.colliders.inserted_count();
+        w.insert_collider(rp::ColliderBuilder::ball(0.1), None);
+        assert_eq!(w.colliders.inserted_count(), before + 1);
+    }
+
+    /// Moving a collider within its body (set_position_wrt_parent) moves it in the
+    /// world and in the broad / narrow phases as a body move would.
+    #[test]
+    fn offset_moves_update_pairs() {
+        let (mut w, ground) = world();
+        let b = w.insert_body(rp::RigidBodyBuilder::dynamic().translation(rp::Vector::new(0.0, 5.0, 0.0)).build());
+        let c = w.insert_collider(rp::ColliderBuilder::cuboid(0.4, 0.4, 0.4), Some(b));
+        detect(&mut w);
+        assert!(!w.narrow_phase.contact_pair(c, ground).is_some_and(|p| p.has_any_active_contact()));
+        // Down by 4.2: the box's bottom 0.4 into the ground's top at 0.5.
+        w.colliders.get_mut(c).unwrap().set_position_wrt_parent(rp::Pose::from_translation(rp::Vector::new(0.0, -4.2, 0.0)));
+        detect(&mut w);
+        let y = w.colliders.get(c).unwrap().position().translation.y;
+        assert!((y - 0.8).abs() < 1e-5, "world pose follows the offset: {y}");
+        assert!(w.narrow_phase.contact_pair(c, ground).is_some_and(|p| p.has_any_active_contact()), "new contact found");
+        w.colliders.get_mut(c).unwrap().set_position_wrt_parent(rp::Pose::IDENTITY);
+        detect(&mut w);
+        assert!(!w.narrow_phase.contact_pair(c, ground).is_some_and(|p| p.has_any_active_contact()), "contact gone");
+        // A massive collider's offset still moves the body's centre of mass; a massless
+        // one's leaves the mass properties alone.
+        // (rapier's collision pipeline recomputes a body's mass properties on the step
+        // after a collider change marked it, before as after PARENT_OFFSET.)
+        w.colliders.get_mut(c).unwrap().set_position_wrt_parent(rp::Pose::from_translation(rp::Vector::new(1.0, 0.0, 0.0)));
+        detect(&mut w);
+        detect(&mut w);
+        let com = w.bodies.get(b).unwrap().center_of_mass();
+        assert!((com.x - 1.0).abs() < 1e-5, "centre of mass follows: {com:?}");
+        let ghost = w.insert_collider(rp::ColliderBuilder::cuboid(0.4, 0.4, 0.4).density(0.0), Some(b));
+        detect(&mut w);
+        detect(&mut w);
+        let m = w.bodies.get(b).unwrap().mass();
+        w.colliders.get_mut(ghost).unwrap().set_position_wrt_parent(rp::Pose::from_translation(rp::Vector::new(-3.0, 0.0, 0.0)));
+        detect(&mut w);
+        detect(&mut w);
+        let bd = w.bodies.get(b).unwrap();
+        assert_eq!((bd.mass(), bd.center_of_mass().x), (m, com.x));
+    }
+}

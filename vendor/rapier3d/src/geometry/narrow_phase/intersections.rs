@@ -106,6 +106,12 @@ impl NarrowPhase {
                     break 'emit_events;
                 }
 
+                // Nobody needs this pair's overlaps.
+                if !co1.touch_wanted(co2) {
+                    edge.weight.intersecting = false;
+                    break 'emit_events;
+                }
+
                 let active_hooks = co1.flags.active_hooks | co2.flags.active_hooks;
 
                 if active_hooks.contains(ActiveHooks::FILTER_INTERSECTION_PAIR) {

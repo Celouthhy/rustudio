@@ -60,6 +60,9 @@ struct Frame {
 
 pub struct Seq {
     joints: Vec<(String, Joint)>,
+    /// Joint name → its first entry in `joints` (the step looks each rig
+    /// joint up in every posing track).
+    index: rustc_hash::FxHashMap<String, usize>,
     frames: Vec<Frame>,
     length: f64,
     looped: bool,
@@ -105,7 +108,7 @@ pub struct Tracks {
     seqs: HashMap<String, Rc<Seq>>,
     /// rig → (Part1 name, joint): the joints a rig's tracks animate, found
     /// when it starts animating and kept while it does.
-    animated: Vec<(Ref, Vec<(String, Ref)>)>,
+    animated: Vec<(Ref, Rc<Vec<(String, Ref)>>)>,
     /// rig → the rig Studio builds from it for retargeting (None: not an R15
     /// Humanoid rig), kept while it animates.
     char_rigs: HashMap<Ref, Option<Rc<super::anim_retarget::Rig>>>,
@@ -171,8 +174,13 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
         }
         None => None,
     };
+    let mut index: rustc_hash::FxHashMap<String, usize> = Default::default();
+    for (i, (n, _)) in joints.iter().enumerate() {
+        index.entry(n.clone()).or_insert(i);
+    }
     Ok(Seq {
         rig,
+        index,
         joints,
         frames,
         length: t.get::<Option<f64>>("length")?.unwrap_or(0.0),
@@ -715,15 +723,21 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     };
     // rig → tracks posing it, in step order.
     let mut by_rig: Vec<(Ref, Vec<Ref>)> = Vec::new();
+    // (rig → its entry in by_rig)
+    let mut rig_at: rustc_hash::FxHashMap<Ref, usize> = Default::default();
     for r in order {
         if step_track(lua, r, dt)? {
             let rig = tracks(lua).all.get(&r).map(|s| s.rig).unwrap_or_else(Ref::none);
-            match by_rig.iter_mut().find(|e| e.0 == rig) {
-                Some(e) => e.1.push(r),
-                None => by_rig.push((rig, vec![r])),
+            match rig_at.get(&rig) {
+                Some(&i) => by_rig[i].1.push(r),
+                None => {
+                    rig_at.insert(rig, by_rig.len());
+                    by_rig.push((rig, vec![r]));
+                }
             }
         }
     }
+    let mut retarget_on: Option<bool> = None;
     for (rig, list) in &by_rig {
         let joints = {
             let t = tracks(lua);
@@ -732,7 +746,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         let joints = match joints {
             Some(j) => j,
             None => {
-                let j = joints_of(lua, *rig)?;
+                let j = Rc::new(joints_of(lua, *rig)?);
                 tracks(lua).animated.push((*rig, j.clone()));
                 j
             }
@@ -745,17 +759,21 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 .filter_map(|s| s.seq.clone().map(|q| (q, s.weight, rank(&s.priority), s.time)))
                 .collect()
         };
-        let retarget = retargeting_enabled(lua)?;
+        // (Once per step: nothing in this loop runs a script.)
+        let retarget = match retarget_on {
+            Some(v) => v,
+            None => *retarget_on.insert(retargeting_enabled(lua)?),
+        };
         let mut posing_rt = Vec::with_capacity(posing.len());
         for (seq, w, rk, time) in posing {
             let rt = if retarget { retargeter_for(lua, &seq, *rig)? } else { None };
             posing_rt.push((seq, w, rk, time, rt));
         }
-        for (name, motor) in &joints {
+        for (name, motor) in joints.iter() {
             // This joint's poses by priority level, highest first.
             let mut levels: Vec<(i64, Vec<(Xform, f64)>)> = Vec::new();
             for (seq, w, rk, time, rt) in &posing_rt {
-                let Some((_, j)) = seq.joints.iter().find(|(n, _)| n == name) else { continue };
+                let Some((_, j)) = seq.index.get(name.as_str()).map(|&i| &seq.joints[i]) else { continue };
                 let Some(cf) = sample(lua, j, *time)? else { continue };
                 // Retargeted onto this rig's proportions (anim_retarget.rs).
                 let cf = match rt {
@@ -814,10 +832,10 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         }
     }
     // Rigs whose tracks all faded out go back to their rest pose once.
-    let gone: Vec<(Ref, Vec<(String, Ref)>)> = {
+    let gone: Vec<(Ref, Rc<Vec<(String, Ref)>>)> = {
         let mut t = tracks(lua);
         let (keep, gone): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut t.animated).into_iter().partition(|e| by_rig.iter().any(|b| b.0 == e.0));
+            std::mem::take(&mut t.animated).into_iter().partition(|e| rig_at.contains_key(&e.0));
         t.animated = keep;
         for (r, _) in &gone {
             t.char_rigs.remove(r);
@@ -826,8 +844,8 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         gone
     };
     for (_, joints) in gone {
-        for (_, m) in joints {
-            write_transform(lua, m, super::anim_ik::ident())?;
+        for (_, m) in joints.iter() {
+            write_transform(lua, *m, super::anim_ik::ident())?;
         }
     }
     // The Animator holds playing and fading tracks only: a released one is

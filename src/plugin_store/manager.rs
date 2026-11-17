@@ -215,9 +215,16 @@ impl PluginManager {
         let check = self.last_user_check.is_none_or(|t| t.elapsed().as_millis() > 1000);
         if check {
             self.last_user_check = Some(std::time::Instant::now());
-            let who = client.as_ref().and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.user_id())));
-            self.signed_in = who.is_some();
-            if let Some(uid) = who {
+            // Account workers can be using the session during a network request.
+            // Keep the last sign-in state until the next tick if the lock is busy.
+            let who = match client.as_ref() {
+                None => Some(None),
+                Some(client) => client.try_lock().ok().map(|g| g.as_ref().map(|c| c.user_id())),
+            };
+            if let Some(current) = who {
+                self.signed_in = current.is_some();
+            }
+            if let Some(Some(uid)) = who {
                 self.switch_user(uid);
                 if self.sync_requested_for != Some(uid) && self.loading_on() {
                     self.sync_requested_for = Some(uid);
@@ -592,6 +599,28 @@ pub fn fetch_for_install(s: &Session, user_id: u64, asset_id: u64, acquire: bool
 mod tests {
     use super::super::tests::{tiny_rbxm, tmp};
     use super::*;
+
+    #[test]
+    fn frame_keeps_account_state_while_session_is_busy() {
+        let root = tmp("busy-session");
+        let store = Store::open(root.clone(), root.join("Plugins"), 0);
+        let mut manager = PluginManager::new(store, Box::new(NoRuntime::default()));
+        manager.signed_in = true;
+        let client = SharedClient::default();
+        let held = client.clone();
+        let (ready, locked) = channel();
+        let (done, release) = channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            ready.send(()).unwrap();
+            let _ = release.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        locked.recv().unwrap();
+        manager.tick(Some(client), 1);
+        let _ = done.send(());
+        worker.join().unwrap();
+        assert!(manager.signed_in);
+    }
 
     #[test]
     fn startup_loads_one_per_frame_in_order_and_toggles_live() {

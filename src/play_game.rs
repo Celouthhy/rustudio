@@ -2266,6 +2266,18 @@ impl Editor {
             .and_then(|c| c.world.as_ref())
             .is_none_or(|w| !w.core_gui_off.contains("Chat"));
         open_chat &= chat_on;
+        // SetCoreGuiEnabled(Backpack, false) turns off Roblox's Backpack
+        // CoreScript: no hotbar is drawn and the number keys equip nothing
+        // (games with their own hotbar, e.g. the test place's CustomHotbar).
+        let backpack_on = self
+            .play
+            .as_ref()
+            .and_then(|s| s.client.as_ref())
+            .and_then(|c| c.world.as_ref())
+            .is_none_or(|w| !w.core_gui_off.contains("Backpack"));
+        if !backpack_on {
+            slots.clear();
+        }
         // The open menu has the mouse and keys: none of it reaches the game
         // (SettingsHub's Modal shield and RbxSettingsHubStopCharacter).
         let menu = self.play.as_ref().is_some_and(|s| s.game.menu_open);
@@ -2334,7 +2346,7 @@ impl Editor {
             .play
             .as_ref()
             .and_then(|s| s.game.equipped.as_ref().map(|e| e.tool));
-        if !slot_tools.is_empty() {
+        if backpack_on && !slot_tools.is_empty() {
             // (Slots hold server refs: viewing the client, the tool is in
             // the other DataModel.) Drawn as Roblox's Backpack CoreScript
             // does: gui.rs `draw_hotbar`.

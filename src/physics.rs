@@ -1006,6 +1006,12 @@ pub struct Physics {
     asms: HashMap<u32, Assembly>,
     next_asm: u32,
     by_collider: rustc_hash::FxHashMap<rp::ColliderHandle, Ref>,
+    /// The parts whose overlaps something hears (play.rs `sync_touch_interest`); None:
+    /// every part's (no runtime tells). See `apply_touch_quiet`.
+    touch_parts: Option<rustc_hash::FxHashSet<Ref>>,
+    touch_gen: u64,
+    /// (touch_gen, colliders inserted) `apply_touch_quiet` last ran for.
+    touch_applied: Option<(u64, u64)>,
     /// Rigid joints: joint → (Part0, Part1), and part → its joints.
     joints: HashMap<Ref, (Ref, Ref)>,
     adj: HashMap<Ref, Vec<Ref>>,
@@ -1123,6 +1129,13 @@ fn tick_dump_on() -> bool {
 }
 
 /// The world step: Studio's 1/240 s. (hz, iterations, max steps a frame)
+/// RUSTUDIO_HUM_DEBUG is set (read once: the Humanoid paths asked the
+/// environment per character per step).
+pub fn hum_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some())
+}
+
 pub fn step_rate() -> (f32, usize, usize) {
     (mech::PHYSICS_HZ, mech::PHYSICS_SUBSTEPS, mech::MAX_PHYSICS_STEPS)
 }
@@ -1190,6 +1203,9 @@ impl Physics {
             asms: HashMap::default(),
             next_asm: 0,
             by_collider: Default::default(),
+            touch_parts: None,
+            touch_gen: 0,
+            touch_applied: None,
             joints: HashMap::default(),
             adj: HashMap::default(),
             collector: Collector::default(),
@@ -2048,7 +2064,9 @@ impl Physics {
         }
         let groups: Vec<Vec<u32>> = buckets.into_values().collect();
         use rapier3d::rayon::prelude::*;
-        let built: Vec<(rp::ColliderBuilder, usize)> = groups
+        // (On the shared pool: a thread that steps physics is a one-worker pool of
+        // its own, `with_inline_pool`.)
+        let build = || -> Vec<(rp::ColliderBuilder, usize)> { groups
             .par_iter()
             .filter_map(|tris| {
                 let mut remap: HashMap<u32, u32> = HashMap::default();
@@ -2074,7 +2092,11 @@ impl Physics {
                         .ok()?;
                 Some((b, n))
             })
-            .collect();
+            .collect() };
+        let built = match par_pool() {
+            Some(pool) => pool.install(build),
+            None => build(),
+        };
         for (b, n) in built {
             let b = b
                 .friction(mech::TERRAIN_FRICTION)
@@ -2968,7 +2990,35 @@ impl Physics {
 
     /// Advances the simulation in fixed steps and writes moved parts' CFrames
     /// back into the document.
+    /// The parts something hears touches of (a Touched / TouchEnded / … connection on
+    /// the part, or Humanoid.Touched on its character): the others' colliders go quiet.
+    pub fn set_touch_interest(&mut self, parts: rustc_hash::FxHashSet<Ref>) {
+        self.touch_parts = Some(parts);
+        self.touch_gen += 1;
+    }
+
+    /// Studio tests a part's overlaps only when it has a TouchTransmitter (a script
+    /// connected to its touch events): an NPC's 1271 CanCollide=false limbs and
+    /// accessories in the NPC test place have none (204 weapon Handles do), and overlap tests
+    /// of such pairs were most of rustudio's collision step. A sensor pair between two
+    /// parts nobody hears is never made (rapier `touch_quiet`); it would only have
+    /// fired events with no listener. Contact pairs are unaffected.
+    fn apply_touch_quiet(&mut self) {
+        let Some(set) = &self.touch_parts else { return };
+        let key = (self.touch_gen, self.world.colliders.inserted_count());
+        if self.touch_applied == Some(key) {
+            return;
+        }
+        self.touch_applied = Some(key);
+        for (c, r) in &self.by_collider {
+            if let Some(co) = self.world.colliders.get_mut(*c) {
+                co.set_touch_quiet(!set.contains(r));
+            }
+        }
+    }
+
     pub fn step(&mut self, doc: &mut Document, dt: f32) -> StepResult {
+        self.apply_touch_quiet();
         self.sync_gravity(doc);
         self.take_script_impulses(doc.id);
         for (r, (v, left)) in std::mem::take(&mut self.pending_vel) {
@@ -3121,37 +3171,25 @@ impl Physics {
         }
     }
 
-    /// One world step (step_rate). A few awake bodies (Place B's ~25
-    /// balloons and sprites among 71k anchored parts) step on one thread of
-    /// their own: rapier's rayon fan-out (BVH refit, pair and solver joins)
-    /// made every small step spin the calling thread for the pool, 2.6 M of
-    /// its instructions per 1/240 s step (checks/Place B-perf/findings.md).
-    /// Many awake bodies still use the whole pool.
+    /// One world step (step_rate). A world with up to
+    /// `mech::PHYSICS_SERIAL_MAX_AWAKE` awake bodies steps on the calling thread,
+    /// inside a one-worker rayon pool that is that thread itself (`with_inline_pool`):
+    /// rapier's rayon fan-out (BVH refit, pair and solver joins) made every small
+    /// step spin the calling thread for the pool, 2.6 M of its instructions per
+    /// 1/240 s step (about 25 awake bodies),
+    /// and handing each step to a thread of its own cost a wake-up per 1/240 s tick
+    /// (the NPC test place under load: 14.3 ms per frame waited on 8.6 ms of step work).
+    /// Many awake bodies use the shared pool (`par_pool`).
     fn world_step(&mut self) {
         let awake = match &self.studio {
             Some(sv) => sv.stats.awake as usize,
             None => self.world.islands.active_bodies().count(),
         };
-        // (Not the stepping thread itself as the pool's worker: rayon would
-        // then run every later par_iter of that thread on this one thread.)
-        static SERIAL: std::sync::OnceLock<Option<rapier3d::rayon::ThreadPool>> = std::sync::OnceLock::new();
         // RUSTUDIO_SOLVER_SERIAL=1 (perf runs): every step on the one thread,
         // so the instruction counter sees all of it (solver/perf.sh).
         static ALL_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let all_serial = *ALL_SERIAL.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_SERIAL").is_some());
-        let pool = (all_serial || awake <= mech::PHYSICS_SERIAL_MAX_AWAKE)
-            .then(|| {
-                SERIAL
-                    .get_or_init(|| {
-                        rapier3d::rayon::ThreadPoolBuilder::new()
-                            .num_threads(1)
-                            .thread_name(|_| "physics-step".into())
-                            .build()
-                            .ok()
-                    })
-                    .as_ref()
-            })
-            .flatten();
+        let serial = all_serial || awake <= mech::PHYSICS_SERIAL_MAX_AWAKE;
         let (world, collector) = (&mut self.world, &self.collector);
         // (Contacts across the network-ownership boundary: physics_humanoid.rs.)
         let owner_hooks = hum_body::OwnerHooks(&self.hums.roles, self.gravity, &self.hums.mid, &self.link, &self.by_collider);
@@ -3174,29 +3212,17 @@ impl Physics {
                 }
             }
             let g = gv(world.gravity);
-            match pool {
-                Some(pool) => {
-                    let ((), work) = pool.install(|| crate::bench::measure(|| sv.step(world, g, hooks, collector)));
-                    crate::bench::add("ph_step_thread", work, 1);
-                    if let Some(c) = self.census.as_ref() {
-                        crate::bench::add(c.section(), work, 1);
-                    }
-                }
-                None => sv.step(world, g, hooks, collector),
+            let ((), work) = run_step(serial, || sv.step(world, g, hooks, collector));
+            if let Some(c) = self.census.as_ref() {
+                crate::bench::add(c.section(), work, 1);
             }
             for (name, cost) in sv.take_costs() {
                 crate::bench::add(name, cost, 1);
             }
         } else {
-            match pool {
-                Some(pool) => {
-                    let ((), work) = pool.install(|| crate::bench::measure(|| world.step_with_events(hooks, collector)));
-                    crate::bench::add("ph_step_thread", work, 1);
-                    if let Some(c) = self.census.as_ref() {
-                        crate::bench::add(c.section(), work, 1);
-                    }
-                }
-                None => world.step_with_events(hooks, collector),
+            let ((), work) = run_step(serial, || world.step_with_events(hooks, collector));
+            if let Some(c) = self.census.as_ref() {
+                crate::bench::add(c.section(), work, 1);
             }
         }
         if let Some(c) = self.census.as_mut() {
@@ -3788,7 +3814,7 @@ impl Physics {
             || [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)].iter().any(|(i, j)| hit(Vec3::new(i * s.x, -s.y, j * s.z)))
     }
 
-    pub fn find_floor(&self, root: Vec3, rot: Quat, sh: &HumShape, had_floor: bool, own: &std::collections::HashSet<Ref>) -> Option<HumFloor> {
+    pub fn find_floor<S: std::hash::BuildHasher>(&self, root: Vec3, rot: Quat, sh: &HumShape, had_floor: bool, own: &std::collections::HashSet<Ref, S>) -> Option<HumFloor> {
         let size = sh.root_size.max(Vec3::splat(mech::FLOOR_RAY_MIN_SIZE));
         let s = size * mech::FLOOR_RAY_SPREAD;
         let len = mech::FLOOR_RAY_EXTRA * (sh.hip + size.y)
@@ -3837,7 +3863,7 @@ impl Physics {
                 }
             }
         }
-        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+        if crate::physics::hum_debug() {
             eprintln!(
                 "HUMFLOOR root={:.3},{:.3},{:.3} len={len:.3} held={had_floor} s={:?} hits {:?}",
                 root.x,
@@ -4434,8 +4460,8 @@ mod tests {
         sh.root_size = Vec3::splat(0.01);
         sh.hip = 0.0;
         // Origin is .02 below the root, reach is .3 * .05 = .015.
-        assert!(p.find_floor(Vec3::new(60.0, 0.03, 60.0), Quat::IDENTITY, &sh, false, &HashSet::default()).is_some());
-        assert!(p.find_floor(Vec3::new(60.0, 0.04, 60.0), Quat::IDENTITY, &sh, false, &HashSet::default()).is_none());
+        assert!(p.find_floor(Vec3::new(60.0, 0.03, 60.0), Quat::IDENTITY, &sh, false, &std::collections::HashSet::<Ref>::new()).is_some());
+        assert!(p.find_floor(Vec3::new(60.0, 0.04, 60.0), Quat::IDENTITY, &sh, false, &std::collections::HashSet::<Ref>::new()).is_none());
     }
 
     /// A world with one big floor part (top at y = 0) and what else is given.
@@ -5336,4 +5362,40 @@ mod tests {
         let p = Physics::new(&mut doc);
         assert_eq!(p.counts().0, 1, "one assembly");
     }
+}
+
+/// A world step: `serial` on the calling thread as its own one-worker rayon pool
+/// (rapier's parallel passes then run inline, in their serial order), else on the
+/// shared pool. Its cost (bench::measure units, the thread that ran it) is bench
+/// section `ph_step_thread` (solver/perf.sh, solver_ticks.rs); on the pool that is
+/// the one pool thread's share.
+fn run_step(serial: bool, f: impl FnOnce() + Send) -> ((), f64) {
+    let pool = if serial { None } else { par_pool() };
+    let ((), work) = match pool {
+        Some(pool) => pool.install(|| crate::bench::measure(f)),
+        None => with_inline_pool(|pool| match pool.filter(|_| serial) {
+            Some(pool) => pool.install(|| crate::bench::measure(f)),
+            None => crate::bench::measure(f),
+        }),
+    };
+    crate::bench::add("ph_step_thread", work, 1);
+    ((), work)
+}
+
+/// The calling thread as a one-worker rayon pool (`use_current_thread`): rayon work
+/// started on this thread from now on runs on it, inline. Work meant for many
+/// threads goes through `par_pool` explicitly (big world steps, the terrain build).
+/// None when the thread can't be one (it already is a rayon worker).
+fn with_inline_pool<R>(f: impl FnOnce(Option<&rapier3d::rayon::ThreadPool>) -> R) -> R {
+    thread_local! {
+        static INLINE: Option<rapier3d::rayon::ThreadPool> =
+            rapier3d::rayon::ThreadPoolBuilder::new().num_threads(1).use_current_thread().build().ok();
+    }
+    INLINE.with(|p| f(p.as_ref()))
+}
+
+/// The pool for physics work worth spreading over the machine's threads.
+fn par_pool() -> Option<&'static rapier3d::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rapier3d::rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rapier3d::rayon::ThreadPoolBuilder::new().thread_name(|i| format!("physics-par-{i}")).build().ok()).as_ref()
 }

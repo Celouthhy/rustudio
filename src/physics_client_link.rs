@@ -130,7 +130,7 @@ impl Link {
     /// Whether a query by a character (its parts `own`) should skip this collider:
     /// the player's character skips what its client took out of Workspace, every
     /// other one (NPCs, the server's) skips what only the client has.
-    pub(super) fn hides_from(&self, h: rp::ColliderHandle, by_collider: &rustc_hash::FxHashMap<rp::ColliderHandle, Ref>, own: &std::collections::HashSet<Ref>) -> bool {
+    pub(super) fn hides_from<S: std::hash::BuildHasher>(&self, h: rp::ColliderHandle, by_collider: &rustc_hash::FxHashMap<rp::ColliderHandle, Ref>, own: &std::collections::HashSet<Ref, S>) -> bool {
         if self.is_empty() {
             return false;
         }

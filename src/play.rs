@@ -142,6 +142,16 @@ pub struct SideState {
     world: Option<World>,
 }
 
+impl SideState {
+    /// `f` on this side's World, entered or not.
+    fn with_world<R>(&self, f: impl FnOnce(&World) -> R) -> Option<R> {
+        match &self.world {
+            Some(w) => Some(f(w)),
+            None => self.runtime.world_mut().map(|w| f(&w)),
+        }
+    }
+}
+
 pub struct PlaySession {
     pub mode: RunMode,
     /// Place content loads only Roblox content while this session lives
@@ -158,6 +168,8 @@ pub struct PlaySession {
     pub showing: Side,
     pub map: RepMap,
     pub physics: Physics,
+    /// (server, client) `World::touch_rev` the physics' touch interest was built from.
+    touch_seen: Option<(u64, u64)>,
     pub character: Option<Character>,
     /// The Player instance (server ref).
     pub player: Ref,
@@ -646,6 +658,7 @@ impl Editor {
             showing: Side::Server,
             map,
             physics,
+            touch_seen: None,
             character: None,
             player: Ref::none(),
             respawn_at: None,
@@ -2504,6 +2517,7 @@ impl Editor {
         drop(sc);
         // 3. Physics (server-authoritative for everything not owned by the client).
         let sc = crate::bench::scope("p3_physics_step");
+        self.sync_touch_interest();
         let result = {
             let s = self.play.as_mut().expect("playing");
             s.physics.step(&mut self.doc, dt)
@@ -3537,4 +3551,48 @@ pub(crate) fn studio_collides(name: &str, rig: RigType) -> bool {
 /// before the frame is drawn) apply; the default rapier path keeps its old behaviour.
 fn studio_path() -> bool {
     crate::solver::kind() != crate::solver::SolverKind::Rapier
+}
+
+impl Editor {
+    /// The parts whose touches a script hears, on either side (`World::touch_refs`):
+    /// the part itself, or every part of a character whose Humanoid.Touched is heard
+    /// (rig.rs `fire_humanoid_touched`: the model's direct BasePart children). Given to
+    /// the physics when a side's set grew.
+    fn sync_touch_interest(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let srev = s.server.with_world(|w| w.touch_rev).unwrap_or(0);
+        let crev = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_rev)).unwrap_or(0);
+        if s.touch_seen == Some((srev, crev)) {
+            return;
+        }
+        s.touch_seen = Some((srev, crev));
+        let mut refs: Vec<Ref> = s.server.with_world(|w| w.touch_refs.iter().copied().collect()).unwrap_or_default();
+        let client: Vec<Ref> = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_refs.iter().copied().collect())).unwrap_or_default();
+        for r in client {
+            refs.push(r);
+            if let Some(sr) = s.map.c2s.get(&r) {
+                refs.push(*sr);
+            }
+        }
+        let mut parts: rustc_hash::FxHashSet<Ref> = Default::default();
+        for r in refs {
+            parts.insert(r);
+            for d in [Some(&self.doc), s.other_doc.as_ref()].into_iter().flatten() {
+                let Some(i) = d.dom.get_by_ref(r) else { continue };
+                if i.class != "Humanoid" {
+                    continue;
+                }
+                let model = i.parent();
+                for c in d.dom.get_by_ref(model).map(|m| m.children().to_vec()).unwrap_or_default() {
+                    if d.dom.get_by_ref(c).is_some_and(|ci| doc::is_a(&ci.class, "BasePart")) {
+                        parts.insert(c);
+                        if let Some(sr) = s.map.c2s.get(&c) {
+                            parts.insert(*sr);
+                        }
+                    }
+                }
+            }
+        }
+        s.physics.set_touch_interest(parts);
+    }
 }

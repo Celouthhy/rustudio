@@ -17,7 +17,10 @@ pub(crate) fn handle_user_changes_to_colliders(
         // NOTE: we use `get` because the collider may no longer
         //       exist if it has been removed.
         if let Some(co) = colliders.get_mut_internal(*handle) {
-            if co.changes.contains(ColliderChanges::PARENT) {
+            if co
+                .changes
+                .intersects(ColliderChanges::PARENT | ColliderChanges::PARENT_OFFSET)
+            {
                 if let Some(co_parent) = co.parent {
                     let parent_rb = &bodies[co_parent.handle];
 
@@ -26,12 +29,17 @@ pub(crate) fn handle_user_changes_to_colliders(
                 }
             }
 
-            if co.changes.intersects(
-                ColliderChanges::SHAPE
-                    | ColliderChanges::LOCAL_MASS_PROPERTIES
-                    | ColliderChanges::ENABLED_OR_DISABLED
-                    | ColliderChanges::PARENT,
-            ) {
+            // A massless collider's offset adds nothing to its parent's mass properties.
+            let offset_moves_mass = co.changes.contains(ColliderChanges::PARENT_OFFSET)
+                && !co.mprops.is_massless();
+            if offset_moves_mass
+                || co.changes.intersects(
+                    ColliderChanges::SHAPE
+                        | ColliderChanges::LOCAL_MASS_PROPERTIES
+                        | ColliderChanges::ENABLED_OR_DISABLED
+                        | ColliderChanges::PARENT,
+                )
+            {
                 if let Some(rb) = co
                     .parent
                     .and_then(|p| bodies.get_mut_internal_with_modification_tracking(p.handle))

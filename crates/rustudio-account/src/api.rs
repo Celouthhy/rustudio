@@ -7,13 +7,8 @@ use serde::Serialize;
 
 use crate::config::AccountConfig;
 use crate::session::{self, Cookie, CookieSource, ProfileCache, Session};
-use crate::store::PublishKeyStore;
 use crate::{Error, Result};
 
-/// Open Cloud Place Publishing API, API key only (scope
-/// `universe-places:write`). Kept for publishing until Roblox accepts the
-/// session cookie for place uploads (docs/AUTH.md).
-pub const PUBLISH_URL: &str = "https://apis.roblox.com/universes/v1";
 /// Public develop endpoints used for experience and place names.
 pub const DEVELOP_URL: &str = "https://develop.roblox.com/v1/universes";
 
@@ -111,7 +106,7 @@ pub struct UniverseInfo {
 #[derive(Debug, Clone)]
 pub struct PublishResult {
     pub version_number: u64,
-    /// "publishing key" or "session".
+    /// The authentication method used ("session").
     pub via: &'static str,
 }
 
@@ -314,62 +309,44 @@ impl Client {
         self.session.download_asset(asset_id, version)
     }
 
-    /// Whether a publishing key is saved.
-    pub fn has_publish_key() -> bool {
-        PublishKeyStore::load().ok().flatten().is_some()
+    /// Creates a personal or group experience and returns its universe
+    /// ID and start place ID.
+    /// A configuration error after creation includes both IDs.
+    pub fn create_experience(&self, name: &str, description: &str, group: Option<u64>) -> Result<(u64, u64)> {
+        crate::cloud::create_experience(
+            &self.session,
+            &crate::Endpoints::default(),
+            name,
+            description,
+            group,
+        )
     }
 
-    /// Saves or publishes the place. With the publishing key: Open Cloud
-    /// Place Publishing (Saved or Published). Without it: the session's
-    /// place upload (Data/Upload.ashx with the CSRF token), which Roblox
-    /// currently refuses (docs/MECHANICS.md, "Account"); its answer is reported.
+    /// Adds a place to an experience this account can edit and returns its ID.
+    /// A configuration error after creation includes the new place ID.
+    pub fn create_place(&self, universe: u64, name: &str) -> Result<u64> {
+        crate::cloud::create_place(&self.session, &crate::Endpoints::default(), universe, name)
+    }
+
+    /// Saves or publishes a place through the signed-in session and returns
+    /// the confirmed revision number. The place ID identifies the upload target.
     pub fn publish_place(
         &self,
-        universe_id: u64,
+        _universe_id: u64,
         place_id: u64,
         version_type: VersionType,
         rbxl: &[u8],
         is_xml: bool,
     ) -> Result<PublishResult> {
-        let Some(key) = PublishKeyStore::load()? else {
-            let reply = self.session.upload_place(place_id, rbxl, is_xml)?;
-            return Ok(PublishResult {
-                version_number: reply.trim().parse().unwrap_or(0),
-                via: "session",
-            });
-        };
-        let url = format!(
-            "{PUBLISH_URL}/{universe_id}/places/{place_id}/versions?versionType={}",
-            version_type.as_str()
-        );
-        let content_type = if is_xml {
-            "application/xml"
-        } else {
-            "application/octet-stream"
-        };
-        let mut r = agent()
-            .post(&url)
-            .header("x-api-key", &key)
-            .header("Content-Type", content_type)
-            .send(rbxl)?;
-        let status = r.status().as_u16();
-        let text = r.body_mut().read_to_string()?;
-        if status >= 400 {
-            let detail: String = text.chars().take(300).collect();
-            return Err(Error(format!(
-                "Place Publishing (publishing key) answered HTTP {status}: {}",
-                detail.trim()
-            )));
-        }
-        let version_number = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("versionNumber").and_then(|n| n.as_u64()))
-            .or_else(|| text.trim().trim_matches('"').parse().ok())
-            .unwrap_or(0);
-        Ok(PublishResult {
-            version_number,
-            via: "publishing key",
-        })
+        let version_number = crate::cloud::upload_place(
+            &self.session,
+            &crate::Endpoints::default().apis,
+            place_id,
+            rbxl,
+            is_xml,
+            version_type,
+        )?;
+        Ok(PublishResult { version_number, via: "session" })
     }
 
     /// Keeps this session as a saved account (account switching).

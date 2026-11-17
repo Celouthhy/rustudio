@@ -7,10 +7,10 @@
 //! and place downloads, and state-changing calls with the X-CSRF-TOKEN
 //! dance. Public assets also download anonymously ([`public_asset`]).
 //!
-//! An Open Cloud API key is still accepted for publishing only, until
-//! Roblox takes the cookie for place uploads.
+//! Place saves and publishes also use the signed-in session.
 
 pub mod api;
+mod asset_upload;
 pub mod assets_cloud;
 pub mod avatar;
 pub mod characters;

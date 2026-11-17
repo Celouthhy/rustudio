@@ -13,12 +13,12 @@ use std::sync::Arc;
 use egui::RichText;
 use rustudio_account::cloud::{CloudPlace, GroupInfo, RecentPlace, VersionInfo};
 use rustudio_account::{
-    open_mode, parse_place_ref, CloudApi, CloudOrigin, OpenMode, Endpoints, Experience, ExperienceSource, PlaceCache, PublishKeyStore,
+    open_mode, parse_place_ref, CloudApi, CloudOrigin, OpenMode, Endpoints, Experience, ExperienceSource, PlaceCache,
     SaveOutcome, TeamCreateStatus, VersionType,
 };
 
 use crate::app::{Editor, Level, PendingAction};
-use crate::doc::Document;
+use crate::doc::{DocKind, Document};
 use crate::theme;
 
 type Listing = Option<Result<Vec<Experience>, String>>;
@@ -125,9 +125,7 @@ enum Msg {
     /// Team Create is on: Studio would join, not download.
     TeamCreateOn(Box<CloudOrigin>),
     Status(u64, TeamCreateStatus),
-    Saved { version: u64, revision: u64, vt: VersionType, bytes: Vec<u8> },
-    Conflict { opened: u64, server: u64, vt: VersionType },
-    SaveFailed(String),
+    SaveFinished(SaveJob, Result<SaveOutcome, String>),
     Done,
 }
 
@@ -139,9 +137,21 @@ pub struct Conflict {
     pub vt: VersionType,
 }
 
+struct SaveJob {
+    document: u64,
+    revision: u64,
+    universe: u64,
+    place: u64,
+    vt: VersionType,
+    from_dialog: bool,
+    relink: bool,
+    origin: Option<CloudOrigin>,
+}
+
 struct LiveSave {
     revision: u64,
     vt: VersionType,
+    from_dialog: bool,
     sent: Option<std::time::Instant>,
 }
 
@@ -214,6 +224,10 @@ pub struct CloudUi {
     /// Team Create and edit access of the open document's universe.
     pub status: Option<(u64, TeamCreateStatus)>,
     pub conflict: Option<Conflict>,
+    conflict_from_dialog: bool,
+    save_pending: bool,
+    upload_mode: Option<(u64, VersionType)>,
+    upload_result: Option<Result<Option<u64>, String>>,
     pub save_error: Option<String>,
     /// The last save that went through: (version, Saved/Published).
     pub last_saved: Option<(u64, VersionType)>,
@@ -290,6 +304,10 @@ impl CloudUi {
             live_origin: None,
             status: None,
             conflict: None,
+            conflict_from_dialog: false,
+            save_pending: false,
+            upload_mode: None,
+            upload_result: None,
             save_error: None,
             last_saved: None,
             window_title: String::new(),
@@ -313,13 +331,11 @@ impl CloudUi {
         }
         let ep = self.endpoints.clone();
         Arc::new(move || {
-            // The account lock only for the copy; the keyring read after.
             let session = {
                 let g = client.as_ref()?.lock().ok()?;
                 g.as_ref()?.session.downloader()
             };
-            let key = PublishKeyStore::load().ok().flatten();
-            Some(CloudApi::new(session, ep.clone(), key))
+            Some(CloudApi::new(session, ep.clone(), None))
         })
     }
 
@@ -424,6 +440,10 @@ impl CloudUi {
         self.open_cancelled = self.opening;
     }
 
+    pub fn request_experience_icons(&mut self, client: Option<crate::assets::SharedClient>, ids: Vec<u64>) {
+        self.request_icons(self.factory(client), ids);
+    }
+
     /// Experience icons from thumbnails.roblox.com, each once.
     fn request_icons(&mut self, api: ApiFactory, ids: Vec<u64>) {
         let ids: Vec<u64> = ids.into_iter().filter(|i| self.icons_asked.insert(*i)).collect();
@@ -436,7 +456,7 @@ impl CloudUi {
             for (id, url) in urls {
                 let Ok(bytes) = a.image(&url) else { continue };
                 let Ok(img) = image::load_from_memory(&bytes) else { continue };
-                let img = img.thumbnail(64, 64).to_rgba8();
+                let img = img.thumbnail(150, 150).to_rgba8();
                 let size = [img.width() as usize, img.height() as usize];
                 let _ = tx.send(Msg::Icon(id, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())));
             }
@@ -497,7 +517,8 @@ impl CloudUi {
                     return;
                 }
             };
-            let st = a.team_create(origin.universe_id);
+            let mut st = a.team_create(origin.universe_id);
+            st.enabled = st.enabled.or(origin.team_create);
             origin.team_create = st.enabled;
             let _ = tx.send(Msg::Status(origin.universe_id, st.clone()));
             if open_mode(st.enabled, as_copy) == OpenMode::JoinTeamCreate {
@@ -536,46 +557,49 @@ impl CloudUi {
     }
 
     /// Saves the open cloud document as a new version (Saved or
-    /// Published), after the version check; `overwrite` skips the check.
-    pub fn start_save(
+    /// Published), serializing the submitted snapshot on the save worker.
+    fn start_save(
         &mut self,
         client: Option<crate::assets::SharedClient>,
-        origin: CloudOrigin,
-        bytes: Vec<u8>,
-        revision: u64,
-        vt: VersionType,
+        doc: &Document,
+        mut job: SaveJob,
         overwrite: bool,
     ) {
         self.save_error = None;
         self.conflict = None;
-        self.spawn(self.factory(client), move |a, tx| {
-            let Some(a) = a else {
-                let _ = tx.send(Msg::SaveFailed(format!(
-                    "Save to Roblox needs a session: {}",
-                    Self::signed_out()
-                )));
-                return;
-            };
-            let _ = tx.send(Msg::Log(
-                Level::Info,
-                format!(
-                    "{} place {} (version {} opened; checking Roblox's version first)…",
-                    if vt == VersionType::Published { "Publishing" } else { "Saving" },
-                    origin.place_id,
-                    origin.version
-                ),
-            ));
-            match a.save_place(&origin, &bytes, false, vt, overwrite) {
-                Ok(SaveOutcome::Saved { version }) => {
-                    let _ = tx.send(Msg::Saved { version, revision, vt, bytes });
+        self.save_pending = true;
+        let (dom, roots) = doc.save_snapshot();
+        let cache = self.cache.clone();
+        self.spawn(self.factory(client), move |api, tx| {
+            let result = (|| {
+                let mut api = api.ok_or_else(|| "Sign in to save or publish places to Roblox".to_owned())?;
+                api.session = api.session.with_timeout(std::time::Duration::from_secs(20));
+                let mut bytes = Vec::new();
+                rbx_binary::to_writer(&mut bytes, &dom, &roots)
+                    .map_err(|err| format!("Could not encode the place: {err}"))?;
+                let (mut origin, outcome) = if let Some(origin) = job.origin.take() {
+                    let outcome = api.save_place(&origin, &bytes, false, job.vt, overwrite)
+                        .map_err(|err| err.0)?;
+                    (origin, outcome)
+                } else {
+                    let mut origin = api.resolve(job.place).map_err(|err| err.0)?;
+                    if origin.universe_id != job.universe {
+                        return Err("The selected place belongs to a different universe".into());
+                    }
+                    origin.local_copy = origin.team_create == Some(true);
+                    let version = api.upload_place(job.universe, job.place, &bytes, false, job.vt)
+                        .map_err(|err| err.0)?;
+                    (origin, SaveOutcome::Saved { version })
+                };
+                if let SaveOutcome::Saved { version } = outcome {
+                    origin.version = version;
+                    let _ = cache.store(&origin, &bytes);
+                    let _ = cache.remember(&origin);
+                    job.origin = Some(origin);
                 }
-                Ok(SaveOutcome::Conflict { opened, server }) => {
-                    let _ = tx.send(Msg::Conflict { opened, server, vt });
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::SaveFailed(e.0));
-                }
-            }
+                Ok(outcome)
+            })();
+            let _ = tx.send(Msg::SaveFinished(job, result));
         });
     }
 
@@ -665,34 +689,15 @@ impl Editor {
                     }
                     self.cloud.status = Some((u, st));
                 }
-                Msg::Saved { version, revision, vt, bytes } => {
-                    if let Some(o) = self.doc.cloud.as_mut() {
-                        o.version = version;
-                        let o = o.clone();
-                        let _ = self.cloud.cache.store(&o, &bytes);
-                        let _ = self.cloud.cache.remember(&o);
-                        self.doc.mark_saved_at(revision);
-                        self.info(format!(
-                            "{} to Roblox: version {version} of {} (place {})",
-                            if vt == VersionType::Published { "Published" } else { "Saved" },
-                            o.name,
-                            o.place_id
-                        ));
-                    }
-                    self.cloud.last_saved = Some((version, vt));
-                }
-                Msg::Conflict { opened, server, vt } => {
-                    self.warn(format!(
-                        "Not saved: someone saved this place on Roblox since it was opened (opened version {opened}, Roblox has version {server})"
-                    ));
-                    self.cloud.conflict = Some(Conflict { opened, server, vt });
-                }
-                Msg::SaveFailed(e) => {
-                    self.error(format!("Save to Roblox failed: {e}"));
-                    self.cloud.save_error = Some(e);
+                Msg::SaveFinished(job, result) => {
+                    self.finish_cloud_save(job, result);
+                    ctx.request_repaint();
                 }
                 Msg::Done => self.cloud.jobs = self.cloud.jobs.saturating_sub(1),
             }
+        }
+        if self.cloud.save_pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         for (u, img) in std::mem::take(&mut self.cloud.icon_images) {
             let tex = ctx.load_texture(format!("experience-icon-{u}"), img, egui::TextureOptions::LINEAR);
@@ -971,8 +976,8 @@ impl Editor {
                 }
             }
         }
-        if live.sync_failed && live.save_pending.take().is_some() {
-            self.error("Save blocked because some local edits have not synchronized; retain a local copy and reopen the live place");
+        if live.sync_failed {
+            self.fail_live_save(&mut live, "Save blocked because some local edits have not synchronized; retain a local copy and reopen the live place");
         }
         if let Some(save) = live.save_pending.as_mut() {
             if save.sent.is_none() {
@@ -981,12 +986,13 @@ impl Editor {
                     let options=P::Dictionary(vec![("publish".into(),P::Bool(save.vt==VersionType::Published)),("upload_to_edge".into(),P::Bool(false))]);
                     match live.session.send_event(service,"TeamCreatePublishService".into(),"TeamCreatePlaceUploadRequest".into(),vec![options]) {
                         Ok(()) => save.sent=Some(std::time::Instant::now()),
-                        Err(error) => {self.error(error.to_string());live.save_pending=None;}
+                        Err(error) => self.fail_live_save(&mut live, error.to_string()),
                     }
-                } else {self.error("The live server does not expose saving yet");live.save_pending=None;}
+                } else {
+                    self.fail_live_save(&mut live, "The live server does not expose saving yet");
+                }
             } else if save.sent.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(120)) {
-                self.error("The Team Create server has not confirmed the save; check Version History before retrying");
-                live.save_pending=None;
+                self.fail_live_save(&mut live, "The Team Create server has not confirmed the save; check Version History before retrying");
             }
         }
         let mut keep = true;
@@ -1043,24 +1049,35 @@ impl Editor {
                                 }
                             }
                             if Some(*id)==live.publish_service && name=="TeamCreatePublishService.TeamCreatePlaceUploadResponse" {
-                                if let Some(save)=live.save_pending.take() {
-                                    if matches!(args.first(),Some(rustudio_net::replicator::PropValue::Bool(true))) {
-                                        if let Some(rustudio_net::replicator::PropValue::Dictionary(metadata))=args.get(1) {
-                                            if let Some(version)=metadata.iter().find_map(|(key,value)| match (key.as_str(),value) {
-                                                ("version_number",rustudio_net::replicator::PropValue::Int(v)) if *v>0 => Some(*v as u64),
-                                                _=>None,
-                                            }) {if let Some(origin)=self.doc.cloud.as_mut() {origin.version=version;}}
+                                use rustudio_net::replicator::PropValue as P;
+                                if !matches!(args.first(), Some(P::Bool(true))) {
+                                    self.fail_live_save(&mut live, "The Team Create server could not save the place");
+                                } else if let Some(save) = live.save_pending.take() {
+                                    let version = match args.get(1) {
+                                        Some(P::Dictionary(metadata)) => metadata.iter().find_map(|(key, value)| match (key.as_str(), value) {
+                                            ("version_number", P::Int(v)) if *v > 0 => Some(*v as u64),
+                                            _ => None,
+                                        }),
+                                        _ => None,
+                                    };
+                                    if let Some(version) = version {
+                                        if let Some(origin) = self.doc.cloud.as_mut() {
+                                            origin.version = version;
                                         }
-                                        self.doc.mark_saved_at(save.revision);
-                                        self.info(if save.vt==VersionType::Published {"Team Create server confirmed publication"} else {"Team Create server confirmed the save"});
-                                    } else {self.error("The Team Create server could not save the place");}
+                                        self.cloud.last_saved = Some((version, save.vt));
+                                    }
+                                    self.doc.mark_saved_at(save.revision);
+                                    self.info(if save.vt == VersionType::Published { "Team Create server confirmed publication" } else { "Team Create server confirmed the save" });
+                                    if save.from_dialog && self.cloud_upload_mode().is_some() {
+                                        self.cloud.upload_result = Some(Ok(version));
+                                    }
                                 }
                             }
                             if Some(*id)==live.publish_service && name=="TeamCreatePublishService.TeamCreateErrorStatus" {
                                 use rustudio_net::replicator::PropValue as P;
                                 match args.first() {
                                     Some(P::Enum(1))=>self.warn("The Team Create place is approaching the save size limit"),
-                                    Some(P::Enum(0 | 2))=>{if live.save_pending.take().is_some() {self.error("The Team Create server reported a save error");}},
+                                    Some(P::Enum(0 | 2)) => self.fail_live_save(&mut live, "The Team Create server reported a save error"),
                                     _=>{},
                                 }
                             }
@@ -1162,7 +1179,11 @@ impl Editor {
                     }
                 }
                 LiveEvent::Identity(user) => live.owner_user = Some(user),
-                LiveEvent::EditRejected(message) => {live.sync_failed=true;live.save_pending=None;self.error(format!("Team Create: {message}"));},
+                LiveEvent::EditRejected(message) => {
+                    live.sync_failed = true;
+                    self.fail_live_save(&mut live, "The Team Create server rejected a local edit during the save");
+                    self.error(format!("Team Create: {message}"));
+                }
                 LiveEvent::Notice(message) => self.warn(format!("Team Create: {message}")),
                 LiveEvent::Error(e) => {
                     if live.document_id.is_none() { if let Some(j) = self.cloud.join.as_mut() { j.fail(e.clone()); } }
@@ -1241,36 +1262,196 @@ impl Editor {
         let timed_out:Vec<_>=live.script_commits.iter().filter_map(|(request,(_,sent,_))| (sent.elapsed()>std::time::Duration::from_secs(60)).then_some(*request)).collect();
         for request in timed_out {live.script_commits.remove(&request);self.warn("The server has not confirmed the script commit; the local draft is retained");}
         if let Err(error)=live.drafts.flush_due() {self.warn(error);}
-        if keep { self.cloud.live = Some(live); ctx.request_repaint_after(std::time::Duration::from_millis(16)); }
+        if keep {
+            self.cloud.live = Some(live);
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        } else {
+            self.fail_live_save(&mut live, "Team Create disconnected before confirming the save; check Version History before retrying");
+        }
+    }
+
+    fn fail_live_save(&mut self, live: &mut LiveView, error: impl Into<String>) {
+        if let Some(save) = live.save_pending.take() {
+            let error = error.into();
+            self.error(error.clone());
+            if save.from_dialog && self.cloud_upload_mode().is_some() {
+                self.cloud.upload_result = Some(Err(error));
+            }
+        }
+    }
+
+    pub fn open_roblox_destination(&mut self, vt: VersionType) {
+        if let Err(error) = self.check_cloud_submission() {
+            self.warn(error);
+            return;
+        }
+        self.cloud.upload_mode = Some((self.doc.id, vt));
+        self.cloud.upload_result = None;
+    }
+
+    pub fn cloud_upload_mode(&self) -> Option<VersionType> {
+        self.cloud.upload_mode.filter(|(doc, _)| *doc == self.doc.id).map(|(_, vt)| vt)
+    }
+
+    pub fn cloud_upload_pending(&self) -> bool {
+        self.cloud.save_pending || self.cloud.live.as_ref().is_some_and(|live|
+            live.document_id == Some(self.doc.id) && live.save_pending.is_some())
+    }
+
+    pub fn cloud_upload_result(&self) -> Option<&Result<Option<u64>, String>> {
+        self.cloud_upload_mode()?;
+        self.cloud.upload_result.as_ref()
+    }
+
+    pub fn submit_cloud_upload(&mut self, universe: u64, place: u64, vt: VersionType) -> Result<(), String> {
+        self.check_cloud_submission()?;
+        if self.cloud_upload_mode() != Some(vt) {
+            return Err("Reopen the Roblox destination dialog for this document".into());
+        }
+        if universe == 0 || place == 0 {
+            return Err("Universe and place IDs must be positive numbers".into());
+        }
+
+        let target = self.live_team_create_ids().or_else(|| self.doc.cloud.as_ref()
+            .map(|origin| (origin.universe_id, origin.place_id)));
+        if let Some((linked_universe, linked_place)) = target {
+            if place == linked_place {
+                if universe != linked_universe {
+                    return Err("The selected place belongs to a different universe".into());
+                }
+                return self.save_linked_cloud(vt, false, true);
+            }
+        }
+        self.start_cloud_save(universe, place, vt, false, true, None);
+        Ok(())
+    }
+
+    fn check_cloud_submission(&self) -> Result<(), String> {
+        if self.doc.kind != DocKind::Place {
+            return Err("Open a place (.rbxl) to save or publish to Roblox".into());
+        }
+        if self.play.is_some() {
+            return Err("Stop the play session before saving to Roblox".into());
+        }
+        if self.cloud_upload_pending() {
+            return Err("A Roblox upload is already in progress".into());
+        }
+        Ok(())
     }
 
     /// Ctrl+S / Save to Roblox / Publish for a document opened from Roblox.
     pub fn save_cloud(&mut self, vt: VersionType, overwrite: bool) {
-        if self.cloud.live.as_ref().is_some_and(|live| live.document_id==Some(self.doc.id)) {
-            if self.play.is_some() {self.warn("Stop the play session before saving to Roblox");return;}
-            let live=self.cloud.live.as_mut().unwrap();
-            if live.sync_failed {self.error("Some local edits have not synchronized; retain a local copy and reopen the live place before saving");return;}
-            if live.save_pending.is_some() {self.warn("A Team Create save is already waiting for the server");return;}
-            if live.drafts.has_unsubmitted() {self.warn("Commit or discard your script drafts before saving the live place");return;}
-            live.save_pending=Some(LiveSave {revision:self.doc.revision,vt,sent:None});
-            self.info("Requesting a save from the Team Create server…");
-            return;
+        if let Err(error) = self.save_linked_cloud(vt, overwrite, false) {
+            self.warn(error);
         }
-        let Some(origin) = self.doc.cloud.clone() else {
-            return;
-        };
-        if self.play.is_some() {
-            self.warn("Stop the play session before saving to Roblox");
-            return;
-        }
-        match self.doc.encode_all(false) {
-            Ok(bytes) => {
-                let client = self.account.shared_client();
-                let rev = self.doc.revision;
-                self.cloud.start_save(client, origin, bytes, rev, vt, overwrite);
+    }
+
+    fn save_linked_cloud(&mut self, vt: VersionType, overwrite: bool, from_dialog: bool) -> Result<(), String> {
+        self.check_cloud_submission()?;
+        if let Some(live) = self.cloud.live.as_mut().filter(|live| live.document_id == Some(self.doc.id)) {
+            if live.sync_failed {
+                return Err("Some local edits have not synchronized; retain a local copy and reopen the live place before saving".into());
             }
-            Err(e) => self.error(format!("Could not encode the place: {e}")),
+            if live.drafts.has_unsubmitted() {
+                return Err("Commit or discard your script drafts before saving the live place".into());
+            }
+            live.save_pending = Some(LiveSave { revision: self.doc.revision, vt, from_dialog, sent: None });
+            if from_dialog {
+                self.cloud.upload_result = None;
+            }
+            self.info("Requesting a save from the Team Create server…");
+            return Ok(());
         }
+        let origin = self.doc.cloud.clone().ok_or("This place has no Roblox destination")?;
+        if origin.team_create == Some(true) && !origin.local_copy {
+            return Err("The Team Create session disconnected. Save a local copy to preserve your edits, then reopen the live place.".into());
+        }
+        self.start_cloud_save(origin.universe_id, origin.place_id, vt, overwrite, from_dialog, Some(origin));
+        Ok(())
+    }
+
+    fn start_cloud_save(
+        &mut self, universe: u64, place: u64, vt: VersionType, overwrite: bool, from_dialog: bool,
+        origin: Option<CloudOrigin>,
+    ) {
+        let relink = origin.is_none() && self.live_team_create_ids().is_none();
+        let job = SaveJob {
+            document: self.doc.id,
+            revision: self.doc.revision,
+            universe,
+            place,
+            vt,
+            from_dialog,
+            relink,
+            origin,
+        };
+        if from_dialog {
+            self.cloud.upload_result = None;
+        }
+        self.cloud.start_save(self.account.shared_client(), &self.doc, job, overwrite);
+    }
+
+    fn finish_cloud_save(&mut self, job: SaveJob, result: Result<SaveOutcome, String>) {
+        self.cloud.save_pending = false;
+        let current = self.doc.id == job.document;
+        let action = if job.vt == VersionType::Published { "Published" } else { "Saved" };
+        match result {
+            Ok(SaveOutcome::Saved { version }) => {
+                self.cloud.last_saved = Some((version, job.vt));
+                self.info(format!("{action} to Roblox: version {version} of place {}", job.place));
+                if current {
+                    if job.relink && self.live_team_create_ids().is_none() {
+                        if let Some(origin) = job.origin {
+                            self.doc.title.clone_from(&origin.name);
+                            self.doc.cloud = Some(origin);
+                            self.cloud.status = None;
+                            self.doc.mark_saved_at(job.revision);
+                        }
+                    } else if let Some(origin) = self.doc.cloud.as_mut().filter(|origin|
+                        (origin.universe_id, origin.place_id) == (job.universe, job.place))
+                    {
+                        origin.version = version;
+                        self.doc.mark_saved_at(job.revision);
+                    }
+                    if job.from_dialog && self.cloud_upload_mode().is_some() {
+                        self.cloud.upload_result = Some(Ok(Some(version)));
+                    }
+                }
+            }
+            Ok(SaveOutcome::Conflict { opened, server }) => {
+                let error = format!("Roblox has a newer version of place {} (opened {opened}, server {server})", job.place);
+                self.warn(error.clone());
+                if current {
+                    self.cloud.conflict = Some(Conflict { opened, server, vt: job.vt });
+                    self.cloud.conflict_from_dialog = job.from_dialog;
+                    if job.from_dialog && self.cloud_upload_mode().is_some() {
+                        self.cloud.upload_result = Some(Err(error));
+                    }
+                }
+            }
+            Err(error) => {
+                self.error(format!("Roblox upload to place {} failed: {error}", job.place));
+                if current {
+                    if job.from_dialog && self.cloud_upload_mode().is_some() {
+                        self.cloud.upload_result = Some(Err(error));
+                    } else {
+                        self.cloud.save_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn close_cloud_upload(&mut self) {
+        self.cloud.upload_mode = None;
+        self.cloud.upload_result = None;
+    }
+
+    pub(crate) fn reset_cloud_save_dialogs(&mut self) {
+        self.close_cloud_upload();
+        self.cloud.conflict = None;
+        self.cloud.save_error = None;
+        self.cloud.confirm_copy_save = None;
     }
 
     pub fn cloud_windows(&mut self, ctx: &egui::Context) {
@@ -1359,7 +1540,12 @@ impl Editor {
         match pick {
             Some(0) => {
                 self.cloud.conflict = None;
-                self.save_cloud(c.vt, true);
+                if let Err(error) = self.save_linked_cloud(c.vt, true, self.cloud.conflict_from_dialog) {
+                    self.warn(error.clone());
+                    if self.cloud.conflict_from_dialog {
+                        self.cloud.upload_result = Some(Err(error));
+                    }
+                }
             }
             Some(1) => {
                 self.cloud.conflict = None;
@@ -1408,16 +1594,12 @@ impl Editor {
     fn save_error_modal(&mut self, ctx: &egui::Context) {
         let Some(e) = self.cloud.save_error.clone() else { return };
         let mut close = false;
-        let mut key = false;
         let mut save_as = false;
         egui::Modal::new(egui::Id::new("cloud_save_error")).show(ctx, |ui| {
             ui.set_max_width(460.0);
             ui.label(RichText::new("Not saved to Roblox").strong());
             ui.label(&e);
             ui.horizontal(|ui| {
-                if e.contains("Open Cloud API key") && ui.button("Publishing key…").clicked() {
-                    key = true;
-                }
                 if ui.button("Save to File As…").clicked() {
                     save_as = true;
                 }
@@ -1426,11 +1608,8 @@ impl Editor {
                 }
             });
         });
-        if close || key || save_as {
+        if close || save_as {
             self.cloud.save_error = None;
-        }
-        if key {
-            self.account.show_publish = true;
         }
         if save_as {
             self.save_as();
@@ -1477,7 +1656,7 @@ impl Editor {
                     row(
                         "Opened as",
                         if o.local_copy {
-                            "a local copy of the last saved version (Team Create is on; joining isn't supported yet)".into()
+                            "a local copy of the last saved version (Team Create is on)".into()
                         } else {
                             "the saved version on Roblox".into()
                         },

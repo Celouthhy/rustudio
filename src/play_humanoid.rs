@@ -290,7 +290,7 @@ impl Editor {
                 let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| crate::scene::xform_of(cd, *c)));
                 let server = crate::scene::xform_of(&self.doc, root);
                 if let Some(xf) = [client, server].into_iter().flatten().find(|xf| (xf.pos - last.pos).length() > 1e-4 || (xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) == false) {
-                    if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+                    if crate::physics::hum_debug() {
                         eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})", last.pos, xf.pos, client.map(|c| c.pos), server.map(|c| c.pos));
                     }
                     s.physics.teleport_humanoid(model, &xf);
@@ -473,7 +473,7 @@ impl Editor {
         };
         hd.had_floor = floor.is_some();
         hd.floor_part = floor.and_then(|f| f.1);
-        if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() {
+        if crate::physics::hum_debug() {
             eprintln!("HUMFRAME root={:.4},{:.4},{:.4} floor={:?}", root_xf.pos.x, root_xf.pos.y, root_xf.pos.z, floor.map(|f| (f.0.y, f.0.normal, f.0.point)));
         }
         let facing = -root_xf.rot.z_axis;
@@ -492,7 +492,7 @@ impl Editor {
                 &own,
             );
             ch.ladder_wait = ladder_interval(state);
-            if std::env::var_os("RUSTUDIO_HUM_DEBUG").is_some() && ch.ladder.is_some() {
+            if crate::physics::hum_debug() && ch.ladder.is_some() {
                 eprintln!("HUMLADDER root={:.3},{:.3},{:.3} facing={:?} height={:.3} reach={:.3} -> {:?}", root_xf.pos.x, root_xf.pos.y, root_xf.pos.z, facing, shape.hip + shape.root_size.y * 0.5, (if shape.r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 }) * head_y, ch.ladder);
             }
         }

@@ -430,74 +430,10 @@ end
 ------------------------------------------------- GetGuiObjectsAtPosition
 -- Every GuiObject drawn at (x, y) in GUI coordinates (AbsolutePosition's),
 -- top-most first: ScreenGuis by DisplayOrder, ZIndexBehavior's order inside
--- each, clipped by ClipsDescendants and ScrollingFrames.
-local function draw_order(gui, out)
-    local global = gui:IsA("ScreenGui") and gui.ZIndexBehavior == Enum.ZIndexBehavior.Global
-    local function kids(p)
-        local list = {}
-        for _, c in p:GetChildren() do
-            if c:IsA("GuiObject") then table.insert(list, c)
-            elseif c:IsA("Folder") then for _, k in kids(c) do table.insert(list, k) end end
-        end
-        return list
-    end
-    if global then
-        local all, seq = {}, 0
-        local function walk(p)
-            for _, c in kids(p) do
-                seq += 1
-                table.insert(all, { c, c.ZIndex, seq })
-                walk(c)
-            end
-        end
-        walk(gui)
-        table.sort(all, function(a, b)
-            if a[2] ~= b[2] then return a[2] < b[2] end
-            return a[3] < b[3]
-        end)
-        for _, e in all do table.insert(out, e[1]) end
-    else
-        local function walk(p)
-            local list = kids(p)
-            local idx = {}
-            for i, c in list do idx[c] = i end
-            table.sort(list, function(a, b)
-                if a.ZIndex ~= b.ZIndex then return a.ZIndex < b.ZIndex end
-                return idx[a] < idx[b]
-            end)
-            for _, c in list do
-                table.insert(out, c)
-                walk(c)
-            end
-        end
-        walk(gui)
-    end
-end
-local function inside(o, x, y)
-    local p, s = o.AbsolutePosition, o.AbsoluteSize
-    return x >= p.X and y >= p.Y and x < p.X + s.X and y < p.Y + s.Y
-end
-local function hit(o, x, y)
-    if not inside(o, x, y) then return false end
-    local cur = o.Parent
-    while cur and cur:IsA("GuiObject") do
-        if (cur.ClipsDescendants or cur:IsA("ScrollingFrame")) and not inside(cur, x, y) then return false end
-        cur = cur.Parent
-    end
-    return true
-end
+-- each, clipped by ClipsDescendants and ScrollingFrames. The walk is Rust
+-- (gui_input.rs objects_at): a big PlayerGui made it a long frame in Luau.
 local function objects_at(guis, x, y)
-    local res = {}
-    for _, g in guis do
-        local order = {}
-        draw_order(g, order)
-        local here = {}
-        for _, o in order do
-            if shown(o) and hit(o, x, y) then table.insert(here, o) end
-        end
-        for i = #here, 1, -1 do table.insert(res, here[i]) end
-    end
-    return res
+    return G.objects_at(guis, x, y)
 end
 local function screen_guis(pg)
     local list = {}

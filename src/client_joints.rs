@@ -43,6 +43,12 @@ pub struct ClientJoints {
     frame: u64,
     /// WeldConstraint → (Part0, Part1, Part0⁻¹ · Part1 when first seen).
     welds: HashMap<Ref, (Ref, Ref, Xform)>,
+    /// Each posed rig's model → its joints (descendant order), kept until
+    /// a tree change inside the model; and each listed joint → its model.
+    /// (Walking 230 NPC models' descendants every frame was ~4 M
+    /// instructions on the NPC test place.)
+    rig_joints: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
+    joint_rig: rustc_hash::FxHashMap<Ref, Ref>,
 }
 
 fn is_joint(cd: &Document, r: Ref) -> bool {
@@ -80,8 +86,11 @@ impl ClientJoints {
     /// Places the client-only parts of `cd` (the client's DataModel) from
     /// their joints. `c2s` maps client instances the server also has.
     pub fn solve(&mut self, cd: &mut Document, c2s: &HashMap<Ref, Ref>) {
-        self.pose_rigs(cd, c2s);
+        // (Read first: pose_rigs keeps its rigs' joint lists by it. Its own
+        // writes are CFrames, which only matter here as tree changes.)
         let marks = cd.marks_for(doc::Reader::ClientJoints);
+        self.rig_marks(cd, &marks);
+        self.pose_rigs(cd, c2s);
         let ws = cd.find_child(cd.dom.root_ref(), "Workspace");
         // Under Workspace, or under a WorldModel (a ViewportFrame's world:
         // Studio solves joints and plays animations there, not elsewhere
@@ -230,6 +239,52 @@ impl ClientJoints {
         }
     }
 
+    /// Drops the joint lists of rigs a tree change reached: something added
+    /// or moved under the model (its ancestors), or a listed joint (or an
+    /// ancestor of one) taken out or moved.
+    fn rig_marks(&mut self, cd: &Document, marks: &doc::Marks) {
+        let list = match marks {
+            doc::Marks::Some(m) if cd.id == self.doc_id => m,
+            _ => {
+                self.rig_joints.clear();
+                self.joint_rig.clear();
+                return;
+            }
+        };
+        if self.rig_joints.is_empty() {
+            return;
+        }
+        let drop_rig = |me: &mut Self, model: Ref| {
+            if let Some(js) = me.rig_joints.remove(&model) {
+                for j in js {
+                    me.joint_rig.remove(&j);
+                }
+            }
+        };
+        for m in list {
+            let doc::Mark::Tree(t) = *m else { continue };
+            let mut cur = t;
+            while let Some(i) = cd.dom.get_by_ref(cur) {
+                if self.rig_joints.contains_key(&cur) {
+                    drop_rig(self, cur);
+                }
+                cur = i.parent();
+            }
+            for r in cd.subtree(t) {
+                if let Some(model) = self.joint_rig.get(&r).copied() {
+                    drop_rig(self, model);
+                }
+            }
+        }
+        if self.rig_joints.len() > self.rigs.len() * 2 + 64 {
+            let live: HashSet<Ref> = self.rigs.iter().filter_map(|r| cd.dom.get_by_ref(*r).map(|i| i.parent())).collect();
+            let gone: Vec<Ref> = self.rig_joints.keys().copied().filter(|m| !live.contains(m)).collect();
+            for m in gone {
+                drop_rig(self, m);
+            }
+        }
+    }
+
     /// Server-owned rigs as the client sees them: each frame its own
     /// simulation poses them from their Motor6D.Transform (what the
     /// Animator wrote, replicated), outward from the root part the server
@@ -257,12 +312,22 @@ impl ClientJoints {
             }
             let Some(at) = cframe(cd, root, "CFrame") else { continue };
             let mut edges: Vec<(Ref, Ref, Xform, Xform)> = Vec::new();
-            let found: Vec<Ref> = cd
-                .dom
-                .descendants_of(model)
-                .filter(|i| joint_class(i.class.as_str()))
-                .map(|i| i.referent())
-                .collect();
+            let found: Vec<Ref> = match self.rig_joints.get(&model) {
+                Some(list) => list.clone(),
+                None => {
+                    let list: Vec<Ref> = cd
+                        .dom
+                        .descendants_of(model)
+                        .filter(|i| joint_class(i.class.as_str()))
+                        .map(|i| i.referent())
+                        .collect();
+                    for j in &list {
+                        self.joint_rig.insert(*j, model);
+                    }
+                    self.rig_joints.insert(model, list.clone());
+                    list
+                }
+            };
             for j in found {
                 let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                     continue;
@@ -270,7 +335,7 @@ impl ClientJoints {
                 let t = cframe(cd, j, "Transform").unwrap_or(ident);
                 edges.push((p0, p1, compose(&c0, &t), c1));
             }
-            let mut placed: HashMap<Ref, Xform> = HashMap::new();
+            let mut placed: rustc_hash::FxHashMap<Ref, Xform> = Default::default();
             placed.insert(root, at);
             let mut queue = VecDeque::from([root]);
             while let Some(p) = queue.pop_front() {

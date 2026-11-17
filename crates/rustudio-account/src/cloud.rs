@@ -6,14 +6,16 @@
 //!
 //! Every host goes through [`Endpoints`], so tests point them at a local
 //! [`crate::mock::MockServer`]: nothing here writes to Roblox in a test.
-//! The only state-changing call is [`CloudApi::save_place`] (Open Cloud
-//! Place Publishing, publishing key only).
+//! Creation and place uploads both use the signed-in session.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::api::VersionType;
+use crate::asset_upload::{self, ASSETS_PATH, OPERATIONS_PATH};
 use crate::session::Session;
 use crate::{Error, Result};
 
@@ -219,7 +221,7 @@ impl TeamCreateStatus {
     /// One line for the Output and the place's info.
     pub fn describe(&self) -> String {
         let tc = match self.enabled {
-            Some(true) => "Team Create is on: live co-editing isn't supported yet; saving replaces the server copy",
+            Some(true) => "Team Create is on. Open the live session to save with your signed-in account.",
             Some(false) => "Team Create is off: saving to Roblox makes a new version of the place",
             None => "Team Create status unknown (Roblox only shows it to people who can edit this experience)",
         };
@@ -264,16 +266,11 @@ pub enum SaveOutcome {
     Conflict { opened: u64, server: u64 },
 }
 
-/// Why Save to Roblox can't work without the publishing key (shown as is).
-pub const NEEDS_PUBLISH_KEY: &str = "Save to Roblox needs an Open Cloud API key: Roblox refuses the session cookie for place uploads (docs/AUTH.md, \"Publishing\"). Create a key at create.roblox.com > Open Cloud > API Keys with the universe-places:write permission for this experience, and save it as rustudio's publishing key (Roblox account window, \"Save / publish the open place\"). Nothing was saved; File > Save to File As keeps a local copy.";
-
 /// Calls for cloud places over a session (a downloader copy, so long
 /// downloads don't hold the account's lock).
 pub struct CloudApi {
     pub session: Session,
     pub ep: Endpoints,
-    /// The Open Cloud publishing key, when one is saved.
-    pub publish_key: Option<String>,
 }
 
 fn json(text: &str) -> Option<serde_json::Value> {
@@ -291,13 +288,106 @@ fn error_message(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+const BASEPLATE_TEMPLATE_ID: u64 = 95206881;
+
+pub(crate) fn create_experience(
+    session: &Session,
+    ep: &Endpoints,
+    name: &str,
+    description: &str,
+    group: Option<u64>,
+) -> Result<(u64, u64)> {
+    if name.trim().is_empty() {
+        return Err(Error::new("Enter a name for the experience"));
+    }
+
+    let mut url = format!("{}/universes/v1/universes/create", ep.apis);
+    if let Some(group) = group {
+        url.push_str(&format!("?groupId={group}"));
+    }
+    let text = write_json(
+        session,
+        "POST",
+        &url,
+        "Create experience",
+        json!({ "templatePlaceId": BASEPLATE_TEMPLATE_ID }),
+    )?;
+    let reply = json(&text).unwrap_or_default();
+    let universe = created_id(&reply, "universeId", "Create experience")?;
+    let place = created_id(&reply, "rootPlaceId", &format!("Create experience {universe}"))?;
+
+    write_json(
+        session,
+        "PATCH",
+        &format!("{}/v2/universes/{universe}/configuration", ep.develop),
+        &format!("Experience {universe} (start place {place}) was created, but setting its name and description"),
+        json!({ "name": name, "description": description }),
+    )?;
+    Ok((universe, place))
+}
+
+pub(crate) fn create_place(
+    session: &Session,
+    ep: &Endpoints,
+    universe: u64,
+    name: &str,
+) -> Result<u64> {
+    if name.trim().is_empty() {
+        return Err(Error::new("Enter a name for the place"));
+    }
+    if universe == 0 {
+        return Err(Error::new("Select an experience for the new place"));
+    }
+
+    let text = write_json(
+        session,
+        "POST",
+        &format!("{}/universes/v1/user/universes/{universe}/places", ep.apis),
+        "Create place",
+        json!({ "templatePlaceId": BASEPLATE_TEMPLATE_ID }),
+    )?;
+    let reply = json(&text).unwrap_or_default();
+    let place = created_id(&reply, "placeId", "Create place")?;
+
+    write_json(
+        session,
+        "PATCH",
+        &format!("{}/v2/places/{place}", ep.develop),
+        &format!("Place {place} was created in experience {universe}, but setting its name"),
+        json!({ "name": name }),
+    )?;
+    Ok(place)
+}
+
+fn created_id(reply: &Value, field: &str, action: &str) -> Result<u64> {
+    reply
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|&id| id != 0)
+        .ok_or_else(|| Error::new(format!("{action} succeeded but Roblox did not return a valid {field}")))
+}
+
+fn write_json(
+    session: &Session,
+    method: &str,
+    url: &str,
+    action: &str,
+    payload: Value,
+) -> Result<String> {
+    let (status, text) = session
+        .send_csrf(method, url, "application/json", payload.to_string().as_bytes())
+        .map_err(|e| Error::new(format!("{action} failed: {e}")))?;
+    if !(200..300).contains(&status) {
+        let why = error_message(&text).map(|m| format!(": {m}")).unwrap_or_default();
+        return Err(Error::new(format!("{action} returned HTTP {status}{why}")));
+    }
+    Ok(text)
+}
+
 impl CloudApi {
-    pub fn new(session: Session, ep: Endpoints, publish_key: Option<String>) -> CloudApi {
-        CloudApi {
-            session,
-            ep,
-            publish_key,
-        }
+    /// The third argument is retained for existing callers.
+    pub fn new(session: Session, ep: Endpoints, _publish_key: Option<String>) -> CloudApi {
+        CloudApi { session, ep }
     }
 
     fn get_json(&self, url: &str, what: &str) -> Result<serde_json::Value> {
@@ -510,7 +600,7 @@ impl CloudApi {
             creator_id: exp.creator_id,
             creator_type: exp.creator_type,
             creator_name: exp.creator_name,
-            team_create: None,
+            team_create: exp.team_create,
             local_copy: false,
         };
         if let Ok((200, text)) = self.session.get(&format!(
@@ -654,6 +744,12 @@ impl CloudApi {
                 .find(|r| r.get("id").and_then(|i| i.as_u64()) == Some(universe_id))
                 .and_then(|r| r.get("isEnabled").and_then(|b| b.as_bool()));
         }
+        if st.enabled.is_none() {
+            let url = format!("{}/v1/universes/{universe_id}/teamcreate", self.ep.develop);
+            if let Ok(settings) = self.get_json(&url, "teamcreate") {
+                st.enabled = settings.get("isEnabled").and_then(|v| v.as_bool());
+            }
+        }
         let body = format!("{{\"universeId\":{universe_id}}}");
         if let Ok((200, text)) = self.session.post_csrf(
             &format!("{}/team-create-service/v1/GetCanCollaborate", self.ep.apis),
@@ -682,8 +778,7 @@ impl CloudApi {
     /// Saves (Saved) or publishes (Published) the place as a new version.
     /// First the server's newest version is compared with the one opened:
     /// if someone saved in between, nothing is sent and the conflict comes
-    /// back, unless `overwrite`. Needs the publishing key (Open Cloud Place
-    /// Publishing); without it the reason is the error, nothing is sent.
+    /// back, unless `overwrite`.
     pub fn save_place(
         &self,
         origin: &CloudOrigin,
@@ -692,9 +787,6 @@ impl CloudApi {
         vt: VersionType,
         overwrite: bool,
     ) -> Result<SaveOutcome> {
-        let Some(key) = self.publish_key.as_deref() else {
-            return Err(Error(NEEDS_PUBLISH_KEY.into()));
-        };
         let server = self.latest_version(origin.place_id)?;
         if !overwrite && server != origin.version {
             return Ok(SaveOutcome::Conflict {
@@ -702,39 +794,88 @@ impl CloudApi {
                 server,
             });
         }
-        let url = format!(
-            "{}/universes/v1/{}/places/{}/versions?versionType={}",
-            self.ep.apis,
-            origin.universe_id,
-            origin.place_id,
-            vt.as_str()
-        );
-        let content_type = if is_xml { "application/xml" } else { "application/octet-stream" };
-        let mut r = crate::api::agent()
-            .post(&url)
-            .header("x-api-key", key)
-            .header("Content-Type", content_type)
-            .send(bytes)?;
-        let status = r.status().as_u16();
-        let text = r.body_mut().read_to_string()?;
-        if status >= 400 {
-            let detail: String = text.chars().take(300).collect();
-            let hint = match status {
-                401 | 403 => " (the key needs universe-places:write for this experience, and the IP it allows)",
-                409 => " (Roblox has a newer version or the place is locked)",
-                _ => "",
-            };
-            return Err(Error(format!(
-                "Place Publishing answered HTTP {status}{hint}: {}",
-                detail.trim()
-            )));
-        }
-        let version = json(&text)
-            .and_then(|v| v.get("versionNumber").and_then(|n| n.as_u64()))
-            .or_else(|| text.trim().trim_matches('"').parse().ok())
-            .ok_or_else(|| Error(format!("Place Publishing: no version number in {:?}", text.chars().take(120).collect::<String>())))?;
+        let version = self.upload_place(origin.universe_id, origin.place_id, bytes, is_xml, vt)?;
         Ok(SaveOutcome::Saved { version })
     }
+
+    /// Uploads to an explicitly selected destination, with the requested
+    /// version type. The destination has no opened version to compare.
+    pub fn upload_place(
+        &self,
+        _universe_id: u64,
+        place_id: u64,
+        bytes: &[u8],
+        is_xml: bool,
+        vt: VersionType,
+    ) -> Result<u64> {
+        upload_place(&self.session, &self.ep.apis, place_id, bytes, is_xml, vt)
+    }
+}
+
+pub(crate) fn upload_place(
+    session: &Session,
+    apis: &str,
+    place_id: u64,
+    bytes: &[u8],
+    is_xml: bool,
+    vt: VersionType,
+) -> Result<u64> {
+    let published = vt == VersionType::Published;
+    let request = serde_json::json!({
+        "assetType": "Place",
+        "assetId": place_id,
+        "published": published,
+        "creationContext": {},
+    });
+    let (filename, mime) = if is_xml {
+        ("place.rbxlx", "application/xml")
+    } else {
+        ("place.rbxl", "application/octet-stream")
+    };
+    let (content_type, body) = asset_upload::multipart(&request, filename, mime, bytes);
+    let cookie = session.cookie();
+    let error = |detail: String| {
+        if cookie.appears_in(&detail) || session.cookie().appears_in(&detail) {
+            Error::new("Place Publishing failed")
+        } else {
+            let detail: String = detail.chars().take(300).collect();
+            Error::new(format!("Place Publishing: {detail}"))
+        }
+    };
+    let check_reply = |status, body: String| {
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        let detail = error_message(&body).unwrap_or(body);
+        Err(error(format!("HTTP {status}: {}", detail.trim())))
+    };
+    let url = format!("{apis}{ASSETS_PATH}/{place_id}");
+    let (status, text) = session
+        .send_csrf_with_timeout("PATCH", &url, &content_type, &body, Some(Duration::from_secs(120)))
+        .map_err(|e| error(e.0))?;
+    let initial = check_reply(status, text)?;
+    let operation = asset_upload::wait_for_operation(
+        &initial,
+        &format!("{apis}{OPERATIONS_PATH}"),
+        |url| {
+            let (status, body) = session
+                .get_with_timeout(url, Some(Duration::from_secs(20)))
+                .map_err(|e| error(e.0))?;
+            check_reply(status, body)
+        },
+        error,
+    )?;
+    let version = operation
+        .pointer("/response/revisionId")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|v| *v > 0)
+        .ok_or_else(|| Error::new("Place Publishing: completed operation has no valid revisionId"))?;
+    if operation.pointer("/response/isPublished").and_then(Value::as_bool) != Some(published) {
+        return Err(Error::new(format!(
+            "Place Publishing: revision {version} did not confirm isPublished={published}"
+        )));
+    }
+    Ok(version)
 }
 
 /// A place reference typed or pasted by the person.
@@ -1057,8 +1198,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A pretend Roblox: place 95206881 is at `server` version; Open Cloud
-    /// publishing answers the next version.
+    const UPLOAD: &str = "/apis/assets/user-auth/v1/assets/95206881";
+    const POLL: &str = "/apis/assets/user-auth/v1/operations/place-upload";
+
+    /// A pretend Roblox where the place is at `server` version.
     fn roblox(server: Arc<Mutex<u64>>) -> MockServer {
         MockServer::start(Arc::new(move |r: &MockRequest| {
             let p = r.path.as_str();
@@ -1086,10 +1229,20 @@ mod tests {
                     body: format!("<roblox!v{n}").into_bytes(),
                 };
             }
-            if p.starts_with("/apis/universes/v1/28220420/places/95206881/versions") {
-                let mut g = server.lock().unwrap();
-                *g += 1;
-                return MockReply::json(200, &format!("{{\"versionNumber\":{}}}", *g));
+            if p == UPLOAD && r.method == "PATCH" {
+                if r.header("x-csrf-token") != Some("place-csrf") {
+                    return MockReply::json(403, "{}").with_header("x-csrf-token", "place-csrf");
+                }
+                let published = multipart_request(r)["published"].as_bool().unwrap();
+                let mut version = server.lock().unwrap();
+                *version += 1;
+                if published {
+                    return MockReply::json(202, r#"{"path":"operations/place-upload"}"#);
+                }
+                return completed(*version, false);
+            }
+            if p == POLL && r.method == "GET" {
+                return completed(v, true);
             }
             if p == "/apis/universes/v1/places/95206881/universe" {
                 return MockReply::json(200, r#"{"universeId":28220420}"#);
@@ -1112,6 +1265,9 @@ mod tests {
             }
             if p == "/develop/v1/universes/28220420/permissions" {
                 return MockReply::json(200, r#"{"canManage":true,"canCloudEdit":true}"#);
+            }
+            if p.ends_with("/v1/universes/12345/teamcreate") {
+                return MockReply::json(200, r#"{"isEnabled":true}"#);
             }
             if p.starts_with("/apis/universes/v1/search") {
                 return MockReply::json(200, r#"{"data":[{"id":5,"name":"Shared One","rootPlaceId":6,"creatorType":"User","creatorTargetId":7,"creatorName":"friend","updated":"2026-01-01T00:00:00Z","isTeamCreateEnabled":true}],"totalResults":1}"#);
@@ -1146,6 +1302,50 @@ mod tests {
     }
 
     #[test]
+    fn creation_configures_metadata_and_reports_partial_failure() {
+        let server = MockServer::start(Arc::new(|req: &MockRequest| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            match (req.method.as_str(), req.path.as_str()) {
+                ("POST", "/apis/universes/v1/universes/create" | "/apis/universes/v1/universes/create?groupId=314") => {
+                    assert_eq!(body, json!({ "templatePlaceId": 95206881 }));
+                    if req.header("x-csrf-token").is_none() {
+                        return MockReply::json(403, "{}").with_header("x-csrf-token", "mock-token");
+                    }
+                    MockReply::json(200, r#"{"universeId":42,"rootPlaceId":100}"#)
+                }
+                ("PATCH", "/develop/v2/universes/42/configuration") => {
+                    assert_eq!(body, json!({ "name": "New experience", "description": "Test" }));
+                    MockReply::json(200, "{}")
+                }
+                ("POST", "/apis/universes/v1/user/universes/42/places") => {
+                    assert_eq!(body, json!({ "templatePlaceId": 95206881 }));
+                    MockReply::json(200, r#"{"placeId":101}"#)
+                }
+                ("PATCH", "/develop/v2/places/101") => {
+                    assert_eq!(body, json!({ "name": "New place" }));
+                    MockReply::json(400, r#"{"errors":[{"message":"Name rejected"}]}"#)
+                }
+                _ => MockReply::json(404, "{}"),
+            }
+        }))
+        .unwrap();
+        let a = api(&server, None);
+        assert_eq!(
+            create_experience(&a.session, &a.ep, "New experience", "Test", None).unwrap(),
+            (42, 100)
+        );
+        assert_eq!(create_experience(&a.session, &a.ep, "New experience", "Test", Some(314)).unwrap(), (42, 100));
+        let err = create_place(&a.session, &a.ep, 42, "New place").unwrap_err();
+        assert!(err.0.contains("Place 101 was created in experience 42"));
+        assert!(err.0.contains("Name rejected"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 7);
+        for req in &requests[1..] {
+            assert_eq!(req.header("x-csrf-token"), Some("mock-token"));
+        }
+    }
+
+    #[test]
     fn open_resolves_downloads_and_reads_team_create() {
         let v = Arc::new(Mutex::new(71));
         let s = roblox(v.clone());
@@ -1158,9 +1358,10 @@ mod tests {
         assert_eq!(a.latest_version(95206881).unwrap(), 71);
         let e = a.download(100000005, None).unwrap_err().0;
         assert!(e.contains("won't give this account place 100000005") && e.contains("not authorized"), "{e}");
+        assert_eq!(a.team_create(12345).enabled, Some(true));
         let tc = a.team_create(28220420);
         assert_eq!((tc.enabled, tc.can_collaborate, tc.can_edit()), (Some(true), Some(true), Some(true)));
-        assert!(tc.describe().starts_with("Team Create is on: live co-editing isn't supported yet"));
+        assert!(tc.describe().starts_with("Team Create is on."));
         let vs = a.versions(95206881).unwrap();
         assert_eq!(vs.iter().map(|v| v.version).collect::<Vec<_>>(), vec![72, 71]);
         assert!(vs[1].published && !vs[0].published);
@@ -1191,37 +1392,136 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("creatorType=Group") && p.contains("PageIndex=2")));
     }
 
+    fn completed(version: u64, published: bool) -> MockReply {
+        MockReply::json(200, &serde_json::json!({
+            "done": true,
+            "response": {"path": "assets/95206881", "revisionId": version.to_string(), "isPublished": published}
+        }).to_string())
+    }
+
+    fn multipart_request(request: &MockRequest) -> Value {
+        let text = String::from_utf8_lossy(&request.body);
+        let (_, data) = text.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(data.split_once("\r\n").unwrap().0).unwrap()
+    }
+
+    #[test]
+    fn destination_upload_uses_session_csrf_and_multipart_for_both_modes() {
+        let server = roblox(Arc::new(Mutex::new(71)));
+        let a = api(&server, Some("unused-key"));
+        let binary = b"<roblox!\x00\xff";
+        let xml = b"<roblox version=\"4\"></roblox>";
+        assert_eq!(a.upload_place(28220420, 95206881, binary, false, VersionType::Saved).unwrap(), 72);
+        assert_eq!(a.upload_place(28220420, 95206881, xml, true, VersionType::Published).unwrap(), 73);
+
+        let requests = server.requests();
+        assert_eq!(requests.iter().map(|r| (r.method.as_str(), r.path.as_str())).collect::<Vec<_>>(),
+            [("PATCH", UPLOAD), ("PATCH", UPLOAD), ("PATCH", UPLOAD), ("GET", POLL)]);
+        for r in &requests {
+            assert_eq!(r.header("cookie"), Some(".ROBLOSECURITY=mock-session-not-a-real-cookie"));
+            assert_eq!(r.header("x-api-key"), None);
+        }
+        assert_eq!(requests[0].header("x-csrf-token"), None);
+        assert_eq!(requests[0].body, requests[1].body);
+        for (r, published, filename, mime, bytes) in [
+            (&requests[1], false, "place.rbxl", "application/octet-stream", binary.as_slice()),
+            (&requests[2], true, "place.rbxlx", "application/xml", xml.as_slice()),
+        ] {
+            assert_eq!(r.header("x-csrf-token"), Some("place-csrf"));
+            assert_eq!(multipart_request(r), serde_json::json!({
+                "assetType": "Place", "assetId": 95206881, "published": published, "creationContext": {}
+            }));
+            let boundary = r.header("content-type").unwrap().strip_prefix("multipart/form-data; boundary=").unwrap();
+            let header = format!("Content-Disposition: form-data; name=\"fileContent\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n");
+            let mut suffix = header.into_bytes();
+            suffix.extend_from_slice(bytes);
+            suffix.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            assert!(r.body.ends_with(&suffix));
+        }
+    }
+
     #[test]
     fn save_checks_the_server_version_first() {
         let v = Arc::new(Mutex::new(71));
         let s = roblox(v.clone());
-        let posts = |s: &MockServer| s.requests().into_iter().filter(|r| r.method == "POST" && r.path.contains("/versions")).collect::<Vec<_>>();
-        // No key: a clear reason, nothing sent anywhere.
-        let none = api(&s, None);
-        let e = none.save_place(&origin(71), b"<roblox!x", false, VersionType::Saved, false).unwrap_err().0;
-        assert!(e.contains("Open Cloud API key") && e.contains("universe-places:write"), "{e}");
-        assert!(posts(&s).is_empty());
-        // Same version on the server: saved as the next version.
-        let a = api(&s, Some("test-key"));
+        let a = api(&s, None);
         let out = a.save_place(&origin(71), b"<roblox!x", false, VersionType::Saved, false).unwrap();
         assert_eq!(out, SaveOutcome::Saved { version: 72 });
-        let p = posts(&s);
-        assert_eq!(p.len(), 1);
-        assert!(p[0].path.ends_with("versionType=Saved"));
-        assert_eq!(p[0].header("x-api-key"), Some("test-key"));
-        assert_eq!(p[0].header("content-type"), Some("application/octet-stream"));
-        assert_eq!(p[0].body, b"<roblox!x");
-        // Someone else saved (server 73, opened 72): conflict, nothing sent.
+        assert_eq!(s.requests()[0].method, "GET");
+        assert!(s.requests()[0].path.starts_with("/assetdelivery/"));
+
         *v.lock().unwrap() = 73;
+        let before_conflict = s.requests().len();
         let out = a.save_place(&origin(72), b"<roblox!y", false, VersionType::Saved, false).unwrap();
         assert_eq!(out, SaveOutcome::Conflict { opened: 72, server: 73 });
-        assert_eq!(posts(&s).len(), 1);
-        // Overwrite: sent anyway, as a published version.
+        let requests = s.requests();
+        assert_eq!(requests.len(), before_conflict + 1);
+        assert!(requests[before_conflict].path.starts_with("/assetdelivery/"));
+
         let out = a.save_place(&origin(72), b"<roblox!y", false, VersionType::Published, true).unwrap();
         assert_eq!(out, SaveOutcome::Saved { version: 74 });
-        let p = posts(&s);
-        assert_eq!(p.len(), 2);
-        assert!(p[1].path.ends_with("versionType=Published"));
+    }
+
+    #[test]
+    fn upload_requires_a_successful_operation_with_a_confirmed_revision() {
+        for (status, body, expected) in [
+            (409, r#"{"errors":[{"message":"Place is locked"}]}"#, "HTTP 409: Place is locked"),
+            (200, r#"{"done":true,"error":{"code":7,"message":"Permission denied"}}"#, "Permission denied"),
+            (200, r#"{"done":true,"response":{"assetId":95206881,"isPublished":true}}"#, "no valid revisionId"),
+            (200, r#"{"done":true,"response":{"revisionId":"0","isPublished":true}}"#, "no valid revisionId"),
+            (200, r#"{"done":true,"response":{"revisionId":72,"isPublished":false}}"#, "did not confirm isPublished=true"),
+            (200, r#"{"done":true,"response":{"revisionId":72}}"#, "did not confirm isPublished=true"),
+            (200, r#"{"done":false,"response":{"revisionId":"72","isPublished":true}}"#, "missing its operation ID"),
+        ] {
+            let s = MockServer::start(Arc::new(move |_| MockReply::json(status, body))).unwrap();
+            let error = api(&s, None).upload_place(28220420, 95206881, b"place", false, VersionType::Published).unwrap_err();
+            assert!(error.0.contains(expected), "{error}");
+            assert_eq!(s.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn operation_poll_reuses_the_original_id_and_reports_terminal_failure() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let s = MockServer::start(Arc::new(move |r| {
+            match (r.method.as_str(), r.path.as_str()) {
+                ("PATCH", UPLOAD) => MockReply::json(202, r#"{"operationId":"place-upload"}"#),
+                ("GET", POLL) if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 => {
+                    MockReply::json(200, r#"{"done":false}"#)
+                }
+                ("GET", POLL) => {
+                    MockReply::json(200, r#"{"done":true,"error":{"code":7,"message":"Permission denied"}}"#)
+                }
+                _ => MockReply::json(404, "{}"),
+            }
+        })).unwrap();
+        let error = api(&s, None)
+            .upload_place(28220420, 95206881, b"place", false, VersionType::Published)
+            .unwrap_err();
+        assert!(error.0.contains("Permission denied"), "{error}");
+        assert!(error.0.contains(r#""code":7"#), "{error}");
+        assert_eq!(s.requests().iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), [UPLOAD, POLL, POLL]);
+    }
+
+    #[test]
+    fn upload_does_not_follow_foreign_operation_paths_or_redirects() {
+        let foreign = MockServer::start(Arc::new(|_| completed(72, true))).unwrap();
+        let url = format!("{}/assets/user-auth/v1/operations/place-upload", foreign.base);
+        for redirect in [false, true] {
+            let url = url.clone();
+            let s = MockServer::start(Arc::new(move |r| {
+                if r.method == "GET" {
+                    return MockReply::json(302, "{}").with_header("Location", &url);
+                }
+                let path = if redirect { "operations/place-upload" } else { &url };
+                MockReply::json(202, &serde_json::json!({"path": path}).to_string())
+            })).unwrap();
+            let error = api(&s, None).upload_place(28220420, 95206881, b"place", false, VersionType::Published).unwrap_err();
+            let expected = if redirect { "HTTP 302" } else { "invalid operation path" };
+            assert!(error.0.contains(expected), "{error}");
+            assert_eq!(s.requests().len(), if redirect { 2 } else { 1 });
+        }
+        assert!(foreign.requests().is_empty());
     }
 }
 

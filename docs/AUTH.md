@@ -23,10 +23,7 @@ sections were dead).
   displayName) and `avatar.roblox.com/v1/avatar` are cached for display
   only, in `~/.cache/rustudio/session.json`, under a one-way key of the
   cookie (SHA-256 with an app prefix), so a cookie change invalidates them.
-- **API keys:** no longer a way to sign in. One remains only as the
-  *publishing key*, because Roblox refuses the cookie for place uploads (see
-  "Publishing" below). It goes once publishing over the cookie works, so
-  that exactly one credential remains.
+- The signed-in account also authorizes place saves and publishes.
 
 ## Where the cookie lives
 
@@ -146,12 +143,12 @@ then downloaded once more and compared.
 - After both, the place's bytes were identical to before (367 380 bytes):
   nothing was written.
 
-So publishing over the cookie doesn't work today. rustudio still tries the
-session upload when no publishing key is saved (and reports Roblox's
-answer), and publishes through Open Cloud Place Publishing
-(`POST apis.roblox.com/universes/v1/{universeId}/places/{placeId}/versions`)
-with the publishing key otherwise. The key UI goes when a cookie upload
-path is proven.
+The editor sends edited place bytes to
+`PATCH apis.roblox.com/assets/user-auth/v1/assets/{placeId}` with the signed-in
+session and a CSRF token. The multipart request contains the place file and
+a `Place` metadata object. Save sends `published: false` and Publish sends
+`published: true`. The editor waits for the upload operation to finish before
+recording the new place version.
 
 ## Code
 
@@ -160,7 +157,7 @@ path is proven.
 | `crates/rustudio-account/src/session.rs` | `Cookie` (redacted), keyring via `store.rs`, the import file, `Session` (validate, GET, `post_csrf`, avatar, owned universes, asset download, place upload), `ProfileCache` |
 | `crates/rustudio-account/src/api.rs` | `Client::open` (cookie → validated session → cache), experiences, downloads, publishing; `public_asset` stays anonymous |
 | `crates/rustudio-account/src/config.rs` | bookmarks and the signed-out flag only |
-| `crates/rustudio-account/src/store.rs` | the system keyring: the publishing key, and the entries `session.rs` keeps the cookie in |
+| `crates/rustudio-account/src/store.rs` | system keyring entries used for saved account sessions |
 | `src/account_ui.rs` | Account panel (active account, saved accounts, switch, add by pasted cookie, sign out) and the Publish to Roblox window |
 | `src/avatar.rs` | the avatar from the session's own description |
 | `crates/rustudio-account/src/cloud.rs` | places on Roblox: lists, resolve, download, versions, Team Create status, cache, save with the version check |
@@ -206,12 +203,8 @@ POSTs are "get" calls. MECHANICS.md round 27 has how they are used.
 | `thumbnails.roblox.com/v1/games/icons?universeIds=…&size=150x150&format=Png` | 200, CDN PNG URLs (fetched without the cookie) |
 | `develop.roblox.com/v1/gametemplates` | 200, Roblox's templates (Baseplate 28220420 / 95206881, by Templates 998796, uncopylocked) |
 
-Saving a version is Open Cloud Place Publishing with the publishing key
-(`POST apis.roblox.com/universes/v1/{u}/places/{p}/versions?versionType=Saved|Published`).
-It was **not** called against Roblox: it is tested against a local mock
-only. Still waiting on a live test the person approves: one Saved and one
-Published version of a place they own, with a key, and the conflict check
-against a real second save.
+The local cloud tests exercise authenticated uploads, version conflicts and
+server-reported errors without changing an experience on Roblox.
 
 ### Seeing your own games
 
@@ -252,16 +245,13 @@ store.
 ## Sequencing
 
 1. Cookie store + validation + profile cache (the whole of "signed in"). Done.
-2. Publishing over the cookie. Tried; refused by Roblox (above). The
-   publishing key stays until a cookie path works.
-3. OAuth removed. Done. The API key as a sign-in: removed; as a publishing
-   key: waits on 2.
+2. Place-file uploads use the signed-in session through the user-auth Assets API.
+3. OAuth removed.
+
 4. Team Create on the same session.
 
 ## Open questions
 
-- Which upload path takes the cookie for a place version today, if any?
-- Does `Upload.ashx` (if it returns) accept `.rbxlx` (XML) or only `.rbxl`?
 - Cookie lifetime: how long a session survives without a page load, and
   whether `users.roblox.com/v1/users/authenticated` stays a safe liveness
   probe (it has on every run so far).

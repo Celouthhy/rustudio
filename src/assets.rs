@@ -1232,7 +1232,7 @@ impl MeshCache {
     }
 }
 
-/// RUSTUDIO_SYNC_DECODE=1 decodes every texture in the frame that asks.
+/// RUSTUDIO_SYNC_DECODE=1 (and --fixed-dt) decodes in the requesting frame.
 /// Texture upload time per frame before further uploads wait a frame.
 const UPLOAD_BUDGET_MS: f32 = 6.0;
 
@@ -1261,7 +1261,11 @@ fn parse_upload_budget(v: Option<&str>) -> usize {
 
 fn sync_decode() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_SYNC_DECODE").is_some())
+    // Fixed-step captures must not race wall-clock workers. Decode and upload
+    // in the requesting frame, rather than blocking workers whose memory
+    // budget can only be released by subsequent render passes.
+    crate::sim_clock::on()
+        || *ON.get_or_init(|| std::env::var_os("RUSTUDIO_SYNC_DECODE").is_some())
 }
 
 /// A texture on the GPU plus its pixels (clothing compositing reads them).
@@ -1288,7 +1292,8 @@ pub struct TextureCache {
     pub messages: Vec<String>,
     /// Decodes running on worker threads, and finished ones not yet uploaded.
     decoding: std::collections::HashSet<String>,
-    decoded: HashMap<String, texture::Decoded>,
+    decoded: HashMap<String, (texture::Decoded, u64)>,
+    decode_frame: u64,
     /// Upload time spent this frame (mip chain + GPU copy), and whether a
     /// decoded texture was held back for the next frame by that budget.
     upload_ms: f32,
@@ -1361,7 +1366,7 @@ impl TextureCache {
             return None;
         }
         let decoded = match self.decoded.remove(id) {
-            Some(d) => Some(d),
+            Some((d, _)) => Some(d),
             None => match store.content(id, doc_dir) {
                 Fetch::Pending => return None,
                 Fetch::Unavailable(why) => {
@@ -1390,7 +1395,7 @@ impl TextureCache {
         {
             // Over this frame's budget: upload it next frame.
             if let Some(d) = decoded {
-                self.decoded.insert(id.to_string(), d);
+                self.decoded.insert(id.to_string(), (d, self.decode_frame));
             }
             self.deferred = true;
             return None;
@@ -1477,13 +1482,19 @@ impl TextureCache {
     /// Collects finished background decodes; true when any arrived (the
     /// caller bumps its asset generation so waiting parts are redone).
     pub fn poll_decoded(&mut self) -> bool {
+        self.decode_frame += 1;
+        // Completed results for parts that left the scene must release their
+        // Waiting tokens. Otherwise they permanently consume the worker budget.
+        // Give arrivals several render passes to be requested; upload-budget
+        // deferrals refresh their age in image(), so live textures keep waiting.
+        self.decoded.retain(|_, (_, frame)| self.decode_frame - *frame <= 3);
         self.upload_ms = 0.0;
         self.upload_bytes = 0;
         let mut any = std::mem::take(&mut self.deferred);
         let Some((_, rx)) = &self.decode_chan else { return any };
         while let Ok((id, r)) = rx.try_recv() {
             self.decoding.remove(&id);
-            self.decoded.insert(id, r);
+            self.decoded.insert(id, (r, self.decode_frame));
             any = true;
         }
         any
@@ -2107,6 +2118,49 @@ pub fn composite_over(under: Option<&Rgba>, over: Option<&Rgba>) -> Option<Rgba>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_decode_results_expire_but_recent_results_survive() {
+        let mut cache = TextureCache::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        cache.decode_chan = Some((tx.clone(), rx));
+        cache.decoding.insert("old-area".into());
+        tx.send(("old-area".into(), Err("fixture".into()))).unwrap();
+        assert!(cache.poll_decoded());
+        assert!(!cache.decoding());
+        for _ in 0..3 {
+            cache.poll_decoded();
+            assert!(cache.decoded.contains_key("old-area"));
+        }
+        tx.send(("new-area".into(), Err("fixture".into()))).unwrap();
+        cache.poll_decoded();
+        assert!(!cache.decoded.contains_key("old-area"));
+        assert!(cache.decoded.contains_key("new-area"));
+        assert!(!cache.entries.contains_key("old-area"));
+        // Expiration also runs when there are no new completions.
+        for _ in 0..4 {
+            cache.poll_decoded();
+        }
+        assert!(cache.decoded.is_empty());
+    }
+
+    #[test]
+    fn upload_deferred_results_do_not_expire_while_requested() {
+        if sync_decode() { return; }
+        let mut cache = TextureCache::default();
+        let mut store = AssetStore::default();
+        cache.decoded.insert("rbxassetid://987654321".into(), (Err("fixture".into()), 0));
+        for _ in 0..10 {
+            cache.poll_decoded();
+            cache.upload_ms = UPLOAD_BUDGET_MS + 1.0;
+            assert!(cache.image("rbxassetid://987654321", None, &mut store, &mut |_| panic!("over budget")).is_none());
+            assert!(cache.decoded.contains_key("rbxassetid://987654321"));
+        }
+        cache.poll_decoded();
+        cache.image("rbxassetid://987654321", None, &mut store, &mut |_| panic!("failed decode"));
+        assert!(cache.decoded.is_empty());
+        assert!(cache.failed("rbxassetid://987654321"));
+    }
 
     #[test]
     fn upload_budget_parse() {

@@ -18,7 +18,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui::{Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use rustudio_account::cloud::GroupInfo;
-use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, ExperienceSource, PublishKeyStore};
+use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, ExperienceSource};
 
 use crate::app::{Editor, PendingAction};
 use crate::cloud_ui::Paged;
@@ -148,8 +148,7 @@ impl StartPage {
             let g = ed_client.as_ref()?.lock().ok()?;
             g.as_ref()?.session.downloader()
         };
-        let key = PublishKeyStore::load().ok().flatten();
-        Some(CloudApi::new(session, ep, key))
+        Some(CloudApi::new(session, ep, None))
     }
 
     fn spawn(

@@ -476,6 +476,10 @@ impl Gui {
         self.hits.clear();
         self.world_batches.clear();
         self.cache_check(ctx, inp.doc);
+        if self.retry_missing_faces(inp.store) {
+            self.memo.clear();
+            self.cache.clear();
+        }
         self.fx_frame(inp.doc);
         if (inp.playing && inp.roots == Roots::View) || inp.roots == Roots::CoreGui {
             let _a = crate::bench::scope("gui_adorn");
@@ -1775,9 +1779,17 @@ fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [
     let c = cam.project(rect, p)?;
     let s = udim2(d, g, "Size");
     // Size: scale in studs, offset in pixels.
+    // (by view-space depth, not distance: Studio's 230 px at 10 studs
+    // off-axis is depth's 229.76, distance's would be 229.46)
+    let depth = (p - cam.pos).dot(cam.forward());
     let px_per_stud =
-        rect.height() / (2.0 * dist.max(0.01) * (cam.fov_deg.to_radians() * 0.5).tan());
-    let canvas = [s[0] * px_per_stud + s[1], s[2] * px_per_stud + s[3]];
+        rect.height() / (2.0 * depth.max(0.01) * (cam.fov_deg.to_radians() * 0.5).tan());
+    // Whole pixels, rounded, as Studio's AbsoluteSize (Studio 2026-11-16, a
+    // 4 x 0.75-stud tag: 80x15 at 30 studs, 7.5 → 8, 2.25 → 2, 0.9 → 1;
+    // descendants lay out in the rounded box, and sub-pixel motion changes
+    // nothing — the test place's 200 NPC name tags re-walked every frame on
+    // ~1e-6 stud jitter).
+    let canvas = [(s[0] * px_per_stud + s[1]).round(), (s[2] * px_per_stud + s[3]).round()];
     if canvas[0] <= 0.0 || canvas[1] <= 0.0 || canvas[0] > 8192.0 || canvas[1] > 8192.0 {
         return None;
     }

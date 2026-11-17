@@ -10,28 +10,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use egui::RichText;
-use rustudio_account::{
-    AccountConfig, Client, CookieSource, Profile, PublishKeyStore, SavedAccount, SignedOut,
-    UniverseInfo, VersionType,
-};
+use rustudio_account::{AccountConfig, Client, CookieSource, Profile, PublishKeyStore, SavedAccount, SignedOut};
 
 use crate::app::{Editor, Level};
-use crate::doc::DocKind;
 use crate::theme;
+
+#[path = "account_destination.rs"]
+mod destination;
 
 enum Msg {
     Log(Level, String),
     SignedIn {
         profile: Profile,
         source: CookieSource,
-        publish_key: bool,
     },
     Head(u64, egui::ColorImage),
     /// A switch or add that failed; the previous session was kept.
     Failed(String),
     SignedOut(String),
-    PublishKey(bool),
-    Universes(Vec<UniverseInfo>),
+    CachedName(Option<String>),
     Avatar(Box<crate::avatar::AvatarLook>),
     Done,
 }
@@ -48,22 +45,18 @@ pub enum SessionState {
 
 pub struct AccountUi {
     pub open: bool,
-    pub show_publish: bool,
+    destination: Option<destination::Picker>,
+    profile: Option<Profile>,
     config: Option<AccountConfig>,
     client: Arc<Mutex<Option<Client>>>,
     pub state: SessionState,
     source: Option<CookieSource>,
-    universes: Vec<UniverseInfo>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     jobs: usize,
-    publish_universe: String,
-    publish_place: String,
     restored: bool,
-    confirm_publish: Option<VersionType>,
     avatar: Option<crate::avatar::AvatarLook>,
     avatar_requested: bool,
-    has_publish_key: bool,
     /// The add-account form: the pasted `.ROBLOSECURITY` value (cleared as
     /// soon as it is handed to the sign-in job).
     pub adding: bool,
@@ -77,7 +70,6 @@ pub struct AccountUi {
     heads: HashMap<u64, egui::TextureHandle>,
     head_images: Vec<(u64, egui::ColorImage)>,
     heads_asked: HashSet<u64>,
-    restored_universes: bool,
     adding_pending: bool,
     /// A Quick Sign-in in progress (Sign in with your browser).
     quick: Option<QuickView>,
@@ -105,22 +97,18 @@ impl AccountUi {
         let (tx, rx) = channel();
         AccountUi {
             open: false,
-            show_publish: false,
+            destination: None,
+            profile: None,
             config: None,
             client: Arc::new(Mutex::new(None)),
             state: SessionState::Checking(None),
             source: None,
-            universes: Vec::new(),
             tx,
             rx,
             jobs: 0,
-            publish_universe: String::new(),
-            publish_place: String::new(),
             restored: false,
-            confirm_publish: None,
             avatar: None,
             avatar_requested: false,
-            has_publish_key: false,
             adding: false,
             cookie_input: String::new(),
             add_error: None,
@@ -130,7 +118,6 @@ impl AccountUi {
             heads: HashMap::new(),
             head_images: Vec::new(),
             heads_asked: HashSet::new(),
-            restored_universes: false,
             adding_pending: false,
             quick: None,
         }
@@ -161,7 +148,8 @@ impl AccountUi {
             let mut log = |s: String| {
                 let _ = txl.send(Msg::Log(Level::Info, s));
             };
-            match crate::avatar::load(client, &mut log) {
+            let snapshot = Arc::new(Mutex::new(Some(client_snapshot(client)?)));
+            match crate::avatar::load(&snapshot, &mut log) {
                 Ok(look) => {
                     let _ = tx.send(Msg::Avatar(Box::new(look)));
                     Ok(())
@@ -197,7 +185,7 @@ impl AccountUi {
         if !self.signed_in() {
             return None;
         }
-        self.with_client(|c| c.session.profile.id)
+        self.user
     }
 
     /// The signed-in account's username and display name (Play's local
@@ -206,8 +194,7 @@ impl AccountUi {
         if !self.signed_in() {
             return None;
         }
-        self.with_client(|c| {
-            let p = &c.session.profile;
+        self.profile.as_ref().map(|p| {
             let disp = if p.display_name.is_empty() { p.name.clone() } else { p.display_name.clone() };
             (p.name.clone(), disp)
         })
@@ -256,7 +243,6 @@ impl AccountUi {
                 Msg::SignedIn {
                     profile,
                     source,
-                    publish_key,
                 } => {
                     let who = profile.display();
                     logs.push((
@@ -275,7 +261,6 @@ impl AccountUi {
                     if self.user != Some(profile.id) {
                         self.changed = self.user.is_some() || self.changed;
                         self.user = Some(profile.id);
-                        self.universes.clear();
                         self.avatar = None;
                         self.avatar_requested = false;
                     }
@@ -286,9 +271,9 @@ impl AccountUi {
                     if std::mem::take(&mut self.adding_pending) && self.add_error.is_none() {
                         self.adding = false;
                     }
+                    self.profile = Some(profile);
                     self.state = SessionState::SignedIn(who);
                     self.source = Some(source);
-                    self.has_publish_key = publish_key;
                 }
                 Msg::Head(id, img) => self.head_images.push((id, img)),
                 Msg::Failed(e) => {
@@ -303,14 +288,14 @@ impl AccountUi {
                     self.adding_pending = false;
                     self.state = SessionState::SignedOut(why);
                     self.source = None;
-                    self.universes.clear();
+                    self.profile = None;
                     self.avatar = None;
                     self.avatar_requested = false;
                 }
-                Msg::PublishKey(k) => self.has_publish_key = k,
-                Msg::Universes(u) => {
-                    logs.push((Level::Info, format!("Found {} experience(s)", u.len())));
-                    self.universes = u;
+                Msg::CachedName(name) => {
+                    if matches!(self.state, SessionState::Checking(_)) {
+                        self.state = SessionState::Checking(name);
+                    }
                 }
                 Msg::Avatar(look) => {
                     logs.push((
@@ -321,7 +306,9 @@ impl AccountUi {
                             if look.r15 { "R15" } else { "R6" }
                         ),
                     ));
-                    self.avatar = Some(*look);
+                    if self.user == Some(look.user_id) {
+                        self.avatar = Some(*look);
+                    }
                 }
                 Msg::Done => {
                     self.jobs = self.jobs.saturating_sub(1);
@@ -383,9 +370,11 @@ impl AccountUi {
     }
 
     fn check_session(&mut self) {
-        let cached = Client::cached_profile().map(|c| c.profile.display());
-        self.state = SessionState::Checking(cached);
-        self.connect("Checking the Roblox session", false, |cfg| {
+        self.state = SessionState::Checking(None);
+        let tx = self.tx.clone();
+        self.connect("Checking the Roblox session", false, move |cfg| {
+            let cached = Client::cached_profile().map(|c| c.profile.display());
+            let _ = tx.send(Msg::CachedName(cached));
             // Tokens an older (OAuth) rustudio left in the keyring go.
             PublishKeyStore::forget_oauth_tokens();
             Client::open(cfg)
@@ -424,7 +413,6 @@ impl AccountUi {
                     let _ = tx.send(Msg::SignedIn {
                         profile,
                         source,
-                        publish_key: Client::has_publish_key(),
                     });
                 }
                 Err(e) => {
@@ -625,62 +613,24 @@ impl AccountUi {
         }
     }
 
-    fn remove_publish_key(&mut self) {
-        self.spawn("Removing the publishing key", move |_, tx| {
-            PublishKeyStore::clear()?;
-            let _ = tx.send(Msg::PublishKey(false));
-            Ok(())
-        });
-    }
 
-    fn refresh_universes(&mut self) {
-        let bookmarks = self.config().bookmarks.clone();
-        self.spawn("Listing experiences", move |client, tx| {
-            let mut guard = client.lock().unwrap();
-            let c = guard
-                .as_mut()
-                .ok_or_else(|| rustudio_account::Error::new("signed out"))?;
-            c.config.bookmarks = bookmarks;
-            let list = c.list_universes()?;
-            let _ = tx.send(Msg::Universes(list));
-            Ok(())
-        });
-    }
+}
 
-    fn publish(&mut self, universe: u64, place: u64, vt: VersionType, bytes: Vec<u8>) {
-        self.spawn(
-            &format!(
-                "{} place {place}",
-                if vt == VersionType::Published {
-                    "Publishing"
-                } else {
-                    "Saving"
-                }
-            ),
-            move |client, tx| {
-                let guard = client.lock().unwrap();
-                let c = guard
-                    .as_ref()
-                    .ok_or_else(|| rustudio_account::Error::new("signed out"))?;
-                let r = c.publish_place(universe, place, vt, &bytes, false)?;
-                let _ = tx.send(Msg::Log(
-                    Level::Info,
-                    format!(
-                        "{} version {} of place {place} (with the {})",
-                        vt.as_str(),
-                        r.version_number,
-                        r.via
-                    ),
-                ));
-                Ok(())
-            },
-        );
-    }
+/// Copy the session under a short lock before doing network work. Downloader
+/// copies share cookie rotations with the signed-in session.
+fn client_snapshot(shared: &crate::assets::SharedClient) -> rustudio_account::Result<Client> {
+    let guard = shared.lock().map_err(|_| rustudio_account::Error::new("Account session is unavailable"))?;
+    let client = guard.as_ref().ok_or_else(|| rustudio_account::Error::new("Sign in to Roblox"))?;
+    Ok(Client {
+        config: client.config.clone(),
+        session: client.session.downloader(),
+        source: client.source,
+    })
 }
 
 impl Editor {
     pub fn account_window(&mut self, ctx: &egui::Context) {
-        if self.account.open || self.account.show_publish {
+        if self.account.open || self.cloud_upload_mode().is_some() {
             self.account.restore();
         }
         if self.account.take_changed() {
@@ -691,20 +641,7 @@ impl Editor {
             self.account.heads(ctx);
             self.account_popover(ctx);
         }
-        if self.account.show_publish {
-            let mut open = true;
-            egui::Window::new("Publish to Roblox")
-                .id(egui::Id::new("roblox_publish_window"))
-                .open(&mut open)
-                .default_width(400.0)
-                .resizable(false)
-                .collapsible(false)
-                .show(ctx, |ui| self.publish_contents(ui));
-            if !open {
-                self.account.show_publish = false;
-                self.account.confirm_publish = None;
-            }
-        }
+        self.roblox_destination_window(ctx);
     }
 
     /// The account dropdown under the top-right account button.
@@ -1026,140 +963,6 @@ impl Editor {
         }
     }
 
-    fn publish_contents(&mut self, ui: &mut egui::Ui) {
-        let is_place = self.doc.kind == DocKind::Place;
-        let live_place = self.live_team_create_place();
-        let origin = self.doc.cloud.clone();
-        let a = &mut self.account;
-        if a.publish_universe.is_empty() && a.publish_place.is_empty() {
-            if let Some(o) = &origin {
-                a.publish_universe = o.universe_id.to_string();
-                a.publish_place = o.place_id.to_string();
-            }
-        }
-        if a.signed_in() && a.universes.is_empty() && !a.busy() && !a.restored_universes {
-            a.restored_universes = true;
-            a.refresh_universes();
-        }
-        ui.label(RichText::new(a.status_short()).small().color(theme::TEXT_DIM));
-        if !a.signed_in() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Sign in to publish.").color(theme::WARN));
-                if ui.button("Account…").clicked() {
-                    a.open = true;
-                }
-            });
-        }
-        // Pick a place from the account's experiences, or type the IDs.
-        let current = a
-            .universes
-            .iter()
-            .flat_map(|u| u.places.iter().map(move |p| (u, p)))
-            .find(|(u, p)| a.publish_universe.trim() == u.id.to_string() && a.publish_place.trim() == p.id.to_string())
-            .map(|(u, p)| format!("{} — {}", u.name, p.name))
-            .unwrap_or_else(|| "Choose a place…".into());
-        let mut pick: Option<(u64, u64)> = None;
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("publish_target")
-                .selected_text(current)
-                .width(300.0)
-                .show_ui(ui, |ui| {
-                    if a.universes.is_empty() {
-                        ui.label(RichText::new(if a.busy() { "Loading…" } else { "No experiences found" }).color(theme::TEXT_DIM));
-                    }
-                    for u in &a.universes {
-                        ui.label(RichText::new(&u.name).small().strong().color(theme::TEXT_DIM));
-                        for p in &u.places {
-                            let label = format!("  {}{}", if p.is_root { "★ " } else { "" }, p.name);
-                            if ui.selectable_label(false, label).clicked() {
-                                pick = Some((u.id, p.id));
-                            }
-                        }
-                    }
-                });
-            if ui.add_enabled(a.signed_in() && !a.busy(), egui::Button::new("Reload")).on_hover_text("Reload your experiences").clicked() {
-                a.refresh_universes();
-            }
-        });
-        if let Some((u, p)) = pick {
-            a.publish_universe = u.to_string();
-            a.publish_place = p.to_string();
-        }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Universe ID").small().color(theme::TEXT_DIM));
-            ui.add(egui::TextEdit::singleline(&mut a.publish_universe).desired_width(110.0));
-            ui.label(RichText::new("Place ID").small().color(theme::TEXT_DIM));
-            ui.add(egui::TextEdit::singleline(&mut a.publish_place).desired_width(110.0));
-        });
-        let ids = (a.publish_universe.trim().parse::<u64>(), a.publish_place.trim().parse::<u64>());
-        let ready = a.signed_in() && is_place && ids.0.is_ok() && ids.1.is_ok() && !a.busy();
-        if !is_place {
-            ui.label(RichText::new("Open a place (.rbxl) to publish; models cannot be published as places.").color(theme::WARN));
-        }
-        let saves_live = live_place.is_some() && ids.1.as_ref().ok().copied() == live_place;
-        let note = if saves_live {
-            "Saved through the connected Team Create server."
-        } else {
-            "Uploaded with your signed-in session. The Output panel shows Roblox's answer."
-        };
-        ui.label(RichText::new(note).small().color(theme::TEXT_DIM));
-        if a.has_publish_key {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("An older publishing key is stored and still used.").small().color(theme::TEXT_DIM));
-                if ui.add_enabled(!a.busy(), egui::Button::new("Remove it").small()).clicked() {
-                    a.remove_publish_key();
-                }
-            });
-        }
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.add_enabled(ready, egui::Button::new("Save")).on_hover_text("Stores a saved version without making it the published version").clicked() {
-                a.confirm_publish = Some(VersionType::Saved);
-            }
-            if ui.add_enabled(ready, egui::Button::new(RichText::new("Publish").strong())).on_hover_text("Becomes the live version").clicked() {
-                a.confirm_publish = Some(VersionType::Published);
-            }
-        });
-        if let Some(vt) = self.account.confirm_publish {
-            let (u, p) = (
-                self.account.publish_universe.trim().to_string(),
-                self.account.publish_place.trim().to_string(),
-            );
-            let mut decision: Option<bool> = None;
-            ui.group(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} the open place to place {p} (universe {u})?",
-                        if vt == VersionType::Published { "Publish (goes live)" } else { "Save" }
-                    ))
-                    .strong(),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Yes").clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-            if let Some(go) = decision {
-                self.account.confirm_publish = None;
-                if go {
-                    if live_place.is_some() && p.parse::<u64>().ok() == live_place {
-                        self.save_cloud(vt, false);
-                        return;
-                    }
-                    match (u.parse(), p.parse(), self.doc.encode_all(false)) {
-                        (Ok(u), Ok(p), Ok(bytes)) => self.account.publish(u, p, vt, bytes),
-                        (_, _, Err(e)) => self.error(format!("Could not encode the place: {e}")),
-                        _ => self.error("Universe and place IDs must be numbers"),
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn disp(a: &SavedAccount) -> &str {

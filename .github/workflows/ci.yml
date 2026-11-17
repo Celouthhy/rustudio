@@ -113,7 +113,10 @@ jobs:
           name: rustudio-windows-x64
           path: dist/*.zip
 
-  # A v* tag: one release with all three downloads and their SHA-256 sums.
+  # A v* tag: attaches the three downloads and their SHA-256 sums to the
+  # release the maintainer drafted for this tag, then publishes it. This job
+  # never creates a release: one made here would be credited to
+  # github-actions instead of its author.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [macos-app, linux-release, windows-release]
@@ -132,14 +135,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" dist/* --clobber ||
-            gh release create "$GITHUB_REF_NAME" dist/* --title "rustudio $GITHUB_REF_NAME" --notes-file - <<'NOTES'
-          Downloads:
-          - Linux x86_64: rustudio-linux-x86_64.tar.gz (unpack, run ./install.sh, then launch rustudio from the applications menu)
-          - Windows x64: rustudio-windows-x64.zip (unzip, run install.cmd for a Start menu shortcut, or run rustudio.exe portably)
-          - macOS (Apple Silicon and Intel): unzip, move rustudio.app to Applications, and the first time right-click it > Open (it isn't notarized).
-
-          SHA256SUMS lists each file's checksum.
-
-          rustudio is made by @rippelz.
-          NOTES
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::No release exists for $GITHUB_REF_NAME. The maintainer drafts it first (gh release create $GITHUB_REF_NAME --draft --title \"rustudio $GITHUB_REF_NAME\" --notes-file NOTES.md), then this job is re-run."
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

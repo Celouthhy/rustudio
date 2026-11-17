@@ -810,7 +810,10 @@ fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
             return false;
         }
     }
-    true
+    // A point in line with every edge only happens for a quad with no area
+    // (a zero-size GuiObject, such as legacy chat's MessageMode button),
+    // which takes no input in Roblox.
+    sign != 0.0
 }
 
 // ------------------------------------------------------------------ fonts
@@ -1649,6 +1652,42 @@ mod tests {
         ];
         assert!(point_in_quad(&q, Pos2::new(5.0, 5.0)));
         assert!(!point_in_quad(&q, Pos2::new(0.5, 0.5)));
+        // Keep edges and corners interactive, with either winding order.
+        for q in [q, [q[3], q[2], q[1], q[0]]] {
+            assert!(point_in_quad(&q, Pos2::new(2.5, 2.5)));
+            assert!(point_in_quad(&q, q[0]));
+            assert!(point_in_quad(&q, Pos2::new(5.0, 5.0)));
+        }
+    }
+
+    #[test]
+    fn point_in_zero_size_quad() {
+        // A zero-size object (all four corners at one point) is hit nowhere.
+        let p = Pos2::new(12.0, 147.3);
+        assert!(!point_in_quad(&[p; 4], Pos2::new(480.0, 300.0)));
+        assert!(!point_in_quad(&[p; 4], p));
+
+        // A single collapsed dimension is also noninteractive, even on the
+        // resulting line or its endpoints. Include rotated and reversed quads.
+        for end in [
+            Pos2::new(10.0, 0.0),
+            Pos2::new(0.0, 10.0),
+            Pos2::new(10.0, 10.0),
+        ] {
+            for q in [
+                [Pos2::ZERO, end, end, Pos2::ZERO],
+                [Pos2::ZERO, Pos2::ZERO, end, end],
+            ] {
+                for p in [
+                    Pos2::ZERO,
+                    end,
+                    Pos2::new(end.x * 0.5, end.y * 0.5),
+                    Pos2::new(20.0, 3.0),
+                ] {
+                    assert!(!point_in_quad(&q, p), "quad {q:?} accepted {p:?}");
+                }
+            }
+        }
     }
 }
 

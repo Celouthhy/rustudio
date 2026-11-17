@@ -6522,8 +6522,21 @@ impl Runtime {
                 }
             })
             .flatten();
+        let character = match (name, &v) {
+            ("Character", Variant::Ref(c)) if c.is_some() => Some(*c),
+            _ => None,
+        };
         if let Err(e) = store_prop(&self.lua, r, name, v) {
             report(&self.lua, &e);
+        }
+        // The LocalPlayer's Character set: the LocalScripts already in that
+        // model start now, as in Roblox (a server may stream the character
+        // in before it sets the property); ones that arrive later start as
+        // they arrive (set_parent).
+        if let (Some(c), Ok(mut w)) = (character, world(&self.lua)) {
+            if w.d().exists(c) {
+                w.queue_scripts(c);
+            }
         }
         if let (Some((old, new)), Ok(mut w)) = (health, world(&self.lua)) {
             if new != old {
@@ -7129,6 +7142,47 @@ mod legacy_tests {
         rt.step(1.0 / 60.0);
         let out = rt.leave().output;
         assert!(out.iter().any(|(_, t)| t.starts_with("gui script ran")), "{out:?}");
+    }
+
+    #[test]
+    fn replicated_character_starts_only_local_scripts_once_in_either_order() {
+        for character_first in [false, true] {
+            let mut d = Document::new_place();
+            let root = d.dom.root_ref();
+            let players = d.find_child(root, "Players").unwrap();
+            let player = d.dom.insert(players, InstanceBuilder::new("Player"));
+            let other = d.dom.insert(players, InstanceBuilder::new("Player"));
+            d.dom.get_by_ref_mut(players).unwrap().properties
+                .insert(ustr("LocalPlayer"), Variant::Ref(player));
+            let workspace = d.workspace().unwrap();
+            let character = d.dom.insert(workspace, InstanceBuilder::new("Model"));
+            let script_parent = if character_first { root } else { character };
+            let script = d.dom.insert(script_parent, InstanceBuilder::new("LocalScript")
+                .with_property("Source", "print('character script ran')".to_string()));
+            d.dom.insert(character, InstanceBuilder::new("LocalScript")
+                .with_property("Disabled", true)
+                .with_property("Source", "error('disabled character script ran')".to_string()));
+            let rt = Runtime::new().unwrap();
+            let mut w = World::new(d, RunMode::Play);
+            w.side = Side::Client;
+            rt.enter(w);
+            rt.bind_globals().unwrap();
+            rt.apply_prop(other, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.is_empty());
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            if character_first {
+                rt.apply_parent(script, character);
+            }
+            // Repeated replication before dispatch must still execute once.
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            assert!(world(&rt.lua).unwrap().to_start.iter().all(|r| *r == script));
+            rt.dispatch();
+            rt.apply_prop(player, "Character", Variant::Ref(character));
+            rt.dispatch();
+            let out = rt.leave().output;
+            assert_eq!(out.len(), 1, "{out:?}");
+            assert!(out[0].1.starts_with("character script ran"), "{out:?}");
+        }
     }
 
     /// Round 26's library gaps from Place D's second admin script and Place B's

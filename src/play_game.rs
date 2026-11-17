@@ -2725,3 +2725,32 @@ impl GameState {
         self.walks.get(&humanoid).map(|w| w.target)
     }
 }
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    #[test]
+    fn tool_handle_accepts_named_base_part_children() {
+        for class in ["Part", "MeshPart", "UnionOperation"] {
+            let mut d = doc::Document::new_place();
+            let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+            let handle = d.dom.insert(tool, InstanceBuilder::new(class).with_name("Handle"));
+            assert_eq!(tool_handle(&d, tool), Some(handle), "{class}");
+        }
+    }
+
+    #[test]
+    fn tool_handle_ignores_wrong_names_classes_and_nested_parts() {
+        let mut d = doc::Document::new_place();
+        let tool = d.dom.insert(d.dom.root_ref(), InstanceBuilder::new("Tool"));
+        d.dom.insert(tool, InstanceBuilder::new("Part").with_name("handle"));
+        let folder = d.dom.insert(tool, InstanceBuilder::new("Folder").with_name("Handle"));
+        d.dom.insert(folder, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), None);
+
+        let handle = d.dom.insert(tool, InstanceBuilder::new("Part").with_name("Handle"));
+        assert_eq!(tool_handle(&d, tool), Some(handle));
+        assert_eq!(tool_handle(&d, Ref::new()), None);
+    }
+}

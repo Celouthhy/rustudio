@@ -68,7 +68,7 @@ Probed 2026-11-01 against the live cookie (account @Owner2, id
 | `www.roblox.com/my/account/json` | 200 | legacy account fields (id, name, email state) |
 | `develop.roblox.com/v1/user/universes?limit=50` | 200 | the experiences this account owns (one: "Owner2's Place", universe 100000004, root place 100000005, private) |
 | `develop.roblox.com/v1/universes/{id}` | 200 | universe details |
-| `assetdelivery.roblox.com/v2/assetId/{id}` | 200 | asset bytes: public ones anonymously; with the cookie also the account's own private place and assets served only to signed-in accounts (the current dynamic head 123480233606534 and its cage 76523574292282; catalog layered clothing such as 8516620262) |
+| `assetdelivery.roblox.com/v2/assetId/{id}` | 200 | asset bytes: public ones anonymously; with the cookie also the account's own private place and assets served only to signed-in accounts (the current dynamic head 123480233606534 and its cage 76523574292282; catalog layered clothing such as 8516620262). The cookie has to be the current generation — see "Cookie rotation" below |
 | `apis.roblox.com/...` (Open Cloud) | 404 | **not cookie-authenticated** |
 | `data.roblox.com/Data/Upload.ashx` (POST) | 403 + `x-csrf-token`, then 307 → `request-error?code=404` | see "Publishing" |
 | `www.roblox.com/ide/publish/UploadExistingAsset` (POST) | 404 | see "Publishing" |
@@ -83,6 +83,40 @@ The account's `playerAvatarType` is **R6**, with non-default scales (height
 0.9, width 0.7, head 0.95, depth 0.85), torso BrickColor 26 (Black) and the
 rest 1003 (Really black): a real-world test of the R6 rig and, when a place
 forces R15, of scale-aware body parts.
+
+## Cookie rotation
+
+Roblox rotates `.ROBLOSECURITY` on a cadence of hours to days and announces
+the next value in a `Set-Cookie` reply (`Upcoming .ROBLOSECURITY Cookie
+Format Changes`, DevForum 4328913, 2026-02-03). A client that ignores it
+keeps an outdated value. rustudio follows it: `Session::validate` keeps the
+rotation the identity call hands out, every other reply is checked
+(`Session::apply_rotation`), the copies `Session::downloader` makes share the
+value, and a rotation is written to the keyring (the active slot, and the
+saved-account slot when there is one) so the next start uses it.
+
+Asset delivery enforces the rotation before the other hosts do [verified:
+live 2026-11-15, with a signed-in account's cookie that had gone a
+rotation stale]. With an outdated value:
+
+- `users.roblox.com/v1/users/authenticated` answers 200 — and hands out the
+  next value in `Set-Cookie`;
+- `assetdelivery.roblox.com/v2/assetId/{id}` answers **200 with
+  `errors[0]` code 401 "Authentication required to access Asset."**
+  (`customErrorCode` 11) for private assets, the account's own places
+  included. Headers do not change that: `Roblox-Place-Id`,
+  `Roblox-Browser-Asset-Request`, `AssetType` (matching or not),
+  `AssetFormat`/`Roblox-AssetFormat`, a Studio or browser user agent, HTTP/1.1
+  and HTTP/2, and the `rbxas` cookie all answer the same 401; `AssetType`
+  mismatch answers 403 code 8 instead.
+
+With the rotated value the same requests serve the bytes (avatar animation
+assets 72515517400250 1166 B, 82874913229227 1167 B, 86581706084882 1601 B,
+87313977906892 1132 B, 112358977833574 1131 B, 127578931479679 1133 B,
+137009629513823 1210 B; one of the account's places, 167 763 B).
+`Session::download_asset`
+therefore asks the identity endpoint for the rotation once when asset
+delivery refuses on authentication, and retries.
 
 ## CSRF
 

@@ -93,8 +93,8 @@ pub enum RepOp {
     /// Anything we recognise the kind of but can't decode the body of yet.
     Unhandled { kind: ItemKind },
     /// A net asset (a union's SolidMeshHolder contents) from the 0xa5
-    /// channel, keyed like the holder property's reference (`net_asset_key`).
-    NetAsset { key: u64, data: Vec<u8> },
+    /// channel, keyed by the id a holder property refers to.
+    NetAsset { key: NetAssetId, data: Vec<u8> },
 }
 
 /// A property value in transit.
@@ -133,6 +133,10 @@ pub enum PropValue {
     },
     /// Decoded but not modelled further: raw bytes kept for analysis.
     Raw(Vec<u8>),
+    /// A net asset handle (wire type 0x3c, e.g. SolidMeshHolder): the id of
+    /// an asset whose contents arrive on the 0xa5 channel. `None` is the
+    /// empty handle.
+    NetAssetHandle(Option<NetAssetId>),
     /// A value of wire type `ty` whose payload the model converts to a
     /// Roblox type (UDim/UDim2, Vector3int16, NumberSequence, NumberRange,
     /// ColorSequence, PhysicalProperties, Font). `bytes` is laid out as
@@ -188,6 +192,9 @@ impl<'a> Cur<'a> {
     }
     fn u32(&mut self) -> R<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> R<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn f32(&mut self) -> R<f32> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -278,14 +285,29 @@ pub struct Schema {
     pub content_prefixes: Vec<String>,
     /// The common-name dictionary used by Name values (`0x80 | index`).
     pub names: Vec<String>,
+    /// Net asset handles (type 0x3c) carry a varint schema asset type before
+    /// the id instead of a u64 type after it. Set by bit 5 of the header's
+    /// engine configuration word (the client reads it at the end of the
+    /// schema reader); off in a 2026-11-04 join (`03 01`), on in a
+    /// 2026-11-18 join (`03 21`).
+    pub net_asset_handles: bool,
 }
 
 impl Schema {
     /// Parse the decompressed 0x97 body.
     pub fn parse(d: &[u8]) -> Result<Schema, DecodeError> {
         let mut c = Cur::new(d);
-        c.take(9)?;
-        let mut s = Schema::default();
+        // Header: varint schema version (the client rejects anything but 3),
+        // then the u64 engine configuration word.
+        let version = c.varint()?;
+        if version != 3 {
+            return bad(format!("schema version {version}"));
+        }
+        let config = c.u64()?;
+        let mut s = Schema {
+            net_asset_handles: (config >> 5) & 1 != 0,
+            ..Schema::default()
+        };
         for _ in 0..c.varint()? {
             s.enums.push(c.varstr()?);
             c.u8()?;
@@ -461,19 +483,7 @@ impl Schema {
                 PropValue::Typed { ty, bytes: c.d[start..c.o].to_vec() }
             }
             0x37 => PropValue::Raw(c.take(8)?.to_vec()),
-            0x3c => {
-                let start = c.o;
-                let n = c.u32()?;
-                if n > 64 {
-                    return bad(format!("solid mesh count {n}"));
-                }
-                for _ in 0..n {
-                    c.take(3)?;
-                    c.varint()?;
-                    c.take(8)?;
-                }
-                PropValue::Typed { ty, bytes: c.d[start..c.o].to_vec() }
-            }
+            0x3c => PropValue::NetAssetHandle(self.net_asset_handle(c)?),
             0x3d => match c.u8()? {
                 0 => PropValue::String(String::new()),
                 1 => PropValue::String(c.varstr()?),
@@ -494,6 +504,41 @@ impl Schema {
     }
 }
 
+impl Schema {
+    /// One net asset handle. With [`Schema::net_asset_handles`]: a varint
+    /// schema asset type (`0xffff` = empty handle, nothing follows), then
+    /// the id. Without: the id, then a u64 local asset type. The id is the
+    /// same in both, and in the 0xa5 begin message.
+    fn net_asset_handle(&self, c: &mut Cur) -> R<Option<NetAssetId>> {
+        if !self.net_asset_handles {
+            let id = NetAssetId::read(c)?;
+            c.u64()?;
+            return Ok(Some(id));
+        }
+        match c.varint()? {
+            0xffff => Ok(None),
+            ty if ty > 0xffff => bad(format!("net asset type {ty}")),
+            _ => NetAssetId::read(c).map(Some),
+        }
+    }
+}
+
+/// A net asset's id: the creating peer's u64 GUID word, then a varint index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetAssetId {
+    pub guid: u64,
+    pub index: u32,
+}
+
+impl NetAssetId {
+    fn read(c: &mut Cur) -> R<NetAssetId> {
+        let guid = c.u64()?;
+        let index = c.varint()?;
+        let index = u32::try_from(index).map_err(|_| DecodeError::Bad(format!("net asset index {index}")))?;
+        Ok(NetAssetId { guid, index })
+    }
+}
+
 /// A CFrame rotation: id 0 = nine f32 follow, else a basic (axis-aligned)
 /// rotation id as in the binary place format.
 fn rotation(id: u8, c: &mut Cur) -> R<[f32; 9]> {
@@ -506,23 +551,6 @@ fn rotation(id: u8, c: &mut Cur) -> R<[f32; 9]> {
         ]),
         Err(_) => bad(format!("rotation id {id:#x}")),
     }
-}
-
-/// A net asset reference as the SolidMeshHolder property and the 0xa5 begin
-/// message both write it: `u32 1, u8 1, u16 0, u8 tag, varint id`; the key
-/// packs the tag and id.
-fn net_asset_key(c: &mut Cur) -> R<u64> {
-    c.take(4)?;
-    c.take(3)?;
-    let tag = c.u8()? as u64;
-    let id = c.varint()?;
-    Ok((tag << 56) | (id & 0x00ff_ffff_ffff_ffff))
-}
-
-/// The key of the first reference in a SolidMeshHolder property's bytes.
-pub fn holder_key(bytes: &[u8]) -> Option<u64> {
-    let mut c = Cur::new(bytes);
-    net_asset_key(&mut c).ok()
 }
 
 // A local resource limit, not a claimed protocol maximum.
@@ -629,7 +657,7 @@ pub struct Decoder {
     /// Items or values the decoder could not parse (kept for diagnostics).
     pub errors: Vec<String>,
     /// The 0xa5 transfer in progress: its key, compressed length, chunks.
-    net_asset: Option<(u64, usize, u16, Vec<u8>)>,
+    net_asset: Option<(NetAssetId, usize, u16, Vec<u8>)>,
 }
 
 impl Decoder {
@@ -664,8 +692,8 @@ impl Decoder {
     }
 
     /// The 0xa5 channel (2026-11-05, from the Place B [DEV] join capture): each
-    /// transfer is `02 fe 04 <ref> 00 <varint compressed length>` (begin; ref as
-    /// in the SolidMeshHolder property), then `01 fe <u16 LE chunk index>
+    /// transfer is `02 fe 04 <id> 00 <varint compressed length>` (begin; id as
+    /// in a net asset handle, [`NetAssetId`]), then `01 fe <u16 LE chunk index>
     /// <≤512 bytes>` chunks, then `03 fe <varint>` (end); `06 01 <varint>`
     /// carries no geometry. The joined chunks are a varint of the decompressed
     /// size, then an LZ4 block: the holder blob without its `03 01` prefix
@@ -676,8 +704,8 @@ impl Decoder {
             2 => {
                 c.u8()?; // fe
                 c.u8()?; // 04
-                let key = net_asset_key(&mut c)?;
-                c.u8()?; // 00 (where the holder property has its u32 3)
+                let key = NetAssetId::read(&mut c)?;
+                c.u8()?; // 00
                 let len = c.varint()? as usize;
                 if len > MAX_NET_ASSET_BYTES {
                     self.net_asset = None;
@@ -716,7 +744,7 @@ impl Decoder {
                             holder.append(&mut out);
                             ops.push(RepOp::NetAsset { key, data: holder });
                         }
-                        None => self.errors.push(format!("net asset {key}: LZ4 data didn't decode")),
+                        None => self.errors.push(format!("net asset {key:?}: LZ4 data didn't decode")),
                     }
                 }
             }
@@ -1201,6 +1229,43 @@ mod tests {
         assert_eq!(s.global_props[3], (1, 1)); // Part.Name
         assert_eq!(s.global_events, vec![(1, 0)]);
         assert_eq!(s.names, vec!["Baseplate"]);
+    }
+
+    /// The header's engine configuration word selects the net asset handle
+    /// layout: bit 5 clear in an older join (`03 01`), set in a newer
+    /// one (`03 21`).
+    #[test]
+    fn schema_header_selects_net_asset_handle_layout() {
+        assert!(!decoder().schema.unwrap().net_asset_handles);
+        let mut d = schema_body();
+        d[1] = 0x21;
+        assert!(Schema::parse(&d).unwrap().net_asset_handles);
+        d[0] = 2;
+        assert!(Schema::parse(&d).is_err());
+    }
+
+    fn handle(net_asset_handles: bool, bytes: &[u8]) -> (Option<NetAssetId>, usize) {
+        let s = Schema { net_asset_handles, ..Schema::default() };
+        let mut c = Cur::new(bytes);
+        let v = s.net_asset_handle(&mut c).unwrap();
+        (v, c.o)
+    }
+
+    /// SolidMeshHolder values as captured: the id (GUID word, varint index)
+    /// is the same in both layouts; only the asset type moves.
+    #[test]
+    fn net_asset_handles_in_both_layouts() {
+        let guid = 0xf000_0001_0000_0001;
+        // Newer join (2026-11-18): schema type 0, id, then the next
+        // property's index (0x0b).
+        let newer = [0x00, 1, 0, 0, 0, 1, 0, 0, 0xf0, 0x05, 0x0b];
+        assert_eq!(handle(true, &newer), (Some(NetAssetId { guid, index: 5 }), 10));
+        assert_eq!(handle(true, &[0xff, 0xff, 0x03, 0x0b]), (None, 3));
+        // Older join (2026-11-04): id, then u64 local type 3.
+        let older = [1, 0, 0, 0, 1, 0, 0, 0xf0, 0x11, 3, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(handle(false, &older), (Some(NetAssetId { guid, index: 0x11 }), 17));
+        let older_wide = [1, 0, 0, 0, 1, 0, 0, 0xf0, 0xc9, 0x13, 3, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(handle(false, &older_wide), (Some(NetAssetId { guid, index: 0x9c9 }), 18));
     }
 
     #[test]

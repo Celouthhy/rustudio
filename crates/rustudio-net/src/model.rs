@@ -6,7 +6,7 @@
 //! the read-only target for Phase 1: feed it the stream and hand the `WeakDom`
 //! to the app for the Explorer and the 3D view.
 
-use crate::replicator::{PropValue, RefMap, RepOp};
+use crate::replicator::{NetAssetId, PropValue, RefMap, RepOp};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use std::collections::HashMap;
@@ -20,11 +20,11 @@ pub struct LiveModel {
     root_server_id: Option<u64>,
     pending_refs: HashMap<u64, Vec<(Ref, String)>>,
     pending_ref_targets: HashMap<(Ref, String), u64>,
-    /// Union geometry from the 0xa5 channel, by reference key.
-    net_assets: HashMap<u64, rbx_types::NetAssetRef>,
-    /// Unions whose holder names a key not arrived yet.
-    waiting_assets: HashMap<u64, Vec<Ref>>,
-    waiting_asset_targets: HashMap<Ref, u64>,
+    /// Union geometry from the 0xa5 channel, by net asset id.
+    net_assets: HashMap<NetAssetId, rbx_types::NetAssetRef>,
+    /// Holder properties whose net asset hasn't arrived yet.
+    waiting_assets: HashMap<NetAssetId, Vec<(Ref, String)>>,
+    waiting_asset_targets: HashMap<(Ref, String), NetAssetId>,
     /// Unions given their geometry since the last `take_resolved`.
     resolved: Vec<Ref>,
 }
@@ -122,11 +122,12 @@ impl LiveModel {
             }
             RepOp::NetAsset { key, data } => {
                 let asset = rbx_types::NetAssetRef::new(data);
-                for r in self.waiting_assets.remove(&key).unwrap_or_default() {
-                    if self.waiting_asset_targets.get(&r) != Some(&key) { continue; }
-                    self.waiting_asset_targets.remove(&r);
+                for target in self.waiting_assets.remove(&key).unwrap_or_default() {
+                    if self.waiting_asset_targets.get(&target) != Some(&key) { continue; }
+                    self.waiting_asset_targets.remove(&target);
+                    let (r, name) = target;
                     if let Some(inst) = self.dom.get_by_ref_mut(r) {
-                        inst.properties.insert("SolidMeshHolder".into(), Variant::NetAssetRef(asset.clone()));
+                        inst.properties.insert(name.into(), Variant::NetAssetRef(asset.clone()));
                         self.resolved.push(r);
                     }
                 }
@@ -271,27 +272,28 @@ impl LiveModel {
                         continue;
                     }
                 }
-                if name == "SolidMeshHolder" {
-                    self.waiting_asset_targets.remove(&r);
-                }
-                if let Some(value) = to_variant(value, name) {
-                    // A union's geometry reference: its contents if they've
-                    // arrived on the 0xa5 channel, else wait for them.
-                    if let (Variant::BinaryString(b), true) = (&value, name == "SolidMeshHolder") {
-                        if let Some(key) = crate::replicator::holder_key(b.as_ref()) {
-                            match self.net_assets.get(&key) {
-                                Some(asset) => {
-                                    inst.properties.insert(name.clone().into(), Variant::NetAssetRef(asset.clone()));
-                                }
-                                None => {
-                                    inst.properties.remove(&rbx_dom_weak::ustr("SolidMeshHolder"));
-                                    self.waiting_asset_targets.insert(r, key);
-                                    self.waiting_assets.entry(key).or_default().push(r);
-                                }
-                            }
-                            continue;
+                // A union's geometry handle: its contents if they've arrived
+                // on the 0xa5 channel, else wait for them. A later value
+                // supersedes an earlier unresolved one.
+                if let PropValue::NetAssetHandle(handle) = value {
+                    let target = (r, name.clone());
+                    self.waiting_asset_targets.remove(&target);
+                    match handle.map(|id| (id, self.net_assets.get(&id))) {
+                        Some((_, Some(asset))) => {
+                            inst.properties.insert(name.clone().into(), Variant::NetAssetRef(asset.clone()));
+                        }
+                        Some((id, None)) => {
+                            inst.properties.remove(&rbx_dom_weak::ustr(name));
+                            self.waiting_asset_targets.insert(target.clone(), id);
+                            self.waiting_assets.entry(id).or_default().push(target);
+                        }
+                        None => {
+                            inst.properties.remove(&rbx_dom_weak::ustr(name));
                         }
                     }
+                    continue;
+                }
+                if let Some(value) = to_variant(value, name) {
                     inst.properties.insert(name.clone().into(), value);
                 }
             }
@@ -489,9 +491,6 @@ fn typed_variant(ty: u8, b: &[u8]) -> Option<Variant> {
             }
             Variant::Font(font)
         }
-        // SolidMeshHolder: the net asset references (the geometry arrives
-        // on the 0xa5 channel); kept raw for the live session to resolve.
-        0x3c => Variant::BinaryString(b.to_vec().into()),
         _ => return None,
     })
 }
@@ -555,7 +554,7 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
                 rbx_types::Vector3::new(rot[6], rot[7], rot[8]),
             ),
         )),
-        PropValue::Ref(_) | PropValue::Raw(_) | PropValue::Typed { .. } | PropValue::SharedHash(_) | PropValue::Array(_) | PropValue::Dictionary(_) => return None,
+        PropValue::Ref(_) | PropValue::NetAssetHandle(_) | PropValue::Raw(_) | PropValue::Typed { .. } | PropValue::SharedHash(_) | PropValue::Array(_) | PropValue::Dictionary(_) => return None,
     };
     Some(match (name, variant) {
         ("WorldPivotData", Variant::CFrame(cf)) => Variant::OptionalCFrame(Some(cf)),

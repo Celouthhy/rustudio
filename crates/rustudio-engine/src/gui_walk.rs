@@ -206,8 +206,8 @@ impl Walk<'_, '_> {
         }
         let mut kids = Vec::new();
         gui_children(d, parent, &mut kids, self.gui, self.cur);
-        let list = child_of_class(d, parent, "UIListLayout")
-            .or_else(|| child_of_class(d, parent, "UIPageLayout"));
+        let list_layout = child_of_class(d, parent, "UIListLayout");
+        let list = list_layout.or_else(|| child_of_class(d, parent, "UIPageLayout"));
         let grid = child_of_class(d, parent, "UIGridLayout");
         let mut placed: HashMap<Ref, Rect> = HashMap::new();
         if let Some(lay) = grid.or(list) {
@@ -295,13 +295,23 @@ impl Walk<'_, '_> {
                     .map(|s| if vertical { s.y } else { s.x })
                     .sum::<f32>()
                     + gap * order.len().saturating_sub(1) as f32;
-                // UIFlexItem: Grow / Fill / Custom (GrowRatio) children share
-                // the room left on the fill axis by their ratio (Model
-                // Reflect's title label is Size (0, 28) and grows to the
-                // rest of its header row).
+                // Fill lets each item grow by default. A UIFlexItem can
+                // override how much its own item grows.
+                let flex_property = if vertical { "VerticalFlex" } else { "HorizontalFlex" };
+                let fill = Some(lay) == list_layout
+                    && enum_u32(d.prop(lay, flex_property)) == Some(1);
                 let room = if vertical { content.height() } else { content.width() } - total;
-                if room > 0.0 {
-                    let ratios: Vec<f32> = order.iter().map(|k| flex_grow(d, *k)).collect();
+                if room > 0.0 && !order.is_empty() {
+                    let ratios: Vec<f32> = order.iter().map(|k| {
+                        self.gui.walk_kids.push(*k);
+                        match child_of_class(d, *k, "UIFlexItem") {
+                            Some(item) => {
+                                self.gui.walk_reads.push((item, self.cur));
+                                flex_grow(d, item)
+                            }
+                            None => if fill { 1.0 } else { 0.0 },
+                        }
+                    }).collect();
                     let sum: f32 = ratios.iter().sum();
                     if sum > 0.0 {
                         for (s, r) in sizes.iter_mut().zip(&ratios) {
@@ -809,12 +819,17 @@ impl Walk<'_, '_> {
         // Studio's box under turned ancestors: its centre turned with them,
         // the size unturned; AbsoluteRotation is every Rotation summed.
         // (a negative size is reported, and places the box, as in Studio)
-        let abs_size = match laid {
-            Some(_) => rect.size(),
-            None => signed,
+        let (abs_min, abs_size) = match laid {
+            Some(_) => (rect.min, rect.size()),
+            None => {
+                let anchor = vec2(d, r, "AnchorPoint", [0.0, 0.0]);
+                let shift = egui::vec2(
+                    anchor[0] * (size.x - signed.x),
+                    anchor[1] * (size.y - signed.y),
+                );
+                (rect.min + shift, signed)
+            }
         };
-        let anchor = vec2(d, r, "AnchorPoint", [0.0, 0.0]);
-        let abs_min = rect.min + egui::vec2(anchor[0] * (size.x - abs_size.x), anchor[1] * (size.y - abs_size.y));
         let centre = dn.aff.apply(abs_min + abs_size * 0.5);
         let mut gb = GuiBox {
             pos: [
@@ -1638,10 +1653,9 @@ impl Walk<'_, '_> {
     }
 }
 
-/// A list child's UIFlexItem grow ratio: FlexMode Grow (1) and Fill (3)
+/// UIFlexItem grow ratio: FlexMode Grow (1) and Fill (3)
 /// grow by 1, Custom (4) by its GrowRatio; None (0) and Shrink (2) don't.
-fn flex_grow(d: &Document, k: Ref) -> f32 {
-    let Some(f) = child_of_class(d, k, "UIFlexItem") else { return 0.0 };
+fn flex_grow(d: &Document, f: Ref) -> f32 {
     match enum_u32(d.prop(f, "FlexMode")).unwrap_or(0) {
         1 | 3 => 1.0,
         4 => num(d, f, "GrowRatio", 0.0).max(0.0),
@@ -1667,7 +1681,42 @@ mod tests {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
-    use rbx_dom_weak::{InstanceBuilder, types::{UDim, UDim2, Enum}};
+    use rbx_dom_weak::{InstanceBuilder, types::{UDim, UDim2, Enum, Vector2}};
+
+    #[test]
+    fn list_fill_expands_a_single_visible_item() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let parent = doc.dom.insert(root, InstanceBuilder::new("Frame"));
+        doc.dom.insert(parent, InstanceBuilder::new("UIListLayout")
+            .with_property("FillDirection", Enum::from_u32(0))
+            .with_property("HorizontalAlignment", Enum::from_u32(2))
+            .with_property("HorizontalFlex", Enum::from_u32(1))
+            .with_property("Padding", UDim::new(0.0, 8)));
+        let size = UDim2::new(UDim::new(0.5, 0), UDim::new(0.0, 28));
+        let reply = doc.dom.insert(parent, InstanceBuilder::new("TextButton")
+            .with_property("Size", size)
+            .with_property("AnchorPoint", Vector2::new(0.5, 0.0)));
+        doc.dom.insert(parent, InstanceBuilder::new("TextButton")
+            .with_property("Size", size)
+            .with_property("Visible", false));
+
+        let ctx = egui::Context::default();
+        let mut gui = Gui::default();
+        let cam = Camera::default();
+        let mut store = AssetStore::default();
+        let rect = Rect::from_min_size(Pos2::new(20.0, 0.0), egui::vec2(309.7, 30.0));
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
+            walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
+            let reply_box = &walk.boxes.iter().find(|(r, _)| *r == reply).unwrap().1;
+            assert!((reply_box.size[0] - rect.width()).abs() < 0.01);
+            assert!((reply_box.pos[0] - rect.left()).abs() < 0.01);
+            assert!((reply_box.size[1] - 28.0).abs() < 0.01);
+        });
+        out.textures_delta.clear();
+    }
 
     #[test]
     fn grid_overrides_authored_tab_width() {

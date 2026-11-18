@@ -365,7 +365,7 @@ pub struct NarrowPhase {
     /// set. `false` forces a full rebuild on the next maintenance pass (the very first
     /// step, or after a change that invalidates the whole graph).
     solver_graph_valid: bool,
-    /// The [`IslandManager::active_set_epoch`] the solver contact graph was last
+    /// The [`a test place::active_set_epoch`] the solver contact graph was last
     /// (re)built at. A mismatch means the awake set / solver-body indices shifted
     /// (sleep, wake, body add/remove), so the graph is fully rebuilt.
     solver_graph_epoch: u32,

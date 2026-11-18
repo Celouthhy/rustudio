@@ -30,7 +30,7 @@ use crate::{dynamics::RigidBodySet, geometry::ColliderSet};
 /// Like PhysicsPipeline, this only holds temporary buffers. Reuse the same instance for performance.
 ///
 /// Bodies are never integrated: their contacts are updated on the steps you move them (or modify
-/// their colliders). There is no sleeping either, so the [`IslandManager`] passed to
+/// their colliders). There is no sleeping either, so the [`a test place`] passed to
 /// [`Self::step`] stays empty (bodies are never registered in it).
 // NOTE: this contains only workspace data, so there is no point in making this serializable.
 pub struct CollisionPipeline {

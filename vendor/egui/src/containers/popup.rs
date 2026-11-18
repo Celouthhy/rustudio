@@ -4,7 +4,7 @@ use emath::{Align, Pos2, Rect, RectAlign, Vec2, vec2};
 
 use crate::{
     Area, AreaState, Context, Frame, Id, InnerResponse, Key, LayerId, Layout, Order, Response,
-    Sense, Ui, UiKind, UiStackInfo,
+    ScrollArea, Sense, Ui, UiKind, UiStackInfo,
     containers::menu::{MenuConfig, MenuState, menu_style},
     style::StyleModifier,
 };
@@ -501,6 +501,10 @@ impl<'a> Popup<'a> {
         .unwrap_or_default()
     }
 
+    pub(crate) fn scrollbar_click_id(id: Id) -> Id {
+        id.with("menu_scrollbar_clicked")
+    }
+
     /// Show the popup.
     ///
     /// Returns `None` if the popup is not open or anchor is `PopupAnchor::Pointer` and there is
@@ -598,14 +602,31 @@ impl<'a> Popup<'a> {
             area = area.default_width(width);
         }
 
+        let mut scrollbar_clicked = false;
         let mut response = area.show(&ctx, |ui| {
             style.apply(ui.style_mut());
             let frame = frame.unwrap_or_else(|| Frame::popup(ui.style()));
-            frame.show(ui, content).inner
+            if kind == PopupKind::Menu {
+                let height = (ctx.content_rect().height() - frame.total_margin().sum().y).max(0.0);
+                frame.show(ui, |ui| {
+                    ui.set_max_height(height);
+                    let scroll = ScrollArea::vertical()
+                        .min_scrolled_height(0.0)
+                        .show(ui, content);
+                    scrollbar_clicked = ctx.read_response(scroll.id.with(1_usize))
+                        .is_some_and(|bar| bar.clicked());
+                    scroll.inner
+                }).inner
+            } else {
+                frame.show(ui, content).inner
+            }
         });
 
         // If the popup was just opened with a click, we don't want to immediately close it again.
-        let close_click = was_open_last_frame && ctx.input(|i| i.pointer.any_click());
+        if kind == PopupKind::Menu {
+            ctx.data_mut(|data| data.insert_temp(Self::scrollbar_click_id(id), scrollbar_clicked));
+        }
+        let close_click = !scrollbar_clicked && was_open_last_frame && ctx.input(|i| i.pointer.any_click());
 
         let closed_by_click = match close_behavior {
             PopupCloseBehavior::CloseOnClick => close_click,

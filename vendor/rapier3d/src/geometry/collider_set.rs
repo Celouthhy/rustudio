@@ -407,7 +407,7 @@ impl ColliderSet {
     /// # use rapier3d::prelude::*;
     /// # let mut colliders = ColliderSet::new();
     /// # let mut bodies = RigidBodySet::new();
-    /// # let mut islands = IslandManager::new();
+    /// # let mut islands = a test place::new();
     /// # let body_handle = bodies.insert(RigidBodyBuilder::dynamic().build());
     /// # let mut soft_bodies = SoftBodySet::new();
     /// # let handle = colliders.insert_with_parent(ColliderBuilder::ball(0.5).build(), body_handle, &mut bodies);

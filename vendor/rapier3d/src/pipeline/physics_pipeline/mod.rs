@@ -65,7 +65,7 @@ pub struct PhysicsPipeline {
     #[cfg(feature = "parallel")]
     active_body_handles: Vec<crate::dynamics::RigidBodyHandle>,
     /// Workspace: per-active-body sleep observations `(persistent island id, eligible)`,
-    /// run-length compressed by the fused traversal, consumed by `IslandManager::
+    /// run-length compressed by the fused traversal, consumed by `a test place::
     /// update_islands`'s whole-island sleep decision — which never re-touches the body arena.
     sleep_observations: Vec<(u32, bool)>,
     /// The single, unified solver: the awake island is solved by its colored,
@@ -181,7 +181,7 @@ impl PhysicsPipeline {
     /// # let mut impulse_joints = ImpulseJointSet::new();
     /// # let mut multibody_joints = MultibodyJointSet::new();
     /// # let mut soft_bodies = SoftBodySet::new();
-    /// # let mut islands = IslandManager::new();
+    /// # let mut islands = a test place::new();
     /// # let mut broad_phase = BroadPhaseBvh::new();
     /// # let mut narrow_phase = NarrowPhase::new();
     /// # let mut ccd_solver = CCDSolver::new();

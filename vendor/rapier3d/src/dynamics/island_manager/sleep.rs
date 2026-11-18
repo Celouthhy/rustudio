@@ -19,7 +19,7 @@ impl IslandManager {
     /// ```
     /// # use rapier3d::prelude::*;
     /// # let mut bodies = RigidBodySet::new();
-    /// # let mut islands = IslandManager::new();
+    /// # let mut islands = a test place::new();
     /// # let body_handle = bodies.insert(RigidBodyBuilder::dynamic());
     /// islands.wake_up(&mut bodies, body_handle, true);
     /// let body = bodies.get_mut(body_handle).unwrap();

@@ -40,7 +40,7 @@ fn max_key(a: u32, b: u32) -> u32 {
     key((a >> 16).max(b >> 16), (a & 0xFFFF).max(b & 0xFFFF))
 }
 
-/// Workspace state for [`IslandManager::update_substep_groups`], kept to reuse
+/// Workspace state for [`a test place::update_substep_groups`], kept to reuse
 /// allocations across steps.
 #[derive(Clone, Default)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]

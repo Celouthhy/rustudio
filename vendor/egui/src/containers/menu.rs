@@ -10,7 +10,7 @@
 
 use crate::style::StyleModifier;
 use crate::{
-    Button, Color32, Context, Frame, Id, InnerResponse, IntoAtoms, Layout, PointerButton, Popup,
+    Button, Color32, Context, Frame, Id, InnerResponse, IntoAtoms, Layout, PointerButton, Popup, PopupKind,
     PopupCloseBehavior, Response, Style, Ui, UiBuilder, UiKind, UiStack, UiStackInfo, Widget as _,
 };
 use emath::{Align, RectAlign, Vec2, vec2};
@@ -501,6 +501,7 @@ impl SubMenu {
 
         let popup_response = Popup::from_response(&response)
             .id(id)
+            .kind(PopupKind::Menu)
             .open(is_open)
             .align(RectAlign::RIGHT_START)
             .layout(Layout::top_down_justified(Align::Min))
@@ -540,7 +541,11 @@ impl SubMenu {
             // so the following check is enough.
             let submenu_button_clicked = button_response.clicked();
 
+            let scrollbar_clicked = ui.ctx().data(|data| {
+                data.get_temp::<bool>(Popup::scrollbar_click_id(id)).unwrap_or_default()
+            });
             let clicked_inside = is_deepest_submenu
+                && !scrollbar_clicked
                 && !submenu_button_clicked
                 && response.ctx.input(|i| i.pointer.any_click())
                 && hover_pos.is_some_and(|pos| popup_response.response.interact_rect.contains(pos));

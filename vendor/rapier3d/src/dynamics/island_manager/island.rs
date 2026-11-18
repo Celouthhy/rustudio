@@ -8,7 +8,7 @@ use super::IslandManager;
 pub(crate) struct Island {
     /// The rigid-bodies part of this island.
     ///
-    /// At most one island is awake — the one `IslandManager::awake_island` points
+    /// At most one island is awake — the one `a test place::awake_island` points
     /// to (all awake bodies share it); every other island is a sleeping chunk.
     pub(super) bodies: Vec<RigidBodyHandle>,
 }

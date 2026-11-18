@@ -3,7 +3,7 @@
 //! removals, and link updates on body lifecycle edits.
 //!
 //! These tests observe island *equality* between bodies through the
-//! test-only `IslandManager::persistent_island_of` accessor; the heavy
+//! test-only `a test place::persistent_island_of` accessor; the heavy
 //! structural invariants are asserted by the debug-build validation that runs
 //! inside every `world.step()`.
 

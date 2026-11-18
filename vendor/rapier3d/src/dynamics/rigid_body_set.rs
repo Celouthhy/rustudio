@@ -180,7 +180,7 @@ impl RigidBodySet {
     /// ```
     /// # use rapier3d::prelude::*;
     /// # let mut bodies = RigidBodySet::new();
-    /// # let mut islands = IslandManager::new();
+    /// # let mut islands = a test place::new();
     /// # let mut colliders = ColliderSet::new();
     /// # let mut impulse_joints = ImpulseJointSet::new();
     /// # let mut multibody_joints = MultibodyJointSet::new();

@@ -6914,6 +6914,64 @@ mod tests {
     }
 
     #[test]
+    fn input_actions_keep_gamepad_sticks_and_other_held_bindings() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local ctx = Instance.new("InputContext", workspace)
+            ctx.Name = "TestInputContext"
+            local move = Instance.new("InputAction", ctx)
+            move.Name = "Move"
+            move.Type = Enum.InputActionType.Direction2D
+            local stick = Instance.new("InputBinding", move)
+            stick.KeyCode = Enum.KeyCode.Thumbstick1
+            stick.Deadzone = NumberRange.new(0, 1)
+            stick.ResponseCurve = 2
+            local keyboard = Instance.new("InputBinding", move)
+            keyboard.Up = Enum.KeyCode.W
+
+            local jump = Instance.new("InputAction", ctx)
+            jump.Name = "Jump"
+            local button = Instance.new("InputBinding", jump)
+            button.KeyCode = Enum.KeyCode.ButtonA
+        "#).exec().unwrap();
+        rt.step(1.0 / 60.0);
+        rt.lua.load(r#"
+            local move = workspace.TestInputContext.Move
+            local jump = workspace.TestInputContext.Jump
+            local presses, releases = 0, 0
+            jump.Pressed:Connect(function() presses += 1 end)
+            jump.Released:Connect(function() releases += 1 end)
+
+            local function input(state, device, key, x)
+                __rs_input_event(state, device, key, x or 0, 0, 0, 0, 0, false)
+            end
+            input("Change", "Gamepad1", "Thumbstick1", .5)
+            assert(move:GetState() == Vector2.new(.25, 0), tostring(move:GetState()))
+            __rs_input_frame_end(1/60)
+            input("Begin", "Keyboard", "W")
+            assert(move:GetState() == Vector2.new(.25, 1))
+            input("Change", "Gamepad1", "Thumbstick1", 0)
+            assert(move:GetState() == Vector2.new(0, 1))
+            input("End", "Keyboard", "W")
+            assert(move:GetState() == Vector2.zero)
+            input("Begin", "Gamepad1", "ButtonA")
+            input("Begin", "Gamepad2", "ButtonA")
+            input("End", "Gamepad1", "ButtonA")
+            assert(jump:GetState())
+            input("End", "Gamepad2", "ButtonA")
+            assert(not jump:GetState())
+            task.defer(function() assert(presses == 1 and releases == 1) end)
+        "#).exec().unwrap();
+        rt.step(1.0 / 60.0);
+        let out = rt.leave().output;
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
     fn render_callbacks_run_before_waiting_tasks_resume() {
         let rt = Runtime::new().unwrap();
         rt.enter(World::new(Document::new_place(), RunMode::Run));

@@ -57,6 +57,7 @@ mod explorer;
 mod file_dialog;
 mod hypr;
 mod game_settings;
+mod gamepad;
 mod studio_settings;
 mod rustudio_settings;
 mod fbx;

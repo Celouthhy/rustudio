@@ -186,8 +186,7 @@ pub struct PlaySession {
     window_focused: bool,
     /// Joystick devices seen (sorted names; slot i = Enum.UserInputType.Gamepad(i+1))
     /// and when they were last scanned.
-    gamepads: Vec<String>,
-    gamepad_scan_at: f64,
+    gamepads: crate::gamepad::Gamepads,
     /// When the instance collector last ran (`collect_garbage`), and parts the
     /// engine itself took out of the tree (fallen) for it to free.
     gc_at: f64,
@@ -613,7 +612,13 @@ impl Editor {
         }
         crate::load_trace::mark("play: server DataModel copied");
         let defaults = if two {
-            crate::default_scripts::insert_player_scripts(&mut server_doc)
+            match crate::default_scripts::insert_player_scripts(&mut server_doc) {
+                Ok(added) => added,
+                Err(error) => {
+                    self.error(format!("Could not load Studio PlayerModule for Play: {error}"));
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -667,8 +672,7 @@ impl Editor {
             keys_prev: HashSet::new(),
             keys_processed: HashSet::new(),
             window_focused: true,
-            gamepads: Vec::new(),
-            gamepad_scan_at: f64::NEG_INFINITY,
+            gamepads: if two { crate::gamepad::Gamepads::new() } else { Default::default() },
             gc_at: 0.0,
             engine_orphans: Vec::new(),
             memstats_at: 0.0,
@@ -2892,20 +2896,12 @@ impl Editor {
                     focused_now
                 })
             });
-            // Gamepads plugged in or out (scanned about once a second):
-            // UserInputService.GamepadConnected / GamepadDisconnected.
-            let (pads_added, pads_removed, pads_now) = match self.play.as_mut() {
-                Some(s) if s.time - s.gamepad_scan_at >= mech::GAMEPAD_SCAN_S as f64 => {
-                    s.gamepad_scan_at = s.time;
-                    let now = gamepad_devices();
-                    let added: Vec<usize> = (s.gamepads.len()..now.len()).collect();
-                    let removed: Vec<usize> = (now.len()..s.gamepads.len()).collect();
-                    s.gamepads = now;
-                    (added, removed, s.gamepads.len())
-                }
-                Some(s) => (Vec::new(), Vec::new(), s.gamepads.len()),
-                None => (Vec::new(), Vec::new(), 0),
-            };
+            let accepts_gamepad = focused_now && self.play_game_input() && !menu_open;
+            let gamepads = self
+                .play
+                .as_mut()
+                .map(|s| s.gamepads.poll(accepts_gamepad))
+                .unwrap_or_default();
             // Moving parts' velocities on the client, its own character's too.
             let client_velocities: HashMap<Ref, Vec3> = {
                 let mut v: HashMap<Ref, Vec3> = velocities
@@ -3057,7 +3053,7 @@ impl Editor {
                 fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
                 fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
-                    w.input.gamepads = pads_now;
+                    w.input.gamepads = gamepads.connected;
                 }
                 if let Some(uis) = cuis {
                     let pad = |i: usize| {
@@ -3065,12 +3061,24 @@ impl Editor {
                             .and_then(|e| crate::ltypes::enum_value(&rt.lua, e).ok())
                             .unwrap_or(Value::Nil)
                     };
-                    for i in &pads_removed {
-                        rt.fire(uis, "GamepadDisconnected", vec![pad(*i)]);
+                    for i in 0..8 {
+                        if gamepads.removed & (1 << i) != 0 {
+                            rt.fire(uis, "GamepadDisconnected", vec![pad(i)]);
+                        }
+                        if gamepads.added & (1 << i) != 0 {
+                            rt.fire(uis, "GamepadConnected", vec![pad(i)]);
+                        }
                     }
-                    for i in &pads_added {
-                        rt.fire(uis, "GamepadConnected", vec![pad(*i)]);
-                    }
+                }
+                for input in &gamepads.inputs {
+                    ev(
+                        input.state,
+                        &format!("Gamepad{}", input.slot + 1),
+                        input.key,
+                        (f64::from(input.position.x), f64::from(input.position.y), 0.0),
+                        (f64::from(input.delta.x), f64::from(input.delta.y)),
+                        false,
+                    );
                 }
                 for (list, state) in [(&began, "Begin"), (&ended, "End")] {
                     for (k, processed) in list {
@@ -3435,26 +3443,10 @@ impl Editor {
     }
 }
 
-/// Gamepads plugged in: the kernel's joystick devices
-/// (/dev/input/by-id/*-event-joystick), sorted so slots stay stable.
 /// `RUSTUDIO_FEEL_TRACE` is set (the per-frame FEELR lines, with RUSTUDIO_LOG_TEE).
 fn feel_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FEEL_TRACE").is_some())
-}
-
-fn gamepad_devices() -> Vec<String> {
-    let mut v: Vec<String> = std::fs::read_dir("/dev/input/by-id")
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.ends_with("-event-joystick"))
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort();
-    v.truncate(8); // Enum.UserInputType.Gamepad1..Gamepad8
-    v
 }
 
 fn script_enabled(d: &Document, r: Ref) -> bool {

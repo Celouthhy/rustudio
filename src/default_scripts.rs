@@ -21,6 +21,7 @@
 //!   objects the modules read their input from), and
 //!   StarterPlayerScripts.`RbxCharacterSounds`. The tree is the install's
 //!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`.
+//!   Studio 0.748 and later reference an external `InputContexts.rbxp` subtree.
 //! - The older layout (that property Disabled, an install without the
 //!   project file, or a place with its own PlayerModule / PlayerScriptsLoader
 //!   in StarterPlayerScripts): StarterPlayerScripts gets `PlayerScriptsLoader`
@@ -245,19 +246,54 @@ fn path_node(p: &Path, name: &str) -> Option<Node> {
     Some(node)
 }
 
-/// A project node laid over what its `$path` gave (or a new instance):
-/// `$className`, `$properties`, and its children by name.
-fn project_node(name: &str, j: &serde_json::Value, base: &Path) -> Option<Node> {
-    let mut node = match j.get("$path").and_then(|p| p.as_str()) {
-        Some(p) => path_node(&base.join(p), name)?,
-        None => Node::new(name, if name == "StarterPlayerScripts" { "StarterPlayerScripts" } else { "Folder" }),
-    };
-    apply_project(&mut node, j, base);
-    Some(node)
+/// Read the instance tree from a Studio project, including standalone subtrees.
+fn project_tree(path: &Path) -> Result<serde_json::Value, String> {
+    let source = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?;
+    json.pointer_mut("/instanceHierarchy/tree")
+        .filter(|tree| tree.is_object())
+        .map(std::mem::take)
+        .ok_or_else(|| format!("{}: missing instanceHierarchy.tree", path.display()))
 }
 
-fn apply_project(node: &mut Node, j: &serde_json::Value, base: &Path) {
-    let Some(o) = j.as_object() else { return };
+/// Resolve a project node's source before applying its local overrides.
+fn project_node(
+    name: &str,
+    j: &serde_json::Value,
+    base: &Path,
+    includes: usize,
+) -> Result<Node, String> {
+    let mut node = match j.get("$path") {
+        Some(p) => {
+            let path = base.join(p.as_str().ok_or_else(|| format!("{name}: invalid $path"))?);
+            if path.extension().is_some_and(|ext| ext == "rbxp") {
+                if includes >= 32 {
+                    return Err(format!("{}: too many nested project references", path.display()));
+                }
+                let tree = project_tree(&path)?;
+                project_node(name, &tree, path.parent().unwrap_or(base), includes + 1)?
+            } else {
+                path_node(&path, name)
+                    .ok_or_else(|| format!("{}: cannot load project node {name}", path.display()))?
+            }
+        }
+        None => Node::new(
+            name,
+            if name == "StarterPlayerScripts" { "StarterPlayerScripts" } else { "Folder" },
+        ),
+    };
+    apply_project(&mut node, j, base, includes)?;
+    Ok(node)
+}
+
+fn apply_project(
+    node: &mut Node,
+    j: &serde_json::Value,
+    base: &Path,
+    includes: usize,
+) -> Result<(), String> {
+    let o = j.as_object().ok_or_else(|| format!("{}: expected a project node", node.name))?;
     if let Some(c) = o.get("$className").and_then(|c| c.as_str()) {
         node.class = c.to_string();
     }
@@ -273,20 +309,31 @@ fn apply_project(node: &mut Node, j: &serde_json::Value, base: &Path) {
             continue;
         }
         match node.children.iter_mut().find(|c| c.name == *k) {
-            Some(child) => apply_project(child, v, base),
-            None => node.children.extend(project_node(k, v, base)),
+            Some(child) if v.get("$path").is_some() => *child = project_node(k, v, base, includes)?,
+            Some(child) => apply_project(child, v, base, includes)?,
+            None => node.children.push(project_node(k, v, base, includes)?),
         }
     }
+    Ok(())
 }
 
 /// Studio's current player scripts: what PlayerScripts.rbxp puts under
 /// StarterPlayer (PlayerModule, StarterPlayerScripts' children).
-fn project_starter_player(root: &Path) -> Option<Node> {
-    let base = root.join(PLAYER_SCRIPTS);
-    let json: serde_json::Value = serde_json::from_str(&read(&base.join("PlayerScripts.rbxp"))?).ok()?;
-    let tree = json.get("instanceHierarchy")?.get("tree")?;
-    let sp = project_node("StarterPlayer", tree.get("StarterPlayer")?, &base)?;
-    sp.children.iter().any(|c| c.name == "PlayerModule").then_some(sp)
+fn project_starter_player(path: &Path, base: &Path) -> Result<Node, String> {
+    let tree = project_tree(path)?;
+    let starter = tree.get("StarterPlayer")
+        .ok_or_else(|| format!("{}: missing StarterPlayer", path.display()))?;
+    let sp = project_node("StarterPlayer", starter, base, 0)?;
+    let has_loader = sp.children.iter().any(|module| {
+        module.name == "PlayerModule" && module.class == "ModuleScript"
+            && module.children.iter().any(|loader| {
+                loader.name == "PlayerScriptsLoader" && loader.class == "Script"
+            })
+    });
+    if !has_loader {
+        return Err(format!("{}: missing PlayerModule or PlayerScriptsLoader", path.display()));
+    }
+    Ok(sp)
 }
 
 /// Workspace.PlayerScriptsUseInputActionSystem is Disabled (RolloutState 1).
@@ -298,10 +345,14 @@ fn input_action_system_off(doc: &Document) -> bool {
 /// Puts the default player scripts into StarterPlayer.StarterPlayerScripts
 /// (made if missing) unless the place has its own of the same name. Returns
 /// the names inserted.
-pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
+pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, String> {
     let Some(root_dir) = studio_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    insert_player_scripts_from(doc, &root_dir)
+}
+
+fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec<&'static str>, String> {
     let root = doc.dom.root_ref();
     let sp = doc.find_child(root, "StarterPlayer").unwrap_or_else(|| {
         doc.dom.insert(
@@ -322,7 +373,10 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
     // Studio's current layout: StarterPlayer.PlayerModule (see the module docs).
     let own_old = ["PlayerModule", "PlayerScriptsLoader"].iter().any(|n| child_named(doc, sps, n).is_some());
     if !own_old && !input_action_system_off(doc) {
-        if let Some(tree) = project_starter_player(&root_dir) {
+        let project = base.join("PlayerScripts.rbxp");
+        let present = project.try_exists().map_err(|e| format!("{}: {e}", project.display()))?;
+        if present {
+            let tree = project_starter_player(&project, &base)?;
             for child in tree.children {
                 if child.name == "StarterPlayerScripts" {
                     for c in child.children {
@@ -338,7 +392,7 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
                     doc.mark_tree(r);
                 }
             }
-            return added;
+            return Ok(added);
         }
     }
     let mut add = |doc: &mut Document, name: &'static str, b: Option<InstanceBuilder>| {
@@ -357,7 +411,7 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
         read(&base.join("StarterPlayerScripts/PlayerScriptsLoader.lua"))
             .map(|s| script("LocalScript", "PlayerScriptsLoader", s)),
     );
-    add(doc, "PlayerModule", player_module(&root_dir));
+    add(doc, "PlayerModule", player_module(root_dir));
     let sounds = read(&base.join("StarterPlayerScriptsCommon/RbxCharacterSounds.lua")).map(|s| {
         let mut b = script("LocalScript", "RbxCharacterSounds", s);
         if let Some(ab) =
@@ -368,7 +422,7 @@ pub fn insert_player_scripts(doc: &mut Document) -> Vec<&'static str> {
         b
     });
     add(doc, "RbxCharacterSounds", sounds);
-    added
+    Ok(added)
 }
 
 /// Reads a model file (binary or XML) into its own DOM.
@@ -430,10 +484,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_imports_input_contexts_with_properties_and_rejects_missing_sources() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-player-project-{}-{unique}", std::process::id()));
+        let base = root.join(PLAYER_SCRIPTS);
+        let module = base.join("StarterPlayer/PlayerModule");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("init.lua"), "return {}").unwrap();
+        std::fs::write(module.join("PlayerScriptsLoader.client.lua"), "return").unwrap();
+        std::fs::write(base.join("PlayerScripts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"StarterPlayer": {
+                "$path": "StarterPlayer",
+                "PlayerModule": {
+                    "InputContexts": {"$path": "input/InputContexts.rbxp",
+                        "CharacterContext": {"$properties": {"Priority": 250}}}
+                }
+            }}}
+        }"#).unwrap();
+
+        let mut doc = Document::empty();
+        let err = insert_player_scripts_from(&mut doc, &root).unwrap_err();
+        let sp = doc.find_child(doc.dom.root_ref(), "StarterPlayer").unwrap();
+        assert!(err.contains("InputContexts.rbxp"));
+        assert!(child_named(&doc, sp, "PlayerModule").is_none());
+
+        let input = base.join("input");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("InputContexts.rbxp"), r#"{
+            "instanceHierarchy": {"tree": {"$className": "Folder",
+                "CharacterContext": {"$className": "InputContext",
+                    "$properties": {"Priority": 150, "Sink": true},
+                    "Move": {"$className": "InputAction",
+                        "$properties": {"Type": "Direction2D", "Enabled": false},
+                        "Keyboard": {"$className": "InputBinding",
+                            "$properties": {"Up": "W"}},
+                        "Gamepad": {"$className": "InputBinding",
+                            "$properties": {"KeyCode": "Thumbstick1", "Vector2Scale": [2, -3]}}
+                    }
+                }
+            }}
+        }"#).unwrap();
+        let result = insert_player_scripts_from(&mut doc, &root);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), vec!["PlayerModule"]);
+        let child = |r, name| child_named(&doc, r, name).unwrap();
+        let pm = child(sp, "PlayerModule");
+        let ctx = child(child(pm, "InputContexts"), "CharacterContext");
+        assert_eq!(doc.prop(ctx, "Priority"), Some(Variant::Int32(250)));
+        assert_eq!(doc.prop(ctx, "Sink"), Some(Variant::Bool(true)));
+        let action = child(ctx, "Move");
+        assert_eq!(doc.prop(action, "Enabled"), Some(Variant::Bool(false)));
+        let enum_of = |r, prop| crate::scene::enum_u32(doc.prop(r, prop));
+        let key = |name| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
+        assert_eq!(enum_of(child(action, "Keyboard"), "Up"), key("W"));
+        let gamepad = child(action, "Gamepad");
+        assert_eq!(enum_of(gamepad, "KeyCode"), key("Thumbstick1"));
+        assert_eq!(doc.prop(gamepad, "Vector2Scale"), Some(Variant::Vector2(
+            rbx_dom_weak::types::Vector2::new(2.0, -3.0),
+        )));
+    }
+
+    #[test]
     fn default_scripts_from_studio_folder() {
         let Some(_) = studio_dir() else { return }; // no Studio install on this machine
         let mut d = Document::empty();
-        let added = insert_player_scripts(&mut d);
+        let added = insert_player_scripts(&mut d).unwrap();
         assert_eq!(added, vec!["PlayerModule", "RbxCharacterSounds"]);
         let root = d.dom.root_ref();
         let sp = d.find_child(root, "StarterPlayer").unwrap();
@@ -477,7 +593,7 @@ mod tests {
         }
         assert!(len(&d, pm) > 100 && len(&d, cam) > 20_000);
         // A second call keeps what is there.
-        assert!(insert_player_scripts(&mut d).is_empty());
+        assert!(insert_player_scripts(&mut d).unwrap().is_empty());
         let ch = d
             .dom
             .insert(root, InstanceBuilder::new("Model").with_name("Player"));

@@ -318,7 +318,6 @@ pub const JUMP_POWER: f32 = 50.0; // Humanoid.JumpPower default (used when UseJu
 #[allow(dead_code)] // used by library.luau __rs_seat (same number)
 pub const SEAT_WELD_MIN_ROOT_HEIGHT: f32 = 0.05; // R6 SeatWeld C1.Y = -(max(root.Size.Y, 0.05) × 0.5 + 0.5); R15 from the rig attachments (library.luau __rs_seat)
 pub const PROJECT_DEBOUNCE_MS: u64 = 150; // a project folder's disk changes are applied once the folder has been quiet this long (well inside the 1 s promise)
-pub const GAMEPAD_SCAN_S: f32 = 1.0; // how often Play looks for plugged / unplugged gamepads (rustudio's own polling)
 pub const SEAT_COOLDOWN_S: f32 = 1.0; // after leaving a seat the humanoid doesn't sit again for this long (estimated; Roblox debounces re-sitting)
 
 pub const CLIMB_REACH: f32 = 0.7; // FindLadder caller Studio, .rdata Studio (R6; scaled by head size); measured truss face 1.0 accepted, 1.1 rejected. Query length is twice this.

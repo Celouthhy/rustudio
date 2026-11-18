@@ -1588,6 +1588,8 @@ get["InputActionLabel.ResolvedText"] = function() return "" end
 get["InputActionLabel.ResolvedImageContent"] = function() return Content.none end
 -- Held keys / buttons per binding, for the action's value.
 local held = {}
+local pad_values = {}
+local sticks = {}
 local function mods_ok(b)
     local uis = svc("UserInputService")
     for _, m in { b.PrimaryModifier, b.SecondaryModifier } do
@@ -1609,6 +1611,12 @@ local function binding_value(a, b)
         return v * s
     elseif t == Enum.InputActionType.Direction2D then
         local v = Vector2.new((h(b.Right) and 1 or 0) - (h(b.Left) and 1 or 0), (h(b.Up) and 1 or 0) - (h(b.Down) and 1 or 0))
+        local stick = sticks[b.KeyCode]
+        if stick and stick.Magnitude > b.Deadzone.Min then
+            local range = b.Deadzone.Max - b.Deadzone.Min
+            local magnitude = if range > 0 then math.min(1, (stick.Magnitude - b.Deadzone.Min) / range) else 1
+            v += stick.Unit * magnitude ^ b.ResponseCurve
+        end
         if b.ClampMagnitudeToOne and v.Magnitude > 1 then v = v.Unit end
         return v * b.Vector2Scale * s
     elseif t == Enum.InputActionType.Direction3D then
@@ -1626,11 +1634,25 @@ local function binding_uses(b, key)
     end
     return false
 end
--- This frame's analog input per action (mouse motion, wheel): added to
--- what its held keys give.
+-- This frame's mouse motion and wheel input, added to held keys and sticks.
 local analog = setmetatable({}, { __mode = "k" })
--- Runs the input action system for one key / button; true when a Sink
--- context took it.
+local function keys_value(a)
+    local t = a.Type
+    local value = zero_of(t)
+    if t == Enum.InputActionType.ViewportPosition then return value end
+    for _, b in a:GetChildren() do
+        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable then
+            local v = binding_value(a, b)
+            if t == Enum.InputActionType.Bool then
+                value = value or v
+            elseif v ~= nil then
+                value += v
+            end
+        end
+    end
+    return value
+end
+-- Re-evaluate an action on a relevant input change, keeping other held bindings.
 local function actions_input(key, down)
     held[key] = down or nil
     local ctxs = {}
@@ -1641,24 +1663,14 @@ local function actions_input(key, down)
     for _, ctx in ctxs do
         local took = false
         for _, a in ctx:GetChildren() do
-            if a:IsA("InputAction") and a.Enabled then
-                local uses, value = false, nil
+            if a:IsA("InputAction") and a.Enabled and a.Type ~= Enum.InputActionType.ViewportPosition then
                 for _, b in a:GetChildren() do
                     if b:IsA("InputBinding") and binding_uses(b, key) then
-                        uses = true
-                        local v = binding_value(a, b)
-                        if a.Type == Enum.InputActionType.Bool then
-                            value = value or v
-                        elseif v ~= nil then
-                            value = value and (value + v) or v
-                        end
-                    end
-                end
-                if uses then
-                    took = true
-                    if value ~= nil then
-                        if analog[a] ~= nil and a.Type ~= Enum.InputActionType.Bool then value += analog[a] end
+                        local value = keys_value(a)
+                        if analog[a] ~= nil then value += analog[a] end
                         set_state(a, value)
+                        took = true
+                        break
                     end
                 end
             end
@@ -1667,17 +1679,32 @@ local function actions_input(key, down)
     end
     return false
 end
--- What an action's held keys give (every non-scriptable binding summed).
-local function keys_value(a)
-    local value = zero_of(a.Type)
-    if a.Type == Enum.InputActionType.Bool or a.Type == Enum.InputActionType.ViewportPosition then return value end
-    for _, b in a:GetChildren() do
-        if b:IsA("InputBinding") and b.Type ~= Enum.InputBindingType.Scriptable then
-            local v = binding_value(a, b)
-            if v ~= nil then value += v end
-        end
+
+local function gamepad_input(state, pad, key, x, y)
+    local kc = Enum.KeyCode[key]
+    if not kc then return end
+    local values = pad_values[pad]
+    if not values then
+        values = {}
+        pad_values[pad] = values
     end
-    return value
+    if key == "Thumbstick1" or key == "Thumbstick2" then
+        local stick = Vector2.new(x, y)
+        values[kc] = if stick == Vector2.zero then nil else stick
+        local strongest = Vector2.zero
+        for _, other in pad_values do
+            if other[kc] and other[kc].Magnitude > strongest.Magnitude then strongest = other[kc] end
+        end
+        sticks[kc] = strongest
+        actions_input(kc, false)
+    elseif state == "Begin" or state == "End" then
+        values[kc] = state == "Begin" or nil
+        local down = false
+        for _, other in pad_values do
+            if other[kc] then down = true; break end
+        end
+        actions_input(kc, down)
+    end
 end
 -- The analog key codes (measured in Studio 0.747 with a real mouse,
 -- checks/humanoid-physics/feel/traces/studio-ias.log): a binding on
@@ -1765,8 +1792,7 @@ local function on_input(state, uit, key, x, y, z, gpe, dx, dy)
         -- (z is already the engine's 0.5 a notch: mech WHEEL_INPUT_PER_NOTCH.)
         if not gpe and (z or 0) ~= 0 then analog_input("MouseWheel", z, 0) end
     elseif uit:find("^Gamepad") then
-        local kc = Enum.KeyCode[key]
-        if kc and not gpe and (state == "Begin" or state == "End") then actions_input(kc, state == "Begin") end
+        if not gpe then gamepad_input(state, uit, key, x, y) end
         last_device = "Gamepad"
     end
 end
@@ -1811,7 +1837,7 @@ local function pad_index(t)
 end
 local function pad_connected(t)
     local i = pad_index(t)
-    return i ~= nil and i <= G.gamepads()
+    return i ~= nil and i >= 1 and i <= 8 and bit32.btest(G.gamepads(), bit32.lshift(1, i - 1))
 end
 methods["HapticService.IsVibrationSupported"] = function(_, t)
     if typeof(t) ~= "EnumItem" then error("Unable to cast value to token", 0) end

@@ -8,8 +8,8 @@ use glam::{Mat3, Quat, Vec3};
 use rapier3d::parry;
 use rapier3d::prelude as rp;
 
-use crate::doc::{self, Document};
-use crate::math::Xform;
+use rustudio_core::doc::{self, Document};
+use rustudio_core::math::Xform;
 
 /// A part's shape for queries (as physics.rs builds its colliders):
 /// Block, Ball (radius = smallest half size), Cylinder (along X, radius =
@@ -27,7 +27,7 @@ pub fn kind_of(d: &Document, r: rbx_dom_weak::types::Ref, class: &str) -> u8 {
     match class {
         "WedgePart" => WEDGE,
         "CornerWedgePart" => CORNER_WEDGE,
-        c if doc::is_a(c, "Part") => match crate::scene::enum_u32(d.prop(r, "Shape")) {
+        c if doc::is_a(c, "Part") => match rustudio_core::doc::enum_u32(d.prop(r, "Shape")) {
             Some(0) => BALL,
             Some(2) => CYLINDER,
             Some(3) => WEDGE,
@@ -634,7 +634,7 @@ pub fn obb_mesh(b: &Xform, b_size: Vec3, mesh: &Xform, mesh_size: Vec3, tris: &[
 }
 
 /// `obb_mesh` through the mesh's BVH: only triangles near the box are tested.
-pub fn obb_mesh_bvh(b: &Xform, b_size: Vec3, mesh: &Xform, mesh_size: Vec3, bvh: &crate::mesh_bvh::MeshBvh) -> bool {
+pub fn obb_mesh_bvh(b: &Xform, b_size: Vec3, mesh: &Xform, mesh_size: Vec3, bvh: &rustudio_core::mesh_bvh::MeshBvh) -> bool {
     let inv: Mat3 = b.rot.transpose();
     let h = b_size * 0.5;
     let to_box = |v: Vec3| inv * (mesh.pos + mesh.rot * (v * mesh_size) - b.pos);
@@ -688,7 +688,7 @@ mod tests {
         (a - b).length() < 2e-3
     }
 
-    /// The Place A nav repros (Place A-UITEST-NOTES.md), Studio's numbers.
+    /// The Place A nav repros (Studio observations), Studio's numbers.
     #[test]
     fn rays_hit_true_shapes() {
         let down = Vec3::new(0.0, -1.0, 0.0);
@@ -792,4 +792,48 @@ mod tests {
         assert!(obb_mesh(&at(Vec3::new(0.0, 0.8, 0.0)), Vec3::splat(1.0), &slab, size, &tris));
         assert!(obb_mesh(&at(Vec3::ZERO), Vec3::splat(0.2), &slab, size, &tris));
     }
+
+    // (from mesh_bvh's tests: the BVH must answer like the brute-force test)
+    fn soup(n: usize) -> Vec<[Vec3; 3]> {
+        // A pseudo-random triangle soup in [-0.5, 0.5]^3.
+        let mut s = 12345u32;
+        let mut r = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        (0..n)
+            .map(|_| {
+                let c = Vec3::new(r(), r(), r());
+                [c, c + Vec3::new(r(), r(), r()) * 0.2, c + Vec3::new(r(), r(), r()) * 0.2]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn boxes_match_brute_force() {
+        use rustudio_core::math::Xform;
+        let tris = std::sync::Arc::new(soup(1500));
+        let bvh = rustudio_core::mesh_bvh::MeshBvh::build(tris.clone());
+        let mesh = Xform { pos: Vec3::new(3.0, -1.0, 2.0), rot: glam::Mat3::from_rotation_y(0.7) };
+        let size = Vec3::new(40.0, 10.0, 25.0);
+        let mut s = 99u32;
+        let mut r = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let mut hits = 0;
+        for _ in 0..800 {
+            let b = Xform {
+                pos: mesh.pos + Vec3::new(r() * 50.0, r() * 14.0, r() * 30.0),
+                rot: glam::Mat3::from_rotation_x(r()) * glam::Mat3::from_rotation_z(r()),
+            };
+            let bs = Vec3::new(r().abs() * 3.0 + 0.1, r().abs() * 6.0 + 0.1, r().abs() * 3.0 + 0.1);
+            let a = obb_mesh(&b, bs, &mesh, size, &tris);
+            let c = obb_mesh_bvh(&b, bs, &mesh, size, &bvh);
+            assert_eq!(a, c);
+            hits += a as u32;
+        }
+        assert!(hits > 20);
+    }
+
 }

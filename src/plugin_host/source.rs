@@ -102,7 +102,7 @@ pub fn read_file(path: &Path) -> Result<WeakDom, String> {
             dom.insert(root, InstanceBuilder::new("Script").with_name("Script").with_property("Source", src));
             Ok(dom)
         }
-        "rbxm" | "rbxmx" => crate::doc::Document::decode(&bytes).map_err(|e| format!("{}: {e}", path.display())),
+        "rbxm" | "rbxmx" => rustudio_core::doc::Document::decode(&bytes).map_err(|e| format!("{}: {e}", path.display())),
         _ => Err(format!("{}: not a plugin file (.lua, .luau, .rbxm or .rbxmx)", path.display())),
     }
 }

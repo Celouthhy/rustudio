@@ -34,7 +34,7 @@ use rbx_dom_weak::types::Ref;
 use super::util::*;
 use crate::ltypes::*;
 use crate::runtime::*;
-use crate::terrain::{self, Voxels};
+use rustudio_core::terrain::{self, Voxels};
 
 const CELL_TO_SMOOTH: &[(&str, &str)] = &[
     ("Empty", "Air"),

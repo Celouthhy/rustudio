@@ -8,9 +8,9 @@ use glam::Mat3;
 
 use super::walk::{padded, Aff, Down, Walk};
 use super::*;
-use crate::math::Xform;
-use crate::mech;
-use crate::scene::{vec3_of, xform_of};
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
+use rustudio_render::scene::{vec3_of, xform_of};
 
 /// The GUI's debugging switches (read once).
 #[derive(Clone, Copy)]
@@ -49,10 +49,11 @@ pub(super) fn local_player_gui(d: &Document) -> Option<Ref> {
 ///
 /// Studio does the same: each GuiBase2d's LayoutNode keeps dirty bits
 /// (LayoutDirty, ViewportDirty, MarkedForViewportUpdate, ChildSort,
-/// IntrinsicSize, ContentSize…), layout runs only for dirty nodes, and the
-/// vertices sit in a retained GUI cluster per layer collector that is
-/// refilled only when marked (the frame stats time UILayout,
-/// FillGuiVertices and Render2d apart).
+/// IntrinsicSize, ContentSize…; names at Studio, dumped by
+/// Studio), layout runs only for dirty nodes, and the vertices sit in
+/// a retained Graphics::GuiCluster per layer collector (an ISuperCluster,
+/// vtable Studio) that is refilled only when marked (the frame stats
+/// time UILayout, FillGuiVertices and Render2d apart, Studio).
 pub(super) struct RootCache {
     key: [u32; 12],
     shapes: Vec<Shape>,
@@ -110,7 +111,7 @@ impl Gui {
     /// document's journal: scanning Place B's 116k instances for them was
     /// 8 ms a frame. Call before `draw`.
     pub fn sync_roots(&mut self, d: &mut Document) {
-        let _p = crate::bench::scope("gui_roots");
+        let _p = rustudio_core::bench::scope("gui_roots");
         let marks = d.marks_for(doc::Reader::Gui);
         self.cache_marks(d, &marks);
         let ws = d.workspace();
@@ -203,7 +204,7 @@ impl Gui {
     /// SurfaceGuis under CoreGui and the handle adornments under CoreGui or
     /// Workspace (Studio draws a plugin's handles in the edit view).
     pub fn sync_plugin(&mut self, d: &Document, marks: &doc::Marks) {
-        let _p = crate::bench::scope("gui_roots_plugin");
+        let _p = rustudio_core::bench::scope("gui_roots_plugin");
         self.cache_marks(d, marks);
         let root = d.dom.root_ref();
         let core = d.find_child(root, "CoreGui");
@@ -349,7 +350,7 @@ impl Gui {
             )
         };
         let same = n_shape.is_none() && n_hit.is_none();
-        crate::bench::add(if same { "gui_verify_same" } else { "gui_verify_differ" }, 0.0, 1);
+        rustudio_core::bench::add(if same { "gui_verify_same" } else { "gui_verify_differ" }, 0.0, 1);
         if !same {
             eprintln!(
                 "[guiverify] {} differs from its kept output: first differing triangles {:?}, hit {:?} (usize::MAX: counts differ; {} / {} screen shapes, {} / {} canvas items)",
@@ -482,10 +483,10 @@ impl Gui {
         }
         self.fx_frame(inp.doc);
         if (inp.playing && inp.roots == Roots::View) || inp.roots == Roots::CoreGui {
-            let _a = crate::bench::scope("gui_adorn");
+            let _a = rustudio_core::bench::scope("gui_adorn");
             self.draw_adornments(inp.doc, inp.cam, inp.rect, painter);
         }
-        let pre = crate::bench::scope("gui_pre");
+        let pre = rustudio_core::bench::scope("gui_pre");
         let d = inp.doc;
         let root = d.dom.root_ref();
         let rect = inp.rect;
@@ -601,7 +602,7 @@ impl Gui {
                 .filter(|g| !matches!(inp.roots, Roots::Widget(_)) && d.exists(*g) && boolp(d, *g, "Enabled", true)),
         );
         drop(pre);
-        let place = crate::bench::scope("gui_place");
+        let place = rustudio_core::bench::scope("gui_place");
         for g in layered {
             if let Some((target, canvas, dist)) = place_3d(d, inp.cam, rect, g) {
                 let on_top = boolp(d, g, "AlwaysOnTop", false);
@@ -672,7 +673,7 @@ impl Gui {
             if let Target::Surface { tl, tr, bl } = root.target {
                 if clip != Rect::EVERYTHING && !surface_in_view(&view_proj, rect, ctx.pixels_per_point(), tl, tr, bl) {
                     // (its entries from its last walk stay in `layout`)
-                    crate::bench::add("gui_unseen", 0.0, 1);
+                    rustudio_core::bench::add("gui_unseen", 0.0, 1);
                     continue;
                 }
             }
@@ -716,11 +717,11 @@ impl Gui {
                     out.extend(c.shapes.iter().cloned());
                     self.hits.extend(c.hits.iter().cloned());
                     crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI2D, c.ui2d.0, c.ui2d.1);
-                    crate::bench::add("gui_cached", 0.0, 1);
+                    rustudio_core::bench::add("gui_cached", 0.0, 1);
                     continue;
                 } else if vfs_ok {
                     reuse = self.cache.remove(&g);
-                    crate::bench::add("gui_cached", 0.0, 1);
+                    rustudio_core::bench::add("gui_cached", 0.0, 1);
                 }
             }
             let (target, canvas) = (root.target, root.canvas);
@@ -841,7 +842,7 @@ impl Gui {
                             self.layout.remove(&r);
                         }
                     }
-                    let walk_scope = crate::bench::scope("gui_walk");
+                    let walk_scope = rustudio_core::bench::scope("gui_walk");
                     let mut w = Walk {
                         gui: self,
                         ctx,
@@ -878,7 +879,7 @@ impl Gui {
                         },
                     );
                     drop(walk_scope);
-                    let _mesh_scope = crate::bench::scope("gui_mesh");
+                    let _mesh_scope = rustudio_core::bench::scope("gui_mesh");
                     let mut items = std::mem::take(&mut w.items);
                     let hits = std::mem::take(&mut w.hits);
                     let boxes = std::mem::take(&mut w.boxes);
@@ -952,7 +953,7 @@ impl Gui {
                         if bad.is_none() && boxes != boxes2 {
                             bad = Some(format!("boxes {} / {}", boxes.len(), boxes2.len()));
                         }
-                        crate::bench::add(if bad.is_none() { "gui_verify_memo_same" } else { "gui_verify_memo_differ" }, 0.0, 1);
+                        rustudio_core::bench::add(if bad.is_none() { "gui_verify_memo_same" } else { "gui_verify_memo_differ" }, 0.0, 1);
                         if let Some(b) = bad {
                             eprintln!("[guiverify] {}: memo walk differs from a full walk: {b}", name_of(d, g));
                         }
@@ -1030,11 +1031,11 @@ impl Gui {
                 t_map += t3.elapsed().as_secs_f64();
                 if ok && world {
                     // Into the renderer's pass (NDC over the view), in order.
-                    let verts: Vec<crate::world_gui::GuiVertex> = mesh
+                    let verts: Vec<rustudio_render::world_gui::GuiVertex> = mesh
                         .vertices
                         .iter()
                         .zip(&depths)
-                        .map(|(v, d)| crate::world_gui::GuiVertex {
+                        .map(|(v, d)| rustudio_render::world_gui::GuiVertex {
                             ndc: [
                                 (v.pos.x - rect.min.x) / rect.width().max(1.0) * 2.0 - 1.0,
                                 1.0 - (v.pos.y - rect.min.y) / rect.height().max(1.0) * 2.0,
@@ -1049,7 +1050,7 @@ impl Gui {
                             ..Default::default()
                         })
                         .collect();
-                    crate::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
+                    rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
                 } else if ok {
                     // Stats.UI2D*: a draw call per texture change (egui batches the rest).
                     let new_tex = ui2d_tex.replace(mesh.texture_id) != Some(mesh.texture_id);
@@ -1059,12 +1060,12 @@ impl Gui {
                     out.push(Shape::Mesh(mesh.into()));
                 }
             }
-            crate::bench::add("gui_m_tess", t_tess * 1e3, 1);
-            crate::bench::add("gui_m_clip", t_clip * 1e3, 1);
-            crate::bench::add("gui_m_split", t_split * 1e3, 1);
-            crate::bench::add("gui_m_map", t_map * 1e3, 1);
-            crate::bench::add(if perspective { "gui_tris_surface_in" } else { "gui_tris_flat" }, 0.0, n_in);
-            crate::bench::add("gui_tris_out", 0.0, n_out);
+            rustudio_core::bench::add("gui_m_tess", t_tess * 1e3, 1);
+            rustudio_core::bench::add("gui_m_clip", t_clip * 1e3, 1);
+            rustudio_core::bench::add("gui_m_split", t_split * 1e3, 1);
+            rustudio_core::bench::add("gui_m_map", t_map * 1e3, 1);
+            rustudio_core::bench::add(if perspective { "gui_tris_surface_in" } else { "gui_tris_flat" }, 0.0, n_in);
+            rustudio_core::bench::add("gui_tris_out", 0.0, n_out);
             for h in &lhits {
                 let corners = [
                     h.rect.left_top(),
@@ -1129,7 +1130,7 @@ impl Gui {
                     },
                 );
             } else {
-                crate::bench::add("gui_uncached", 0.0, 1);
+                rustudio_core::bench::add("gui_uncached", 0.0, 1);
             }
             if why_on {
                 eprintln!(
@@ -1167,16 +1168,16 @@ impl Gui {
                 }
             }
             let same = fresh == self.layout;
-            crate::bench::add(if same { "gui_verify_layout_same" } else { "gui_verify_layout_differ" }, 0.0, 1);
+            rustudio_core::bench::add(if same { "gui_verify_layout_same" } else { "gui_verify_layout_differ" }, 0.0, 1);
             if !same {
                 eprintln!("[guiverify] layout: {} kept, {} fresh", self.layout.len(), fresh.len());
             }
         }
         self.layout_roots = drawn_roots;
-        crate::bench::add("gui_memo_hit", 0.0, std::mem::take(&mut self.memo_hits));
-        crate::bench::add("gui_memo_walk", 0.0, std::mem::take(&mut self.memo_walks));
+        rustudio_core::bench::add("gui_memo_hit", 0.0, std::mem::take(&mut self.memo_hits));
+        rustudio_core::bench::add("gui_memo_walk", 0.0, std::mem::take(&mut self.memo_walks));
         self.drawn = out.len();
-        let _paint = crate::bench::scope("gui_paint");
+        let _paint = rustudio_core::bench::scope("gui_paint");
         let clipped = painter.with_clip_rect(rect);
         // (RUSTUDIO_GUI_BLACK_BG: ScreenGuis over black, to compare GUI
         // captures without the 3D view's frame-to-frame differences)
@@ -1338,7 +1339,7 @@ impl Gui {
                     .focus
                     .filter(|f| top.as_ref().is_none_or(|t| t.r != *f))
                 {
-                    // The scripts fire FocusLost (src/domains/gui_input.rs).
+                    // The scripts fire FocusLost (crates/rustudio-engine/src/domains/gui_input.rs).
                     let mut sh = super::share();
                     sh.focus_events.push((f, false, false, Some((b, x, y))));
                     sh.focus = None;
@@ -1827,12 +1828,12 @@ pub(crate) fn scene_light(d: &Document, normal: Option<Vec3>) -> f32 {
         }
     };
     let luma = |v: Vec3| v.x * 0.299 + v.y * 0.587 + v.z * 0.114;
-    let amb = crate::lighting::sq(rgb("Ambient", mech::AMBIENT));
-    let out = crate::lighting::sq(rgb("OutdoorAmbient", mech::OUTDOOR_AMBIENT));
+    let amb = rustudio_render::lighting::sq(rgb("Ambient", mech::AMBIENT));
+    let out = rustudio_render::lighting::sq(rgb("OutdoorAmbient", mech::OUTDOOR_AMBIENT));
     let ambient = luma(amb) + (luma(out) - luma(amb)).max(0.0);
     let clock = f32_of(get("ClockTime")).unwrap_or(mech::CLOCK_TIME);
     let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
-    let sun = crate::lighting::sun_direction(clock, lat);
+    let sun = rustudio_render::lighting::sun_direction(clock, lat);
     let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);
     let sun_light = if sun.y > 0.0 {
         mech::SUN_IRRADIANCE_PER_BRIGHTNESS * brightness * normal.map_or(1.0, |n| n.dot(sun).max(0.0))

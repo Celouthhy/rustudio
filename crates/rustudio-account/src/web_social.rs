@@ -1626,7 +1626,7 @@ mod tests {
             Read::Users(vec![1]),
             Read::Policy,
             Read::Party { id: "00000000-0000-0000-0000-000000000000".into(), universe: 10000000007, place: 10000000000008, job: String::new() },
-            Read::RankProducts(json!({"universeId":10000000007_u64,"productIdentifiers":[{"id":1286521615,"type":"Product"}]})),
+            Read::RankProducts(json!({"universeId":10000000007_u64,"productIdentifiers":[{"id":1,"type":"Product"}]})),
             Read::TopProducts(json!({"universeId":10000000007_u64,"productInfoTypes":["Product","GamePass"]})),
             Read::CampaignEligibility("0".into()),
             Read::CommerceProduct("COM-0".into()),

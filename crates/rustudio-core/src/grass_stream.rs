@@ -91,7 +91,7 @@ pub fn material_weight(world: [[f32; 3]; 3], material: [f32; 3]) -> f32 {
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn captured_mixed_material_sampler() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/grass/mixed-material-sampler.json")).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/grass/mixed-material-sampler.json")).unwrap();
         for row in rows.as_array().unwrap() {
             let world = std::array::from_fn(|i| std::array::from_fn(|j| row["world"][i][j].as_f64().unwrap() as f32));
             let indicators = std::array::from_fn(|i| row["indicators"][i].as_f64().unwrap() as f32);
@@ -99,7 +99,7 @@ pub fn material_weight(world: [[f32; 3]; 3], material: [f32; 3]) -> f32 {
         }
     }
     #[test] fn captured_material_sampler() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/grass/material-weight-sampler.json")).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/grass/material-weight-sampler.json")).unwrap();
         for row in rows.as_array().unwrap() {
             let world = std::array::from_fn(|i| std::array::from_fn(|j| row["world"][i][j].as_f64().unwrap() as f32));
             let (u,v) = material_uv(world);
@@ -116,7 +116,7 @@ pub fn material_weight(world: [[f32; 3]; 3], material: [f32; 3]) -> f32 {
         }
     }
     #[test] fn captured_grass_roots_and_templates() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/grass/placement.json")).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/grass/placement.json")).unwrap();
         for row in rows.as_array().unwrap() {
             let first: [f32; 3] = std::array::from_fn(|i| row["first"][i].as_f64().unwrap() as f32);
             let near = matches!(row["event"].as_u64().unwrap(), 251 | 257);
@@ -142,4 +142,109 @@ pub fn material_weight(world: [[f32; 3]; 3], material: [f32; 3]) -> f32 {
 
 }
 
+#[test]
+#[ignore = "reads local evidence under checks/"]
+fn retained_nondefault_ordered_geometry() {
+    let base = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/nondefault"));
+    let text = std::fs::read_to_string(base.join("capture.jsonl")).unwrap();
+    let decode = |s: &str| (0..s.len()).step_by(2).map(|i|u8::from_str_radix(&s[i..i+2],16).unwrap()).collect::<Vec<_>>();
+    let templates = std::fs::read(base.join("grass_templates.bin")).unwrap();
+    let mut checked=0;
+    for line in text.lines() {
+        let row: serde_json::Value=serde_json::from_str(line).unwrap();
+        if row["kind"]!="emitter" || row["buffers"].as_array().unwrap().is_empty() {continue;}
+        let length=row["case"]["length"].as_f64().unwrap() as f32;
+        let density=row["case"]["density"].as_f64().unwrap() as f32;
+        let header=decode(row["output_header"].as_str().unwrap());
+        let count=u32::from_le_bytes(header[76..80].try_into().unwrap()) as usize;
+        let near=count==sample_count(length,density,true);
+        assert_eq!(count,sample_count(length,density,near));
+        let points=if near {crate::mech::GRASS_NEAR_SAMPLE_POINTS}else{crate::mech::GRASS_SAMPLE_POINTS};
+        let input=decode(row["input"].as_str().unwrap());let domains=input.len()/28;
+        let output=std::fs::read(base.join(row["buffers"][0]["file"].as_str().unwrap())).unwrap();
+        for (di,record) in input.chunks_exact(28).enumerate() {
+            let f=|i:usize|i16::from_le_bytes(record[i*2..i*2+2].try_into().unwrap()) as f32/512.0;
+            let first=std::array::from_fn(|a|f(a));let weight=f(9)*512.0/16384.0;
+            let mut stream=Stream::new(first);let order=stream.shuffled_slots(count);
+            let real=((count as f32*weight).trunc() as usize).max(3).min(count);
+            for si in 0..real {
+                let (u,v)=fold(weight*points[si][0]*0.5+0.5,weight*points[si][1]*0.5+0.5);
+                let p=std::array::from_fn(|a|(f(a)+f(a+3)*u)+f(a+6)*v);
+                let (h,w,id)=stream.blade();let component=|i:usize|f32::from_le_bytes(templates[id*24+i*4..id*24+i*4+4].try_into().unwrap());
+                let size=(row["size"].as_f64().unwrap() as f32*if near {0.85}else{1.0})*weight;
+                let actual=crate::terrain::grass_pack::emit(p,std::array::from_fn(component),std::array::from_fn(|i|component(i+3)),size*w,size*h);
+                let slot=(order[si]*domains+di)*36;
+                for v in 0..3 {for a in 0..4 {
+                    let off=slot+v*12+a*2;let expected=i16::from_le_bytes(output[off..off+2].try_into().unwrap()) as f32/512.0;
+                    assert_eq!(actual[v][a],expected,"length {length} density {density} near {near} domain {di} sample {si} vertex {v} axis {a}");
+                }}checked+=1;
+            }
+            // Native fills unused allocation slots by copying the last real
+            // blade. These are duplicates, not additional PRNG draws.
+            for si in real..count {
+                let slot=(order[si]*domains+di)*36;
+                let previous=(order[si-1]*domains+di)*36;
+                assert_eq!(&output[slot..slot+36], &output[previous..previous+36]);
+            }
+        }
+    }
+    assert!(checked>10000);println!("{checked} ordered native blades matched exactly");
+}
 
+/// Compare generated selected geometry with actual RenderDoc draw ranges. The
+/// emitter output is independently byte-joined to each resident GPU allocation.
+#[test]
+#[ignore = "reads local evidence under checks/"]
+fn retained_gpu_selected_ordinals() {
+    let base=std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/gpu-ordinal"));
+    let joins:serde_json::Value=serde_json::from_slice(&std::fs::read(base.join("emitter-gpu-join.json")).unwrap()).unwrap();
+    let observations:serde_json::Value=serde_json::from_slice(&std::fs::read(base.join("resident-comparison.json")).unwrap()).unwrap();
+    let templates=std::fs::read(base.join("grass_templates.bin")).unwrap();
+    let mut selected=0;
+    for batch in 0..4 {
+        let row=&joins[batch]["matches"][0];
+        let input_hex=row["input"].as_str().unwrap();
+        let input:Vec<u8>=(0..input_hex.len()).step_by(2).map(|i|u8::from_str_radix(&input_hex[i..i+2],16).unwrap()).collect();
+        let domains=input.len()/28;
+        let near=batch<2;
+        let count=sample_count(0.7,1.0,near);
+        let points=if near {crate::mech::GRASS_NEAR_SAMPLE_POINTS}else{crate::mech::GRASS_SAMPLE_POINTS};
+        let native=std::fs::read(base.join(row["file"].as_str().unwrap())).unwrap();
+        let mut generated=std::collections::BTreeMap::new();
+        for (di,record) in input.chunks_exact(28).enumerate() {
+            let f=|i:usize|i16::from_le_bytes(record[i*2..i*2+2].try_into().unwrap()) as f32/512.0;
+            let mut stream=Stream::new(std::array::from_fn(|a|f(a)));
+            let order=stream.shuffled_slots(count);
+            let weight=f(9)*512.0/16384.0;
+            let real=((count as f32*weight).trunc() as usize).max(3).min(count);
+            for si in 0..real {
+                let (u,v)=fold(weight*points[si][0]*0.5+0.5,weight*points[si][1]*0.5+0.5);
+                let root=std::array::from_fn(|a|(f(a)+f(a+3)*u)+f(a+6)*v);
+                let (h,w,id)=stream.blade();
+                let component=|i:usize|f32::from_le_bytes(templates[id*24+i*4..id*24+i*4+4].try_into().unwrap());
+                let size=(row["size"].as_f64().unwrap() as f32*if near {0.85}else{1.0})*weight;
+                generated.insert(order[si]*domains+di,crate::terrain::grass_pack::emit(root,std::array::from_fn(component),std::array::from_fn(|i|component(i+3)),size*w,size*h));
+            }
+            for si in real..count {
+                let previous=generated[&(order[si-1]*domains+di)];
+                generated.insert(order[si]*domains+di,previous);
+            }
+        }
+        for obs in observations[batch]["observations"].as_array().unwrap() {
+            let limit=obs["primitives"].as_u64().unwrap() as usize;
+            let mut actual=std::collections::BTreeSet::new();
+            for (&ordinal,geometry) in generated.range(..limit) {
+                for v in 0..3 {for a in 0..4 {
+                    let off=ordinal*36+v*12+a*2;
+                    let expected=i16::from_le_bytes(native[off..off+2].try_into().unwrap()) as f32/512.0;
+                    assert_eq!(geometry[v][a],expected,"batch {batch} ordinal {ordinal} vertex {v} axis {a}");
+                }}
+                actual.insert(ordinal);selected+=1;
+            }
+            // Compare allocated ordinals, including native copied fillers.
+            assert_eq!(actual,(0..limit).collect(),"selected ordinal set batch {batch}");
+        }
+    }
+    assert!(selected>10000);
+    println!("{selected} selected native primitives match generated slots across out/back GPU captures");
+}

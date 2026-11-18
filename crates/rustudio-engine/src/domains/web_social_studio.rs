@@ -111,7 +111,7 @@ fn reviewable_key(lua: &Lua, value: Value) -> mlua::Result<Value> {
     } else {
         return Err(rt_err("Unsupported content format"));
     };
-    let bytes = crate::assets::generated(&uri).ok_or_else(|| rt_err("Unsupported content format"))?;
+    let bytes = rustudio_core::assets::generated(&uri).ok_or_else(|| rt_err("Unsupported content format"))?;
     let id: String = lua.load("return game:GetService('HttpService'):GenerateGUID(false)").eval()?;
     let id = id.to_uppercase();
     state.raw_set(format!("review.content:{id}"), value)?;
@@ -183,7 +183,7 @@ pub fn call(
             "ShowRewardedVideoAdAsync" => {
                 let p =
                     opt_inst(&arg(args, 1)).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
-                if !crate::doc::is_a(&inst_meta(lua, p)?.0, "Player") {
+                if !rustudio_core::doc::is_a(&inst_meta(lua, p)?.0, "Player") {
                     return Err(rt_err("Unable to cast Instance to Player"));
                 }
                 if opt_ud::<AdReward>(&arg(args, 2)).is_none() {
@@ -370,7 +370,7 @@ mod self_view_tests {
     #[test]
     fn self_view_signals_in_the_runtime() {
         use rbx_dom_weak::InstanceBuilder;
-        let mut d = crate::doc::Document::new_place();
+        let mut d = rustudio_core::doc::Document::new_place();
         let parent = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
         let script = d.dom.insert(parent, InstanceBuilder::new("Script").with_property("Source", r#"
 local service=game:GetService('SocialService')

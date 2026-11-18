@@ -42,14 +42,14 @@ fn click(q: &mut Vec<Event>, p: Pos2) {
 }
 
 fn rgb_of(ed: &Editor, r: Ref) -> [u8; 3] {
-    match ed.doc.prop(r, "Color") {
+    match ed.game.doc.prop(r, "Color") {
         Some(Variant::Color3uint8(c)) => [c.r, c.g, c.b],
         _ => [0, 0, 0],
     }
 }
 
 fn transparency(ed: &Editor, r: Ref) -> f64 {
-    match ed.doc.prop(r, "Transparency") {
+    match ed.game.doc.prop(r, "Transparency") {
         Some(Variant::Float32(f)) => f as f64,
         _ => -1.0,
     }
@@ -61,12 +61,12 @@ impl SelfTest {
         match (self.r4.phase, t) {
             // ------------------------------------------------ BrickColor palette
             (111, _) if self.ui3.started == 0 => {
-                if ed.play.is_some() {
+                if ed.game.play.is_some() {
                     ed.stop_play();
                 }
                 ed.new_place();
-                let ws = ed.doc.default_parent();
-                let part = ed.doc.insert(
+                let ws = ed.game.doc.default_parent();
+                let part = ed.game.doc.insert(
                     ws,
                     InstanceBuilder::new("Part")
                         .with_name("EditMe")
@@ -92,7 +92,7 @@ impl SelfTest {
                     }
                     _ => self.ui3.notes.push("no popup rect".into()),
                 }
-                self.ui3.undo_before = ed.doc.undo_len();
+                self.ui3.undo_before = ed.game.doc.undo_len();
             }
             (111, 9) => {
                 let hovered = ed.props.brick_popup.as_ref().and_then(|p| p.hovered);
@@ -103,7 +103,7 @@ impl SelfTest {
             (111, 12) => {
                 let c = rgb_of(ed, self.ui3.part);
                 let closed = ed.props.brick_popup.is_none();
-                let steps = ed.doc.undo_len() - self.ui3.undo_before;
+                let steps = ed.game.doc.undo_len() - self.ui3.undo_before;
                 ed.undo();
                 let back = rgb_of(ed, self.ui3.part);
                 let pal = crate::color_editors::popup_cells();
@@ -129,7 +129,7 @@ impl SelfTest {
                 let size = ed.ui_rects.get("color.dialog").map(|r| r.size());
                 self.ui3.ok = ed.props.color_dialog.is_some() && size == Some(Vec2::new(522.0, 399.0));
                 self.ui3.notes.push(format!("dialog open: {}, size {size:?}", ed.props.color_dialog.is_some()));
-                self.ui3.undo_before = ed.doc.undo_len();
+                self.ui3.undo_before = ed.game.doc.undo_len();
                 if let Some(d) = ed.ui_rects.get("color.dialog") {
                     // In the hue × saturation field (x 248–468, y 21–221).
                     click(&mut self.queue, d.min + Vec2::new(300.0, 60.0));
@@ -145,7 +145,7 @@ impl SelfTest {
             }
             (112, 11) => {
                 let kept = rgb_of(ed, self.ui3.part);
-                let steps = ed.doc.undo_len() - self.ui3.undo_before;
+                let steps = ed.game.doc.undo_len() - self.ui3.undo_before;
                 ed.undo();
                 let back = rgb_of(ed, self.ui3.part);
                 self.steps.push(Step {
@@ -168,7 +168,7 @@ impl SelfTest {
                 let shown = matches!((row, slider), (Some(r), Some(s)) if s.center().y > r.min.y && s.center().y < r.max.y);
                 self.ui3.ok = shown;
                 self.ui3.notes.push(format!("hover shows the slider: {shown}"));
-                self.ui3.undo_before = ed.doc.undo_len();
+                self.ui3.undo_before = ed.game.doc.undo_len();
                 if let Some(s) = slider {
                     let (a, _) = crate::prop_slider::track(s);
                     self.ui3.at = Pos2::new(s.max.x - 4.5, s.center().y);
@@ -194,7 +194,7 @@ impl SelfTest {
             }
             (113, 11) => {
                 let v = transparency(ed, self.ui3.part);
-                let steps = ed.doc.undo_len() - self.ui3.undo_before;
+                let steps = ed.game.doc.undo_len() - self.ui3.undo_before;
                 ed.undo();
                 let back = transparency(ed, self.ui3.part);
                 self.ui3.notes.push(format!("released at {v:.3}, undo steps {steps}, undo → {back}"));

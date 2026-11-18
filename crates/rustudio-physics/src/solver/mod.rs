@@ -1,7 +1,7 @@
 //! The Studio solver port: `RUSTUDIO_SOLVER` unset / `studio` (the default) or
 //! `studio-nextgen`; `RUSTUDIO_SOLVER=rapier` is the old physics.
 //!
-//! Two Studio solvers share this module (LEAD-NOTES.md 2026-11-13):
+//! Two Studio solvers share this module (Studio observations 2026-11-13):
 //! * `studio`: the legacy solver Studio 0.747 runs by default
 //!   (workspace.NextGenerationPhysicsSolver = Default): "Solve Batch" Studio,
 //!   dual LDL + PGS, rows from connector vtbl[10] (dual.rs; lanes DUAL, DUALROWS,
@@ -65,39 +65,13 @@ use std::sync::OnceLock;
 
 pub use step::StudioSolver;
 
-/// Which solver steps the bodies (`RUSTUDIO_SOLVER`, read once per process).
-/// Unset or empty = `studio` (the default since the solver landed on master);
-/// `rapier` = the old physics, unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SolverKind {
-    /// `rapier`: rapier's PhysicsPipeline (collision + solver + integration), the
-    /// physics before the port; no longer the default.
-    Rapier,
-    /// `studio` (default; also unset / empty): Studio's legacy solver (dual LDL + PGS, "Solve Batch"), what Studio
-    /// 0.747 runs with workspace.NextGenerationPhysicsSolver = Default. Hooks: DUAL,
-    /// DUALROWS, JOINT, STEP.
-    Studio,
-    /// `studio-nextgen`: the primal ("next generation") solver Roblox is rolling
-    /// out (NextGenerationPhysicsSolver = Enabled). Hooks: ITER, LINSYS, CONTACT,
-    /// JOINT, STEP.
-    StudioNextGen,
-}
-
-impl SolverKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            SolverKind::Rapier => "rapier",
-            SolverKind::Studio => "studio",
-            SolverKind::StudioNextGen => "studio-nextgen",
-        }
-    }
-}
+pub use rustudio_core::rustudio_settings::SolverKind;
 
 /// The solver of this Play session: `RUSTUDIO_SOLVER`, else the saved
-/// rustudio option, else studio (src/rustudio_settings.rs), re-read at each
+/// rustudio option, else studio (crates/rustudio-core/src/rustudio_settings.rs), re-read at each
 /// Play start.
 pub fn kind() -> SolverKind {
-    crate::rustudio_settings::solver()
+    rustudio_core::rustudio_settings::solver()
 }
 
 pub fn strict() -> bool {

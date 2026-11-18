@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::runtime::{RemoteMsg, RepOp, Runtime};
 
 /// Services whose contents never reach the client.
@@ -62,7 +62,8 @@ enum PendingKind {
     /// instances over several packets, parents first).
     Attach { s: Ref, next: usize },
 }
-/// Studio's client packet budget (ProcessPacketsJob; its DFInt defaults):
+/// Studio's client packet budget (ProcessPacketsJob step Studio, its
+/// deadline Studio; DFInt defaults read from the exe):
 /// ClientPacketHealthyAllocationPercent 15 % of the frame-time average,
 /// at least ClientPacketMinMicroseconds 1600, frames counted up to
 /// ClientPacketMaxFrameMicroseconds 48000. Once the oldest waiting data is
@@ -354,7 +355,7 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
         }
         let p = map.queue.pop_front().unwrap();
         map.frame_items += 1;
-        let _sc = crate::bench::scope(match &p.kind {
+        let _sc = rustudio_core::bench::scope(match &p.kind {
             PendingKind::Op(RepOp::Parent(_)) => "rep_parent",
             PendingKind::Op(RepOp::Destroy(_)) => "rep_destroy",
             PendingKind::Op(RepOp::Moved(_)) => "rep_moved",

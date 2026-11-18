@@ -83,23 +83,23 @@ fn write_fixture(dir: &Path) -> std::io::Result<()> {
 
 /// A child by name.
 fn named(ed: &Editor, parent: Ref, name: &str) -> Option<Ref> {
-    let p = ed.doc.dom.get_by_ref(parent)?;
+    let p = ed.game.doc.dom.get_by_ref(parent)?;
     p.children()
         .iter()
         .copied()
-        .find(|c| ed.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == name))
+        .find(|c| ed.game.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == name))
 }
 
 /// The fixture's Hello script in the open place.
 fn hello(ed: &Editor) -> Option<Ref> {
-    let root = ed.doc.dom.root_ref();
+    let root = ed.game.doc.dom.root_ref();
     let sss = named(ed, root, "ServerScriptService")?;
     let server = named(ed, sss, "Server")?;
     named(ed, server, "Hello")
 }
 
 fn source(ed: &Editor, r: Ref) -> String {
-    match ed.doc.prop(r, "Source") {
+    match ed.game.doc.prop(r, "Source") {
         Some(Variant::String(s)) => s,
         _ => String::new(),
     }
@@ -112,7 +112,7 @@ impl SelfTest {
         match self.r4.phase {
             97 if self.pj.dir.as_os_str().is_empty() => {
                 // Edit mode (the step before may still be playing).
-                if ed.play.is_some() {
+                if ed.game.play.is_some() {
                     ed.stop_play();
                 }
                 let dir = std::env::temp_dir().join(format!("rustudio-selftest-project-{}", std::process::id()));
@@ -136,16 +136,16 @@ impl SelfTest {
                     .map(|(p, _)| p.display().to_string())
                     .chain(self.pj.before.keys().filter(|p| !after.contains_key(*p)).map(|p| format!("{} (gone)", p.display())))
                     .collect();
-                let root = ed.doc.dom.root_ref();
+                let root = ed.game.doc.dom.root_ref();
                 let shared = named(ed, root, "ReplicatedStorage").and_then(|rs| named(ed, rs, "Shared"));
                 let class = |n: &str| {
                     shared
                         .and_then(|s| named(ed, s, n))
-                        .and_then(|r| ed.doc.class_of(r))
+                        .and_then(|r| ed.game.doc.class_of(r))
                         .unwrap_or_default()
                 };
                 let loaded = hello(ed).is_some_and(|h| {
-                    ed.doc.class_of(h).as_deref() == Some("Script") && source(ed, h) == HELLO
+                    ed.game.doc.class_of(h).as_deref() == Some("Script") && source(ed, h) == HELLO
                 }) && class("Mod") == "ModuleScript"
                     && class("Note") == "StringValue"
                     && class("Box") == "Part"
@@ -154,9 +154,9 @@ impl SelfTest {
                     self.pj.notes.push(format!(
                         "loaded state: project open {}, document \"{}\", playing {}, Hello {:?} source {:?}, Shared: {:?}",
                         ed.project.is_some(),
-                        ed.doc.title,
-                        ed.play.is_some(),
-                        hello(ed).and_then(|h| ed.doc.class_of(h)),
+                        ed.game.doc.title,
+                        ed.game.play.is_some(),
+                        hello(ed).and_then(|h| ed.game.doc.class_of(h)),
                         hello(ed).map(|h| source(ed, h)),
                         ["Mod", "Note", "Box", "Data"].map(class)
                     ));
@@ -193,7 +193,7 @@ impl SelfTest {
                     self.pj.before = files(&self.pj.dir);
                     if let Some(h) = hello(ed) {
                         let text = format!("{}print(2)\n", source(ed, h).replace("\r\n", "\n"));
-                        ed.doc.set_props(
+                        ed.game.doc.set_props(
                             "Edit script",
                             vec![(h, rbx_dom_weak::ustr("Source"), Variant::String(text))],
                             Some(format!("source:{h:?}")),

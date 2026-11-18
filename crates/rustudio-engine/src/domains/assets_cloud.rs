@@ -106,7 +106,7 @@ pub const METHODS: &[(&str, &str)] = &[
 ];
 pub const EVENTS: &[(&str, &str)] = &[("AssetFetchFailed", "ContentProvider")];
 fn status(lua: &Lua, id: &str) -> mlua::Result<Value> {
-    let n=crate::assets::content_fetch_status(id);
+    let n=rustudio_core::assets::content_fetch_status(id);
     let s=match n {1=>"Loading",2=>"Success",3=>"Failure",_=>"None"};
     Ok(Value::UserData(lua.create_userdata(
         LEnumItem::from_name("AssetFetchStatus", s).unwrap(),
@@ -141,7 +141,7 @@ pub fn call(
                 _ => return Err(rt_err("ContentId expected")),
             };
             return one(if name.ends_with("Signal") {
-                let current=crate::assets::content_fetch_status(&id);
+                let current=rustudio_core::assets::content_fetch_status(&id);
                 {
                     let mut s=lua.app_data_mut::<State>().unwrap();
                     s.watched.entry(id.clone()).or_insert((this,current));
@@ -245,7 +245,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     Ok(match key {
         "BaseUrl" => Some(Value::String(lua.create_string("https://www.roblox.com/")?)),
         "RequestQueueSize" => Some(Value::Integer(
-            crate::assets::content_queue_size() as i64,
+            rustudio_core::assets::content_queue_size() as i64,
         )),
         _ => None,
     })
@@ -274,7 +274,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     scene::install(lua)?;
     decal::install(lua)?;
     content::install(lua)?;
-    lua.set_app_data(State {failure_seq:crate::assets::content_failures_since(u64::MAX).0,..State::default()});
+    lua.set_app_data(State {failure_seq:rustudio_core::assets::content_failures_since(u64::MAX).0,..State::default()});
     lua.globals().set(
         "__rs_asset_begin",
         lua.create_function(|lua, (provider, ids): (Value, mlua::Table)| {
@@ -287,7 +287,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 }
                 let result = Arc::new(Mutex::new(None));
                 s.fetches.insert(id.clone(), result.clone());
-                crate::assets::content_track(&id,1);
+                rustudio_core::assets::content_track(&id,1);
                 s.statuses.insert(id.clone(), "Loading".into());
                 s.providers.insert(id.clone(), r);
                 s.watched.insert(id.clone(),(r,1));
@@ -297,7 +297,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 )?);
                 world(lua)?.fire(r, &format!("AssetFetchStatus:{id}"), vec![v]);
                 std::thread::spawn(move || {
-                    let ok = crate::assets::script_content_blocking(&id).is_ok();
+                    let ok = rustudio_core::assets::script_content_blocking(&id).is_ok();
                     *result.lock().unwrap() = Some(ok);
                 });
             }
@@ -318,7 +318,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             while let Some(r) = pending.pop() {
                 let Some(i) = d.dom.get_by_ref(r) else { continue };
                 pending.extend_from_slice(i.children());
-                let db = crate::doc::db();
+                let db = rustudio_core::doc::db();
                 let Some(class) = db.classes.get(i.class.as_str()) else { continue };
                 for c in db.superclasses_iter(class) {
                     for key in c.properties.keys() {
@@ -373,12 +373,12 @@ pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
     // Only when some content's status changed (or a new id is watched):
     // asking for every watched id's status each frame was 0.85 ms a frame
     // in a live Place A match (a lock, a canonical key and a lookup per id).
-    let generation=crate::assets::content_status_generation();
+    let generation=rustudio_core::assets::content_status_generation();
     let changes: Vec<_> = if lua.app_data_ref::<State>().unwrap().status_gen==generation {Vec::new()} else {
         let mut s=lua.app_data_mut::<State>().unwrap();
         s.status_gen=generation;
         s.watched.iter().filter_map(|(id,(r,old))| {
-            let current=crate::assets::content_fetch_status(id);
+            let current=rustudio_core::assets::content_fetch_status(id);
             (current!=*old).then(||(id.clone(),*r,current))
         }).collect()
     };
@@ -388,7 +388,7 @@ pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
         world(lua)?.fire(r,&format!("AssetFetchStatus:{id}"),vec![value]);
     }
     let cursor=lua.app_data_ref::<State>().unwrap().failure_seq;
-    let (next,failures)=crate::assets::content_failures_since(cursor);
+    let (next,failures)=rustudio_core::assets::content_failures_since(cursor);
     lua.app_data_mut::<State>().unwrap().failure_seq=next;
     let provider={let w=world(lua)?;let d=w.d();d.find_child(d.dom.root_ref(),"ContentProvider")};
     if let Some(r)=provider {for id in failures {world(lua)?.fire(r,"AssetFetchFailed",vec![Value::String(lua.create_string(id)?)]);}}
@@ -398,7 +398,7 @@ pub fn step(lua: &Lua, _: f64) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use rbx_dom_weak::InstanceBuilder;
     #[test]
     fn realtime_class_access_matches_studio(){
@@ -541,7 +541,7 @@ __ac_test_done()
                 .to_string(),
             ),
         );
-        crate::assets::register_generated("rbxtemp://rustudio/parity-preload", vec![1]);
+        rustudio_core::assets::register_generated("rbxtemp://rustudio/parity-preload", vec![1]);
         let rt = Runtime::new().unwrap();
         rt.enter(World::new(d, RunMode::Run));
         rt.bind_globals().unwrap();

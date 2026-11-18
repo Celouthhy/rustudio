@@ -1863,7 +1863,8 @@ pub fn grass_geometry_density(v: &Voxels, key: [i32; 3], length: f32, density: f
                 let h = blade_scale * height;
                 let (base_axis, tip_axis) = grass_template(template);
                 let half_width = blade_scale * width;
-                // Blade orientation from one of 1024 templates (grass_template).
+                // Native emitter Studio uses the first two vectors of
+                // the 60-byte orientation template (1024 entries, seed deadbeef).
                 let side = base_axis * half_width;
                 let tip = p + tip_axis * h;
                 let shade = (rnd() * 255.0) as u8;
@@ -2096,7 +2097,7 @@ mod tests {
     #[test]
     #[ignore = "requires checks/water-full-re native GPU evidence"]
     fn water_matches_native_gpu_positions() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("checks/water-full-re");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../checks/water-full-re");
         let rows: Vec<(i32,i32,i32,String,f32,f32)> = serde_json::from_slice(
             &std::fs::read(root.join("slope-voxels.json")).unwrap()).unwrap();
         let mut v = Voxels::empty();
@@ -2341,7 +2342,7 @@ mod tests {
     #[test]
     fn decoration_ownership_matches_accepted_native_source_cells() {
         let rows: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/grass/decoration-regression.json")).unwrap();
+            "../../../tests/fixtures/grass/decoration-regression.json")).unwrap();
         for row in rows.as_array().unwrap() {
             let raw = std::array::from_fn(|i| {
                 let r = &row["raw"][i];
@@ -2849,7 +2850,7 @@ mod tests {
         assert!(!pos.is_empty() && idx.len() % 3 == 0);
     }
 
-    /// Run with: cargo test --release --bin rustudio terrain_perf -- --ignored --nocapture
+    /// Run with: cargo test --release -p rustudio-core --lib terrain_perf -- --ignored --nocapture
     #[test]
     #[ignore]
     fn terrain_perf() {
@@ -2886,7 +2887,7 @@ mod tests {
 #[ignore = "reads local evidence under checks/"]
 fn grass_native_domain_fixtures(){
  use crate::terrain;
- let base=std::path::Path::new("checks/grass-full-re/domain-fixtures");
+ let base=std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/domain-fixtures"));
  for name in ["flat","slope"] {
  let d=std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap();let mut v=terrain::Voxels::empty();
  for r in d.chunks_exact(20){let i=|o|i32::from_le_bytes(r[o..o+4].try_into().unwrap());let occ=f32::from_le_bytes(r[16..20].try_into().unwrap());v.set_raw_many([([i(0),i(4),i(8)],(if i(12)==1280 {2}else{0},(occ*256.0-1.0).max(0.0) as u8,0))]);}
@@ -2919,8 +2920,8 @@ fn grass_native_domain_fixtures(){
 #[test]
 #[ignore = "retained mixed-material native ownership investigation"]
 fn grass_mixed_material_ownership_probe() {
- let base_path=std::env::var("MIXED_PROBE_DIR").unwrap_or_else(|_| "checks/grass-full-re/mixed-material".into());
- let base=std::path::Path::new(&base_path);
+ let base=std::env::var_os("MIXED_PROBE_DIR").map(std::path::PathBuf::from)
+  .unwrap_or_else(|| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/mixed-material")));
  for name in ["sand","flat","slope","transition"] {
   let d=std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap();
   let mut v=Voxels::empty();
@@ -2946,7 +2947,7 @@ fn grass_mixed_material_ownership_probe() {
 #[test]
 #[ignore = "reads local evidence under checks/"]
 fn grass_atomic_mixed_boundary_export() {
- let base=std::path::Path::new("checks/grass-full-re/mixed-atomic");
+ let base=std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/mixed-atomic"));
 
  for name in ["slope","slope-plus","slope-minus"] {
   let d=std::fs::read(base.join(format!("{name}-packed.bin"))).unwrap();
@@ -3053,12 +3054,12 @@ mod grass_ordinal_tests {
 #[test]
 #[ignore = "reads local evidence under checks/"]
 fn native_producer_domain_order() {
-    let base = std::path::Path::new("checks/grass-full-re/domain-fixtures");
+    let base = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/domain-fixtures"));
     for (name, captures, mixed) in [("flat", vec![(8, [0,0,0])],false), ("slope", vec![(10,[0,0,0]), (12,[0,-1,0])],false),
         ("slope",vec![(0,[0,-1,0]),(2,[0,0,0])],true),
         ("slope-plus",vec![(4,[0,0,0]),(6,[0,-1,0])],true),
         ("slope-minus",vec![(8,[0,0,0]),(10,[0,-1,0])],true)] {
-        let base = if mixed { std::path::Path::new("checks/grass-full-re/mixed-atomic") } else { base };
+        let base = if mixed { std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/mixed-atomic")) } else { base };
         let mut voxels = Voxels::empty();
         if mixed {
             let data=std::fs::read(base.join(format!("{name}-packed.bin"))).unwrap();
@@ -3098,7 +3099,7 @@ fn native_producer_domain_order() {
 #[test]
 #[ignore = "explicit same-input X/Z boundary source inventory"]
 fn square_boundary_source_inventory() {
- let base=std::path::Path::new("checks/grass-square-boundaries/runtime");
+ let base=std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-square-boundaries/runtime"));
  for name in ["flat","slope"] {
   let mut vox=Voxels::empty();
   for r in std::fs::read(base.join(format!("{name}-voxels.bin"))).unwrap().chunks_exact(20) {
@@ -3135,15 +3136,14 @@ fn square_boundary_source_inventory() {
 #[test]
 #[ignore = "explicit CPU production Village coverage export"]
 fn village_coverage_export() {
- let path=format!("{}/.cache/rustudio/templates/520390648/v63.rbxl",std::env::var("HOME").unwrap());
- let dom=rbx_binary::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+ let path="/home/user/.cache/rustudio/templates/520390648/v63.rbxl";
+ let dom=rbx_binary::from_reader(std::fs::File::open(path).unwrap()).unwrap();
  let v=Voxels::from_dom(&dom).unwrap().unwrap();
  let terrain=dom.root().children().iter().filter_map(|r|dom.get_by_ref(*r)).find(|i|i.class=="Workspace").unwrap().children().iter().filter_map(|r|dom.get_by_ref(*r)).find(|i|i.class=="Terrain").unwrap();
  let length=match terrain.properties.get(&rbx_dom_weak::ustr("GrassLength")) {Some(rbx_types::Variant::Float32(x))=>*x,_=>crate::mech::GRASS_LENGTH_DEFAULT};
  let mut keys=dirty_chunks(None,&v); keys.sort();
  for key in keys { let lo=glam::Vec3::from_array(key.map(|x|x as f32*128.0)); let cam=glam::Vec3::new(-12.0,155.0,210.0); if cam.distance(cam.clamp(lo,lo+glam::Vec3::splat(128.0)))<=crate::mech::GRASS_RADIUS {grass_geometry_density(&v,key,length,1.0);} }
 }
-
 
 /// Blade orientation `i` of 1024: a horizontal base axis at a random heading
 /// and a unit tip axis leaning 10°–40° off vertical across it.

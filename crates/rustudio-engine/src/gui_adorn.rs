@@ -1,5 +1,5 @@
 //! HandleAdornments, Handles and ArcHandles drawn over the 3D view while
-//! playing (the scripts hit-test them in src/domains/gui_input.luau, with
+//! playing (the scripts hit-test them in crates/rustudio-engine/src/domains/gui_input.luau, with
 //! the same geometry): boxes / images / pyramids / cylinders / cones as
 //! their faces, spheres as discs, lines as segments, in Color3 at
 //! Transparency; Handles a sphere per face (half size + 2 studs out);
@@ -12,8 +12,8 @@ use egui::{Pos2, Shape, Stroke};
 use glam::{Mat3, Vec3};
 
 use super::*;
-use crate::math::Xform;
-use crate::scene::{vec3_of, xform_of};
+use rustudio_core::math::Xform;
+use rustudio_render::scene::{vec3_of, xform_of};
 
 const HANDLE_R: f32 = 0.55;
 

@@ -59,7 +59,7 @@ pub fn detect() -> Vec<StudioInstall> {
             }
         }
     }
-    let base = crate::paths::home().join(".var/app/org.vinegarhq.Vinegar");
+    let base = rustudio_core::paths::home().join(".var/app/org.vinegarhq.Vinegar");
     let mut roots = vec![("Vinegar".to_string(), base.join("data/vinegar"))];
     for d in dirs_in(&base) {
         let name = d.file_name().unwrap().to_string_lossy().to_string();

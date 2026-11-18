@@ -14,7 +14,7 @@ use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use super::api::Failure;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 /// One row of the instance tree view.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,7 +89,7 @@ impl Previews {
     /// Editor side, once a frame before the 3D view draws: installs a
     /// loaded model into the document, forgets frames of a closed page,
     /// and returns the frames to draw with their requests.
-    pub fn frames(&mut self, doc: &mut crate::doc::Document) -> HashMap<Ref, crate::render::vf::Request> {
+    pub fn frames(&mut self, doc: &mut rustudio_core::doc::Document) -> HashMap<Ref, rustudio_render::render::vf::Request> {
         if self.doc_id != Some(doc.id) {
             // A new document: the old one's frames went with it.
             self.doc_id = Some(doc.id);
@@ -157,7 +157,7 @@ impl Previews {
             let cam = Xform { pos, rot: Mat3::from_cols(right, up, -fwd) };
             out.insert(
                 *vf,
-                crate::render::vf::Request {
+                rustudio_render::render::vf::Request {
                     size: [size[0].max(16), size[1].max(16)],
                     cam,
                     fov_y: fov,

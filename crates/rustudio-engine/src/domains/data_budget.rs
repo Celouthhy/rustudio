@@ -133,7 +133,7 @@ pub fn call(lua: &Lua, name: &str, args: &MultiValue) -> Option<mlua::Result<Mul
         drop(b);
         if repeat {
             if let Some(mut w) = lua.app_data_mut::<World>() {
-                w.output.push((crate::app::Level::Warn,format!("SetRateLimitForRequestType: Rate limit for DataStoreRequestType.{} has already been set. Please ensure this is intended behavior.",item.name)))
+                w.output.push((rustudio_core::log::Level::Warn,format!("SetRateLimitForRequestType: Rate limit for DataStoreRequestType.{} has already been set. Please ensure this is intended behavior.",item.name)))
             }
         }
         Ok(MultiValue::new())
@@ -207,7 +207,7 @@ pub fn queue(lua: &Lua, method: &str, path: &str, delta: i32, operation: &str) -
     b.queued[a] += 1;
     drop(b);
     if let Some(mut w) = lua.app_data_mut::<World>() {
-        w.output.push((crate::app::Level::Warn,"DataStore request was added to queue. If request queue fills, further requests will be dropped. Try sending fewer requests.".into()));
+        w.output.push((rustudio_core::log::Level::Warn,"DataStore request was added to queue. If request queue fills, further requests will be dropped. Try sending fewer requests.".into()));
     }
     Ok(())
 }

@@ -33,10 +33,10 @@ pub struct EditorState {
 impl Default for EditorState {
     fn default() -> Self {
         EditorState {
-            snap_move: crate::mech::SNAP_ON_BY_DEFAULT,
-            move_inc: crate::mech::MOVE_SNAP,
-            snap_rotate: crate::mech::SNAP_ON_BY_DEFAULT,
-            rotate_inc: crate::mech::ROTATE_SNAP_DEG,
+            snap_move: rustudio_core::mech::SNAP_ON_BY_DEFAULT,
+            move_inc: rustudio_core::mech::MOVE_SNAP,
+            snap_rotate: rustudio_core::mech::SNAP_ON_BY_DEFAULT,
+            rotate_inc: rustudio_core::mech::ROTATE_SNAP_DEG,
             local_space: false,
             collisions: false,
             join_surfaces: false,
@@ -91,7 +91,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     let v = match (class, key) {
         // The script whose tab is in front (plugin_host/script_docs.rs;
         // ScriptEditorService / OpenScript set it too).
-        ("StudioService", "ActiveScript") => match crate::plugin_host::script_docs::active() {
+        ("StudioService", "ActiveScript") => match crate::runtime::domains::active_script() {
             Some(s) if world(lua)?.d().exists(s) => inst_value(lua, s)?,
             _ => Value::Nil,
         },
@@ -244,10 +244,10 @@ pub fn call(
             ret1(enum_item(lua, "InstanceFileSyncStatus", 0)?)
         })(),
         // The signed-in user's id (0 signed out), as plugin:GetStudioUserId.
-        "GetUserId" if class == "StudioService" => ret1(Value::Number(crate::plugin_host::settings::user_id() as f64)),
+        "GetUserId" if class == "StudioService" => ret1(Value::Number(crate::runtime::domains::plugin_api::user_id() as f64)),
         // The widget's close callback (called when the widget closes; no
         // plugin widget ever closes in rustudio's play session).
-        "BindToClose" if crate::doc::is_a(class, "PluginGui") => (|| {
+        "BindToClose" if rustudio_core::doc::is_a(class, "PluginGui") => (|| {
             let f = arg(args, 1);
             if !matches!(f, Value::Nil | Value::Function(_)) {
                 return Err(rt_err(format!("Unable to cast {} to Function", f.type_name())));

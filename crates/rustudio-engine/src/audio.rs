@@ -732,7 +732,7 @@ impl Audio {
             looped,
             paused: false,
             base: start,
-            anchor: crate::sim_clock::now(),
+            anchor: rustudio_core::sim_clock::now(),
             wraps: 0,
             wraps_reported: 0,
             region,
@@ -793,7 +793,7 @@ impl Audio {
                         s.volume,
                         s.speed,
                         s.looped,
-                        s.position(crate::sim_clock::now()),
+                        s.position(rustudio_core::sim_clock::now()),
                         s.region,
                         s.paused,
                     )
@@ -848,7 +848,7 @@ impl Audio {
     pub fn pause(&mut self, key: u64) {
         if let Some(s) = self.sounds.get_mut(&key) {
             if !s.paused {
-                s.rebase(crate::sim_clock::now());
+                s.rebase(rustudio_core::sim_clock::now());
                 s.paused = true;
                 s.apply();
             }
@@ -859,7 +859,7 @@ impl Audio {
     pub fn resume(&mut self, key: u64) {
         if let Some(s) = self.sounds.get_mut(&key) {
             if s.paused {
-                s.rebase(crate::sim_clock::now());
+                s.rebase(rustudio_core::sim_clock::now());
                 s.paused = false;
                 s.apply();
             }
@@ -877,7 +877,7 @@ impl Audio {
     /// Roblox Sound.PlaybackSpeed (also shifts pitch, like Roblox). 0 holds the sound in place.
     pub fn set_speed(&mut self, key: u64, sp: f32) {
         if let Some(s) = self.sounds.get_mut(&key) {
-            s.rebase(crate::sim_clock::now());
+            s.rebase(rustudio_core::sim_clock::now());
             s.speed = sane_speed(sp);
             s.apply();
         }
@@ -885,7 +885,7 @@ impl Audio {
 
     pub fn set_looped(&mut self, key: u64, l: bool) {
         if let Some(s) = self.sounds.get_mut(&key) {
-            s.rebase(crate::sim_clock::now());
+            s.rebase(rustudio_core::sim_clock::now());
             s.looped = l;
             if let Some(c) = &s.ctl {
                 c.looped.store(l, Ordering::Relaxed);
@@ -894,7 +894,7 @@ impl Audio {
     }
 
     pub fn is_playing(&self, key: u64) -> bool {
-        let now = crate::sim_clock::now();
+        let now = rustudio_core::sim_clock::now();
         self.sounds
             .get(&key)
             .is_some_and(|s| !s.paused && !s.finished(now))
@@ -904,7 +904,7 @@ impl Audio {
     pub fn position(&self, key: u64) -> f64 {
         self.sounds
             .get(&key)
-            .map_or(0.0, |s| s.position(crate::sim_clock::now()))
+            .map_or(0.0, |s| s.position(rustudio_core::sim_clock::now()))
     }
 
     /// Sound.TimeLength: from the container headers, or by decoding when they don't say.
@@ -915,7 +915,7 @@ impl Audio {
     /// Keys of sounds that reached their end (not looped) since the last call, for
     /// Sound.Ended. Finished sounds are dropped, so they read as stopped afterwards.
     pub fn poll_finished(&mut self) -> Vec<u64> {
-        let now = crate::sim_clock::now();
+        let now = rustudio_core::sim_clock::now();
         let mut done: Vec<u64> = self
             .sounds
             .iter()
@@ -933,7 +933,7 @@ impl Audio {
     /// Keys of looped sounds that wrapped around since the last call (Sound.DidLoop), best
     /// effort: the decoder's wrap count with a device, the clock in silent mode.
     pub fn looped_since_poll(&mut self) -> Vec<u64> {
-        let now = crate::sim_clock::now();
+        let now = rustudio_core::sim_clock::now();
         let mut out = Vec::new();
         for (k, s) in self.sounds.iter_mut() {
             let total = match &s.ctl {
@@ -951,7 +951,7 @@ impl Audio {
 
     /// How many sounds are playing now (measurement).
     pub fn playing_count(&self) -> usize {
-        let now = crate::sim_clock::now();
+        let now = rustudio_core::sim_clock::now();
         self.sounds
             .values()
             .filter(|s| !s.paused && !s.finished(now))
@@ -997,7 +997,7 @@ mod tests {
     /// last page's granule position like Studio, not after the padded packet.
     #[test]
     fn ogg_vorbis_stops_at_the_last_granule() {
-        let b = Arc::new(include_bytes!("../tests/fixtures/tail-padded-22050.ogg").to_vec());
+        let b = Arc::new(include_bytes!("../../../tests/fixtures/tail-padded-22050.ogg").to_vec());
         assert_eq!(ogg_vorbis_frames(&b), Some(2212));
         let p = decode_pcm(&b).expect("decode");
         assert_eq!(p.rate, 22050);
@@ -1270,7 +1270,7 @@ mod tests {
     /// once ended every .ogg before its first sample.
     #[test]
     fn audio_ogg_vorbis_plays_on_the_device_path() {
-        let ogg = Arc::new(include_bytes!("../tests/fixtures/tail-padded-22050.ogg").to_vec());
+        let ogg = Arc::new(include_bytes!("../../../tests/fixtures/tail-padded-22050.ogg").to_vec());
         let (mixer, mut out) = rodio::mixer::mixer(
             ChannelCount::new(2).unwrap(),
             SampleRate::new(dsp::RATE).unwrap(),
@@ -1293,7 +1293,7 @@ mod tests {
     /// audio fails there as it would with a device.
     #[test]
     fn audio_silent_engine_rejects_an_empty_ogg() {
-        let ogg = include_bytes!("../tests/fixtures/tail-padded-22050.ogg");
+        let ogg = include_bytes!("../../../tests/fixtures/tail-padded-22050.ogg");
         let pages: Vec<usize> = ogg.windows(4).enumerate().filter(|(_, w)| *w == b"OggS").map(|(i, _)| i).collect();
         // Page 0: identification header; page 1: comment + setup headers.
         let headers = Arc::new(ogg[..pages[2]].to_vec());

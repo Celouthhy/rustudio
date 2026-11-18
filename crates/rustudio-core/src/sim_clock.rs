@@ -33,7 +33,6 @@ static FIXED: OnceLock<Fixed> = OnceLock::new();
 /// 2026-01-01 00:00:00 UTC.
 const FIXED_EPOCH: f64 = 1_767_225_600.0;
 static FRAMES: AtomicU64 = AtomicU64::new(0);
-static SEEDS: AtomicU64 = AtomicU64::new(0);
 
 /// Turns simulated time on (once, at startup, before any clock is read).
 pub fn enable(dt: f64) {
@@ -90,51 +89,6 @@ pub fn epoch_secs() -> f64 {
     match FIXED.get() {
         Some(f) => f.epoch + sim_secs(f),
         None => wall_epoch(),
-    }
-}
-
-/// A VM's seeds under --fixed-dt: its own base (the Play side it runs) and
-/// how many it has handed out, so no other VM's timing moves them.
-struct Seeds {
-    base: u64,
-    n: u64,
-}
-
-fn mix(base: u64, n: u64) -> u64 {
-    let mut z = base.wrapping_add(n.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
-/// Under --fixed-dt: gives this VM its seed base (one per Play side) and
-/// seeds its math.random from it. No-op on the wall clock.
-pub fn seed_vm(lua: &mlua::Lua, base: u64) {
-    if !on() {
-        return;
-    }
-    lua.set_app_data(Seeds { base, n: 0 });
-    let s = mix(base, 0) % (1u64 << 52);
-    let _ = lua.load(format!("math.randomseed({s})")).exec();
-}
-
-/// A seed for randomness that would come from the time (Random.new(),
-/// BrickColor.Random()): `fallback` on the wall clock, this VM's next seed
-/// under --fixed-dt.
-pub fn seed(lua: &mlua::Lua, fallback: u64) -> u64 {
-    if !on() {
-        return fallback;
-    }
-    match lua.app_data_mut::<Seeds>() {
-        Some(mut s) => {
-            s.n += 1;
-            mix(s.base, s.n)
-        }
-        None => {
-            // (a VM outside Play: the edit document's --luau)
-            let n = SEEDS.fetch_add(1, Ordering::Relaxed) + 1;
-            mix(0x5eed, n)
-        }
     }
 }
 

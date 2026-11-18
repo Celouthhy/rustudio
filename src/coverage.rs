@@ -17,9 +17,9 @@ use std::path::Path;
 use mlua::{Table, Value};
 use rbx_dom_weak::InstanceBuilder;
 
-use crate::api::Kind;
-use crate::doc::Document;
-use crate::runtime::{RunMode, Runtime, World};
+use rustudio_core::api::Kind;
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::{RunMode, World};
 
 const PROBE: &str = r#"
 local folder = game:GetService("ReplicatedStorage"):FindFirstChild("__CoverageProbe")
@@ -75,8 +75,8 @@ __cov_fails = fails
 "#;
 
 pub fn run(out: &Path, gap_files: &[std::path::PathBuf]) -> Result<serde_json::Value, String> {
-    let api = crate::api::get().ok_or("app/api-dump.json not found (RUSTUDIO_API_DUMP)")?;
-    crate::telemetry::enable();
+    let api = rustudio_core::api::get().ok_or("app/api-dump.json not found (RUSTUDIO_API_DUMP)")?;
+    rustudio_core::telemetry::enable();
 
     let mut doc = Document::new_place();
     let root = doc.dom.root_ref();
@@ -102,7 +102,7 @@ pub fn run(out: &Path, gap_files: &[std::path::PathBuf]) -> Result<serde_json::V
         }
     }
 
-    let rt = Runtime::new()?;
+    let rt = crate::studio_hooks::new_runtime()?;
     rt.enter(World::new(doc, RunMode::Play));
     rt.bind_globals().map_err(|e| e.to_string())?;
     // Every declared member, on an instance of its declaring class.
@@ -180,7 +180,7 @@ pub fn run(out: &Path, gap_files: &[std::path::PathBuf]) -> Result<serde_json::V
             }
         }
     };
-    take(&crate::telemetry::snapshot(), &["missing", "default-only", "stub"]);
+    take(&rustudio_core::telemetry::snapshot(), &["missing", "default-only", "stub"]);
     for path in gap_files {
         if let Ok(text) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -205,10 +205,10 @@ pub fn run(out: &Path, gap_files: &[std::path::PathBuf]) -> Result<serde_json::V
     for (c, m, kind, security) in &entries {
         let exists = !fails.contains(&format!("{c}.{m}"));
         // A callback can't be read, so it has real behaviour only when the
-        // runtime calls it (crate::runtime::stubs::REAL_CALLBACKS).
+        // runtime calls it (rustudio_engine::runtime::stubs::REAL_CALLBACKS).
         let ok = exists
             && !flagged.contains(&(c.to_string(), m.to_string()))
-            && (*kind != Kind::Callback || crate::runtime::stubs::REAL_CALLBACKS.contains(m));
+            && (*kind != Kind::Callback || rustudio_engine::runtime::stubs::REAL_CALLBACKS.contains(m));
         if !ok && api.classes[*c].members[*m].deprecated {
             missing_deprecated += 1;
         }

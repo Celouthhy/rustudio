@@ -43,7 +43,7 @@ pub const TECHNOLOGY_FUTURE: u32 = 4; // Enum.Technology.Future: PrioritizeLight
 pub const TERRAIN_BRUSH_INTERVAL_S: f32 = 1.0 / 30.0; // Terrain Editor: one brush application per this while the button is held (estimated, not measured in Studio)
 pub const UNDERWATER_FOG: [f32; 2] = [1.066, 0.00137]; // camera in terrain water: visibility = clamp(2^(a − k·d) − 1, 0, 1) toward the lit WaterColor (Studio's exp2 fog form, fs FogParams); fitted to Place B's lake (F4, Place B-terrain 22 s: hit distances 63–698 studs, linear-light blue channel, < 0.02 off): clear to 48 studs, gone by 778
 pub const RANDOM_PCG_INC: u64 = 0x69; // Random: PCG32 (multiplier 0x5851f42d4c957f2d) with increment 105, seeded like pcg32_srandom; NextNumber = (second draw << 32 | first) × 2^-64, NextNumber(a, b) = min(1 − t) + max·t clamped; matches Studio's sequences for seeds 0, 1, 1001, 1005, 123456789
-pub const TECHNOLOGY_NO_TONE_CURVE: [u32; 1] = [2]; // Enum.Technology Compatibility only (Studio migrates it on load to Voxel + a ColorGradingEffect TonemapperPreset Retro, roughly sqrt). Measured 2026-11-08 in Studio (~/.cache/rustudio/lightov/tone/REPORT.md): Legacy, Voxel, ShadowMap and Future all draw the Default curve, bit-identical (RMS 1.03 levels on TONE_CURVE); round 21 had Legacy/Voxel curve-free, which only offset the sRGB texel decode fixed in 3f3dffc
+pub const TECHNOLOGY_NO_TONE_CURVE: [u32; 1] = [2]; // Enum.Technology Compatibility only (Studio migrates it on load to Voxel + a ColorGradingEffect TonemapperPreset Retro, roughly sqrt). Measured 2026-11-08 in Studio (Studio measurements): Legacy, Voxel, ShadowMap and Future all draw the Default curve, bit-identical (RMS 1.03 levels on TONE_CURVE); round 21 had Legacy/Voxel curve-free, which only offset the sRGB texel decode fixed in 3f3dffc
 pub const TECHNOLOGY_QUALITY: [u32; 2] = [3, 4]; // Enum.Technology ShadowMap, Future: PrioritizeLightingQuality on when not saved (control place, Future, reads true; Place B, ShadowMap, reads true; Place A, Voxel, false)
 /// Services every place has in Studio even when its file doesn't list them
 /// (made on load). Checked against offline Studio by tools/fidelity (the
@@ -73,10 +73,10 @@ pub const LOOK_DEG_PER_PX: f32 = 0.25;
 // min(ticks / FLY_RAMP_TICKS_PER_STUD, FLY_STEP_CAP). Studio ticks once per
 // rendered frame; rustudio uses the rate that matches the offline Studio's measurement.
 pub const CAMERA_SPEED: f32 = 1.5; // "Camera Speed" default,
-pub const FLY_BASE_STEP: f32 = 0.5;
-pub const FLY_RAMP_AFTER_TICKS: f32 = 120.0;
-pub const FLY_RAMP_TICKS_PER_STUD: f32 = 240.0;
-pub const FLY_STEP_CAP: f32 = 15.0;
+pub const FLY_BASE_STEP: f32 = 0.5; // .rdata Studio
+pub const FLY_RAMP_AFTER_TICKS: f32 = 120.0; // .rdata Studio
+pub const FLY_RAMP_TICKS_PER_STUD: f32 = 240.0; // .rdata Studio
+pub const FLY_STEP_CAP: f32 = 15.0; // .rdata Studio
 pub const FLY_TICK_HZ: f32 = 142.7; // camera ticks per second (offline Studio: 107 studs/s ÷ 0.75 studs/tick)
 pub const FLY_SPEED: f32 = FLY_BASE_STEP * CAMERA_SPEED * FLY_TICK_HZ; // 107 studs/s base
 pub const FLY_SHIFT_FACTOR: f32 = 0.2; // "Camera Shift Speed" default,
@@ -138,7 +138,7 @@ pub const ATMOS_FOG_POW: f32 = 4.2;
 // Atmosphere from Studio's own code; these replace the
 // round 26 fits above in the sky (AdvSkyFS) and the part fog.
 pub const ATMOS_HAZE_THRESHOLD: f32 = 1.98; // Atmosphere change: A = clamp(Haze − this, ATMOS_A_MIN, 1)
-pub const ATMOS_A_MIN: f32 = 0.02;
+pub const ATMOS_A_MIN: f32 = 0.02; // (constant Studio)
 pub const ATMOS_B_HAZE: f32 = 0.5; // B = Haze × this + (Haze ≠ 0 ? ATMOS_B_ON : 0); AdvSkyFS exponent fogOffset.y = B
 pub const ATMOS_B_ON: f32 = 0.6;
 pub const ATMOS_T_EPS: f32 = 0.001; // AdvSkyFS: t = exp2(fogOffset.x / (this + max(dir.y, 1e-5)^fogOffset.y)), fogOffset.x = −A / ln 2
@@ -324,8 +324,6 @@ pub const CLIMB_REACH: f32 = 0.7; // FindLadder caller Studio, .rdata Studio (R6
 pub const CLIMB_REACH_R15: f32 = 1.2; // Studio rig branch, float Studio; both rigs multiply by the character Model's scale (parent).
 pub const CLIMB_QUERY_TOP: f32 = 1.0; // Studio: the broad query box ends 1 stud above the root (.rdata Studio); measured own Studio pid 6184 (truss bottom +0.9 climbs, +1.1 does not)
 pub const CLIMB_QUERY_DEPTH_FACTOR: f32 = 0.75; // Studio broad query half depth, .rdata Studio
-#[cfg(test)]
-pub const CLIMB_SCAN_HEIGHT: f32 = 3.0; // default R6: half root Y + max leg Y + HipHeight; setter Studio. Production uses HumShape hip + half root Y.
 pub const CLIMB_SCAN_DIVISOR: f32 = 3.0; // Studio, .rdata Studio
 pub const CLIMB_SCAN_EXTRA_SAMPLES: usize = 10; // Studio: floor((height - 0.3)/step) + 10 loop bound; float Studio.
 pub const CLIMB_SCAN_STEP_FACTOR: f32 = 1.0 / 7.0; // Studio, .rdata Studio
@@ -517,7 +515,7 @@ pub const TELEPORT_MIN_STUDS: f32 = 0.5; // a script moving the HumanoidRootPart
 /// SmoothPlastic, Neon, Glass and the rest: 1. Now only a cross-check:
 /// parts use Studio's own table colours (matpack::fallback_albedo), which
 /// these measurements match within 0.013.
-#[cfg(test)]
+#[cfg(feature = "test-support")]
 pub fn material_albedo(material: u32) -> [f32; 3] {
     match material {
         512 => [0.785, 0.785, 0.785],  // Wood
@@ -881,7 +879,7 @@ pub const HUMANOID_VELOCITY_GAIN: f32 = 150.0;
 // Freefall horizontal acceleration cap.
 pub const HUMANOID_AIR_ACCEL: f32 = 143.0;
 
-// Instance collector (src/runtime.rs Runtime::collect, src/play.rs collect_garbage).
+// Instance collector (crates/rustudio-engine/src/runtime.rs Runtime::collect, src/play.rs collect_garbage).
 pub const GC_INTERVAL: f64 = 0.5; // seconds of Play between collector passes
 pub const GC_BUDGET: usize = 20_000; // unparented instances looked at per pass and side
 pub const GC_CYCLE_PASSES: usize = 2; // collector passes a Luau GC cycle is stepped over (each steps heap / this KB; keeps weak instance values clearing on quiet scripts)
@@ -968,3 +966,110 @@ pub const GRASS_NEAR_SAMPLE_POINTS: [[f32; 2]; 32] = [
 /// A panel window (src/panels.rs) eframe couldn't show this many frames in
 /// a row is docked back into the main window (app.rs panel_windows).
 pub const PANEL_WINDOW_MAX_FAILS: u32 = 30;
+
+// --------------------------------------------------- physical properties
+
+/// A part's PhysicalProperties: plain data, read by the physics simulation
+/// and wrapped for Luau by `ltypes::LPhysicalProperties`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicalProperties {
+    pub density: f32,
+    pub friction: f32,
+    pub elasticity: f32,
+    pub friction_weight: f32,
+    pub elasticity_weight: f32,
+    pub acoustic_absorption: f32,
+    /// Studio's "default" value (`PhysicalProperties.new('a')`: tostring
+    /// "default"; a part given it has no custom properties).
+    pub default: bool,
+}
+
+/// Default AcousticAbsorption: the reference lists the property but no
+/// default value, so this is an estimate.
+pub const DEFAULT_ACOUSTIC_ABSORPTION: f32 = 1.0;
+
+/// (material, density, elasticity, friction, elasticityWeight, frictionWeight)
+/// from the "Materials" page of the Roblox creator docs.
+const MATERIAL_PHYSICS: &[(&str, f32, f32, f32, f32, f32)] = &[
+    ("Asphalt", 2.36, 0.2, 0.8, 1.0, 0.3),
+    ("Basalt", 2.691, 0.15, 0.7, 1.0, 0.3),
+    ("Brick", 1.922, 0.15, 0.8, 1.0, 0.3),
+    ("Cardboard", 0.7, 0.05, 0.5, 2.0, 1.0),
+    ("Carpet", 1.1, 0.25, 0.4, 2.0, 1.0),
+    ("CeramicTiles", 2.4, 0.2, 0.51, 1.0, 1.0),
+    ("ClayRoofTiles", 2.0, 0.2, 0.51, 1.0, 1.0),
+    ("Cobblestone", 2.691, 0.17, 0.5, 1.0, 1.0),
+    ("Concrete", 2.403, 0.2, 0.7, 1.0, 0.3),
+    ("CorrodedMetal", 7.85, 0.2, 0.7, 1.0, 1.0),
+    ("CrackedLava", 2.691, 0.15, 0.65, 1.0, 1.0),
+    ("DiamondPlate", 7.85, 0.25, 0.35, 1.0, 1.0),
+    ("Fabric", 0.7, 0.05, 0.35, 1.0, 1.0),
+    ("Foil", 2.7, 0.25, 0.4, 1.0, 1.0),
+    ("ForceField", 2.403, 0.2, 0.25, 1.0, 1.0),
+    ("Glacier", 0.919, 0.15, 0.05, 1.0, 2.0),
+    ("Glass", 2.403, 0.2, 0.25, 1.0, 1.0),
+    ("Granite", 2.691, 0.2, 0.4, 1.0, 1.0),
+    ("Grass", 0.9, 0.1, 0.4, 1.5, 1.0),
+    ("Ground", 0.9, 0.1, 0.45, 1.0, 1.0),
+    ("Ice", 0.919, 0.15, 0.02, 1.0, 3.0),
+    ("LeafyGrass", 0.9, 0.1, 0.4, 2.0, 2.0),
+    ("Leather", 0.86, 0.25, 0.35, 1.0, 1.0),
+    ("Limestone", 2.691, 0.15, 0.5, 1.0, 1.0),
+    ("Marble", 2.563, 0.17, 0.2, 1.0, 1.0),
+    ("Metal", 7.85, 0.25, 0.4, 1.0, 1.0),
+    ("Mud", 0.9, 0.07, 0.3, 4.0, 3.0),
+    ("Neon", 0.7, 0.2, 0.3, 1.0, 1.0),
+    ("Pavement", 2.691, 0.17, 0.5, 1.0, 0.3),
+    ("Pebble", 2.403, 0.17, 0.4, 1.5, 1.0),
+    ("Plaster", 0.75, 0.2, 0.6, 1.0, 0.3),
+    ("Plastic", 0.7, 0.5, 0.3, 1.0, 1.0),
+    ("Rock", 2.691, 0.17, 0.5, 1.0, 1.0),
+    ("RoofShingles", 2.36, 0.2, 0.8, 1.0, 0.3),
+    ("Rubber", 1.3, 0.95, 1.5, 2.0, 3.0),
+    ("Salt", 2.165, 0.05, 0.5, 1.0, 1.0),
+    ("Sand", 1.602, 0.05, 0.5, 2.5, 5.0),
+    ("Sandstone", 2.691, 0.15, 0.5, 1.0, 5.0),
+    ("SmoothPlastic", 0.7, 0.5, 0.2, 1.0, 1.0),
+    ("Slate", 2.691, 0.2, 0.4, 1.0, 1.0),
+    ("Snow", 0.9, 0.03, 0.3, 4.0, 3.0),
+    ("Wood", 0.35, 0.2, 0.48, 1.0, 1.0),
+    ("WoodPlanks", 0.35, 0.2, 0.48, 1.0, 1.0),
+];
+
+impl PhysicalProperties {
+    /// Default physical properties of a material (by Enum.Material name).
+    /// Materials missing from the docs table (e.g. Air, Water, newer
+    /// materials) fall back to Plastic — an estimate.
+    pub fn for_material(name: &str) -> Self {
+        let row = MATERIAL_PHYSICS
+            .iter()
+            .find(|r| r.0 == name)
+            .or_else(|| MATERIAL_PHYSICS.iter().find(|r| r.0 == "Plastic"))
+            .copied();
+        let (_, density, elasticity, friction, ew, fw) =
+            row.unwrap_or(("Plastic", 0.7, 0.5, 0.3, 1.0, 1.0));
+        PhysicalProperties {
+            density,
+            friction,
+            elasticity,
+            friction_weight: fw,
+            elasticity_weight: ew,
+            acoustic_absorption: DEFAULT_ACOUSTIC_ABSORPTION,
+            default: false,
+        }
+    }
+
+    /// Clamp to plausible ranges (estimated: density 0.0001..100,
+    /// friction 0..2, elasticity 0..1, weights 0..100).
+    pub fn clamped(self) -> Self {
+        PhysicalProperties {
+            density: self.density.clamp(0.0001, 100.0),
+            friction: self.friction.clamp(0.0, 2.0),
+            elasticity: self.elasticity.clamp(0.0, 1.0),
+            friction_weight: self.friction_weight.clamp(0.0, 100.0),
+            elasticity_weight: self.elasticity_weight.clamp(0.0, 100.0),
+            acoustic_absorption: self.acoustic_absorption.max(0.0),
+            default: self.default,
+        }
+    }
+}

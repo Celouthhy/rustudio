@@ -13,11 +13,23 @@
 //! The file is JSON, rewritten on every flush (each harness shot and Stop).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::api::Kind;
 
-include!(concat!(env!("OUT_DIR"), "/engine_reads.rs"));
+/// Engine property reads and event fires scanned by the Studio build script.
+struct EngineTables {
+    reads: &'static [&'static str],
+    fires: &'static [&'static str],
+}
+
+static ENGINE_TABLES: OnceLock<EngineTables> = OnceLock::new();
+
+/// Installs both tables. Gap classifications that rely on these tables are
+/// available once the host supplies them.
+pub fn install_engine_tables(reads: &'static [&'static str], fires: &'static [&'static str]) {
+    let _ = ENGINE_TABLES.set(EngineTables { reads, fires });
+}
 
 #[derive(Default)]
 struct Entry {
@@ -103,24 +115,11 @@ pub fn touch(class: &str, member: &str) {
 /// Most stack walks per member: enough to name the scripts, cheap in loops.
 const SCRIPT_SAMPLES: u64 = 64;
 
-/// The script running now (its chunk name), from the Lua stack.
-pub fn current_script(lua: &mlua::Lua) -> String {
-    (0..32)
-        .map_while(|level| {
-            lua.inspect_stack(level, |d| {
-                d.source()
-                    .short_src
-                    .map(|s| s.trim_start_matches(['=', '@']).to_string())
-                    .unwrap_or_default()
-            })
-        })
-        .find(|s| !s.is_empty() && !s.starts_with("rustudio.") && s != "[C]")
-        .unwrap_or_else(|| "?".into())
-}
-
 /// Records a gap of `kind` for `class.member` if the API dump has that
 /// member; returns whether it was recorded (false: not a real member).
-pub fn gap(lua: &mlua::Lua, kind: &'static str, class: &str, member: &str) -> bool {
+/// `script` names the script running now, and is only called when the gap
+/// still needs one (see `lua_bridge::current_script`).
+pub fn gap(script: impl FnOnce() -> String, kind: &'static str, class: &str, member: &str) -> bool {
     if !on() {
         return false;
     }
@@ -132,7 +131,7 @@ pub fn gap(lua: &mlua::Lua, kind: &'static str, class: &str, member: &str) -> bo
     };
     let key = (kind, decl.to_string(), member.to_string());
     let need_script = with(|s| s.gaps.get(&key).is_none_or(|e| e.count < SCRIPT_SAMPLES)).unwrap_or(false);
-    let script = need_script.then(|| current_script(lua));
+    let script = need_script.then(script);
     with(|s| {
         let e = s.gaps.entry(key).or_default();
         e.count += 1;
@@ -145,7 +144,7 @@ pub fn gap(lua: &mlua::Lua, kind: &'static str, class: &str, member: &str) -> bo
 
 /// A property read answered from the reflection default: a gap when Roblox
 /// works the value out at run time (not saved in places).
-pub fn default_read(lua: &mlua::Lua, class: &str, member: &str) {
+pub fn default_read(script: impl FnOnce() -> String, class: &str, member: &str) {
     if !on() {
         return;
     }
@@ -154,27 +153,27 @@ pub fn default_read(lua: &mlua::Lua, class: &str, member: &str) {
         .is_some_and(|(_, m)| m.kind == Kind::Property && !m.can_load);
     // (A property the engine itself keeps up to date reads its default
     // honestly until something changes it.)
-    if computed && !ENGINE_READS.contains(&member) {
-        gap(lua, "default-only", class, member);
+    if computed && ENGINE_TABLES.get().is_some_and(|tables| !tables.reads.contains(&member)) {
+        gap(script, "default-only", class, member);
     }
 }
 
 /// A property written with nothing acting on it beyond storing the value: a
 /// gap when Roblox reacts to it at run time (not saved in places).
-pub fn plain_write(lua: &mlua::Lua, class: &str, member: &str) {
+pub fn plain_write(script: impl FnOnce() -> String, class: &str, member: &str) {
     if !on() {
         return;
     }
     let computed = crate::api::get()
         .and_then(|a| a.lookup(class, member))
         .is_some_and(|(_, m)| m.kind == Kind::Property && !m.can_load && !m.read_only);
-    if computed && !ENGINE_READS.contains(&member) {
-        gap(lua, "write-ignored", class, member);
+    if computed && ENGINE_TABLES.get().is_some_and(|tables| !tables.reads.contains(&member)) {
+        gap(script, "write-ignored", class, member);
     }
 }
 
 /// A script touched event `name` of `class`.
-pub fn event_used(lua: &mlua::Lua, class: &str, name: &str) {
+pub fn event_used(script: impl FnOnce() -> String, class: &str, name: &str) {
     if !on() {
         return;
     }
@@ -183,7 +182,7 @@ pub fn event_used(lua: &mlua::Lua, class: &str, name: &str) {
     };
     let key = (decl.to_string(), name.to_string());
     let need = with(|s| s.events_used.get(&key).is_none_or(|e| e.count < SCRIPT_SAMPLES)).unwrap_or(false);
-    let script = need.then(|| current_script(lua));
+    let script = need.then(script);
     with(|s| {
         let e = s.events_used.entry(key).or_default();
         e.count += 1;
@@ -228,9 +227,11 @@ pub fn snapshot() -> serde_json::Value {
             .collect();
         // Events scripts use that nothing in rustudio fires (by name: the
         // sources' fire calls, and what fired during the run).
-        for ((c, m), e) in &s.events_used {
-            if !s.fired.contains(m) && !ENGINE_FIRES.contains(&m.as_str()) {
-                rows.push(entry_json("event-unwired", c, m, e));
+        if let Some(tables) = ENGINE_TABLES.get() {
+            for ((c, m), e) in &s.events_used {
+                if !s.fired.contains(m) && !tables.fires.contains(&m.as_str()) {
+                    rows.push(entry_json("event-unwired", c, m, e));
+                }
             }
         }
         rows.sort_by(|a, b| {

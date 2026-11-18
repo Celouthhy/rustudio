@@ -8,8 +8,8 @@ use egui::Event;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
-use crate::runtime::Side;
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::Side;
 
 #[derive(Default)]
 pub(super) struct GuiModalTest {
@@ -39,8 +39,8 @@ _G.__modalButton = b
 
 impl SelfTest {
     fn modal_check(&mut self, ed: &Editor, want_grab: bool, what: &str) {
-        let held = ed.game_grab.is_some();
-        let behavior = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
+        let held = ed.game.game_grab.is_some();
+        let behavior = ed.game.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
         let ok = held == want_grab && behavior == 1;
         self.gmodal.ok &= ok;
         self.gmodal.notes.push(format!(
@@ -51,19 +51,19 @@ impl SelfTest {
     /// Phases 246..=247.
     pub(super) fn tick_gui_modal(&mut self, f: u64, ed: &mut Editor) -> bool {
         let t = f.saturating_sub(self.gmodal.started);
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         let mut run = |this: &mut Self, ed: &mut Editor, src: &str| {
-            if let Some(e) = ed.run_luau(Side::Client, src) {
+            if let Some(e) = ed.game.run_luau(Side::Client, src) {
                 this.gmodal.ok = false;
                 this.gmodal.notes.push(format!("script: {e}"));
             }
         };
         match self.r4.phase {
             246 if self.gmodal.started == 0 => {
-                let showed_client = ed.play_shows_client;
-                ed.play_shows_client = true;
+                let showed_client = ed.game.play_shows_client;
+                ed.game.play_shows_client = true;
                 ed.set_document(Document::new_place());
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.gmodal = GuiModalTest { started: f, ok: true, showed_client, ..Default::default() };
             }
             246 if t == 60 => {
@@ -91,7 +91,7 @@ impl SelfTest {
             247 if t == 140 => {
                 self.modal_check(ed, true, "its ScreenGui disabled");
                 ed.stop_play();
-                ed.play_shows_client = self.gmodal.showed_client;
+                ed.game.play_shows_client = self.gmodal.showed_client;
                 self.steps.push(Step {
                     step: "gui-modal-cursor",
                     passed: self.gmodal.ok,

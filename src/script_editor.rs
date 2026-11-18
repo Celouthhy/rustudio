@@ -11,8 +11,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::app::Editor;
 use crate::icons;
-use crate::runtime;
-use crate::theme;
+use rustudio_engine::runtime;
+use rustudio_engine::theme;
 
 const KEYWORDS: &[&str] = &[
     "and", "break", "continue", "do", "else", "elseif", "end", "export", "false", "for",
@@ -254,7 +254,7 @@ pub struct ScriptTabs {
 
 impl Editor {
     pub fn script_title(&self, r: Ref) -> String {
-        match self.doc.dom.get_by_ref(r) {
+        match self.game.doc.dom.get_by_ref(r) {
             Some(i) => i.name.clone(),
             None => "Script".to_string(),
         }
@@ -262,13 +262,13 @@ impl Editor {
 
     pub fn script_tab_ui(&mut self, ui: &mut egui::Ui, r: Ref) {
         self.live_draft_toolbar(ui,r);
-        let Some(inst) = self.doc.dom.get_by_ref(r) else {
+        let Some(inst) = self.game.doc.dom.get_by_ref(r) else {
             ui.add_space(12.0);
             ui.label(RichText::new("This script is not in the DataModel being shown (it may belong to the edit copy while playing).").color(theme::TEXT_DIM));
             return;
         };
         let class = inst.class.to_string();
-        let source = match self.doc.prop(r, "Source") {
+        let source = match self.game.doc.prop(r, "Source") {
             Some(Variant::String(s)) => s,
             _ => String::new(),
         };
@@ -309,10 +309,10 @@ impl Editor {
             buf.plugin_checked = Some(buf.text.clone());
             let diags = self
                 .plugins
-                .with_edit(&mut self.doc, |rt| {
+                .with_edit(&mut self.game.doc, |rt| {
                     let lua = &rt.lua;
-                    if crate::runtime::domains::plugin::script_editor::has_callbacks(lua).1 {
-                        crate::runtime::domains::plugin::script_editor::analyze(lua, r).unwrap_or_default()
+                    if crate::plugin_host::api::script_editor::has_callbacks(lua).1 {
+                        crate::plugin_host::api::script_editor::analyze(lua, r).unwrap_or_default()
                     } else {
                         Vec::new()
                     }
@@ -337,11 +337,9 @@ impl Editor {
                     ui.label(RichText::new(format!("⚠ {msg}")).color(theme::ERROR));
                 }
                 None => {
-                    ui.label(
-                        RichText::new("✓ no syntax errors")
-                            .small()
-                            .color(Color32::from_rgb(130, 200, 120)),
-                    );
+                    let color = Color32::from_rgb(130, 200, 120);
+                    ui.label(rustudio_engine::ti::text("check", 12.0).color(color));
+                    ui.label(RichText::new("no syntax errors").small().color(color));
                 }
             }
         });
@@ -471,7 +469,7 @@ impl Editor {
             }
             // Plugins' autocomplete for the word being typed.
             let pos = word_end.map(|i| crate::plugin_host::script_docs::pos_of(&text, i));
-            self.doc.set_props(
+            self.game.doc.set_props(
                 "Edit script",
                 vec![(r, rbx_dom_weak::ustr("Source"), Variant::String(text.clone()))],
                 Some(format!("source:{r:?}")),
@@ -483,10 +481,10 @@ impl Editor {
             let items = match (pos, typing_word) {
                 (Some((line, ch)), true) => self
                     .plugins
-                    .with_edit(&mut self.doc, |rt| {
+                    .with_edit(&mut self.game.doc, |rt| {
                         let lua = &rt.lua;
-                        if crate::runtime::domains::plugin::script_editor::has_callbacks(lua).0 {
-                            crate::runtime::domains::plugin::script_editor::autocomplete(lua, r, line, ch).unwrap_or_default()
+                        if crate::plugin_host::api::script_editor::has_callbacks(lua).0 {
+                            crate::plugin_host::api::script_editor::autocomplete(lua, r, line, ch).unwrap_or_default()
                         } else {
                             Vec::new()
                         }
@@ -504,10 +502,10 @@ impl Editor {
     }
 
     fn full_name(&self, r: Ref) -> String {
-        let root = self.doc.dom.root_ref();
+        let root = self.game.doc.dom.root_ref();
         let mut parts = Vec::new();
         let mut cur = r;
-        while let Some(i) = self.doc.dom.get_by_ref(cur) {
+        while let Some(i) = self.game.doc.dom.get_by_ref(cur) {
             if cur == root {
                 break;
             }

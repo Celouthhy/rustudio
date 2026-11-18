@@ -19,17 +19,3 @@ fn nested_bones_and_terrain() {
     let a = d.insert(ws, InstanceBuilder::new("Attachment"));
     assert_eq!(world(&d,a,true).unwrap().pos, Vec3::ZERO);
 }
-
-#[test]
-fn bone_light_uses_transformed_frame() {
-    let mut d = Document::new_place();
-    let ws = d.find_child(d.dom.root_ref(), "Workspace").unwrap();
-    let p = d.insert(ws, InstanceBuilder::new("Part").with_property("CFrame", cf(Vec3::new(10.,0.,0.), Mat3::IDENTITY)));
-    let b = d.insert(p, InstanceBuilder::new("Bone").with_property("CFrame", cf(Vec3::Y, Mat3::IDENTITY)).with_property("Transform", cf(Vec3::X, Mat3::IDENTITY)));
-    d.insert(b, InstanceBuilder::new("PointLight"));
-    let mut cache = crate::lighting::LightCache::default();
-    assert!(cache.hosts(&mut d).contains(&p));
-    let lights = cache.gather(&mut d, &crate::camera::Camera::default(), &|_,_| true);
-    assert_eq!(lights.len(), 1);
-    assert_eq!(&lights[0].pos_range[..3], &[11.,1.,0.]);
-}

@@ -10,7 +10,7 @@ use rbx_dom_weak::types::Ref;
 use serde_json::{json, Value as J};
 
 use super::ProjectState;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::project::Origin;
 
 fn is_script(class: &str) -> bool {

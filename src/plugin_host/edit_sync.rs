@@ -25,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 
 use rbx_dom_weak::types::Ref;
 
-use crate::doc::{Document, Mark, Marks, Reader};
-use crate::runtime::Runtime;
+use rustudio_core::doc::{Document, Mark, Marks, Reader};
+use rustudio_engine::runtime::Runtime;
 
 #[derive(Default)]
 pub struct EditSync {
@@ -148,7 +148,7 @@ impl EditSync {
                             let before = sink.trees.len();
                             let was_in = self.parents.contains_key(&r);
                             self.tree_change(d, r, &mut sink);
-                            let t = (was_in || sink.trees.len() > before) && !crate::doc::in_unsaved_service(d, r);
+                            let t = (was_in || sink.trees.len() > before) && !rustudio_core::doc::in_unsaved_service(d, r);
                             if t && std::env::var_os("RUSTUDIO_PLUGIN_DEBUG_MARKS").is_some() {
                                 eprintln!("plugin touched tree {:?} {:?}", d.class_of(r), d.dom.get_by_ref(r).map(|i| i.name.clone()));
                             }
@@ -156,7 +156,7 @@ impl EditSync {
                         }
                     }
                     Mark::Prop(r, name) => {
-                        let t = (r == root || self.parents.contains_key(&r)) && !crate::doc::in_unsaved_service(d, r);
+                        let t = (r == root || self.parents.contains_key(&r)) && !rustudio_core::doc::in_unsaved_service(d, r);
                         if t && std::env::var_os("RUSTUDIO_PLUGIN_DEBUG_MARKS").is_some() {
                             eprintln!("plugin touched {:?}.{name}", d.class_of(r));
                         }
@@ -205,11 +205,11 @@ impl Pending {
         for (r, old, new, below) in self.trees {
             if new.is_none() {
                 let immediate = {
-                    let Ok(mut w) = crate::runtime::world(&rt.lua) else { continue };
+                    let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) else { continue };
                     if w.dm().unlimbo(r) {
                         lent.push(r);
                     }
-                    w.signal_mode == crate::runtime::signal_timing::SignalMode::Immediate
+                    w.signal_mode == rustudio_engine::runtime::signal_timing::SignalMode::Immediate
                 };
                 // Immediate signals: DescendantRemoving runs while the
                 // instance is still in place (Studio fires it before the
@@ -217,7 +217,7 @@ impl Pending {
                 // Deferred: they all run later, after the removal (Studio's
                 // handler of an undone insert reads Parent nil).
                 if immediate && old.is_some() {
-                    let back = crate::runtime::world(&rt.lua).is_ok_and(|mut w| {
+                    let back = rustudio_engine::runtime::world(&rt.lua).is_ok_and(|mut w| {
                         let ok = w.d().exists(r) && w.d().exists(old);
                         if ok {
                             w.dm().dom.transfer_within(r, old);
@@ -225,16 +225,16 @@ impl Pending {
                         ok
                     });
                     if back {
-                        if let Err(e) = crate::runtime::fire_descendant_removing(&rt.lua, old, &below) {
+                        if let Err(e) = rustudio_engine::runtime::fire_descendant_removing(&rt.lua, old, &below) {
                             rt.report_error(&e);
                         }
                         rt.dispatch();
-                        if let Ok(mut w) = crate::runtime::world(&rt.lua) {
+                        if let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) {
                             if w.d().exists(r) {
                                 w.dm().dom.transfer_within(r, Ref::none());
                             }
                         }
-                        if let Err(e) = crate::runtime::fire_parent_signals_opts(&rt.lua, r, old, new, below, false) {
+                        if let Err(e) = rustudio_engine::runtime::fire_parent_signals_opts(&rt.lua, r, old, new, below, false) {
                             rt.report_error(&e);
                         }
                         continue;
@@ -247,7 +247,7 @@ impl Pending {
             rt.notify_prop(r, &name);
         }
         if self.selection_changed {
-            let sel = crate::runtime::world(&rt.lua).ok().and_then(|w| {
+            let sel = rustudio_engine::runtime::world(&rt.lua).ok().and_then(|w| {
                 let d = w.d();
                 d.find_child(d.dom.root_ref(), "Selection")
             });

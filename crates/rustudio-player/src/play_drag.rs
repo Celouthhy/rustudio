@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 
 use super::*;
-use crate::runtime::domains::world::drag;
+use rustudio_engine::runtime::domains::world::drag;
 
 #[derive(Clone, Copy)]
 struct Active {
@@ -25,8 +25,8 @@ thread_local! {
 
 /// The face normal of `part`'s box nearest the point `p`.
 fn face_normal(d: &Document, part: Ref, p: Vec3) -> Vec3 {
-    let Some(x) = crate::scene::xform_of(d, part) else { return Vec3::Y };
-    let h = crate::scene::vec3_of(d.prop(part, "Size")).unwrap_or(Vec3::ONE) * 0.5;
+    let Some(x) = rustudio_render::scene::xform_of(d, part) else { return Vec3::Y };
+    let h = rustudio_render::scene::vec3_of(d.prop(part, "Size")).unwrap_or(Vec3::ONE) * 0.5;
     let l = x.rot.transpose() * (p - x.pos) / h.max(Vec3::splat(1e-4));
     let a = l.abs();
     if a.x >= a.y && a.x >= a.z {
@@ -38,7 +38,7 @@ fn face_normal(d: &Document, part: Ref, p: Vec3) -> Vec3 {
     }
 }
 
-impl Editor {
+impl Game {
     fn drag_c(&self, server: Ref) -> Option<Ref> {
         self.play.as_ref()?.map.s2c.get(&server).copied()
     }
@@ -59,9 +59,9 @@ impl Editor {
                 Variant::Ref(c) if c.is_some() => c,
                 _ => return None,
             };
-            crate::scene::xform_of(d, c)
+            rustudio_render::scene::xform_of(d, c)
         });
-        cam.unwrap_or_else(|| crate::ltypes::look_at(fallback.0, fallback.0 + fallback.1, Vec3::Y))
+        cam.unwrap_or_else(|| rustudio_engine::ltypes::look_at(fallback.0, fallback.0 + fallback.1, Vec3::Y))
     }
 
     fn mode_key_down(&self) -> bool {
@@ -73,7 +73,7 @@ impl Editor {
     }
 
     /// Fires a drag event on the client copy of `det`.
-    fn drag_client_event(&mut self, det: Ref, ev: &str, ray: &crate::ltypes::LRay, view: Xform, hit: Option<(Xform, Ref)>, mode: bool) {
+    fn drag_client_event(&mut self, det: Ref, ev: &str, ray: &rustudio_engine::ltypes::LRay, view: Xform, hit: Option<(Xform, Ref)>, mode: bool) {
         let (Some(cd), Some(cp)) = (self.drag_c(det), self.play.as_ref().and_then(|s| self.drag_c(s.player))) else {
             return;
         };
@@ -109,8 +109,8 @@ impl Editor {
                 let Some((hit_ref, hit)) = p.hit else { return };
                 let Some(part) = self.drag_s(p.side, hit_ref) else { return };
                 let Some(det) = drag::detector_for(&self.doc, part) else { return };
-                let reach = crate::scene::f32_of(self.doc.prop(det, "MaxActivationDistance")).unwrap_or(32.0);
-                if let (Some(at), Some(x)) = (self.character_pos_for_drag(), crate::scene::xform_of(&self.doc, part)) {
+                let reach = rustudio_render::scene::f32_of(self.doc.prop(det, "MaxActivationDistance")).unwrap_or(32.0);
+                if let (Some(at), Some(x)) = (self.character_pos_for_drag(), rustudio_render::scene::xform_of(&self.doc, part)) {
                     if (x.pos - at).length() > reach {
                         return;
                     }

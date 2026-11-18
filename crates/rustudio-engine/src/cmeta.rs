@@ -73,7 +73,7 @@ pub fn type_name(v: &Value) -> String {
         Value::Nil => "nil".into(),
         Value::Boolean(_) => "boolean".into(),
         Value::Integer(_) | Value::Number(_) => "number".into(),
-        // Vector3 is Luau's vector (typeof "Vector3", src/dtmeta.rs).
+        // Vector3 is Luau's vector (typeof "Vector3", crates/rustudio-engine/src/dtmeta.rs).
         Value::Vector(_) => "Vector3".into(),
         Value::String(_) => "string".into(),
         Value::Table(_) => "table".into(),
@@ -176,7 +176,7 @@ unsafe extern "C-unwind" fn meta_trampoline(l: *mut ffi::lua_State) -> c_int {
         }
         let mut n = ffi::lua_gettop(l);
         // Upvalue 5 set: the implementation also takes the key's Luau atom
-        // (src/runtime_routes.rs), read as Studio's bridge does.
+        // (crates/rustudio-engine/src/runtime_routes.rs), read as Studio's bridge does.
         if ffi::lua_toboolean(l, ffi::lua_upvalueindex(5)) != 0 {
             let mut atom: c_int = -1;
             if ffi::lua_tostringatom(l, 2, &mut atom).is_null() {

@@ -71,7 +71,7 @@ impl LinSys {
         if rows.len() == 0 {
             return;
         }
-        crate::todo_spec!("LINSYS §3 buildSystem: inertia term (3.2), one-body kernel (3.3), two-body items (3.4)");
+        crate::todo_spec!("LINSYS §3 buildSystem : inertia term (3.2), one-body kernel  (3.3), two-body items (3.4)");
     }
 
     /// Prepares the chosen method (LINSYS §4.1).
@@ -79,7 +79,7 @@ impl LinSys {
         if self.off.is_empty() && self.diag.iter().all(|d| d.iter().all(|v| *v == 0.0)) {
             return;
         }
-        crate::todo_spec!("LINSYS §4.1 method choice; §4.2 block-diagonal, §4.3 two-body direct, §4.4 PCR, §4.5 6x6 LDL");
+        crate::todo_spec!("LINSYS §4.1 method choice; §4.2 block-diagonal, §4.3 two-body direct , §4.4 PCR, §4.5 6x6 LDL");
     }
 
     /// Solves with the factor: x = A⁻¹ rhs.
@@ -87,7 +87,7 @@ impl LinSys {
         if self.factor_diag.is_empty() {
             return;
         }
-        crate::todo_spec!("LINSYS §4 linearSolve: the solve with the chosen method");
+        crate::todo_spec!("LINSYS §4 linearSolve : the solve with the chosen method");
     }
 }
 

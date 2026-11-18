@@ -151,7 +151,7 @@ fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
     T.get_or_init(|| {
         let j: Value =
-            serde_json::from_str(include_str!("../assets/terrain-materials.json")).unwrap_or(Value::Null);
+            serde_json::from_str(include_str!("../../../assets/terrain-materials.json")).unwrap_or(Value::Null);
         let colors = j.get("colors").cloned().unwrap_or(Value::Null);
         Tables {
             pre2022: parse(&j["pre2022"], &colors, "baseColorsPre2022", "avgAlbedoPre2022"),
@@ -296,7 +296,7 @@ pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     packs.hash(&mut h);
-    crate::scene::use_2022_materials(doc).hash(&mut h);
+    crate::doc::use_2022_materials(doc).hash(&mut h);
     let parent = doc.workspace().unwrap_or(doc.dom.root_ref());
     if let Some(terrain) = doc.find_child(parent, "Terrain") {
         match doc.prop(terrain, "MaterialColors") {
@@ -306,7 +306,7 @@ pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
         }
     }
     for m in 2..23 {
-        if let Some(tex) = terrain_override(doc, m, crate::scene::use_2022_materials(doc)) {
+        if let Some(tex) = terrain_override(doc, m, crate::doc::use_2022_materials(doc)) {
             m.hash(&mut h); tex.pack.hash(&mut h); tex.tiling.to_bits().hash(&mut h);
         }
     }
@@ -344,12 +344,12 @@ pub fn terrain_override(doc: &crate::doc::Document, m: u8, use2022: bool) -> Opt
     let ms = doc.find_child(doc.dom.root_ref(), "MaterialService")?;
     let Variant::String(name) = doc.prop(ms, &format!("{}Name", base.name))? else { return None };
     if name.is_empty() { return None; }
-    let expected = crate::ltypes::LEnumItem::from_name("Material", &base.name)?.value;
+    let expected = crate::doc::enum_item_value("Material", &base.name)?;
     let v = doc.dom.descendants_of(ms).find(|v| v.class == "MaterialVariant" && v.name == name
         && matches!(doc.prop(v.referent(), "BaseMaterial"), Some(Variant::Enum(e)) if e.to_u32() == expected))?.referent();
     let id = |key: &str| {
-        let uri = crate::scene::content_string(doc.prop(v, key))
-            .or_else(|| crate::scene::content_string(doc.prop(v, &format!("{key}Content"))))?;
+        let uri = crate::doc::content_string(doc.prop(v, key))
+            .or_else(|| crate::doc::content_string(doc.prop(v, &format!("{key}Content"))))?;
         uri.strip_prefix("rbxassetid://").unwrap_or(&uri).parse::<u64>().ok()
     };
     let studs = match doc.prop(v, "StudsPerTile") { Some(Variant::Float32(v)) => v,
@@ -361,7 +361,7 @@ pub fn terrain_override(doc: &crate::doc::Document, m: u8, use2022: bool) -> Opt
     // A variant without one (not yet published) registers its loose maps.
     let pack = match id("TexturePack") {
         Some(pack) => pack,
-        None => crate::matpack::register_terrain_variant(crate::matpack::Pack {
+        None => crate::texture_pack::register_terrain_variant(crate::texture_pack::Pack {
             color: Some(id("ColorMap")?), normal: id("NormalMap"), roughness: id("RoughnessMap"),
             metalness: id("MetalnessMap"), tiling: 1.0, ..Default::default() }),
     };

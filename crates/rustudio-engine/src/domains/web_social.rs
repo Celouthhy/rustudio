@@ -275,7 +275,7 @@ mod tests {
     use super::*;
     #[test]
     fn teleport_result_reads_engine_storage_and_empty_native_defaults() -> mlua::Result<()> {
-        let mut d=crate::doc::Document::new_place();
+        let mut d=rustudio_core::doc::Document::new_place();
         let root=d.dom.root_ref();
         let result=d.dom.insert(root,rbx_dom_weak::InstanceBuilder::new("TeleportAsyncResult"));
         let rt=Runtime::new().map_err(rt_err)?;rt.enter(World::new(d,RunMode::Run));rt.bind_globals()?;

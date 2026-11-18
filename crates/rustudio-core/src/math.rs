@@ -21,6 +21,7 @@ pub struct Xform {
 
 impl Xform {
     /// A point in this transform's space → world.
+    #[inline]
     pub fn apply(&self, p: Vec3) -> Vec3 {
         self.pos + self.rot * p
     }
@@ -89,6 +90,23 @@ impl Xform {
             };
         self.rot = Mat3::from_cols(x, y, z);
         self
+    }
+}
+
+#[inline]
+pub fn cf_mul(a: &Xform, b: &Xform) -> Xform {
+    Xform {
+        pos: a.pos + a.rot * b.pos,
+        rot: a.rot * b.rot,
+    }
+}
+
+#[inline]
+pub fn cf_inv(a: &Xform) -> Xform {
+    let r = a.rot.transpose();
+    Xform {
+        pos: -(r * a.pos),
+        rot: r,
     }
 }
 

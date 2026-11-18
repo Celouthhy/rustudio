@@ -4,7 +4,7 @@
 use egui_wgpu::wgpu;
 fn main(){pollster::block_on(run())}
 async fn run(){
- let source=std::fs::read_to_string("src/shader.wgsl").unwrap();
+ let source=include_str!("../src/shader.wgsl");
  let coc=source.split("fn dof_coc(").nth(1).unwrap().split("@fragment").next().unwrap();
  let radius=source.split("const DOF_CHEAP_BELOW").nth(1).unwrap().split("@fragment").next().unwrap();
  let shader=format!(r#"

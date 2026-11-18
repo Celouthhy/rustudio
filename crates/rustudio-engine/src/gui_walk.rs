@@ -5,7 +5,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{FontId, Shape, Stroke};
 
 use super::*;
-use crate::mech;
+use rustudio_core::mech;
 
 
 /// `rect` inside the UIPadding of `r` (a GuiObject or a LayerCollector:
@@ -354,7 +354,7 @@ impl Walk<'_, '_> {
             }
         }
         // A UIPageLayout shows its current page where the row starts, sliding
-        // between pages while it tweens (src/domains/gui_input.luau).
+        // between pages while it tweens (crates/rustudio-engine/src/domains/gui_input.luau).
         if let Some(lay) = list.filter(|l| d.class_of(*l).is_some_and(|c| c == "UIPageLayout")) {
             let page = super::share().pages.get(&lay).copied();
             if let Some((from, to, alpha)) = page {
@@ -840,7 +840,7 @@ impl Walk<'_, '_> {
         // blackBkg_square/_round.png, black at 179/255 with an 8 px
         // corner, in place of the frame's own colour and border.
         let frame_style = if class == "Frame" {
-            crate::scene::enum_u32(d.prop(r, "Style")).unwrap_or(0)
+            rustudio_render::scene::enum_u32(d.prop(r, "Style")).unwrap_or(0)
         } else {
             0
         };

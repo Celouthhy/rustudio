@@ -28,6 +28,7 @@
 //! (measured). The host does the same: `load_into_play` from start_play,
 //! the edit VM ticks on the saved edit document while Play runs.
 
+pub mod api;
 pub mod edit_sync;
 mod glue;
 pub mod widgets_ui;
@@ -47,15 +48,15 @@ use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::WeakDom;
 
 use crate::app::Level;
-use crate::doc::Document;
-use crate::runtime::{RunMode, Runtime, World};
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::{RunMode, Runtime, World, STACK_MARK};
 
 pub use source::PluginSource;
 pub use vm::{EditorRequest, UiItem, UiKind};
 
 /// A plugin's id in this rustudio session (stable across reloads).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PluginId(pub u32);
+/// (The type lives in the engine: engine code names it.)
+pub use rustudio_engine::runtime::domains::plugin_api::PluginId;
 
 /// What `PluginHost::loaded` reports per plugin.
 #[derive(Clone, Debug)]
@@ -107,7 +108,7 @@ pub enum Trigger {
     /// or its full ActionId.
     Action(String),
     /// Answers the open PluginMenu:ShowAsync popup on top (see
-    /// `domains::plugin::menus::answer_top` for the choice syntax).
+    /// `plugin_host::api::menus::answer_top` for the choice syntax).
     Menu(String),
     /// Fires `event` on a plugin object of the edit VM (the ribbon's clicks).
     Fire(Ref, &'static str),
@@ -154,6 +155,10 @@ pub struct PluginHost {
 
 impl Default for PluginHost {
     fn default() -> Self {
+        // The engine's registered domains (the plugin API is one of them):
+        // before any runtime is made, so its members are in the tables and
+        // the atom list. (Tests that make a PluginHost get it too.)
+        crate::studio_hooks::install();
         // HTTP / script-injection permissions come from the plugin store
         // (once: a check registered later, e.g. by a test, stays).
         static STORE_CHECKS: std::sync::Once = std::sync::Once::new();
@@ -349,10 +354,10 @@ impl PluginHost {
         let pending = self.sync.take(doc);
         w.doc = Some(std::mem::replace(doc, Document::placeholder()));
         // (the plugins' GUI channel: widgets_ui.rs)
-        let _ch = crate::gui::share_channel(1);
+        let _ch = rustudio_engine::gui::share_channel(1);
         e.rt.enter(w);
         let lent = pending.fire(&e.rt);
-        if let Ok(mut w) = crate::runtime::world(&e.rt.lua) {
+        if let Ok(mut w) = rustudio_engine::runtime::world(&e.rt.lua) {
             for r in lent {
                 w.orphans.remove(&r);
             }
@@ -417,15 +422,15 @@ impl PluginHost {
         let log = &mut self.log;
         let e = self.edit.as_mut().expect("edit vm");
         let Some(mut w) = e.world.take() else { return };
-        let _ch = crate::gui::share_channel(1);
+        let _ch = rustudio_engine::gui::share_channel(1);
         w.realtime = realtime;
-        w.signal_mode = crate::runtime::signal_timing::SignalMode::of(doc);
+        w.signal_mode = rustudio_engine::runtime::signal_timing::SignalMode::of(doc);
         w.doc = Some(std::mem::replace(doc, Document::placeholder()));
         e.rt.enter(w);
         if !e.bound {
             e.bound = true;
             if let Err(err) = e.rt.bind_globals().and_then(|_| edit_loadstring(&e.rt)) {
-                log.push((Level::Error, crate::runtime::describe_error(&err)));
+                log.push((Level::Error, rustudio_engine::runtime::describe_error(&err)));
             }
         }
         let lent = pending.fire(&e.rt);
@@ -459,7 +464,7 @@ impl PluginHost {
         if loaded_any {
             vm::start_later(&e.rt);
         }
-        let rs = crate::runtime::world(&e.rt.lua).ok().and_then(|w| {
+        let rs = rustudio_engine::runtime::world(&e.rt.lua).ok().and_then(|w| {
             let d = w.d();
             d.find_child(d.dom.root_ref(), "RunService")
         });
@@ -474,7 +479,7 @@ impl PluginHost {
         // A selected instance a plugin destroyed or unparented leaves the
         // selection, and SelectionChanged fires (Studio: Destroy of a
         // selected part fires once).
-        if let Ok(mut w) = crate::runtime::world(&e.rt.lua) {
+        if let Ok(mut w) = rustudio_engine::runtime::world(&e.rt.lua) {
             let d = w.d();
             let root = d.dom.root_ref();
             let keep: Vec<_> = d.selection.iter().copied().filter(|r| d.is_ancestor(root, *r)).collect();
@@ -489,7 +494,7 @@ impl PluginHost {
         // Selection:Set / Add / Remove of this frame, after the callers yielded.
         let fires = vm::vm(&e.rt.lua).map(|mut v| std::mem::take(&mut v.selection_fires)).unwrap_or(0);
         if fires > 0 {
-            let sel = crate::runtime::world(&e.rt.lua).ok().and_then(|w| {
+            let sel = rustudio_engine::runtime::world(&e.rt.lua).ok().and_then(|w| {
                 let d = w.d();
                 d.find_child(d.dom.root_ref(), "Selection")
             });
@@ -501,38 +506,38 @@ impl PluginHost {
             }
         }
         // The person switched rustudio's theme: settings().Studio.ThemeChanged.
-        match crate::runtime::domains::plugin::theme::watch_theme(&e.rt.lua) {
+        match crate::plugin_host::api::theme::watch_theme(&e.rt.lua) {
             Ok(true) => e.rt.dispatch(),
             Ok(false) => {}
-            Err(err) => log.push((Level::Error, crate::runtime::describe_error(&err))),
+            Err(err) => log.push((Level::Error, rustudio_engine::runtime::describe_error(&err))),
         }
         // Source writes that waited for a script-injection prompt.
         if permissions::retry_source_writes(&e.rt.lua) {
             e.rt.dispatch();
         }
-        match crate::runtime::domains::plugin::script_editor::fire_events(&e.rt.lua) {
+        match crate::plugin_host::api::script_editor::fire_events(&e.rt.lua) {
             Ok(true) => e.rt.dispatch(),
             Ok(false) => {}
-            Err(err) => log.push((Level::Error, crate::runtime::describe_error(&err))),
+            Err(err) => log.push((Level::Error, rustudio_engine::runtime::describe_error(&err))),
         }
-        match crate::runtime::domains::plugin::studio::apply_pending_tool(&e.rt.lua) {
+        match crate::plugin_host::api::studio::apply_pending_tool(&e.rt.lua) {
             Ok(true) => e.rt.dispatch(),
             Ok(false) => {}
-            Err(err) => log.push((Level::Error, crate::runtime::describe_error(&err))),
+            Err(err) => log.push((Level::Error, rustudio_engine::runtime::describe_error(&err))),
         }
         // ChangeHistoryService's OnUndo / OnRedo / recording events of this
         // frame (plugins' and the editor's Ctrl+Z), after the callers yielded.
-        match crate::runtime::domains::plugin::history::fire_events(&e.rt.lua) {
+        match crate::plugin_host::api::history::fire_events(&e.rt.lua) {
             Ok(true) => e.rt.dispatch(),
             Ok(false) => {}
-            Err(err) => log.push((Level::Error, crate::runtime::describe_error(&err))),
+            Err(err) => log.push((Level::Error, rustudio_engine::runtime::describe_error(&err))),
         }
         // Instances the editor removed stay lent (in the document,
         // parentless): Studio's deleted instances are still there for a
         // plugin holding them (Parent nil, properties readable); undo / redo
         // take them from there (doc.rs), and the change history pins them.
-        let lent: Vec<_> = lent.into_iter().chain(crate::runtime::domains::plugin::history::take_lent(&e.rt.lua)).collect();
-        if let Ok(mut w) = crate::runtime::world(&e.rt.lua) {
+        let lent: Vec<_> = lent.into_iter().chain(crate::plugin_host::api::history::take_lent(&e.rt.lua)).collect();
+        if let Ok(mut w) = rustudio_engine::runtime::world(&e.rt.lua) {
             for r in lent {
                 w.orphans.remove(&r);
             }
@@ -542,10 +547,10 @@ impl PluginHost {
             e.gc_t = 0.0;
             let mut pins = vm::pinned(&e.rt.lua);
             // (What the change history can still bring back stays.)
-            if let Ok(w) = crate::runtime::world(&e.rt.lua) {
+            if let Ok(w) = rustudio_engine::runtime::world(&e.rt.lua) {
                 pins.extend(w.d().history_refs());
             }
-            e.rt.collect(&|r| pins.contains(&r), crate::mech::GC_BUDGET);
+            e.rt.collect(&|r| pins.contains(&r), rustudio_core::mech::GC_BUDGET);
         }
         e.rt.gc_step(dt);
         let (reqs, seq) = match vm::vm(&e.rt.lua) {
@@ -583,7 +588,7 @@ impl PluginHost {
         for s in self.specs.iter().filter(|s| s.running) {
             if let Some(spec) = s.load_spec() {
                 if let Err(e) = vm::load(rt, &spec) {
-                    if let Ok(mut w) = crate::runtime::world(&rt.lua) {
+                    if let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) {
                         w.output.push((Level::Error, format!("Plugin {} failed to load: {e}", s.name)));
                     }
                 }
@@ -634,15 +639,15 @@ fn studio_place_name(doc: &mut Document) {
 fn edit_loadstring(rt: &Runtime) -> mlua::Result<()> {
     let lua = &rt.lua;
     let f = lua.create_function(|lua, (src, name): (mlua::String, Option<String>)| {
-        if crate::runtime::security::current(lua) != crate::runtime::security::PLUGIN_IDENT {
+        if rustudio_engine::runtime::security::current(lua) != rustudio_engine::runtime::security::PLUGIN_IDENT {
             return Err(mlua::Error::runtime("loadstring() is not available"));
         }
         let src = src.to_str()?.to_string();
-        let env = crate::globals_parity::new_env(lua, None)?;
+        let env = rustudio_engine::globals_parity::new_env(lua, None)?;
         let chunk = lua.load(&src).set_name(name.unwrap_or_else(|| src.clone())).set_environment(env);
         match chunk.into_function() {
             Ok(f) => Ok((Value::Function(f), Value::Nil)),
-            Err(e) => Ok((Value::Nil, Value::String(lua.create_string(crate::runtime::describe_error(&e))?))),
+            Err(e) => Ok((Value::Nil, Value::String(lua.create_string(rustudio_engine::runtime::describe_error(&e))?))),
         }
     })?;
     let shared: mlua::Table = lua.named_registry_value("rustudio_shared")?;
@@ -652,8 +657,8 @@ fn edit_loadstring(rt: &Runtime) -> mlua::Result<()> {
 }
 
 fn new_vm(mode: RunMode) -> Result<(Runtime, World), String> {
-    let rt = Runtime::new()?;
-    rt.install_side().map_err(|e| crate::runtime::describe_error(&e))?;
+    let rt = crate::studio_hooks::new_runtime()?;
+    rt.install_side().map_err(|e| rustudio_engine::runtime::describe_error(&e))?;
     vm::install(&rt.lua);
     let mut w = World::new(Document::empty(), mode);
     w.doc = None;
@@ -685,7 +690,7 @@ fn attribute_errors(specs: &mut [Spec], out: &[(Level, String)]) {
     // stack line, which names the script.
     let mut pending: Option<String> = None;
     for (level, text) in out {
-        let t = text.trim_start_matches(crate::output_panel::STACK_MARK);
+        let t = text.trim_start_matches(STACK_MARK);
         let msg = t.split("  —").next().unwrap_or(t).to_string();
         if *level == Level::Error {
             pending = None;
@@ -715,8 +720,8 @@ fn fire_trigger(rt: &Runtime, t: &Trigger, log: &mut Vec<(Level, String)>) {
         })
     };
     if let Trigger::Menu(choice) = t {
-        let answered = match crate::runtime::world(&rt.lua) {
-            Ok(w) => crate::runtime::domains::plugin::menus::answer_top(&rt.lua, w.d(), choice),
+        let answered = match rustudio_engine::runtime::world(&rt.lua) {
+            Ok(w) => crate::plugin_host::api::menus::answer_top(&rt.lua, w.d(), choice),
             Err(_) => false,
         };
         if !answered {
@@ -727,8 +732,8 @@ fn fire_trigger(rt: &Runtime, t: &Trigger, log: &mut Vec<(Level, String)>) {
     if let Trigger::Deactivate(id) = t {
         let root = vm::vm(&rt.lua).and_then(|v| v.by_id(*id).map(|p| p.root));
         if let Some(root) = root {
-            if let Err(e) = crate::runtime::domains::plugin::deactivate(&rt.lua, root) {
-                log.push((Level::Error, crate::runtime::describe_error(&e)));
+            if let Err(e) = crate::plugin_host::api::deactivate(&rt.lua, root) {
+                log.push((Level::Error, rustudio_engine::runtime::describe_error(&e)));
             }
             rt.dispatch();
         }
@@ -738,7 +743,7 @@ fn fire_trigger(rt: &Runtime, t: &Trigger, log: &mut Vec<(Level, String)>) {
         // RUSTUDIO_PLUGIN_TRACE: each UI fire and whether anything listens
         // on the object (checks/plugins/ui/check.py's corpus clicks).
         if std::env::var_os("RUSTUDIO_PLUGIN_TRACE").is_some() {
-            let listening = crate::runtime::world(&rt.lua).is_ok_and(|w| w.listening.contains(r));
+            let listening = rustudio_engine::runtime::world(&rt.lua).is_ok_and(|w| w.listening.contains(r));
             log.push((Level::Info, format!("plugin-ui: {ev} {r:?} listening {listening}")));
         }
         rt.fire(*r, ev, vec![]);
@@ -760,7 +765,7 @@ fn fire_trigger(rt: &Runtime, t: &Trigger, log: &mut Vec<(Level, String)>) {
             .iter()
             .find(|u| {
                 matches!(&u.kind, UiKind::Action { id, .. } if id == a)
-                    || crate::runtime::world(&rt.lua).is_ok_and(|w| {
+                    || rustudio_engine::runtime::world(&rt.lua).is_ok_and(|w| {
                         matches!(w.d().prop(u.r, "ActionId"), Some(rbx_dom_weak::types::Variant::String(s)) if s == *a)
                     })
             })

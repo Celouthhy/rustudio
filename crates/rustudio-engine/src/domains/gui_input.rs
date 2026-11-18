@@ -245,7 +245,7 @@ const STORED: &[(&str, &str, VariantType, &str, &str)] = &[
 ];
 
 fn stored(class: &str, key: &str) -> Option<&'static (&'static str, &'static str, VariantType, &'static str, &'static str)> {
-    STORED.iter().find(|s| s.1 == key && crate::doc::is_a(class, s.0))
+    STORED.iter().find(|s| s.1 == key && rustudio_core::doc::is_a(class, s.0))
 }
 
 /// Computed properties answered by gui_input.luau's `get["Class.Prop"]`
@@ -298,7 +298,7 @@ const LUA_PROPS: &[(&str, &str)] = &[
 fn lua_prop(class: &str, key: &str) -> Option<&'static str> {
     LUA_PROPS
         .iter()
-        .find(|(c, k)| *k == key && crate::doc::is_a(class, c))
+        .find(|(c, k)| *k == key && rustudio_core::doc::is_a(class, c))
         .map(|(c, _)| *c)
 }
 
@@ -319,7 +319,7 @@ const LUA_WRITES: &[(&str, &str)] = &[
 fn lua_write(class: &str, key: &str) -> Option<&'static str> {
     LUA_WRITES
         .iter()
-        .find(|(c, k)| *k == key && crate::doc::is_a(class, c))
+        .find(|(c, k)| *k == key && rustudio_core::doc::is_a(class, c))
         .map(|(c, _)| *c)
 }
 
@@ -375,7 +375,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
     };
     let base = METHODS
         .iter()
-        .find(|(m, b)| *m == name && crate::doc::is_a(&class, b))
+        .find(|(m, b)| *m == name && rustudio_core::doc::is_a(&class, b))
         .map(|(_, b)| *b)?;
     if base == "Path2D" {
         return Some(path2d::call(lua, name, this, args));
@@ -442,7 +442,7 @@ pub fn write_acts(class: &str, key: &str) -> bool {
 /// order inside each, clipped by ClipsDescendants and ScrollingFrames. Boxes
 /// are AbsolutePosition / AbsoluteSize as a script reads them (abs_now).
 fn objects_at(w: &mut World, guis: &[Ref], x: f32, y: f32) -> Vec<Ref> {
-    use crate::doc::is_a;
+    use rustudio_core::doc::is_a;
     fn class(w: &World, r: Ref) -> Option<&str> {
         w.d().dom.get_by_ref(r).map(|i| i.class.as_str())
     }
@@ -570,9 +570,9 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "log",
         lua.create_function(|lua, (level, msg): (String, String)| {
             let lv = match level.as_str() {
-                "error" => crate::app::Level::Error,
-                "warn" => crate::app::Level::Warn,
-                _ => crate::app::Level::Info,
+                "error" => rustudio_core::log::Level::Error,
+                "warn" => rustudio_core::log::Level::Warn,
+                _ => rustudio_core::log::Level::Info,
             };
             world(lua)?.output.push((lv, msg));
             Ok(())
@@ -671,7 +671,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     // objects_at({LayerCollector…}, x, y): GetGuiObjectsAtPosition's walk
-    // (gui_input.luau), native: FtF's PlayerGui has ~4,600 GuiObjects and
+    // (gui_input.luau), native: a test place's PlayerGui has ~4,600 GuiObjects and
     // Kohl's Admin asks on every mouse move over its buttons; walked in Luau
     // through the engine that was 80+ ms a call.
     g.set(
@@ -689,7 +689,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(out)
         })?,
     )?;
-    // The viewport GUI's shared state (src/gui.rs GuiShare).
+    // The viewport GUI's shared state (crates/rustudio-engine/src/gui.rs GuiShare).
     g.set(
         "focus",
         lua.create_function(|lua, ()| match crate::gui::share().focus {
@@ -849,7 +849,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "prompt_ui",
         lua.create_function(|lua, ()| {
-            let Some(dir) = crate::default_scripts::studio_dir() else { return Ok(Value::Nil) };
+            let Some(dir) = rustudio_core::default_scripts::studio_dir() else { return Ok(Value::Nil) };
             let path = dir.join("ExtraContent/scripts/CoreScripts/CoreScripts/ProximityPrompt.lua");
             let Ok(mut src) = std::fs::read_to_string(&path) else { return Ok(Value::Nil) };
             let shims: [(&str, &str); 6] = [
@@ -884,7 +884,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "dialog_ui",
         lua.create_function(|lua, ()| {
-            let Some(dir) = crate::default_scripts::studio_dir() else { return Ok(Value::Nil) };
+            let Some(dir) = rustudio_core::default_scripts::studio_dir() else { return Ok(Value::Nil) };
             let path = dir.join("ExtraContent/scripts/CoreScripts/CoreScripts/MainBotChatScript2.lua");
             let Ok(mut src) = std::fs::read_to_string(&path) else { return Ok(Value::Nil) };
             let once: [(&str, &str); 14] = [
@@ -1038,7 +1038,7 @@ pub fn engine_message(rt: &Runtime, inst: Ref, player: Ref, args: &[Xfer], map: 
     };
     if let Err(e) = run() {
         if let Ok(mut w) = world(lua) {
-            w.output.push((crate::app::Level::Error, format!("gui_input: {}", error_message(&e))));
+            w.output.push((rustudio_core::log::Level::Error, format!("gui_input: {}", error_message(&e))));
         }
     }
     rt.dispatch();
@@ -1060,7 +1060,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     let f: Function = m.get("step")?;
     if let Err(e) = f.call::<()>(dt) {
         if let Ok(mut w) = world(lua) {
-            w.output.push((crate::app::Level::Error, format!("gui_input step: {}", error_message(&e))));
+            w.output.push((rustudio_core::log::Level::Error, format!("gui_input step: {}", error_message(&e))));
         }
     }
     Ok(())

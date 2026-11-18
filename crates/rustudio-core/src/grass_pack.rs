@@ -19,7 +19,7 @@ pub fn emit(p: [f32; 3], base: [f32; 3], tip: [f32; 3], width: f32, height: f32)
 
 #[test]
 fn grass_native_same_input() {
-    let data = include_bytes!("../tests/fixtures/grass/quantization.bin");
+    let data = include_bytes!("../../../tests/fixtures/grass/quantization.bin");
     for row in data.chunks_exact(68) {
         let f: Vec<f32> = row[..44].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let actual = emit(f[0..3].try_into().unwrap(), f[3..6].try_into().unwrap(), f[6..9].try_into().unwrap(), f[9], f[10]);

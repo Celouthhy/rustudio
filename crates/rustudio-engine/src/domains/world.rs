@@ -1,5 +1,5 @@
 //! Engine API domain: world (physics and the 3D world API). See
-//! src/domains/mod.rs for the hook contract and checks/parity/world.md for
+//! crates/rustudio-engine/src/domains/mod.rs for the hook contract and checks/parity/world.md for
 //! what was measured in Studio (offline Studio 0.705) and what's left.
 //!
 //! Submodules:
@@ -29,7 +29,7 @@ use rbx_dom_weak::types::Ref;
 use crate::runtime::*;
 
 #[path = "world_part.rs"]
-pub(crate) mod part;
+pub mod part;
 #[path = "world_camera.rs"]
 mod camera;
 #[path = "world_constraints.rs"]
@@ -234,9 +234,9 @@ pub(crate) mod util {
     use mlua::{Lua, MultiValue, Value};
     use rbx_dom_weak::types::{Ref, Variant};
 
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use crate::ltypes::*;
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
 
     pub fn none() -> mlua::Result<MultiValue> {
         Ok(MultiValue::new())
@@ -312,10 +312,10 @@ pub(crate) mod util {
         }
     }
     pub fn f32p(d: &Document, r: Ref, name: &str, default: f32) -> f32 {
-        crate::scene::f32_of(d.prop(r, name)).unwrap_or(default)
+        rustudio_render::scene::f32_of(d.prop(r, name)).unwrap_or(default)
     }
     pub fn v3p(d: &Document, r: Ref, name: &str) -> Option<Vec3> {
-        crate::scene::vec3_of(d.prop(r, name))
+        rustudio_render::scene::vec3_of(d.prop(r, name))
     }
     /// An attachment's world frame (its parent part's CFrame × its CFrame;
     /// a Bone's too). None when it isn't under a part.
@@ -323,7 +323,7 @@ pub(crate) mod util {
         let local = xf(d, a, "CFrame").unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
         let parent = d.dom.get_by_ref(a)?.parent();
         let pc = d.class_of(parent)?;
-        if !crate::doc::is_a(&pc, "BasePart") {
+        if !rustudio_core::doc::is_a(&pc, "BasePart") {
             return None;
         }
         Some(mul(&xf(d, parent, "CFrame")?, &local))
@@ -333,6 +333,6 @@ pub(crate) mod util {
         d.workspace().is_some_and(|ws| d.is_ancestor(ws, r))
     }
     pub fn is_part(d: &Document, r: Ref) -> bool {
-        d.class_of(r).is_some_and(|c| crate::doc::is_a(&c, "BasePart"))
+        d.class_of(r).is_some_and(|c| rustudio_core::doc::is_a(&c, "BasePart"))
     }
 }

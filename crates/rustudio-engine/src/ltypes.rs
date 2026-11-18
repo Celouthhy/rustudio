@@ -15,8 +15,9 @@ use mlua::{
 };
 use rbx_dom_weak::types::BrickColor;
 
-use crate::doc;
-use crate::math::Xform;
+use rustudio_core::doc;
+use rustudio_core::math::Xform;
+use rustudio_core::mech::PhysicalProperties;
 
 pub fn rt_err(msg: impl Into<String>) -> mlua::Error {
     mlua::Error::RuntimeError(msg.into())
@@ -261,20 +262,8 @@ impl FromLua for LCFrame {
     }
 }
 
-pub fn cf_mul(a: &Xform, b: &Xform) -> Xform {
-    Xform {
-        pos: a.pos + a.rot * b.pos,
-        rot: a.rot * b.rot,
-    }
-}
-
-pub fn cf_inv(a: &Xform) -> Xform {
-    let r = a.rot.transpose();
-    Xform {
-        pos: -(r * a.pos),
-        rot: r,
-    }
-}
+// The CFrame products are core's (`math`): physics computes with them too.
+pub use rustudio_core::math::{cf_inv, cf_mul};
 
 /// CFrame.lookAt / lookAlong: right = look × up, however short (Studio,
 /// round 19: a view 1e-5 off straight down keeps right = +X); only an
@@ -814,7 +803,7 @@ impl LEnumItem {
     /// An enum only api-dump.json knows (missing from the reflection
     /// database): its items.
     fn dump_items(enum_type: &str) -> Option<&'static Vec<(String, u32)>> {
-        crate::api::get()?.enums.get(enum_type)
+        rustudio_core::api::get()?.enums.get(enum_type)
     }
 
     /// Whether `Enum.<name>` exists (reflection database or API dump).
@@ -825,7 +814,7 @@ impl LEnumItem {
     /// Whether a script sees `Enum.<name>`: Studio's API dump when loaded
     /// (the reflection database is another version).
     pub fn script_enum_exists(name: &str) -> bool {
-        match crate::api::get() {
+        match rustudio_core::api::get() {
             Some(api) => api.enums.contains_key(name),
             None => Self::enum_exists(name),
         }
@@ -842,50 +831,18 @@ impl LEnumItem {
     }
 
     pub fn from_value(enum_type: &str, value: u32) -> Option<Self> {
-        let Some(e) = doc::db().enums.get(enum_type) else {
-            let (name, value) = Self::dump_items(enum_type)?.iter().find(|(_, v)| *v == value)?.clone();
-            return Some(LEnumItem { enum_type: enum_type.to_string(), name, value });
-        };
-        let name = e
-            .items
-            .iter()
-            .find(|(_, v)| **v == value)
-            .map(|(k, _)| k.to_string())?;
-        Some(LEnumItem {
-            enum_type: enum_type.to_string(),
-            name,
-            value,
-        })
+        let name = doc::enum_item_name(enum_type, value)?;
+        Some(Self { enum_type: enum_type.to_string(), name, value })
     }
 
     pub fn from_name(enum_type: &str, name: &str) -> Option<Self> {
-        let Some(e) = doc::db().enums.get(enum_type) else {
-            let (name, value) = Self::dump_items(enum_type)?.iter().find(|(n, _)| n == name)?.clone();
-            return Some(LEnumItem { enum_type: enum_type.to_string(), name, value });
-        };
-        if let Some(value) = e.items.get(name) {
-            return Some(LEnumItem {
-                enum_type: enum_type.to_string(),
-                name: name.to_string(),
-                value: *value,
-            });
-        }
-        // A legacy name (Studio's API dump, LegacyNames) is the item it
-        // became: Enum.ContextActionPriority.Default is Medium.
-        let now = crate::api::get()?
-            .legacy_enum_items
-            .get(&(enum_type.to_string(), name.to_string()))?;
-        let value = *e.items.get(now.as_str())?;
-        Some(LEnumItem {
-            enum_type: enum_type.to_string(),
-            name: now.clone(),
-            value,
-        })
+        let (name, value) = doc::enum_item_by_name(enum_type, name)?;
+        Some(Self { enum_type: enum_type.to_string(), name: name.to_string(), value })
     }
 }
 
 // Enum, Enums and EnumItem metamethods are C functions as in Studio
-//: reads check self then the key, writes the
+// (crates/rustudio-engine/src/cmeta.rs; RE-BRIDGE.md 5): reads check self then the key, writes the
 // key then self, and every write fails. Methods (GetEnums, GetEnumItems,
 // FromName, FromValue, IsA) are new named C functions on every read.
 const ITEM_INDEX: crate::cmeta::Spec = crate::cmeta::Spec { self_types: &[c"EnumItem"], key_first: false };
@@ -1062,7 +1019,7 @@ pub fn enum_type_value(lua: &Lua, name: &str) -> LResult<Value> {
 /// Every enum a script sees (`Enum:GetEnums()`), sorted: Studio's own API
 /// dump (app/api-dump.json, 0.744: 652), else the reflection database.
 pub fn enum_names() -> Vec<String> {
-    let mut v: Vec<String> = match crate::api::get() {
+    let mut v: Vec<String> = match rustudio_core::api::get() {
         Some(api) => api.enums.keys().cloned().collect(),
         None => doc::db().enums.keys().map(|k| k.to_string()).collect(),
     };
@@ -1395,7 +1352,7 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let n = (crate::sim_clock::seed(lua, nanos as u64) % 200) as u16 + 1;
+        let n = (crate::lua_bridge::seed(lua, nanos as u64) % 200) as u16 + 1;
         Ok(LBrickColor(BrickColor::from_number(n).unwrap_or_else(
             || BrickColor::from_number(194).expect("default"),
         )))
@@ -2071,109 +2028,28 @@ impl UserData for LRect {
 
 // ----------------------------------------------------- PhysicalProperties
 
+/// The plain struct is core's (`mech::PhysicalProperties`): physics and the
+/// renderer read it too. Luau sees it through this newtype, so the UserData
+/// and FromLua impls below are this crate's to write (a type alias would
+/// break the orphan rule once the struct is another crate's).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LPhysicalProperties {
-    pub density: f32,
-    pub friction: f32,
-    pub elasticity: f32,
-    pub friction_weight: f32,
-    pub elasticity_weight: f32,
-    pub acoustic_absorption: f32,
-    /// Studio's "default" value (`PhysicalProperties.new('a')`: tostring
-    /// "default"; a part given it has no custom properties).
-    pub default: bool,
+pub struct LPhysicalProperties(pub PhysicalProperties);
+
+impl std::ops::Deref for LPhysicalProperties {
+    type Target = PhysicalProperties;
+    fn deref(&self) -> &PhysicalProperties {
+        &self.0
+    }
 }
-from_ud!(LPhysicalProperties, "PhysicalProperties");
-
-/// Default AcousticAbsorption: the reference lists the property but no
-/// default value, so this is an estimate.
-const DEFAULT_ACOUSTIC_ABSORPTION: f32 = 1.0;
-
-/// (material, density, elasticity, friction, elasticityWeight, frictionWeight)
-/// from the "Materials" page of the Roblox creator docs.
-const MATERIAL_PHYSICS: &[(&str, f32, f32, f32, f32, f32)] = &[
-    ("Asphalt", 2.36, 0.2, 0.8, 1.0, 0.3),
-    ("Basalt", 2.691, 0.15, 0.7, 1.0, 0.3),
-    ("Brick", 1.922, 0.15, 0.8, 1.0, 0.3),
-    ("Cardboard", 0.7, 0.05, 0.5, 2.0, 1.0),
-    ("Carpet", 1.1, 0.25, 0.4, 2.0, 1.0),
-    ("CeramicTiles", 2.4, 0.2, 0.51, 1.0, 1.0),
-    ("ClayRoofTiles", 2.0, 0.2, 0.51, 1.0, 1.0),
-    ("Cobblestone", 2.691, 0.17, 0.5, 1.0, 1.0),
-    ("Concrete", 2.403, 0.2, 0.7, 1.0, 0.3),
-    ("CorrodedMetal", 7.85, 0.2, 0.7, 1.0, 1.0),
-    ("CrackedLava", 2.691, 0.15, 0.65, 1.0, 1.0),
-    ("DiamondPlate", 7.85, 0.25, 0.35, 1.0, 1.0),
-    ("Fabric", 0.7, 0.05, 0.35, 1.0, 1.0),
-    ("Foil", 2.7, 0.25, 0.4, 1.0, 1.0),
-    ("ForceField", 2.403, 0.2, 0.25, 1.0, 1.0),
-    ("Glacier", 0.919, 0.15, 0.05, 1.0, 2.0),
-    ("Glass", 2.403, 0.2, 0.25, 1.0, 1.0),
-    ("Granite", 2.691, 0.2, 0.4, 1.0, 1.0),
-    ("Grass", 0.9, 0.1, 0.4, 1.5, 1.0),
-    ("Ground", 0.9, 0.1, 0.45, 1.0, 1.0),
-    ("Ice", 0.919, 0.15, 0.02, 1.0, 3.0),
-    ("LeafyGrass", 0.9, 0.1, 0.4, 2.0, 2.0),
-    ("Leather", 0.86, 0.25, 0.35, 1.0, 1.0),
-    ("Limestone", 2.691, 0.15, 0.5, 1.0, 1.0),
-    ("Marble", 2.563, 0.17, 0.2, 1.0, 1.0),
-    ("Metal", 7.85, 0.25, 0.4, 1.0, 1.0),
-    ("Mud", 0.9, 0.07, 0.3, 4.0, 3.0),
-    ("Neon", 0.7, 0.2, 0.3, 1.0, 1.0),
-    ("Pavement", 2.691, 0.17, 0.5, 1.0, 0.3),
-    ("Pebble", 2.403, 0.17, 0.4, 1.5, 1.0),
-    ("Plaster", 0.75, 0.2, 0.6, 1.0, 0.3),
-    ("Plastic", 0.7, 0.5, 0.3, 1.0, 1.0),
-    ("Rock", 2.691, 0.17, 0.5, 1.0, 1.0),
-    ("RoofShingles", 2.36, 0.2, 0.8, 1.0, 0.3),
-    ("Rubber", 1.3, 0.95, 1.5, 2.0, 3.0),
-    ("Salt", 2.165, 0.05, 0.5, 1.0, 1.0),
-    ("Sand", 1.602, 0.05, 0.5, 2.5, 5.0),
-    ("Sandstone", 2.691, 0.15, 0.5, 1.0, 5.0),
-    ("SmoothPlastic", 0.7, 0.5, 0.2, 1.0, 1.0),
-    ("Slate", 2.691, 0.2, 0.4, 1.0, 1.0),
-    ("Snow", 0.9, 0.03, 0.3, 4.0, 3.0),
-    ("Wood", 0.35, 0.2, 0.48, 1.0, 1.0),
-    ("WoodPlanks", 0.35, 0.2, 0.48, 1.0, 1.0),
-];
 
 impl LPhysicalProperties {
-    /// Default physical properties of a material (by Enum.Material name).
-    /// Materials missing from the docs table (e.g. Air, Water, newer
-    /// materials) fall back to Plastic — an estimate.
     pub fn for_material(name: &str) -> Self {
-        let row = MATERIAL_PHYSICS
-            .iter()
-            .find(|r| r.0 == name)
-            .or_else(|| MATERIAL_PHYSICS.iter().find(|r| r.0 == "Plastic"))
-            .copied();
-        let (_, density, elasticity, friction, ew, fw) =
-            row.unwrap_or(("Plastic", 0.7, 0.5, 0.3, 1.0, 1.0));
-        LPhysicalProperties {
-            density,
-            friction,
-            elasticity,
-            friction_weight: fw,
-            elasticity_weight: ew,
-            acoustic_absorption: DEFAULT_ACOUSTIC_ABSORPTION,
-            default: false,
-        }
-    }
-
-    /// Clamp to plausible ranges (estimated: density 0.0001..100,
-    /// friction 0..2, elasticity 0..1, weights 0..100).
-    fn clamped(self) -> Self {
-        LPhysicalProperties {
-            density: self.density.clamp(0.0001, 100.0),
-            friction: self.friction.clamp(0.0, 2.0),
-            elasticity: self.elasticity.clamp(0.0, 1.0),
-            friction_weight: self.friction_weight.clamp(0.0, 100.0),
-            elasticity_weight: self.elasticity_weight.clamp(0.0, 100.0),
-            acoustic_absorption: self.acoustic_absorption.max(0.0),
-            default: self.default,
-        }
+        Self(PhysicalProperties::for_material(name))
     }
 }
+
+use rustudio_core::mech::DEFAULT_ACOUSTIC_ABSORPTION;
+from_ud!(LPhysicalProperties, "PhysicalProperties");
 
 impl UserData for LPhysicalProperties {
     fn add_fields<F: UserDataFields<Self>>(f: &mut F) {
@@ -2269,7 +2145,7 @@ impl LRandom {
     pub fn new(seed: u64) -> Self {
         let mut r = LRandom {
             state: 0,
-            inc: crate::mech::RANDOM_PCG_INC,
+            inc: rustudio_core::mech::RANDOM_PCG_INC,
         };
         r.next_u32();
         r.state = r.state.wrapping_add(seed);
@@ -2289,7 +2165,7 @@ impl LRandom {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0)
         };
-        LRandom::new(crate::sim_clock::seed(
+        LRandom::new(crate::lua_bridge::seed(
             lua,
             t ^ COUNTER
                 .fetch_add(1, Ordering::Relaxed)
@@ -2463,8 +2339,8 @@ from_ud!(LDateTime, "DateTime");
 
 impl LDateTime {
     pub fn now() -> Self {
-        let ms = if crate::sim_clock::on() {
-            (crate::sim_clock::epoch_secs() * 1000.0).floor() as i64
+        let ms = if rustudio_core::sim_clock::on() {
+            (rustudio_core::sim_clock::epoch_secs() * 1000.0).floor() as i64
         } else {
             match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
                 Ok(d) => d.as_millis() as i64,
@@ -3403,7 +3279,7 @@ pub fn variant_to_datatype(
         ),
         V::PhysicalProperties(rbx_types::PhysicalProperties::Custom(c)) => u(
             lua,
-            LPhysicalProperties {
+            LPhysicalProperties(PhysicalProperties {
                 density: c.density(),
                 friction: c.friction(),
                 elasticity: c.elasticity(),
@@ -3411,7 +3287,7 @@ pub fn variant_to_datatype(
                 elasticity_weight: c.elasticity_weight(),
                 acoustic_absorption: c.acoustic_absorption(),
                 default: false,
-            },
+            }),
         ),
         V::PhysicalProperties(_) => Ok(Some(Value::Nil)),
         V::Vector3int16(x) => u(lua, lv3i(*x)),
@@ -3634,13 +3510,13 @@ fn install_datatypes(lua: &Lua, g: &Table) -> LResult<()> {
             if LEnumItem::from_name("Material", &name).is_some() {
                 return Ok(LPhysicalProperties::for_material(&name));
             }
-            return Ok(LPhysicalProperties { default: true, ..LPhysicalProperties::for_material("Plastic") });
+            return Ok(LPhysicalProperties(PhysicalProperties { default: true, ..*LPhysicalProperties::for_material("Plastic") }));
         }
         if a.len() < 3 || a.iter().take(3).any(|v| num(v).is_none()) {
             return Err(rt_err("PhysicalProperties.new expects a Material or (density, friction, elasticity[, frictionWeight, elasticityWeight[, acousticAbsorption]])"));
         }
         let opt = |i: usize, d: f32| a.get(i).and_then(num).map(|x| x as f32).unwrap_or(d);
-        Ok(LPhysicalProperties {
+        Ok(LPhysicalProperties(PhysicalProperties {
             density: arg_f32(&a, 0),
             friction: arg_f32(&a, 1),
             elasticity: arg_f32(&a, 2),
@@ -3649,7 +3525,7 @@ fn install_datatypes(lua: &Lua, g: &Table) -> LResult<()> {
             acoustic_absorption: opt(5, DEFAULT_ACOUSTIC_ABSORPTION),
             default: false,
         }
-        .clamped())
+        .clamped()))
     })?)?;
     g.set("PhysicalProperties", pp)?;
 

@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::ustr;
 
-use crate::doc::{self, Document};
-use crate::math::Xform;
+use rustudio_core::doc::{self, Document};
+use rustudio_core::math::Xform;
 
 /// Joint classes that hold two parts by C0 / C1.
 const JOINTS: [&str; 7] = ["Motor6D", "Weld", "Motor", "ManualWeld", "Snap", "Glue", "AnimationConstraint"];
@@ -218,12 +218,12 @@ impl ClientJoints {
             if matches!(cd.prop(j, "Enabled"), Some(Variant::Bool(false))) {
                 return None;
             }
-            return crate::rig::joint_frames(cd, j);
+            return rustudio_core::body::joint_frames(cd, j);
         }
-        if !crate::physics::joint_enabled(cd, j) {
+        if !rustudio_core::body::joint_enabled(cd, j) {
             return None;
         }
-        let (p0, p1) = crate::physics::joint_parts(cd, j)?;
+        let (p0, p1) = rustudio_core::body::joint_parts(cd, j)?;
         let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
         if class == "RigidConstraint" {
             let a = |k: &str| part_ref(cd, j, k).and_then(|a| cframe(cd, a, "CFrame")).unwrap_or(ident);

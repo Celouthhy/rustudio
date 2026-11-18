@@ -2,7 +2,7 @@
 //! (checks/humanoid-physics SPEC.md §4.1 item 8): a character that isn't the
 //! player's — an NPC a server Script walks with Humanoid:Move / MoveTo, a
 //! dummy that just stands — is the same dynamic assembly
-//! (physics_humanoid.rs) pushed by the same controller (crate::humanoid) as
+//! (physics_humanoid.rs) pushed by the same controller (rustudio_physics::humanoid) as
 //! the player's (play_humanoid.rs), simulated by the server: its Humanoid's
 //! values are the server's, its joint transforms the server Animator's, its
 //! pose is written to the server's DataModel and the client's copy.
@@ -16,8 +16,8 @@
 //! walk, jump, fall, tip over and get up).
 
 use super::*;
-use crate::humanoid::{FrameIn, Humanoid, StepIn};
-use crate::physics::hum_body::HumCtl;
+use rustudio_physics::humanoid::{FrameIn, Humanoid, StepIn};
+use rustudio_physics::physics::hum_body::HumCtl;
 
 /// Frames between looks for new / gone Humanoids under Workspace.
 const SCAN_EVERY: u32 = 30;
@@ -27,7 +27,7 @@ pub(crate) struct Npc {
     root: Ref,
     rig: rig::Rig,
     r6: bool,
-    shape: crate::physics::HumShape,
+    shape: rustudio_physics::physics::HumShape,
     hum: Humanoid,
     had_floor: bool,
     floor_part: Option<Ref>,
@@ -112,7 +112,7 @@ fn senses_floor(s: State) -> bool {
     matches!(s, State::Jumping | State::Freefall | State::Landed | State::Running | State::Climbing)
 }
 
-impl Editor {
+impl Game {
     /// Finds the Humanoids to drive: models under Workspace with a Humanoid
     /// and an unanchored HumanoidRootPart, alive, not the player's character.
     fn npc_scan(&mut self) {
@@ -176,7 +176,7 @@ impl Editor {
                 rig,
                 r6,
                 shape,
-                hum: Humanoid { state: State::Freefall, bal_p: crate::humanoid::BAL_P_FREEFALL, ..Default::default() },
+                hum: Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() },
                 had_floor: false,
                 floor_part: None,
                 transforms: HashMap::new(),
@@ -189,9 +189,9 @@ impl Editor {
                 rest: None,
                 posed_on: None,
             };
-            if crate::physics::hum_debug() {
+            if rustudio_physics::physics::hum_debug() {
                 let name = |r: Ref| self.doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
-                eprintln!("HUMDBG npc added: {} {:?} at {:?} (player's character: {:?})", name(model), model, crate::scene::xform_of(&self.doc, root).map(|x| x.pos), mine.map(name));
+                eprintln!("HUMDBG npc added: {} {:?} at {:?} (player's character: {:?})", name(model), model, rustudio_render::scene::xform_of(&self.doc, root).map(|x| x.pos), mine.map(name));
             }
             if let Some(s) = self.play.as_mut() {
                 // Out of the general assemblies: the character is one body
@@ -243,7 +243,7 @@ impl Editor {
         // The ownership boundary: characters a script kept on the server
         // (SetNetworkOwner(nil) on their root) against the player's.
         {
-            let kept = crate::runtime::domains::world::part::server_owned_roots(self.doc.id);
+            let kept = rustudio_engine::runtime::domains::world::part::server_owned_roots(self.doc.id);
             let s = self.play.as_mut().expect("playing");
             let server: Vec<Ref> = s.npcs.by_model.iter().filter(|(_, n)| kept.contains(&n.root)).map(|(m, _)| *m).collect();
             let client = s.character.as_ref().filter(|c| !c.dead).map(|c| c.model);
@@ -276,11 +276,11 @@ impl Editor {
                     npc_view(&self.doc, &mut s.npcs, model);
                 }
             }
-            let doc_root = crate::scene::xform_of(&self.doc, root);
+            let doc_root = rustudio_render::scene::xform_of(&self.doc, root);
             // The body, at the parts' poses (only when it is built or its
             // parts may have changed).
             let posed = |doc: &Document, list: &[Ref]| -> Vec<(Ref, Xform)> {
-                list.iter().filter_map(|r| crate::scene::xform_of(doc, *r).map(|x| (*r, x))).collect()
+                list.iter().filter_map(|r| rustudio_render::scene::xform_of(doc, *r).map(|x| (*r, x))).collect()
             };
             {
                 let s = self.play.as_mut().expect("playing");
@@ -296,7 +296,7 @@ impl Editor {
                     if view.verified.is_none() || view.verified != sig {
                         let parts = posed(&self.doc, &view.parts);
                         s.physics.refresh_humanoid(&self.doc, model, root, &parts);
-                        view.verified = crate::physics::Physics::humanoid_parts_settled(&self.doc, &view.parts)
+                        view.verified = rustudio_physics::physics::Physics::humanoid_parts_settled(&self.doc, &view.parts)
                             .then(|| s.physics.humanoid_sig_of(model))
                             .flatten();
                     }
@@ -538,7 +538,7 @@ impl Editor {
             let humanoid = n.humanoid;
             let floor = match n.floor_part.filter(|_| senses_floor(state) && n.had_floor) {
                 None => mech::MATERIAL_AIR,
-                Some(p) => crate::scene::enum_u32(self.doc.prop(p, "Material")).unwrap_or(256),
+                Some(p) => rustudio_render::scene::enum_u32(self.doc.prop(p, "Material")).unwrap_or(256),
             };
             let floor_changed = (floor != n.floor_material).then(|| {
                 n.floor_material = floor;
@@ -576,7 +576,7 @@ fn npc_view(doc: &Document, npcs: &mut Npcs, model: Ref) {
         members.push(r);
         npcs.member_of.insert(r, (model, part));
         // (A part without a pose isn't part of the body.)
-        if part && crate::scene::xform_of(doc, r).is_some() {
+        if part && rustudio_render::scene::xform_of(doc, r).is_some() {
             parts.push(r);
         }
     }
@@ -591,7 +591,7 @@ fn npc_view(doc: &Document, npcs: &mut Npcs, model: Ref) {
         ["Left Leg", "Right Leg"]
             .iter()
             .filter_map(|name| doc.find_named(model, name))
-            .filter_map(|r| crate::scene::vec3_of(doc.prop(r, "Size")))
+            .filter_map(|r| rustudio_render::scene::vec3_of(doc.prop(r, "Size")))
             .map(|s| s.y)
             .fold(0.0f32, f32::max)
     } else {

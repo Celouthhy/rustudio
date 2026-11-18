@@ -8,7 +8,7 @@ use rustudio_account::{
 };
 
 use super::{client_snapshot, divider, theme, Editor, SessionState};
-use crate::{assets::SharedClient, doc::DocKind};
+use rustudio_core::{assets::SharedClient, doc::DocKind};
 
 #[derive(Clone)]
 struct Target {
@@ -80,7 +80,7 @@ impl Request {
     }
 }
 
-pub(super) struct Picker {
+pub(crate) struct Picker {
     mode: VersionType,
     document: u64,
     owner: Option<u64>,
@@ -321,32 +321,30 @@ enum Action {
 impl Editor {
     pub(super) fn roblox_destination_window(&mut self, ctx: &egui::Context) {
         let Some(mode) = self.cloud_upload_mode() else {
-            self.account.destination = None;
+            self.account_destination = None;
             return;
         };
         if self.cloud_upload_result().is_some_and(Result::is_ok) {
-            self.account.destination = None;
+            self.account_destination = None;
             self.close_cloud_upload();
             return;
         }
-        let owner = self.account.user_id();
-        let mut picker = self
-            .account
-            .destination
+        let owner = self.game.account.user_id();
+        let mut picker = self.account_destination
             .take()
             .filter(|p| {
                 p.mode == mode
-                    && p.document == self.doc.id
+                    && p.document == self.game.doc.id
                     && (p.owner.is_none() || p.owner == owner)
             })
-            .unwrap_or_else(|| Picker::new(mode, self.doc.id));
+            .unwrap_or_else(|| Picker::new(mode, self.game.doc.id));
         picker.owner = owner;
         let created_target = picker.poll(ctx);
         let save_error = self
             .cloud_upload_result()
             .and_then(|result| result.as_ref().err())
             .cloned();
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         if let Some(client) = &client {
             if picker.groups.is_none() && picker.group_worker.is_none() {
                 picker.group_worker = Some(picker.fetch(ctx, client.clone(), |client| {
@@ -357,20 +355,17 @@ impl Editor {
                 && picker.experiences.is_none()
                 && picker.worker.is_none()
                 && picker.error.is_none()
-                && self.doc.kind == DocKind::Place
+                && self.game.doc.kind == DocKind::Place
             {
                 picker.load_page(ctx, client.clone());
             }
         }
         let uploading = self.cloud_upload_pending();
         let blocked = picker.creating || uploading || created_target.is_some();
-        let personal_creator = self
-            .account
-            .profile
-            .as_ref()
+        let personal_creator = self.game.account.profile()
             .map(|p| format!("@{}", p.name));
         let copy_source = self
-            .doc
+            .game.doc
             .cloud
             .as_ref()
             .filter(|o| o.local_copy)
@@ -409,7 +404,7 @@ impl Editor {
                     });
                 });
                 ui.add_space(6.0);
-                ui.label(RichText::new(self.account.status_short()).color(theme::TEXT_DIM));
+                ui.label(RichText::new(self.game.account.status_short()).color(theme::TEXT_DIM));
                 ui.add_space(12.0);
                 divider(ui);
                 ui.add_space(12.0);
@@ -424,7 +419,7 @@ impl Editor {
                 egui::ScrollArea::vertical().id_salt(scroll_id).max_height(body_height)
                     .auto_shrink([false, false]).show(ui, |ui| {
                         ui.set_min_height(body_height);
-                        if self.doc.kind != DocKind::Place {
+                        if self.game.doc.kind != DocKind::Place {
                             ui.label("Open a place to save or publish to Roblox.");
                         } else if owner.is_some() {
                             action = picker.contents(ui, uploading, &self.cloud, personal_creator.as_deref(), &mut visible_icons);
@@ -433,10 +428,10 @@ impl Editor {
                             {
                                 ui.label(RichText::new("Overwriting this Team Create place replaces its server version with your local copy.").color(theme::WARN));
                             }
-                        } else if matches!(self.account.state, SessionState::Checking(_)) {
+                        } else if matches!(self.game.account.state, SessionState::Checking(_)) {
                             ui.spinner();
                         } else if picker.show_sign_in {
-                            self.account.heads(ctx);
+                            self.game.account.heads(ctx);
                             self.account_contents(ui);
                         } else {
                             ui.label("Sign in to choose a destination on Roblox.");
@@ -465,10 +460,10 @@ impl Editor {
             });
         if !blocked && (modal.should_close() || matches!(modal.inner, Some(Action::Close))) {
             if picker.show_sign_in {
-                if let Some(quick) = &self.account.quick {
+                if let Some(quick) = &self.game.account.quick {
                     quick.cancel();
                 }
-                self.account.cookie_input.clear();
+                self.game.account.cookie_input.clear();
             }
             self.close_cloud_upload();
             return;
@@ -512,7 +507,7 @@ impl Editor {
                         Action::NewPlace(experience) => Page::NewPlace(experience),
                         _ => Page::NewExperience,
                     };
-                    picker.name.clone_from(&self.doc.title);
+                    picker.name.clone_from(&self.game.doc.title);
                     picker.description.clear();
                     picker.error = None;
                 }
@@ -529,7 +524,7 @@ impl Editor {
         if picker.worker.is_some() || blocked {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        self.account.destination = self.cloud_upload_mode().map(|_| picker);
+        self.account_destination = self.cloud_upload_mode().map(|_| picker);
     }
 }
 
@@ -563,7 +558,7 @@ impl Picker {
                     };
                     let button = ui.add_sized(
                         [creator_width, ui.spacing().interact_size.y],
-                        Button::new(creator_name).right_text("▾").truncate(),
+                        Button::new(creator_name).right_text(rustudio_engine::ti::text("chevron-down", 12.0)).truncate(),
                     );
                     egui::Popup::menu(&button)
                         .width(creator_width)
@@ -1051,7 +1046,7 @@ fn paint_thumbnail(
         egui::Image::new(texture).paint_at(ui, bounds);
     } else {
         painter.rect_filled(bounds, 3.0, theme::PANEL_ALT);
-        crate::ti::paint(
+        rustudio_engine::ti::paint(
             painter,
             bounds.shrink(bounds.width() * 0.28),
             placeholder,

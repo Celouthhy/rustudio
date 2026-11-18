@@ -55,7 +55,7 @@ fn legacy(name: &str) -> (&'static str, u32, bool) {
 
 /// The nearest local face file of a family (`rbxasset://fonts/families/X.json`).
 fn face_path(family_json: &str, weight: u32, italic: bool) -> Option<std::path::PathBuf> {
-    let p = crate::assets::resolve(family_json, None)?;
+    let p = rustudio_core::assets::resolve(family_json, None)?;
     let j: serde_json::Value = serde_json::from_slice(&std::fs::read(p).ok()?).ok()?;
     let mut best: Option<(u32, std::path::PathBuf)> = None;
     for f in j.get("faces")?.as_array()? {
@@ -63,7 +63,7 @@ fn face_path(family_json: &str, weight: u32, italic: bool) -> Option<std::path::
         if !id.starts_with("rbxasset://") {
             continue;
         }
-        let Some(file) = crate::assets::resolve(id, None).filter(|p| p.is_file()) else { continue };
+        let Some(file) = rustudio_core::assets::resolve(id, None).filter(|p| p.is_file()) else { continue };
         let w = f.get("weight")?.as_u64()? as u32;
         let it = f.get("style")?.as_str()? == "italic";
         let cost = w.abs_diff(weight) + if it != italic { 1000 } else { 0 };
@@ -113,7 +113,7 @@ pub fn text_size(text: &str, size: f32, family_json: &str, weight: u32, italic: 
                 ms.fonts = Fonts::new(TextOptions::default(), ms.defs.clone());
                 let fam = FontFamily::Name(name.into());
                 let line = ms.fonts.with_pixels_per_point(1.0).row_height(&FontId::new(100.0, fam.clone())) / 100.0;
-                let em = crate::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
+                let em = rustudio_core::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
                 ms.faces.insert(path.clone(), (fam, em));
             }
         }
@@ -145,14 +145,14 @@ pub fn call(lua: &Lua, class: &str, name: &str, _this: Ref, args: &MultiValue) -
                 Value::Number(n) => n as f32,
                 v => return Err(rt_err(format!("Unable to cast {} to float", v.type_name()))),
             };
-            let font = opt_ud::<crate::ltypes::LEnumItem>(&argv(args, 3))
+            let font = opt_ud::<rustudio_engine::ltypes::LEnumItem>(&argv(args, 3))
                 .filter(|e| e.enum_type == "Font")
                 .map(|e| e.name.to_string())
                 .ok_or_else(|| rt_err("Unable to cast value to Font"))?;
-            let frame = opt_ud::<crate::ltypes::LVector2>(&argv(args, 4)).ok_or_else(|| rt_err("Unable to cast value to Vector2"))?;
+            let frame = opt_ud::<rustudio_engine::ltypes::LVector2>(&argv(args, 4)).ok_or_else(|| rt_err("Unable to cast value to Vector2"))?;
             let (fam, w, it) = legacy(&font);
             let s = text_size(&text, size, &format!("rbxasset://fonts/families/{fam}.json"), w, it, frame.0.x);
-            ret1(Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(s[0], s[1])))?))
+            ret1(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::new(s[0], s[1])))?))
         })(),
         "GetTextBoundsAsync" => (|| {
             let p = opt_inst(&argv(args, 1)).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
@@ -205,7 +205,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, _this: Ref, args: &MultiValue) -
                 None => ("rbxasset://fonts/families/SourceSansPro.json".to_string(), 400, false),
             };
             let s = text_size(&text, size, &fam, weight, italic, width);
-            ret1(Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(s[0], s[1])))?))
+            ret1(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::new(s[0], s[1])))?))
         })(),
         _ => return None,
     };

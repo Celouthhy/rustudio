@@ -12,8 +12,8 @@
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
-use crate::runtime::Side;
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::Side;
 
 #[derive(Default)]
 pub(super) struct ClientVelocityTest {
@@ -68,12 +68,12 @@ impl SelfTest {
         match self.r4.phase {
             244 if self.cvel.started == 0 => {
                 ed.set_document(Document::new_place());
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.cvel = ClientVelocityTest { started: f, ok: true, ..Default::default() };
             }
             244 if t == 60 => {
                 for (side, src) in [(Side::Server, SERVER), (Side::Client, CLIENT)] {
-                    if let Some(e) = ed.run_luau(side, src) {
+                    if let Some(e) = ed.game.run_luau(side, src) {
                         self.cvel.ok = false;
                         self.cvel.notes.push(format!("setup ({side:?}): {e}"));
                     }
@@ -82,7 +82,7 @@ impl SelfTest {
             }
             // (about half a second of falling at the self-test's frame rate)
             245 if t == 95 => {
-                let res = ed.run_luau(Side::Client, CHECK).unwrap_or_default();
+                let res = ed.game.run_luau(Side::Client, CHECK).unwrap_or_default();
                 let ok = res.contains("ok: ");
                 self.cvel.ok &= ok;
                 self.cvel.notes.push(res);

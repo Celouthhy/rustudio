@@ -18,7 +18,7 @@
 
 use glam::{Mat3, Vec3};
 
-use crate::mech;
+use rustudio_core::mech;
 use crate::render::MeshKind;
 
 /// The grid's size in voxels: (X, Y, Z).

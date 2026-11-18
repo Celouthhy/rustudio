@@ -1,6 +1,7 @@
-//! Engine API domain: plugin — the Plugin object and what plugins make
-//! (compiled as `runtime::domains::plugin`, src/domains/mod.rs; every
-//! `api*.rs` file here is scanned for member claims by build.rs).
+//! Studio's API domain: plugin — the Plugin object and what plugins make
+//! (`plugin_host::api`; studio registers it in the engine at start-up,
+//! `studio_hooks::install`; every `api*.rs` file here is scanned for member
+//! claims by build.rs).
 //!
 //! This file: the dispatcher, the Plugin core (settings, activation, the
 //! mouse object, user id, Unloading / Deactivation) and Selection's base
@@ -21,9 +22,10 @@
 use mlua::{Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::app::Level;
+use rustudio_core::log::Level;
+use rustudio_engine::ltypes::rt_err;
 use crate::plugin_host::vm::{self, UiKind};
-use crate::runtime::*;
+use rustudio_engine::runtime::*;
 
 #[path = "api_toolbar.rs"]
 pub mod toolbar;
@@ -47,6 +49,13 @@ pub mod studio_service;
 pub mod fbx_anim;
 #[path = "api_text.rs"]
 pub mod text;
+
+/// The plugin domain's member claims (build.rs scans src/plugin_host/api*.rs).
+/// The engine's member_claims.rs cannot include them (this file is above the
+/// engine); the engine takes them through the Domain registered at start-up.
+pub mod claims {
+    include!(concat!(env!("OUT_DIR"), "/plugin_claims.rs"));
+}
 
 pub const METHODS: &[(&str, &str)] = &[
     // Plugin core (this file)
@@ -209,13 +218,52 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("CreateDockWidgetPluginGuiAsync", "Plugin"),
 ];
 
+/// The domain the engine holds (its slot in every table is last, where
+/// `plugin::` sat when this was an engine module). `studio_hooks::install`
+/// registers it once, before any runtime is made.
+pub static DOMAIN: rustudio_engine::runtime::domains::Domain = rustudio_engine::runtime::domains::Domain {
+    name: "plugin",
+    methods: METHODS,
+    lua_methods: LUA_METHODS,
+    events: EVENTS,
+    claims: claims::CLAIMS,
+    claim_pairs: claims::CLAIMS_PAIRS,
+    call_claims: claims::CALL_CLAIMS,
+    call_claim_pairs: claims::CALL_CLAIMS_PAIRS,
+    newindex_claims: claims::NEWINDEX_CLAIMS,
+    newindex_claim_pairs: claims::NEWINDEX_CLAIMS_PAIRS,
+    prop_get,
+    newindex,
+    call,
+    write_acts,
+    install,
+    step,
+    hold_source_write: crate::plugin_host::permissions::hold_source_write,
+    script_env: vm::script_env,
+    running_asset_id: vm::running_asset_id,
+    plugin_manager: studio_service::plugin_manager,
+    check_http: crate::plugin_host::permissions::check_http,
+    running_plugin: crate::plugin_host::permissions::running_plugin,
+    http_decision: crate::plugin_host::permissions::http_decision,
+    theme_get: theme::studio_theme,
+    theme_set: theme::set_theme,
+    theme_note: theme::note_theme,
+    active_script: crate::plugin_host::script_docs::active,
+};
+
+/// Registers the plugin domain in the engine (idempotent; call before the
+/// first `Runtime::new`).
+pub fn install_domain() {
+    rustudio_engine::runtime::domains::register(&DOMAIN);
+}
+
 fn mine(class: &str) -> bool {
     matches!(
         class,
         "Plugin" | "Selection" | "PluginToolbar" | "PluginToolbarButton" | "PluginMenu" | "PluginMouse"
             | "PluginAction" | "StudioTheme" | "ChangeHistoryService" | "ScriptEditorService" | "ScriptDocument"
             | "StudioService" | "File" | "PluginManagerInterface" | "PluginManager" | "TextService" | "Studio"
-    ) || crate::doc::is_a(class, "PluginGui")
+    ) || rustudio_core::doc::is_a(class, "PluginGui")
 }
 
 pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
@@ -447,8 +495,8 @@ fn lua_type_name(v: &Value) -> &'static str {
 }
 
 pub(crate) fn enum_value(lua: &Lua, en: &str, name: &str) -> mlua::Result<Value> {
-    match crate::ltypes::LEnumItem::from_name(en, name) {
-        Some(item) => crate::ltypes::enum_value(lua, item),
+    match rustudio_engine::ltypes::LEnumItem::from_name(en, name) {
+        Some(item) => rustudio_engine::ltypes::enum_value(lua, item),
         None => Ok(Value::Nil),
     }
 }
@@ -517,7 +565,7 @@ fn core_call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) -
         // Studio's toolbar setting (Model > Constraints > Join Surfaces):
         // Always when joining is on, else None.
         ("Plugin", "GetJoinMode") => (|| {
-            let join = crate::runtime::domains::testing::studio::editor_join_surfaces();
+            let join = rustudio_engine::runtime::domains::testing::studio::editor_join_surfaces();
             ret1(enum_value(lua, "JointCreationMode", if join { "All" } else { "None" })?)
         })(),
         ("Selection", "Get") => (|| {

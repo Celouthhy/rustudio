@@ -28,7 +28,7 @@ use egui::{Key, KeyboardShortcut, Modifiers};
 use rbx_dom_weak::types::Ref;
 
 use crate::app::Editor;
-use crate::theme;
+use rustudio_engine::theme;
 
 #[derive(Default)]
 pub struct Shortcuts {
@@ -46,7 +46,7 @@ pub fn file() -> PathBuf {
     if let Some(p) = std::env::var_os("RUSTUDIO_PLUGIN_SHORTCUTS") {
         return PathBuf::from(p);
     }
-    crate::paths::config().join("rustudio").join("plugin-shortcuts.json")
+    rustudio_core::paths::config().join("rustudio").join("plugin-shortcuts.json")
 }
 
 impl Shortcuts {

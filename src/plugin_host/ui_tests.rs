@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use super::*;
-use crate::runtime::domains::plugin::{menus, toolbar};
+use crate::plugin_host::api::{menus, toolbar};
 
 fn src(name: &str, code: &str) -> PluginSource {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));

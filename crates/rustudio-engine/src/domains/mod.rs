@@ -23,6 +23,12 @@
 //! - `install(lua)` once per Lua state, `step(lua, dt)` once per frame.
 //!
 //! Fire events with `world(lua)?.fire(r, "Name", args)`.
+//!
+//! The built-in domains below are compiled in. A domain that lives above the
+//! engine (studio's plugin API, `src/plugin_host/api.rs`) fills the same
+//! slots through [`Domain`] and [`register`], called once at start-up before
+//! any runtime is made. With nothing registered it has no members: the
+//! engine's tables, claims and atom list are built without it.
 
 use std::sync::LazyLock;
 
@@ -42,69 +48,85 @@ use rbx_dom_weak::types::Ref;
 #[path = "players_chat.rs"] pub mod players_chat;
 #[path = "assets_cloud.rs"] pub mod assets_cloud;
 #[path = "testing.rs"] pub mod testing;
-#[path = "../plugin_host/api.rs"] pub mod plugin;
+// The engine's side of Studio Settings (installed by src/studio_settings.rs).
+pub mod settings_host;
 
+/// The engine's side of the plugin API domain (studio): the id and
+/// permission types the engine names, and the registration hook
+/// ([`register`]) studio calls at start-up. With nothing registered the
+/// plugin domain has no members.
+pub mod plugin_api;
+pub use plugin_api::{
+    active_script, check_http, hold_source_write, http_decision, is_pending, plugin_manager,
+    register, running_asset_id, running_plugin, script_env, theme_get, theme_note, theme_set,
+    Decision, Domain, PluginId,
+};
 
-/// Every domain's (method, base class).
-pub static METHODS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    let mut v = Vec::new();
-    v.extend_from_slice(pages::METHODS);
-    v.extend_from_slice(web_social::METHODS);
-    v.extend_from_slice(avatar::METHODS);
-    v.extend_from_slice(data::METHODS);
-    v.extend_from_slice(anim::METHODS);
-    v.extend_from_slice(world::METHODS);
-    v.extend_from_slice(geometry::METHODS);
-    v.extend_from_slice(gui_input::METHODS);
-    v.extend_from_slice(media::METHODS);
-    v.extend_from_slice(services::METHODS);
-    v.extend_from_slice(players_chat::METHODS);
-    v.extend_from_slice(assets_cloud::METHODS);
-    v.extend_from_slice(testing::METHODS);
-    v.extend_from_slice(plugin::METHODS);
-    v
-});
+/// Every domain's (method, base class): the built-in domains in their
+/// order, then the registered domain (studio's plugin API), which sat last
+/// when it was a built-in (`plugin::METHODS` after `testing`).
+pub fn methods() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    const BUILT_IN: &[&[(&str, &str)]] = &[
+        pages::METHODS,
+        web_social::METHODS,
+        avatar::METHODS,
+        data::METHODS,
+        anim::METHODS,
+        world::METHODS,
+        geometry::METHODS,
+        gui_input::METHODS,
+        media::METHODS,
+        services::METHODS,
+        players_chat::METHODS,
+        assets_cloud::METHODS,
+        testing::METHODS,
+    ];
+    BUILT_IN.iter().copied().flatten()
+        .chain(plugin_api::registered().into_iter().flat_map(|d| d.methods))
+}
 
 /// Methods a domain writes in Luau because they yield (each domain's
 /// optional `LUA_METHODS`; the functions go in `__rs_lua_methods` from the
 /// domain's `install`).
-pub static LUA_METHODS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    let mut v = Vec::new();
-    v.extend_from_slice(pages::LUA_METHODS);
-    v.extend_from_slice(avatar::LUA_METHODS);
-    v.extend_from_slice(anim::LUA_METHODS);
-    v.extend_from_slice(services::LUA_METHODS);
-    v.extend_from_slice(assets_cloud::LUA_METHODS);
-    v.extend_from_slice(&data::LUA_METHODS);
-    v.extend_from_slice(web_social::LUA_METHODS);
-    v.extend_from_slice(geometry::LUA_METHODS);
-    v.extend_from_slice(players_chat::LUA_METHODS);
-    v.extend_from_slice(gui_input::LUA_METHODS);
-    v.extend_from_slice(plugin::LUA_METHODS);
-    v
-});
+pub fn lua_methods() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let built_in: [&[(&str, &str)]; 10] = [
+        pages::LUA_METHODS,
+        avatar::LUA_METHODS,
+        anim::LUA_METHODS,
+        services::LUA_METHODS,
+        assets_cloud::LUA_METHODS,
+        &data::LUA_METHODS,
+        web_social::LUA_METHODS,
+        geometry::LUA_METHODS,
+        players_chat::LUA_METHODS,
+        gui_input::LUA_METHODS,
+    ];
+    built_in.into_iter().flatten()
+        .chain(plugin_api::registered().into_iter().flat_map(|d| d.lua_methods))
+}
 
-pub static EVENTS: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
-    let mut v = Vec::new();
-    v.extend_from_slice(pages::EVENTS);
-    v.extend_from_slice(web_social::EVENTS);
-    v.extend_from_slice(avatar::EVENTS);
-    v.extend_from_slice(data::EVENTS);
-    v.extend_from_slice(anim::EVENTS);
-    v.extend_from_slice(world::EVENTS);
-    v.extend_from_slice(geometry::EVENTS);
-    v.extend_from_slice(gui_input::EVENTS);
-    v.extend_from_slice(media::EVENTS);
-    v.extend_from_slice(services::EVENTS);
-    v.extend_from_slice(players_chat::EVENTS);
-    v.extend_from_slice(assets_cloud::EVENTS);
-    v.extend_from_slice(testing::EVENTS);
-    v.extend_from_slice(plugin::EVENTS);
-    v
-});
+pub fn events() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    const BUILT_IN: &[&[(&str, &str)]] = &[
+        pages::EVENTS,
+        web_social::EVENTS,
+        avatar::EVENTS,
+        data::EVENTS,
+        anim::EVENTS,
+        world::EVENTS,
+        geometry::EVENTS,
+        gui_input::EVENTS,
+        media::EVENTS,
+        services::EVENTS,
+        players_chat::EVENTS,
+        assets_cloud::EVENTS,
+        testing::EVENTS,
+    ];
+    BUILT_IN.iter().copied().flatten()
+        .chain(plugin_api::registered().into_iter().flat_map(|d| d.events))
+}
 
 pub fn event_exists(class: &str, name: &str) -> bool {
-    EVENTS.iter().any(|(e, b)| *e == name && crate::doc::is_a(class, b))
+    events().any(|(e, b)| *e == name && rustudio_core::doc::is_a(class, b))
 }
 
 
@@ -116,9 +138,10 @@ mod member_claims {
 
 type PropGet = fn(&Lua, Ref, &str, &str) -> mlua::Result<Option<Value>>;
 
-/// The domains' prop_get, in chain order (bit i of a claim mask = entry i;
-/// the same order as `member_claims::CLAIMS`).
-static PROP_GETS: [(&str, PropGet); 14] = [
+/// The built-in domains' prop_get, in chain order (bit i of a claim mask =
+/// entry i; the same order as `member_claims::CLAIMS`). The registered
+/// domain fills the slot after them ([`prop_get_at`]).
+static PROP_GETS: [(&str, PropGet); 13] = [
     ("pages", pages::prop_get),
     ("web_social", web_social::prop_get),
     ("avatar", avatar::prop_get),
@@ -132,39 +155,83 @@ static PROP_GETS: [(&str, PropGet); 14] = [
     ("players_chat", players_chat::prop_get),
     ("assets_cloud", assets_cloud::prop_get),
     ("testing", testing::prop_get),
-    ("plugin", plugin::prop_get),
 ];
 
-/// Whether `claimer`'s prop_get code names `key` for `class`: anywhere as
-/// a bare literal, or in a literal pair ("Class", "key") whose first word
-/// is a class `class` is (a first word that names no class constrains
-/// nothing).
-fn claimed(claimer: usize, class: &str, key: &str) -> bool {
-    claimed_in(member_claims::CLAIMS, member_claims::CLAIMS_PAIRS, claimer, class, key)
+/// Entry `i` of the prop_get chain: a built-in domain, or the registered
+/// domain in the last slot (None with nothing registered: no members).
+fn prop_get_at(i: usize) -> Option<(&'static str, PropGet)> {
+    match PROP_GETS.get(i) {
+        Some((name, f)) => Some((name, *f)),
+        None if i == PROP_GETS.len() => plugin_api::registered().map(|d| (d.name, d.prop_get)),
+        None => None,
+    }
 }
 
-/// `claimed` over one table (CLAIMS, CALL_CLAIMS or NEWINDEX_CLAIMS) and
-/// its pairs.
-fn claimed_in(
-    words: &[(&str, &[&str])],
-    pairs: &[(&str, &[(&str, &str)])],
-    claimer: usize,
-    class: &str,
-    key: &str,
-) -> bool {
-    if words[claimer].1.binary_search(&key).is_ok() {
+/// One claimer's tables: its name, the words its code names (sorted) and
+/// its (key, class) literal pairs (sorted by key). A built-in domain's come
+/// from the engine's member_claims.rs; the registered domain's come from the
+/// Domain studio passes at registration (its claims are generated in studio,
+/// above the engine, as plugin_claims.rs).
+type ClaimTables = (&'static str, &'static [&'static str], &'static [(&'static str, &'static str)]);
+
+fn prop_claim_tables(claimer: usize) -> ClaimTables {
+    if claimer < PROP_GETS.len() {
+        let (name, words) = member_claims::CLAIMS[claimer];
+        (name, words, member_claims::CLAIMS_PAIRS[claimer].1)
+    } else {
+        let d = plugin_api::registered().expect("no domain registered for this slot");
+        (d.name, d.claims, d.claim_pairs)
+    }
+}
+
+fn newindex_claim_tables(claimer: usize) -> ClaimTables {
+    if claimer < NEWINDEXES.len() {
+        let (name, words) = member_claims::NEWINDEX_CLAIMS[claimer];
+        (name, words, member_claims::NEWINDEX_CLAIMS_PAIRS[claimer].1)
+    } else {
+        let d = plugin_api::registered().expect("no domain registered for this slot");
+        (d.name, d.newindex_claims, d.newindex_claim_pairs)
+    }
+}
+
+fn call_claim_tables(claimer: usize) -> ClaimTables {
+    if claimer < CALLS.len() {
+        let (name, words) = member_claims::CALL_CLAIMS[claimer];
+        (name, words, member_claims::CALL_CLAIMS_PAIRS[claimer].1)
+    } else {
+        let d = plugin_api::registered().expect("no domain registered for this slot");
+        (d.name, d.call_claims, d.call_claim_pairs)
+    }
+}
+
+/// runtime_ext's (or editable's) tables: the entry after the domains in
+/// member_claims.rs, which is the last one.
+fn ext_claim_tables() -> (&'static [&'static str], &'static [(&'static str, &'static str)]) {
+    (member_claims::CLAIMS[PROP_GETS.len()].1, member_claims::CLAIMS_PAIRS[PROP_GETS.len()].1)
+}
+
+/// Whether a claimer's code names `key` for `class`: anywhere as a bare
+/// literal, or in a literal pair ("Class", "key") whose first word is a
+/// class `class` is (a first word that names no class constrains nothing).
+fn claimed_in(words: &[&str], pairs: &[(&str, &str)], class: &str, key: &str) -> bool {
+    if words.binary_search(&key).is_ok() {
         return true;
     }
-    let pairs = pairs[claimer].1;
     let start = pairs.partition_point(|(k, _)| *k < key);
     pairs[start..]
         .iter()
         .take_while(|(k, _)| *k == key)
-        .any(|(_, c)| !is_class(c) || crate::doc::is_a(class, c))
+        .any(|(_, c)| !is_class(c) || rustudio_core::doc::is_a(class, c))
+}
+
+/// Whether slot `claimer`'s prop_get code names `key` for `class`.
+fn claimed(claimer: usize, class: &str, key: &str) -> bool {
+    let (_, words, pairs) = prop_claim_tables(claimer);
+    claimed_in(words, pairs, class, key)
 }
 
 fn is_class(name: &str) -> bool {
-    crate::doc::db().classes.contains_key(name) || crate::api::get().is_some_and(|a| a.classes.contains_key(name))
+    rustudio_core::doc::db().classes.contains_key(name) || rustudio_core::api::get().is_some_and(|a| a.classes.contains_key(name))
 }
 
 /// Classes a domain answers any member of (its prop_get looks the key up
@@ -202,25 +269,28 @@ const ANY_KEY: &[(&str, &str)] = &[
 /// member_claims), and those answering any member of the class (ANY_KEY).
 pub fn claims(class: &str, key: &str) -> u16 {
     let mut bits = 0u16;
-    for (i, (name, _)) in PROP_GETS.iter().enumerate() {
-        debug_assert_eq!(member_claims::CLAIMS[i].0, *name);
+    let mut i = 0;
+    while let Some((name, _)) = prop_get_at(i) {
+        debug_assert_eq!(prop_claim_tables(i).0, name);
         if class_listed(ANY_KEY, name, class) || claimed(i, class, key) {
             bits |= 1 << i;
         }
+        i += 1;
     }
     bits
 }
 
 /// Whether runtime_ext's prop_get (or editable's) can answer `key`.
 pub fn ext_claims(class: &str, key: &str) -> bool {
-    debug_assert_eq!(member_claims::CLAIMS[14].0, "ext");
-    claimed(14, class, key)
+    let (words, pairs) = ext_claim_tables();
+    claimed_in(words, pairs, class, key)
 }
 
 type NewIndex = fn(&Lua, Ref, &str, &str, &Value) -> mlua::Result<bool>;
 
-/// The domains' newindex (same order as PROP_GETS).
-static NEWINDEXES: [(&str, NewIndex); 14] = [
+/// The built-in domains' newindex (same order as PROP_GETS); the
+/// registered domain fills the slot after them ([`newindex_at`]).
+static NEWINDEXES: [(&str, NewIndex); 13] = [
     ("pages", pages::newindex),
     ("web_social", web_social::newindex),
     ("avatar", avatar::newindex),
@@ -234,8 +304,16 @@ static NEWINDEXES: [(&str, NewIndex); 14] = [
     ("players_chat", players_chat::newindex),
     ("assets_cloud", assets_cloud::newindex),
     ("testing", testing::newindex),
-    ("plugin", plugin::newindex),
 ];
+
+/// Entry `i` of the newindex chain (see [`prop_get_at`]).
+fn newindex_at(i: usize) -> Option<(&'static str, NewIndex)> {
+    match NEWINDEXES.get(i) {
+        Some((name, f)) => Some((name, *f)),
+        None if i == NEWINDEXES.len() => plugin_api::registered().map(|d| (d.name, d.newindex)),
+        None => None,
+    }
+}
 
 /// Classes a domain's newindex acts on for any member (ANY_KEY's, for
 /// writes).
@@ -275,33 +353,37 @@ fn class_listed(list: &[(&str, &str)], domain: &str, class: &str) -> bool {
 /// Which domains' newindex can take `class.key = v` (see `claims`).
 pub fn newindex_claims(class: &str, key: &str) -> u16 {
     let mut bits = 0u16;
-    for (i, (name, _)) in NEWINDEXES.iter().enumerate() {
-        debug_assert_eq!(member_claims::NEWINDEX_CLAIMS[i].0, *name);
-        if class_listed(NEWINDEX_ANY, name, class)
-            || claimed_in(member_claims::NEWINDEX_CLAIMS, member_claims::NEWINDEX_CLAIMS_PAIRS, i, class, key)
-        {
+    let mut i = 0;
+    while let Some((name, _)) = newindex_at(i) {
+        let (slot, words, pairs) = newindex_claim_tables(i);
+        debug_assert_eq!(slot, name);
+        if class_listed(NEWINDEX_ANY, name, class) || claimed_in(words, pairs, class, key) {
             bits |= 1 << i;
         }
+        i += 1;
     }
     bits
 }
 
 /// Whether runtime_ext's newindex can take `class.key = v`.
 pub fn ext_newindex_claims(class: &str, key: &str) -> bool {
-    claimed_in(member_claims::NEWINDEX_CLAIMS, member_claims::NEWINDEX_CLAIMS_PAIRS, 14, class, key)
+    let (_, words) = member_claims::NEWINDEX_CLAIMS[NEWINDEXES.len()];
+    claimed_in(words, member_claims::NEWINDEX_CLAIMS_PAIRS[NEWINDEXES.len()].1, class, key)
 }
 
 /// `newindex` over the domains in `mask` only. (Check mode: over all of
 /// them, as before routes, reporting a skipped one that takes the write.)
 pub fn newindex_masked(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value, mask: u16) -> mlua::Result<bool> {
     if route_check_on() {
-        for (i, (name, f)) in NEWINDEXES.iter().enumerate() {
+        let mut i = 0;
+        while let Some((name, f)) = newindex_at(i) {
             if f(lua, r, class, key, value)? {
                 if mask & (1 << i) == 0 {
                     eprintln!("ROUTE MISS domain {name} takes {class}.{key} =");
                 }
                 return Ok(true);
             }
+            i += 1;
         }
         return Ok(false);
     }
@@ -309,8 +391,10 @@ pub fn newindex_masked(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value,
     while m != 0 {
         let i = m.trailing_zeros() as usize;
         m &= m - 1;
-        if (NEWINDEXES[i].1)(lua, r, class, key, value)? {
-            return Ok(true);
+        if let Some((_, f)) = newindex_at(i) {
+            if f(lua, r, class, key, value)? {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -318,9 +402,10 @@ pub fn newindex_masked(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value,
 
 type Call = fn(&Lua, &str, Ref, &MultiValue) -> Option<mlua::Result<MultiValue>>;
 
-/// The domains' call, their METHODS and LUA_METHODS (same order as
-/// PROP_GETS).
-static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 14] = [
+/// The built-in domains' call, their METHODS and LUA_METHODS (same order
+/// as PROP_GETS); the registered domain fills the slot after them
+/// ([`call_at`]).
+static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 13] = [
     ("pages", pages::call, pages::METHODS, pages::LUA_METHODS),
     ("web_social", web_social::call, web_social::METHODS, web_social::LUA_METHODS),
     ("avatar", avatar::call, avatar::METHODS, avatar::LUA_METHODS),
@@ -334,8 +419,16 @@ static CALLS: [(&str, Call, &[(&str, &str)], &[(&str, &str)]); 14] = [
     ("players_chat", players_chat::call, players_chat::METHODS, players_chat::LUA_METHODS),
     ("assets_cloud", assets_cloud::call, assets_cloud::METHODS, assets_cloud::LUA_METHODS),
     ("testing", testing::call, testing::METHODS, &[]),
-    ("plugin", plugin::call, plugin::METHODS, plugin::LUA_METHODS),
 ];
+
+/// Entry `i` of the call chain (see [`prop_get_at`]).
+fn call_at(i: usize) -> Option<(&'static str, Call, &'static [(&'static str, &'static str)], &'static [(&'static str, &'static str)])> {
+    match CALLS.get(i) {
+        Some((name, f, methods, lua_methods)) => Some((name, *f, methods, lua_methods)),
+        None if i == CALLS.len() => plugin_api::registered().map(|d| (d.name, d.call, d.methods, d.lua_methods)),
+        None => None,
+    }
+}
 
 /// Domain methods declared on a base class only for the objects the core
 /// runtime doesn't cover, whose answer for the others is the core's: there
@@ -362,15 +455,17 @@ pub fn call_claims(class: &str, name: &str, core: bool, core_base: Option<&str>)
 pub fn call_claims_shadow(class: &str, name: &str, _core: bool, core_base: Option<&str>) -> (u16, u16) {
     let mut bits = 0u16;
     let mut shadowed = 0u16;
-    for (i, (d, _, methods, lua_methods)) in CALLS.iter().enumerate() {
-        debug_assert_eq!(member_claims::CALL_CLAIMS[i].0, *d);
+    let mut i = 0;
+    while let Some((d, _, methods, lua_methods)) = call_at(i) {
+        let (slot, claim_words, claim_pairs) = call_claim_tables(i);
+        debug_assert_eq!(slot, d);
         let mut hidden = false;
         let listed = methods.iter().chain(lua_methods.iter()).any(|(m, b)| {
-            if *m != name || !crate::doc::is_a(class, b) {
+            if *m != name || !rustudio_core::doc::is_a(class, b) {
                 return false;
             }
             let shown = core_base.is_none_or(|cb| {
-                *b == cb || !crate::doc::is_a(cb, b) || !DEFERS_TO_CORE.iter().any(|(dd, mm)| dd == d && mm == m)
+                *b == cb || !rustudio_core::doc::is_a(cb, b) || !DEFERS_TO_CORE.iter().any(|(dd, mm)| *dd == d && mm == m)
             });
             hidden |= !shown;
             shown
@@ -381,9 +476,10 @@ pub fn call_claims_shadow(class: &str, name: &str, _core: bool, core_base: Optio
         // Domains answer before core, as the old chain did: a domain that
         // handles a method core also has (world_part's assembly-aware
         // ApplyImpulse over core's single-part one) must still be asked.
-        if listed || claimed_in(member_claims::CALL_CLAIMS, member_claims::CALL_CLAIMS_PAIRS, i, class, name) {
+        if listed || claimed_in(claim_words, claim_pairs, class, name) {
             bits |= 1 << i;
         }
+        i += 1;
     }
     (bits, shadowed & !bits)
 }
@@ -404,18 +500,22 @@ pub fn call_masked_check(
 ) -> Option<mlua::Result<MultiValue>> {
     if route_check_on() {
         // (Only reports: a skipped domain that would answer.)
-        for (i, (d, f, _, _)) in CALLS.iter().enumerate() {
+        let mut i = 0;
+        while let Some((d, f, _, _)) = call_at(i) {
             if (mask | shadowed) & (1 << i) == 0 && f(lua, name, this, args).is_some() {
                 eprintln!("ROUTE MISS domain {d} calls {name}");
             }
+            i += 1;
         }
     }
     let mut m = mask;
     while m != 0 {
         let i = m.trailing_zeros() as usize;
         m &= m - 1;
-        if let Some(r) = (CALLS[i].1)(lua, name, this, args) {
-            return Some(r);
+        if let Some((_, f, _, _)) = call_at(i) {
+            if let Some(r) = f(lua, name, this, args) {
+                return Some(r);
+            }
         }
     }
     None
@@ -431,20 +531,24 @@ pub fn route_check_on() -> bool {
 /// `prop_get` over the domains in `mask` only (see `claims`).
 pub fn prop_get_masked(lua: &Lua, r: Ref, class: &str, key: &str, mask: u16) -> mlua::Result<Option<Value>> {
     if route_check_on() {
-        for (i, (name, f)) in PROP_GETS.iter().enumerate() {
+        let mut i = 0;
+        while let Some((name, f)) = prop_get_at(i) {
             if mask & (1 << i) == 0 {
                 if let Ok(Some(_)) | Err(_) = f(lua, r, class, key) {
                     eprintln!("ROUTE MISS domain {name} answers {class}.{key}");
                 }
             }
+            i += 1;
         }
     }
     let mut m = mask;
     while m != 0 {
         let i = m.trailing_zeros() as usize;
         m &= m - 1;
-        if let Some(v) = (PROP_GETS[i].1)(lua, r, class, key)? {
-            return Ok(Some(v));
+        if let Some((_, f)) = prop_get_at(i) {
+            if let Some(v) = f(lua, r, class, key)? {
+                return Ok(Some(v));
+            }
         }
     }
     Ok(None)
@@ -467,7 +571,7 @@ pub fn write_acts(class: &str, key: &str) -> bool {
         || players_chat::write_acts(class, key)
         || assets_cloud::write_acts(class, key)
         || testing::write_acts(class, key)
-        || plugin::write_acts(class, key)
+        || plugin_api::registered().is_some_and(|d| (d.write_acts)(class, key))
 }
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
@@ -484,63 +588,67 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     players_chat::install(lua)?;
     assets_cloud::install(lua)?;
     testing::install(lua)?;
-    plugin::install(lua)?;
+    if let Some(d) = plugin_api::registered() {
+        (d.install)(lua)?;
+    }
     Ok(())
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     {
-        let _s = crate::bench::scope("dstep_pages");
+        let _s = rustudio_core::bench::scope("dstep_pages");
         pages::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_web_social");
+        let _s = rustudio_core::bench::scope("dstep_web_social");
         web_social::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_avatar");
+        let _s = rustudio_core::bench::scope("dstep_avatar");
         avatar::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_data");
+        let _s = rustudio_core::bench::scope("dstep_data");
         data::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_anim");
+        let _s = rustudio_core::bench::scope("dstep_anim");
         anim::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_world");
+        let _s = rustudio_core::bench::scope("dstep_world");
         world::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_geometry");
+        let _s = rustudio_core::bench::scope("dstep_geometry");
         geometry::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_gui_input");
+        let _s = rustudio_core::bench::scope("dstep_gui_input");
         gui_input::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_media");
+        let _s = rustudio_core::bench::scope("dstep_media");
         media::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_services");
+        let _s = rustudio_core::bench::scope("dstep_services");
         services::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_players_chat");
+        let _s = rustudio_core::bench::scope("dstep_players_chat");
         players_chat::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_assets_cloud");
+        let _s = rustudio_core::bench::scope("dstep_assets_cloud");
         assets_cloud::step(lua, dt)?;
     }
     {
-        let _s = crate::bench::scope("dstep_testing");
+        let _s = rustudio_core::bench::scope("dstep_testing");
         testing::step(lua, dt)?;
     }
-    plugin::step(lua, dt)?;
+    if let Some(d) = plugin_api::registered() {
+        (d.step)(lua, dt)?;
+    }
     Ok(())
 }

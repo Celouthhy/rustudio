@@ -62,12 +62,32 @@ struct Store {
 
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
 
+/// The store as core (document, asset and texture caches) sees it.
+struct Source;
+static INSTALLED: Source = Source;
+
+impl rustudio_core::editable_source::EditableSource for Source {
+    fn content_uri(&self, obj: Ref, user: Option<(Ref, &str)>) -> Option<String> {
+        content_uri(obj, user)
+    }
+    fn image_pixels(&self, id: &str) -> Option<(u64, rustudio_core::texture::Rgba)> {
+        image_pixels(id)
+    }
+    fn is_live(&self, id: &str) -> bool {
+        is_live(id)
+    }
+    fn live_build(&self, id: &str) -> Option<(Vec<rustudio_core::vertex::Vertex>, Vec3)> {
+        live_build(id)
+    }
+}
+
+
+
 fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     let mut g = STORE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(Store::default))
 }
 
-const IMG_PREFIX: &str = "rbxtemp://rustudio/editable/img/";
 const MESH_PREFIX: &str = "rbxtemp://rustudio/editable/";
 /// Content ids of engine-made images Roblox shows as ContentSourceType.Opaque.
 pub const OPAQUE_PREFIX: &str = "rbxtemp://rustudio/opaque/";
@@ -81,57 +101,23 @@ pub fn content_uri(obj: Ref, user: Option<(Ref, &str)>) -> Option<String> {
             if let Some((r, p)) = user {
                 img.users.insert((r, rbx_dom_weak::ustr(p)));
             }
-            return Some(format!("{IMG_PREFIX}{}@{}", img.n, img.gen));
+            return Some(format!("{}{}@{}", rustudio_core::editable_source::IMG_PREFIX, img.n, img.gen));
         }
         let m = lock(s.meshes.get(&obj)?);
         (m.gen > 0).then(|| format!("{MESH_PREFIX}mesh/{}@{}", m.n, m.gen))
     })
 }
 
-/// For a texture cache: `rbxtemp://rustudio/editable/img/<n>@<gen>` → the
-/// key without the generation and the generation.
-pub fn image_key(id: &str) -> Option<(&str, u64)> {
-    let rest = id.strip_prefix(IMG_PREFIX)?;
-    let at = rest.find('@')?;
-    let gen = rest[at + 1..].parse().ok()?;
-    Some((&id[..IMG_PREFIX.len() + at], gen))
-}
-
-/// A cache key with every editable image generation taken out (composites
-/// name several ids), or None when it names none.
-pub fn strip_generations(key: &str) -> Option<String> {
-    if !key.contains(IMG_PREFIX) {
-        return None;
-    }
-    let mut out = String::with_capacity(key.len());
-    let mut rest = key;
-    while let Some(i) = rest.find(IMG_PREFIX) {
-        let after = i + IMG_PREFIX.len();
-        out.push_str(&rest[..after]);
-        let tail = &rest[after..];
-        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-        out.push_str(&tail[..digits]);
-        let mut t = &tail[digits..];
-        if let Some(g) = t.strip_prefix('@') {
-            let gd = g.bytes().take_while(u8::is_ascii_digit).count();
-            t = &g[gd..];
-        }
-        rest = t;
-    }
-    out.push_str(rest);
-    Some(out)
-}
-
 /// The pixels of an editable image id (any generation: the current ones).
-pub fn image_pixels(id: &str) -> Option<(u64, crate::texture::Rgba)> {
-    let rest = id.strip_prefix(IMG_PREFIX)?;
+pub fn image_pixels(id: &str) -> Option<(u64, rustudio_core::texture::Rgba)> {
+    let rest = id.strip_prefix(rustudio_core::editable_source::IMG_PREFIX)?;
     let n: u64 = rest.split('@').next()?.parse().ok()?;
     with(|s| {
         let r = *s.image_by_n.get(&n)?;
         let img = s.images.get(&r)?;
         Some((
             img.gen,
-            crate::texture::Rgba { width: img.w.max(1), height: img.h.max(1), pixels: (*img.px).clone() },
+            rustudio_core::texture::Rgba { width: img.w.max(1), height: img.h.max(1), pixels: (*img.px).clone() },
         ))
     })
 }
@@ -221,8 +207,11 @@ pub fn content_value(lua: &Lua, c: &Content) -> mlua::Result<Value> {
     Ok(Value::UserData(lua.create_userdata(LContent(c.clone()))?))
 }
 
-/// Puts the `Content` global in place (over library.luau's string version).
+/// Puts the `Content` global in place (over library.luau's string version)
+/// and tells core where the store is (the document and the caches read it
+/// through `editable_source`).
 pub fn install(lua: &Lua) -> mlua::Result<()> {
+    rustudio_core::editable_source::install(&INSTALLED);
     let t = lua.create_table()?;
     t.set("none", LContent(Content::none()))?;
     t.set(
@@ -494,7 +483,7 @@ pub fn external_image(key: Ref, w: u32, h: u32, px: Vec<u8>) -> String {
             s.images.insert(key, Image { n, ..new_image(w, h, px) });
         }
         let img = &s.images[&key];
-        format!("{IMG_PREFIX}{}@{}", img.n, img.gen)
+        format!("{}{}@{}", rustudio_core::editable_source::IMG_PREFIX, img.n, img.gen)
     })
 }
 
@@ -556,8 +545,8 @@ fn asset_call(lua: &Lua, name: &str, args: &MultiValue) -> mlua::Result<MultiVal
                 ContentType::Object(r) => with(|s| s.images.get(r).map(|i| new_image(i.w, i.h, (*i.px).clone())))
                     .ok_or_else(|| rt_err("CreateEditableImageAsync: the object is not an EditableImage"))?,
                 ContentType::Uri(u) => {
-                    let bytes = crate::assets::script_content_blocking(u).map_err(|e| rt_err(format!("CreateEditableImageAsync: {e}")))?;
-                    let d = crate::texture::decode(&bytes).map_err(|e| rt_err(format!("CreateEditableImageAsync: {e}")))?;
+                    let bytes = rustudio_core::assets::script_content_blocking(u).map_err(|e| rt_err(format!("CreateEditableImageAsync: {e}")))?;
+                    let d = rustudio_core::texture::decode(&bytes).map_err(|e| rt_err(format!("CreateEditableImageAsync: {e}")))?;
                     new_image(d.width, d.height, d.pixels)
                 }
                 _ => return Err(rt_err("CreateEditableImageAsync: empty Content")),
@@ -852,15 +841,15 @@ fn image_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
 // ------------------------------------------------------------------ meshes
 
 fn mesh_from_uri(uri: &str) -> mlua::Result<Mesh> {
-    let bytes = crate::assets::generated(uri)
+    let bytes = rustudio_core::assets::generated(uri)
         .map(Ok)
-        .unwrap_or_else(|| crate::assets::script_content_blocking(uri))
+        .unwrap_or_else(|| rustudio_core::assets::script_content_blocking(uri))
         .map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
-    if let Some(st) = crate::mesh::stored(&bytes) {
-        let skin = if st.major >= 4 { crate::mesh::parse(&bytes).ok().and_then(|d| d.skin) } else { None };
+    if let Some(st) = rustudio_core::mesh::stored(&bytes) {
+        let skin = if st.major >= 4 { rustudio_core::mesh::parse(&bytes).ok().and_then(|d| d.skin) } else { None };
         return Ok(Mesh::from_stored(&st, skin.as_ref()));
     }
-    let d = crate::mesh::parse(&bytes).map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
+    let d = rustudio_core::mesh::parse(&bytes).map_err(|e| rt_err(format!("CreateEditableMeshAsync: {e}")))?;
     Ok(Mesh::from_mesh_data(&d))
 }
 
@@ -878,7 +867,7 @@ fn snapshot(r: Ref) -> Option<(String, Vec3, Vec3)> {
         Some((Some(b), lo, hi, format!("{MESH_PREFIX}mesh/{}@{}", m.n, m.gen)))
     })?;
     if let Some(bytes) = bytes {
-        crate::assets::register_generated(&id, bytes);
+        rustudio_core::assets::register_generated(&id, bytes);
     }
     Some((id, lo, hi))
 }
@@ -966,7 +955,7 @@ pub fn show_mesh(lua: &Lua, part: Ref, em: Option<Ref>, centre: Vec3) -> mlua::R
             }) else {
                 return Ok(());
             };
-            crate::assets::register_generated(&id, bytes);
+            rustudio_core::assets::register_generated(&id, bytes);
             Some(id)
         }
         None => None,
@@ -1072,7 +1061,7 @@ struct Copy {
     tint: bool,
     /// Faces of more than 3 vertices: automatic normals by face.
     polys: bool,
-    verts: Vec<crate::render::Vertex>,
+    verts: Vec<rustudio_render::render::Vertex>,
 }
 
 #[derive(Default)]
@@ -1194,11 +1183,11 @@ fn quant(x: f32) -> f32 {
 /// unit normal (the triangle's when none) × extent, UV, colour bytes.
 fn gpu_vertex(
     p: Vec3, n: Option<Vec3>, flat: Vec3, uv: Vec2, c: ([f32; 3], f32), tint: bool, centre: Vec3, extent: Vec3,
-) -> crate::render::Vertex {
+) -> rustudio_render::render::Vertex {
     let face = flat.try_normalize().unwrap_or(Vec3::Y);
     let n = n.filter(|n| n.length_squared() > 1e-12).and_then(Vec3::try_normalize).unwrap_or(face);
     let color = if tint { [quant(c.0[0]), quant(c.0[1]), quant(c.0[2]), -1.0 - quant(c.1)] } else { [0.0; 4] };
-    crate::render::Vertex {
+    rustudio_render::render::Vertex {
         pos: ((p - centre) / extent).to_array(),
         normal: (n * extent).to_array(),
         uv: uv.to_array(),
@@ -1240,7 +1229,7 @@ fn build_copy(m: &Mesh, lo: Vec3, hi: Vec3) -> Copy {
 }
 
 /// The renderer's first copy of live mesh `id`: (vertices, extent).
-pub fn live_build(id: &str) -> Option<(Vec<crate::render::Vertex>, Vec3)> {
+pub fn live_build(id: &str) -> Option<(Vec<rustudio_render::render::Vertex>, Vec3)> {
     let (em, lo, hi) = live(|l| l.by_id.get(id).map(|x| (x.em, x.lo, x.hi)))?;
     let m = with(|s| s.meshes.get(&em).cloned());
     let Some(m) = m else {
@@ -1260,7 +1249,7 @@ pub fn live_build(id: &str) -> Option<(Vec<crate::render::Vertex>, Vec3)> {
 /// What the renderer does with a live id this frame.
 pub enum LivePatch {
     /// Write these runs of vertices (first corner, vertices) in place.
-    Ranges(Vec<(u32, Vec<crate::render::Vertex>)>),
+    Ranges(Vec<(u32, Vec<rustudio_render::render::Vertex>)>),
     /// Build it again (`live_build`, or its re-registered bytes when
     /// skinned) and redraw these parts.
     Rebuild { users: Vec<Ref>, skinned: bool },
@@ -1286,7 +1275,7 @@ pub fn live_resnap(id: &str) -> Vec<Ref> {
     };
     if let Some(m) = with(|s| s.meshes.get(&em).cloned()) {
         let (b, _, _) = lock(&m).to_mesh_bytes_about(Some(centre));
-        crate::assets::register_generated(id, b);
+        rustudio_core::assets::register_generated(id, b);
     }
     users
 }
@@ -1460,7 +1449,7 @@ pub fn sync_live() -> Vec<(String, LivePatch)> {
         });
         for (id, centre) in resnap {
             let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
-            crate::assets::register_generated(&id, b);
+            rustudio_core::assets::register_generated(&id, b);
         }
     }
     for (em, m) in dying {
@@ -1491,7 +1480,7 @@ fn drop_live(em: Ref, m: &Mesh) {
     });
     for (id, centre) in ids {
         let (b, _, _) = m.to_mesh_bytes_about(Some(centre));
-        crate::assets::register_generated(&id, b);
+        rustudio_core::assets::register_generated(&id, b);
     }
 }
 

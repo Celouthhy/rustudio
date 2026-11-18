@@ -17,7 +17,7 @@ use rbx_dom_weak::types::{CFrame, CustomPhysicalProperties, Enum, Matrix3, Physi
 use rbx_dom_weak::{ustr, InstanceBuilder};
 use serde_json::Value;
 
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::physics::Physics;
 
 fn f(v: &Value) -> f32 {
@@ -174,7 +174,7 @@ pub fn run(path: &str, out: Option<&str>) -> Result<(), String> {
         }
     };
     print(&mut w, 0, &d, &p);
-    let h = 1.0 / crate::mech::PHYSICS_HZ;
+    let h = 1.0 / rustudio_core::mech::PHYSICS_HZ;
     let per_tick = std::env::var_os("RUSTUDIO_BENCH_INSTR").is_some();
     let mut last = 0.0;
     // `at`: Luau run before a tick's step in Studio's lab. The one form the scenes use,
@@ -251,7 +251,7 @@ pub fn run(path: &str, out: Option<&str>) -> Result<(), String> {
                     let pos = Vec3::new((c[0] + origin[0]) as f32, (c[1] + origin[1]) as f32, (c[2] + origin[2]) as f32);
                     let g = |i: usize| c[3 + i] as f32;
                     let rot = glam::Mat3::from_cols(Vec3::new(g(0), g(3), g(6)), Vec3::new(g(1), g(4), g(7)), Vec3::new(g(2), g(5), g(8)));
-                    let xf = crate::math::Xform { pos, rot };
+                    let xf = rustudio_core::math::Xform { pos, rot };
                     p.harness_set_state(*r, &xf, Vec3::new(c[12] as f32, c[13] as f32, c[14] as f32), Vec3::new(c[15] as f32, c[16] as f32, c[17] as f32));
                 }
             }
@@ -261,8 +261,8 @@ pub fn run(path: &str, out: Option<&str>) -> Result<(), String> {
         }
         p.step(&mut d, h);
         if per_tick {
-            let (v, _) = crate::bench::section_total("sv_collide");
-            let (a, _) = crate::bench::section_total("ph_step_thread");
+            let (v, _) = rustudio_core::bench::section_total("sv_collide");
+            let (a, _) = rustudio_core::bench::section_total("ph_step_thread");
             if v > 0.0 {
                 writeln!(w, "# tick {t} sv_collide {:.3}", v - last).ok();
                 last = v;
@@ -278,7 +278,7 @@ pub fn run(path: &str, out: Option<&str>) -> Result<(), String> {
     if std::env::var_os("RUSTUDIO_BENCH_INSTR").is_some() {
         let mut line = String::from("# cost (M instr per tick)");
         for k in ["ph_step_thread", "sv_collide", "sv_gather", "sv_islands", "sv_solve", "sv_integrate"] {
-            let (v, n) = crate::bench::section_total(k);
+            let (v, n) = rustudio_core::bench::section_total(k);
             if n > 0 {
                 line += &format!(" {k} {:.4}", v / n as f64);
             }

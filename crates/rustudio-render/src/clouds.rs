@@ -29,7 +29,7 @@
 //!     (DefaultUnified*, SmoothCluster, SmoothWater, Grass). rustudio keeps
 //!     it in Globals.outdoor.w (shader.wgsl `sun_shadow`, `sun_cover`).
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use glam::Vec3;
 use rbx_dom_weak::types::Variant;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -236,7 +236,7 @@ fn decode_bc1(src: &[u8], w: u32, h: u32) -> Vec<u8> {
 /// A texture from Studio's content (`rbxasset://sky/…`), all its mips; a
 /// 1-texel stand-in when missing.
 fn content_texture(device: &wgpu::Device, queue: &wgpu::Queue, id: &str, three_d: bool) -> wgpu::TextureView {
-    let parsed = crate::assets::resolve(id, None)
+    let parsed = rustudio_core::assets::resolve(id, None)
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| read_dds(&b));
     if parsed.is_none() {
@@ -446,8 +446,8 @@ impl CloudsGpu {
             comp_pipe,
             sized: None,
             bsm_key: None,
-            started: crate::sim_clock::now(),
-            last: crate::sim_clock::now(),
+            started: rustudio_core::sim_clock::now(),
+            last: rustudio_core::sim_clock::now(),
             offset: Vec3::ZERO,
             readback: 0,
             mapped: Default::default(),
@@ -549,7 +549,7 @@ impl CloudsGpu {
         sun_y: f32,
         full: [u32; 2],
     ) {
-        let now = crate::sim_clock::now();
+        let now = rustudio_core::sim_clock::now();
         let dt = now.duration_since(self.last).as_secs_f32().min(1.0);
         self.last = now;
         self.active = true;
@@ -557,7 +557,7 @@ impl CloudsGpu {
         let time = std::env::var("RUSTUDIO_CLOUDS_TIME")
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or_else(|| crate::sim_clock::since(self.started).as_secs_f32());
+            .unwrap_or_else(|| rustudio_core::sim_clock::since(self.started).as_secs_f32());
         let wind = if look.wind.length() > WIND_MAX { look.wind.normalize() * WIND_MAX } else { look.wind };
         // fmodf: the sign follows the dividend.
         self.offset.x = (self.offset.x - WIND_KM * wind.x * dt) % WIND_WRAP;
@@ -699,7 +699,7 @@ mod tests {
             ("rbxasset://sky/cloudAdvection.dds", (256, 256, 1)),
             ("rbxasset://sky/bn.dds", (128, 128, 1)),
         ] {
-            let Some(b) = crate::assets::resolve(id, None).and_then(|p| std::fs::read(p).ok()) else {
+            let Some(b) = rustudio_core::assets::resolve(id, None).and_then(|p| std::fs::read(p).ok()) else {
                 eprintln!("{id}: no Studio content here, skipped");
                 continue;
             };

@@ -55,12 +55,12 @@ fn button(q: &mut Vec<Event>, p: Pos2, down: bool) {
 }
 
 fn pos_of(ed: &Editor, r: Ref) -> Vec3 {
-    crate::scene::xform_of(&ed.doc, r).map(|x| x.pos).unwrap_or(Vec3::NAN)
+    rustudio_render::scene::xform_of(&ed.game.doc, r).map(|x| x.pos).unwrap_or(Vec3::NAN)
 }
 
 fn cube(ed: &mut Editor, name: &str, at: Vec3) -> Ref {
-    let ws = ed.doc.default_parent();
-    ed.doc.insert(
+    let ws = ed.game.doc.default_parent();
+    ed.game.doc.insert(
         ws,
         InstanceBuilder::new("Part")
             .with_name(name)
@@ -73,30 +73,30 @@ fn cube(ed: &mut Editor, name: &str, at: Vec3) -> Ref {
 impl SelfTest {
     pub(super) fn tick_ui2(&mut self, f: u64, ed: &mut Editor) -> bool {
         let t = f.saturating_sub(self.ui2.started);
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         match (self.r4.phase, t) {
             // ------------------------------------------------------------ drag
             (105, _) if self.ui2.started == 0 => {
-                if ed.play.is_some() {
+                if ed.game.play.is_some() {
                     ed.stop_play();
                 }
                 ed.new_place();
                 ed.tool = crate::app::Tool::Select;
-                ed.snap_move = true;
-                ed.move_inc = 1.0;
-                ed.cam.pos = Vec3::new(0.0, 22.0, 34.0);
-                ed.cam.yaw = 0.0;
-                ed.cam.pitch = -0.55;
+                ed.game.snap_move = true;
+                ed.game.move_inc = 1.0;
+                ed.game.cam.pos = Vec3::new(0.0, 22.0, 34.0);
+                ed.game.cam.yaw = 0.0;
+                ed.game.cam.pitch = -0.55;
                 self.ui2 = Ui2Test { started: f, ..Default::default() };
             }
             (105, 2) => {
                 self.ui2.part = cube(ed, "DragMe", Vec3::new(0.3, 2.0, 0.2));
-                ed.doc.selection.clear();
+                ed.game.doc.selection.clear();
             }
             (105, 5) => {
                 self.ui2.start = pos_of(ed, self.ui2.part);
-                self.ui2.undo_before = ed.doc.can_undo().map(|s| s.to_string());
-                match ed.cam.project(vp, self.ui2.start + Vec3::Y * 1.9) {
+                self.ui2.undo_before = ed.game.doc.can_undo().map(|s| s.to_string());
+                match ed.game.cam.project(vp, self.ui2.start + Vec3::Y * 1.9) {
                     Some(p) => {
                         self.ui2.from = p;
                         button(&mut self.queue, p, true);
@@ -118,8 +118,8 @@ impl SelfTest {
                 let snapped = (now.x - now.x.round()).abs() < 1e-3 && (now.z - now.z.round()).abs() < 1e-3;
                 let resting = (now.y - 2.0).abs() < 1e-3;
                 let moved = (now - self.ui2.start).length() > 2.0;
-                let selected = ed.doc.selection == vec![self.ui2.part];
-                let undo = ed.doc.can_undo().map(|s| s.to_string());
+                let selected = ed.game.doc.selection == vec![self.ui2.part];
+                let undo = ed.game.doc.can_undo().map(|s| s.to_string());
                 ed.undo();
                 let back = (pos_of(ed, self.ui2.part) - self.ui2.start).length() < 1e-3;
                 self.steps.push(Step {
@@ -137,13 +137,13 @@ impl SelfTest {
             }
             // ---------------------------------------------------- live box select
             (106, 1) => {
-                ed.doc.selection.clear();
+                ed.game.doc.selection.clear();
                 self.ui2.part = cube(ed, "BoxA", Vec3::new(-4.0, 2.0, 0.0));
                 self.ui2.other = cube(ed, "BoxB", Vec3::new(5.0, 2.0, -2.0));
             }
             (106, 4) => {
-                let a = ed.cam.project(vp, pos_of(ed, self.ui2.part));
-                let b = ed.cam.project(vp, pos_of(ed, self.ui2.other));
+                let a = ed.game.cam.project(vp, pos_of(ed, self.ui2.part));
+                let b = ed.game.cam.project(vp, pos_of(ed, self.ui2.other));
                 match (a, b) {
                     (Some(a), Some(b)) => {
                         // From the sky above both to below-right of both.
@@ -161,20 +161,20 @@ impl SelfTest {
             }
             (106, 14) => {
                 // Still held: the box's parts must already be selected.
-                let live = ed.doc.selection.contains(&self.ui2.part) && ed.doc.selection.contains(&self.ui2.other);
+                let live = ed.game.doc.selection.contains(&self.ui2.part) && ed.game.doc.selection.contains(&self.ui2.other);
                 self.ui2.ok = live && ed.marquee.is_some();
-                self.ui2.notes.push(format!("while dragging: {} selected, both cubes: {live}", ed.doc.selection.len()));
+                self.ui2.notes.push(format!("while dragging: {} selected, both cubes: {live}", ed.game.doc.selection.len()));
                 button(&mut self.queue, self.ui2.to, false);
             }
             (106, 17) => {
-                let kept = ed.doc.selection.contains(&self.ui2.part) && ed.doc.selection.contains(&self.ui2.other);
+                let kept = ed.game.doc.selection.contains(&self.ui2.part) && ed.game.doc.selection.contains(&self.ui2.other);
                 self.steps.push(Step {
                     step: "box-select-live",
                     passed: self.ui2.ok && kept,
                     detail: format!("{}; after release both kept: {kept}", self.ui2.notes.join("; ")),
                 });
                 self.ui2.notes.clear();
-                ed.explorer.expanded.insert(ed.doc.default_parent());
+                ed.explorer.expanded.insert(ed.game.doc.default_parent());
                 self.r4.phase = 107;
                 self.ui2.started = f;
             }
@@ -202,7 +202,7 @@ impl SelfTest {
             // ------------------------------------------------- no chat hint in Play
             (108, 1) => ed.start_run(crate::studio_ui::RunType::Test),
             (108, 40) => {
-                let ready = ed.play.as_ref().map(|s| s.game.chat_ready_frames).unwrap_or(0);
+                let ready = ed.game.play.as_ref().map(|s| s.game.chat_ready_frames).unwrap_or(0);
                 ed.stop_play();
                 self.steps.push(Step {
                     step: "play-no-chat-hint",
@@ -222,8 +222,8 @@ impl SelfTest {
             }
             (109, 4) => {
                 use crate::output_panel::{kind_color, line_job, parse, Context, Kind, OutputState};
-                let n = ed.log.len();
-                let lines = &ed.log[n.saturating_sub(5)..];
+                let n = ed.game.log.len();
+                let lines = &ed.game.log[n.saturating_sub(5)..];
                 let st = OutputState::default();
                 let shown: Vec<_> = lines.iter().map(|l| (parse(l), l)).collect();
                 let kinds: Vec<Kind> = shown.iter().map(|(s, _)| s.kind).collect();

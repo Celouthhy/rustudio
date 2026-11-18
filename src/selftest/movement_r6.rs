@@ -1,7 +1,8 @@
 //! Deterministic controller traces; no renderer, wall clock, assets or account.
 use std::{collections::HashSet, path::Path};
 use glam::Vec3;
-use crate::{doc::{Document, new_part}, physics::{Physics, CharBody, HumShape}};
+use rustudio_core::doc::{Document, new_part};
+use rustudio_physics::physics::{Physics, CharBody, HumShape};
 
 pub(super) fn run(dir: &Path) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;

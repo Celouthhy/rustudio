@@ -27,7 +27,7 @@ use rbx_dom_weak::types::{
 };
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 /// Studio's template tabs (TemplatesPage: All, Blank, Gameplay, Themed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -444,8 +444,8 @@ pub fn build_dom(base: &[Inst], patch: Option<&Patch>) -> WeakDom {
 pub const FLAT_TERRAIN_VOXELS: ([i32; 3], [i32; 3]) = ([-256, -14, -256], [255, 1, 255]);
 
 fn flat_terrain_grid() -> Vec<u8> {
-    let mut v = crate::terrain::Voxels::empty();
-    let grass = crate::terrain::material_index("Grass").unwrap_or(2);
+    let mut v = rustudio_core::terrain::Voxels::empty();
+    let grass = rustudio_core::terrain::material_index("Grass").unwrap_or(2);
     let (lo, hi) = FLAT_TERRAIN_VOXELS;
     let cells = (lo[0]..=hi[0]).flat_map(move |x| {
         (lo[1]..=hi[1]).flat_map(move |y| (lo[2]..=hi[2]).map(move |z| ([x, y, z], (grass, 255u8, 0u16))))
@@ -487,7 +487,7 @@ const ORIGINAL_TECHNOLOGY: &str = "RBX_OriginalTechnologyOnFileLoad";
 /// Technology it was opened with.
 pub fn migrate_lighting(doc: &mut Document) {
     let Some(l) = doc.find_child(doc.dom.root_ref(), "Lighting") else { return };
-    let tech = crate::scene::enum_u32(doc.prop(l, "Technology")).unwrap_or(crate::mech::TECHNOLOGY_SOFT[1]);
+    let tech = rustudio_render::scene::enum_u32(doc.prop(l, "Technology")).unwrap_or(rustudio_core::mech::TECHNOLOGY_SOFT[1]);
     let Some(i) = doc.dom.get_by_ref_mut(l) else { return };
     let key = rbx_dom_weak::ustr("Attributes");
     let mut attrs = match i.properties.get(&key) {
@@ -495,7 +495,7 @@ pub fn migrate_lighting(doc: &mut Document) {
         _ => Attributes::default(),
     };
     if attrs.get(MIGRATED).is_none() {
-        let soft = crate::mech::TECHNOLOGY_SOFT.contains(&tech);
+        let soft = rustudio_core::mech::TECHNOLOGY_SOFT.contains(&tech);
         i.properties.insert(rbx_dom_weak::ustr("LightingStyle"), Variant::Enum(Enum::from_u32(u32::from(soft))));
         attrs.insert(MIGRATED.into(), Variant::Bool(true));
     }

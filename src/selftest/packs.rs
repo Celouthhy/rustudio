@@ -11,7 +11,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 /// (name, Enum.Material value, x) along z = 0, 4-stud cubes.
 pub const ROW: [(&str, u32, f32); 7] = [
@@ -27,9 +27,9 @@ pub const ROW: [(&str, u32, f32); 7] = [
 /// Mean grey level and its standard deviation over a 15 × 15 patch.
 fn patch(ed: &Editor, frame: &(u32, u32, Vec<u8>), p: Vec3) -> Option<(f32, f32)> {
     let (w, h, px) = frame;
-    let rect = ed.viewport_rect;
+    let rect = ed.game.viewport_rect;
     let scale = *w as f32 / rect.width().max(1.0);
-    let sp = ed.cam.project(rect, p)?;
+    let sp = ed.game.cam.project(rect, p)?;
     let (cx, cy) = (
         ((sp.x - rect.min.x) * scale) as i64,
         ((sp.y - rect.min.y) * scale) as i64,
@@ -93,10 +93,10 @@ impl SelfTest {
             }
             ed.set_document(doc);
             ed.show_grid = false;
-            ed.cam.pos = Vec3::new(0.0, 9.0, 24.0);
-            ed.cam.yaw = 0.0;
-            ed.cam.pitch = (-7.0f32).atan2(24.0);
-            ed.cam.fov_deg = 70.0;
+            ed.game.cam.pos = Vec3::new(0.0, 9.0, 24.0);
+            ed.game.cam.yaw = 0.0;
+            ed.game.cam.pitch = (-7.0f32).atan2(24.0);
+            ed.game.cam.fov_deg = 70.0;
             self.r6 = super::R6Test {
                 started: f,
                 ..Default::default()
@@ -107,11 +107,11 @@ impl SelfTest {
         // Wait for the packs (first run: downloads, ~10 MB a material).
         let entries: Vec<_> = ROW
             .iter()
-            .filter_map(|(_, m, _)| crate::matpack::entry(*m, true))
+            .filter_map(|(_, m, _)| rustudio_render::matpack::entry(*m, true))
             .collect();
         let pending = entries
             .iter()
-            .any(|e| matches!(crate::matpack::maps(e), crate::matpack::Lookup::Pending));
+            .any(|e| matches!(rustudio_render::matpack::maps(e), rustudio_render::matpack::Lookup::Pending));
         let waited = f.saturating_sub(self.r6.started);
         let t0 = *self.r6.t0.get_or_insert_with(std::time::Instant::now);
         if (pending && t0.elapsed().as_secs() < 240) || waited < 40 {
@@ -127,31 +127,31 @@ impl SelfTest {
         }
         let mut ok = true;
         let mut notes = Vec::new();
-        let frame = ed
+        let frame = ed.game
             .renderer
             .as_ref()
-            .zip(ed.render_state.as_ref())
+            .zip(ed.game.render_state.as_ref())
             .and_then(|(r, rs)| r.read_frame(rs));
         for (name, mat, x) in ROW {
-            let e = crate::matpack::entry(mat, true).expect("table entry");
-            let maps = match crate::matpack::maps(e) {
-                crate::matpack::Lookup::Ready(m) => m,
-                crate::matpack::Lookup::Pending => {
+            let e = rustudio_render::matpack::entry(mat, true).expect("table entry");
+            let maps = match rustudio_render::matpack::maps(e) {
+                rustudio_render::matpack::Lookup::Ready(m) => m,
+                rustudio_render::matpack::Lookup::Pending => {
                     ok = false;
                     notes.push(format!("{name}: pack {} still loading", e.pack));
                     continue;
                 }
-                crate::matpack::Lookup::Unavailable(why) => {
+                rustudio_render::matpack::Lookup::Unavailable(why) => {
                     ok = false;
                     notes.push(format!("{name}: pack {}: {why}", e.pack));
                     continue;
                 }
             };
-            let part = ed
+            let part = ed.game
                 .doc
                 .workspace()
-                .and_then(|ws| crate::default_scripts::child_named(&ed.doc, ws, name));
-            let draw = part.and_then(|r| ed.renderer.as_ref()?.item_draws(r)?.first().copied());
+                .and_then(|ws| rustudio_core::default_scripts::child_named(&ed.game.doc, ws, name));
+            let draw = part.and_then(|r| ed.game.renderer.as_ref()?.item_draws(r)?.first().copied());
             let layer = draw.map_or(-1, |d| d.mat_layer);
             let tiling = draw.map_or(0.0, |d| d.uvt[0]);
             let maps_found = ["colour", "normal", "roughness", "metalness", "height"]
@@ -172,7 +172,7 @@ impl SelfTest {
             let patterned = matches!(mat, 848 | 512 | 1280 | 800);
             let good = layer >= 0
                 && maps.found[0]
-                && (tiling - maps.tiling / crate::matpack::consts(mat, true)[5]).abs() < 1e-6
+                && (tiling - maps.tiling / rustudio_render::matpack::consts(mat, true)[5]).abs() < 1e-6
                 && (!patterned || contrast > 5.0);
             ok &= good;
             notes.push(format!(

@@ -216,9 +216,9 @@ pub fn entry(material: u32, use2022: bool) -> Option<&'static Entry> {
 /// tiling every STUDS_PER_TILE studs.
 pub fn consts(material: u32, use2022: bool) -> [f32; 6] {
     let rows = if use2022 {
-        &crate::mech::PART_MATERIAL_2022
+        &rustudio_core::mech::PART_MATERIAL_2022
     } else {
-        &crate::mech::PART_MATERIAL_PRE2022
+        &rustudio_core::mech::PART_MATERIAL_PRE2022
     };
     table(use2022)
         .iter()
@@ -231,9 +231,9 @@ pub fn consts(material: u32, use2022: bool) -> [f32; 6] {
 /// when old and new materials coexist; detail layers keep neutral defaults.
 pub fn full_consts(pack: u64) -> Option<&'static [f32; 21]> {
     for (entries, rows) in [
-        (&PRE_2022, &crate::mech::PART_MATERIAL_FULL_PRE2022),
-        (&Y2022, &crate::mech::PART_MATERIAL_FULL_2022),
-        (&Y2022_4K, &crate::mech::PART_MATERIAL_FULL_2022),
+        (&PRE_2022, &rustudio_core::mech::PART_MATERIAL_FULL_PRE2022),
+        (&Y2022, &rustudio_core::mech::PART_MATERIAL_FULL_2022),
+        (&Y2022_4K, &rustudio_core::mech::PART_MATERIAL_FULL_2022),
     ] {
         if let Some(i) = entries.iter().position(|e| e.pack != 0 && e.pack == pack) {
             return Some(&rows[i]);
@@ -247,9 +247,9 @@ pub fn full_consts(pack: u64) -> Option<&'static [f32; 21]> {
 /// uses nearest/wrap, matching slot 9's filter=0.
 pub fn wang_index() -> Vec<[f32; 4]> {
     let mut out = vec![[0.0; 4]; 1024];
-    let img = crate::assets::resolve(crate::mech::WANG_INDEX, None)
+    let img = rustudio_core::assets::resolve(rustudio_core::mech::WANG_INDEX, None)
         .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| crate::texture::decode(&b).ok());
+        .and_then(|b| rustudio_core::texture::decode(&b).ok());
     if let Some(img) = img.filter(|i| i.width == 128 && i.height == 128) {
         for (i, px) in img.pixels.chunks_exact(4).enumerate() {
             let cell = (px[0] / 64) as u32 | (((px[3] / 64) as u32) << 2);
@@ -263,8 +263,8 @@ pub fn wang_index() -> Vec<[f32; 4]> {
 /// FNV-1a; turns the hash into the part's offset. The renderer
 /// supplies a stable random referent identity in place of Studio's address.
 pub fn uv_offset(size: glam::Vec3, material: u32, identity: u64) -> [f32; 2] {
-    let hash = identity.to_le_bytes().iter().fold(crate::mech::MATERIAL_UV_FNV_OFFSET,
-        |h, b| (h ^ *b as u64).wrapping_mul(crate::mech::MATERIAL_UV_FNV_PRIME));
+    let hash = identity.to_le_bytes().iter().fold(rustudio_core::mech::MATERIAL_UV_FNV_OFFSET,
+        |h, b| (h ^ *b as u64).wrapping_mul(rustudio_core::mech::MATERIAL_UV_FNV_PRIME));
     let u = ((hash >> 3) & 63) as usize;
     let v = ((hash >> 9) & 63) as usize;
     if matches!(material, 256 | 272) {
@@ -274,7 +274,7 @@ pub fn uv_offset(size: glam::Vec3, material: u32, identity: u64) -> [f32; 2] {
         return [u as f32, v as f32];
     }
     let k = (size.x + size.y + size.z) * 0.5;
-    [u, v].map(|i| (crate::mech::MATERIAL_UV_RANDOM[i] * 2.0 - 1.0) * k)
+    [u, v].map(|i| (rustudio_core::mech::MATERIAL_UV_RANDOM[i] * 2.0 - 1.0) * k)
 }
 
 /// Studio's detiling noise (mech::DETILE_NOISE, 32 × 32): its red channel,
@@ -283,9 +283,9 @@ pub fn detile_noise() -> &'static [f32; 1024] {
     static N: OnceLock<[f32; 1024]> = OnceLock::new();
     N.get_or_init(|| {
         let mut out = [0.0f32; 1024];
-        let img = crate::assets::resolve(crate::mech::DETILE_NOISE, None)
+        let img = rustudio_core::assets::resolve(rustudio_core::mech::DETILE_NOISE, None)
             .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| crate::texture::decode(&b).ok());
+            .and_then(|b| rustudio_core::texture::decode(&b).ok());
         if let Some(img) = img.filter(|i| i.width == 32 && i.height == 32) {
             for (i, v) in out.iter_mut().enumerate() {
                 *v = img.pixels[i * 4] as f32 / 255.0;
@@ -307,40 +307,6 @@ pub fn fallback_albedo(material: u32, use2022: bool) -> [f32; 3] {
         Some(e) => rgb(e.color).map(|c| (c as f32 / 255.0).powi(2)),
         None => [1.0; 3],
     }
-}
-
-/// The child image ids a texture pack XML names.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Pack {
-    pub tiling: f32,
-    pub color: Option<u64>,
-    pub normal: Option<u64>,
-    pub roughness: Option<u64>,
-    pub metalness: Option<u64>,
-    pub height: Option<u64>,
-    pub emissive: Option<u64>,
-}
-
-pub fn parse_pack(xml: &str) -> Result<Pack, String> {
-    if !xml.contains("<roblox") || !xml.contains("texturepack_version") {
-        return Err("not a texture pack".into());
-    }
-    let field = |tag: &str| -> Option<&str> {
-        let open = xml.find(&format!("<{tag}"))?;
-        let start = open + xml[open..].find('>')? + 1;
-        let end = start + xml[start..].find(&format!("</{tag}>"))?;
-        Some(xml[start..end].trim())
-    };
-    let id = |tag: &str| field(tag).and_then(|v| v.parse::<u64>().ok());
-    Ok(Pack {
-        tiling: field("tiling").and_then(|v| v.parse().ok()).unwrap_or(1.0),
-        color: id("color"),
-        normal: id("normal"),
-        roughness: id("roughness"),
-        metalness: id("metalness"),
-        height: id("height"),
-        emissive: id("emissive"),
-    })
 }
 
 /// A pack's decoded maps: two RGBA8 mip chains and scalar height and
@@ -627,25 +593,25 @@ pub fn wait(e: &Entry, timeout: std::time::Duration) -> Lookup {
     }
 }
 
-fn image(id: u64) -> Result<crate::texture::Rgba, String> {
-    let bytes = crate::assets::public_cached(id)?;
-    let img = crate::texture::decode(&bytes).map_err(|e| format!("image {id}: {e}"))?;
+fn image(id: u64) -> Result<rustudio_core::texture::Rgba, String> {
+    let bytes = rustudio_core::assets::public_cached(id)?;
+    let img = rustudio_core::texture::decode(&bytes).map_err(|e| format!("image {id}: {e}"))?;
     Ok(resized(img, LAYER_SIZE))
 }
 
-fn resized(img: crate::texture::Rgba, size: u32) -> crate::texture::Rgba {
+fn resized(img: rustudio_core::texture::Rgba, size: u32) -> rustudio_core::texture::Rgba {
     if img.width == size && img.height == size {
         return img;
     }
     let Some(buf) = image::RgbaImage::from_raw(img.width, img.height, img.pixels) else {
-        return crate::texture::Rgba {
+        return rustudio_core::texture::Rgba {
             width: size,
             height: size,
             pixels: vec![255; (size * size * 4) as usize],
         };
     };
     let out = image::imageops::resize(&buf, size, size, image::imageops::FilterType::Triangle);
-    crate::texture::Rgba {
+    rustudio_core::texture::Rgba {
         width: size,
         height: size,
         pixels: out.into_raw(),
@@ -673,21 +639,21 @@ fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String>
         }
         return Ok((found, terrain));
     }
-    if pack_id & ACR_BIT != 0 {
+    if pack_id & rustudio_core::texture_pack::ACR_BIT != 0 {
         // Studio's own terrain textures, else the pack's maps.
-        let base = pack_id & !ACR_BIT;
+        let base = pack_id & !rustudio_core::texture_pack::ACR_BIT;
         return build_acr(base).or_else(|why| {
             eprintln!("terrain pack {base}: {why}; using its maps");
             build_pixels(base, color)
         });
     }
-    let registered = variant_packs().lock().expect("variant packs").get(&pack_id).cloned();
+    let registered = rustudio_core::texture_pack::variant_pack(pack_id);
     let pack = if let Some(pack) = registered { pack } else {
-        let xml = crate::assets::public_cached(pack_id)?;
-        parse_pack(&String::from_utf8_lossy(&xml)).map_err(|e| format!("pack {pack_id}: {e}"))?
+        let xml = rustudio_core::assets::public_cached(pack_id)?;
+        rustudio_core::texture_pack::parse_pack(&String::from_utf8_lossy(&xml)).map_err(|e| format!("pack {pack_id}: {e}"))?
     };
     let n = (LAYER_SIZE * LAYER_SIZE) as usize;
-    let get = |id: Option<u64>| -> Result<Option<crate::texture::Rgba>, String> {
+    let get = |id: Option<u64>| -> Result<Option<rustudio_core::texture::Rgba>, String> {
         id.map(image).transpose()
     };
     let colour = get(pack.color)?;
@@ -708,7 +674,7 @@ fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String>
     let mut surface = vec![0u8; n * 4];
     let mut emissive = vec![0u8; n * 4];
     for i in 0..n {
-        let px = |m: &Option<crate::texture::Rgba>, c: usize, none: u8| {
+        let px = |m: &Option<rustudio_core::texture::Rgba>, c: usize, none: u8| {
             m.as_ref().map_or(none, |m| m.pixels[i * 4 + c])
         };
         albedo[i * 4] = px(&colour, 0, r);
@@ -731,7 +697,7 @@ fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String>
 }
 
 /// Keep height linear through every mip; colour alpha remains a part tint mask.
-fn height_chain(image: Option<&crate::texture::Rgba>) -> Vec<u8> {
+fn height_chain(image: Option<&rustudio_core::texture::Rgba>) -> Vec<u8> {
     let n = (LAYER_SIZE * LAYER_SIZE) as usize;
     let mut rgba = vec![128; n * 4];
     if let Some(image) = image {
@@ -758,7 +724,7 @@ fn terrain_key(pack: u64) -> u64 {
     // (registered, bit 62) only have their maps. The terrain view is built
     // on the pack workers (it was a second copy of every pack's maps made
     // and kept on the main thread).
-    let pack = if acr_enabled() && pack & (1u64 << 62) == 0 { pack | ACR_BIT } else { pack };
+    let pack = if acr_enabled() && pack & (1u64 << 62) == 0 { pack | rustudio_core::texture_pack::ACR_BIT } else { pack };
     pack | TERRAIN_BIT
 }
 
@@ -812,6 +778,7 @@ pub fn mip_levels() -> Vec<(usize, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustudio_core::texture_pack::{is_variant_pack, parse_pack, register_terrain_variant, Pack};
 
     /// Part MaterialVariants share the terrain variant registry; their ids
     /// must be told apart from table packs (which keep their random uvOffset)
@@ -823,13 +790,13 @@ mod tests {
         assert!(is_variant_pack(id));
         for e in PRE_2022.iter().chain(Y2022.iter()).chain(Y2022_4K.iter()) {
             assert!(!is_variant_pack(e.pack) && !is_variant_pack(e.detail));
-            assert!(!is_variant_pack(e.pack | ACR_BIT));
+            assert!(!is_variant_pack(e.pack | rustudio_core::texture_pack::ACR_BIT));
         }
     }
 
     #[test]
     fn terrain_height_mips_are_linear_and_use_red() {
-        let image = crate::texture::Rgba {
+        let image = rustudio_core::texture::Rgba {
             width: LAYER_SIZE, height: LAYER_SIZE,
             pixels: [64, 190, 220, 255].repeat((LAYER_SIZE * LAYER_SIZE) as usize),
         };
@@ -859,7 +826,7 @@ mod tests {
         for e in PRE_2022.iter() {
             let (a, b) = (
                 fallback_albedo(e.material, false),
-                crate::mech::material_albedo(e.material),
+                rustudio_core::mech::material_albedo(e.material),
             );
             for c in 0..3 {
                 assert!((a[c] - b[c]).abs() < 0.015, "{} {a:?} {b:?}", e.material);
@@ -937,30 +904,6 @@ mod material_shading_contract {
     }
 }
 
-fn variant_packs() -> &'static Mutex<HashMap<u64, Pack>> {
-    static PACKS: OnceLock<Mutex<HashMap<u64, Pack>>> = OnceLock::new();
-    PACKS.get_or_init(Default::default)
-}
-
-/// A pack id from `register_terrain_variant` (a MaterialVariant's maps).
-pub fn is_variant_pack(pack: u64) -> bool {
-    pack & (1u64 << 62) != 0 && pack & ACR_BIT == 0
-}
-
-/// Route authored terrain maps through the regular asynchronous pack loader.
-pub fn register_terrain_variant(pack: Pack) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    [pack.color, pack.normal, pack.roughness, pack.metalness, pack.height].hash(&mut h);
-    // Bit 62 marks a variant; the hash must stay below ACR_BIT (bit 61), or
-    // `build` takes the variant for a Studio KTX2 pack, the KTX2 lookup 404s
-    // and its fallback asks for the id without bit 61, which nothing
-    // registered (Laser Tag's Walkway / MossGrass / Moss drew flat white).
-    let id = (h.finish() & (ACR_BIT - 1)) | (1u64 << 62);
-    variant_packs().lock().expect("variant packs").entry(id).or_insert(pack);
-    id
-}
-
 /// A loaded pack's mean colour (sRGB unit RGB), averaged in linear light
 /// (γ 2.2) over its top level. Studio's decoration grass takes its blade
 /// base colour from the grass layer's mean albedo: the 2022 Grass colour map
@@ -1003,8 +946,6 @@ fn top_level_mean(albedo: &[u8]) -> [f32; 3] {
 // The raw maps stay the fallback (offline without a cache, or
 // RUSTUDIO_TERRAIN_ACR=0).
 
-/// Key bit: the pack's maps built from its KTX2 representations.
-const ACR_BIT: u64 = 1 << 61;
 
 /// The three representations: (priority list, base64 of
 /// [{"format":"ktx2","majorVersion":"7rdo","fidelity":…}], fidelity bytes).
@@ -1023,7 +964,7 @@ fn acr_enabled() -> bool {
 /// (anonymous, as for public assets).
 fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
     let (list, fid) = ACR_REPS[rep];
-    let path = crate::assets::cache_dir().join("assets").join(format!("{pack}_acr_ktx2-7rdo-{fid}.ktx2"));
+    let path = rustudio_core::assets::cache_dir().join("assets").join(format!("{pack}_acr_ktx2-7rdo-{fid}.ktx2"));
     if let Ok(b) = std::fs::read(&path) {
         return Ok(b);
     }
@@ -1047,8 +988,8 @@ fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("pack {pack} ktx2: {e}"))?;
     let mut text = r.body_mut().read_to_string().map_err(|e| format!("pack {pack} ktx2: {e}"))?;
     let mut loc = location(&text);
-    if loc.is_none() && crate::assets::wait_for_session(std::time::Duration::from_secs(30)) {
-        let session = crate::assets::session_client()
+    if loc.is_none() && rustudio_core::assets::wait_for_session(std::time::Duration::from_secs(30)) {
+        let session = rustudio_core::assets::session_client()
             .and_then(|c| Some(c.lock().ok()?.as_ref()?.session.downloader()));
         if let Some(session) = session {
             let place = rustudio_account::session::PLACE_CONTEXT.load(Ordering::Relaxed).to_string();
@@ -1220,7 +1161,7 @@ fn build_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
         .collect::<Result<Vec<_>, _>>()?;
     let (mut albedo, mut surface, mut height, mut emissive) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // Pre-2022 packs come as YCoCg, 2022 packs as RGB + tint mask.
-    let ycocg = crate::terrain_mat::pre2022_pack(pack);
+    let ycocg = rustudio_core::terrain_mat::pre2022_pack(pack);
     for (_, size) in mip_levels() {
         let [a, n, s] = [0, 1, 2].map(|i| acr_level(&reps[i], size));
         for ((a, n), s) in a.chunks_exact(4).zip(n.chunks_exact(4)).zip(s.chunks_exact(4)) {

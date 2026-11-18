@@ -25,7 +25,7 @@ editor's own text.
 Read straight from the Studio install at run time (read only, never
 copied; found as `RUSTUDIO_STUDIO_DIR`, else the folder the content link
 points into, else the copy rustudio downloads on first run from Roblox's
-deployment CDN into `~/.local/share/rustudio/studio` (`src/studio_content.rs`),
+deployment CDN into `~/.local/share/rustudio/studio` (`crates/rustudio-core/src/studio_content.rs`),
 else `~/.local/share/rustudio/studio`):
 
 | File in the game's folder | Used for |

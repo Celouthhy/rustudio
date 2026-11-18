@@ -6,10 +6,15 @@ use glam::{Mat3, Vec3, Vec4};
 use rbx_dom_weak::types::{BrickColor, Ref, Variant};
 use rbx_dom_weak::{Instance, Ustr};
 
-use crate::doc::{self, DocKind, Document};
-use crate::math::Xform;
-use crate::mech;
+use rustudio_core::doc::{self, DocKind, Document};
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
 use crate::render::{LineVertex, MeshKind, PartDraw};
+
+pub use rustudio_core::doc::{content_string, enum_u32, use_2022_materials};
+
+// Unions are solved in core (`mesh::union_mesh`): physics collides them.
+pub use rustudio_core::mesh::{union_mesh, MeshAsset};
 
 /// A part in the scene, with the ref it came from.
 #[derive(Debug, Clone)]
@@ -32,7 +37,7 @@ pub struct ScenePart {
     pub clothing: Option<(String, Option<String>, Option<String>)>,
     /// An R15 body MeshPart under that clothing: its character's atlas
     /// colours (assets::r15_composite).
-    pub r15_look: Option<crate::assets::R15Look>,
+    pub r15_look: Option<rustudio_core::assets::R15Look>,
     /// Locked parts can't be clicked in the viewport.
     pub locked: bool,
     /// A MaterialVariant replaces the material's own texture pack.
@@ -226,7 +231,7 @@ fn character_clothing(
     Option<(String, Option<String>, Option<String>)>,
     Option<String>,
 ) {
-    if crate::assets::clothing_role(&inst.name).is_none() {
+    if rustudio_core::assets::clothing_role(&inst.name).is_none() {
         return (None, None);
     }
     let Some(model) = doc.dom.get_by_ref(inst.parent()) else {
@@ -261,8 +266,8 @@ fn character_clothing(
 ///: each cell's colour from the first part of its group that
 /// is a MeshPart with a TextureID, else the group's first
 /// part present; the Shirt / Pants Color3.
-fn r15_look(doc: &Document, inst: &Instance) -> Option<crate::assets::R15Look> {
-    if inst.class != "MeshPart" || crate::assets::r15_cell(&inst.name).is_none() {
+fn r15_look(doc: &Document, inst: &Instance) -> Option<rustudio_core::assets::R15Look> {
+    if inst.class != "MeshPart" || rustudio_core::assets::r15_cell(&inst.name).is_none() {
         return None;
     }
     let model = doc.dom.get_by_ref(inst.parent())?;
@@ -273,7 +278,7 @@ fn r15_look(doc: &Document, inst: &Instance) -> Option<crate::assets::R15Look> {
     };
     let colour = |r: Ref| color_of(doc.prop(r, "Color")).or_else(|| color_of(doc.prop(r, "BrickColor")));
     let mut cell_colors = [[0u8; 3]; 5];
-    for (k, group) in crate::assets::R15_CELL_GROUPS.iter().enumerate() {
+    for (k, group) in rustudio_core::assets::R15_CELL_GROUPS.iter().enumerate() {
         let parts: Vec<Ref> = group.iter().filter_map(|n| child(n)).collect();
         let textured = parts.iter().copied().find(|p| {
             doc.class_of(*p).is_some_and(|c| c == "MeshPart")
@@ -296,116 +301,7 @@ fn r15_look(doc: &Document, inst: &Instance) -> Option<crate::assets::R15Look> {
             })
             .unwrap_or([1.0, 1.0, 1.0])
     };
-    Some(crate::assets::R15Look { cell_colors, shirt_color: cloth("Shirt"), pants_color: cloth("Pants") })
-}
-
-/// A short content hash for a mesh blob without its own (MeshData).
-fn blake3_hex(data: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut h);
-    format!("{:016x}{:08x}", h.finish(), data.len())
-}
-
-/// A union's solved geometry (its SolidMeshHolder: Studio measurements "Unions"),
-/// registered as generated content under an id from the blob's hash. With
-/// UsePartColor the id ends in `#partcolor` and the loader drops the child
-/// colours, so the union's own Color shows.
-pub(crate) fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
-    let v = doc.prop(r, "SolidMeshHolder");
-    // The solved SolidMesh, else the legacy CSGMDL mesh (MeshData2 / MeshData).
-    let blob: Option<(Vec<u8>, String)> = match &v {
-        Some(Variant::NetAssetRef(h)) if !h.data().is_empty() => Some((
-            h.data().to_vec(),
-            h.hash().as_bytes().iter().take(16).map(|b| format!("{b:02x}")).collect(),
-        )),
-        _ => match doc.prop(r, "MeshData2") {
-            Some(Variant::SharedString(s)) if !s.data().is_empty() => {
-                Some((s.data().to_vec(), s.hash().as_bytes().iter().take(16).map(|b| format!("{b:02x}")).collect()))
-            }
-            _ => match doc.prop(r, "MeshData") {
-                Some(Variant::BinaryString(b)) if !AsRef::<[u8]>::as_ref(&b).is_empty() => {
-                    let data: Vec<u8> = AsRef::<[u8]>::as_ref(&b).to_vec();
-                    let h = blake3_hex(&data);
-                    Some((data, h))
-                }
-                _ => None,
-            },
-        },
-    };
-    let Some((bytes, hash)) = blob else {
-        let mut id = content_string(doc.prop(r, "Content"))?;
-        if matches!(doc.prop(r, "UsePartColor"), Some(Variant::Bool(true))) {
-            id.push_str("#partcolor");
-        }
-        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true });
-    };
-    if std::env::var_os("RUSTUDIO_UNION_DENSITY_TRACE").is_some() {
-        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-        if SEEN.get_or_init(Default::default).lock().unwrap().insert(hash.clone()) {
-            if let Ok(m) = crate::mesh::parse(&bytes) {
-                eprintln!("UNION_DENSITY {hash} size={:?} initial={:?} mesh_size={:?} bounds={:?}..{:?} tags={:?} (UV: signed projection of normalized_position * Size; material multiplier=pack.tiling / studs_per_tile)", doc.prop(r,"Size"), doc.prop(r,"InitialSize"), doc.prop(r,"MeshSize"), m.min, m.max, { let mut counts = [0usize; 16]; for &t in &m.projection_tags { counts[t as usize] += 1; } counts });
-            }
-        }
-    }
-    let base = format!("rbxtemp://rustudio/union/{hash}");
-    if crate::assets::generated(&base).is_none() {
-        crate::assets::register_generated(&base, bytes.clone());
-    }
-    let part_color = matches!(doc.prop(r, "UsePartColor"), Some(Variant::Bool(true)));
-    let id = if part_color {
-        let id = format!("{base}#partcolor");
-        if crate::assets::generated(&id).is_none() {
-            crate::assets::register_generated(&id, bytes);
-        }
-        id
-    } else {
-        base
-    };
-    Some(MeshAsset {
-        id,
-        fit_to_part: true,
-        scale: Vec3::ONE,
-        offset: Vec3::ZERO,
-        vertex_colors: true,
-    })
-}
-
-/// A MeshPart's mesh (stretched to the part's Size) or a SpecialMesh file mesh
-/// (drawn at its own size times Scale, shifted by Offset).
-#[derive(Debug, Clone)]
-pub struct MeshAsset {
-    pub id: String,
-    pub fit_to_part: bool,
-    pub scale: Vec3,
-    pub offset: Vec3,
-    /// The mesh's own vertex colours are drawn. False for a SpecialMesh
-    /// FileMesh: Studio 0.747 never draws a SpecialMesh's mesh colours
-    /// (textured or not, any VertexColor, world and ViewportFrames; a
-    /// MeshPart of the same mesh shows them: checks/viewport-frame-render/
-    /// studio/specialmesh). Applied by the mesh cache (MeshCache::get_colored)
-    /// only to meshes in a Roblox format; see the exception there.
-    pub vertex_colors: bool,
-}
-
-/// The MaterialVariant a part is drawn with: its MaterialVariant name, else
-/// MaterialService's `<Material>Name` override for its Material; the variant
-/// (in MaterialService, same BaseMaterial) gives its ColorMap and StudsPerTile.
-/// MaterialService.Use2022Materials (absent: false, the pre-2022 table,
-/// which is what Studio draws for a place without the setting).
-pub fn use_2022_materials(doc: &Document) -> bool {
-    doc.find_child(doc.dom.root_ref(), "MaterialService")
-        .and_then(|ms| {
-            // Consult serialized values before reflection defaults: the API
-            // property can default false while the XML property stores true.
-            ["Use2022Materials", "Use2022MaterialsXml"]
-                .iter()
-                .find_map(|k| match doc.dom.get_by_ref(ms)?.properties.get(&rbx_dom_weak::ustr(k)).cloned() {
-                    Some(Variant::Bool(b)) => Some(b),
-                    _ => None,
-                })
-        })
-        .unwrap_or(false)
+    Some(rustudio_core::assets::R15Look { cell_colors, shirt_color: cloth("Shirt"), pants_color: cloth("Pants") })
 }
 
 fn material_variant(doc: &Document, part: Ref, material: u32) -> Option<(String, f32)> {
@@ -428,7 +324,7 @@ fn material_variant_pack(doc: &Document, part: Ref, material: u32) -> Option<(u6
             .or_else(|| content_string(doc.prop(v, &format!("{key}Content"))))?;
         uri.strip_prefix("rbxassetid://").unwrap_or(&uri).trim().parse::<u64>().ok()
     };
-    let pack = crate::matpack::Pack {
+    let pack = rustudio_core::texture_pack::Pack {
         color: Some(id("ColorMap")?),
         normal: id("NormalMap"),
         roughness: id("RoughnessMap"),
@@ -436,12 +332,12 @@ fn material_variant_pack(doc: &Document, part: Ref, material: u32) -> Option<(u6
         tiling: 1.0,
         ..Default::default()
     };
-    Some((crate::matpack::register_terrain_variant(pack), variant_studs(doc, v)))
+    Some((rustudio_core::texture_pack::register_terrain_variant(pack), variant_studs(doc, v)))
 }
 
 fn material_variant_ref(doc: &Document, part: Ref, material: u32) -> Option<Ref> {
     let ms = doc.find_child(doc.dom.root_ref(), "MaterialService")?;
-    let mat_name = crate::ltypes::LEnumItem::from_value("Material", material)?.name;
+    let mat_name = rustudio_core::doc::enum_item_name("Material", material)?;
     let name = match doc.prop(part, "MaterialVariant") {
         Some(Variant::String(s)) if !s.is_empty() => s,
         _ => match doc.prop(ms, &format!("{mat_name}Name")) {
@@ -459,20 +355,6 @@ fn material_variant_ref(doc: &Document, part: Ref, material: u32) -> Option<Ref>
         })?
         .referent();
     Some(v)
-}
-
-pub fn content_string(v: Option<Variant>) -> Option<String> {
-    match v? {
-        Variant::ContentId(c) => Some(c.as_str().to_string()),
-        Variant::Content(c) => c.as_uri().map(str::to_string).or_else(|| {
-            c.as_object().and_then(|o| crate::runtime::editable::content_uri(o, None))
-        }),
-        Variant::String(s) => Some(s),
-        _ => None,
-    }
-    // Roblox reads content ids trimmed (Place B has "…?id=125882923   ").
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
 }
 
 /// What changed in the scene since the viewport last asked.
@@ -546,38 +428,8 @@ fn color_of(v: Option<Variant>) -> Option<[u8; 3]> {
     }
 }
 
-pub fn enum_u32(v: Option<Variant>) -> Option<u32> {
-    match v? {
-        Variant::Enum(e) => Some(e.to_u32()),
-        Variant::EnumItem(e) => Some(e.value),
-        _ => None,
-    }
-}
-
-pub fn f32_of(v: Option<Variant>) -> Option<f32> {
-    match v? {
-        Variant::Float32(f) => Some(f),
-        Variant::Float64(f) => Some(f as f32),
-        Variant::Int32(i) => Some(i as f32),
-        _ => None,
-    }
-}
-
-pub fn vec3_of(v: Option<Variant>) -> Option<Vec3> {
-    match v? {
-        Variant::Vector3(v) => Some(Vec3::new(v.x, v.y, v.z)),
-        _ => None,
-    }
-}
-
-pub fn xform_of(doc: &Document, r: Ref) -> Option<Xform> {
-    match doc.prop(r, "CFrame")? {
-        // Old places can hold slightly skewed rotations: square them up so
-        // nothing draws stretched.
-        Variant::CFrame(cf) => Some(Xform::from_cframe(&cf).orthonormalized()),
-        _ => None,
-    }
-}
+// The property readers are core's (`doc`): physics reads them too.
+pub use rustudio_core::doc::{f32_of, vec3_of, xform_of};
 
 impl Scene {
     pub fn is_part_class(&mut self, class: Ustr) -> bool {
@@ -773,7 +625,7 @@ impl Scene {
         // A Bone / joint / FaceControls added, removed, renamed or re-pointed:
         // skinned parts look their Bones up again and are redrawn.
         let mut rig = false;
-        let marks_scope = crate::bench::scope("ss_marks");
+        let marks_scope = rustudio_core::bench::scope("ss_marks");
         for m in marks {
             match *m {
                 doc::Mark::Prop(r, name)
@@ -864,8 +716,8 @@ impl Scene {
                 }
             }
         }
-        let _draws_scope = crate::bench::scope("ss_part_draw");
-        crate::bench::add("ss_full_count", 0.0, full.len() as u64);
+        let _draws_scope = rustudio_core::bench::scope("ss_part_draw");
+        rustudio_core::bench::add("ss_full_count", 0.0, full.len() as u64);
         for r in full.iter().copied() {
             let layer = doc
                 .dom
@@ -978,7 +830,7 @@ fn surfaces_of(doc: &Document, r: Ref) -> u32 {
     out
 }
 
-pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
+pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     let r = inst.referent();
     let xf = xform_of(doc, r)?;
     let size = vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::new(4.0, 1.0, 2.0));
@@ -1073,7 +925,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     }
     // Mesh textures cover the part outright, except on characters, where
     // transparent texels show the body Color (skin).
-    let character_part = crate::assets::clothing_role(&inst.name).is_some()
+    let character_part = rustudio_core::assets::clothing_role(&inst.name).is_some()
         || (inst.name == "Head"
             && doc.dom.get_by_ref(inst.parent()).is_some_and(|m| {
                 m.children()
@@ -1126,13 +978,13 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
         // GeometryService unions keep the main part's CFrame: their geometry
         // sits off-centre in the Size box (mesh_bvh::union_offset).
         if let Some(a) = &mesh_asset {
-            draw_offset = crate::mesh_bvh::union_offset(&a.id) * size;
+            draw_offset = rustudio_core::mesh_bvh::union_offset(&a.id) * size;
         }
     }
     // GeometryService's MeshParts (fragments) are off-centre the same way.
     if class == "MeshPart" {
         if let Some(a) = &mesh_asset {
-            draw_offset = crate::mesh_bvh::union_offset(&a.id) * size;
+            draw_offset = rustudio_core::mesh_bvh::union_offset(&a.id) * size;
         }
     }
     // CharacterMesh (R6 package bodies): the model's CharacterMesh for this
@@ -1337,7 +1189,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             }
         }
     }
-    if crate::assets::clothing_role(&inst.name).is_some() {
+    if rustudio_core::assets::clothing_role(&inst.name).is_some() {
         if let Some(model) = doc.dom.get_by_ref(inst.parent()) {
             deps.extend(model.children().iter().copied().filter(|c| {
                 doc.class_of(*c)
@@ -1346,7 +1198,7 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             // The R15 atlas takes its cell colours from the other body parts.
             if r15_look.is_some() {
                 deps.extend(model.children().iter().copied().filter(|c| {
-                    *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| crate::assets::r15_cell(&i.name).is_some())
+                    *c != r && doc.dom.get_by_ref(*c).is_some_and(|i| rustudio_core::assets::r15_cell(&i.name).is_some())
                 }));
             }
         }
@@ -1492,6 +1344,46 @@ pub(crate) fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
 }
 
 /// The ground grid, drawn just above the baseplate top.
+// ---------------------------------------------------------------- decals
+// (drawn by the viewport's parts and by skin.rs's skinned meshes)
+
+/// Where a face's Decal / Texture image lands on a part, in its unit box
+/// (Enum.NormalId: Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5),
+/// as Studio 0.747 maps it: seen from outside, the image upright and not
+/// mirrored (checks/mesh-deform/tools/decalprobe.py, a grid image on all
+/// six faces of a Part: Front u runs toward −X, Back toward +X, Top's u
+/// toward −X and v toward −Z).
+pub fn decal_face_uv(face: u32, v: Vec3) -> glam::Vec2 {
+    match face {
+        0 => glam::Vec2::new(0.5 - v.z, 0.5 - v.y),
+        1 => glam::Vec2::new(0.5 - v.x, 0.5 - v.z),
+        2 => glam::Vec2::new(v.x + 0.5, 0.5 - v.y),
+        3 => glam::Vec2::new(v.z + 0.5, 0.5 - v.y),
+        4 => glam::Vec2::new(v.x + 0.5, 0.5 - v.z),
+        _ => glam::Vec2::new(0.5 - v.x, 0.5 - v.y),
+    }
+}
+
+/// The face whose Decal a mesh triangle takes: its geometric normal's
+/// largest axis (mesh space). Studio 0.747: a quad turned 44° from Front
+/// takes the Front image, 46° doesn't (about either axis, skinned or not,
+/// Size × (1, 1, 3) the same); a triangle's vertex normals don't count.
+pub fn decal_face_of(n: Vec3) -> Option<u32> {
+    let a = n.abs();
+    if a.max_element() <= 0.0 || !n.is_finite() {
+        return None;
+    }
+    Some(if a.x >= a.y && a.x >= a.z {
+        if n.x > 0.0 { 0 } else { 3 }
+    } else if a.y >= a.z {
+        if n.y > 0.0 { 1 } else { 4 }
+    } else if n.z > 0.0 {
+        2
+    } else {
+        5
+    })
+}
+
 pub fn grid_lines(out: &mut Vec<LineVertex>, step: f32) {
     let ext = mech::GRID_EXTENT;
     let step = if step > 0.0 { step } else { mech::GRID_SPACING };
@@ -1571,9 +1463,9 @@ fn studio_avatar_mesh(rel: &str) -> Option<String> {
     g.get_or_insert_with(Default::default)
         .entry(rel.to_string())
         .or_insert_with(|| {
-            let bytes = std::fs::read(crate::default_scripts::studio_dir()?.join("content/avatar").join(rel)).ok()?;
+            let bytes = std::fs::read(rustudio_core::default_scripts::studio_dir()?.join("content/avatar").join(rel)).ok()?;
             let id = format!("rbxtemp://rustudio/avatar/{rel}");
-            crate::assets::register_generated(&id, bytes);
+            rustudio_core::assets::register_generated(&id, bytes);
             Some(id)
         })
         .clone()

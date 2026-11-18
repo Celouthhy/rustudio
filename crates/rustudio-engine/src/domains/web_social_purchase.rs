@@ -110,7 +110,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, v: Value| {
             Ok(opt_inst(&v)
                 .and_then(|r| inst_meta(lua, r).ok())
-                .is_some_and(|(c, _, _)| crate::doc::is_a(&c, "Player")))
+                .is_some_and(|(c, _, _)| rustudio_core::doc::is_a(&c, "Player")))
         })?,
     )?;
     ctx.set(

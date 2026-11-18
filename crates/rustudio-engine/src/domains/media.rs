@@ -1,4 +1,4 @@
-//! Engine API domain: media. See src/domains/mod.rs for the hook contract.
+//! Engine API domain: media. See crates/rustudio-engine/src/domains/mod.rs for the hook contract.
 //!
 //! The Audio* API as a real processing graph: Wires connect pins
 //! (GetInputPins / GetOutputPins / GetConnectedWires, Wire.Connected,
@@ -37,10 +37,10 @@ use mlua::{Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::{Content, Enum, Ref, Variant, VariantType};
 use rbx_dom_weak::ustr;
 
-use crate::app::Level;
+use rustudio_core::log::Level;
 use crate::audio::Pcm;
-use crate::doc::Document;
-use crate::math::Xform;
+use rustudio_core::doc::Document;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 #[path = "media_dsp.rs"]
@@ -348,7 +348,7 @@ pub struct Media {
     nodes: Vec<(Ref, String)>,
     scanned_at: f64,
     /// Wires and wirable instances, kept from the document's change journal.
-    index: Option<crate::doc::ClassIndex>,
+    index: Option<rustudio_core::doc::ClassIndex>,
     players: HashMap<Ref, PlayerState>,
     fx: HashMap<Ref, dsp::Fx>,
     wind: HashMap<Ref, dsp::Wind>,
@@ -446,7 +446,7 @@ fn decode(id: &str, bytes: Arc<Vec<u8>>) -> Got {
 /// RUSTUDIO_ALLOW_LOCAL_CONTENT=1 (assets::place_content_allowed). Asked
 /// before the PCM cache so cached samples never bypass it (#16).
 fn audio_allowed(id: &str) -> bool {
-    crate::assets::place_content_allowed(id, true)
+    rustudio_core::assets::place_content_allowed(id, true)
 }
 
 fn start_load(id: &str) -> Got {
@@ -456,23 +456,23 @@ fn start_load(id: &str) -> Got {
     if let Some(p) = pcm_cached(id) {
         return Got::Ready(p);
     }
-    if let Some(path) = crate::assets::resolve(id, None) {
+    if let Some(path) = rustudio_core::assets::resolve(id, None) {
         return match std::fs::read(&path) {
             Ok(b) => decode(id, Arc::new(b)),
             Err(e) => Got::Failed(format!("{}: {e}", path.display())),
         };
     }
-    match crate::assets::asset_ref(id) {
+    match rustudio_core::assets::asset_ref(id) {
         Some(a) => poll_fetch(id, a.id),
         None => Got::Failed("Invalid Asset identifier or not found".into()),
     }
 }
 
 fn poll_fetch(id: &str, asset: u64) -> Got {
-    match crate::assets::public_prefetch(asset) {
-        crate::assets::Fetch::Ready(b) => decode(id, b),
-        crate::assets::Fetch::Pending => Got::Pending(Load::Fetch(asset)),
-        crate::assets::Fetch::Unavailable(e) => Got::Failed(e),
+    match rustudio_core::assets::public_prefetch(asset) {
+        rustudio_core::assets::Fetch::Ready(b) => decode(id, b),
+        rustudio_core::assets::Fetch::Pending => Got::Pending(Load::Fetch(asset)),
+        rustudio_core::assets::Fetch::Unavailable(e) => Got::Failed(e),
     }
 }
 
@@ -776,7 +776,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     for name in ASYNC {
         let n = name.to_string();
         let raw = lua.create_function(move |lua, args: MultiValue| {
-            crate::bench::api_timed("call", &n, || checked(lua, call_method(lua, &n, args)))
+            rustudio_core::bench::api_timed("call", &n, || checked(lua, call_method(lua, &n, args)))
         })?;
         let f = crate::cmeta::method(lua, name, Some(raw), None, None)?;
         let maker: mlua::Function = lua
@@ -1045,7 +1045,7 @@ fn refresh(lua: &Lua, force: bool) -> mlua::Result<()> {
     let mut index = media(lua)?
         .index
         .take()
-        .unwrap_or_else(|| crate::doc::ClassIndex::new(crate::doc::Reader::Media));
+        .unwrap_or_else(|| rustudio_core::doc::ClassIndex::new(rustudio_core::doc::Reader::Media));
     let (wires, nodes): (Vec<Ref>, Vec<(Ref, String)>) = {
         let mut w = world(lua)?;
         let d = w.dm();
@@ -1505,7 +1505,7 @@ fn node_frame(lua: &Lua, r: Ref) -> mlua::Result<Option<Xform>> {
     };
     let Some(t) = target else { return Ok(None) };
     let class = class_of(world(lua)?.d(), t);
-    let is = |b: &str| crate::doc::is_a(&class, b);
+    let is = |b: &str| rustudio_core::doc::is_a(&class, b);
     Ok(if is("BasePart") {
         Some(part_xform(lua, t)?)
     } else if class == "Attachment" {
@@ -2185,7 +2185,7 @@ mod curve_tests {
             pcm_store(&id, Arc::new(Pcm { rate: 8000, chans: vec![vec![0.25, -0.25]] }));
             let denied = matches!(start_load(&id), Got::Failed(_)) && pcm_cached(&id).is_none();
             PCM.lock().unwrap().as_mut().unwrap().remove(&id);
-            assert!(denied || crate::assets::local_content_opt_in(), "local audio cache bypass: {id}");
+            assert!(denied || rustudio_core::assets::local_content_opt_in(), "local audio cache bypass: {id}");
         }
         // Roblox content still plays from the cache.
         for id in ["rbxasset://sounds/x.wav", "rbxassetid://123", "rbxtemp://rustudio/tts/1"] {
@@ -2242,7 +2242,7 @@ mod curve_tests {
 
 #[cfg(test)]
 mod asset_tests {
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use crate::runtime::{RunMode, Runtime, Side, World};
 
     fn run(code: &str) -> Vec<String> {

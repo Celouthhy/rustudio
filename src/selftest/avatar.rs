@@ -17,7 +17,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 const TORSO_CAGE: u64 = 7430071117;
 
@@ -37,7 +37,7 @@ end)
 "#;
 
 /// OBJ text for the cage's triangles scaled by `k` (OBJ stores v upward).
-fn scaled_obj(m: &crate::mesh::MeshData, k: f32) -> String {
+fn scaled_obj(m: &rustudio_core::mesh::MeshData, k: f32) -> String {
     let mut s = String::new();
     for (p, uv) in m.positions.iter().zip(&m.uvs) {
         let q = *p * k;
@@ -114,13 +114,13 @@ impl SelfTest {
             let mut notes = Vec::new();
             if !r6 {
                 // Garments from Roblox's UpperTorso cage.
-                match crate::assets::public_cached(TORSO_CAGE)
+                match rustudio_core::assets::public_cached(TORSO_CAGE)
                     .map_err(|e| e.to_string())
-                    .and_then(|b| crate::mesh::parse(&b))
+                    .and_then(|b| rustudio_core::mesh::parse(&b))
                 {
                     Ok(cage) => {
                         for (what, k) in [("inner", 0.9), ("outer", 0.97), ("garment", 0.95)] {
-                            crate::assets::register_generated(
+                            rustudio_core::assets::register_generated(
                                 &format!("rbxtemp://rustudio/selftest/{what}.obj"),
                                 scaled_obj(&cage, k).into_bytes(),
                             );
@@ -158,8 +158,8 @@ impl SelfTest {
             }
             ed.set_document(doc);
             // The place's avatar setting decides (an earlier step picked R15).
-            ed.play_rig = None;
-            ed.start_play(crate::runtime::RunMode::Play);
+            ed.game.play_rig = None;
+            ed.start_play(rustudio_engine::runtime::RunMode::Play);
             self.r6 = super::R6Test {
                 started: f,
                 notes,
@@ -171,12 +171,12 @@ impl SelfTest {
         }
         let r6 = phase == 83;
         let waited = self.r6.t0.map_or(0, |t| t.elapsed().as_secs());
-        let installed = crate::default_scripts::studio_dir().is_some();
-        let doc = &ed.doc;
+        let installed = rustudio_core::default_scripts::studio_dir().is_some();
+        let doc = &ed.game.doc;
         let model = doc
             .workspace()
-            .and_then(|ws| crate::default_scripts::child_named(doc, ws, &ed.player_name()));
-        let fit = model.map(|m| crate::wrap::fitted(doc, m));
+            .and_then(|ws| rustudio_core::default_scripts::child_named(doc, ws, &ed.game.player_name()));
+        let fit = model.map(|m| rustudio_render::wrap::fitted(doc, m));
         // Waits for the character's own meshes (15 R15 parts, the R6 head)
         // and, on R15, the server Script's garments and their fitting.
         let meshes_drawn = model.map_or(0, |m| {
@@ -186,7 +186,7 @@ impl SelfTest {
                 .unwrap_or_default()
                 .iter()
                 .filter(|r| {
-                    ed.renderer
+                    ed.game.renderer
                         .as_ref()
                         .and_then(|rd| rd.item_draws(**r))
                         .and_then(|d| d.first())
@@ -199,7 +199,7 @@ impl SelfTest {
             || (!r6
                 && matches!(
                     fit,
-                    Some(crate::wrap::Lookup::Pending | crate::wrap::Lookup::None)
+                    Some(rustudio_render::wrap::Lookup::Pending | rustudio_render::wrap::Lookup::None)
                 ));
         if (pending && waited < 60) || f.saturating_sub(self.r6.started) < 60 {
             return false;
@@ -225,10 +225,10 @@ impl SelfTest {
             .get_by_ref(m)
             .map(|i| i.children().to_vec())
             .unwrap_or_default();
-        let named = |n: &str| crate::default_scripts::child_named(doc, m, n);
+        let named = |n: &str| rustudio_core::default_scripts::child_named(doc, m, n);
         // R15 Play characters get Studio 0.746's joint upgrade
         // (AnimationConstraints); R6 keeps Motor6Ds.
-        let joint = if !r6 && crate::rig::joint_upgrade(doc) { "AnimationConstraint" } else { "Motor6D" };
+        let joint = if !r6 && rustudio_engine::rig::joint_upgrade(doc) { "AnimationConstraint" } else { "Motor6D" };
         let motors = doc
             .dom
             .descendants_of(m)
@@ -237,7 +237,7 @@ impl SelfTest {
         let drawn_meshes = parts
             .iter()
             .filter(|r| {
-                ed.renderer
+                ed.game.renderer
                     .as_ref()
                     .and_then(|rd| rd.item_draws(**r))
                     .and_then(|d| d.first())
@@ -270,8 +270,8 @@ impl SelfTest {
         } else {
             let mesh_of = |n: &str| {
                 named(n).and_then(|p| {
-                    crate::scene::content_string(doc.prop(p, "MeshContent"))
-                        .or_else(|| crate::scene::content_string(doc.prop(p, "MeshId")))
+                    rustudio_render::scene::content_string(doc.prop(p, "MeshContent"))
+                        .or_else(|| rustudio_render::scene::content_string(doc.prop(p, "MeshId")))
                 })
             };
             let hand = mesh_of("LeftHand").unwrap_or_default();
@@ -297,11 +297,11 @@ impl SelfTest {
             ));
             // Layered clothing.
             match fit {
-                Some(crate::wrap::Lookup::Ready(fit)) => {
+                Some(rustudio_render::wrap::Lookup::Ready(fit)) => {
                     let torso = named("UpperTorso");
-                    let cage_r = crate::assets::public_cached(TORSO_CAGE)
+                    let cage_r = rustudio_core::assets::public_cached(TORSO_CAGE)
                         .ok()
-                        .and_then(|b| crate::mesh::parse(&b).ok())
+                        .and_then(|b| rustudio_core::mesh::parse(&b).ok())
                         .map(|c| {
                             c.positions.iter().map(|p| p.length()).sum::<f32>()
                                 / c.positions.len().max(1) as f32
@@ -338,7 +338,7 @@ impl SelfTest {
                         fit.pieces.len()
                     ));
                 }
-                Some(crate::wrap::Lookup::Failed(e)) => {
+                Some(rustudio_render::wrap::Lookup::Failed(e)) => {
                     ok = false;
                     notes.push(format!("layered clothing failed: {e}"));
                 }
@@ -365,10 +365,10 @@ impl SelfTest {
             }
         }
         if let Ok(dir) = std::env::var("RUSTUDIO_SELFTEST_SHOTS") {
-            if let Some((w, h, px)) = ed
+            if let Some((w, h, px)) = ed.game
                 .renderer
                 .as_ref()
-                .zip(ed.render_state.as_ref())
+                .zip(ed.game.render_state.as_ref())
                 .and_then(|(r, rs)| r.read_frame(rs))
             {
                 if let Some(img) = image::RgbaImage::from_raw(w, h, px) {

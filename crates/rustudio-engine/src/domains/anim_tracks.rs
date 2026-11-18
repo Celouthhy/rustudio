@@ -1,7 +1,8 @@
 //! The Animator's tracks stepped natively (frame hook after PreAnimation,
 //! anim.rs `animate`), as Studio's Animator::animatorOnStepped /
 //! evaluateAndAccumulateAnimationTracks / AnimationTrack::accumulate do
-//! (Studio's profiler names).
+//! (profiler names at Studio). Notes and
+//! probes: Studio measurements.
 //!
 //! What stays in Luau (library.luau, run once per load, not per frame):
 //! finding and parsing an AnimationId's KeyframeSequence / CurveAnimation
@@ -36,7 +37,7 @@ use glam::{Mat3, Quat, Vec3};
 use mlua::{Function, Lua, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 struct Key {
@@ -592,7 +593,7 @@ fn retargeting_enabled(lua: &Lua) -> mlua::Result<bool> {
     }
     let mode = match mode {
         Some(m) => m,
-        None => crate::scene::enum_u32(world(lua)?.d().prop(ws, "Retargeting")).unwrap_or(0),
+        None => rustudio_render::scene::enum_u32(world(lua)?.d().prop(ws, "Retargeting")).unwrap_or(0),
     };
     Ok(mode == 2 || mode == 0)
 }
@@ -616,7 +617,7 @@ fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<
                 let humanoid = d.dom.get_by_ref(rig).and_then(|m| {
                     m.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"))
                 });
-                let r15 = humanoid.is_some_and(|h| crate::scene::enum_u32(d.prop(h, "RigType")) == Some(1));
+                let r15 = humanoid.is_some_and(|h| rustudio_render::scene::enum_u32(d.prop(h, "RigType")) == Some(1));
                 let root = d.dom.get_by_ref(rig).and_then(|m| {
                     m.children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.name == "HumanoidRootPart"))
                 });
@@ -652,7 +653,7 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
         };
         let derived = || {
             let has_att = matches!(d.prop(i.referent(), "Attachment0"), Some(Variant::Ref(a)) if a.is_some());
-            if has_att { crate::rig::joint_frames(d, i.referent()).map(|f| f.1) } else { None }
+            if has_att { rustudio_core::body::joint_frames(d, i.referent()).map(|f| f.1) } else { None }
         };
         let p1 = if i.class == "AnimationConstraint" { derived().or(stored) } else { stored };
         let Some(p1) = p1.filter(|p| p.is_some()) else { continue };

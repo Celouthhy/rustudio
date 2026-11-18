@@ -230,7 +230,7 @@ fn composition(lua:&Lua)->mlua::Result<mlua::Table>{
         for instance in d.dom.descendants_of(root){
             if instance.referent()==root{continue}
             let class=instance.class.as_str();
-            let category=CATEGORIES.iter().find(|(base,_)|crate::doc::is_a(class,base)).map(|(_,n)|*n).unwrap_or(15);
+            let category=CATEGORIES.iter().find(|(base,_)|rustudio_core::doc::is_a(class,base)).map(|(_,n)|*n).unwrap_or(15);
             *counts[category].entry(class.to_owned()).or_default()+=1;
         }
     }

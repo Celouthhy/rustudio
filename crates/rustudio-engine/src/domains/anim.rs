@@ -1,6 +1,6 @@
 //! Engine API domain: anim (Humanoid state API, Animator, AnimationTrack,
 //! animation clips, curves, keyframes, IKControl, Motor / Motor6D /
-//! JointInstance). See src/domains/mod.rs for the hook contract and
+//! JointInstance). See crates/rustudio-engine/src/domains/mod.rs for the hook contract and
 //! checks/parity/anim.md for the Studio measurements behind each member.
 //!
 //! - anim_lib.luau: curves (FloatCurve / RotationCurve / ValueCurve /
@@ -68,18 +68,18 @@ pub fn run_hook(lua: &Lua, name: &str, args: &[Value]) {
     };
     let r = match name {
         HOOK_TWEEN => {
-            let _s = crate::bench::scope("tween_step");
+            let _s = rustudio_core::bench::scope("tween_step");
             anim_tween::step(lua, dt)
         }
         HOOK_ANIMATE => {
-            let _s = crate::bench::scope("animate_step");
+            let _s = rustudio_core::bench::scope("animate_step");
             animate(lua, dt)
         }
         _ => Ok(()),
     };
     if let Err(e) = r {
         if let Ok(mut w) = world(lua) {
-            w.output.push((crate::app::Level::Error, format!("{name}: {e}")));
+            w.output.push((rustudio_core::log::Level::Error, format!("{name}: {e}")));
         }
     }
 }
@@ -224,7 +224,7 @@ struct AnimState {
     iks: Vec<Ref>,
     ik: HashMap<Ref, anim_ik::IkState>,
     /// Motors and IKControls, kept from the document's change journal.
-    index: Option<crate::doc::ClassIndex>,
+    index: Option<rustudio_core::doc::ClassIndex>,
 }
 
 fn state(lua: &Lua) -> mlua::AppDataRefMut<'_, AnimState> {
@@ -237,7 +237,7 @@ fn state(lua: &Lua) -> mlua::AppDataRefMut<'_, AnimState> {
 fn mine(class: &str, name: &str) -> bool {
     METHODS
         .iter()
-        .any(|(m, b)| *m == name && crate::doc::is_a(class, b))
+        .any(|(m, b)| *m == name && rustudio_core::doc::is_a(class, b))
 }
 
 pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
@@ -344,7 +344,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 let w = world(lua)?;
                 let d = w.d();
                 let has_att = matches!(d.prop(r, "Attachment0"), Some(Variant::Ref(a)) if a.is_some());
-                if has_att { crate::rig::joint_frames(d, r) } else { None }
+                if has_att { rustudio_core::body::joint_frames(d, r) } else { None }
             };
             let Some((p0, p1, c0, c1)) = derived else { return Ok(None) };
             return Ok(Some(match key {
@@ -358,7 +358,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             let full = world(lua)?.full_name(r);
             return Err(rt_err(format!("{key} is not a valid member of Motor6D \"{full}\"")));
         }
-        (_, "Active") if crate::doc::is_a(class, "JointInstance") => {
+        (_, "Active") if rustudio_core::doc::is_a(class, "JointInstance") => {
             let w = world(lua)?;
             let d = w.d();
             let part = |k: &str| match d.prop(r, k) {
@@ -438,10 +438,10 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "__rs_anim_asset",
         lua.create_function(|lua, id: f64| {
-            let crate::assets::Fetch::Ready(bytes) = crate::assets::public_prefetch(id as u64) else {
+            let rustudio_core::assets::Fetch::Ready(bytes) = rustudio_core::assets::public_prefetch(id as u64) else {
                 return Ok(Value::Nil);
             };
-            let Ok(mut tmp) = crate::doc::Document::decode(&bytes) else {
+            let Ok(mut tmp) = rustudio_core::doc::Document::decode(&bytes) else {
                 return Ok(Value::Nil);
             };
             let r = super::super::ext::create_any(lua, "Model")?;
@@ -494,7 +494,7 @@ fn rescan(lua: &Lua) -> mlua::Result<()> {
     let mut index = state(lua)
         .index
         .take()
-        .unwrap_or_else(|| crate::doc::ClassIndex::new(crate::doc::Reader::Anim));
+        .unwrap_or_else(|| rustudio_core::doc::ClassIndex::new(rustudio_core::doc::Reader::Anim));
     let (motors, iks) = {
         let mut w = world(lua)?;
         let d = w.dm();
@@ -541,14 +541,14 @@ fn step_motors(lua: &Lua, dt: f32) -> mlua::Result<()> {
     if motors.is_empty() {
         return Ok(());
     }
-    let mut writes: Vec<(Ref, f32, Option<(Ref, crate::math::Xform)>)> = Vec::new();
+    let mut writes: Vec<(Ref, f32, Option<(Ref, rustudio_core::math::Xform)>)> = Vec::new();
     {
         let w = world(lua)?;
         if w.side != Side::Server {
             return Ok(());
         }
         let d = w.d();
-        let f = |r: Ref, k: &str| crate::scene::f32_of(d.prop(r, k)).unwrap_or(0.0);
+        let f = |r: Ref, k: &str| rustudio_render::scene::f32_of(d.prop(r, k)).unwrap_or(0.0);
         for m in motors {
             if !d.exists(m) {
                 continue;
@@ -566,10 +566,10 @@ fn step_motors(lua: &Lua, dt: f32) -> mlua::Result<()> {
             let place = match (part("Part0"), part("Part1")) {
                 (Some(p0), Some(p1)) if !matches!(d.prop(p1, "Anchored"), Some(Variant::Bool(true))) => {
                     let cf = |r: Ref, k: &str| match d.prop(r, k) {
-                        Some(Variant::CFrame(c)) => crate::math::Xform::from_cframe(&c),
+                        Some(Variant::CFrame(c)) => rustudio_core::math::Xform::from_cframe(&c),
                         _ => anim_ik::ident(),
                     };
-                    let rz = crate::math::Xform { pos: Vec3::ZERO, rot: Mat3::from_rotation_z(new) };
+                    let rz = rustudio_core::math::Xform { pos: Vec3::ZERO, rot: Mat3::from_rotation_z(new) };
                     let xf = anim_ik::mul(
                         &anim_ik::mul(&anim_ik::mul(&cf(p0, "CFrame"), &cf(m, "C0")), &rz),
                         &cf(m, "C1").inverse(),
@@ -612,7 +612,7 @@ fn after(lua: &Lua, dt: f32) -> mlua::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use crate::runtime::{RunMode, Runtime, World};
     use rbx_dom_weak::InstanceBuilder;
 
@@ -809,14 +809,14 @@ assert(h:ReplaceBodyPartR15(Enum.BodyPartR15.Head, Instance.new("Part")) == fals
 print("anim-pass")
 "#, 20);
         // StarterPlayer.AvatarJointUpgrade = Disabled keeps Motor6D rigs.
-        let mut d = crate::doc::Document::new_place();
+        let mut d = rustudio_core::doc::Document::new_place();
         let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
         d.dom.get_by_ref_mut(sp).unwrap().properties.insert(
             rbx_dom_weak::ustr("AvatarJointUpgrade"),
             rbx_dom_weak::types::Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
         );
         assert!(!crate::rig::joint_upgrade(&d));
-        assert!(crate::rig::joint_upgrade(&crate::doc::Document::new_place()));
+        assert!(crate::rig::joint_upgrade(&rustudio_core::doc::Document::new_place()));
     }
 
     /// A RotationCurve as Studio 0.746 saved it (3 keys: Y 0, 1, 2 rad at

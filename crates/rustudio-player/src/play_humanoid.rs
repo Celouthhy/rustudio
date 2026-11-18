@@ -1,6 +1,6 @@
 //! Play's character as Studio's Humanoid (checks/humanoid-physics SPEC.md):
 //! a dynamic assembly in the physics world (physics_humanoid.rs) pushed by
-//! Studio's own controller (crate::humanoid), in Studio's frame order
+//! Studio's own controller (rustudio_physics::humanoid), in Studio's frame order
 //! (§0.1, gameStep Studio):
 //!
 //!   PreAnimation → stepHumanoid (`hum_pre`) → the Animator → Stepped →
@@ -14,8 +14,8 @@
 //! in the history before the commit that made this the only path.)
 
 use super::*;
-use crate::humanoid::{Floor, FrameIn, Humanoid, StepIn};
-use crate::physics::hum_body::HumCtl;
+use rustudio_physics::humanoid::{Floor, FrameIn, Humanoid, StepIn};
+use rustudio_physics::physics::hum_body::HumCtl;
 
 /// Studio 0.747 puts a Scriptable camera's Focus this many studs ahead of its
 /// CFrame before each frame's RenderStepped (`scriptable_camera_focus`).
@@ -36,10 +36,10 @@ pub(super) fn scriptable_camera_focus(cd: &mut Document) {
             None => return,
         },
     };
-    if crate::scene::enum_u32(cd.prop(cam, "CameraType")) != Some(6) {
+    if rustudio_render::scene::enum_u32(cd.prop(cam, "CameraType")) != Some(6) {
         return;
     }
-    let Some(cf) = crate::scene::xform_of(cd, cam) else { return };
+    let Some(cf) = rustudio_render::scene::xform_of(cd, cam) else { return };
     let f = Xform { pos: cf.pos + cf.rot * Vec3::new(0.0, 0.0, -SCRIPTABLE_FOCUS_AHEAD), rot: cf.rot };
     if let Some(inst) = cd.dom.get_by_ref_mut(cam) {
         inst.properties.insert(ustr("Focus"), Variant::CFrame(f.to_cframe()));
@@ -76,7 +76,7 @@ pub(crate) const SEAT_TOUCH_FRAMES: u8 = 3;
 impl Default for HumDyn {
     /// A new character is in the air (it spawns above its SpawnLocation).
     fn default() -> Self {
-        let hum = Humanoid { state: State::Freefall, bal_p: crate::humanoid::BAL_P_FREEFALL, ..Default::default() };
+        let hum = Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() };
         HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None }
     }
 }
@@ -123,7 +123,7 @@ fn senses_ladder(s: State) -> bool {
     matches!(s, State::Running | State::Freefall | State::Climbing)
 }
 
-impl Editor {
+impl Game {
     /// The Lua side of the frame before the world steps (Studio's order):
     /// PreAnimation, then (after stepHumanoid, `hum_pre`) the Animator,
     /// Stepped and PreSimulation. `phase` 0 = PreAnimation (the client's
@@ -206,7 +206,7 @@ impl Editor {
             return;
         }
         // (rapier path: the view camera's look, as before)
-        let look = if crate::solver::kind() != crate::solver::SolverKind::Rapier {
+        let look = if rustudio_physics::solver::kind() != rustudio_physics::solver::SolverKind::Rapier {
             self.client_camera_heading().unwrap_or_else(|| self.cam.forward())
         } else {
             self.cam.forward()
@@ -214,14 +214,14 @@ impl Editor {
         if look.x.abs() + look.z.abs() < 1e-4 {
             return;
         }
-        let cam_yaw = crate::humanoid::yaw_of_look(look);
+        let cam_yaw = rustudio_physics::humanoid::yaw_of_look(look);
         let Some(s) = self.play.as_mut() else { return };
         let Some((root_xf, _, _)) = s.physics.humanoid_root(model) else { return };
         let facing = -root_xf.rot.z_axis;
         if facing.x.abs() + facing.z.abs() < 1e-4 {
             return;
         }
-        let delta = crate::humanoid::wrap(cam_yaw - crate::humanoid::yaw_of_look(facing));
+        let delta = rustudio_physics::humanoid::wrap(cam_yaw - rustudio_physics::humanoid::yaw_of_look(facing));
         if delta.abs() < 1e-7 {
             return;
         }
@@ -250,7 +250,7 @@ impl Editor {
             Some(Variant::Ref(r)) if cd.exists(r) => r,
             _ => cd.find_child(ws, "Camera")?,
         };
-        let cf = crate::scene::xform_of(cd, cam)?;
+        let cf = rustudio_render::scene::xform_of(cd, cam)?;
         let focus = match cd.prop(cam, "Focus") {
             Some(Variant::CFrame(f)) => Some(Xform::from_cframe(&f)),
             _ => None,
@@ -287,10 +287,10 @@ impl Editor {
             let s = self.play.as_mut().expect("playing");
             let ch = s.character.as_mut().expect("character");
             if let Some(last) = ch.last_root {
-                let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| crate::scene::xform_of(cd, *c)));
-                let server = crate::scene::xform_of(&self.doc, root);
+                let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
+                let server = rustudio_render::scene::xform_of(&self.doc, root);
                 if let Some(xf) = [client, server].into_iter().flatten().find(|xf| (xf.pos - last.pos).length() > 1e-4 || (xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) == false) {
-                    if crate::physics::hum_debug() {
+                    if rustudio_physics::physics::hum_debug() {
                         eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})", last.pos, xf.pos, client.map(|c| c.pos), server.map(|c| c.pos));
                     }
                     s.physics.teleport_humanoid(model, &xf);
@@ -320,7 +320,7 @@ impl Editor {
             }
             // … and AssemblyAngularVelocity (T16: a Ragdoll given a spin).
             if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
-                let spins = crate::physics::live::take_spin_sets_of(cid, |r| {
+                let spins = rustudio_physics::physics::live::take_spin_sets_of(cid, |r| {
                     s.map.c2s.get(&r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model))
                 });
                 if let Some((_, w)) = spins.last() {
@@ -332,7 +332,7 @@ impl Editor {
                 s.physics.set_client_movers(cd, &s.map.c2s, mc);
                 // What the player owns besides its character: parts a script
                 // gave it, the seat it sits in.
-                let mut owned = crate::runtime::domains::world::part::player_owned_roots(self.doc.id);
+                let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
                 owned.extend(s.character.as_ref().and_then(|c| c.seat));
                 s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
             }
@@ -408,7 +408,7 @@ impl Editor {
             let s = self.play.as_ref().expect("playing");
             s.camera_relative.then(|| {
                 let look = self.cam.forward();
-                crate::humanoid::yaw_of_look(look)
+                rustudio_physics::humanoid::yaw_of_look(look)
             })
         };
         // The character collides as its HumanoidRootPart's CollisionGroup.
@@ -423,9 +423,9 @@ impl Editor {
                 .s2c
                 .get(&root)
                 .and_then(|c| s.other_doc.as_ref().and_then(|cd| from(cd, *c)))
-                .filter(|g| g != crate::collision_groups::DEFAULT)
+                .filter(|g| g != rustudio_core::collision_groups::DEFAULT)
                 .or_else(|| from(&self.doc, root))
-                .unwrap_or_else(|| crate::collision_groups::DEFAULT.to_string());
+                .unwrap_or_else(|| rustudio_core::collision_groups::DEFAULT.to_string());
             s.physics.char_group = g;
         }
         let own: HashSet<Ref> = self
@@ -440,14 +440,14 @@ impl Editor {
         // with the head. Studio 0.747, default R15 (Head.Size.Y 1.182): a
         // part's face is climbed from a root centre up to 1.1994 studs away
         // (1.2 × scale 1), a TrussPart from 1.8001 (the broad query).
-        let head_y = crate::scene::f32_of(self.doc.prop(model, "Scale")).unwrap_or(1.0);
+        let head_y = rustudio_render::scene::f32_of(self.doc.prop(model, "Scale")).unwrap_or(1.0);
         let anchored = matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true)));
         let hip_height = self.owned_humanoid_f32(humanoid, "HipHeight", 0.0);
         let legs = if rig_type == RigType::R6 {
             ["Left Leg", "Right Leg"]
                 .iter()
                 .filter_map(|n| self.doc.find_named(model, n))
-                .filter_map(|r| crate::scene::vec3_of(self.doc.prop(r, "Size")))
+                .filter_map(|r| rustudio_render::scene::vec3_of(self.doc.prop(r, "Size")))
                 .map(|s| s.y)
                 .fold(0.0f32, f32::max)
         } else {
@@ -473,7 +473,7 @@ impl Editor {
         };
         hd.had_floor = floor.is_some();
         hd.floor_part = floor.and_then(|f| f.1);
-        if crate::physics::hum_debug() {
+        if rustudio_physics::physics::hum_debug() {
             eprintln!("HUMFRAME root={:.4},{:.4},{:.4} floor={:?}", root_xf.pos.x, root_xf.pos.y, root_xf.pos.z, floor.map(|f| (f.0.y, f.0.normal, f.0.point)));
         }
         let facing = -root_xf.rot.z_axis;
@@ -492,7 +492,7 @@ impl Editor {
                 &own,
             );
             ch.ladder_wait = ladder_interval(state);
-            if crate::physics::hum_debug() && ch.ladder.is_some() {
+            if rustudio_physics::physics::hum_debug() && ch.ladder.is_some() {
                 eprintln!("HUMLADDER root={:.3},{:.3},{:.3} facing={:?} height={:.3} reach={:.3} -> {:?}", root_xf.pos.x, root_xf.pos.y, root_xf.pos.z, facing, shape.hip + shape.root_size.y * 0.5, (if shape.r6 { mech::CLIMB_REACH } else { mech::CLIMB_REACH_R15 }) * head_y, ch.ladder);
             }
         }
@@ -612,7 +612,7 @@ impl Editor {
             }
         }
         let ceiling = hd.hum.state == State::Jumping && {
-            let head = doc.find_named(model, "Head").and_then(|h| crate::scene::vec3_of(doc.prop(h, "Size"))).map(|v| v.y);
+            let head = doc.find_named(model, "Head").and_then(|h| rustudio_render::scene::vec3_of(doc.prop(h, "Size"))).map(|v| v.y);
             s.physics.jump_ceiling(root_xf.pos, rot, shape.root_size, head, &own)
         };
         let step = StepIn {
@@ -716,7 +716,7 @@ impl Editor {
             .descendants_of(model)
             .filter(|i| doc::is_a(&i.class, "BasePart"))
             .filter(|i| !matches!(i.name.as_str(), "HumanoidRootPart" | "Head" | "Torso" | "UpperTorso" | "LowerTorso"))
-            .filter(|i| crate::rig::is_body_part_name(&i.name))
+            .filter(|i| rustudio_core::body::is_body_part_name(&i.name))
             .map(|i| i.referent())
             .collect();
         for r in limbs {
@@ -758,13 +758,13 @@ impl Editor {
     /// Where the SeatWeld holds the root: seat · C0 · C1⁻¹.
     fn seat_root_xform(&self) -> Option<Xform> {
         let seat = self.play.as_ref()?.character.as_ref()?.seat?;
-        let xf = crate::scene::xform_of(&self.doc, seat)?;
+        let xf = rustudio_render::scene::xform_of(&self.doc, seat)?;
         let weld = self.doc.find_named(seat, "SeatWeld")?;
         let cf = |k: &str| match self.doc.prop(weld, k) {
             Some(Variant::CFrame(c)) => Xform::from_cframe(&c),
             _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
         };
-        use crate::ltypes::{cf_inv, cf_mul};
+        use rustudio_engine::ltypes::{cf_inv, cf_mul};
         Some(cf_mul(&cf_mul(&xf, &cf("C0")), &cf_inv(&cf("C1"))))
     }
 
@@ -777,7 +777,7 @@ impl Editor {
                 .dom
                 .descendants_of(model)
                 .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .filter_map(|i| crate::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
+                .filter_map(|i| rustudio_render::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
                 .collect();
             s.physics.refresh_humanoid(&self.doc, model, root, &parts);
             return;
@@ -787,11 +787,11 @@ impl Editor {
             .dom
             .descendants_of(model)
             .filter(|i| doc::is_a(&i.class, "BasePart"))
-            .filter_map(|i| crate::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
+            .filter_map(|i| rustudio_render::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
             .collect();
         s.physics.add_humanoid(&self.doc, model, root, &parts);
         if let Some(ch) = s.character.as_mut() {
-            ch.last_root = crate::scene::xform_of(&self.doc, root);
+            ch.last_root = rustudio_render::scene::xform_of(&self.doc, root);
         }
     }
 
@@ -821,7 +821,7 @@ impl Editor {
         let pose = ch.rig.solve(root_xf, &ch.dynamic.transforms);
         ch.last_root = Some(root_xf);
         ch.body.pos = root_xf.pos - Vec3::Y * ch.root_lift;
-        ch.yaw = crate::humanoid::yaw_of_look(-root_xf.rot.z_axis);
+        ch.yaw = rustudio_physics::humanoid::yaw_of_look(-root_xf.rot.z_axis);
         ch.velocity = s.physics.humanoid_com_velocity(model).unwrap_or(v);
         ch.body.grounded = ch.dynamic.had_floor;
         let state = ch.state;
@@ -832,12 +832,12 @@ impl Editor {
             Some(p) if self.doc.class_of(p).is_some_and(|k| k == "Terrain") => s
                 .physics
                 .terrain_material_under(root_xf.pos - Vec3::Y * (ch.shape.hip + ch.shape.root_size.y * 0.5) + Vec3::Y * 0.1)
-                .and_then(|m| crate::ltypes::LEnumItem::from_name("Material", crate::terrain::material_name(m)))
+                .and_then(|m| rustudio_engine::ltypes::LEnumItem::from_name("Material", rustudio_core::terrain::material_name(m)))
                 .map(|e| e.value)
                 .unwrap_or(256),
             // (A part only the client has: its document's.)
-            Some(p) => crate::scene::enum_u32(self.doc.prop(p, "Material"))
-                .or_else(|| s.other_doc.as_ref().and_then(|cd| crate::scene::enum_u32(cd.prop(p, "Material"))))
+            Some(p) => rustudio_render::scene::enum_u32(self.doc.prop(p, "Material"))
+                .or_else(|| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::enum_u32(cd.prop(p, "Material"))))
                 .unwrap_or(256),
         };
         if floor != ch.floor_material {

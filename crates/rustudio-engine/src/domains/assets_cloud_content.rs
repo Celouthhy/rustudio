@@ -4,9 +4,9 @@ use std::sync::{atomic::{AtomicU64,Ordering},mpsc::{self,Receiver,TryRecvError}}
 static NEXT:AtomicU64=AtomicU64::new(1);
 #[derive(Default)]
 struct ContentJobs{pending:HashMap<u64,Receiver<Result<Vec<u8>,String>>>,ids:Vec<String>}
-impl Drop for ContentJobs{fn drop(&mut self){for id in &self.ids{crate::assets::unregister_generated(id);}}}
+impl Drop for ContentJobs{fn drop(&mut self){for id in &self.ids{rustudio_core::assets::unregister_generated(id);}}}
 const UNSUPPORTED:&str="The input content type is not supported by AssetService::CreateDataModelContentAsync yet!";
-enum Source{Image(crate::texture::Rgba),Mesh(Arc<Vec<u8>>)}
+enum Source{Image(rustudio_core::texture::Rgba),Mesh(Arc<Vec<u8>>)}
 pub fn install(lua:&Lua)->mlua::Result<()>{
     lua.set_app_data(ContentJobs::default());
     let example=lua.create_userdata(crate::runtime::editable::LContent(rbx_dom_weak::types::Content::none()))?;
@@ -33,7 +33,7 @@ pub fn install(lua:&Lua)->mlua::Result<()>{
                 let snapshot=crate::runtime::editable::mesh_part_source(&content);
                 if let Some(uri)=crate::runtime::editable::content_uri(r,None){lua.app_data_mut::<ContentJobs>().unwrap().ids.push(uri);}
                 let (uri,_)=snapshot.ok_or_else(||rt_err("Error creating FileMeshData: Empty Result"))?.map_err(|_|rt_err("Error creating FileMeshData: Empty Result"))?;
-                Source::Mesh(crate::assets::generated(&uri).ok_or_else(||rt_err("Error creating FileMeshData: Empty Result"))?)
+                Source::Mesh(rustudio_core::assets::generated(&uri).ok_or_else(||rt_err("Error creating FileMeshData: Empty Result"))?)
             },
             _=>return Err(rt_err(UNSUPPORTED)),
         };
@@ -62,7 +62,7 @@ pub fn install(lua:&Lua)->mlua::Result<()>{
         jobs.pending.remove(&token);
         let bytes=result.map_err(rt_err)?;
         let id=format!("{}datamodel/{token}",crate::runtime::editable::OPAQUE_PREFIX);
-        crate::assets::register_generated(&id,bytes);jobs.ids.push(id.clone());drop(jobs);
+        rustudio_core::assets::register_generated(&id,bytes);jobs.ids.push(id.clone());drop(jobs);
         Ok((true,crate::runtime::editable::content_value(lua,&rbx_dom_weak::types::Content::from_uri(id))?))
         })();
         Ok(match result{Ok((done,value))=>(done,value,None),Err(e)=>(true,Value::Nil,Some(crate::runtime::describe_error(&e)))})
@@ -88,9 +88,9 @@ end
     use super::*;
     #[test]fn scoped_content_is_released(){
         let id=format!("{}scope-test/{}",crate::runtime::editable::OPAQUE_PREFIX,NEXT.fetch_add(1,Ordering::Relaxed));
-        crate::assets::register_generated(&id,vec![1,2,3]);
-        assert!(crate::assets::generated(&id).is_some());
+        rustudio_core::assets::register_generated(&id,vec![1,2,3]);
+        assert!(rustudio_core::assets::generated(&id).is_some());
         drop(ContentJobs{pending:HashMap::new(),ids:vec![id.clone()]});
-        assert!(crate::assets::generated(&id).is_none());
+        assert!(rustudio_core::assets::generated(&id).is_none());
     }
 }

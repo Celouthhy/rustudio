@@ -70,7 +70,7 @@ pub fn ranges() -> &'static HashMap<(String, String), SliderSpec> {
     static M: OnceLock<HashMap<(String, String), SliderSpec>> = OnceLock::new();
     M.get_or_init(|| {
         let mut out = HashMap::new();
-        let Some(dir) = crate::default_scripts::studio_dir() else {
+        let Some(dir) = rustudio_core::default_scripts::studio_dir() else {
             return out;
         };
         let Ok(text) = std::fs::read_to_string(dir.join("ReflectionMetadata.xml")) else {
@@ -118,7 +118,7 @@ fn parse(text: &str, out: &mut HashMap<(String, String), SliderSpec>) {
 /// lists BasePart.Transparency under BasePart).
 pub fn spec_for(class: &str, prop: &str) -> Option<SliderSpec> {
     let map = ranges();
-    let db = crate::doc::db();
+    let db = rustudio_core::doc::db();
     let desc = db.classes.get(class)?;
     db.superclasses_iter(desc).find_map(|c| map.get(&(c.name.to_string(), prop.to_string())).copied())
 }

@@ -323,7 +323,7 @@ pub(crate) fn euler_ordered(deg: DVec3, order: i64) -> DMat4 {
 /// node's RotationOrder, scaling and their pivots, as FBX defines them).
 /// The RotationOrder counts only with RotationActive set, as in the FBX SDK
 /// (Studio's animation import, measured: a ZYX order without
-/// RotationActive is read as XYZ; src/fbx_anim.rs).
+/// RotationActive is read as XYZ; crates/rustudio-core/src/fbx_anim.rs).
 pub(crate) fn local_matrix(p: &HashMap<String, Vec<Prop>>) -> DMat4 {
     let active = p.get("RotationActive").and_then(|v| v.first()?.as_i64()).unwrap_or(0) != 0;
     let order = if active { p.get("RotationOrder").and_then(|v| v.first()?.as_i64()).unwrap_or(0) } else { 0 };
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn place_a_all_gun_packs() {
         let home = crate::paths::home();
-        let root = home.join("games/place-a");
+        let root = home.join("code/active/games/roblox/T7Zombies");
         let Ok(spec) = std::fs::read_to_string(root.join("src/Shared/GunMeshes.luau")) else {
             return;
         };
@@ -873,9 +873,9 @@ mod tests {
     /// Place A' sample gun pack, when it's on this machine: the imported
     /// pieces match the centres and sizes its generator recorded.
     #[test]
-    fn place_a_argus_pack() {
+    fn place_a_sample_pack() {
         let path = crate::paths::home()
-            .join("games/place-a/tools/guns/out/gun_mesh/fbx/pack_argus.fbx");
+            .join("code/active/games/roblox/T7Zombies/tools/guns/out/gun_mesh/fbx/pack_argus.fbx");
         let Ok(bytes) = std::fs::read(&path) else {
             return;
         };

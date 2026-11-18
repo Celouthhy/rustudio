@@ -529,7 +529,7 @@ local standard=__rs_lua_methods.GetDataStore({},'mock');local ok,e=pcall(standar
     #[test]
     #[ignore = "writes only the explicitly authorized scratch universe through the login session"]
     fn live_scratch_roundtrip() {
-        use crate::doc::Document;
+        use rustudio_core::doc::Document;
         use crate::runtime::{RunMode, Runtime};
         use rbx_dom_weak::{types::Variant, ustr, InstanceBuilder};
         let mut d = Document::new_place();
@@ -585,7 +585,7 @@ shared.dataLiveDone=true;print('SCRATCH ROUNDTRIP PASSED',name)
                 .unwrap()
                 .output
                 .iter()
-                .any(|(l, _)| matches!(l, crate::app::Level::Error))
+                .any(|(l, _)| matches!(l, rustudio_core::log::Level::Error))
             {
                 break;
             }

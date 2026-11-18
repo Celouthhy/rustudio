@@ -9,7 +9,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{R6Test, SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 /// One scene: what to build and Studio's colours at world points.
 struct LightScene {
@@ -113,7 +113,7 @@ const SCENES: [LightScene; 4] = [
 ];
 
 fn set(ed: &mut Editor, r: Ref, name: &str, v: Variant) {
-    if let Some(i) = ed.doc.dom.get_by_ref_mut(r) {
+    if let Some(i) = ed.game.doc.dom.get_by_ref_mut(r) {
         i.properties.insert(rbx_dom_weak::ustr(name), v);
     }
 }
@@ -121,10 +121,10 @@ fn set(ed: &mut Editor, r: Ref, name: &str, v: Variant) {
 fn build(ed: &mut Editor, scene: &LightScene) {
     ed.set_document(Document::new_place());
     ed.show_grid = false;
-    let root = ed.doc.dom.root_ref();
-    let ws = ed.doc.workspace().expect("workspace");
+    let root = ed.game.doc.dom.root_ref();
+    let ws = ed.game.doc.workspace().expect("workspace");
     // Only our parts: take out what a new place starts with.
-    let start: Vec<Ref> = ed
+    let start: Vec<Ref> = ed.game
         .doc
         .dom
         .get_by_ref(ws)
@@ -133,25 +133,25 @@ fn build(ed: &mut Editor, scene: &LightScene) {
     let parts: Vec<Ref> = start
         .into_iter()
         .filter(|c| {
-            ed.doc
+            ed.game.doc
                 .class_of(*c)
-                .is_some_and(|k| crate::doc::is_a(&k, "BasePart"))
+                .is_some_and(|k| rustudio_core::doc::is_a(&k, "BasePart"))
         })
         .collect();
-    ed.doc.remove(&parts);
-    let lighting = match ed.doc.find_child(root, "Lighting") {
+    ed.game.doc.remove(&parts);
+    let lighting = match ed.game.doc.find_child(root, "Lighting") {
         Some(l) => l,
-        None => ed
+        None => ed.game
             .doc
             .insert(root, InstanceBuilder::new("Lighting").with_name("Lighting")),
     };
-    let effects: Vec<Ref> = ed
+    let effects: Vec<Ref> = ed.game
         .doc
         .dom
         .get_by_ref(lighting)
         .map(|i| i.children().to_vec())
         .unwrap_or_default();
-    ed.doc.remove(&effects);
+    ed.game.doc.remove(&effects);
     let grey = |v: f32| Variant::Color3(Color3::new(v, v, v));
     let ambient = if scene.soft_ball { 0.0 } else { 70.0 / 255.0 };
     let outdoor = if scene.soft_ball { 0.0 } else { 128.0 / 255.0 };
@@ -175,7 +175,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
         set(ed, lighting, name, v);
     }
     let smooth = || Enum::from_u32(272);
-    ed.doc.insert(
+    ed.game.doc.insert(
         ws,
         new_part(
             "Baseplate",
@@ -187,7 +187,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
         .with_property("Material", smooth()),
     );
     if scene.soft_ball {
-        ed.doc.insert(
+        ed.game.doc.insert(
             ws,
             new_part(
                 "Ball",
@@ -198,7 +198,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
             )
             .with_property("Material", smooth()),
         );
-        ed.doc.insert(
+        ed.game.doc.insert(
             ws,
             new_part(
                 "PL",
@@ -220,7 +220,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
             .into_iter()
             .enumerate()
         {
-            ed.doc.insert(
+            ed.game.doc.insert(
                 ws,
                 new_part(
                     name,
@@ -232,7 +232,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
                 .with_property("Material", Enum::from_u32(scene.materials[i])),
             );
         }
-        ed.doc.insert(
+        ed.game.doc.insert(
             ws,
             new_part(
                 "Neon",
@@ -245,7 +245,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
         );
     }
     if scene.lamps {
-        ed.doc.insert(
+        ed.game.doc.insert(
             ws,
             new_part(
                 "Lamp",
@@ -262,7 +262,7 @@ fn build(ed: &mut Editor, scene: &LightScene) {
                     .with_property("Range", 16.0f32),
             ),
         );
-        ed.doc.insert(
+        ed.game.doc.insert(
             ws,
             new_part(
                 "Spot",
@@ -285,11 +285,11 @@ fn build(ed: &mut Editor, scene: &LightScene) {
     // Studio's calibration view: from (4, 9, 22) toward (4, 2, 0), FOV 70,
     // rendered at Studio's 863×675 (glow and anything else that follows the
     // view's size come out as in its captures).
-    ed.view_render_size = Some(STUDIO_VIEW);
-    ed.cam.pos = Vec3::new(4.0, 9.0, 22.0);
-    ed.cam.yaw = 0.0;
-    ed.cam.pitch = (-7.0f32).atan2(22.0);
-    ed.cam.fov_deg = 70.0;
+    ed.game.view_render_size = Some(STUDIO_VIEW);
+    ed.game.cam.pos = Vec3::new(4.0, 9.0, 22.0);
+    ed.game.cam.yaw = 0.0;
+    ed.game.cam.pitch = (-7.0f32).atan2(22.0);
+    ed.game.cam.fov_deg = 70.0;
 }
 
 /// The view size of Studio's captures.
@@ -299,12 +299,12 @@ const STUDIO_VIEW: [u32; 2] = [863, 675];
 fn sample(ed: &Editor, frame: &(u32, u32, Vec<u8>), p: Vec3) -> Option<[u8; 3]> {
     let (w, h, px) = frame;
     // (rendered at view_render_size pixels: project onto that)
-    let rect = match ed.view_render_size {
-        Some(s) => egui::Rect::from_min_size(ed.viewport_rect.min, egui::vec2(s[0] as f32, s[1] as f32)),
-        None => ed.viewport_rect,
+    let rect = match ed.game.view_render_size {
+        Some(s) => egui::Rect::from_min_size(ed.game.viewport_rect.min, egui::vec2(s[0] as f32, s[1] as f32)),
+        None => ed.game.viewport_rect,
     };
     let scale = *w as f32 / rect.width().max(1.0);
-    let sp = ed.cam.project(rect, p)?;
+    let sp = ed.game.cam.project(rect, p)?;
     let (cx, cy) = (
         ((sp.x - rect.min.x) * scale) as i64,
         ((sp.y - rect.min.y) * scale) as i64,
@@ -351,9 +351,9 @@ impl SelfTest {
     fn tick_setters(&mut self, f: u64, ed: &mut Editor) -> bool {
         if self.r4.phase % 2 == 0 {
             ed.set_document(Document::new_place());
-            let root = ed.doc.dom.root_ref();
-            let ws = ed.doc.workspace().expect("workspace");
-            ed.doc.insert(
+            let root = ed.game.doc.dom.root_ref();
+            let ws = ed.game.doc.workspace().expect("workspace");
+            ed.game.doc.insert(
                 ws,
                 new_part(
                     "Lamp",
@@ -363,8 +363,8 @@ impl SelfTest {
                     [255, 255, 255],
                 ),
             );
-            let sss = ed.doc.find_child(root, "ServerScriptService").expect("sss");
-            ed.doc.insert(
+            let sss = ed.game.doc.find_child(root, "ServerScriptService").expect("sss");
+            ed.game.doc.insert(
                 sss,
                 InstanceBuilder::new("Script")
                     .with_name("Setters")
@@ -372,17 +372,17 @@ impl SelfTest {
             );
             self.r6 = R6Test {
                 started: f,
-                mark: ed.log.len(),
+                mark: ed.game.log.len(),
                 ..Default::default()
             };
-            ed.start_play(crate::runtime::RunMode::Run);
+            ed.start_play(rustudio_engine::runtime::RunMode::Run);
             self.r4.phase += 1;
             return false;
         }
         if f.saturating_sub(self.r6.started) < 20 {
             return false;
         }
-        let line = ed.log[self.r6.mark.min(ed.log.len())..]
+        let line = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
             .iter()
             .find(|l| l.text.contains("setters "))
             .map(|l| l.text.clone());
@@ -407,19 +407,19 @@ impl SelfTest {
     pub(super) fn tick_light(&mut self, f: u64, ed: &mut Editor) -> bool {
         let index = (self.r4.phase - 40) as usize / 2;
         if index == SCENES.len() {
-            ed.view_render_size = None;
+            ed.game.view_render_size = None;
             return self.tick_setters(f, ed);
         }
         let Some(scene) = SCENES.get(index) else {
-            ed.view_render_size = None;
+            ed.game.view_render_size = None;
             ed.show_grid = true;
-            crate::matpack::set_enabled(true);
+            rustudio_render::matpack::set_enabled(true);
             self.r4.phase = 60;
             return false;
         };
         if self.r4.phase % 2 == 0 {
             // Studio's references were taken offline (no material packs).
-            crate::matpack::set_enabled(false);
+            rustudio_render::matpack::set_enabled(false);
             build(ed, scene);
             self.r6 = R6Test {
                 started: f,
@@ -433,7 +433,7 @@ impl SelfTest {
         // rebuilds; these frames run faster than that, so rebuild it now
         // that the scene is in, before reading the view.
         if f.saturating_sub(self.r6.started) == 20 {
-            ed.lighting.refresh_lightgrid_now();
+            ed.game.lighting.refresh_lightgrid_now();
         }
         if f.saturating_sub(self.r6.started) < 30 {
             return false;
@@ -441,22 +441,22 @@ impl SelfTest {
         // Parts that reached the scene after that rebuild leave the grid stale
         // (it's rebuilt on a real-time timer): rebuild and read once it's
         // current, or the outdoor light read depends on timing.
-        if ed.lighting.lightgrid_pending() && f.saturating_sub(self.r6.started) < 600 {
-            ed.lighting.refresh_lightgrid_now();
+        if ed.game.lighting.lightgrid_pending() && f.saturating_sub(self.r6.started) < 600 {
+            ed.game.lighting.refresh_lightgrid_now();
             return false;
         }
         // The skybox loads in the background: until it is in, the previous
         // scene's sky light is used (a busy machine would read too early).
-        if ed.lighting.sky_pending() && f.saturating_sub(self.r6.started) < 1200 {
+        if ed.game.lighting.sky_pending() && f.saturating_sub(self.r6.started) < 1200 {
             if f.saturating_sub(self.r6.started) % 10 == 0 {
-                ed.lighting.refresh_lightgrid_now();
+                ed.game.lighting.refresh_lightgrid_now();
             }
             return false;
         }
-        let frame = ed
+        let frame = ed.game
             .renderer
             .as_ref()
-            .zip(ed.render_state.as_ref())
+            .zip(ed.game.render_state.as_ref())
             .and_then(|(r, rs)| r.read_frame(rs));
         // RUSTUDIO_LIGHT_DUMP=DIR: the frame each scene was read from (debugging).
         if let (Some(dir), Some((w, h, px))) = (std::env::var_os("RUSTUDIO_LIGHT_DUMP"), &frame) {
@@ -472,12 +472,12 @@ impl SelfTest {
         let mut notes = Vec::new();
         // The calibration view must not have moved (a key held from an
         // earlier step would fly it now that the fly keys work anywhere).
-        let drift = (ed.cam.pos - Vec3::new(4.0, 9.0, 22.0)).length();
+        let drift = (ed.game.cam.pos - Vec3::new(4.0, 9.0, 22.0)).length();
         if drift > 0.01 {
             notes.push(format!("camera moved {drift:.3} studs from the calibration view"));
         }
         if std::env::var_os("RUSTUDIO_LIGHT_DUMP").is_some() {
-            notes.push(format!("view rect {:?}", ed.viewport_rect));
+            notes.push(format!("view rect {:?}", ed.game.viewport_rect));
         }
         match &frame {
             Some(frame) => {
@@ -506,12 +506,12 @@ impl SelfTest {
         }
         self.steps.push(Step {
             step: scene.step,
-            passed: worst <= crate::mech::LIGHT_TEST_TOLERANCE,
+            passed: worst <= rustudio_core::mech::LIGHT_TEST_TOLERANCE,
             detail: format!(
                 "{}: {}; largest difference {worst} levels (allowed {})",
                 scene.what,
                 notes.join(", "),
-                crate::mech::LIGHT_TEST_TOLERANCE
+                rustudio_core::mech::LIGHT_TEST_TOLERANCE
             ),
         });
         self.r4.phase += 1;

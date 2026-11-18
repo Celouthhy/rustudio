@@ -9,8 +9,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 
 use super::{key, SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
-use crate::runtime::Side;
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::Side;
 
 /// What the step has seen so far.
 #[derive(Default)]
@@ -28,16 +28,16 @@ pub(super) struct PlayerTest {
 
 /// The client's DataModel (shown, or waiting in other_doc).
 fn client_doc(ed: &Editor) -> Option<&Document> {
-    let s = ed.play.as_ref()?;
+    let s = ed.game.play.as_ref()?;
     if s.showing == Side::Client {
-        Some(&ed.doc)
+        Some(&ed.game.doc)
     } else {
-        ed.play_other_doc()
+        ed.game.play_other_doc()
     }
 }
 
 fn child(d: &Document, parent: Ref, name: &str) -> Option<Ref> {
-    crate::default_scripts::child_named(d, parent, name)
+    rustudio_core::default_scripts::child_named(d, parent, name)
 }
 
 /// (camera-to-focus distance, yaw in degrees) of the client's CurrentCamera.
@@ -48,7 +48,7 @@ fn client_camera(ed: &Editor) -> Option<(f32, f32)> {
         Some(Variant::Ref(c)) => c,
         _ => return None,
     };
-    let cf = crate::scene::xform_of(d, cam)?;
+    let cf = rustudio_render::scene::xform_of(d, cam)?;
     let focus = match d.prop(cam, "Focus") {
         Some(Variant::CFrame(f)) => Vec3::new(f.position.x, f.position.y, f.position.z),
         _ => return None,
@@ -61,22 +61,22 @@ fn client_camera(ed: &Editor) -> Option<(f32, f32)> {
 }
 
 fn character_pos(ed: &Editor) -> Option<Vec3> {
-    ed.play.as_ref()?.character.as_ref().map(|c| c.body.pos)
+    ed.game.play.as_ref()?.character.as_ref().map(|c| c.body.pos)
 }
 
 impl SelfTest {
     /// Phases 60..=69 (68–69: the game-lock step).
     pub(super) fn tick_player(&mut self, f: u64, ed: &mut Editor) -> bool {
         let t = f.saturating_sub(self.pm.started);
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         match self.r4.phase {
             60 => {
                 ed.set_document(Document::new_place());
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.pm = PlayerTest {
                     started: f,
                     ok: true,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     ..Default::default()
                 };
                 self.r4.phase = 61;
@@ -100,7 +100,7 @@ impl SelfTest {
                         };
                         let ch = d
                             .workspace()
-                            .and_then(|ws| child(d, ws, &ed.player_name()));
+                            .and_then(|ws| child(d, ws, &ed.game.player_name()));
                         // Studio's current layout (0.747): the PlayerModule
                         // (with its PlayerScriptsLoader) in StarterPlayer,
                         // RbxCharacterSounds alone in PlayerScripts; the
@@ -114,9 +114,9 @@ impl SelfTest {
                     }
                     None => (false, false),
                 };
-                let installed = crate::default_scripts::studio_dir().is_some();
+                let installed = rustudio_core::default_scripts::studio_dir().is_some();
                 let cam = client_camera(ed);
-                let errors = ed.log[self.pm.mark.min(ed.log.len())..]
+                let errors = ed.game.log[self.pm.mark.min(ed.game.log.len())..]
                     .iter()
                     .filter(|l| matches!(l.level, crate::app::Level::Error))
                     .count();
@@ -192,7 +192,7 @@ impl SelfTest {
             }
             65 if (4..14).contains(&t) => self.queue.push(Event::MouseMoved(Vec2::new(20.0, 0.0))),
             65 if t == 16 => {
-                let grabbed = ed.play.as_ref().is_some_and(|s| s.mouse_behavior == 2);
+                let grabbed = ed.game.play.as_ref().is_some_and(|s| s.mouse_behavior == 2);
                 self.pm.notes.push(format!(
                     "right button held: MouseBehavior LockCurrentPosition {grabbed}"
                 ));
@@ -225,7 +225,7 @@ impl SelfTest {
             }
             // Shift-lock on.
             66 if t >= 20 => {
-                let (mb, rel) = ed
+                let (mb, rel) = ed.game
                     .play
                     .as_ref()
                     .map(|s| (s.mouse_behavior, s.camera_relative))
@@ -235,11 +235,11 @@ impl SelfTest {
                 self.pm.notes.push(format!("Shift tapped inside one frame: shift-lock on (MouseBehavior LockCenter, RotationType CameraRelative): {on}"));
                 // MouseLockController's icon (PlayerMouse.Icon), drawn in the
                 // middle of the view with the system cursor hidden.
-                let icon = ed.play.as_ref().and_then(|s| s.cursor_image.clone()).unwrap_or_default();
+                let icon = ed.game.play.as_ref().and_then(|s| s.cursor_image.clone()).unwrap_or_default();
                 let drawn = icon == "rbxasset://textures/MouseLockedCursor.png"
-                    && ed.lock_center_held()
-                    && ed.gui.pointer_override == Some(vp.center())
-                    && ed.game_cursor_hidden;
+                    && ed.game.lock_center_held()
+                    && ed.game.gui.pointer_override == Some(vp.center())
+                    && ed.game.game_cursor_hidden;
                 self.pm.ok &= drawn;
                 self.pm.notes.push(format!("shift-lock cursor {icon:?} at the view's middle, system cursor hidden: {drawn}"));
                 self.queue.push(Event::ModifiersChanged(Modifiers::SHIFT));
@@ -249,7 +249,7 @@ impl SelfTest {
             // Shift-lock off, then zoom all the way in.
             67 if t == 4 => self.queue.push(Event::ModifiersChanged(Modifiers::NONE)),
             67 if t == 20 => {
-                let off = ed
+                let off = ed.game
                     .play
                     .as_ref()
                     .is_some_and(|s| s.mouse_behavior == 0 && !s.camera_relative);
@@ -265,7 +265,7 @@ impl SelfTest {
             }
             67 if t >= 110 => {
                 let (dist, _) = client_camera(ed).unwrap_or((99.0, 0.0));
-                let (mb, rel) = ed
+                let (mb, rel) = ed.game
                     .play
                     .as_ref()
                     .map(|s| (s.mouse_behavior, s.camera_relative))
@@ -273,10 +273,10 @@ impl SelfTest {
                 let head_hidden = client_doc(ed)
                     .and_then(|d| {
                         d.workspace()
-                            .and_then(|ws| child(d, ws, &ed.player_name()))
+                            .and_then(|ws| child(d, ws, &ed.game.player_name()))
                             .and_then(|c| child(d, c, "Head"))
                             .map(|h| {
-                                crate::scene::f32_of(d.dom.get_by_ref(h).and_then(|i| {
+                                rustudio_render::scene::f32_of(d.dom.get_by_ref(h).and_then(|i| {
                                     i.properties
                                         .get(&rbx_dom_weak::ustr("LocalTransparencyModifier"))
                                         .cloned()
@@ -292,7 +292,7 @@ impl SelfTest {
                     "wheel all the way in: first person {fp} (distance {dist:.2}, LockCenter {}, CameraRelative {rel}, head hidden {head_hidden})",
                     mb == 1
                 ));
-                let errors: Vec<String> = ed.log[self.pm.mark.min(ed.log.len())..]
+                let errors: Vec<String> = ed.game.log[self.pm.mark.min(ed.game.log.len())..]
                     .iter()
                     .filter(|l| matches!(l.level, crate::app::Level::Error))
                     .map(|l| l.text.chars().take(160).collect())
@@ -319,7 +319,7 @@ impl SelfTest {
                 self.pm = PlayerTest {
                     started: f,
                     ok: true,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     ..Default::default()
                 };
                 self.r4.phase = 68;
@@ -328,7 +328,7 @@ impl SelfTest {
             // round; the pointer then leaves the game view while the mouse
             // keeps moving.
             68 if t == 60 => {
-                let err = ed.run_luau(
+                let err = ed.game.run_luau(
                     Side::Client,
                     r#"
                     local UIS = game:GetService("UserInputService")
@@ -355,21 +355,21 @@ impl SelfTest {
                 self.queue.push(Event::MouseMoved(Vec2::new(12.0, 0.0)));
             }
             68 if t == 100 => {
-                let held = ed.game_grab.is_some();
-                let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(0);
+                let held = ed.game.game_grab.is_some();
+                let mb = ed.game.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(0);
                 let yaw = client_camera(ed).map(|c| c.1).unwrap_or(self.pm.yaw0);
                 let turned = (yaw - self.pm.yaw0 + 540.0).rem_euclid(360.0) - 180.0;
                 // The game's mouse is the middle of the view (where the lock
                 // icon is drawn), wherever the held system cursor is.
-                let centred = ed.lock_center_held() && ed.gui.pointer_override == Some(vp.center());
-                let hidden = ed.game_cursor_hidden;
+                let centred = ed.game.lock_center_held() && ed.game.gui.pointer_override == Some(vp.center());
+                let hidden = ed.game.game_cursor_hidden;
                 let ok = held && mb == 1 && turned.abs() > 2.0 && centred && hidden;
                 self.pm.ok &= ok;
                 self.pm.notes.push(format!(
                     "LockCenter from a client script, pointer off the view: grab held {held} (MouseBehavior {mb}), camera turned {turned:.1}°, game mouse at the view's middle {centred}, system cursor hidden {hidden}"
                 ));
-                ed.cursor_log.clear();
-                let err = ed.run_luau(
+                ed.game.cursor_log.clear();
+                let err = ed.game.run_luau(
                     Side::Client,
                     "_G.__lockMode = Enum.MouseBehavior.Default",
                 );
@@ -381,9 +381,9 @@ impl SelfTest {
                 self.pm.started = f;
             }
             69 if t >= 20 => {
-                let released = ed.game_grab.is_none();
-                let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
-                let log = ed.cursor_log.clone();
+                let released = ed.game.game_grab.is_none();
+                let mb = ed.game.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
+                let log = ed.game.cursor_log.clone();
                 // Let go where it is held: never put in the middle of the view
                 // (a Confined grab goes back to where the lock began).
                 let c = vp.center();

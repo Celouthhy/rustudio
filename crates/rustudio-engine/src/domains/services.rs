@@ -1,4 +1,4 @@
-//! Engine API domain: services (core engine services). See src/domains/mod.rs
+//! Engine API domain: services (core engine services). See crates/rustudio-engine/src/domains/mod.rs
 //! for the hook contract and checks/parity/services.md for what was measured.
 //!
 //! Every behaviour here was checked against Studio 0.744 in an offline Studio, in
@@ -34,7 +34,7 @@ mod http;
 #[path = "services_reflect.rs"]
 mod reflect;
 #[path = "services_stream.rs"]
-pub(crate) mod stream;
+pub mod stream;
 
 pub const METHODS: &[(&str, &str)] = &[
     ("IsPropertyModified", "Instance"),
@@ -196,7 +196,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("DataChanged", "MicroProfilerService"),
     // Prediction: nothing is resimulated in rustudio (or in a Studio test),
     // so neither fires. Game scripts may index both, connect to Rollback,
-    // but not to Misprediction (PluginOrOpenCloud: src/security.rs).
+    // but not to Misprediction (PluginOrOpenCloud: crates/rustudio-engine/src/security.rs).
     ("Misprediction", "RunService"),
     ("Rollback", "RunService"),
 ];
@@ -313,7 +313,7 @@ fn enum_arg(args: &MultiValue, i: usize, enum_name: &str) -> mlua::Result<u32> {
         Value::Integer(_) | Value::Number(_) => Err(rt_err(format!("Unable to cast double to {enum_name}"))),
         Value::String(st) => {
             let name = st.to_str()?.to_string();
-            crate::doc::db()
+            rustudio_core::doc::db()
                 .enums
                 .get(enum_name)
                 .and_then(|e| e.items.get(name.as_str()).copied())
@@ -342,7 +342,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
     };
     let owner = METHODS
         .iter()
-        .find(|(m, b)| *m == name && crate::doc::is_a(&class, b))
+        .find(|(m, b)| *m == name && rustudio_core::doc::is_a(&class, b))
         .map(|(_, b)| *b)?;
     Some(call_inner(lua, name, owner, &class, this, args))
 }
@@ -544,7 +544,7 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             Err(rt_err(format!("Flag {f} does not exist")))
         }
         ("UserSettings", "Reset") => {
-            emit(lua, crate::app::Level::Error, "Insufficient permissions to set ControlMode".into())?;
+            emit(lua, rustudio_core::log::Level::Error, "Insufficient permissions to set ControlMode".into())?;
             Err(capability("set", "camera control mode", "RobloxScript"))
         }
         ("UserGameSettings", "GetCameraYInvertValue") => {
@@ -569,7 +569,7 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
 
         ("Object", "IsA") => {
             let c = arg_str(args, 1, "string")?;
-            ok(Value::Boolean(crate::doc::is_a(class, &c)))
+            ok(Value::Boolean(rustudio_core::doc::is_a(class, &c)))
         }
 
         // ---------------------------------------------------- the rest
@@ -582,7 +582,7 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         ("GeneratedFolder", "SetPrimaryPart") => {
             let p = arg(args, 1);
             match opt_inst(&p) {
-                Some(r) if crate::doc::is_a(&class_of(lua, r)?, "BasePart") => {
+                Some(r) if rustudio_core::doc::is_a(&class_of(lua, r)?, "BasePart") => {
                     world(lua)?.dm().dom.get_by_ref_mut(this).map(|i| {
                         i.properties.insert("PrimaryPart".into(), Variant::Ref(r));
                     });
@@ -670,13 +670,13 @@ fn receivers_of(lua: &Lua, ev: Ref) -> mlua::Result<Vec<Ref>> {
 }
 
 fn rss_mb() -> f64 {
-    crate::platform::resident_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0)
+    rustudio_core::platform::resident_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0)
 }
 
 // ------------------------------------------------------------------ output
 
 /// A line in the session output, as rustudio's own engine lines are pushed.
-fn emit(lua: &Lua, level: crate::app::Level, text: String) -> mlua::Result<()> {
+fn emit(lua: &Lua, level: rustudio_core::log::Level, text: String) -> mlua::Result<()> {
     world(lua)?.output.push((level, text));
     Ok(())
 }
@@ -692,7 +692,7 @@ fn capture_output(lua: &Lua) -> mlua::Result<()> {
         if w.output.len() <= seen {
             return Ok(());
         }
-        let fresh: Vec<(crate::app::Level, String)> = w.output[seen..].to_vec();
+        let fresh: Vec<(rustudio_core::log::Level, String)> = w.output[seen..].to_vec();
         let ls = w
             .doc
             .as_ref()
@@ -700,20 +700,20 @@ fn capture_output(lua: &Lua) -> mlua::Result<()> {
             .filter(|ls| w.listening.contains(ls));
         (fresh, ls)
     };
-    let now = (crate::sim_clock::epoch_secs() * 1000.0).floor() / 1000.0;
+    let now = (rustudio_core::sim_clock::epoch_secs() * 1000.0).floor() / 1000.0;
     let mut lines = Vec::with_capacity(fresh.len());
     for (level, text) in &fresh {
-        let mark = crate::output_panel::STACK_MARK;
+        let mark = STACK_MARK;
         let (t, info) = match text.strip_prefix(mark) {
             Some(r) => (r, true),
             None => (text.as_str(), false),
         };
         let msg = t.rsplit_once("  —  ").map(|(m, _)| m).unwrap_or(t).to_string();
         let ty = match level {
-            crate::app::Level::Error => 3,
-            crate::app::Level::Warn => 2,
-            crate::app::Level::Info if info => 1,
-            crate::app::Level::Info => 0,
+            rustudio_core::log::Level::Error => 3,
+            rustudio_core::log::Level::Warn => 2,
+            rustudio_core::log::Level::Info if info => 1,
+            rustudio_core::log::Level::Info => 0,
         };
         lines.push((msg, ty, now));
     }
@@ -771,8 +771,8 @@ fn http_enabled_check(lua: &Lua, hs: Ref) -> mlua::Result<()> {
         !std::mem::replace(&mut st.http_hint_shown, true)
     };
     if first {
-        let mark = crate::output_panel::STACK_MARK;
-        emit(lua, crate::app::Level::Info, format!("{mark}Go to Experience Settings and turn on Allow HTTP requests."))?;
+        let mark = STACK_MARK;
+        emit(lua, rustudio_core::log::Level::Info, format!("{mark}Go to Experience Settings and turn on Allow HTTP requests."))?;
     }
     Err(rt_err("HTTP requests are not enabled. Enable via Experience Settings"))
 }
@@ -784,7 +784,7 @@ fn http_enabled_check(lua: &Lua, hs: Ref) -> mlua::Result<()> {
 fn http_start(lua: &Lua, a: (LInst, String, Value, Option<Table>, Option<mlua::LuaString>)) -> mlua::Result<(Option<u64>, Option<String>)> {
     match http_start_inner(lua, a) {
         Ok(id) => Ok((Some(id), None)),
-        Err(e) if crate::plugin_host::permissions::is_pending(&e) => Ok((None, None)),
+        Err(e) if super::is_pending(&e) => Ok((None, None)),
         Err(e) => Ok((None, Some(error_message(&e)))),
     }
 }
@@ -817,8 +817,9 @@ fn http_start_inner(lua: &Lua, (hs, method, url, headers, body): (LInst, String,
     if http::is_roblox_domain(&url) {
         return Err(rt_err("HttpService is not allowed to access that Roblox resource"));
     }
-    // A plugin's request asks the store's permission check (plugin_host).
-    crate::plugin_host::permissions::check_http(lua, &url)?;
+    // A plugin's request asks the store's permission check (the plugin
+    // domain, when registered).
+    super::check_http(lua, &url)?;
     // Methods are case-sensitive ("get" fails the same way).
     if !matches!(method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE") {
         return Err(rt_err("HttpError: Aborted"));
@@ -908,6 +909,7 @@ fn place_id(lua: &Lua) -> mlua::Result<i64> {
 /// Connecting until it is answered). What is and isn't Studio-backed:
 /// services_stream.rs's header.
 fn create_stream(lua: &Lua, hs: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    use super::Decision;
     let kind = stream::Kind::from_value(enum_arg(args, 1, "WebStreamClientType")?);
     let opts = match arg(args, 2) {
         Value::Table(t) => t,
@@ -964,9 +966,8 @@ fn create_stream(lua: &Lua, hs: Ref, args: &MultiValue) -> mlua::Result<MultiVal
     if !matches!(method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS" | "TRACE") {
         return Err(rt_err("HttpError: Aborted"));
     }
-    use crate::plugin_host::permissions::{self, Decision};
-    let plugin = permissions::running_plugin(lua);
-    let decision = plugin.as_ref().and_then(|p| permissions::http_decision(p, &purl));
+    let plugin = super::running_plugin(lua);
+    let decision = plugin.as_ref().and_then(|p| super::http_decision(p, &purl));
     if let Some(Decision::Deny(m)) = &decision {
         return Err(rt_err(m.clone()));
     }
@@ -987,7 +988,7 @@ fn create_stream(lua: &Lua, hs: Ref, args: &MultiValue) -> mlua::Result<MultiVal
 
 /// Once a frame: each client's new connection events become its signals.
 fn pump_streams(lua: &Lua) -> mlua::Result<()> {
-    use crate::plugin_host::permissions::{http_decision, Decision};
+    use super::Decision;
     let refs: Vec<Ref> = state(lua)?.streams.0.keys().copied().collect();
     if refs.is_empty() {
         return Ok(());
@@ -1009,7 +1010,7 @@ fn pump_streams(lua: &Lua) -> mlua::Result<()> {
             }
         }
         for (r, o) in st.streams.0.iter_mut() {
-            let answer = o.waiting.as_ref().map(|(plugin, req)| http_decision(plugin, &permission_url(&req.url)));
+            let answer = o.waiting.as_ref().map(|(plugin, req)| super::http_decision(plugin, &permission_url(&req.url)));
             match answer {
                 None | Some(Some(Decision::Pending)) => {}
                 Some(Some(Decision::Deny(m))) => {
@@ -1148,7 +1149,7 @@ end
 // ------------------------------------------------------------------ properties
 
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
-    let is = |b: &str| crate::doc::is_a(class, b);
+    let is = |b: &str| rustudio_core::doc::is_a(class, b);
     Ok(Some(match key {
         "Sandboxed" => Value::Boolean(matches!(world(lua)?.d().prop(r, "Sandboxed"), Some(Variant::Bool(true)))),
         // Not scriptable: Studio has no such member for scripts.
@@ -1200,11 +1201,13 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         // the Studio Settings dialog's values (src/studio_settings.rs).
         // settings().Studio.Theme: the StudioTheme object (GetColor) of the
         // chosen theme (src/plugin_host/api_theme.rs).
-        "Theme" if class == "Studio" => crate::runtime::domains::plugin::theme::studio_theme(lua)?,
-        _ if crate::studio_settings::is_item_class(class) => match crate::studio_settings::lua_get(lua, class, key)? {
-            Some(v) => v,
-            None => return Ok(None),
-        },
+        "Theme" if class == "Studio" => super::theme_get(lua)?,
+        _ if crate::runtime::domains::settings_host::is_item_class(class) => {
+            match crate::runtime::domains::settings_host::lua_get(lua, class, key)? {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        }
         "ConnectionState" if class == "WebSocketClient" => enum_val(lua, "WebSocketState", 3)?,
         "ConnectionState" if class == "WebStreamClient" => {
             let v = state(lua)?.streams.0.get(&r).map(|o| o.state).unwrap_or(3);
@@ -1239,7 +1242,7 @@ fn stats_prop(lua: &Lua, key: &str) -> mlua::Result<Option<Value>> {
             let w = world(lua)?;
             let d = w.d();
             let Some(ws) = d.workspace() else { return Ok(Some(Value::Integer(0))) };
-            let parts = d.dom.descendants_of(ws).filter(|i| crate::doc::is_a(&i.class, "BasePart"));
+            let parts = d.dom.descendants_of(ws).filter(|i| rustudio_core::doc::is_a(&i.class, "BasePart"));
             let n = if key == "PrimitivesCount" {
                 parts.count()
             } else {
@@ -1290,68 +1293,20 @@ fn stats_prop(lua: &Lua, key: &str) -> mlua::Result<Option<Value>> {
 }
 
 /// Engine counters Stats reads, fed by the renderer, the GUI passes,
-/// physics and replication (one call each; see services.md).
+/// physics and replication (one call each; see services.md). The counters
+/// themselves are in core (`bench::perf`) so the renderer and physics can
+/// reach them; the network ones stay here, where the runtime is.
 pub mod perf {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::Mutex;
     use std::time::Instant;
 
     use rbx_dom_weak::types::Variant;
 
-    pub const SCENE: usize = 0;
-    pub const SHADOW: usize = 2;
-    pub const UI2D: usize = 4;
-    pub const UI3D: usize = 6;
-
-    /// This frame's running counts: (calls, triangles) per kind.
-    static ACC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
-    #[derive(Clone, Copy, Default)]
-    pub struct Frame {
-        pub n: [u64; 8],
-        pub cpu_s: f64,
-        pub gpu_s: f64,
-    }
-    static LAST: Mutex<Frame> = Mutex::new(Frame { n: [0; 8], cpu_s: 0.0, gpu_s: 0.0 });
-
-    /// One draw of `kind`: `calls` draw calls covering `tris` triangles.
-    pub fn draw(kind: usize, calls: u64, tris: u64) {
-        ACC[kind].fetch_add(calls, Relaxed);
-        ACC[kind + 1].fetch_add(tris, Relaxed);
-    }
-
-    /// The renderer finished a frame: its counts become the last frame's.
-    /// `cpu_s`: the frame's render encoding on the CPU; `gpu_s`: GPU time
-    /// when known (0 otherwise).
-    pub fn end_frame(cpu_s: f64, gpu_s: f64) {
-        let mut f = Frame { n: [0; 8], cpu_s, gpu_s };
-        for (i, a) in ACC.iter().enumerate() {
-            f.n[i] = a.swap(0, Relaxed);
-        }
-        if let Ok(mut l) = LAST.lock() {
-            *l = f;
-        }
-    }
-
-    pub fn frame() -> Frame {
-        LAST.lock().map(|f| *f).unwrap_or_default()
-    }
-
-    // --------------------------------------------------------- contacts
-
-    static CONTACTS: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
-
-    /// Physics stepped DataModel `doc`: its touching collider pairs.
-    pub fn set_contacts(doc: u64, n: usize) {
-        if let Ok(mut m) = CONTACTS.lock() {
-            m.get_or_insert_with(HashMap::new).insert(doc, n);
-        }
-    }
-
-    pub fn contacts(doc: u64) -> usize {
-        CONTACTS.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(&doc).copied())).unwrap_or(0)
-    }
+    pub use rustudio_core::bench::perf::{
+        contacts, draw, end_frame, frame, set_contacts, Frame, SCENE, SHADOW, UI2D, UI3D,
+    };
 
     // --------------------------------------------------------- network
 
@@ -1444,7 +1399,7 @@ pub mod perf {
 
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
     match key {
-        "Sandboxed" if crate::doc::is_a(class, "Instance") => {
+        "Sandboxed" if rustudio_core::doc::is_a(class, "Instance") => {
             let b = match value {
                 Value::Boolean(b) => *b,
                 Value::Nil => false,
@@ -1458,30 +1413,29 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         // settings().Studio.Theme = a StudioTheme (GetAvailableThemes'):
         // Changed + ThemeChanged when it changes the theme.
         "Theme" if class == "Studio" => {
-            if crate::runtime::domains::plugin::theme::set_theme(lua, value)? {
+            if super::theme_set(lua, value)? {
                 let mut w = world(lua)?;
                 w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
                 w.fire(r, "Changed:Theme", vec![]);
                 w.fire(r, "ThemeChanged", vec![]);
                 drop(w);
-                crate::runtime::domains::plugin::theme::note_theme(lua);
+                super::theme_note(lua);
             }
             Ok(true)
         }
         // The Studio Settings store (see prop_get): Changed fires as for any
         // property; the identity check already ran.
-        _ if crate::studio_settings::is_item_class(class) => {
-            let before = crate::studio_settings::get(class, key);
-            match crate::studio_settings::lua_set(class, key, value)? {
-                Some(_) => {
-                    if crate::studio_settings::get(class, key) != before {
+        _ if crate::runtime::domains::settings_host::is_item_class(class) => {
+            match crate::runtime::domains::settings_host::lua_set(class, key, value)? {
+                Some(changed) => {
+                    if changed {
                         let mut w = world(lua)?;
                         w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
                         w.fire(r, &format!("Changed:{key}"), vec![]);
                         if class == "Studio" && key == "Theme" {
                             w.fire(r, "ThemeChanged", vec![]);
                             drop(w);
-                            crate::runtime::domains::plugin::theme::note_theme(lua);
+                            super::theme_note(lua);
                         }
                     }
                     Ok(true)
@@ -1576,7 +1530,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
 
 pub fn write_acts(class: &str, key: &str) -> bool {
     matches!((class, key), ("CustomEventReceiver", "Source")) || class == "UserGameSettings"
-        || crate::studio_settings::is_item_class(class)
+        || crate::runtime::domains::settings_host::is_item_class(class)
         || key == "Sandboxed"
 }
 
@@ -1614,8 +1568,8 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     rs.set(
         "output",
         lua.create_function(|lua, (level, text): (String, String)| {
-            use crate::app::Level;
-            let mark = crate::output_panel::STACK_MARK;
+            use rustudio_core::log::Level;
+            let mark = STACK_MARK;
             let (lv, t) = match level.as_str() {
                 "warn" => (Level::Warn, text),
                 "error" => (Level::Error, text),
@@ -1639,13 +1593,13 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     rs.set(
         "member",
         lua.create_function(|_, (class, name): (String, String)| {
-            let Some(api) = crate::api::get() else { return Ok((None, false)) };
+            let Some(api) = rustudio_core::api::get() else { return Ok((None, false)) };
             Ok(match api.lookup(&class, &name) {
                 Some((_, m)) => (Some(match m.kind {
-                    crate::api::Kind::Property => "Property",
-                    crate::api::Kind::Function => "Function",
-                    crate::api::Kind::Event => "Event",
-                    crate::api::Kind::Callback => "Callback",
+                    rustudio_core::api::Kind::Property => "Property",
+                    rustudio_core::api::Kind::Function => "Function",
+                    rustudio_core::api::Kind::Event => "Event",
+                    rustudio_core::api::Kind::Callback => "Callback",
                 }), m.read_only),
                 None => (None, false),
             })
@@ -1708,7 +1662,7 @@ fn fire_sync(lua: &Lua, r: Ref, name: &str, args: Vec<Value>) {
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     // (RunService.FrameTime: simulated under --fixed-dt)
-    let now = crate::sim_clock::now();
+    let now = rustudio_core::sim_clock::now();
     let hooked = {
         let mut st = state(lua)?;
         if let Some(prev) = st.last_step.replace(now) {
@@ -1716,7 +1670,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         }
         st.step_started = Some(now);
         // The physics step's own time (play.rs's p3 section), per step.
-        let (ms, calls) = crate::bench::section_total("p3_physics_step");
+        let (ms, calls) = rustudio_core::bench::section_total("p3_physics_step");
         let (pms, pcalls) = std::mem::replace(&mut st.physics_prev, (ms, calls));
         if calls > pcalls && ms >= pms {
             st.physics_step = (ms - pms) / (calls - pcalls) as f64 / 1000.0;
@@ -1768,7 +1722,7 @@ fn tag_and_service_events(lua: &Lua) -> mlua::Result<()> {
         let mut st = state(lua)?;
         let version = (root, d.tree_revision);
         if w.listening.contains(&root) && st.services.as_ref().is_none_or(|(prev, _)| *prev != version) {
-            let api = crate::api::get();
+            let api = rustudio_core::api::get();
             let now: HashSet<Ref> = d
                 .dom
                 .get_by_ref(root)

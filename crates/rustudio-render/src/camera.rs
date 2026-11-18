@@ -3,13 +3,42 @@
 use egui::{Pos2, Rect};
 use glam::{Mat3, Mat4, Vec3, Vec4};
 
-use crate::math::Ray;
-use crate::mech;
+use rustudio_core::math::Ray;
+use rustudio_core::mech;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode {
     Fly,
     Orbit,
+}
+
+/// Studio Settings > Camera, as the editor passes them in (the settings
+/// store lives above the renderer). Defaults are Studio's (mech::CAMERA_*).
+#[derive(Debug, Clone, Copy)]
+pub struct CameraPrefs {
+    /// Camera Speed: fly studs/s (mech::FLY_SPEED at 1.5).
+    pub fly_speed: f32,
+    /// Camera Shift Speed: the wheel's studs per notch with Shift, and the
+    /// fly speed factor with Shift.
+    pub shift_speed: f32,
+    /// Camera Mouse Wheel Speed: studs per wheel notch.
+    pub scroll_speed: f32,
+    /// Camera Zoom to Mouse Position.
+    pub zoom_to_mouse: bool,
+    /// Camera Pan Speed (a factor, default 1).
+    pub pan_speed: f32,
+}
+
+impl Default for CameraPrefs {
+    fn default() -> Self {
+        CameraPrefs {
+            fly_speed: mech::FLY_SPEED,
+            shift_speed: mech::FLY_SHIFT_FACTOR,
+            scroll_speed: mech::WHEEL_STEP,
+            zoom_to_mouse: mech::WHEEL_ZOOM_TO_MOUSE,
+            pan_speed: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,9 +250,9 @@ impl Camera {
         self.mode = mode;
     }
 
-    pub fn pan(&mut self, dx: f32, dy: f32) {
+    pub fn pan(&mut self, dx: f32, dy: f32, prefs: &CameraPrefs) {
         // Studio Settings > Camera > Pan Speed scales it (default 1).
-        let k = self.focus_distance() * mech::PAN_FRACTION_PER_PX * crate::studio_settings::camera_pan_speed();
+        let k = self.focus_distance() * mech::PAN_FRACTION_PER_PX * prefs.pan_speed;
         let delta = -self.right() * dx * k + self.up() * dy * k;
         self.pos += delta;
         self.focus += delta;
@@ -235,15 +264,11 @@ impl Camera {
     /// with Shift held, along the cursor ray when "Zoom to Mouse Position"
     /// is on, else straight ahead. No slow-down near what's under the cursor:
     /// the camera can pass through it. The view direction stays.
-    pub fn zoom_toward(&mut self, dir: Vec3, notches: f32, shift: bool) {
+    pub fn zoom_toward(&mut self, dir: Vec3, notches: f32, shift: bool, prefs: &CameraPrefs) {
         // Studio Settings > Camera: Scroll Speed, Shift Speed, Scroll
-        // Towards Cursor Position (src/studio_settings.rs).
-        let speed = if shift {
-            crate::studio_settings::camera_shift_speed()
-        } else {
-            crate::studio_settings::camera_scroll_speed()
-        };
-        let dir = if crate::studio_settings::camera_zoom_to_mouse() {
+        // Towards Cursor Position (src/studio_settings.rs, passed in).
+        let speed = if shift { prefs.shift_speed } else { prefs.scroll_speed };
+        let dir = if prefs.zoom_to_mouse {
             dir
         } else {
             self.forward()
@@ -255,14 +280,12 @@ impl Camera {
 
     /// WASD/QE movement in camera space; `dir` is (right, up, forward);
     /// `boost` is the acceleration multiplier from holding the keys.
-    pub fn fly(&mut self, dir: Vec3, dt: f32, slow: bool, boost: f32) {
+    pub fn fly(&mut self, dir: Vec3, dt: f32, slow: bool, boost: f32, prefs: &CameraPrefs) {
         if dir == Vec3::ZERO {
             return;
         }
-        // Studio Settings > Camera > Camera Speed / Shift Speed.
-        let speed = crate::studio_settings::fly_speed()
-            * boost
-            * if slow { crate::studio_settings::camera_shift_speed() } else { 1.0 };
+        // Studio Settings > Camera > Camera Speed / Shift Speed (passed in).
+        let speed = prefs.fly_speed * boost * if slow { prefs.shift_speed } else { 1.0 };
         // Studio (Studio, then Studio): the key vector (A/D x, Q/E
         // y, W/S z) is normalised, then multiplied by all three columns of
         // the camera's rotation (, the look column

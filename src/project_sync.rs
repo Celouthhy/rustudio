@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::ustr;
 
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::project::{self, Origin, Reader, Snap};
 
 #[path = "project_write.rs"]
@@ -324,7 +324,7 @@ impl ProjectState {
             }
         }
         let since = self.pending_since?;
-        if since.elapsed().as_millis() < crate::mech::PROJECT_DEBOUNCE_MS as u128 {
+        if since.elapsed().as_millis() < rustudio_core::mech::PROJECT_DEBOUNCE_MS as u128 {
             return None;
         }
         self.pending_since = None;

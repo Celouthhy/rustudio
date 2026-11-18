@@ -97,7 +97,7 @@ fn inst_arg(args: &MultiValue, i: usize) -> mlua::Result<Ref> {
     }
 }
 
-fn cframe_arg(args: &MultiValue, i: usize) -> mlua::Result<crate::math::Xform> {
+fn cframe_arg(args: &MultiValue, i: usize) -> mlua::Result<rustudio_core::math::Xform> {
     match args.get(i) {
         None | Some(Value::Nil) => Err(rt_err(format!("Argument {i} missing or nil"))),
         Some(v) => opt_ud::<crate::ltypes::LCFrame>(v).map(|c| c.0).ok_or_else(|| cast_err(v, "CoordinateFrame")),
@@ -116,7 +116,7 @@ fn v3(lua: &Lua, v: glam::Vec3) -> mlua::Result<MultiValue> {
 }
 
 fn warn(lua: &Lua, msg: String) -> mlua::Result<()> {
-    world(lua)?.output.push((crate::app::Level::Warn, msg));
+    world(lua)?.output.push((rustudio_core::log::Level::Warn, msg));
     Ok(())
 }
 
@@ -135,7 +135,7 @@ fn finger_joints(lua: &Lua, r: Ref, f: usize) -> mlua::Result<Option<[glam::Vec3
         if d.dom.get_by_ref(j).is_none() {
             return Ok(None);
         }
-        *slot = match crate::attachment::world(d, j, true) {
+        *slot = match rustudio_core::attachment::world(d, j, true) {
             Some(x) => x.pos,
             None => return Ok(None),
         };

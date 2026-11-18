@@ -16,7 +16,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::App as _;
 use egui_wgpu::wgpu;
 
 pub struct Options {
@@ -105,10 +104,11 @@ fn read_back(rs: &egui_wgpu::RenderState, t: &Target, size: [u32; 2]) -> egui::C
 }
 
 /// Runs the app until it asks to close; returns the exit code.
-pub fn run(
+pub fn run<A: eframe::App>(
     config: egui_wgpu::WgpuConfiguration,
     opts: Options,
-    make: impl FnOnce(&egui::Context, Option<egui_wgpu::RenderState>) -> crate::app::RustudioApp,
+    make: impl FnOnce(&egui::Context, Option<egui_wgpu::RenderState>) -> A,
+    mut draw: impl FnMut(&mut A, &mut egui::Ui),
 ) -> i32 {
     let ctx = egui::Context::default();
     let rs = if opts.render {
@@ -150,7 +150,7 @@ pub fn run(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| app.frame(ui));
+        let out = ctx.run_ui(raw, |ui| draw(&mut app, ui));
         let mut close = false;
         let mut shots = Vec::new();
         for (_, v) in out.viewport_output.iter() {
@@ -190,7 +190,7 @@ pub fn run(
                 });
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
-            crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
+            rustudio_render::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
             for id in &out.textures_delta.free {
                 renderer.free_texture(id);
             }
@@ -232,5 +232,45 @@ pub fn run(
                 next = now;
             }
         }
+    }
+}
+
+pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
+    egui_wgpu::WgpuConfiguration {
+        wgpu_setup: {
+            let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+            let descriptor = setup.device_descriptor.clone();
+            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+                let mut d = descriptor(adapter);
+                d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // Studio HBAO writes its full-resolution R8 visibility UAV.
+                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+                // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
+                d.required_features |= rustudio_render::gpu_timing::features(adapter.features());
+                // GPU memory in blocks sized for memory use (8-64 MB), not
+                // wgpu's default 128-256 MB device blocks: the allocator keeps
+                // its last empty block, so a 1440 island settled 2.18-2.19 GB
+                // with them and 1.79-1.81 GB with these, with the same frame
+                // instructions, GPU time and texture load time (RX 9070,
+                // Vulkan; Windows RTX 3070: 1.83-2.09 -> 1.58-1.61 GB).
+                // RUSTUDIO_GPU_MEMORY=performance: wgpu's default blocks.
+                if std::env::var("RUSTUDIO_GPU_MEMORY").ok().as_deref() != Some("performance") {
+                    d.memory_hints = egui_wgpu::wgpu::MemoryHints::MemoryUsage;
+                }
+                d
+            });
+            egui_wgpu::WgpuSetup::CreateNew(setup)
+        },
+        surface: egui_wgpu::SurfaceConfig {
+            // No vsync when measuring or driven for captures: a shot waits
+            // for a few frames after each camera move.
+            present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
+                egui_wgpu::wgpu::PresentMode::AutoNoVsync
+            } else {
+                egui_wgpu::wgpu::PresentMode::AutoVsync
+            },
+            ..egui_wgpu::SurfaceConfig::LOW_LATENCY
+        },
+        ..Default::default()
     }
 }

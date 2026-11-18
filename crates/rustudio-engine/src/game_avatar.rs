@@ -9,8 +9,8 @@ use std::sync::{Mutex, OnceLock};
 
 use rbx_dom_weak::types::Variant;
 
-use crate::assets::SharedClient;
-use crate::doc::Document;
+use rustudio_core::assets::SharedClient;
+use rustudio_core::doc::Document;
 
 /// Enum.AssetType names of animation packages by id (game-start-info
 /// overrides name types by number).
@@ -96,7 +96,7 @@ pub fn rules(doc: &Document) -> GameAnimRules {
         // player's / default). Older files: AnimationClipsMode CustomClips
         // with Custom…AnimationEnabled + Custom…AnimationId, which the API
         // dump marks deprecated in favour of the overrides.
-        let legacy = crate::scene::enum_u32(doc.prop(r, "AnimationClipsMode")).unwrap_or(0) == 1;
+        let legacy = rustudio_render::scene::enum_u32(doc.prop(r, "AnimationClipsMode")).unwrap_or(0) == 1;
         let clip = |now: &str, old: &str| -> Option<u64> {
             let id = int(doc, r, &format!("{now}AnimationOverride"));
             if id > 0 {

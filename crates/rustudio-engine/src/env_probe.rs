@@ -21,6 +21,10 @@
 
 use glam::Vec3;
 
+// The probe frame's types and sizes are render's (`env_probe_gpu`): the
+// renderer consumes them, so they cannot point up at this module.
+use rustudio_render::render::env_probe_gpu::{capture_tasks, ProbeFrame, Task};
+
 /// FInt Studio: rays per region pass.
 pub const RAYS: usize = 32;
 /// FInt Studio: ray length, studs.
@@ -37,10 +41,6 @@ pub const GOLDEN: f32 = 2.39996;
 pub const MOVE_STUDS: f32 = 8.0;
 /// FInt Studio: seconds between passes while the camera is outside the box.
 pub const RETRY_SECONDS: f64 = 5.0;
-/// Probe cube: 128 px for PBR, 90-degree faces, far 3000
-///.
-pub const SIZE: u32 = 128;
-pub const FAR: f32 = 3000.0;
 /// Blend rates (Studio x FInt Studio).
 pub const BLEND_MOTION: f32 = 0.05;
 pub const BLEND_MOTION_MAX: f32 = 0.2;
@@ -59,40 +59,6 @@ pub fn directions() -> [Vec3; RAYS] {
         *d = Vec3::new(a.sin() * r, y, a.cos() * r);
     }
     out
-}
-
-/// One GPU step of a capture.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Task {
-    /// Draw cube face `0..6` of the scene at `centre` into the next slot.
-    Face(u32),
-    /// Build the FastConvDownsample source pyramid from the captured faces.
-    Pyramid,
-    /// FastConvolution of mip `mip` (1 or 2), faces `first..first+count`.
-    Convolve { mip: u32, first: u32, count: u32 },
-}
-
-/// The capture task list, one entry a frame: six faces, then the
-/// convolution (Studio: one face a call for mip 1, two for mips 2..3).
-pub fn capture_tasks() -> Vec<Task> {
-    let mut t: Vec<Task> = (0..6).map(Task::Face).collect();
-    t.push(Task::Pyramid);
-    t.extend((0..6).map(|f| Task::Convolve { mip: 1, first: f, count: 1 }));
-    t.extend((0..3).map(|f| Task::Convolve { mip: 2, first: f * 2, count: 2 }));
-    t
-}
-
-/// What the renderer does with the probe this frame.
-#[derive(Clone, Debug, Default)]
-pub struct ProbeFrame {
-    /// The capture position (centre of the probe box).
-    pub centre: Vec3,
-    /// GPU work this frame, in order.
-    pub tasks: Vec<Task>,
-    /// CB0[32].w: how far the shader blends from the current slot to the next.
-    pub blend: f32,
-    /// The next slot becomes the current one before drawing.
-    pub swap: bool,
 }
 
 #[derive(Default)]
@@ -325,9 +291,9 @@ fn commit(
 /// (runtime_ext.rs cast_swept, plain rays): CanQuery only counts once
 /// CanCollide is off; stored collision pieces, then the mesh, then the box
 /// for MeshParts and unions; exact balls, cylinders and wedges.
-pub fn world_ray(d: &crate::doc::Document, scene: &crate::scene::Scene, o: Vec3, dir: Vec3, len: f32) -> Option<f32> {
+pub fn world_ray(d: &rustudio_core::doc::Document, scene: &rustudio_render::scene::Scene, o: Vec3, dir: Vec3, len: f32) -> Option<f32> {
     use rbx_dom_weak::types::Variant;
-    let ray = crate::math::Ray { origin: o, dir };
+    let ray = rustudio_core::math::Ray { origin: o, dir };
     let mut best: Option<f32> = None;
     for (sp, b) in scene.parts.iter().zip(&scene.bounds) {
         let oc = b.truncate() - o;
@@ -341,42 +307,42 @@ pub fn world_ray(d: &crate::doc::Document, scene: &crate::scene::Scene, o: Vec3,
             continue;
         }
         let Some(class) = d.class_of(sp.r) else { continue };
-        let Some(xf) = crate::scene::xform_of(d, sp.r) else { continue };
+        let Some(xf) = rustudio_render::scene::xform_of(d, sp.r) else { continue };
         let size = sp.size;
-        let mesh_class = class == "MeshPart" || crate::doc::is_a(&class, "PartOperation");
+        let mesh_class = class == "MeshPart" || rustudio_core::doc::is_a(&class, "PartOperation");
         let t = if mesh_class {
-            let fidelity = crate::physics_mesh::fidelity(d, sp.r);
-            let pieces = match crate::physics_mesh::of_part_id(d, sp.r) {
-                Some((crate::physics_mesh::Geometry::Pieces(_), id)) if fidelity != Some(crate::physics_mesh::FIDELITY_BOX) => Some(id),
+            let fidelity = rustudio_physics::physics_mesh::fidelity(d, sp.r);
+            let pieces = match rustudio_physics::physics_mesh::of_part_id(d, sp.r) {
+                Some((rustudio_physics::physics_mesh::Geometry::Pieces(_), id)) if fidelity != Some(rustudio_physics::physics_mesh::FIDELITY_BOX) => Some(id),
                 _ => None,
             };
             if let Some(id) = pieces {
-                let initial = crate::scene::vec3_of(d.prop(sp.r, "InitialSize"))
-                    .or_else(|| crate::scene::vec3_of(d.prop(sp.r, "MeshSize")))
+                let initial = rustudio_render::scene::vec3_of(d.prop(sp.r, "InitialSize"))
+                    .or_else(|| rustudio_render::scene::vec3_of(d.prop(sp.r, "MeshSize")))
                     .filter(|v| v.max_element() > 0.0)
                     .unwrap_or(size);
-                let scale = crate::physics_mesh::scale(initial, size);
+                let scale = rustudio_physics::physics_mesh::scale(initial, size);
                 if ray.hit_obb(&xf, size).is_none() {
                     continue;
                 }
-                crate::physics_mesh::pieces(id).and_then(|p| crate::physics_mesh::ray(&p, &xf, scale, o, dir, len)).map(|h| h.0)
+                rustudio_physics::physics_mesh::pieces(id).and_then(|p| rustudio_physics::physics_mesh::ray(&p, &xf, scale, o, dir, len)).map(|h| h.0)
             } else {
                 let id = if class == "MeshPart" {
-                    crate::scene::content_string(d.prop(sp.r, "MeshId"))
+                    rustudio_render::scene::content_string(d.prop(sp.r, "MeshId"))
                 } else {
-                    crate::scene::union_mesh(d, sp.r).map(|m| m.id)
+                    rustudio_core::mesh::union_mesh(d, sp.r).map(|m| m.id)
                 };
                 let gxf = match &id {
-                    Some(id) => crate::math::Xform { pos: xf.pos + xf.rot * (crate::mesh_bvh::union_offset(id) * size), rot: xf.rot },
+                    Some(id) => rustudio_core::math::Xform { pos: xf.pos + xf.rot * (rustudio_core::mesh_bvh::union_offset(id) * size), rot: xf.rot },
                     None => xf,
                 };
-                if fidelity == Some(crate::physics_mesh::FIDELITY_BOX) {
+                if fidelity == Some(rustudio_physics::physics_mesh::FIDELITY_BOX) {
                     ray.enter_obb(&gxf, size)
                 } else {
                     if ray.hit_obb(&gxf, size).is_none() {
                         continue;
                     }
-                    match id.as_deref().filter(|i| !i.is_empty()).and_then(crate::mesh_bvh::for_mesh) {
+                    match id.as_deref().filter(|i| !i.is_empty()).and_then(rustudio_core::mesh_bvh::for_mesh) {
                         Some(bvh) => {
                             let inv = gxf.rot.transpose();
                             let s = size.max(Vec3::splat(1e-4));
@@ -387,11 +353,11 @@ pub fn world_ray(d: &crate::doc::Document, scene: &crate::scene::Scene, o: Vec3,
                 }
             }
         } else {
-            let kind = crate::query_shapes::kind_of(d, sp.r, &class);
-            if kind == crate::query_shapes::BOX {
+            let kind = rustudio_physics::query_shapes::kind_of(d, sp.r, &class);
+            if kind == rustudio_physics::query_shapes::BOX {
                 ray.enter_obb(&xf, size)
             } else {
-                crate::query_shapes::ray_part(&xf, size, kind, o, dir).map(|h| h.0)
+                rustudio_physics::query_shapes::ray_part(&xf, size, kind, o, dir).map(|h| h.0)
             }
         };
         if let Some(t) = t.filter(|t| *t >= 0.0 && *t <= len) {
@@ -401,19 +367,6 @@ pub fn world_ray(d: &crate::doc::Document, scene: &crate::scene::Scene, o: Vec3,
         }
     }
     best
-}
-
-/// The face's view basis (forward, up), cube order +X, -X, +Y, -Y, +Z, -Z
-/// (Studio; D3D / wgpu cube faces).
-pub fn face_basis(face: u32) -> (Vec3, Vec3) {
-    match face {
-        0 => (Vec3::X, Vec3::Y),
-        1 => (-Vec3::X, Vec3::Y),
-        2 => (Vec3::Y, -Vec3::Z),
-        3 => (-Vec3::Y, Vec3::Z),
-        4 => (Vec3::Z, Vec3::Y),
-        _ => (-Vec3::Z, Vec3::Y),
-    }
 }
 
 #[cfg(test)]
@@ -480,70 +433,3 @@ mod tests {
         assert!(swapped);
     }
 }
-
-/// FastConvolutionPS CB4: the 960 bytes Studio uploads (copied from
-/// .rdata Studio..Studio; checks/laser-tag-parity/render/
-/// native-traced/convolution-cb4.json). Per level (mip 1, mip 2): 30 vec4,
-/// tangent / bitangent / normal weights, source lod, tap weight (6 each).
-pub const CONVOLUTION: [[f32; 4]; 60] = [
-    [-0.047896601259708405, 0.0022376899141818285, 0.13721300661563873, -0.14268499612808228],
-    [0.11079200357198715, -0.048012200742959976, -0.004811530001461506, 0.02609799988567829],
-    [-0.04865869879722595, -0.03231469914317131, 0.12428499758243561, -0.08737579733133316],
-    [0.09280289709568024, -0.0064116897992789745, -0.04859580099582672, 0.03342840075492859],
-    [-0.02262910082936287, -0.06591200083494186, 0.10839200019836426, -0.09438200294971466],
-    [0.10435599833726883, -0.029181700199842453, -0.0050018299371004105, 0.006752519868314266],
-    [-0.03361539915204048, -0.03066210076212883, 0.014751099981367588, 0.017846299335360527],
-    [-0.0310651995241642, 0.011960700154304504, 0.006071330048143864, 0.01514929998666048],
-    [0.012825800105929375, -0.0040247500874102116, 0.016707399860024452, -0.01684579998254776],
-    [-0.05792130157351494, 0.021790800616145134, -0.007918530143797398, 0.0215901006013155],
-    [-0.03485039994120598, -0.0032204100862145424, -0.028062399476766586, -0.016979800537228584],
-    [-0.02272370085120201, 0.018890999257564545, 5.3588599257636815e-05, 0.037955399602651596],
-    [0.996815025806427, 0.994388997554779, 0.9810929894447327, 0.9833130240440369],
-    [0.9915739893913269, 0.9951609969139099, 0.999879002571106, 0.9983410239219666],
-    [0.9976639747619629, 0.9984059929847717, 0.9793969988822937, 0.9896960258483887],
-    [0.9916139841079712, 0.9988129734992981, 0.9976040124893188, 0.9975969791412354],
-    [0.9971839785575867, 0.9959679841995239, 0.9866899847984314, 0.9871580004692078],
-    [0.993815004825592, 0.9975690245628357, 0.9999669790267944, 0.9984369874000549],
-    [2.672990083694458, 3.6537699699401855, 2.87103009223938, 2.8844099044799805],
-    [3.0511300563812256, 2.3980400562286377, 1.9938299655914307, 2.415450096130371],
-    [2.810889959335327, 3.819659948348999, 2.9271399974823, 2.921689987182617],
-    [3.2918100357055664, 2.4230000972747803, 1.9989500045776367, 2.137350082397461],
-    [2.3872199058532715, 3.312659978866577, 2.9524900913238525, 3.029860019683838],
-    [2.9255900382995605, 2.4142000675201416, 1.9309899806976318, 2.0014500617980957],
-    [0.5689849853515625, 0.3531000018119812, 0.973406970500946, 0.8651319742202759],
-    [0.7326409816741943, 1.384950041770935, 1.5516899824142456, 1.457900047302246],
-    [1.127020001411438, 0.7165160179138184, 0.9421409964561462, 0.9906229972839355],
-    [0.9753149747848511, 1.7410099506378174, 1.442829966545105, 1.4955799579620361],
-    [0.7084370255470276, 0.556538999080658, 1.0517100095748901, 0.7899979948997498],
-    [0.9671270251274109, 1.3909800052642822, 1.573349952697754, 1.2821600437164307],
-    [-0.0694521963596344, -0.054684098809957504, 0.26948198676109314, -0.48583298921585083],
-    [0.3975369930267334, -0.05444389954209328, 0.08300969749689102, -0.20476700365543365],
-    [-0.07158230245113373, -0.07419479638338089, 0.2483379989862442, -0.48693400621414185],
-    [0.355663001537323, -0.025955699384212494, 0.054478999227285385, -0.19293299317359924],
-    [-0.06279610097408295, -0.055908799171447754, 0.2013150006532669, -0.42486900091171265],
-    [0.42616501450538635, 0.010062700137495995, 0.0889727994799614, -0.22596800327301025],
-    [0.054569099098443985, -0.2913289964199066, 0.13726100325584412, -0.004152089823037386],
-    [-0.16085900366306305, 0.28030699491500854, -0.06945829838514328, -0.13830700516700745],
-    [0.07551079988479614, -0.2936210036277771, 0.10127600282430649, -0.06112419813871384],
-    [-0.14244399964809418, 0.2934190034866333, -0.07422740012407303, -0.09664910286664963],
-    [0.04261770099401474, -0.26699700951576233, 0.08656840026378632, -0.02063559927046299],
-    [-0.030395999550819397, 0.30966299772262573, -0.08135200291872025, -0.13887600600719452],
-    [0.9949929714202881, 0.9509490132331848, 0.9523249864578247, 0.8693649768829346],
-    [0.8976889848709106, 0.9541260004043579, 0.9930970072746277, 0.9621040225028992],
-    [0.9941409826278687, 0.9483960270881653, 0.9630360007286072, 0.8638520240783691],
-    [0.9198269844055176, 0.9513630270957947, 0.9941009879112244, 0.9704750180244446],
-    [0.9959679841995239, 0.9590579867362976, 0.9744129776954651, 0.9016939997673035],
-    [0.8975729942321777, 0.945268988609314, 0.9916499853134155, 0.9569230079650879],
-    [3.491489887237549, 3.9926199913024902, 4.155479907989502, 4.767980098724365],
-    [5.026559829711914, 4.073729991912842, 3.4915199279785156, 3.8488099575042725],
-    [3.4601500034332275, 3.6936099529266357, 4.029660224914551, 4.756750106811523],
-    [4.919229984283447, 4.336880207061768, 3.511280059814453, 3.899319887161255],
-    [3.5485899448394775, 3.955549955368042, 4.2572197914123535, 5.208270072937012],
-    [4.674950122833252, 4.198890209197998, 3.345679998397827, 3.716559886932373],
-    [1.5162999629974365, 0.7468050122261047, 0.9939900040626526, 0.7289569973945618],
-    [0.7255610227584839, 0.7039139866828918, 1.3796299695968628, 0.7575200200080872],
-    [1.5814599990844727, 0.6280959844589233, 1.0032299757003784, 0.756367027759552],
-    [1.0983500480651855, 1.1569299697875977, 1.5953700542449951, 1.0459599494934082],
-    [1.8529499769210815, 0.8183349967002869, 1.0174599885940552, 0.7971770167350769],
-    [0.9702339768409729, 0.9149870276451111, 1.0250999927520752, 0.5558300018310547],
-];

@@ -912,6 +912,7 @@ mod tests {
 
     fn rec_path(name: &str) -> Option<std::path::PathBuf> {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .join("checks/humanoid-physics/ticks/solver/studio")
             .join(name);
         p.exists().then_some(p)

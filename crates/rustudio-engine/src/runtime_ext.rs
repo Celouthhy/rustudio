@@ -479,7 +479,7 @@ fn num_arg(args: &MultiValue, i: usize) -> Option<f32> {
 fn terrain_material(args: &MultiValue, i: usize, call: &str) -> mlua::Result<u8> {
     let e = opt_ud::<LEnumItem>(&arg(args, i))
         .ok_or_else(|| rt_err(&format!("Terrain:{call}: Enum.Material expected")))?;
-    crate::terrain::material_index(&e.name)
+    rustudio_core::terrain::material_index(&e.name)
         .ok_or_else(|| rt_err(&format!("Terrain:{call}: Enum.Material.{} is not a terrain material", e.name)))
 }
 
@@ -497,7 +497,7 @@ fn box_distance(p: Vec3, h: Vec3) -> f32 {
 /// FillBlock, Place B its water. Edits go to a decoded copy of the voxels
 /// that `flush_terrain` writes back to SmoothGrid once a step.
 fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
-    use crate::terrain::{self, Voxels};
+    use rustudio_core::terrain::{self, Voxels};
     if name == "SetMaterialColor" || name == "GetMaterialColor" {
         let slot = terrain_material(args, 1, name)? as usize;
         let mut w = world(lua)?;
@@ -640,7 +640,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                 .ok_or_else(|| rt_err("Terrain:CopyRegion: Region3int16 expected"))?;
             let (lo, hi) = (rg.min.0.map(i32::from), rg.max.0.map(i32::from));
             let size = [0, 1, 2].map(|k| (hi[k] - lo[k] + 1).max(0));
-            let region = crate::terrain_region::Region::copy(&voxels, lo, size);
+            let region = rustudio_core::terrain_region::Region::copy(&voxels, lo, size);
             world(lua)?.terrain_edit = Some((this, voxels));
             let r = create_any(lua, "TerrainRegion")?;
             let v3 = |c: [i32; 3]| Variant::Vector3int16(rbx_dom_weak::types::Vector3int16::new(c[0] as i16, c[1] as i16, c[2] as i16));
@@ -672,7 +672,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                     Some(Variant::BinaryString(b)) => AsRef::<[u8]>::as_ref(&b).to_vec(),
                     _ => Vec::new(),
                 };
-                crate::terrain_region::Region::from_smooth_grid(&grid, min, max)
+                rustudio_core::terrain_region::Region::from_smooth_grid(&grid, min, max)
             };
             match region {
                 Ok(region) => region.paste(&mut voxels, corner, paste_empty),
@@ -1090,7 +1090,7 @@ struct QueryCache {
     /// Workspace.Terrain's voxels for rays (None = read them again).
     /// With its voxel bounds (studs), which every ray needs (round 20: the
     /// scan over every chunk per ray was 12% of Place B's Play frame).
-    terrain: Option<Option<(Ref, std::rc::Rc<crate::terrain::Voxels>, Option<([f32; 3], [f32; 3])>)>>,
+    terrain: Option<Option<(Ref, std::rc::Rc<rustudio_core::terrain::Voxels>, Option<([f32; 3], [f32; 3])>)>>,
     /// The material of the last ray that hit terrain (for its RaycastResult).
     terrain_material: Option<u8>,
     /// Terrain triangles per chunk for rays (dropped with `terrain`).
@@ -1296,14 +1296,14 @@ impl QueryGrid {
 /// (GeometryService keeps the main part's CFrame; mesh_bvh::union_offset).
 fn geometry_box(d: &Document, r: Ref, class: &str, xf: Xform, size: Vec3) -> Xform {
     let id = if doc::is_a(class, "PartOperation") {
-        crate::scene::union_mesh(d, r).map(|m| m.id)
+        rustudio_core::mesh::union_mesh(d, r).map(|m| m.id)
     } else if class == "MeshPart" {
-        crate::scene::content_string(d.prop(r, "MeshId"))
+        rustudio_render::scene::content_string(d.prop(r, "MeshId"))
     } else {
         None
     };
     match id {
-        Some(id) => Xform { pos: xf.pos + xf.rot * (crate::mesh_bvh::union_offset(&id) * size), rot: xf.rot },
+        Some(id) => Xform { pos: xf.pos + xf.rot * (rustudio_core::mesh_bvh::union_offset(&id) * size), rot: xf.rot },
         None => xf,
     }
 }
@@ -1317,36 +1317,36 @@ fn qpart(d: &Document, r: Ref) -> Option<QPart> {
     if !d.is_ancestor(ws, r) {
         return None;
     }
-    let xf = crate::scene::xform_of(d, r)?;
-    let size = crate::scene::vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
+    let xf = rustudio_render::scene::xform_of(d, r)?;
+    let size = rustudio_render::scene::vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
     let collide = !matches!(d.prop(r, "CanCollide"), Some(Variant::Bool(false)));
     let query = !matches!(d.prop(r, "CanQuery"), Some(Variant::Bool(false)));
     let mesh_class = class == "MeshPart" || doc::is_a(&class, "PartOperation");
     // Studio's own collision pieces (PhysicalConfigData), which also say the
     // CollisionFidelity: the file has no such property for these classes.
     let geo = if mesh_class {
-        crate::physics_mesh::of_part_id(d, r)
+        rustudio_physics::physics_mesh::of_part_id(d, r)
     } else {
         None
     };
     let fidelity = if mesh_class {
-        crate::physics_mesh::fidelity(d, r)
+        rustudio_physics::physics_mesh::fidelity(d, r)
     } else {
         None
     };
     let cvx = match &geo {
-        Some((crate::physics_mesh::Geometry::Pieces(_), id)) if fidelity != Some(crate::physics_mesh::FIDELITY_BOX) => *id,
+        Some((rustudio_physics::physics_mesh::Geometry::Pieces(_), id)) if fidelity != Some(rustudio_physics::physics_mesh::FIDELITY_BOX) => *id,
         _ => 0,
     };
-    let initial = crate::scene::vec3_of(d.prop(r, "InitialSize"))
-        .or_else(|| crate::scene::vec3_of(d.prop(r, "MeshSize")))
+    let initial = rustudio_render::scene::vec3_of(d.prop(r, "InitialSize"))
+        .or_else(|| rustudio_render::scene::vec3_of(d.prop(r, "MeshSize")))
         .filter(|v| v.max_element() > 0.0)
         .unwrap_or(size);
     // The pieces sit around the part's CFrame; otherwise the drawn mesh's box.
     let xf = if cvx != 0 { xf } else { geometry_box(d, r, &class, xf, size) };
     // CollisionFidelity: Default 0, Hull 1, Box 2, PreciseConvexDecomposition 3.
-    let mesh = mesh_class && cvx == 0 && fidelity != Some(crate::physics_mesh::FIDELITY_BOX);
-    let shape = crate::query_shapes::kind_of(d, r, &class);
+    let mesh = mesh_class && cvx == 0 && fidelity != Some(rustudio_physics::physics_mesh::FIDELITY_BOX);
+    let shape = rustudio_physics::query_shapes::kind_of(d, r, &class);
     Some(QPart {
         r,
         xf,
@@ -1478,10 +1478,10 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
                         touched.insert(r);
                         continue;
                     };
-                    p.xf = crate::math::Xform::from_cframe(&cf).orthonormalized();
+                    p.xf = rustudio_core::math::Xform::from_cframe(&cf).orthonormalized();
                 }
                 if bits & 2 != 0 {
-                    p.size = crate::scene::vec3_of(get(k_size)).unwrap_or(Vec3::ONE);
+                    p.size = rustudio_render::scene::vec3_of(get(k_size)).unwrap_or(Vec3::ONE);
                 }
                 if bits & 4 != 0 {
                     p.collide = !matches!(get(k_collide), Some(Variant::Bool(false)));
@@ -1727,7 +1727,7 @@ fn cast_swept_once(
     if len < 1e-6 {
         return Ok(None);
     }
-    let ray = crate::math::Ray {
+    let ray = rustudio_core::math::Ray {
         origin,
         dir: dir / len,
     };
@@ -1752,13 +1752,13 @@ fn cast_swept_once(
             if ray.hit_obb(&p.xf, p.size + grow * 2.0).is_none_or(|t| best.is_some_and(|(bt, ..)| t >= bt)) {
                 return;
             }
-            let scale = crate::physics_mesh::scale(p.initial, p.size);
+            let scale = rustudio_physics::physics_mesh::scale(p.initial, p.size);
             if swept {
                 let Some((kind, size, rot)) = probe else { return };
-                let Some(shapes) = crate::physics_mesh::shapes(p.cvx, scale, p.size) else { return };
-                let start = crate::math::Xform { pos: ray.origin, rot };
+                let Some(shapes) = rustudio_physics::physics_mesh::shapes(p.cvx, scale, p.size) else { return };
+                let start = rustudio_core::math::Xform { pos: ray.origin, rot };
                 let Some((t, at, n)) =
-                    crate::query_shapes::sweep_pieces(
+                    rustudio_physics::query_shapes::sweep_pieces(
                         &start,
                         size,
                         kind,
@@ -1774,8 +1774,8 @@ fn cast_swept_once(
                 touch = Some(at);
                 t
             } else {
-                let Some(pieces) = crate::physics_mesh::pieces(p.cvx) else { return };
-                let Some((t, n)) = crate::physics_mesh::ray(&pieces, &p.xf, scale, ray.origin, ray.dir, len) else {
+                let Some(pieces) = rustudio_physics::physics_mesh::pieces(p.cvx) else { return };
+                let Some((t, n)) = rustudio_physics::physics_mesh::ray(&pieces, &p.xf, scale, ray.origin, ray.dir, len) else {
                     return;
                 };
                 normal = Some(n);
@@ -1792,8 +1792,8 @@ fn cast_swept_once(
                     if best.is_some_and(|(bt, ..)| t >= bt) {
                         return;
                     }
-                    let start = crate::math::Xform { pos: ray.origin, rot };
-                    let Some((t, at, n)) = crate::query_shapes::sweep_part(
+                    let start = rustudio_core::math::Xform { pos: ray.origin, rot };
+                    let Some((t, at, n)) = rustudio_physics::query_shapes::sweep_part(
                         &start, size, kind, ray.dir, len, &p.xf, p.size, p.shape,
                     ) else {
                         return;
@@ -1804,8 +1804,8 @@ fn cast_swept_once(
                 }
                 None => t,
             }
-        } else if p.shape != crate::query_shapes::BOX && !p.mesh {
-            let Some((t, n)) = crate::query_shapes::ray_part(&p.xf, p.size, p.shape, ray.origin, ray.dir)
+        } else if p.shape != rustudio_physics::query_shapes::BOX && !p.mesh {
+            let Some((t, n)) = rustudio_physics::query_shapes::ray_part(&p.xf, p.size, p.shape, ray.origin, ray.dir)
             else {
                 return;
             };
@@ -1824,18 +1824,18 @@ fn cast_swept_once(
                     owned = match d.prop(p.r, "MeshId") {
                         Some(Variant::ContentId(c)) => c.as_str().to_string(),
                         // A union: its mesh (geometry_box already centred p.xf on it).
-                        _ => crate::scene::union_mesh(d, p.r).map(|m| m.id).unwrap_or_default(),
+                        _ => rustudio_core::mesh::union_mesh(d, p.r).map(|m| m.id).unwrap_or_default(),
                     };
                     owned.as_str()
                 }
             };
-            let _m = crate::bench::scope("ray_mesh");
+            let _m = rustudio_core::bench::scope("ray_mesh");
             match (!id.is_empty())
-                .then(|| crate::mesh_bvh::for_mesh(id))
+                .then(|| rustudio_core::mesh_bvh::for_mesh(id))
                 .flatten()
             {
                 Some(bvh) => {
-                    crate::bench::add("ray_mesh_tris", 0.0, bvh.tris.len() as u64);
+                    rustudio_core::bench::add("ray_mesh_tris", 0.0, bvh.tris.len() as u64);
                     let inv = p.xf.rot.transpose();
                     let size = p.size.max(Vec3::splat(1e-4));
                     let o = (inv * (ray.origin - p.xf.pos)) / size;
@@ -1875,9 +1875,9 @@ fn cast_swept_once(
     };
     // Along the ray a few grid cells at a time; stop once a hit is nearer
     // than the next stretch.
-    let parts_scope = crate::bench::scope("ray_parts");
+    let parts_scope = rustudio_core::bench::scope("ray_parts");
     {
-        let _q = crate::bench::scope("ray_query_sync");
+        let _q = rustudio_core::bench::scope("ray_query_sync");
         query_parts(lua)?;
     }
     let step = mech::QUERY_GRID_CELL * 4.0;
@@ -1923,7 +1923,7 @@ fn cast_swept_once(
     // Terrain: rays meet its surface, sweeps its surface with the shape.
     {
         drop(parts_scope);
-        let _t = crate::bench::scope("ray_terrain");
+        let _t = rustudio_core::bench::scope("ray_terrain");
         let terrain = match probe {
             Some(pr) if swept => terrain_sweep(lua, pr, ray.origin, grow, ray.dir, len, filter.ignore_water)?,
             _ => terrain_hit(lua, ray.origin, ray.dir, len, filter.ignore_water)?,
@@ -1983,7 +1983,7 @@ fn cast_swept_once(
 }
 
 /// How long a ray stays inside a box (0 when it misses or only touches it).
-fn ray_box_chord(ray: &crate::math::Ray, xf: &Xform, size: Vec3) -> f32 {
+fn ray_box_chord(ray: &rustudio_core::math::Ray, xf: &Xform, size: Vec3) -> f32 {
     let inv = xf.rot.transpose();
     let (o, d) = (inv * (ray.origin - xf.pos), inv * ray.dir);
     let h = size * 0.5;
@@ -2127,7 +2127,7 @@ fn overlap_once(
 
 /// Workspace.Terrain with its voxels and their world bounds (studs), read
 /// once per terrain change.
-fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<crate::terrain::Voxels>, (Vec3, Vec3))>> {
+fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<rustudio_core::terrain::Voxels>, (Vec3, Vec3))>> {
     let cached = {
         let c = lua.app_data_ref::<QueryCache>();
         c.and_then(|c| c.terrain.clone())
@@ -2139,7 +2139,7 @@ fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<crate::terr
                 let w = world(lua)?;
                 let d = w.d();
                 let r = d.workspace().and_then(|ws| d.find_child(ws, "Terrain"));
-                match (r, crate::terrain::Voxels::from_dom(&d.dom)) {
+                match (r, rustudio_core::terrain::Voxels::from_dom(&d.dom)) {
                     (Some(r), Some(Ok(v))) if v.count() > 0 => {
                         let b = v.world_bounds();
                         Some((r, std::rc::Rc::new(v), b))
@@ -2162,10 +2162,10 @@ fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<crate::terr
 /// The chunk keys a world box touches (a chunk's surface reaches one voxel
 /// past its corner; water's lies half a voxel lower still).
 fn terrain_chunk_keys(lo: Vec3, hi: Vec3) -> impl Iterator<Item = [i32; 3]> {
-    use crate::terrain::VOXEL;
+    use rustudio_core::terrain::VOXEL;
     let chunk = VOXEL * 32.0;
     let a = ((lo - VOXEL) / chunk).floor().as_ivec3();
-    let b = ((hi + VOXEL + Vec3::Y * crate::terrain::WATER_RAY_DROP) / chunk).floor().as_ivec3();
+    let b = ((hi + VOXEL + Vec3::Y * rustudio_core::terrain::WATER_RAY_DROP) / chunk).floor().as_ivec3();
     (a.x..=b.x).flat_map(move |x| (a.y..=b.y).flat_map(move |y| (a.z..=b.z).map(move |z| [x, y, z])))
 }
 
@@ -2183,11 +2183,11 @@ fn terrain_hit(
     len: f32,
     ignore_water: bool,
 ) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
-    use crate::terrain::VOXEL;
+    use rustudio_core::terrain::VOXEL;
     let Some((r, v, (lo, hi))) = terrain_state(lua)? else {
         return Ok(None);
     };
-    let (lo, hi) = (lo - VOXEL - Vec3::Y * crate::terrain::WATER_RAY_DROP, hi + VOXEL);
+    let (lo, hi) = (lo - VOXEL - Vec3::Y * rustudio_core::terrain::WATER_RAY_DROP, hi + VOXEL);
     let dir_n = dir.normalize_or_zero();
     // The stretch of the ray inside the terrain's bounds.
     let (mut t0, mut t1) = (0.0f32, len);
@@ -2236,7 +2236,7 @@ fn terrain_hit(
                 if let Some((d, _)) = ray_triangle(origin, dir_n, tri) {
                     if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
                         let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-                        best = Some((d, n, crate::terrain::WATER));
+                        best = Some((d, n, rustudio_core::terrain::WATER));
                     }
                 }
             }
@@ -2264,17 +2264,17 @@ fn terrain_sweep(
     len: f32,
     ignore_water: bool,
 ) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
-    use crate::terrain::VOXEL;
+    use rustudio_core::terrain::VOXEL;
     let Some((r, v, (lo, hi))) = terrain_state(lua)? else {
         return Ok(None);
     };
-    let (lo, hi) = (lo - VOXEL - Vec3::Y * crate::terrain::WATER_RAY_DROP, hi + VOXEL);
+    let (lo, hi) = (lo - VOXEL - Vec3::Y * rustudio_core::terrain::WATER_RAY_DROP, hi + VOXEL);
     let end = origin + dir * len;
     let (plo, phi) = (origin.min(end) - ext, origin.max(end) + ext);
     if plo.cmpgt(hi).any() || phi.cmplt(lo).any() {
         return Ok(None);
     }
-    let start = crate::math::Xform { pos: origin, rot: probe.2 };
+    let start = rustudio_core::math::Xform { pos: origin, rot: probe.2 };
     let chunk = VOXEL * 32.0;
     let step = chunk * 0.5;
     let mut seen: HashSet<[i32; 3]> = HashSet::new();
@@ -2316,11 +2316,11 @@ fn terrain_sweep(
             for p in water.iter().flat_map(|w| w.iter()) {
                 if near(p) {
                     cand.push((mats.len(), *p));
-                    mats.push([crate::terrain::WATER; 3]);
+                    mats.push([rustudio_core::terrain::WATER; 3]);
                 }
             }
         }
-        let hit = crate::query_shapes::sweep_triangles(&start, probe.1, probe.0, dir, len, &cand);
+        let hit = rustudio_physics::query_shapes::sweep_triangles(&start, probe.1, probe.0, dir, len, &cand);
         match hit {
             Err(()) => return Ok(None),
             Ok(Some((i, d, at, n))) if best.is_none_or(|(bt, ..)| d < bt) => {
@@ -2346,7 +2346,7 @@ fn terrain_sweep(
 #[allow(clippy::type_complexity)]
 fn terrain_chunk_tris(
     lua: &Lua,
-    v: &crate::terrain::Voxels,
+    v: &rustudio_core::terrain::Voxels,
     key: [i32; 3],
     water: bool,
 ) -> (std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>, Option<std::rc::Rc<Vec<[Vec3; 3]>>>) {
@@ -2360,7 +2360,7 @@ fn terrain_chunk_tris(
     let solid = match lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_tris.get(&key).cloned()) {
         Some(t) => t,
         None => {
-            let verts = crate::terrain::chunk_triangles(v, key, &|_| false);
+            let verts = rustudio_core::terrain::chunk_triangles(v, key, &|_| false);
             let tris: Vec<([Vec3; 3], [u8; 3])> = verts
                 .chunks_exact(3)
                 .map(|t| {
@@ -2381,7 +2381,7 @@ fn terrain_chunk_tris(
     let wet = match lua.app_data_ref::<QueryCache>().and_then(|c| c.terrain_water.get(&key).cloned()) {
         Some(t) => t,
         None => {
-            let tris: Vec<[Vec3; 3]> = crate::terrain::chunk_water_triangles(v, key)
+            let tris: Vec<[Vec3; 3]> = rustudio_core::terrain::chunk_water_triangles(v, key)
                 .into_iter()
                 .map(|t| t.map(Vec3::from))
                 .collect();
@@ -2635,7 +2635,7 @@ fn raycast_result(lua: &Lua, hit: (Ref, Vec3, Vec3, f32)) -> mlua::Result<Value>
         let w = world(lua)?;
         let d = w.d();
         let material = match terrain_mat {
-            Some(m) => LEnumItem::from_name("Material", crate::terrain::material_name(m)),
+            Some(m) => LEnumItem::from_name("Material", rustudio_core::terrain::material_name(m)),
             None => match d.prop(hit.0, "Material") {
                 Some(Variant::Enum(e)) => LEnumItem::from_value("Material", e.to_u32()),
                 _ => LEnumItem::from_name("Material", "Plastic"),
@@ -2908,10 +2908,10 @@ fn model_bounds(lua: &Lua, r: Ref) -> mlua::Result<(Vec3, Vec3)> {
         if !doc::is_a(&i.class, "BasePart") {
             continue;
         }
-        let Some(xf) = crate::scene::xform_of(d, i.referent()) else {
+        let Some(xf) = rustudio_render::scene::xform_of(d, i.referent()) else {
             continue;
         };
-        let size = crate::scene::vec3_of(d.prop(i.referent(), "Size")).unwrap_or(Vec3::ONE);
+        let size = rustudio_render::scene::vec3_of(d.prop(i.referent(), "Size")).unwrap_or(Vec3::ONE);
         let xf = geometry_box(d, i.referent(), &i.class, xf, size);
         let (a, b) = part_aabb(&QPart {
             r: i.referent(),
@@ -2941,7 +2941,7 @@ fn character_root(d: &Document, player: Ref) -> Option<Vec3> {
     let root = d
         .find_named(ch, "HumanoidRootPart")
         .or_else(|| d.find_named(ch, "Torso"))?;
-    crate::scene::xform_of(d, root).map(|x| x.pos)
+    rustudio_render::scene::xform_of(d, root).map(|x| x.pos)
 }
 
 fn sound_key_of(r: Ref) -> u64 {
@@ -3060,11 +3060,11 @@ pub fn sound_ev(lua: &Lua, r: Ref, cmd: SoundCmd, events: bool) -> mlua::Result<
 /// InsertService:LoadAsset: a Model holding the asset's instances, from the
 /// local asset store (the offline Studio's ~/.local/share/rustudio/assets) or the asset cache.
 fn load_asset(lua: &Lua, id: u64) -> mlua::Result<Ref> {
-    let path = crate::assets::local_asset_path(id);
+    let path = rustudio_core::assets::local_asset_path(id);
     if let Some(bytes) = path
         .as_ref()
         .and_then(|p| std::fs::read(p).ok())
-        .filter(|b| crate::fbx::is_fbx(b))
+        .filter(|b| rustudio_core::fbx::is_fbx(b))
     {
         return load_fbx(lua, id, &bytes);
     }
@@ -3076,7 +3076,7 @@ fn load_asset(lua: &Lua, id: u64) -> mlua::Result<Ref> {
     static FAILED: std::sync::Mutex<Option<HashMap<u64, String>>> = std::sync::Mutex::new(None);
     let mut why = String::from("signed out");
     let mut fetched = || -> Option<Vec<u8>> {
-        if !crate::assets::wait_for_session(std::time::Duration::from_secs(20)) {
+        if !rustudio_core::assets::wait_for_session(std::time::Duration::from_secs(20)) {
             return None;
         }
         let mut f = FAILED.lock().ok()?;
@@ -3085,7 +3085,7 @@ fn load_asset(lua: &Lua, id: u64) -> mlua::Result<Ref> {
             why = e.clone();
             return None;
         }
-        match crate::assets::remote_cached(id) {
+        match rustudio_core::assets::remote_cached(id) {
             Ok(b) => Some((*b).clone()),
             Err(e) => {
                 why = e.clone();
@@ -3101,7 +3101,7 @@ fn load_asset(lua: &Lua, id: u64) -> mlua::Result<Ref> {
     let bytes = path
         .and_then(|p| std::fs::read(p).ok())
         .filter(is_model)
-        .or_else(|| std::fs::read(crate::assets::cache_dir().join(format!("assets/{id}_vlatest.bin"))).ok().filter(is_model))
+        .or_else(|| std::fs::read(rustudio_core::assets::cache_dir().join(format!("assets/{id}_vlatest.bin"))).ok().filter(is_model))
         .or_else(|| crate::runtime::outside_budget(lua, &mut fetched))
         .filter(|b| {
             let ok = is_model(b);
@@ -3172,7 +3172,7 @@ pub fn dress_from_description(lua: &Lua, model: Ref, desc: Ref) -> mlua::Result<
             .map(|h| h.children().to_vec())
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| crate::doc::is_a(&i.class, "Accoutrement")))
+            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| rustudio_core::doc::is_a(&i.class, "Accoutrement")))
             .collect();
         for acc in accs {
             d.dom.transfer_within(acc, model);
@@ -3252,7 +3252,7 @@ pub fn load_fbx(lua: &Lua, id: u64, bytes: &[u8]) -> mlua::Result<Ref> {
     use rbx_dom_weak::types::{CFrame, Color3, Matrix3};
     // Parse once per asset; later loads reuse the meshes.
     static IMPORTED: std::sync::Mutex<
-        Option<HashMap<u64, std::sync::Arc<Vec<crate::fbx::ImportNode>>>>,
+        Option<HashMap<u64, std::sync::Arc<Vec<rustudio_core::fbx::ImportNode>>>>,
     > = std::sync::Mutex::new(None);
     let nodes = {
         let mut g = IMPORTED.lock().map_err(|_| rt_err("FBX import busy"))?;
@@ -3261,18 +3261,18 @@ pub fn load_fbx(lua: &Lua, id: u64, bytes: &[u8]) -> mlua::Result<Ref> {
             Some(n) => n.clone(),
             None => {
                 let n =
-                    std::sync::Arc::new(crate::fbx::import(bytes).map_err(|e| {
+                    std::sync::Arc::new(rustudio_core::fbx::import(bytes).map_err(|e| {
                         rt_err(format!("Asset {id} (FBX) couldn't be imported: {e}"))
                     })?);
                 for (i, node) in n.iter().enumerate() {
                     if let Some(g) = &node.mesh {
-                        crate::assets::register_generated(
+                        rustudio_core::assets::register_generated(
                             &format!("rbxtemp://rustudio/fbx/{id}/{i}"),
-                            crate::fbx::mesh_v2(g),
+                            rustudio_core::fbx::mesh_v2(g),
                         );
                     }
                     if let Some((_, tex)) = &node.texture {
-                        crate::assets::register_generated(
+                        rustudio_core::assets::register_generated(
                             &format!("rbxtemp://rustudio/fbx/{id}/{i}.tex"),
                             tex.clone(),
                         );
@@ -3426,7 +3426,7 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
         d.dom
             .get_by_ref(x)
             .and_then(|i| i.children().iter().copied().find(|k| d.class_of(*k).is_some_and(|c| c == "UIScale")))
-            .and_then(|s| crate::scene::f32_of(d.prop(s, "Scale")))
+            .and_then(|s| rustudio_render::scene::f32_of(d.prop(s, "Scale")))
             .unwrap_or(1.0)
     };
     // UIScale above: offsets of the objects below grow with it.
@@ -3446,7 +3446,7 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
         };
         // Laid out by a UIListLayout / grid / page layout, or sized by its
         // content: the drawn box is the best known.
-        let auto = crate::scene::enum_u32(d.prop(x, "AutomaticSize")).unwrap_or(0) != 0;
+        let auto = rustudio_render::scene::enum_u32(d.prop(x, "AutomaticSize")).unwrap_or(0) != 0;
         if child_of(cur_ref, "UIGridStyleLayout").is_some() || auto {
             if let Some(b) = drawn(x) {
                 cur = b;
@@ -3486,9 +3486,9 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
             size = [size[0].clamp(mn[0], mx[0].max(mn[0])), size[1].clamp(mn[1], mx[1].max(mn[1]))];
         }
         if let Some(c) = child_of(x, "UIAspectRatioConstraint") {
-            let ratio = crate::scene::f32_of(d.prop(c, "AspectRatio")).unwrap_or(1.0).max(1e-3);
-            if crate::scene::enum_u32(d.prop(c, "AspectType")) == Some(1) {
-                if crate::scene::enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
+            let ratio = rustudio_render::scene::f32_of(d.prop(c, "AspectRatio")).unwrap_or(1.0).max(1e-3);
+            if rustudio_render::scene::enum_u32(d.prop(c, "AspectType")) == Some(1) {
+                if rustudio_render::scene::enum_u32(d.prop(c, "DominantAxis")) == Some(1) {
                     size[0] = size[1] * ratio;
                 } else {
                     size[1] = size[0] / ratio;
@@ -3513,7 +3513,7 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
         let (sn, cs) = cur.rot.to_radians().sin_cos();
         let (dx, dy) = (cx - pcx, cy - pcy);
         let (tx, ty) = (pcx + cs * dx - sn * dy, pcy + sn * dx + cs * dy);
-        let rot = crate::scene::f32_of(d.prop(x, "Rotation")).unwrap_or(0.0);
+        let rot = rustudio_render::scene::f32_of(d.prop(x, "Rotation")).unwrap_or(0.0);
         cur = AbsBox { pos: [tx - size[0] * 0.5, ty - size[1] * 0.5], size, rot: cur.rot + rot };
         cur_ref = x;
         scale *= own;
@@ -3790,7 +3790,7 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
             return ([0.0, 0.0], w.input.gui_layout.get(&r).filter(|_| matches!(d.prop(r, "Enabled"), Some(Variant::Bool(true)))).map_or([0.0, 0.0], |b| b.size));
         }
         return match i.class.as_str() {
-            "ScreenGui" if matches!(crate::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
+            "ScreenGui" if matches!(rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
                 ([0.0, -inset], screen)
             }
             "ScreenGui" => ([0.0, 0.0], [screen[0], screen[1] - inset]),
@@ -3963,7 +3963,7 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
                     .map(|i| i.parent())
                     .unwrap_or_else(Ref::none);
                 // RigType: R6 0, R15 1.
-                let r15 = crate::scene::enum_u32(d.prop(r, "RigType")).unwrap_or(0) != 0;
+                let r15 = rustudio_render::scene::enum_u32(d.prop(r, "RigType")).unwrap_or(0) != 0;
                 let fallback = if r15 { mech::ROOT_PART_FALLBACK_R15 } else { mech::ROOT_PART_FALLBACK_R6 };
                 let part_named = |name: &str| {
                     d.dom.get_by_ref(parent).and_then(|p| {
@@ -3987,7 +3987,7 @@ fn device_prop(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option
             let w = world(lua)?;
             let d = w.d();
             let mass = |p: Ref| {
-                let s = crate::scene::vec3_of(d.prop(p, "Size")).unwrap_or(Vec3::ONE);
+                let s = rustudio_render::scene::vec3_of(d.prop(p, "Size")).unwrap_or(Vec3::ONE);
                 s.x * s.y * s.z * mech::PART_DENSITY
             };
             let mut m = mass(r);
@@ -4118,7 +4118,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             Some(Variant::String(s)) => s,
             _ => String::new(),
         };
-        let size = crate::scene::f32_of(d.prop(r, "TextSize")).unwrap_or(14.0);
+        let size = rustudio_render::scene::f32_of(d.prop(r, "TextSize")).unwrap_or(14.0);
         let width = text.chars().count() as f32 * size * mech::TEXT_WIDTH_PER_SIZE;
         return Ok(Some(Value::UserData(lua.create_userdata(LVector2(
             glam::Vec2::new(width, if text.is_empty() { 0.0 } else { size }),
@@ -4126,7 +4126,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     }
     if key == "LocalTransparencyModifier" && doc::is_a(class, "BasePart") {
         // Client-only (never saved): 0 until a script sets it.
-        let v = crate::scene::f32_of(
+        let v = rustudio_render::scene::f32_of(
             world(lua)?
                 .d()
                 .dom
@@ -4177,8 +4177,8 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 let face = inp.mouse_target.and_then(|t| {
                     let w = world(lua).ok()?;
                     let d = w.d();
-                    let txf = crate::scene::xform_of(d, t)?;
-                    let size = crate::scene::vec3_of(d.prop(t, "Size")).unwrap_or(Vec3::ONE);
+                    let txf = rustudio_render::scene::xform_of(d, t)?;
+                    let size = rustudio_render::scene::vec3_of(d.prop(t, "Size")).unwrap_or(Vec3::ONE);
                     let rel = (txf.rot.transpose() * (hit.pos - txf.pos))
                         / (size * 0.5).max(Vec3::splat(1e-4));
                     let a = rel.abs();
@@ -4399,7 +4399,7 @@ fn set_clock(lua: &Lua, r: Ref, hours: f32) -> mlua::Result<()> {
 fn clock_hours(lua: &Lua, r: Ref) -> mlua::Result<f32> {
     let w = world(lua)?;
     let d = w.d();
-    Ok(crate::scene::f32_of(d.prop(r, "ClockTime"))
+    Ok(rustudio_render::scene::f32_of(d.prop(r, "ClockTime"))
         .or_else(|| match d.prop(r, "TimeOfDay") {
             Some(Variant::String(s)) => parse_time_of_day(&s),
             _ => None,
@@ -4677,7 +4677,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                             mech::SHAPECAST_MAX_SIZE * 0.5
                         )));
                     }
-                    probe = Some((crate::query_shapes::BALL, Vec3::splat(r + r), glam::Mat3::IDENTITY));
+                    probe = Some((rustudio_physics::query_shapes::BALL, Vec3::splat(r + r), glam::Mat3::IDENTITY));
                     (o, Vec3::splat(r), vec3_arg(args, 3, name)?, arg(args, 4))
                 }
                 "Blockcast" => {
@@ -4694,7 +4694,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     let h = side * 0.5;
                     let r = cf.0.rot;
                     let ext = r.x_axis.abs() * h.x + r.y_axis.abs() * h.y + r.z_axis.abs() * h.z;
-                    probe = Some((crate::query_shapes::BOX, side, r));
+                    probe = Some((rustudio_physics::query_shapes::BOX, side, r));
                     (cf.0.pos, ext, vec3_arg(args, 3, name)?, arg(args, 4))
                 }
                 _ => {
@@ -4716,10 +4716,10 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         let w = world(lua)?;
                         let d = w.d();
                         let class = d.class_of(p).map(|c| c.to_string()).unwrap_or_default();
-                        crate::query_shapes::kind_of(d, p, &class)
+                        rustudio_physics::query_shapes::kind_of(d, p, &class)
                     };
                     probe = Some((kind, size, xf.rot));
-                    let ball = kind == crate::query_shapes::BALL;
+                    let ball = kind == rustudio_physics::query_shapes::BALL;
                     let ext = if ball {
                         Vec3::splat(size.min_element() * 0.5)
                     } else {
@@ -4809,11 +4809,11 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 let w = world(lua)?;
                 let d = w.d();
                 (
-                    crate::scene::f32_of(d.prop(this, "ClockTime")).unwrap_or(14.0),
-                    crate::scene::f32_of(d.prop(this, "GeographicLatitude")).unwrap_or(41.733),
+                    rustudio_render::scene::f32_of(d.prop(this, "ClockTime")).unwrap_or(14.0),
+                    rustudio_render::scene::f32_of(d.prop(this, "GeographicLatitude")).unwrap_or(41.733),
                 )
             };
-            let s = crate::lighting::sun_direction(clock, lat);
+            let s = rustudio_render::lighting::sun_direction(clock, lat);
             one(vec3_value(lua, if name == "GetSunDirection" { s } else { -s })?)
         }
         "GetMoonPhase" => one(Value::Number(mech::MOON_PHASE as f64)),
@@ -4854,7 +4854,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         .and_then(|c| c.terrain_material)
                         .filter(|_| world(lua).is_ok_and(|w| w.d().class_of(r).is_some_and(|k| k == "Terrain")));
                     let mat = match (terrain, world(lua)?.d().prop(r, "Material")) {
-                        (Some(m), _) => LEnumItem::from_name("Material", crate::terrain::material_name(m)),
+                        (Some(m), _) => LEnumItem::from_name("Material", rustudio_core::terrain::material_name(m)),
                         (None, Some(Variant::Enum(e))) => LEnumItem::from_value("Material", e.to_u32()),
                         _ => None,
                     };
@@ -4942,7 +4942,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 let w = world(lua)?;
                 let d = w.d();
                 let class = d.class_of(p).map(|c| c.to_string()).unwrap_or_default();
-                crate::query_shapes::kind_of(d, p, &class)
+                rustudio_physics::query_shapes::kind_of(d, p, &class)
             };
             let (lo, hi) = part_aabb(&QPart {
                 r: p,
@@ -4982,14 +4982,14 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 let exact = if q.mesh {
                     let id = match world(lua)?.d().prop(r, "MeshId") {
                         Some(Variant::ContentId(c)) => c.as_str().to_string(),
-                        _ => crate::scene::union_mesh(world(lua)?.d(), r).map(|m| m.id).unwrap_or_default(),
+                        _ => rustudio_core::mesh::union_mesh(world(lua)?.d(), r).map(|m| m.id).unwrap_or_default(),
                     };
-                    match (!id.is_empty()).then(|| crate::mesh_bvh::for_mesh(&id)).flatten() {
-                        Some(bvh) => crate::query_shapes::obb_mesh_bvh(&xf, size, &q.xf, q.size, &bvh),
-                        None => crate::query_shapes::obb_obb(&xf, size, &q.xf, q.size),
+                    match (!id.is_empty()).then(|| rustudio_core::mesh_bvh::for_mesh(&id)).flatten() {
+                        Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, size, &q.xf, q.size, &bvh),
+                        None => rustudio_physics::query_shapes::obb_obb(&xf, size, &q.xf, q.size),
                     }
                 } else {
-                    crate::query_shapes::part_part(&xf, size, probe_kind, &q.xf, q.size, q.shape)
+                    rustudio_physics::query_shapes::part_part(&xf, size, probe_kind, &q.xf, q.size, q.shape)
                 };
                 if exact {
                     parts.push(r);
@@ -4998,9 +4998,9 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             one(Value::Table(list(lua, parts)?))
         }
         "GetServerTimeNow" => one(Value::Number(
-            crate::runtime::fixed_epoch_time(lua).unwrap_or_else(crate::sim_clock::epoch_secs),
+            crate::runtime::fixed_epoch_time(lua).unwrap_or_else(rustudio_core::sim_clock::epoch_secs),
         )),
-        "GetRealPhysicsFPS" => one(Value::Number(crate::physics::step_rate().0 as f64)),
+        "GetRealPhysicsFPS" => one(Value::Number(rustudio_physics::physics::step_rate().0 as f64)),
         "MoveTo" => {
             let target = vec3_arg(args, 1, "MoveTo")?;
             world(lua)?.requests.move_to.push((this, target));
@@ -5032,7 +5032,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             }
             none()
         }
-        // Humanoid:SetStateEnabled / GetStateEnabled: src/domains/anim.rs.
+        // Humanoid:SetStateEnabled / GetStateEnabled: crates/rustudio-engine/src/domains/anim.rs.
         // Seat:Sit(humanoid): the humanoid sits in this seat.
         "Sit" => {
             let h = opt_inst(&arg(args, 1)).ok_or_else(|| rt_err("Sit: Humanoid expected"))?;
@@ -5427,13 +5427,13 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 },
             };
             let size = editable_size.unwrap_or_else(|| {
-                crate::assets::asset_ref(&content)
-                    .and_then(|a| crate::assets::local_asset_path(a.id))
+                rustudio_core::assets::asset_ref(&content)
+                    .and_then(|a| rustudio_core::assets::local_asset_path(a.id))
                     .and_then(|p| std::fs::read(p).ok())
                     // Else any content (place-local files, cache, download):
                     // Studio's call yields until the mesh is in.
-                    .or_else(|| crate::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
-                    .and_then(|b| crate::mesh::parse(&b).ok())
+                    .or_else(|| rustudio_core::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
+                    .and_then(|b| rustudio_core::mesh::parse(&b).ok())
                     .map(|m| (m.max - m.min).max(Vec3::splat(0.05)))
                     .unwrap_or(Vec3::ONE)
             });
@@ -5467,11 +5467,11 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     );
                     let skinned = match &editable_src {
                         Some(c) => super::editable::content_skinned(c),
-                        None => crate::assets::asset_ref(&content)
-                            .and_then(|a| crate::assets::local_asset_path(a.id))
+                        None => rustudio_core::assets::asset_ref(&content)
+                            .and_then(|a| rustudio_core::assets::local_asset_path(a.id))
                             .and_then(|p| std::fs::read(p).ok())
-                            .or_else(|| crate::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
-                            .and_then(|b| crate::mesh::parse(&b).ok())
+                            .or_else(|| rustudio_core::assets::content_blocking(&content).ok().map(|b| b.to_vec()))
+                            .and_then(|b| rustudio_core::mesh::parse(&b).ok())
                             .is_some_and(|m| m.skin.is_some()),
                     };
                     i.properties.insert(ustr("HasSkinnedMesh"), Variant::Bool(skinned));
@@ -5628,7 +5628,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     .into_iter()
                     .filter_map(|c| {
                         let i = dom.get_by_ref(c)?;
-                        crate::doc::is_a(&i.class, "BasePart").then(|| (c, crate::play::studio_collides(&i.name, rig)))
+                        rustudio_core::doc::is_a(&i.class, "BasePart").then(|| (c, crate::rig::studio_collides(&i.name, rig)))
                     })
                     .collect();
                 for (c, on) in body {
@@ -5693,7 +5693,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         }
         "SetCell" => {
             // (no behaviour: counted against scripting_api's coverage)
-            crate::telemetry::gap(lua, "call-unimplemented", "Terrain", name);
+            crate::lua_bridge::gap(lua, "call-unimplemented", "Terrain", name);
             let first = !world(lua)?
                 .output
                 .iter()
@@ -5925,7 +5925,7 @@ mod tests {
         assert_eq!(QueryGrid::cells_in([0, 0, 0], [1, 1, 1]), 8);
     }
 
-    fn run(src: &str) -> (Vec<String>, crate::terrain::Voxels) {
+    fn run(src: &str) -> (Vec<String>, rustudio_core::terrain::Voxels) {
         let mut d = Document::new_place();
         let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
         let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
@@ -5937,9 +5937,9 @@ mod tests {
             rt.step(1.0 / 60.0);
         }
         let w = rt.leave();
-        let v = match crate::terrain::Voxels::from_dom(&w.d().dom) {
+        let v = match rustudio_core::terrain::Voxels::from_dom(&w.d().dom) {
             Some(Ok(v)) => v,
-            _ => crate::terrain::Voxels::empty(),
+            _ => rustudio_core::terrain::Voxels::empty(),
         };
         (w.output.into_iter().map(|(_, t)| t).collect(), v)
     }
@@ -6076,7 +6076,7 @@ print("away", f(workspace:Raycast(Vector3.new(110, 0, 0), Vector3.new(0, 0, -20)
                 .with_property("Anchored", true)
                 .with_property("PhysicalConfigData", SharedString::new(blob))
         };
-        d.dom.insert(ws, mesh("Hull", 20.0, crate::physics_mesh::tests::cube_blob()));
+        d.dom.insert(ws, mesh("Hull", 20.0, rustudio_physics::physics_mesh::cube_blob()));
         d.dom.insert(ws, mesh("BoxFidelity", 30.0, b"CSGPHS\0\0\0\0BLOCK".to_vec()));
         let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
         let src = r#"
@@ -6161,12 +6161,12 @@ print("max", tostring(all.SizeInCells))
         assert!(text.contains("channels Air Sand 1 true 2, 1, 1"), "{text}");
         assert!(text.contains("cells 6, 10, 14 4, 8, 12 1, -1, 2"), "{text}");
         assert!(text.contains("max 64001, 64001, 64001"), "{text}");
-        let rock = crate::terrain::material_index("Rock").unwrap();
+        let rock = rustudio_core::terrain::material_index("Rock").unwrap();
         // pasteEmptyCells cleared the original's 2³ corner; the copy stayed.
         assert_eq!(v.get(0, 0, 0).0, 0);
         assert_eq!(v.get(2, 2, 2).0, rock);
         assert_eq!(v.get(11, 1, 1).0, rock);
-        assert_eq!(v.get(0, 10, 0).0, crate::terrain::WATER);
+        assert_eq!(v.get(0, 10, 0).0, rustudio_core::terrain::WATER);
         assert!((v.water(1, 10, 0) - 0.5).abs() < 0.01, "shoreline water {}", v.water(1, 10, 0));
     }
 
@@ -6419,7 +6419,7 @@ end
             Err(_) => Document::new_place(),
         };
         let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
-        if let Some(Ok(v)) = crate::terrain::Voxels::from_dom(&d.dom) {
+        if let Some(Ok(v)) = rustudio_core::terrain::Voxels::from_dom(&d.dom) {
             println!("probe: terrain {} voxels, bounds {:?}", v.count(), v.world_bounds());
         }
         let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src));
@@ -6448,7 +6448,7 @@ fn equip_now(lua: &Lua, humanoid: Ref, tool: Option<Ref>) -> mlua::Result<()> {
             return Ok(());
         };
         if let Some(t) = tool {
-            let ok = d.dom.get_by_ref(t).is_some_and(|i| crate::doc::is_a(&i.class, "BackpackItem"));
+            let ok = d.dom.get_by_ref(t).is_some_and(|i| rustudio_core::doc::is_a(&i.class, "BackpackItem"));
             if !ok || d.dom.get_by_ref(t).map(|i| i.parent()) == Some(model) {
                 return Ok(());
             }
@@ -6459,7 +6459,7 @@ fn equip_now(lua: &Lua, humanoid: Ref, tool: Option<Ref>) -> mlua::Result<()> {
             .map(|m| m.children().to_vec())
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| crate::doc::is_a(&i.class, "Tool")))
+            .filter(|c| d.dom.get_by_ref(*c).is_some_and(|i| rustudio_core::doc::is_a(&i.class, "Tool")))
             .collect();
         // The player whose Character this is, and its Backpack.
         let players = d.dom.root().children().iter().copied().find(|c| d.dom.get_by_ref(*c).is_some_and(|i| i.class == "Players"));

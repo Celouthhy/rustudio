@@ -33,191 +33,10 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::ustr;
 
 use super::util::*;
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
-
-// ------------------------------------------------------------------ mass
-
-/// The PhysicalProperties a part simulates with.
-pub fn phys_props(d: &Document, r: Ref) -> LPhysicalProperties {
-    if let Some(Variant::PhysicalProperties(rbx_dom_weak::types::PhysicalProperties::Custom(c))) =
-        d.prop(r, "CustomPhysicalProperties")
-    {
-        let mut p = LPhysicalProperties::for_material("Plastic");
-        p.density = c.density();
-        p.friction = c.friction();
-        p.elasticity = c.elasticity();
-        p.friction_weight = c.friction_weight();
-        p.elasticity_weight = c.elasticity_weight();
-        return p;
-    }
-    let mat = crate::scene::enum_u32(d.prop(r, "Material"))
-        .and_then(|v| LEnumItem::from_value("Material", v))
-        .map(|e| e.name)
-        .unwrap_or_else(|| "Plastic".into());
-    LPhysicalProperties::for_material(&mat)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Shape {
-    Block,
-    Ball,
-    Cylinder,
-    Wedge,
-    CornerWedge,
-}
-
-fn shape(d: &Document, r: Ref, class: &str) -> Shape {
-    match class {
-        "WedgePart" => return Shape::Wedge,
-        "CornerWedgePart" => return Shape::CornerWedge,
-        "Part" | "Seat" | "SpawnLocation" | "SkateboardPlatform" | "VehicleSeat" | "Platform" => {}
-        _ => return Shape::Block,
-    }
-    match crate::scene::enum_u32(d.prop(r, "Shape")) {
-        Some(0) => Shape::Ball,
-        Some(2) => Shape::Cylinder,
-        Some(3) => Shape::Wedge,
-        Some(4) => Shape::CornerWedge,
-        _ => Shape::Block,
-    }
-}
-
-/// One part's own mass (Massless ignored), centre of mass in its frame and
-/// principal inertia about that centre (its axes).
-#[derive(Clone, Copy)]
-pub struct PMass {
-    pub mass: f32,
-    pub com: Vec3,
-    pub inertia: Vec3,
-}
-
-/// `r` is the Handle of an Accessory (Accoutrement) worn by a character
-/// (a Model with a Humanoid).
-pub fn accessory_handle_on_character(d: &Document, r: Ref) -> bool {
-    let Some(i) = d.dom.get_by_ref(r) else { return false };
-    if i.name != "Handle" {
-        return false;
-    }
-    let Some(acc) = d.dom.get_by_ref(i.parent()) else { return false };
-    if !crate::doc::is_a(&acc.class, "Accoutrement") {
-        return false;
-    }
-    d.dom
-        .get_by_ref(acc.parent())
-        .is_some_and(|m| m.children().iter().any(|c| d.dom.get_by_ref(*c).is_some_and(|k| k.class == "Humanoid")))
-}
-
-pub fn part_mass(d: &Document, r: Ref) -> PMass {
-    let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
-    if class == "Terrain" {
-        return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
-    }
-    // An accessory's Handle on a character weighs nothing: Studio 0.747,
-    // a Handle Part of 5.6 mass reads GetMass() 0 once Humanoid:AddAccessory
-    // has it (Massless and CustomPhysicalProperties untouched, CanCollide
-    // false), and the character's AssemblyMass stays 14.2551 / 12.6
-    // (checks/humanoid-physics/measure/accessory-mass.md).
-    if accessory_handle_on_character(d, r) {
-        return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
-    }
-    let s = v3p(d, r, "Size").unwrap_or(Vec3::ONE).max(Vec3::splat(0.05));
-    let rho = phys_props(d, r).density;
-    // A part's volume comes from its physics geometry when that
-    // is a mesh: a character's Head weighs its mesh (Studio's default R15 Head
-    // 0.7729, box 1.1133), its body parts their box (physics_humanoid.rs).
-    if let Some(m) = head_mesh_mass(d, r, &class, s, rho) {
-        return m;
-    }
-    let box_i = |m: f32, s: Vec3| {
-        Vec3::new(s.y * s.y + s.z * s.z, s.x * s.x + s.z * s.z, s.x * s.x + s.y * s.y) * (m / 12.0)
-    };
-    match shape(d, r, &class) {
-        Shape::Block => {
-            let m = rho * s.x * s.y * s.z;
-            PMass { mass: m, com: Vec3::ZERO, inertia: box_i(m, s) }
-        }
-        Shape::Ball => {
-            let rr = s.min_element() * 0.5;
-            let m = rho * 4.0 / 3.0 * std::f32::consts::PI * rr * rr * rr;
-            PMass { mass: m, com: Vec3::ZERO, inertia: Vec3::splat(0.4 * m * rr * rr) }
-        }
-        Shape::Cylinder => {
-            let rr = s.y.min(s.z) * 0.5;
-            let m = rho * std::f32::consts::PI * rr * rr * s.x;
-            let side = m * (3.0 * rr * rr + s.x * s.x) / 12.0;
-            PMass { mass: m, com: Vec3::ZERO, inertia: Vec3::new(0.5 * m * rr * rr, side, side) }
-        }
-        Shape::Wedge => {
-            let m = rho * s.x * s.y * s.z * 0.5;
-            PMass { mass: m, com: Vec3::new(0.0, -s.y / 6.0, s.z / 6.0), inertia: box_i(m, s) }
-        }
-        Shape::CornerWedge => {
-            let m = rho * s.x * s.y * s.z / 3.0;
-            PMass { mass: m, com: Vec3::new(s.x / 8.0, -s.y / 4.0, -s.z / 8.0), inertia: box_i(m, s) }
-        }
-    }
-}
-
-/// The Studio solver's mass record of a part (solver/mass.rs, STEP §5b [L2]): shape code
-/// prim, size, density. None where `part_mass` takes another route (terrain, a worn
-/// accessory's Handle, a character's mesh Head).
-pub fn studio_part_mass(d: &Document, r: Ref) -> Option<crate::solver::mass::PartMass> {
-    use crate::solver::mass;
-    let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
-    if class == "Terrain" || accessory_handle_on_character(d, r) {
-        return None;
-    }
-    let size = v3p(d, r, "Size").unwrap_or(Vec3::ONE);
-    let rho = phys_props(d, r).density;
-    if head_mesh_mass(d, r, &class, size.max(Vec3::splat(0.05)), rho).is_some() {
-        return None;
-    }
-    let code = match shape(d, r, &class) {
-        Shape::Ball => mass::BALL,
-        Shape::Cylinder => mass::CYLINDER,
-        Shape::Block => mass::BLOCK,
-        Shape::Wedge => mass::WEDGE,
-        Shape::CornerWedge => mass::CORNER_WEDGE,
-    };
-    Some(mass::part(code, size, rho))
-}
-
-/// A Humanoid character's MeshPart Head: mass, centre and inertia of its
-/// collision mesh (cached per mesh and size).
-fn head_mesh_mass(d: &Document, r: Ref, class: &str, s: Vec3, rho: f32) -> Option<PMass> {
-    if class != "MeshPart" || d.dom.get_by_ref(r)?.name != "Head" {
-        return None;
-    }
-    let parent = d.dom.get_by_ref(r)?.parent();
-    let has_humanoid = d.dom.get_by_ref(parent)?.children().iter().any(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"));
-    if !has_humanoid {
-        return None;
-    }
-    let id = match d.prop(r, "MeshId") {
-        Some(Variant::ContentId(c)) => c.as_str().to_string(),
-        Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
-        _ => return None,
-    };
-    let fid = crate::scene::enum_u32(d.prop(r, "CollisionFidelity")).unwrap_or(crate::collision::FIDELITY_DEFAULT);
-    thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<(String, [u32; 3], u32), (f32, Vec3, Vec3)>> = Default::default();
-    }
-    let key = (id.clone(), s.to_array().map(f32::to_bits), fid);
-    let unit = CACHE.with(|c| c.borrow().get(&key).copied()).or_else(|| {
-        let crate::collision::Lookup::Ready(h) = crate::collision::hulls(&id, fid) else { return None };
-        let shape = crate::collision::shape_from_hulls(&h, s)?;
-        let mp = shape.mass_properties(1.0);
-        let pi = mp.principal_inertia();
-        let com = mp.local_com;
-        let v = (mp.mass(), Vec3::new(com.x, com.y, com.z), Vec3::new(pi.x, pi.y, pi.z));
-        CACHE.with(|c| c.borrow_mut().insert(key, v));
-        Some(v)
-    })?;
-    Some(PMass { mass: unit.0 * rho, com: unit.1, inertia: unit.2 * rho })
-}
 
 // ------------------------------------------------------------- assemblies
 
@@ -345,7 +164,7 @@ fn bfs_key(d: &Document, r: Ref) -> (usize, Vec<u32>) {
 }
 
 fn build(d: &Document) -> Graph {
-    let _b = crate::bench::scope("joint_graph");
+    let _b = rustudio_core::bench::scope("joint_graph");
     let mut g = Graph::default();
     let Some(ws) = d.workspace() else { return g };
     // Per class (classes repeat; is_a interns its names).
@@ -414,7 +233,7 @@ fn pick_root(d: &Document, members: &[Ref]) -> (Ref, bool) {
         let hrp = d.dom.get_by_ref(r).is_some_and(|i| i.name == "HumanoidRootPart");
         (
             !boolp(d, r, "Massless", false),
-            crate::scene::f32_of(d.prop(r, "RootPriority")).unwrap_or(0.0) as i32,
+            rustudio_render::scene::f32_of(d.prop(r, "RootPriority")).unwrap_or(0.0) as i32,
             hrp,
             s.x * s.y * s.z,
             s.max_element(),
@@ -527,7 +346,7 @@ impl Graph {
         if dj.is_empty() && dp.is_empty() {
             return;
         }
-        let _b = crate::bench::scope("joint_graph_update");
+        let _b = rustudio_core::bench::scope("joint_graph_update");
         let ws = d.workspace();
         for j in dj {
             if let Some((a, b)) = self.remove_rec(j).and_then(|old| old.edge) {
@@ -758,7 +577,7 @@ fn eff_mass(d: &Document, g: &Graph, r: Ref) -> f32 {
     if boolp(d, r, "Massless", false) && g.root(d, r) != r && !anchored(d, r) {
         return 0.0;
     }
-    part_mass(d, r).mass
+    rustudio_physics::physics::part_mass(d, r).mass
 }
 
 /// Assembly mass, centre of mass (world) and world inertia about it.
@@ -769,7 +588,7 @@ pub fn assembly_mass(d: &Document, r: Ref) -> (f32, Vec3, Mat3) {
         let mut c = Vec3::ZERO;
         let mut info = Vec::new();
         for p in &parts {
-            let pm = part_mass(d, *p);
+            let pm = rustudio_physics::physics::part_mass(d, *p);
             let em = eff_mass(d, g, *p);
             let x = xf(d, *p, "CFrame").unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
             let wc = x.apply(pm.com);
@@ -1021,7 +840,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
                     w.velocity_requests.push((this, v + lin / m));
                 }
                 if ang != Vec3::ZERO && inertia.determinant().abs() > 1e-12 {
-                    crate::physics::live::queue_spin(doc_id, this, inertia.inverse() * ang);
+                    rustudio_physics::physics::live::queue_spin(doc_id, this, inertia.inverse() * ang);
                 }
                 none()
             })()
@@ -1032,7 +851,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
                 let w = world(lua)?;
                 let d = w.d();
                 let v = w.velocities.get(&this).copied().unwrap_or(Vec3::ZERO);
-                let (spin, com) = crate::physics::live::with_stats(d.id, |s| s.spin.get(&this).copied())
+                let (spin, com) = rustudio_physics::physics::live::with_stats(d.id, |s| s.spin.get(&this).copied())
                     .flatten()
                     .unwrap_or((Vec3::ZERO, Vec3::ZERO));
                 one(vec3(lua, v + spin.cross(p - com))?)
@@ -1114,7 +933,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
         "ScaleTo" if doc::is_a(class, "Model") => scale_to(lua, this, args),
         "GetScale" if doc::is_a(class, "Model") => {
             let s = world(lua).ok()?.d().prop(this, "Scale");
-            one(Value::Number(crate::scene::f32_of(s).unwrap_or(1.0) as f64))
+            one(Value::Number(rustudio_render::scene::f32_of(s).unwrap_or(1.0) as f64))
         }
         "SetIdentityOrientation" if doc::is_a(class, "Model") => (|| {
             let w = world(lua)?;
@@ -1166,7 +985,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
         "GetNumAwakeParts" if class == "Workspace" => {
             let n = world(lua)
                 .ok()
-                .and_then(|w| crate::physics::live::with_stats(w.d().id, |s| s.awake_parts))
+                .and_then(|w| rustudio_physics::physics::live::with_stats(w.d().id, |s| s.awake_parts))
                 .unwrap_or(0);
             one(Value::Number(n as f64))
         }
@@ -1198,7 +1017,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             "CenterOfMass" => {
                 let w = world(lua)?;
                 let d = w.d();
-                let p = part_mass(d, r);
+                let p = rustudio_physics::physics::part_mass(d, r);
                 let x = xf(d, r, "CFrame").unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY });
                 vec3(lua, x.apply(p.com))?
             }
@@ -1216,16 +1035,16 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             }
             "AssemblyAngularVelocity" | "RotVelocity" => {
                 let w = world(lua)?;
-                let s = crate::physics::live::with_stats(w.d().id, |s| s.spin.get(&r).map(|x| x.0))
+                let s = rustudio_physics::physics::live::with_stats(w.d().id, |s| s.spin.get(&r).map(|x| x.0))
                     .flatten()
                     .unwrap_or(Vec3::ZERO);
                 vec3(lua, s)?
             }
             "CurrentPhysicalProperties" => {
-                let p = phys_props(world(lua)?.d(), r);
-                Value::UserData(lua.create_userdata(p)?)
+                let p = rustudio_physics::physics::phys_props(world(lua)?.d(), r);
+                Value::UserData(lua.create_userdata(LPhysicalProperties(p))?)
             }
-            "SpecificGravity" => Value::Number(phys_props(world(lua)?.d(), r).density as f64),
+            "SpecificGravity" => Value::Number(rustudio_physics::physics::phys_props(world(lua)?.d(), r).density as f64),
             // The server simulates everything in Studio: no replicated age.
             "ReceiveAge" => Value::Number(0.0),
             "ResizeIncrement" => Value::Number(if class == "TrussPart" { 2.0 } else { 1.0 }),
@@ -1240,7 +1059,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             "InsertPoint" => vec3(lua, v3p(world(lua)?.d(), r, "InsertPoint").unwrap_or(Vec3::ZERO))?,
             "InterpolationThrottling" => enum_item(lua, "InterpolationThrottlingMode", "Default")?,
             "ReplicationFrequency" | "ReplicationThroughput" => {
-                let v = crate::scene::enum_u32(world(lua)?.d().prop(r, key)).unwrap_or(0);
+                let v = rustudio_render::scene::enum_u32(world(lua)?.d().prop(r, key)).unwrap_or(0);
                 match LEnumItem::from_value("ReplicationMode", v) {
                     Some(e) => enum_value(lua, e)?,
                     None => enum_item(lua, "ReplicationMode", "Automatic")?,
@@ -1287,7 +1106,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         _ if doc::is_a(class, "BasePart") && matches!(key, "AssemblyAngularVelocity" | "RotVelocity") => {
             if let Some(v) = ud::<LVector3>(value) {
                 let id = world(lua)?.d().id;
-                crate::physics::live::queue_spin_set(id, r, v.0);
+                rustudio_physics::physics::live::queue_spin_set(id, r, v.0);
             }
             Ok(false)
         }
@@ -1304,7 +1123,7 @@ fn scale_to(lua: &Lua, model: Ref, args: &MultiValue) -> mlua::Result<MultiValue
     let s = num_arg(args, 1).ok_or_else(|| missing(1))? as f32;
     if s.is_nan() {
         world(lua)?.output.push((
-            crate::app::Level::Warn,
+            rustudio_core::log::Level::Warn,
             "Ignoring ScaleTo(NaN) call, check your code for divide by zero errors".into(),
         ));
         return none();
@@ -1315,7 +1134,7 @@ fn scale_to(lua: &Lua, model: Ref, args: &MultiValue) -> mlua::Result<MultiValue
     let (writes, old) = {
         let w = world(lua)?;
         let d = w.d();
-        let old = crate::scene::f32_of(d.prop(model, "Scale")).unwrap_or(1.0);
+        let old = rustudio_render::scene::f32_of(d.prop(model, "Scale")).unwrap_or(1.0);
         let k = s / old;
         let pivot = model_pivot(&w, model);
         let mut writes: Vec<(Ref, &'static str, Variant)> = Vec::new();
@@ -1359,7 +1178,7 @@ fn scale_to(lua: &Lua, model: Ref, args: &MultiValue) -> mlua::Result<MultiValue
                     _ => &[],
                 };
                 for key in lengths {
-                    if let Some(f) = crate::scene::f32_of(d.prop(r, key)) {
+                    if let Some(f) = rustudio_render::scene::f32_of(d.prop(r, key)) {
                         writes.push((r, key, Variant::Float32(f * k)));
                     }
                 }
@@ -1527,7 +1346,7 @@ fn weld_touching(lua: &Lua, set: &[Ref], others: &[Ref], mode: u32) -> mlua::Res
                 }
                 let Some(ob) = part_obb(d, *b) else { continue };
                 if let Some((fa, fb)) = touching_faces(&oa, &ob) {
-                    let st = |r: Ref, f: usize| crate::scene::enum_u32(d.prop(r, surface_prop(f))).unwrap_or(0);
+                    let st = |r: Ref, f: usize| rustudio_render::scene::enum_u32(d.prop(r, surface_prop(f))).unwrap_or(0);
                     if mode == 0 || JOINABLE.contains(&st(*a, fa)) || JOINABLE.contains(&st(*b, fb)) {
                         v.push((*a, *b));
                     }

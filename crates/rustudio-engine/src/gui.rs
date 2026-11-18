@@ -22,10 +22,10 @@ use egui::{Color32, FontFamily, Pos2, Rect, TextureHandle};
 use glam::Vec3;
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::assets::{AssetStore, Fetch};
-use crate::camera::Camera;
-use crate::doc::{self, Document};
-use crate::scene::{enum_u32, f32_of};
+use rustudio_core::assets::{AssetStore, Fetch};
+use rustudio_render::camera::Camera;
+use rustudio_core::doc::{self, Document};
+use rustudio_render::scene::{enum_u32, f32_of};
 
 #[path = "gui_input.rs"]
 mod input;
@@ -77,7 +77,7 @@ impl GuiBox {
 }
 
 /// What the viewport's GUI and the client's scripts tell each other between
-/// frames (src/domains/gui_input.rs): which TextBox has the keyboard, what
+/// frames (crates/rustudio-engine/src/domains/gui_input.rs): which TextBox has the keyboard, what
 /// is hovered / pressed (GuiObject.GuiState), which images have loaded
 /// (ImageLabel.IsLoaded), and the focus changes each side asked for. One
 /// play client per process, so one of these.
@@ -224,7 +224,7 @@ pub struct Gui {
     pub input_inset: Option<f32>,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
-    pub world_batches: Vec<crate::world_gui::GuiBatch>,
+    pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,
     /// ViewportFrames (drawn by the renderer, vf_render.rs): each one's
     /// render size from its last walk, the texture the renderer drew it
     /// into (`set_vf_textures`), the one that walk composited, and the
@@ -928,7 +928,7 @@ fn weight_of(w: rbx_dom_weak::types::FontWeight) -> u32 {
 /// checks/plugins/widgets/captures/studio-wleft.png, Arimo at TextSize 12.
 pub(crate) fn legacy_text_scale(font: &(String, u32, bool)) -> f32 {
     if font.0.ends_with("/LegacyArial.json") {
-        crate::mech::GUI_LEGACY_TEXT_SCALE
+        rustudio_core::mech::GUI_LEGACY_TEXT_SCALE
     } else {
         1.0
     }
@@ -1024,10 +1024,10 @@ fn face_file(
         if failed.contains(id) {
             false
         } else if id.starts_with("rbxasset://") {
-            crate::assets::resolve(id, None).is_some_and(|p| p.is_file())
+            rustudio_core::assets::resolve(id, None).is_some_and(|p| p.is_file())
         } else {
             // here, or fetched by `family` (Pending until it arrives)
-            crate::assets::asset_ref(id).is_some()
+            rustudio_core::assets::asset_ref(id).is_some()
         }
     };
     let mut best: Option<(u32, &String)> = None;
@@ -1049,7 +1049,7 @@ fn face_file(
 pub(crate) fn fallback_fonts() -> &'static [&'static [u8]] {
     static FONTS: std::sync::OnceLock<Vec<&'static [u8]>> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
-        let content = crate::assets::content_dir().join("fonts");
+        let content = rustudio_core::assets::content_dir().join("fonts");
         let mut files: Vec<std::path::PathBuf> = ["BuilderSans-Regular.otf", "SourceSansPro-Regular.ttf"]
             .iter()
             .map(|f| content.join(f))
@@ -1068,7 +1068,7 @@ pub(crate) fn fallback_fonts() -> &'static [&'static [u8]] {
             .unwrap_or_default();
         scripts.sort();
         files.extend(scripts);
-        files.extend(crate::platform::fallback_font_files().iter().map(std::path::PathBuf::from));
+        files.extend(rustudio_core::platform::fallback_font_files().iter().map(std::path::PathBuf::from));
         files
             .iter()
             .filter_map(|p| std::fs::read(p).ok())
@@ -1197,7 +1197,7 @@ impl Gui {
             Some(k) => *k,
             None => {
                 let line = ctx.fonts_mut(|f| f.row_height(&egui::FontId::new(100.0, family.clone()))) / 100.0;
-                let k = crate::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
+                let k = rustudio_core::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
                 if matches!(family, FontFamily::Name(_)) {
                     self.em_ratio.insert(key, k);
                 }
@@ -1216,7 +1216,7 @@ impl Gui {
     /// in a 15 % box at the top left); the equipped slot's four edge frames,
     /// SLOT_EQUIP_THICKNESS 0.1 of the slot, SLOT_EQUIP_COLOR 90,142,233, over
     /// the number. Slots are (name, TextureId, equipped); returns their rects.
-    pub(crate) fn draw_hotbar(
+    pub fn draw_hotbar(
         &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
@@ -1315,14 +1315,14 @@ impl Gui {
     }
 
     /// An image as an egui texture (and its pixel size), loaded on first use.
-    pub(crate) fn texture(
+    pub fn texture(
         &mut self,
         ctx: &egui::Context,
         store: &mut AssetStore,
         doc_dir: Option<&std::path::Path>,
         id: &str,
     ) -> Option<(egui::TextureId, [usize; 2])> {
-        if let Some((base, gen)) = crate::runtime::editable::image_key(id) {
+        if let Some((base, gen)) = rustudio_core::editable_source::image_key(id) {
             // (EditableImage pixels change without a document mark)
             self.no_cache = Some("editable image");
             if self.editable_gens.get(base).is_some_and(|h| *h >= gen) {
@@ -1330,7 +1330,7 @@ impl Gui {
                     return Some((h.id(), *s));
                 }
             }
-            let (now, img) = crate::runtime::editable::image_pixels(id)?;
+            let (now, img) = rustudio_core::editable_source::image_pixels(id)?;
             let size = [img.width as usize, img.height as usize];
             let color = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
             let opts = egui::TextureOptions::NEAREST;
@@ -1393,7 +1393,7 @@ impl Gui {
                 }
             }
         }
-        match crate::texture::decode(&bytes) {
+        match rustudio_core::texture::decode(&bytes) {
             Ok(img) => {
                 let size = [img.width as usize, img.height as usize];
                 let base = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
@@ -1446,7 +1446,7 @@ impl Gui {
     /// What each ViewportFrame drawn this frame shows, read now: its size
     /// from the last walk, its CurrentCamera, Ambient, LightColor and
     /// LightDirection. Frames without a camera aren't drawn.
-    pub fn vf_requests(&self, d: &Document) -> HashMap<Ref, crate::render::vf::Request> {
+    pub fn vf_requests(&self, d: &Document) -> HashMap<Ref, rustudio_render::render::vf::Request> {
         let mut out = HashMap::new();
         for &r in &self.vf_live {
             let Some(&size) = self.vf_size.get(&r) else { continue };
@@ -1454,11 +1454,11 @@ impl Gui {
                 Some(Variant::Ref(c)) if d.exists(c) => c,
                 _ => continue,
             };
-            let Some(xf) = crate::scene::xform_of(d, cam) else { continue };
+            let Some(xf) = rustudio_render::scene::xform_of(d, cam) else { continue };
             let fov = f32_of(d.prop(cam, "FieldOfView")).unwrap_or(70.0).to_radians();
             let ambient = color(d, r, "Ambient", [200.0 / 255.0; 3]);
             let light = color(d, r, "LightColor", [140.0 / 255.0; 3]);
-            let mut ldir = crate::scene::vec3_of(d.prop(r, "LightDirection")).unwrap_or(Vec3::splat(-1.0));
+            let mut ldir = rustudio_render::scene::vec3_of(d.prop(r, "LightDirection")).unwrap_or(Vec3::splat(-1.0));
             // Near-zero directions reset to the default before shading
             // (Studio's LightDirection setter).
             let length2 = ldir.length_squared();
@@ -1468,7 +1468,7 @@ impl Gui {
             }
             let bg = color(d, r, "BackgroundColor3", [1.0; 3]);
             let bt = f32_of(d.prop(r, "BackgroundTransparency")).unwrap_or(0.0).clamp(0.0, 1.0);
-            out.insert(r, crate::render::vf::Request {
+            out.insert(r, rustudio_render::render::vf::Request {
                 size, cam: xf, fov_y: fov, ambient, light, light_dir: ldir.normalize_or_zero(),
                 background: [bg[0], bg[1], bg[2], 1.0 - bt],
             });
@@ -1771,7 +1771,7 @@ mod calibrate {
     /// in Studio: "START GAME" Oswald 14 → 46×14, 18 → 58×18, 24 → 78×24, 32 → 104×32).
     #[test]
     fn oswald_width() {
-        let path = crate::assets::content_dir().join("fonts/Oswald-Regular.ttf");
+        let path = rustudio_core::assets::content_dir().join("fonts/Oswald-Regular.ttf");
         let Ok(bytes) = std::fs::read(&path) else {
             return;
         };

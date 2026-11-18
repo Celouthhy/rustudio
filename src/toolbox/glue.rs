@@ -22,7 +22,7 @@ impl Editor {
         // never wait for it here, and look at most twice a second.
         if self.toolbox.ui.session_checked.is_none_or(|t| t.elapsed().as_millis() > 500) {
             self.toolbox.ui.session_checked = Some(std::time::Instant::now());
-            if let Some(c) = self.account.shared_client() {
+            if let Some(c) = self.game.account.shared_client() {
                 let got = c.try_lock().ok().map(|g| g.as_ref().map(|c| (c.session.downloader(), c.user_id())));
                 if let Some(s) = got {
                     self.toolbox.set_session(s.filter(|_| std::env::var_os("RUSTUDIO_NO_SESSION").is_none()));
@@ -92,17 +92,17 @@ impl Editor {
     /// The point Studio inserts at: the ray through the 3D view's centre
     /// hits something within 2048 studs, else 64 studs in front.
     pub fn toolbox_insert_point(&self) -> Vec3 {
-        let rect = if self.viewport_rect.is_positive() { self.viewport_rect } else { egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)) };
-        let ray = self.cam.ray(rect, rect.center());
+        let rect = if self.game.viewport_rect.is_positive() { self.game.viewport_rect } else { egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)) };
+        let ray = self.game.cam.ray(rect, rect.center());
         match self.ray_distance(&ray).filter(|t| *t <= 2048.0) {
             Some(t) => ray.origin + ray.dir * t,
-            None => self.cam.pos + ray.dir * 64.0,
+            None => self.game.cam.pos + ray.dir * 64.0,
         }
     }
 
     fn world_boxes(&self) -> Vec<(Vec3, Vec3)> {
-        let Some(ws) = self.doc.workspace() else { return Vec::new() };
-        insert_boxes(&self.doc, ws)
+        let Some(ws) = self.game.doc.workspace() else { return Vec::new() };
+        insert_boxes(&self.game.doc, ws)
     }
 
     fn toolbox_ready(&mut self, ready: Ready) {
@@ -147,12 +147,12 @@ impl Editor {
                     self.toolbox.inserts.retain(|j| j.job != ready.job);
                     return;
                 }
-                let home = if starter_pack { self.doc.find_child(self.doc.dom.root_ref(), "StarterPack") } else { None };
-                self.toolbox_apply(ready, Some(home.unwrap_or_else(|| self.doc.default_parent())));
+                let home = if starter_pack { self.game.doc.find_child(self.game.doc.dom.root_ref(), "StarterPack") } else { None };
+                self.toolbox_apply(ready, Some(home.unwrap_or_else(|| self.game.doc.default_parent())));
             }
             Ask::GetPlugin { asset } => {
                 if insert_it {
-                    let client = self.account.shared_client();
+                    let client = self.game.account.shared_client();
                     self.plugin_store.install(client, asset.id);
                     self.toolbox.note_recent(asset.id, asset.type_id);
                     self.toolbox.ui.installing.insert(asset.id);
@@ -174,10 +174,10 @@ impl Editor {
         let label = insert::waypoint(asset.id, kind);
         let id = asset.id;
         let name = if asset.name.is_empty() { format!("Asset {id}") } else { asset.name.clone() };
-        let sel_first = self.doc.selection.first().copied().filter(|r| self.doc.exists(*r));
-        let ws = self.doc.default_parent();
+        let sel_first = self.game.doc.selection.first().copied().filter(|r| self.game.doc.exists(*r));
+        let ws = self.game.doc.default_parent();
         let explicit = match target {
-            Target::Parent(p) if self.doc.exists(p) => Some(p),
+            Target::Parent(p) if self.game.doc.exists(p) => Some(p),
             _ => None,
         };
         let source_id = Variant::Int64(id as i64);
@@ -222,8 +222,8 @@ impl Editor {
                     // A decal: into the part dropped on (that face), else the
                     // selection's first object, else Workspace.
                     let (parent, face) = match target {
-                        Target::Drop { part: Some(p), face, .. } if self.doc.exists(p) => (p, face),
-                        Target::Parent(p) if self.doc.exists(p) => (p, None),
+                        Target::Drop { part: Some(p), face, .. } if self.game.doc.exists(p) => (p, face),
+                        Target::Parent(p) if self.game.doc.exists(p) => (p, None),
                         _ => (sel_first.unwrap_or(ws), None),
                     };
                     if let Some(f) = face {
@@ -236,12 +236,12 @@ impl Editor {
                         }
                     }
                     let bytes = insert::encode(&dom, &roots);
-                    let refs = self.doc.paste_groups(vec![(bytes, parent)], &label);
+                    let refs = self.game.doc.paste_groups(vec![(bytes, parent)], &label);
                     self.select(refs.clone());
                     refs
                 } else {
-                    let lighting = self.doc.find_child(self.doc.dom.root_ref(), "Lighting");
-                    let material = self.doc.find_child(self.doc.dom.root_ref(), "MaterialService");
+                    let lighting = self.game.doc.find_child(self.game.doc.dom.root_ref(), "Lighting");
+                    let material = self.game.doc.find_child(self.game.doc.dom.root_ref(), "MaterialService");
                     let world_parent = tool_parent.or(explicit).unwrap_or(ws);
                     let mut world = Vec::new();
                     let mut groups: Vec<(Vec<u8>, Ref)> = Vec::new();
@@ -263,7 +263,7 @@ impl Editor {
                         if let Some((lo, hi)) = insert::aabb(&dom, &world) {
                             let to = match target {
                                 Target::Drop { at: Some(p), .. } => {
-                                    if self.snap_move { insert::snap(p, self.move_inc) } else { p }
+                                    if self.game.snap_move { insert::snap(p, self.game.move_inc) } else { p }
                                 }
                                 Target::Drop { at: None, ray_origin, ray_dir, .. } => ray_origin + ray_dir * 64.0,
                                 _ => self.toolbox_insert_point(),
@@ -282,7 +282,7 @@ impl Editor {
                     if !mats.is_empty() {
                         groups.push((insert::encode(&dom, &mats), material.unwrap_or(ws)));
                     }
-                    let refs = self.doc.paste_groups(groups, &label);
+                    let refs = self.game.doc.paste_groups(groups, &label);
                     self.select(refs.clone());
                     refs
                 }
@@ -299,10 +299,10 @@ impl Editor {
         // instances (the button still held; the plugin drags them).
         // (with no plugin active, the editor's own dragger takes them: a
         // lone Decal / Texture by the face under the mouse, the rest freeform)
-        let made: Vec<Ref> = inserted.iter().flat_map(|r| std::iter::once(*r).chain(self.doc.dom.descendants_of(*r).map(|i| i.referent()))).collect();
+        let made: Vec<Ref> = inserted.iter().flat_map(|r| std::iter::once(*r).chain(self.game.doc.dom.descendants_of(*r).map(|i| i.referent()))).collect();
         let face = match inserted.as_slice() {
-            [r] if self.doc.dom.get_by_ref(*r).is_some_and(|i| matches!(i.class.as_str(), "Decal" | "Texture")) => {
-                let i = self.doc.dom.get_by_ref(*r).expect("checked");
+            [r] if self.game.doc.dom.get_by_ref(*r).is_some_and(|i| matches!(i.class.as_str(), "Decal" | "Texture")) => {
+                let i = self.game.doc.dom.get_by_ref(*r).expect("checked");
                 Some((*r, i.parent(), i.properties.get(&rbx_dom_weak::ustr("Face")).cloned()))
             }
             _ => None,
@@ -330,11 +330,11 @@ impl Editor {
         }
         let names: Vec<serde_json::Value> = inserted
             .iter()
-            .filter_map(|r| self.doc.dom.get_by_ref(*r).map(|i| serde_json::json!({"class": i.class.as_str(), "name": i.name, "parent": self.doc.dom.get_by_ref(i.parent()).map(|p| p.class.to_string()).unwrap_or_default()})))
+            .filter_map(|r| self.game.doc.dom.get_by_ref(*r).map(|i| serde_json::json!({"class": i.class.as_str(), "name": i.name, "parent": self.game.doc.dom.get_by_ref(i.parent()).map(|p| p.class.to_string()).unwrap_or_default()})))
             .collect();
         self.toolbox.harness.insert(
             format!("insert_{id}"),
-            serde_json::json!({"ok": true, "kind": format!("{kind:?}"), "inserted": names, "undo": self.doc.can_undo().map(str::to_string)}),
+            serde_json::json!({"ok": true, "kind": format!("{kind:?}"), "inserted": names, "undo": self.game.doc.can_undo().map(str::to_string)}),
         );
         self.info(format!("Inserted \"{name}\" ({id})"));
     }
@@ -347,7 +347,7 @@ impl Editor {
             let r = tmp.insert(root, b);
             groups.push((insert::encode(&tmp, &[r]), parent));
         }
-        let refs = self.doc.paste_groups(groups, label);
+        let refs = self.game.doc.paste_groups(groups, label);
         self.select(refs.clone());
         refs
     }
@@ -367,7 +367,7 @@ impl Editor {
             self.toolbox.ask = Some(Ask::GetPlugin { asset });
             return;
         }
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         self.plugin_store.install(client, asset.id);
         self.toolbox.ui.installing.insert(asset.id);
         self.toolbox.note_recent(asset.id, asset.type_id);
@@ -433,9 +433,9 @@ impl Editor {
             // The schedule holds (toolbox_harness_tick) until a prompt shows,
             // at most `secs` of wall time.
             if self.toolbox.ask.is_none() {
-                let at = self.harness.unheld_now();
+                let at = self.harness.run.unheld_now();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f32(secs.max(0.0));
-                self.toolbox.ui.await_ask = Some((at, self.harness.held, deadline, secs));
+                self.toolbox.ui.await_ask = Some((at, self.harness.run.held, deadline, secs));
             } else {
                 self.toolbox_awaited(0.0);
             }
@@ -520,7 +520,7 @@ impl Editor {
             self.toolbox.ui.layout_waiting.push(tag.to_string());
             self.toolbox_layout_reports();
         } else if rest == "undo" {
-            let label = self.doc.can_undo().map(str::to_string);
+            let label = self.game.doc.can_undo().map(str::to_string);
             self.undo();
             self.toolbox.harness.insert("last_undo".into(), serde_json::json!(label));
         } else if rest == "redo" {
@@ -529,15 +529,15 @@ impl Editor {
             // The services an insert can touch, and the selection (checks).
             let mut tree = serde_json::Map::new();
             for svc in ["Workspace", "Lighting", "StarterPack", "MaterialService", "SoundService", "StarterGui"] {
-                let Some(s) = self.doc.find_child(self.doc.dom.root_ref(), svc) else { continue };
-                let kids: Vec<serde_json::Value> = self
+                let Some(s) = self.game.doc.find_child(self.game.doc.dom.root_ref(), svc) else { continue };
+                let kids: Vec<serde_json::Value> = self.game
                     .doc
                     .dom
                     .get_by_ref(s)
                     .map(|i| i.children().to_vec())
                     .unwrap_or_default()
                     .iter()
-                    .filter_map(|r| self.doc.dom.get_by_ref(*r))
+                    .filter_map(|r| self.game.doc.dom.get_by_ref(*r))
                     .map(|i| {
                         let size = match i.properties.get(&"Size".into()) {
                             Some(Variant::Vector3(v)) => serde_json::json!([v.x, v.y, v.z]),
@@ -547,36 +547,36 @@ impl Editor {
                             Some(Variant::CFrame(c)) => serde_json::json!([c.position.x, c.position.y, c.position.z]),
                             _ => serde_json::Value::Null,
                         };
-                        let bbox = super::insert::aabb(&self.doc.dom, &[i.referent()]).map(|(lo, hi)| serde_json::json!([[lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]]));
+                        let bbox = super::insert::aabb(&self.game.doc.dom, &[i.referent()]).map(|(lo, hi)| serde_json::json!([[lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]]));
                         let mut props = serde_json::Map::new();
                         for k in ["SoundId", "Video", "Texture", "MeshId", "Face", "CollisionFidelity", "SourceAssetId", "TextureID", "SkyboxBk", "VideoContent", "AudioContent"] {
-                            if let Some(v) = self.doc.prop(i.referent(), k) {
+                            if let Some(v) = self.game.doc.prop(i.referent(), k) {
                                 props.insert(k.into(), serde_json::json!(variant_text(&v)));
                             }
                         }
                         props.insert("_keys".into(), serde_json::json!(i.properties.keys().map(|k| k.to_string()).collect::<Vec<_>>()));
-                        let kids = i.children().iter().filter_map(|c| self.doc.dom.get_by_ref(*c)).map(|c| format!("{}:{}", c.class, c.name)).take(50).collect::<Vec<_>>();
-                        serde_json::json!({"class": i.class.as_str(), "name": i.name, "size": size, "pos": pos, "bbox": bbox, "props": props, "children": kids, "descendants": self.doc.dom.descendants_of(i.referent()).count()})
+                        let kids = i.children().iter().filter_map(|c| self.game.doc.dom.get_by_ref(*c)).map(|c| format!("{}:{}", c.class, c.name)).take(50).collect::<Vec<_>>();
+                        serde_json::json!({"class": i.class.as_str(), "name": i.name, "size": size, "pos": pos, "bbox": bbox, "props": props, "children": kids, "descendants": self.game.doc.dom.descendants_of(i.referent()).count()})
                     })
                     .collect();
                 tree.insert(svc.into(), serde_json::Value::Array(kids));
             }
-            let sel: Vec<String> = self.doc.selection.iter().filter_map(|r| self.doc.dom.get_by_ref(*r)).map(|i| format!("{}:{}", i.class, i.name)).collect();
+            let sel: Vec<String> = self.game.doc.selection.iter().filter_map(|r| self.game.doc.dom.get_by_ref(*r)).map(|i| format!("{}:{}", i.class, i.name)).collect();
             tree.insert("selection".into(), serde_json::json!(sel));
             // Decals / Textures anywhere in Workspace: parent and Face (drops on a face).
-            let faces: Vec<serde_json::Value> = self
+            let faces: Vec<serde_json::Value> = self.game
                 .doc
                 .dom
-                .descendants_of(self.doc.default_parent())
+                .descendants_of(self.game.doc.default_parent())
                 .filter(|i| matches!(i.class.as_str(), "Decal" | "Texture"))
                 .map(|i| {
-                    let face = self.doc.prop(i.referent(), "Face").map(|v| variant_text(&v));
-                    let parent = self.doc.dom.get_by_ref(i.parent()).map(|p| p.name.clone()).unwrap_or_default();
+                    let face = self.game.doc.prop(i.referent(), "Face").map(|v| variant_text(&v));
+                    let parent = self.game.doc.dom.get_by_ref(i.parent()).map(|p| p.name.clone()).unwrap_or_default();
                     serde_json::json!({"class": i.class.as_str(), "parent": parent, "face": face})
                 })
                 .collect();
             tree.insert("decals".into(), serde_json::json!(faces));
-            tree.insert("undo".into(), serde_json::json!(self.doc.can_undo()));
+            tree.insert("undo".into(), serde_json::json!(self.game.doc.can_undo()));
             tree.insert("asking".into(), serde_json::json!(self.toolbox_asking()));
             self.toolbox.harness.insert(format!("snapshot_{tag}"), serde_json::Value::Object(tree));
         }
@@ -678,14 +678,14 @@ impl Editor {
         // `toolbox:await-ask`: held until a prompt shows or the wall-clock
         // limit passes (then "await_timeouts" says so; the check fails).
         if let Some((at, before, deadline, secs)) = self.toolbox.ui.await_ask {
-            let waited = self.harness.unheld_now() - at;
+            let waited = self.harness.run.unheld_now() - at;
             if self.toolbox.ask.is_some() {
                 self.toolbox.ui.await_ask = None;
-                self.harness.held = before + waited;
+                self.harness.run.held = before + waited;
                 self.toolbox_awaited(waited);
             } else if std::time::Instant::now() >= deadline {
                 self.toolbox.ui.await_ask = None;
-                self.harness.held = before + waited;
+                self.harness.run.held = before + waited;
                 let why = format!("await-ask: no prompt within {secs} s (wall clock)");
                 self.push_log(crate::app::Level::Warn, why.clone());
                 let all = self.toolbox.harness.entry("await_timeouts").or_insert_with(|| serde_json::json!([]));
@@ -693,7 +693,7 @@ impl Editor {
                     a.push(serde_json::json!(why));
                 }
             } else {
-                self.harness.held = before + waited;
+                self.harness.run.held = before + waited;
             }
         }
         // An armed answer goes to the first prompt that shows, recording
@@ -763,21 +763,21 @@ impl Editor {
         }
         let Some(payload) = egui::DragAndDrop::payload::<ToolboxDrag>(ui.ctx()) else { return };
         let Some(p) = ui.ctx().pointer_hover_pos().filter(|p| rect.contains(*p)) else { return };
-        let ray = self.cam.ray(rect, p);
+        let ray = self.game.cam.ray(rect, p);
         let hit = self.ray_distance(&ray).filter(|t| *t <= 2048.0).map(|t| ray.origin + ray.dir * t);
         let part = self.pick(rect, p, true);
         // Preview: a marker at the drop point (and the face for decals).
         let painter = ui.painter_at(rect);
-        painter.circle_stroke(p, 10.0, egui::Stroke::new(2.0, crate::theme::SELECT));
+        painter.circle_stroke(p, 10.0, egui::Stroke::new(2.0, rustudio_engine::theme::SELECT));
         if let Some(a) = self.toolbox.asset(payload.0) {
-            painter.text(p + egui::vec2(14.0, -8.0), egui::Align2::LEFT_BOTTOM, &a.name, egui::FontId::proportional(12.0), crate::theme::TEXT);
+            painter.text(p + egui::vec2(14.0, -8.0), egui::Align2::LEFT_BOTTOM, &a.name, egui::FontId::proportional(12.0), rustudio_engine::theme::TEXT);
         }
         let released = ui.ctx().input(|i| i.pointer.any_released());
         if released || resp.dnd_release_payload::<ToolboxDrag>().is_some() {
             egui::DragAndDrop::clear_payload(ui.ctx());
             let face = part.and_then(|r| {
-                let xf = crate::scene::xform_of(&self.doc, r)?;
-                let size = crate::scene::vec3_of(self.doc.prop(r, "Size"))?;
+                let xf = rustudio_render::scene::xform_of(&self.game.doc, r)?;
+                let size = rustudio_render::scene::vec3_of(self.game.doc.prop(r, "Size"))?;
                 Some(insert::face_of(&xf, size, hit?))
             });
             self.toolbox_insert(payload.0, Target::Drop { at: hit, ray_origin: ray.origin, ray_dir: ray.dir, part, face });
@@ -820,12 +820,12 @@ impl Editor {
             }
             let builtin = self.plugins.active_plugin().is_none();
             let p = pointer.unwrap_or(rect.center());
-            let ray = self.cam.ray(rect, p);
+            let ray = self.game.cam.ray(rect, p);
             let hit = self.ray_distance(&ray).filter(|t| *t <= 2048.0).map(|t| ray.origin + ray.dir * t);
             let part = self.pick(rect, p, true);
             let face = part.and_then(|r| {
-                let xf = crate::scene::xform_of(&self.doc, r)?;
-                let size = crate::scene::vec3_of(self.doc.prop(r, "Size"))?;
+                let xf = rustudio_render::scene::xform_of(&self.game.doc, r)?;
+                let size = rustudio_render::scene::vec3_of(self.game.doc.prop(r, "Size"))?;
                 Some(insert::face_of(&xf, size, hit?))
             });
             let Some(job) = self.toolbox_insert(id, Target::Drop { at: hit, ray_origin: ray.origin, ray_dir: ray.dir, part, face }) else { return false };
@@ -887,11 +887,11 @@ impl Editor {
         let made: std::collections::HashSet<Ref> = d.made.iter().copied().collect();
         let face = d.face.clone();
         let inserted = d.inserted.clone();
-        let ray = self.cam.ray(rect, p);
+        let ray = self.game.cam.ray(rect, p);
         let mut moved: Vec<(Ref, rbx_dom_weak::Ustr, Option<Variant>)> = Vec::new();
         if let Some((decal, _, _)) = face {
             // Over a part: parented to it, Face = the surface under the mouse.
-            let hit = self
+            let hit = self.game
                 .scene
                 .parts
                 .iter()
@@ -899,13 +899,13 @@ impl Editor {
                 .filter_map(|sp| ray.hit_obb(&sp.xf, sp.size).filter(|t| *t > 0.0).map(|t| (t, sp.r, sp.xf, sp.size)))
                 .min_by(|a, b| a.0.total_cmp(&b.0));
             if let Some((t, part, xf, size)) = hit {
-                if self.doc.exists(decal) {
+                if self.game.doc.exists(decal) {
                     let f = insert::face_of(&xf, size, ray.origin + ray.dir * t);
-                    self.doc.reparent_live(decal, part);
+                    self.game.doc.reparent_live(decal, part);
                     let name = rbx_dom_weak::ustr("Face");
                     let v = Variant::Enum(rbx_dom_weak::types::Enum::from_u32(f));
-                    if self.doc.prop(decal, "Face").as_ref() != Some(&v) {
-                        self.doc.set_prop_live(decal, name, v);
+                    if self.game.doc.prop(decal, "Face").as_ref() != Some(&v) {
+                        self.game.doc.set_prop_live(decal, name, v);
                     }
                 }
             }
@@ -913,12 +913,12 @@ impl Editor {
             // Freeform: the box's centre to the surface under the pointer
             // (not the dragged parts themselves), raised clear of the parts
             // there, as the drop places it.
-            let ws = self.doc.workspace();
-            let world: Vec<Ref> = inserted.iter().copied().filter(|r| ws.is_some_and(|w| self.doc.is_ancestor(w, *r))).collect();
+            let ws = self.game.doc.workspace();
+            let world: Vec<Ref> = inserted.iter().copied().filter(|r| ws.is_some_and(|w| self.game.doc.is_ancestor(w, *r))).collect();
             if world.is_empty() {
                 return;
             }
-            let t = self
+            let t = self.game
                 .scene
                 .parts
                 .iter()
@@ -929,21 +929,21 @@ impl Editor {
             let to = match t {
                 Some(t) => {
                     let hit = ray.origin + ray.dir * t;
-                    if self.snap_move { insert::snap(hit, self.move_inc) } else { hit }
+                    if self.game.snap_move { insert::snap(hit, self.game.move_inc) } else { hit }
                 }
                 None => ray.origin + ray.dir * 64.0,
             };
-            let Some((lo, hi)) = insert::aabb(&self.doc.dom, &world) else { return };
+            let Some((lo, hi)) = insert::aabb(&self.game.doc.dom, &world) else { return };
             let boxes: Vec<(Vec3, Vec3)> = match ws {
-                Some(w) => insert_boxes_except(&self.doc, w, &made),
+                Some(w) => insert_boxes_except(&self.game.doc, w, &made),
                 None => Vec::new(),
             };
             let delta = insert::move_to(lo, hi, to, &boxes);
             if delta.length_squared() > 1e-8 && delta.is_finite() {
                 let mut edits: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = Vec::new();
-                for r in world.iter().flat_map(|r| std::iter::once(*r).chain(self.doc.dom.descendants_of(*r).map(|i| i.referent()))) {
-                    let Some(i) = self.doc.dom.get_by_ref(r) else { continue };
-                    let part = crate::doc::is_a(i.class.as_str(), "BasePart");
+                for r in world.iter().flat_map(|r| std::iter::once(*r).chain(self.game.doc.dom.descendants_of(*r).map(|i| i.referent()))) {
+                    let Some(i) = self.game.doc.dom.get_by_ref(r) else { continue };
+                    let part = rustudio_core::doc::is_a(i.class.as_str(), "BasePart");
                     for key in ["CFrame", "WorldPivotData", "WorldPivot"] {
                         let name = rbx_dom_weak::ustr(key);
                         let new = match i.properties.get(&name) {
@@ -964,7 +964,7 @@ impl Editor {
                     }
                 }
                 for (r, name, v) in edits {
-                    self.doc.set_prop_live(r, name, v);
+                    self.game.doc.set_prop_live(r, name, v);
                 }
             }
         }
@@ -988,25 +988,25 @@ impl Editor {
         }
         let mut changes = Vec::new();
         let label = if let Some((decal, parent0, face0)) = &d.face {
-            if let Some(i) = self.doc.dom.get_by_ref(*decal) {
+            if let Some(i) = self.game.doc.dom.get_by_ref(*decal) {
                 if i.parent() != *parent0 {
-                    changes.push(crate::doc::Change::Parent { r: *decal, old: *parent0, new: i.parent() });
+                    changes.push(rustudio_core::doc::Change::Parent { r: *decal, old: *parent0, new: i.parent() });
                 }
-                let face = self.doc.dom.get_by_ref(*decal).and_then(|i| i.properties.get(&rbx_dom_weak::ustr("Face")).cloned());
+                let face = self.game.doc.dom.get_by_ref(*decal).and_then(|i| i.properties.get(&rbx_dom_weak::ustr("Face")).cloned());
                 if face != *face0 {
-                    changes.push(crate::doc::Change::Prop { r: *decal, name: rbx_dom_weak::ustr("Face"), old: face0.clone(), new: face });
+                    changes.push(rustudio_core::doc::Change::Prop { r: *decal, name: rbx_dom_weak::ustr("Face"), old: face0.clone(), new: face });
                 }
             }
             "Drag Face Instance"
         } else {
             for (r, name, old) in &d.moved {
-                let new = self.doc.dom.get_by_ref(*r).and_then(|i| i.properties.get(name).cloned());
-                changes.push(crate::doc::Change::Prop { r: *r, name: *name, old: old.clone(), new });
+                let new = self.game.doc.dom.get_by_ref(*r).and_then(|i| i.properties.get(name).cloned());
+                changes.push(rustudio_core::doc::Change::Prop { r: *r, name: *name, old: old.clone(), new });
             }
             "End Freeform Drag"
         };
-        self.doc.record_changes(label, changes);
-        self.toolbox.harness.insert(format!("drag_end_{}", d.id), serde_json::json!(self.doc.can_undo()));
+        self.game.doc.record_changes(label, changes);
+        self.toolbox.harness.insert(format!("drag_end_{}", d.id), serde_json::json!(self.game.doc.can_undo()));
     }
 
     /// The drag left the view: the loading insert is cancelled (its scripts
@@ -1024,7 +1024,7 @@ impl Editor {
             self.toolbox.harness.insert(format!("drag_cancel_{}", d.id), serde_json::json!(job));
         }
         let made: std::collections::HashSet<Ref> = d.made.iter().copied().collect();
-        if !d.inserted.is_empty() && self.doc.retract_inserted(&d.inserted, &made) {
+        if !d.inserted.is_empty() && self.game.doc.retract_inserted(&d.inserted, &made) {
             self.toolbox.harness.insert(format!("drag_out_{}", d.id), serde_json::json!(d.inserted.len()));
         }
     }
@@ -1037,14 +1037,14 @@ impl Editor {
 }
 
 /// `insert_boxes` without the instances being dragged.
-fn insert_boxes_except(doc: &crate::doc::Document, root: Ref, skip: &std::collections::HashSet<Ref>) -> Vec<(Vec3, Vec3)> {
+fn insert_boxes_except(doc: &rustudio_core::doc::Document, root: Ref, skip: &std::collections::HashSet<Ref>) -> Vec<(Vec3, Vec3)> {
     let mut out = Vec::new();
     for i in doc.dom.descendants_of(root) {
-        if skip.contains(&i.referent()) || !crate::doc::is_a(i.class.as_str(), "BasePart") || i.class.as_str() == "Terrain" {
+        if skip.contains(&i.referent()) || !rustudio_core::doc::is_a(i.class.as_str(), "BasePart") || i.class.as_str() == "Terrain" {
             continue;
         }
         let r = i.referent();
-        let (Some(xf), Some(size)) = (crate::scene::xform_of(doc, r), crate::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
+        let (Some(xf), Some(size)) = (rustudio_render::scene::xform_of(doc, r), rustudio_render::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
         if matches!(doc.prop(r, "CanCollide"), Some(Variant::Bool(false))) {
             continue;
         }
@@ -1068,6 +1068,6 @@ fn variant_text(v: &Variant) -> String {
 }
 
 /// AABBs of the parts under `root` (what an insert must not overlap).
-fn insert_boxes(doc: &crate::doc::Document, root: Ref) -> Vec<(Vec3, Vec3)> {
+fn insert_boxes(doc: &rustudio_core::doc::Document, root: Ref) -> Vec<(Vec3, Vec3)> {
     insert_boxes_except(doc, root, &std::collections::HashSet::new())
 }

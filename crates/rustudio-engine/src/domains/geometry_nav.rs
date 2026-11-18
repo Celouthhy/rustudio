@@ -29,9 +29,9 @@ use glam::{Vec2, Vec3};
 use mlua::{Lua, MultiValue, UserData, UserDataFields, UserDataMethods, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 const STEP: f32 = 1.05;
@@ -198,9 +198,9 @@ struct Obstacle {
 /// The id of a MeshPart's / union's mesh.
 fn mesh_id(doc: &Document, r: Ref, class: &str) -> Option<String> {
     if class == "MeshPart" {
-        crate::scene::content_string(doc.prop(r, "MeshId")).or_else(|| crate::scene::content_string(doc.prop(r, "MeshContent")))
+        rustudio_render::scene::content_string(doc.prop(r, "MeshId")).or_else(|| rustudio_render::scene::content_string(doc.prop(r, "MeshContent")))
     } else if doc::is_a(class, "PartOperation") {
-        crate::scene::union_mesh(doc, r).map(|m| m.id)
+        rustudio_core::mesh::union_mesh(doc, r).map(|m| m.id)
     } else {
         None
     }
@@ -276,7 +276,7 @@ fn label_id(labels: &mut Vec<String>, s: &str) -> u16 {
 }
 
 fn material_name(doc: &Document, r: Ref) -> String {
-    let v = crate::scene::enum_u32(doc.prop(r, "Material")).unwrap_or(256);
+    let v = rustudio_render::scene::enum_u32(doc.prop(r, "Material")).unwrap_or(256);
     LEnumItem::from_value("Material", v).map(|e| e.name).unwrap_or_else(|| "Plastic".into())
 }
 
@@ -303,7 +303,7 @@ fn shape_of(doc: &Document, r: Ref, class: &str) -> u8 {
     match class {
         "WedgePart" => 3,
         "CornerWedgePart" => 4,
-        c if doc::is_a(c, "Part") => match crate::scene::enum_u32(doc.prop(r, "Shape")) {
+        c if doc::is_a(c, "Part") => match rustudio_render::scene::enum_u32(doc.prop(r, "Shape")) {
             Some(0) => 1,
             Some(2) => 2,
             Some(3) => 3,
@@ -422,8 +422,8 @@ fn obstacles(doc: &Document, labels: &mut Vec<String>, lo: Vec2, hi: Vec2) -> (V
         if !doc::is_a(&class, "BasePart") || class == "Terrain" {
             continue;
         }
-        let Some(xf) = crate::scene::xform_of(doc, r) else { continue };
-        let size = crate::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::new(4.0, 1.0, 2.0));
+        let Some(xf) = rustudio_render::scene::xform_of(doc, r) else { continue };
+        let size = rustudio_render::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::new(4.0, 1.0, 2.0));
         let half = size.abs() * 0.5;
         let ext = xf.rot.x_axis.abs() * half.x + xf.rot.y_axis.abs() * half.y + xf.rot.z_axis.abs() * half.z;
         if xf.pos.x + ext.x < lo.x || xf.pos.x - ext.x > hi.x || xf.pos.z + ext.z < lo.y || xf.pos.z - ext.z > hi.y {
@@ -456,9 +456,9 @@ fn obstacles(doc: &Document, labels: &mut Vec<String>, lo: Vec2, hi: Vec2) -> (V
         }
         let mut xf = xf;
         let mesh = mesh_id(doc, r, &class).and_then(|id| {
-            let tris = crate::assets::mesh_triangles(&id)?;
+            let tris = rustudio_core::assets::mesh_triangles(&id)?;
             // An off-centre union's geometry (GeometryService).
-            xf.pos += xf.rot * (crate::mesh_bvh::union_offset(&id) * size.abs());
+            xf.pos += xf.rot * (rustudio_core::mesh_bvh::union_offset(&id) * size.abs());
             Some(tris)
         });
         out.push(Obstacle { xf, half, shape: shape_of(doc, r, &class), label, pass, mesh });
@@ -509,34 +509,34 @@ impl Field {
             }
         }
         // Terrain: solid voxels (and water, walkable, labelled Water).
-        if let Some(Ok(v)) = crate::terrain::Voxels::from_dom(&doc.dom) {
+        if let Some(Ok(v)) = rustudio_core::terrain::Voxels::from_dom(&doc.dom) {
             if v.count() > 0 {
-                let vy0 = (ylo / crate::terrain::VOXEL).floor() as i32;
-                let vy1 = (yhi / crate::terrain::VOXEL).ceil() as i32;
+                let vy0 = (ylo / rustudio_core::terrain::VOXEL).floor() as i32;
+                let vy1 = (yhi / rustudio_core::terrain::VOXEL).ceil() as i32;
                 for iz in 0..nz {
                     for ix in 0..nx {
                         let c = lo + Vec2::new((ix as f32 + 0.5) * cs, (iz as f32 + 0.5) * cs);
-                        let vx = (c.x / crate::terrain::VOXEL).floor() as i32;
-                        let vz = (c.y / crate::terrain::VOXEL).floor() as i32;
+                        let vx = (c.x / rustudio_core::terrain::VOXEL).floor() as i32;
+                        let vz = (c.y / rustudio_core::terrain::VOXEL).floor() as i32;
                         let mut run: Option<(f32, f32, u8)> = None;
                         let col = &mut spans[iz * nx + ix];
                         for vy in vy0..=vy1 {
                             let (m, occ) = v.get(vx, vy, vz);
-                            let y = vy as f32 * crate::terrain::VOXEL;
+                            let y = vy as f32 * rustudio_core::terrain::VOXEL;
                             if m != 0 {
-                                let top = y + crate::terrain::VOXEL * occ.clamp(0.25, 1.0);
+                                let top = y + rustudio_core::terrain::VOXEL * occ.clamp(0.25, 1.0);
                                 run = Some(match run {
                                     Some((a, _, _)) => (a, top, m),
                                     None => (y, top, m),
                                 });
                             } else if let Some((a, b, m)) = run.take() {
-                                let name = crate::terrain::material_name(m);
+                                let name = rustudio_core::terrain::material_name(m);
                                 let l = label_id(&mut labels, name);
                                 col.push(Span { lo: a, hi: b, label: l, pass: false });
                             }
                         }
                         if let Some((a, b, m)) = run {
-                            let l = label_id(&mut labels, crate::terrain::material_name(m));
+                            let l = label_id(&mut labels, rustudio_core::terrain::material_name(m));
                             col.push(Span { lo: a, hi: b, label: l, pass: false });
                         }
                     }
@@ -729,7 +729,7 @@ fn links(doc: &Document) -> Vec<(Link, bool)> {
             continue;
         }
         let att = |k: &str| match doc.prop(r, k) {
-            Some(Variant::Ref(a)) if !a.is_none() => crate::attachment::world(doc, a, true).map(|x| x.pos),
+            Some(Variant::Ref(a)) if !a.is_none() => rustudio_core::attachment::world(doc, a, true).map(|x| x.pos),
             _ => None,
         };
         let (Some(a), Some(b)) = (att("Attachment0"), att("Attachment1")) else { continue };
@@ -750,7 +750,7 @@ fn trusses(doc: &Document, lo: Vec2, hi: Vec2) -> Vec<(Xform, Vec3)> {
         if doc.class_of(r).is_none_or(|c| c != "TrussPart") {
             continue;
         }
-        let (Some(xf), Some(size)) = (crate::scene::xform_of(doc, r), crate::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
+        let (Some(xf), Some(size)) = (rustudio_render::scene::xform_of(doc, r), rustudio_render::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
         if xf.pos.x < lo.x || xf.pos.x > hi.x || xf.pos.z < lo.y || xf.pos.z > hi.y {
             continue;
         }

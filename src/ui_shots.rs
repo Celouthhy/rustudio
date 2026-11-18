@@ -44,7 +44,7 @@ pub struct UiShots {
     queue: Vec<Event>,
     asked: bool,
     rects: serde_json::Map<String, serde_json::Value>,
-    view_baseline: Option<(crate::camera::Camera, Vec<rbx_dom_weak::types::Ref>)>,
+    view_baseline: Option<(rustudio_render::camera::Camera, Vec<rbx_dom_weak::types::Ref>)>,
     pub done: bool,
 }
 
@@ -147,18 +147,18 @@ impl Editor {
     fn ui_shots_reference(&mut self, which: &str) -> Option<rbx_dom_weak::types::Ref> {
         use rbx_dom_weak::types::{CFrame, Matrix3, Variant, Vector3};
         use rbx_dom_weak::InstanceBuilder;
-        let root = self.doc.dom.root_ref();
-        let ws = self.doc.default_parent();
+        let root = self.game.doc.dom.root_ref();
+        let ws = self.game.doc.default_parent();
         let named = |ed: &Editor, parent: rbx_dom_weak::types::Ref, name: &str| {
-            ed.doc.dom.get_by_ref(parent).and_then(|i| {
-                i.children().iter().copied().find(|c| ed.doc.dom.get_by_ref(*c).is_some_and(|k| k.name == name))
+            ed.game.doc.dom.get_by_ref(parent).and_then(|i| {
+                i.children().iter().copied().find(|c| ed.game.doc.dom.get_by_ref(*c).is_some_and(|k| k.name == name))
             })
         };
         let at = |x: f32, y: f32, z: f32| Variant::CFrame(CFrame::new(Vector3::new(x, y, z), Matrix3::identity()));
         Some(match which {
             "Part" => match named(self, ws, "RefPart") {
                 Some(r) => r,
-                None => self.doc.insert(
+                None => self.game.doc.insert(
                     ws,
                     InstanceBuilder::new("Part")
                         .with_name("RefPart")
@@ -169,26 +169,26 @@ impl Editor {
             "Model" => match named(self, ws, "RefModel") {
                 Some(r) => r,
                 None => {
-                    let m = self.doc.insert(ws, InstanceBuilder::new("Model").with_name("RefModel"));
-                    self.doc.insert(m, InstanceBuilder::new("Part").with_name("Part").with_property("CFrame", at(0.0, 10.0, 0.0)));
+                    let m = self.game.doc.insert(ws, InstanceBuilder::new("Model").with_name("RefModel"));
+                    self.game.doc.insert(m, InstanceBuilder::new("Part").with_name("Part").with_property("CFrame", at(0.0, 10.0, 0.0)));
                     m
                 }
             },
             "Script" => {
-                let sss = self.doc.find_child(root, "ServerScriptService")?;
+                let sss = self.game.doc.find_child(root, "ServerScriptService")?;
                 match named(self, sss, "RefScript") {
                     Some(r) => r,
-                    None => self.doc.insert(sss, InstanceBuilder::new("Script").with_name("RefScript")),
+                    None => self.game.doc.insert(sss, InstanceBuilder::new("Script").with_name("RefScript")),
                 }
             }
             "ScreenGui" => {
-                let sg = self.doc.find_child(root, "StarterGui")?;
+                let sg = self.game.doc.find_child(root, "StarterGui")?;
                 match named(self, sg, "RefGui") {
                     Some(r) => r,
-                    None => self.doc.insert(sg, InstanceBuilder::new("ScreenGui").with_name("RefGui")),
+                    None => self.game.doc.insert(sg, InstanceBuilder::new("ScreenGui").with_name("RefGui")),
                 }
             }
-            _ => self.doc.find_child(root, "Lighting")?,
+            _ => self.game.doc.find_child(root, "Lighting")?,
         })
     }
 
@@ -198,32 +198,32 @@ impl Editor {
             return;
         };
         ctx.request_repaint();
-        if self.frame_no < 30 || s.done {
+        if self.game.frame_no < 30 || s.done {
             self.harness.ui_shots = Some(s);
             return;
         }
         let Some((name, show)) = s.shots.get(s.i) else {
             let _ = std::fs::write(s.dir.join("rects.json"), serde_json::to_string_pretty(&s.rects).unwrap_or_default());
             s.done = true;
-            if s.view_baseline.is_some() { self.doc.mark_saved_at(self.doc.revision); }
+            if s.view_baseline.is_some() { self.game.doc.mark_saved_at(self.game.doc.revision); }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             self.harness.ui_shots = Some(s);
             return;
         };
         let name = name.clone();
         if matches!(show,Show::LiveCollaborators | Show::LiveDraft) && self.live_team_create_place().is_none() {
-            if self.harness.started.elapsed().as_secs()>120 {self.error("Live UI capture could not join the test place");ctx.send_viewport_cmd(egui::ViewportCommand::Close);}
+            if self.harness.run.started.elapsed().as_secs()>120 {self.error("Live UI capture could not join the test place");ctx.send_viewport_cmd(egui::ViewportCommand::Close);}
             self.harness.ui_shots=Some(s);return;
         }
 
-        if matches!(show, Show::View(_, _)) && s.t == 5 && self.cam.view_transition.is_some() {
+        if matches!(show, Show::View(_, _)) && s.t == 5 && self.game.cam.view_transition.is_some() {
             ctx.request_repaint();
             self.harness.ui_shots = Some(s);
             return;
         }
         // Plugin shots wait (up to a minute) for the toolbars, their icons,
         // and an open popup.
-        if s.t == 7 && self.harness.started.elapsed().as_secs() < 60 {
+        if s.t == 7 && self.harness.run.started.elapsed().as_secs() < 60 {
             let ready = match show {
                 Show::PluginsTab | Show::PluginTip => {
                     !self.plugin_bar.model.groups.is_empty() && !self.plugin_bar.icons.busy()
@@ -240,15 +240,15 @@ impl Editor {
         let click_at = |key: &str, ed: &Editor| ed.ui_rects.get(key).map(|r| r.center());
         match (s.t, show) {
             (0, Show::View(_, direction)) => {
-                self.cam.select_view((*direction + if direction.y.abs() > 0.9 { glam::Vec3::Z * 0.3 } else { glam::Vec3::Y * 0.3 }).normalize());
+                self.game.cam.select_view((*direction + if direction.y.abs() > 0.9 { glam::Vec3::Z * 0.3 } else { glam::Vec3::Y * 0.3 }).normalize());
                 let target = self.ui_shots_reference("Part");
                 self.select(target.into_iter().collect());
-                s.view_baseline = Some((self.cam.clone(), self.doc.selection.clone()));
+                s.view_baseline = Some((self.game.cam.clone(), self.game.doc.selection.clone()));
             }
             (2 | 3, Show::View(label, _)) => {
                 let key = format!("view.{label}");
                 let r = *self.ui_rects.get(key.as_str()).expect("selector must be laid out");
-                assert!(self.viewport_rect.contains_rect(r), "selector outside viewport");
+                assert!(self.game.viewport_rect.contains_rect(r), "selector outside viewport");
                 assert!(r.width() >= 20.0 && r.height() >= 20.0);
                 let p = r.center();
                 s.queue.push(Event::PointerMoved(p));
@@ -257,30 +257,30 @@ impl Editor {
             }
             (5, Show::View(label, direction)) => {
                 let (before, selection) = s.view_baseline.as_ref().unwrap();
-                assert_eq!(&self.doc.selection, selection, "selector leaked selection");
+                assert_eq!(&self.game.doc.selection, selection, "selector leaked selection");
                 assert!(self.drag.is_none() && self.marquee.is_none(), "selector leaked drag");
-                assert_eq!(self.cam.focus, before.focus);
-                assert!((self.cam.pos.distance(self.cam.focus) - before.pos.distance(before.focus)).abs() < 1e-4);
-                assert!((self.cam.forward() + *direction).length() < 1e-5);
-                assert!(self.cam.view().is_finite());
-                assert_eq!(self.cam.fov_deg, before.fov_deg);
+                assert_eq!(self.game.cam.focus, before.focus);
+                assert!((self.game.cam.pos.distance(self.game.cam.focus) - before.pos.distance(before.focus)).abs() < 1e-4);
+                assert!((self.game.cam.forward() + *direction).length() < 1e-5);
+                assert!(self.game.cam.view().is_finite());
+                assert_eq!(self.game.cam.fov_deg, before.fov_deg);
                 std::fs::write(s.dir.join(format!("view-{label}.validation.json")),
                     serde_json::to_vec_pretty(&serde_json::json!({
                         "view": label, "selection_preserved": true, "no_drag_or_marquee": true,
-                        "focus": self.cam.focus.to_array(), "distance": self.cam.pos.distance(self.cam.focus),
-                        "forward": self.cam.forward().to_array(), "lens_preserved": true,
+                        "focus": self.game.cam.focus.to_array(), "distance": self.game.cam.pos.distance(self.game.cam.focus),
+                        "forward": self.game.cam.forward().to_array(), "lens_preserved": true,
                         "button_inside_viewport": true
                     })).unwrap()).expect("write view validation");
-                s.queue.push(Event::PointerMoved(self.viewport_rect.center()));
-                eprintln!("VIEW VALIDATED {label}: selection preserved, no drag/marquee, focus {:?}, distance {}, forward {:?}", self.cam.focus, self.cam.pos.distance(self.cam.focus), self.cam.forward());
+                s.queue.push(Event::PointerMoved(self.game.viewport_rect.center()));
+                eprintln!("VIEW VALIDATED {label}: selection preserved, no drag/marquee, focus {:?}, distance {}, forward {:?}", self.game.cam.focus, self.game.cam.pos.distance(self.game.cam.focus), self.game.cam.forward());
             }
             (0,Show::LiveCollaborators)=>self.cloud.live_collaborators_open=true,
             (0,Show::LiveDraft)=>{
                 self.cloud.live_collaborators_open=false;
-                let reference=self.doc.dom.descendants().find(|i|i.class.as_str()=="ModuleScript" && i.name=="rustudio_script_probe" && self.doc.dom.get_by_ref(i.parent()).is_some_and(|p|p.name=="rustudio_tc_test")).map(|i|i.referent());
+                let reference=self.game.doc.dom.descendants().find(|i|i.class.as_str()=="ModuleScript" && i.name=="rustudio_script_probe" && self.game.doc.dom.get_by_ref(i.parent()).is_some_and(|p|p.name=="rustudio_tc_test")).map(|i|i.referent());
                 if let Some(reference)=reference {
                     self.open_script.push(reference);
-                    self.doc.set_props("Test local script draft",vec![(reference,"Source".into(),rbx_dom_weak::types::Variant::String("-- rustudio private draft UI probe\nreturn 6\n".into()))],None);
+                    self.game.doc.set_props("Test local script draft",vec![(reference,"Source".into(),rbx_dom_weak::types::Variant::String("-- rustudio private draft UI probe\nreturn 6\n".into()))],None);
                 } else {self.error("The marked live script UI probe is unavailable");}
             }
 
@@ -300,12 +300,12 @@ impl Editor {
                     self.props.brick_popup = Some(crate::color_editors::BrickPopup {
                         prop: "BrickColor".into(),
                         origin: v.left_bottom() + egui::vec2(0.0, 1.0),
-                        opened_frame: self.frame_no,
+                        opened_frame: self.game.frame_no,
                         hovered: None,
                     });
                 }
                 "color" => {
-                    let rgb = match self.doc.selection.first().and_then(|r| self.doc.prop(*r, "Color")) {
+                    let rgb = match self.game.doc.selection.first().and_then(|r| self.game.doc.prop(*r, "Color")) {
                         Some(rbx_dom_weak::types::Variant::Color3uint8(c)) => [c.r, c.g, c.b],
                         _ => [163, 162, 165],
                     };
@@ -329,21 +329,21 @@ impl Editor {
                 }
             }
             (0, Show::OutputRun) => {
-                let root = self.doc.dom.root_ref();
-                if let Some(sss) = self.doc.find_child(root, "ServerScriptService") {
-                    self.doc.insert(
+                let root = self.game.doc.dom.root_ref();
+                if let Some(sss) = self.game.doc.find_child(root, "ServerScriptService") {
+                    self.game.doc.insert(
                         sss,
                         rbx_dom_weak::InstanceBuilder::new("Script")
                             .with_name("RefScript")
                             .with_property("Source", "print(\"hello from a script\")\nwarn(\"careful\")\nerror(\"boom\")\n".to_string()),
                     );
                 }
-                self.log.clear();
+                self.game.log.clear();
                 self.output_view.show_timestamp = true;
                 self.start_run(crate::studio_ui::RunType::Run);
-                self.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}'));
+                self.game.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}'));
             }
-            (5, Show::OutputRun) => self.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}')),
+            (5, Show::OutputRun) => self.game.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}')),
             (0, Show::Tab(t)) => self.ui.tab = *t,
             (0, Show::PluginsTab | Show::PluginPopup) => self.ui.tab = RibbonTab::Plugins,
             (0, Show::Shortcuts) => self.plugin_bar.shortcuts.open = true,
@@ -367,12 +367,12 @@ impl Editor {
                     self.terrain_action("generate");
                     self.poll_terrain_job(true);
                     self.terrain_ed.selection = Some(crate::terrain_editor::RegionBox::from_studs([0.0, 16.0, 0.0], [40.0, 32.0, 32.0]));
-                    self.cam.mode = crate::camera::CameraMode::Fly;
-                    self.cam.basis = None;
-                    self.cam.pos = glam::Vec3::new(50.0, 75.0, 90.0);
-                    self.cam.focus = glam::Vec3::ZERO;
-                    self.cam.yaw = 0.5;
-                    self.cam.pitch = -0.55;
+                    self.game.cam.mode = rustudio_render::camera::CameraMode::Fly;
+                    self.game.cam.basis = None;
+                    self.game.cam.pos = glam::Vec3::new(50.0, 75.0, 90.0);
+                    self.game.cam.focus = glam::Vec3::ZERO;
+                    self.game.cam.yaw = 0.5;
+                    self.game.cam.pitch = -0.55;
                 }
             }
             (0, Show::Click(k)) => {
@@ -438,8 +438,8 @@ impl Editor {
             s.queue.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
             s.queue.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE });
             if matches!(show,Show::LiveDraft) {
-                let reference=self.doc.dom.descendants().find(|i|i.class.as_str()=="ModuleScript" && i.name=="rustudio_script_probe" && self.doc.dom.get_by_ref(i.parent()).is_some_and(|p|p.name=="rustudio_tc_test")).map(|i|i.referent());
-                if let Some(reference)=reference {self.discard_live_draft(reference);self.doc.mark_saved_at(self.doc.revision);}
+                let reference=self.game.doc.dom.descendants().find(|i|i.class.as_str()=="ModuleScript" && i.name=="rustudio_script_probe" && self.game.doc.dom.get_by_ref(i.parent()).is_some_and(|p|p.name=="rustudio_tc_test")).map(|i|i.referent());
+                if let Some(reference)=reference {self.discard_live_draft(reference);self.game.doc.mark_saved_at(self.game.doc.revision);}
             }
             s.i += 1;
             s.t = 0;

@@ -80,7 +80,7 @@ fn hexagon(c: Pos2, r: f32) -> Vec<Pos2> {
 }
 
 fn rgb_of(n: u16) -> [u8; 3] {
-    BrickColor::from_number(n).map(crate::scene::brick_rgb).unwrap_or([163, 162, 165])
+    BrickColor::from_number(n).map(rustudio_render::scene::brick_rgb).unwrap_or([163, 162, 165])
 }
 
 pub struct BrickPopup {
@@ -368,7 +368,7 @@ pub fn color_dialog_ui(ctx: &egui::Context, d: &mut ColorDialog, custom: &mut [O
             p.rect_filled(title, 0.0, Color32::from_rgb(32, 34, 39));
             p.text(title.center(), egui::Align2::CENTER_CENTER, "Select Color", FontId::proportional(UI_FONT), TEXT);
             let close = Rect::from_center_size(Pos2::new(title.max.x - 14.0, title.center().y), Vec2::splat(16.0));
-            crate::ti::paint(&p, close, "x", TEXT);
+            rustudio_engine::ti::paint(&p, close, "x", TEXT);
             if ui.interact(close, ui.id().with("close"), Sense::click()).clicked() {
                 out = DialogOut::Cancel;
             }
@@ -541,8 +541,8 @@ fn spin_box(ui: &mut egui::Ui, rect: Rect, idx: usize, value: i32, max: i32, edi
     let arrows = Rect::from_min_max(Pos2::new(rect.max.x - 12.0, rect.min.y), rect.max);
     let up = Rect::from_min_max(arrows.min, Pos2::new(arrows.max.x, arrows.center().y));
     let down = Rect::from_min_max(Pos2::new(arrows.min.x, arrows.center().y), arrows.max);
-    crate::ti::paint(&p, Rect::from_center_size(up.center() + Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-up", TEXT);
-    crate::ti::paint(&p, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
+    rustudio_engine::ti::paint(&p, Rect::from_center_size(up.center() + Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-up", TEXT);
+    rustudio_engine::ti::paint(&p, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
     let mut out = None;
     if ui.interact(up, ui.id().with(("spin_up", idx)), Sense::click()).clicked() {
         out = Some(if idx == 0 { (value + 1).rem_euclid(360) } else { (value + 1).min(max) });

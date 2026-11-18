@@ -10,7 +10,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{key, SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 /// Reports the Animator's tracks once Animate's idle has loaded, then the
 /// walk after Humanoid:Move, plus a layered Action track at half weight.
@@ -127,11 +127,11 @@ impl SelfTest {
             );
             ed.set_document(doc);
             // The place's avatar setting decides (an earlier step picked R15).
-            ed.play_rig = None;
-            ed.start_play(crate::runtime::RunMode::Play);
+            ed.game.play_rig = None;
+            ed.start_play(rustudio_engine::runtime::RunMode::Play);
             self.r6 = super::R6Test {
                 started: f,
-                mark: ed.log.len(),
+                mark: ed.game.log.len(),
                 t0: Some(std::time::Instant::now()),
                 ..Default::default()
             };
@@ -140,7 +140,7 @@ impl SelfTest {
         }
         let r6 = phase == 79;
         let seen = |ed: &Editor, needle: &str| {
-            ed.log[self.r6.mark.min(ed.log.len())..]
+            ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                 .iter()
                 .any(|l| l.text.contains(needle))
         };
@@ -154,7 +154,7 @@ impl SelfTest {
             self.r6.notes.push("released".into());
         }
         let find = |needle: &str| {
-            ed.log[self.r6.mark.min(ed.log.len())..]
+            ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                 .iter()
                 .find(|l| l.text.contains(needle))
                 .map(|l| l.text.clone())
@@ -165,7 +165,7 @@ impl SelfTest {
         if line.is_none() && waited < 200 {
             return false;
         }
-        let installed = crate::default_scripts::studio_dir().is_some();
+        let installed = rustudio_core::default_scripts::studio_dir().is_some();
         let text = line.unwrap_or_else(|| "no report from the client".into());
         let field = |k: &str| {
             text.split_whitespace()
@@ -223,8 +223,8 @@ impl SelfTest {
 
 #[cfg(test)]
 mod semantics {
-    use crate::doc::Document;
-    use crate::runtime::{RunMode, Runtime, World};
+    use rustudio_core::doc::Document;
+    use rustudio_engine::runtime::{RunMode, World};
     use rbx_dom_weak::InstanceBuilder;
 
     // Registered assets keep this regression independent of network/cache state.
@@ -519,6 +519,9 @@ print('animation-semantics-pass')
     }
 
     fn run(source: &str) {
+        // (the engine's `__rs_…` internals are hidden in the shipped binary
+        // and in a non-test build of the engine crate; these scripts use them)
+        rustudio_engine::globals_parity::show_internals(true);
         let mut d = Document::new_place();
         // Native serialized fixture: scripts cannot assign BinaryString properties.
         let ws = d.find_child(d.dom.root_ref(), "Workspace").unwrap();
@@ -612,7 +615,7 @@ print('animation-semantics-pass')
                 .with_name("AnimationSemantics")
                 .with_property("Source", source.to_string()),
         );
-        let rt = Runtime::new().unwrap();
+        let rt = crate::studio_hooks::new_runtime().unwrap();
         rt.enter(World::new(d, RunMode::Run));
         rt.bind_globals().unwrap();
         rt.run_script(s);

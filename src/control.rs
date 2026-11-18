@@ -112,9 +112,9 @@ impl crate::app::Editor {
         let Some(mut c) = self.control.take() else { return };
         // Stay under the person's windows (sent twice: once the window is
         // mapped, and again a little later in case the first was early).
-        if c.lower_in > 0 && self.frame_no >= 1 {
+        if c.lower_in > 0 && self.game.frame_no >= 1 {
             c.lower_in -= 1;
-            if c.lower_in == 0 || self.frame_no == 1 {
+            if c.lower_in == 0 || self.game.frame_no == 1 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnBottom));
             }
         }
@@ -125,11 +125,11 @@ impl crate::app::Editor {
                 "camera" => {
                     let v: Vec<f32> = arg.split(',').filter_map(|s| s.trim().parse().ok()).collect();
                     if v.len() == 5 {
-                        self.cam.pos = glam::Vec3::new(v[0], v[1], v[2]);
-                        self.cam.yaw = v[3].to_radians();
-                        self.cam.pitch = v[4].to_radians();
-                        self.cam.focus = self.cam.pos + self.cam.forward() * 50.0;
-                        c.moved_at = self.frame_no;
+                        self.game.cam.pos = glam::Vec3::new(v[0], v[1], v[2]);
+                        self.game.cam.yaw = v[3].to_radians();
+                        self.game.cam.pitch = v[4].to_radians();
+                        self.game.cam.focus = self.game.cam.pos + self.game.cam.forward() * 50.0;
+                        c.moved_at = self.game.frame_no;
                         let _ = reply.send("ok".into());
                     } else {
                         let _ = reply.send("error camera wants X,Y,Z,YAW,PITCH".into());
@@ -138,8 +138,8 @@ impl crate::app::Editor {
                 "fov" => match arg.trim().parse::<f32>() {
                     // Vertical field of view in degrees (Camera.FieldOfView).
                     Ok(v) if v > 0.0 && v < 180.0 => {
-                        self.cam.fov_deg = v;
-                        c.moved_at = self.frame_no;
+                        self.game.cam.fov_deg = v;
+                        c.moved_at = self.game.frame_no;
                         let _ = reply.send("ok".into());
                     }
                     _ => {
@@ -177,11 +177,11 @@ impl crate::app::Editor {
         // fits (the panels around the view keep their size).
         if let Some(f) = c.fit.as_mut() {
             let ppp = ctx.pixels_per_point();
-            let r = self.viewport_rect;
+            let r = self.game.viewport_rect;
             // The size a shot will have (whole pixels, as `view_pixels` crops).
             let (_, _, vw, vh) = crate::app::view_pixels(r, ppp, [usize::MAX, usize::MAX]);
             let now = [vw as i64, vh as i64];
-            let waited = f.resized_at.map_or(true, |at| self.frame_no >= at + FIT_FRAMES);
+            let waited = f.resized_at.map_or(true, |at| self.game.frame_no >= at + FIT_FRAMES);
             if waited && r.is_positive() {
                 let off = [f.size[0] - now[0], f.size[1] - now[1]];
                 let inner = ctx.input(|i| i.viewport().inner_rect);
@@ -198,32 +198,32 @@ impl crate::app::Editor {
                 } else if let Some(inner) = inner {
                     let size = inner.size() + egui::vec2(off[0] as f32, off[1] as f32) / ppp;
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                    f.resized_at = Some(self.frame_no);
+                    f.resized_at = Some(self.game.frame_no);
                     f.tries += 1;
                 }
             }
         }
         if let Some(s) = c.shot.as_mut() {
             if !s.requested {
-                let settled = self.frame_no >= c.moved_at + SETTLE_FRAMES
-                    && self.viewport_rect.is_positive()
+                let settled = self.game.frame_no >= c.moved_at + SETTLE_FRAMES
+                    && self.game.viewport_rect.is_positive()
                     && !self.place_loading()
-                    && self.draw_cache.waiting.is_empty()
-                    && crate::assets::content_queue_size() == 0
-                    && !self.assets.busy()
-                    && !self.textures.decoding();
+                    && self.game.draw_cache.waiting.is_empty()
+                    && rustudio_core::assets::content_queue_size() == 0
+                    && !self.game.assets.busy()
+                    && !self.game.textures.decoding();
                 if std::env::var_os("RUSTUDIO_CONTROL_DEBUG").is_some() {
                     eprintln!(
                         "[control] {:.2}s frame {} moved {} view {} loading {} waiting {} queue {} assets {} decoding {}",
                         s.asked.elapsed().as_secs_f32(),
-                        self.frame_no,
+                        self.game.frame_no,
                         c.moved_at,
-                        self.viewport_rect.is_positive(),
+                        self.game.viewport_rect.is_positive(),
                         self.place_loading(),
-                        self.draw_cache.waiting.len(),
-                        crate::assets::content_queue_size(),
-                        self.assets.busy(),
-                        self.textures.decoding()
+                        self.game.draw_cache.waiting.len(),
+                        rustudio_core::assets::content_queue_size(),
+                        self.game.assets.busy(),
+                        self.game.textures.decoding()
                     );
                 }
                 if settled || s.asked.elapsed() > SHOT_TIMEOUT {
@@ -233,10 +233,10 @@ impl crate::app::Editor {
                     // renderer (this tick runs after the view is drawn): no
                     // window screenshot, which took two or three more frames.
                     let t_read = Instant::now();
-                    let direct = self
+                    let direct = self.game
                         .renderer
                         .as_ref()
-                        .zip(self.render_state.as_ref())
+                        .zip(self.game.render_state.as_ref())
                         .and_then(|(r, rs)| r.read_frame(rs));
                     if std::env::var_os("RUSTUDIO_CONTROL_DEBUG").is_some() {
                         eprintln!(
@@ -276,7 +276,7 @@ impl crate::app::Editor {
             })) {
                 let s = c.shot.take().expect("pending shot");
                 let ppp = ctx.pixels_per_point();
-                let (x0, y0, w, h) = crate::app::view_pixels(self.viewport_rect, ppp, image.size);
+                let (x0, y0, w, h) = crate::app::view_pixels(self.game.viewport_rect, ppp, image.size);
                 let pixels = (0..h)
                     .flat_map(|y| (0..w).map(move |x| (x, y)))
                     .map(|(x, y)| image.pixels[(y0 + y) * image.size[0] + x0 + x])

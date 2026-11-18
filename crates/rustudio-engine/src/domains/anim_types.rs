@@ -12,7 +12,7 @@ use glam::{Mat3, Vec3};
 use mlua::{Lua, MetaMethod, UserData, UserDataFields, UserDataMethods, Value};
 
 use crate::ltypes::{enum_arg, enum_value, rt_err, LCFrame, LEnumItem};
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 /// Studio's `%.9g` number text ("0.540302336", "5.96046448e-08").
 pub fn g9(x: f64) -> String {

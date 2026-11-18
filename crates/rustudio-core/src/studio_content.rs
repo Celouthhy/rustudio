@@ -80,9 +80,23 @@ fn post(err: bool, t: String) {
 /// background and report to Output.
 pub fn spawn_background_install_if_missing() {
     fetch_classic_oof_once();
-    if std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some()
-        || crate::default_scripts::studio_dir().is_some()
-    {
+    if std::env::var_os("RUSTUDIO_NO_STUDIO_FETCH").is_some() {
+        return;
+    }
+    if let Some(root) = crate::default_scripts::studio_dir() {
+        // Upgrade older rustudio downloads without replacing the rest of their content.
+        if root == install_dir() && !has_view_selector(&root) {
+            if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
+                if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
+                    let version = version.to_owned();
+                    let _ = std::thread::Builder::new().name("studio-view-selector".into()).spawn(move || {
+                        if let Err(e) = install_view_selector(&agent(), &version, &root) {
+                            post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                        }
+                    });
+                }
+            }
+        }
         return;
     }
     let _ = std::thread::Builder::new().name("studio-content".into()).spawn(|| {
@@ -170,19 +184,56 @@ pub fn fetch_classic_oof_once() {
     });
 }
 
+fn studio_version(version: &str) -> Option<&str> {
+    version.strip_prefix("version-")
+        .filter(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|_| version)
+}
+
+fn has_view_selector(root: &Path) -> bool {
+    root.join("StudioContent/models/ViewSelector/Basic.mesh").is_file()
+        && ["back", "bottom", "front", "left", "right", "top"].iter().all(|face| {
+            ["", "_hover"].iter().all(|suffix| {
+                root.join(format!("StudioContent/textures/ViewSelector/{face}{suffix}.png")).is_file()
+            })
+        })
+}
+
+fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+    // Publish the body last so the renderer can pick up the complete cube.
+    for kind in ["textures", "models"] {
+        let url = format!("{CDN}/{version}-studiocontent-{kind}.zip");
+        let bytes = get(agent, &url, None)?;
+        let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
+        for entry in &zip.entries {
+            let Some((dir, file)) = entry.name.split_once(['\\', '/']) else { continue };
+            if dir != "ViewSelector" || file.is_empty() || file.contains(['\\', '/']) {
+                continue;
+            }
+            let data = zip.read(&bytes, entry).map_err(|e| format!("{url} {}: {e}", entry.name))?;
+            write_file(&root.join("StudioContent").join(kind), &entry.name, &data)?;
+        }
+    }
+    has_view_selector(root).then_some(()).ok_or_else(|| "Studio packages are missing View Selector files".into())
+}
+
 pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     let agent = agent();
     let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)
         .map_err(|e| format!("version answer: {e}"))?;
     let version = v["clientVersionUpload"]
         .as_str()
-        .filter(|s| s.starts_with("version-") && s[8..].chars().all(|c| c.is_ascii_alphanumeric()))
+        .and_then(studio_version)
         .ok_or("version answer has no clientVersionUpload")?
         .to_string();
     progress(&format!("Studio {} ({version})", v["version"].as_str().unwrap_or("?")));
 
     let dest = install_dir();
     if std::fs::read_to_string(dest.join(MARKER)).is_ok_and(|s| s.trim() == format!("{version} {CONTENT_REVISION}")) {
+        if !has_view_selector(&dest) {
+            progress("downloading Studio View Selector");
+            install_view_selector(&agent, &version, &dest)?;
+        }
         progress("already installed");
         return Ok(version);
     }
@@ -208,7 +259,7 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
         // Studio resolves retired rbxasset paths through LegacyContentTable,
         // not another deployment zip. Materialize its missing textures too so
         // a downloaded content tree is usable by file-based consumers.
-        for line in include_str!("../assets/legacy-content.tsv").lines() {
+        for line in include_str!("../../../assets/legacy-content.tsv").lines() {
             let Some((path, id)) = line.split_once('\t') else { continue };
             if !path.starts_with("textures/") || partial.join("content").join(path).is_file() {
                 continue;
@@ -222,6 +273,8 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
                 Err(e) => progress(&format!("legacy {path} unavailable: {e}")),
             }
         }
+        progress("downloading Studio View Selector");
+        install_view_selector(&agent, &version, &partial)?;
         for (pkg, file) in SINGLE_FILES {
             progress(&format!("fetching {file} from {pkg}"));
             let url = format!("{CDN}/{version}-{pkg}");

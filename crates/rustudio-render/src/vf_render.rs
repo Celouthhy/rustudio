@@ -25,7 +25,7 @@ use super::{
     draw_key, pass_of, radius_of, shows, sphere_visible, frustum, to_raw, transparent_order, Globals,
     InstanceRaw, Pass, Renderer, TexMode, DEPTH_FORMAT, HDR_FORMAT, SAMPLES,
 };
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 /// What a ViewportFrame shows, as the GUI walk read it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -288,7 +288,7 @@ impl Renderer {
                 continue;
             }
             t.drawn = Some((*req, gen));
-            let _s = crate::bench::scope("vf_draw");
+            let _s = rustudio_core::bench::scope("vf_draw");
             self.vf.drawn += 1;
             self.draw_vf(rs, vf, req, size, base, &glass_bg);
         }
@@ -353,8 +353,8 @@ impl Renderer {
         let fov = req.fov_y.clamp(1e-3, 3.1);
         let view = Mat4::look_to_rh(req.cam.pos, -req.cam.rot.z_axis, req.cam.rot.y_axis);
         let view_rel = Mat4::look_to_rh(Vec3::ZERO, -req.cam.rot.z_axis, req.cam.rot.y_axis);
-        let reverse = Mat4::perspective_infinite_reverse_rh(fov, aspect, crate::mech::NEAR);
-        let ordinary = Mat4::perspective_rh(fov, aspect, crate::mech::NEAR, crate::mech::FAR);
+        let reverse = Mat4::perspective_infinite_reverse_rh(fov, aspect, rustudio_core::mech::NEAR);
+        let ordinary = Mat4::perspective_rh(fov, aspect, rustudio_core::mech::NEAR, rustudio_core::mech::FAR);
         let mut g = base;
         g.view_proj = (reverse * view).to_cols_array_2d();
         g.inv_view_proj = (ordinary.as_dmat4() * view_rel.as_dmat4()).inverse().as_mat4().to_cols_array_2d();
@@ -383,7 +383,7 @@ impl Renderer {
         let mut decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut surface_decals: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
         let mut blended: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
-        let gather = crate::bench::scope("vf_gather");
+        let gather = rustudio_core::bench::scope("vf_gather");
         for preps in self.vf.items.get(&vf).into_iter().flat_map(|m| m.values()) {
             for p in preps {
                 if !sphere_visible(&planes, p.pos, p.radius) {
@@ -398,7 +398,7 @@ impl Renderer {
             }
         }
         drop(gather);
-        let sort = crate::bench::scope("vf_sort");
+        let sort = rustudio_core::bench::scope("vf_sort");
         opaque.sort_unstable_by_key(|e| e.0);
         decal.sort_unstable_by_key(|e| e.0);
         // Back to front (glass with the rest: no scene behind it to bend).
@@ -412,7 +412,7 @@ impl Renderer {
             .chain(blended.iter().map(|e| e.2))
             .collect();
         drop(sort);
-        let _up = crate::bench::scope("vf_upload");
+        let _up = rustudio_core::bench::scope("vf_upload");
         let t = self.vf.targets.get_mut(&vf).unwrap();
         if raw.len() > t.inst_cap {
             t.inst_cap = raw.len().next_power_of_two();

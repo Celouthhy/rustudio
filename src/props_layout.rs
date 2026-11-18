@@ -24,7 +24,7 @@ const CATEGORY_ORDER: &[&str] = &[
 
 /// Left out of Studio's panel although its data lists them (captured).
 fn left_out(class: &str, prop: &str) -> bool {
-    let is = |b: &str| crate::doc::is_a(class, b);
+    let is = |b: &str| rustudio_core::doc::is_a(class, b);
     matches!(prop, "PredictionMode" | "Capabilities" | "Sandboxed" | "ExtendLightRangeTo120" | "ExtentsCFrame" | "ExtentsSize" | "Pivot Offset")
         || (prop == "Rotation" && is("BasePart"))
         || (prop == "Disabled" && is("BaseScript"))
@@ -93,7 +93,7 @@ fn browsable(chain: &[String], prop: &str) -> bool {
 /// The panel's categories and rows for `class` (`can_collide`: whether the
 /// selected part has CanCollide on, which hides CanQuery).
 pub fn rows(class: &str, can_collide: bool) -> Vec<Category> {
-    let Some(api) = crate::api::get() else {
+    let Some(api) = rustudio_core::api::get() else {
         return Vec::new();
     };
     let mut chain: Vec<String> = Vec::new();
@@ -103,13 +103,13 @@ pub fn rows(class: &str, can_collide: bool) -> Vec<Category> {
         chain.push(c);
         cur = next;
     }
-    let is = |b: &str| crate::doc::is_a(class, b);
+    let is = |b: &str| rustudio_core::doc::is_a(class, b);
     let mut found: Vec<(String, String, Option<i32>, bool)> = Vec::new();
     for c in &chain {
         let Some(k) = api.classes.get(c) else { continue };
         for name in &k.order {
             let m = &k.members[name];
-            if m.kind != crate::api::Kind::Property || found.iter().any(|f| f.1 == *name) {
+            if m.kind != rustudio_core::api::Kind::Property || found.iter().any(|f| f.1 == *name) {
                 continue;
             }
             let shown_security = matches!(m.security.as_str(), "None" | "PluginSecurity") || name == "UniqueId";

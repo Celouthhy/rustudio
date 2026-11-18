@@ -43,9 +43,9 @@ use mlua::{Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::util::*;
-use crate::doc;
+use rustudio_core::doc;
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -416,7 +416,7 @@ fn skateboards(lua: &Lua) -> mlua::Result<()> {
                 w.fire(b, "equipped", args);
             }
             None => world(lua)?.output.push((
-                crate::app::Level::Error,
+                rustudio_core::log::Level::Error,
                 "Error mounting skateboard platform. Both Humanoid and SkateboardPlatform must be direct children of a Model".into(),
             )),
         }

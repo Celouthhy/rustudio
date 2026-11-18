@@ -191,7 +191,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         Ok((c, _)) => c.to_string(),
         Err(_) => return None,
     };
-    if !mine(&class) && !crate::doc::is_a(&class, "PluginGui") {
+    if !mine(&class) && !rustudio_core::doc::is_a(&class, "PluginGui") {
         return None;
     }
     if let Some(r) = service::call(lua, &class, name, this, args) {
@@ -204,7 +204,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
 }
 
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
-    if !mine(class) && !crate::doc::is_a(class, "PluginGui") {
+    if !mine(class) && !rustudio_core::doc::is_a(class, "PluginGui") {
         return Ok(None);
     }
     if let Some(v) = service::prop_get(lua, r, class, key)? {
@@ -217,7 +217,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
 }
 
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
-    if !mine(class) && !crate::doc::is_a(class, "PluginGui") {
+    if !mine(class) && !rustudio_core::doc::is_a(class, "PluginGui") {
         return Ok(false);
     }
     if service::newindex(lua, r, class, key, value)? {

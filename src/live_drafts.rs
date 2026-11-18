@@ -27,7 +27,7 @@ pub struct DraftStore {
 
 impl DraftStore {
     pub fn for_place(place: u64) -> Self {
-        let base = crate::paths::state();
+        let base = rustudio_core::paths::state();
         Self::new(base.join("rustudio/script-drafts").join(place.to_string()))
     }
     fn new(root: PathBuf) -> Self {

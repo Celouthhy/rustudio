@@ -1,6 +1,6 @@
 //! Dragging parts in the 3D view with the Select (or Move) tool: Studio's
 //! freeform drag, ported from its DraggerFramework (SelectDragger.rbxm,
-//! Luau bytecode; MECHANICS.md "Freeform drag parity") and checked against
+//! Luau bytecode; docs/MECHANICS.md "Freeform drag parity") and checked against
 //! 26 drags measured in an offline Studio (the `studio_*` tests below).
 //!
 //! - pressing on a part and dragging moves the selection; an unselected part
@@ -34,8 +34,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
-use crate::math::{Ray, Xform};
-use crate::render::MeshKind;
+use rustudio_core::math::{Ray, Xform};
+use rustudio_render::render::MeshKind;
 
 #[derive(Clone)]
 pub struct PartDrag {
@@ -543,7 +543,7 @@ impl FreeDrag {
         let (mut sx, mut sz) = (None, None);
         if let (Some((cpos, cfwd, fov)), Some(ts)) = (opts.soft, tsize) {
             let centre = l + rt * (self.bbox.offset - self.dragged);
-            let thr = 0.02 * fov.to_radians().sin() * (hit - cpos).dot(cfwd) * crate::studio_settings::studio("DraggerSoftSnapMarginFactor", crate::mech::SOFT_SNAP_MARGIN as f64) as f32;
+            let thr = 0.02 * fov.to_radians().sin() * (hit - cpos).dot(cfwd) * crate::studio_settings::studio("DraggerSoftSnapMarginFactor", rustudio_core::mech::SOFT_SNAP_MARGIN as f64) as f32;
             let sgn = |v: f32| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
             let (dx, _) = soft_snap_interval(centre.x, size.x * 0.5, sgn(l.x) * 0.5 * ts.x, ts.x * 0.5);
             if dx.abs() < thr {
@@ -689,7 +689,7 @@ impl XformMul for Xform {
 // ------------------------------------------------------------- editor
 
 impl Editor {
-    pub(crate) fn solid_of(&self, sp: &crate::scene::ScenePart) -> Solid {
+    pub(crate) fn solid_of(&self, sp: &rustudio_render::scene::ScenePart) -> Solid {
         Solid { xf: sp.xf, size: sp.size, kind: sp.draw.mesh }
     }
 
@@ -697,7 +697,7 @@ impl Editor {
     /// dragger's raycast: transparent parts count, CanQuery off doesn't).
     fn drag_hit(&self, ray: &Ray, carried: &HashSet<Ref>) -> Option<(Vec3, Vec3, Solid)> {
         let mut best: Option<(f32, Vec3, Solid)> = None;
-        for (sp, b) in self.scene.parts.iter().zip(&self.scene.bounds) {
+        for (sp, b) in self.game.scene.parts.iter().zip(&self.game.scene.bounds) {
             let oc = b.truncate() - ray.origin;
             let along = oc.dot(ray.dir);
             if oc.length_squared() - along * along > b.w * b.w || along < -b.w {
@@ -711,7 +711,7 @@ impl Editor {
             if best.as_ref().is_some_and(|(bt, _, _)| t >= *bt) {
                 continue;
             }
-            if matches!(self.doc.prop(sp.r, "CanQuery"), Some(Variant::Bool(false))) {
+            if matches!(self.game.doc.prop(sp.r, "CanQuery"), Some(Variant::Bool(false))) {
                 continue;
             }
             best = Some((t, n, solid));
@@ -720,7 +720,7 @@ impl Editor {
     }
 
     fn drag_grid(&self) -> Option<f32> {
-        (self.snap_move && self.move_inc > 0.0).then_some(self.move_inc)
+        (self.game.snap_move && self.game.move_inc > 0.0).then_some(self.game.move_inc)
     }
 
     /// The free drag's settings this frame: Shift turns grid and part
@@ -729,18 +729,18 @@ impl Editor {
         DragOpts {
             grid: if shift { None } else { self.drag_grid() },
             align: self.align_dragged && !alt,
-            soft: (self.part_snap && !shift).then(|| (self.cam.pos, self.cam.forward(), self.cam.fov_deg)),
+            soft: (self.part_snap && !shift).then(|| (self.game.cam.pos, self.game.cam.forward(), self.game.cam.fov_deg)),
         }
     }
 
     /// The pivot a selectable object turns about (Model:GetPivot / the
     /// part's CFrame * PivotOffset).
     pub(crate) fn object_pivot(&self, r: Ref) -> Option<Xform> {
-        if let Some(p) = editor_model_pivot(&self.doc, r) {
+        if let Some(p) = editor_model_pivot(&self.game.doc, r) {
             return Some(p);
         }
-        let sp = self.scene.get(r)?;
-        Some(match self.doc.prop(r, "PivotOffset") {
+        let sp = self.game.scene.get(r)?;
+        Some(match self.game.doc.prop(r, "PivotOffset") {
             Some(Variant::CFrame(cf)) => sp.xf.mul(&Xform::from_cframe(&cf)),
             _ => sp.xf,
         })
@@ -753,20 +753,20 @@ impl Editor {
             return false;
         };
         let target = self.pick(rect, p, false).unwrap_or(raw);
-        if !self.doc.selection.contains(&target) {
+        if !self.game.doc.selection.contains(&target) {
             if add {
-                let mut sel = self.doc.selection.clone();
+                let mut sel = self.game.doc.selection.clone();
                 sel.push(target);
                 self.select(sel);
             } else {
                 self.select(vec![target]);
             }
         }
-        let Some(gp) = self.scene.get(raw) else {
+        let Some(gp) = self.game.scene.get(raw) else {
             return false;
         };
         let clicked = self.solid_of(gp);
-        let ray = self.cam.ray(rect, p);
+        let ray = self.game.cam.ray(rect, p);
         let (t, n) = clicked
             .raycast(&ray)
             .or_else(|| ray.hit_obb(&clicked.xf, clicked.size).map(|t| (t, Vec3::Y)))
@@ -775,25 +775,25 @@ impl Editor {
         let parts: Vec<(Ref, Xform)> = self
             .selected_parts()
             .into_iter()
-            .filter(|r| !matches!(self.doc.prop(*r, "Locked"), Some(Variant::Bool(true))))
-            .filter_map(|r| self.scene.get(r).map(|sp| (r, sp.xf)))
+            .filter(|r| !matches!(self.game.doc.prop(*r, "Locked"), Some(Variant::Bool(true))))
+            .filter_map(|r| self.game.scene.get(r).map(|sp| (r, sp.xf)))
             .collect();
         if parts.is_empty() {
             return false;
         }
         // The box's basis: the only selected object's pivot, or with several
         // the grabbed one's (SelectionInfo.computeInfo, measured in Studio).
-        let objects: Vec<Ref> = self
+        let objects: Vec<Ref> = self.game
             .doc
-            .top_level(&self.doc.selection.clone())
+            .top_level(&self.game.doc.selection.clone())
             .into_iter()
-            .filter(|r| self.scene.get(*r).is_some() || self.doc.class_of(*r).is_some_and(|c| c == "Model"))
+            .filter(|r| self.game.scene.get(*r).is_some() || self.game.doc.class_of(*r).is_some_and(|c| c == "Model"))
             .collect();
         let basis_object = if objects.len() == 1 { objects[0] } else { target };
         let basis = self.object_pivot(basis_object).unwrap_or(clicked.xf);
         let boxes: Vec<(Xform, Vec3)> = parts
             .iter()
-            .filter_map(|(r, xf)| self.scene.get(*r).map(|sp| (*xf, sp.size)))
+            .filter_map(|(r, xf)| self.game.scene.get(*r).map(|sp| (*xf, sp.size)))
             .collect();
         let bbox = DragBox::new(basis, &boxes, objects.len());
         let face = if self.use_bounding_boxes {
@@ -803,12 +803,12 @@ impl Editor {
         };
         let free = FreeDrag::begin(bbox, click, Some(face), self.drag_grid(), self.use_bounding_boxes);
         let physical = self.physical_drag.then(|| self.phys_drag_begin(&parts, free.bbox.basis.apply(free.dragged)));
-        let originals = parts.iter().filter_map(|(r, _)| Some((*r, self.doc.prop(*r, "CFrame")?))).collect();
+        let originals = parts.iter().filter_map(|(r, _)| Some((*r, self.game.doc.prop(*r, "CFrame")?))).collect();
         let carried = parts.iter().map(|(r, _)| *r).collect();
         self.part_drag = Some(PartDrag {
             undo_parts: None,
             undo_pivots: None,
-            pivots: selected_model_pivots(&self.doc),
+            pivots: selected_model_pivots(&self.game.doc),
             grabbed: raw,
             free,
             parts,
@@ -828,7 +828,7 @@ impl Editor {
         let Some(d) = self.part_drag.as_ref() else {
             return;
         };
-        let ray = self.cam.ray(rect, p);
+        let ray = self.game.cam.ray(rect, p);
         if d.physical.is_some() {
             self.update_phys_drag(&ray);
             if let Some(d) = self.part_drag.as_mut() {
@@ -856,9 +856,9 @@ impl Editor {
             .zip(&d.parts)
             .any(|((_, a), (_, b))| (a.pos - b.pos).length() > 1e-4 || !a.rot.abs_diff_eq(b.rot, 1e-6));
         let pivots = d.pivots.clone();
-        apply_model_pivots(&mut self.doc, &pivots, t);
+        apply_model_pivots(&mut self.game.doc, &pivots, t);
         for (r, xf) in moves {
-            self.doc
+            self.game.doc
                 .set_prop_live(r, ustr("CFrame"), Variant::CFrame(xf.to_cframe()));
         }
         if let Some(d) = self.part_drag.as_mut() {
@@ -878,10 +878,10 @@ impl Editor {
             return;
         }
         let Some((rect, p)) = d.last else { return };
-        let ray = self.cam.ray(rect, p);
+        let ray = self.game.cam.ray(rect, p);
         let hit = self.drag_hit(&ray, &d.carried);
         let m = d.free.surface(&ray, hit).map(|s| s.m);
-        let axis = if tilt { Some(self.cam.right()) } else { m.map(|m| m.rot.col(1)) };
+        let axis = if tilt { Some(self.game.cam.right()) } else { m.map(|m| m.rot.col(1)) };
         let Some(axis) = axis else { return };
         let align = self.drag_opts(d.shift, d.alt).align;
         if let Some(d) = self.part_drag.as_mut() {
@@ -894,11 +894,11 @@ impl Editor {
     /// Ctrl+R (RotateSelectionAction) / Ctrl+T (TiltSelectionAction):
     /// a quarter turn of every selected part about the centre of their
     /// bounding box, measured in the last part's frame. One undo step,
-    /// "SelectionRotate" / "SelectionTilt" (MECHANICS.md "Ctrl+R / Ctrl+T").
+    /// "SelectionRotate" / "SelectionTilt" (docs/MECHANICS.md "Ctrl+R / Ctrl+T").
     pub fn rotate_selection(&mut self, tilt: bool) {
         let parts = self.selected_parts();
-        let m = if tilt { tilt_matrix(self.cam.forward()) } else { ROTATE_MATRIX };
-        quarter_turn_selection(&mut self.doc, &parts, m, tilt);
+        let m = if tilt { tilt_matrix(self.game.cam.forward()) } else { ROTATE_MATRIX };
+        quarter_turn_selection(&mut self.game.doc, &parts, m, tilt);
     }
 
     pub(crate) fn duplicate_part_drag(&mut self, map: &std::collections::HashMap<Ref, Ref>) {
@@ -907,11 +907,11 @@ impl Editor {
             if let Some(copy) = map.get(r) { *r = *copy; true } else { false }
         });
         d.pivots.retain_mut(|p| { if let Some(copy) = map.get(&p.r) { p.r = *copy; true } else { false } });
-        d.undo_pivots = Some(pivot_undo_baseline(&self.doc, &d.pivots));
+        d.undo_pivots = Some(pivot_undo_baseline(&self.game.doc, &d.pivots));
         d.grabbed = map.get(&d.grabbed).copied().unwrap_or(d.grabbed);
         d.carried = d.parts.iter().map(|(r, _)| *r).collect();
         d.undo_parts = Some(d.parts.iter().filter_map(|(r, _)| {
-            let Variant::CFrame(cf) = self.doc.dom.get_by_ref(*r)?.properties.get(&ustr("CFrame"))? else { return None };
+            let Variant::CFrame(cf) = self.game.doc.dom.get_by_ref(*r)?.properties.get(&ustr("CFrame"))? else { return None };
             Some((*r, Xform::from_cframe(cf)))
         }).collect());
         d.moved = false;
@@ -930,7 +930,7 @@ impl Editor {
             .undo_parts.as_ref().unwrap_or(&d.parts)
             .iter()
             .filter_map(|(r, xf)| {
-                let new = self
+                let new = self.game
                     .doc
                     .dom
                     .get_by_ref(*r)?
@@ -945,7 +945,7 @@ impl Editor {
                 Some((*r, ustr("CFrame"), Some(old), new))
             })
             .collect();
-        changes.extend(pivot_changes(&self.doc, d.undo_pivots.as_ref().unwrap_or(&d.pivots)));
+        changes.extend(pivot_changes(&self.game.doc, d.undo_pivots.as_ref().unwrap_or(&d.pivots)));
         // A physical drag also moved what's joined to the selection; and it
         // makes no surface joints (only _updateGeometric computes JointPairs).
         if let Some(ph) = &d.physical {
@@ -953,14 +953,14 @@ impl Editor {
                 if d.parts.iter().any(|(p, _)| p == r) {
                     continue;
                 }
-                if let Some(new) = self.doc.dom.get_by_ref(*r).and_then(|i| i.properties.get(&ustr("CFrame")).cloned()) {
+                if let Some(new) = self.game.doc.dom.get_by_ref(*r).and_then(|i| i.properties.get(&ustr("CFrame")).cloned()) {
                     changes.push((*r, ustr("CFrame"), Some(old.clone()), new));
                 }
             }
         }
         let carried: Vec<Ref> = d.parts.iter().map(|(r, _)| *r).collect();
         let joints = if self.join_surfaces && d.physical.is_none() { self.surface_joints(&carried) } else { Vec::new() };
-        self.doc.record_drag("Drag", changes, joints);
+        self.game.doc.record_drag("Drag", changes, joints);
     }
 
     /// JointPairs.new + createJoints: a `Weld` from each moved part to every
@@ -969,12 +969,12 @@ impl Editor {
     /// inserted (parent = the moved part) and returned for the undo step.
     pub(crate) fn surface_joints(&mut self, moved: &[Ref]) -> Vec<(Ref, Ref)> {
         let carried: HashSet<Ref> = moved.iter().copied().collect();
-        self.scene.sync(&mut self.doc);
+        self.game.scene.sync(&mut self.game.doc);
         let mut made = Vec::new();
         for &a in moved {
-            let Some(sa) = self.scene.get(a).map(|sp| self.solid_of(sp)) else { continue };
+            let Some(sa) = self.game.scene.get(a).map(|sp| self.solid_of(sp)) else { continue };
             let ra = sa.size.length() / 2.0;
-            let others: Vec<(Ref, Solid)> = self
+            let others: Vec<(Ref, Solid)> = self.game
                 .scene
                 .parts
                 .iter()
@@ -983,11 +983,11 @@ impl Editor {
                 .map(|sp| (sp.r, self.solid_of(sp)))
                 .collect();
             for (b, sb) in others {
-                if joined(&self.doc, a, b) || in_humanoid_model(&self.doc, a) || in_humanoid_model(&self.doc, b) {
+                if joined(&self.game.doc, a, b) || in_humanoid_model(&self.game.doc, a) || in_humanoid_model(&self.game.doc, b) {
                     continue;
                 }
                 let Some((c0, c1)) = joint_between(&sa, &sb) else { continue };
-                let w = self.doc.dom.insert(
+                let w = self.game.doc.dom.insert(
                     a,
                     rbx_dom_weak::InstanceBuilder::new("Weld")
                         .with_name("Weld")
@@ -1008,10 +1008,10 @@ impl Editor {
 /// Parts joined rigidly (JointInstances: Weld, Motor6D, Snap…, and enabled
 /// WeldConstraints) to any of `start`: the assembly Studio's IK dragger
 /// carries along.
-pub(crate) fn rigid_assembly(doc: &crate::doc::Document, start: &[Ref]) -> Vec<Ref> {
+pub(crate) fn rigid_assembly(doc: &rustudio_core::doc::Document, start: &[Ref]) -> Vec<Ref> {
     let mut links: std::collections::HashMap<Ref, Vec<Ref>> = std::collections::HashMap::new();
     for i in doc.dom.descendants() {
-        if !(crate::doc::is_a(&i.class, "JointInstance") || i.class == "WeldConstraint") {
+        if !(rustudio_core::doc::is_a(&i.class, "JointInstance") || i.class == "WeldConstraint") {
             continue;
         }
         if matches!(i.properties.get(&ustr("Enabled")), Some(Variant::Bool(false))) {
@@ -1044,15 +1044,15 @@ impl Editor {
     /// moves (an anchored assembly doesn't move: IKMoveTo can't solve it).
     fn phys_drag_begin(&self, parts: &[(Ref, Xform)], grab: Vec3) -> PhysDrag {
         let start: Vec<Ref> = parts.iter().map(|(r, _)| *r).collect();
-        let all = rigid_assembly(&self.doc, &start);
+        let all = rigid_assembly(&self.game.doc, &start);
         let parts: Vec<(Ref, Xform, Vec3, MeshKind, Variant)> = all
             .iter()
             .filter_map(|r| {
-                let sp = self.scene.get(*r)?;
-                Some((*r, sp.xf, sp.size, sp.draw.mesh, self.doc.prop(*r, "CFrame")?))
+                let sp = self.game.scene.get(*r)?;
+                Some((*r, sp.xf, sp.size, sp.draw.mesh, self.game.doc.prop(*r, "CFrame")?))
             })
             .collect();
-        let stuck = parts.iter().any(|(r, ..)| matches!(self.doc.prop(*r, "Anchored"), Some(Variant::Bool(true))));
+        let stuck = parts.iter().any(|(r, ..)| matches!(self.game.doc.prop(*r, "Anchored"), Some(Variant::Bool(true))));
         PhysDrag { grab, parts, stuck, last: Vec3::ZERO }
     }
 
@@ -1064,11 +1064,11 @@ impl Editor {
         ph.parts.iter().any(|(_, xf, size, kind, _)| {
             let a = Solid { xf: Xform { pos: xf.pos + delta, rot: xf.rot }, size: *size, kind: *kind };
             let ra = size.length() * 0.5;
-            self.scene.parts.iter().zip(&self.scene.bounds).any(|(sp, bd)| {
+            self.game.scene.parts.iter().zip(&self.game.scene.bounds).any(|(sp, bd)| {
                 !skip.contains(&sp.r)
                     && (bd.truncate() - a.xf.pos).length() <= ra + bd.w
-                    && !matches!(self.doc.prop(sp.r, "CanCollide"), Some(Variant::Bool(false)))
-                    && solids_overlap(&a, &self.solid_of(sp), crate::mech::COLLISION_OVERLAP)
+                    && !matches!(self.game.doc.prop(sp.r, "CanCollide"), Some(Variant::Bool(false)))
+                    && solids_overlap(&a, &self.solid_of(sp), rustudio_core::mech::COLLISION_OVERLAP)
             })
         })
     }
@@ -1082,7 +1082,7 @@ impl Editor {
         if ph.stuck {
             return;
         }
-        let n = -self.cam.forward();
+        let n = -self.game.cam.forward();
         let dn = ray.dir.dot(n);
         if dn.abs() < 1e-9 {
             return;
@@ -1114,7 +1114,7 @@ impl Editor {
                 for k in 1..=n {
                     let v = from + (to - from) * (k as f32 / n as f32);
                     if self.phys_overlaps(&ph, at(v)) {
-                        ok = safe_amount(ok, v, crate::mech::COLLISION_EPS, |x| self.phys_overlaps(&ph, at(x)));
+                        ok = safe_amount(ok, v, rustudio_core::mech::COLLISION_EPS, |x| self.phys_overlaps(&ph, at(x)));
                         break;
                     }
                     ok = v;
@@ -1127,10 +1127,10 @@ impl Editor {
         };
         for (r, xf, ..) in &ph.parts {
             let moved = Xform { pos: xf.pos + delta, rot: xf.rot };
-            self.doc.set_prop_live(*r, ustr("CFrame"), Variant::CFrame(moved.to_cframe()));
+            self.game.doc.set_prop_live(*r, ustr("CFrame"), Variant::CFrame(moved.to_cframe()));
         }
         let pivots = self.part_drag.as_ref().map(|d| d.pivots.clone()).unwrap_or_default();
-        apply_model_pivots(&mut self.doc, &pivots, Xform { pos: delta, rot: Mat3::IDENTITY });
+        apply_model_pivots(&mut self.game.doc, &pivots, Xform { pos: delta, rot: Mat3::IDENTITY });
         if let Some(d) = self.part_drag.as_mut() {
             if let Some(p) = d.physical.as_mut() {
                 p.last = delta;
@@ -1188,7 +1188,7 @@ pub(crate) fn safe_amount(last_good: f32, wanted: f32, eps: f32, overlaps: impl 
         return wanted;
     }
     let (mut a, mut b) = (last_good, wanted);
-    for _ in 0..crate::mech::COLLISION_STEPS {
+    for _ in 0..rustudio_core::mech::COLLISION_STEPS {
         if (a - b).abs() < eps {
             break;
         }
@@ -1212,13 +1212,13 @@ impl Editor {
     pub(crate) fn overlaps_others(&self, moved: &[(Ref, Xform, Vec3)]) -> bool {
         let skip: HashSet<Ref> = moved.iter().map(|(r, _, _)| *r).collect();
         moved.iter().any(|(r, xf, size)| {
-            let kind = self.scene.get(*r).map(|sp| sp.draw.mesh).unwrap_or(MeshKind::Block);
+            let kind = self.game.scene.get(*r).map(|sp| sp.draw.mesh).unwrap_or(MeshKind::Block);
             let a = Solid { xf: *xf, size: *size, kind };
             let ra = size.length() * 0.5;
-            self.scene.parts.iter().zip(&self.scene.bounds).any(|(sp, bd)| {
+            self.game.scene.parts.iter().zip(&self.game.scene.bounds).any(|(sp, bd)| {
                 !skip.contains(&sp.r)
                     && (bd.truncate() - xf.pos).length() <= ra + bd.w
-                    && solids_overlap(&a, &self.solid_of(sp), crate::mech::COLLISION_OVERLAP)
+                    && solids_overlap(&a, &self.solid_of(sp), rustudio_core::mech::COLLISION_OVERLAP)
             })
         })
     }
@@ -1281,10 +1281,10 @@ impl Editor {
 }
 
 /// Whether a joint or weld already connects `a` and `b`.
-fn joined(doc: &crate::doc::Document, a: Ref, b: Ref) -> bool {
+fn joined(doc: &rustudio_core::doc::Document, a: Ref, b: Ref) -> bool {
     [a, b].iter().any(|&p| {
         doc.dom.descendants_of(p).any(|i| {
-            (crate::doc::is_a(&i.class, "JointInstance") || i.class == "WeldConstraint")
+            (rustudio_core::doc::is_a(&i.class, "JointInstance") || i.class == "WeldConstraint")
                 && {
                     let get = |k: &str| match i.properties.get(&ustr(k)) {
                         Some(Variant::Ref(r)) => Some(*r),
@@ -1298,7 +1298,7 @@ fn joined(doc: &crate::doc::Document, a: Ref, b: Ref) -> bool {
 }
 
 /// JointPairs' isAHumanoidModel: no surface joints inside a character.
-fn in_humanoid_model(doc: &crate::doc::Document, r: Ref) -> bool {
+fn in_humanoid_model(doc: &rustudio_core::doc::Document, r: Ref) -> bool {
     let Some(parent) = doc.dom.get_by_ref(r).map(|i| i.parent()) else { return false };
     doc.class_of(parent).is_some_and(|c| c == "Model")
         && doc.dom.get_by_ref(parent).is_some_and(|m| {
@@ -1314,10 +1314,10 @@ pub(crate) fn scaled_size(
     uniform: bool,
 ) -> (Vec3, f32) {
     let extent =
-        (size[axis] + delta * if symmetric { 2.0 } else { 1.0 }).max(crate::mech::MIN_PART_SIZE);
+        (size[axis] + delta * if symmetric { 2.0 } else { 1.0 }).max(rustudio_core::mech::MIN_PART_SIZE);
     let mut result = size;
     if uniform {
-        let factor = (extent / size[axis]).max(crate::mech::MIN_PART_SIZE / size.min_element());
+        let factor = (extent / size[axis]).max(rustudio_core::mech::MIN_PART_SIZE / size.min_element());
         result *= factor;
     } else {
         result[axis] = extent;
@@ -1393,7 +1393,7 @@ mod tests {
 
 /// Editor pivot lookup mirrors Model:GetPivot: PrimaryPart (including its
 /// PivotOffset), authored WorldPivotData, then the world bounds of descendants.
-pub(crate) fn editor_model_pivot(doc: &crate::doc::Document, r: Ref) -> Option<Xform> {
+pub(crate) fn editor_model_pivot(doc: &rustudio_core::doc::Document, r: Ref) -> Option<Xform> {
     if doc.class_of(r)? != "Model" { return None; }
     if let Some(Variant::Ref(pp)) = doc.prop(r, "PrimaryPart") {
         if let Some(Variant::CFrame(cf)) = doc.prop(pp, "CFrame") {
@@ -1410,11 +1410,11 @@ pub(crate) fn editor_model_pivot(doc: &crate::doc::Document, r: Ref) -> Option<X
     }
     let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
     for part in doc.dom.descendants_of(r) {
-        if !crate::doc::is_a(&part.class, "BasePart") { continue; }
+        if !rustudio_core::doc::is_a(&part.class, "BasePart") { continue; }
         let Some(Variant::CFrame(cf)) = doc.prop(part.referent(), "CFrame") else { continue };
         let xf = Xform::from_cframe(&cf);
         let size = match doc.prop(part.referent(), "Size") {
-            Some(Variant::Vector3(v)) => crate::math::v3(v), _ => Vec3::ONE,
+            Some(Variant::Vector3(v)) => rustudio_core::math::v3(v), _ => Vec3::ONE,
         };
         let half = Vec3::new(half_extent(&xf,size,Vec3::X),half_extent(&xf,size,Vec3::Y),half_extent(&xf,size,Vec3::Z));
         lo = lo.min(xf.pos-half); hi = hi.max(xf.pos+half);
@@ -1425,7 +1425,7 @@ pub(crate) fn editor_model_pivot(doc: &crate::doc::Document, r: Ref) -> Option<X
 #[derive(Clone, Debug)]
 pub(crate) struct PivotSnapshot { pub r: Ref, old: Option<Variant>, xf: Xform }
 
-pub(crate) fn selected_model_pivots(doc: &crate::doc::Document) -> Vec<PivotSnapshot> {
+pub(crate) fn selected_model_pivots(doc: &rustudio_core::doc::Document) -> Vec<PivotSnapshot> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for root in &doc.selection {
@@ -1439,7 +1439,7 @@ pub(crate) fn selected_model_pivots(doc: &crate::doc::Document) -> Vec<PivotSnap
     }
     result
 }
-pub(crate) fn apply_model_pivots(doc: &mut crate::doc::Document, pivots: &[PivotSnapshot], delta: Xform) {
+pub(crate) fn apply_model_pivots(doc: &mut rustudio_core::doc::Document, pivots: &[PivotSnapshot], delta: Xform) {
     for p in pivots {
         let xf = Xform { pos: delta.apply(p.xf.pos), rot: delta.rot * p.xf.rot };
         doc.set_prop_live(p.r,ustr("WorldPivotData"),Variant::OptionalCFrame(Some(xf.to_cframe())));
@@ -1512,13 +1512,13 @@ pub(crate) fn round_turned(xf: Xform) -> Xform {
 /// sorted by heap address (a std::set in Studio), so effectively any
 /// part; rustudio uses the last selected part. Locked parts turn too, the
 /// grid is ignored, nothing is pushed out of overlaps.
-pub(crate) fn quarter_turn_selection(doc: &mut crate::doc::Document, parts: &[Ref], m: Mat3, tilt: bool) {
+pub(crate) fn quarter_turn_selection(doc: &mut rustudio_core::doc::Document, parts: &[Ref], m: Mat3, tilt: bool) {
     let boxes: Vec<(Ref, Xform, Vec3)> = parts
         .iter()
         .filter_map(|&r| {
             let Some(Variant::CFrame(cf)) = doc.prop(r, "CFrame") else { return None };
             let size = match doc.prop(r, "Size") {
-                Some(Variant::Vector3(v)) => crate::math::v3(v),
+                Some(Variant::Vector3(v)) => rustudio_core::math::v3(v),
                 _ => Vec3::ONE,
             };
             Some((r, Xform::from_cframe(&cf), size))
@@ -1541,7 +1541,7 @@ pub(crate) fn quarter_turn_selection(doc: &mut crate::doc::Document, parts: &[Re
     doc.record_props(if tilt { "SelectionTilt" } else { "SelectionRotate" }, changes);
 }
 
-pub(crate) fn pivot_changes(doc: &crate::doc::Document, pivots: &[PivotSnapshot]) -> Vec<(Ref,rbx_dom_weak::Ustr,Option<Variant>,Variant)> {
+pub(crate) fn pivot_changes(doc: &rustudio_core::doc::Document, pivots: &[PivotSnapshot]) -> Vec<(Ref,rbx_dom_weak::Ustr,Option<Variant>,Variant)> {
     pivots.iter().filter_map(|p| Some((p.r,ustr("WorldPivotData"),p.old.clone(),doc.prop(p.r,"WorldPivotData")?))).collect()
 }
 
@@ -1573,7 +1573,7 @@ mod quarter_turn_tests {
     #[test]
     fn studio_quarter_turns() {
         for &(name, sel, model, cam_pos, tilt, want) in CASES {
-            let mut doc = crate::doc::Document::empty();
+            let mut doc = rustudio_core::doc::Document::empty();
             let root = doc.dom.root_ref();
             let parent = if model {
                 doc.dom.insert(root, InstanceBuilder::new("Model").with_name("M").with_property("WorldPivotData", Variant::OptionalCFrame(Some(pivot().to_cframe()))))
@@ -1651,7 +1651,7 @@ mod quarter_turn_tests {
     }
 }
 
-/// Ctrl+R / Ctrl+T measured in an offline Studio (MECHANICS.md "Ctrl+R /
+/// Ctrl+R / Ctrl+T measured in an offline Studio (docs/MECHANICS.md "Ctrl+R /
 /// Ctrl+T"): three anchored parts, the parts in Studio's internal list order
 /// (the last one gives the box frame, see `quarter_turn_selection`), an
 /// optional Model (WorldPivot `pivot()`, no PrimaryPart) holding A and B, the camera at `cam_pos`
@@ -1659,7 +1659,7 @@ mod quarter_turn_tests {
 /// afterwards ("M" = the Model's GetPivot()).
 #[cfg(test)]
 pub(crate) mod quarter_turn_cases {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     use glam::{Mat3, Vec3};
 
     pub type Cf = [f32; 12];
@@ -1718,7 +1718,7 @@ mod model_pivot_tests {
     use rbx_dom_weak::InstanceBuilder;
     #[test]
     fn studio_world_pivot_translation_and_undo() {
-        let mut doc = crate::doc::Document::empty();
+        let mut doc = rustudio_core::doc::Document::empty();
         let model = doc.dom.insert(doc.dom.root_ref(), InstanceBuilder::new("Model")
             .with_property("WorldPivotData", Variant::OptionalCFrame(Some(Xform { pos: Vec3::new(23.,5.,1.), rot: glam::Mat3::IDENTITY }.to_cframe()))));
         let part = doc.dom.insert(model, InstanceBuilder::new("Part")
@@ -1739,12 +1739,12 @@ mod model_pivot_tests {
 }
 
 /// Snapshot the copies at the duplication point without changing drag geometry.
-pub(crate) fn pivot_undo_baseline(doc: &crate::doc::Document, pivots: &[PivotSnapshot]) -> Vec<PivotSnapshot> {
+pub(crate) fn pivot_undo_baseline(doc: &rustudio_core::doc::Document, pivots: &[PivotSnapshot]) -> Vec<PivotSnapshot> {
     pivots.iter().cloned().map(|mut p| { p.old = doc.prop(p.r, "WorldPivotData"); p }).collect()
 }
 
 
-/// The drags measured in an offline Studio (MECHANICS.md "Freeform drag
+/// The drags measured in an offline Studio (docs/MECHANICS.md "Freeform drag
 /// parity"), shared by the unit tests and the editor self-test
 /// (selftest/drag_parity.rs): the scenes and Studio's resulting CFrames.
 pub(crate) mod studio_cases {
@@ -1841,7 +1841,7 @@ pub(crate) mod studio_cases {
     ];
 }
 
-/// The drags measured in an offline Studio (MECHANICS.md "Freeform drag
+/// The drags measured in an offline Studio (docs/MECHANICS.md "Freeform drag
 /// parity"): 862x675 viewport, Camera.CFrame = lookAt((0,20,20), (0,2,0)),
 /// FieldOfView 70, a 512x4x512 baseplate at (0,-2,0); press / release pixels
 /// and DraggerService.LinearSnapIncrement as used there; R / T pressed
@@ -1851,7 +1851,7 @@ pub(crate) mod studio_cases {
 mod studio_parity_tests {
     use super::*;
     use super::studio_cases::*;
-    use crate::camera::Camera;
+    use rustudio_render::camera::Camera;
     use egui::Vec2;
 
     const W: f32 = 862.0;
@@ -1985,19 +1985,19 @@ mod studio_parity_tests {
     fn studio_move_handle_collision() {
         let wall = block([8.0, 4.0, 0.0], [2.0, 8.0, 8.0]);
         let at = |x: f32| block([x, 2.0, 0.0], [4.0; 3]);
-        let hits = |x: f32| solids_overlap(&at(x), &wall, crate::mech::COLLISION_OVERLAP);
+        let hits = |x: f32| solids_overlap(&at(x), &wall, rustudio_core::mech::COLLISION_OVERLAP);
         // The mouse passes through intermediate points as Studio's did.
         let mut good = 0.0;
         for i in 1..=16 {
-            good = safe_amount(good, 7.98286 * i as f32 / 16.0, crate::mech::COLLISION_EPS, hits);
+            good = safe_amount(good, 7.98286 * i as f32 / 16.0, rustudio_core::mech::COLLISION_EPS, hits);
         }
         assert!((good - 5.00074).abs() < 0.001, "{good}");
         assert!(good <= 5.001);
         // Flush faces only touch; a jump past the wall is allowed.
         assert!(!hits(5.0) && hits(5.01));
-        assert_eq!(safe_amount(5.0, 12.0022, crate::mech::COLLISION_EPS, hits), 12.0022);
+        assert_eq!(safe_amount(5.0, 12.0022, rustudio_core::mech::COLLISION_EPS, hits), 12.0022);
         // The baseplate under the cube is touching, not overlapping.
-        assert!(!solids_overlap(&at(0.0), &block([0.0, -2.0, 0.0], [512.0, 4.0, 512.0]), crate::mech::COLLISION_OVERLAP));
+        assert!(!solids_overlap(&at(0.0), &block([0.0, -2.0, 0.0], [512.0, 4.0, 512.0]), rustudio_core::mech::COLLISION_OVERLAP));
     }
 
     /// The camera ray is Studio's ViewportPointToRay: the centre pixel looks
@@ -2078,8 +2078,8 @@ pub(crate) mod mode_cases {
         t.iter().find(|(p, _)| *p == (px, py)).map(|(_, d)| Vec3::from(*d))
     }
 
-    pub fn camera() -> crate::camera::Camera {
-        let mut c = crate::camera::Camera::default();
+    pub fn camera() -> rustudio_render::camera::Camera {
+        let mut c = rustudio_render::camera::Camera::default();
         c.pos = Vec3::new(0.0, 20.0, 20.0);
         let f = (Vec3::new(0.0, 0.0, -5.0) - c.pos).normalize();
         let r = f.cross(Vec3::Y).normalize();

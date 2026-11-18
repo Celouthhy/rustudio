@@ -32,20 +32,20 @@ fn safe_name(s: &str) -> String {
 
 impl Editor {
     pub fn open_export_dialog(&mut self) {
-        let name = self
+        let name = self.game
             .doc
             .cloud
             .as_ref()
             .map(|c| if c.experience.is_empty() { c.name.clone() } else { c.experience.clone() })
-            .or_else(|| self.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()))
+            .or_else(|| self.game.doc.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "game".into());
-        let parent = self
+        let parent = self.game
             .doc
             .path
             .as_ref()
             .and_then(|p| p.parent())
             .map(PathBuf::from)
-            .unwrap_or_else(crate::paths::home);
+            .unwrap_or_else(rustudio_core::paths::home);
         self.project_export = Some(ExportDialog {
             opts: ExportOptions { name: safe_name(&name), ..Default::default() },
             parent: parent.display().to_string(),
@@ -71,15 +71,15 @@ impl Editor {
         let mut open = true;
         let mut go = false;
         let mut browse: Option<String> = None;
-        let root = self.doc.dom.root_ref();
+        let root = self.game.doc.dom.root_ref();
         let present: Vec<(&str, bool)> = CONTAINERS
             .iter()
             .copied()
             .filter(|(c, _)| {
                 let mut r = root;
                 c.split('/').all(|seg| {
-                    let next = self.doc.dom.get_by_ref(r).and_then(|i| {
-                        i.children().iter().copied().find(|k| self.doc.dom.get_by_ref(*k).is_some_and(|x| x.name == seg))
+                    let next = self.game.doc.dom.get_by_ref(r).and_then(|i| {
+                        i.children().iter().copied().find(|k| self.game.doc.dom.get_by_ref(*k).is_some_and(|x| x.name == seg))
                     });
                     next.map(|n| r = n).is_some()
                 })
@@ -142,11 +142,11 @@ impl Editor {
             let dir = PathBuf::from(&d.parent).join(safe_name(&d.opts.name));
             let mut opts = d.opts.clone();
             opts.name = safe_name(&opts.name);
-            if let Some(c) = &self.doc.cloud {
+            if let Some(c) = &self.game.doc.cloud {
                 opts.place_id = Some(c.place_id);
                 opts.game_id = Some(c.universe_id);
             }
-            match crate::project_export::export(&self.doc, &dir, &opts) {
+            match crate::project_export::export(&self.game.doc, &dir, &opts) {
                 Ok(rep) => {
                     self.info(format!(
                         "Saved as project folder {}: {} scripts, {} folders, {} model files",
@@ -273,7 +273,7 @@ impl Editor {
                                 if ui.add_enabled(i + 1 < n, egui::Button::new("↓").small()).clicked() {
                                     swap = Some((i, i + 1));
                                 }
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button(rustudio_engine::ti::text("x", 12.0)).clicked() {
                                     remove = Some(i);
                                 }
                             });
@@ -306,7 +306,7 @@ impl Editor {
                 }
             });
         if write_map {
-            let doc = &self.doc;
+            let doc = &self.game.doc;
             if let Some(st) = self.project.as_mut() {
                 let mut tmp = (*st.config).clone();
                 tmp.sourcemap = true;

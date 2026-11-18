@@ -52,7 +52,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                     let id=match v? {
                         Value::Integer(n) if n>=0=>n as u64,
                         Value::Number(n) if n>=0. && n.is_finite()=>n as u64,
-                        Value::String(s)=>{let raw=s.to_string_lossy();crate::assets::asset_ref(&raw).map(|a|a.id).or_else(||raw.parse().ok()).ok_or_else(||rt_err("Unable to cast value to ContentId"))?},
+                        Value::String(s)=>{let raw=s.to_string_lossy();rustudio_core::assets::asset_ref(&raw).map(|a|a.id).or_else(||raw.parse().ok()).ok_or_else(||rt_err("Unable to cast value to ContentId"))?},
                         _=>return Err(rt_err("Unable to cast value to ContentId")),
                     };
                     ids.push(id);
@@ -99,11 +99,11 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(match result {
             Ok(Reply::Json(v))=>(true,Value::String(lua.create_string(v)?),None),
             Ok(Reply::Asset(bytes,id))=>{
-                if crate::fbx::is_fbx(&bytes) {
+                if rustudio_core::fbx::is_fbx(&bytes) {
                     let r=crate::runtime::ext::load_fbx(lua,id,&bytes)?;
                     return Ok((true,inst_value(lua,r)?,None));
                 }
-                let mut tmp=crate::doc::Document::decode(load::model_bytes(&bytes)).map_err(|e|rt_err(format!("Asset {id} could not be decoded: {e}")))?;
+                let mut tmp=rustudio_core::doc::Document::decode(load::model_bytes(&bytes)).map_err(|e|rt_err(format!("Asset {id} could not be decoded: {e}")))?;
                 let r=crate::runtime::ext::create_any(lua,"Model")?;
                 let mut w=world(lua)?;
                 for child in tmp.root().children().to_vec(){tmp.transfer(child,&mut w.dm().dom,r);}
@@ -113,7 +113,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             },
             Err(e)=>match e.strip_prefix('\u{1}').and_then(|r|r.split_once('\u{1}')) {
                 Some((id,msg))=>{
-                    world(lua)?.output.push((crate::app::Level::Warn,format!("ContentId: rbxassetid://{id} failed due to: {msg}")));
+                    world(lua)?.output.push((rustudio_core::log::Level::Warn,format!("ContentId: rbxassetid://{id} failed due to: {msg}")));
                     (true,Value::Nil,Some(msg.to_string()))
                 }
                 None=>(true,Value::Nil,Some(e)),

@@ -4,12 +4,12 @@ use egui::{PointerButton, Response, Ui};
 
 impl Editor {
     pub(crate) fn viewport_context_menu(&mut self, ui: &mut Ui, response: &Response) {
-        if self.is_playing() { return; }
+        if self.game.is_playing() { return; }
         if response.clicked_by(PointerButton::Secondary) {
             if let Some(p) = response.interact_pointer_pos() {
                 let hit = self.pick(response.rect, p, ui.input(|i| i.modifiers.alt));
                 match hit {
-                    Some(r) if !self.doc.selection.contains(&r) => self.select(vec![r]),
+                    Some(r) if !self.game.doc.selection.contains(&r) => self.select(vec![r]),
                     None => self.select(Vec::new()),
                     _ => {}
                 }
@@ -21,8 +21,8 @@ impl Editor {
             ui.spacing_mut().item_spacing.y = 0.0;
             let mut item = |ui: &mut Ui, label: &str, shortcut: &str, command: &'static str| {
                 let enabled = match command {
-                    "parents" => self.doc.selection.iter().any(|r| self.doc.dom.get_by_ref(*r).is_some_and(|i| i.parent().is_some())),
-                    "children" => self.doc.selection.iter().any(|r| self.doc.dom.get_by_ref(*r).is_some_and(|i| !i.children().is_empty())),
+                    "parents" => self.game.doc.selection.iter().any(|r| self.game.doc.dom.get_by_ref(*r).is_some_and(|i| i.parent().is_some())),
+                    "children" => self.game.doc.selection.iter().any(|r| self.game.doc.dom.get_by_ref(*r).is_some_and(|i| !i.children().is_empty())),
                     "focus" => self.selection_bounds().is_some(),
                     _ => self.action_state(command).0,
                 };
@@ -75,8 +75,8 @@ impl Editor {
             match action {
                 "parents" | "children" => {
                     let mut refs = Vec::new();
-                    for r in &self.doc.selection {
-                        if let Some(i) = self.doc.dom.get_by_ref(*r) {
+                    for r in &self.game.doc.selection {
+                        if let Some(i) = self.game.doc.dom.get_by_ref(*r) {
                             if action == "parents" {
                                 if i.parent().is_some() && !refs.contains(&i.parent()) { refs.push(i.parent()); }
                             } else {

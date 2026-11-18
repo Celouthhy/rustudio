@@ -1,6 +1,8 @@
 //! Animator track replication, as Studio does it: each Animator has 16
 //! replicated hidden slots, `AnimationId{i}`, `AnimTrackMetadata{i}`,
-//! `AnimTrackPlayState{i}` and `AnimTrackWeight{i}` (API dump). The server writes a slot when one of its
+//! `AnimTrackPlayState{i}` and `AnimTrackWeight{i}` (API dump; reflected
+//! get/set pairs, e.g. slot 0's PlayState get Studio / set Studio,
+//! registered at Studio). The server writes a slot when one of its
 //! tracks starts, stops, changes speed / weight / looping / priority or
 //! ends, not every frame; the slot replicates like any property and the
 //! client runs its own track from it (the setter re-syncs the
@@ -140,7 +142,7 @@ pub fn publish(lua: &Lua) {
         for t in &tracks {
             let id = t
                 .anim
-                .and_then(|a| crate::scene::content_string(w.d().prop(a, "AnimationId")))
+                .and_then(|a| rustudio_render::scene::content_string(w.d().prop(a, "AnimationId")))
                 .unwrap_or_default();
             let snap = Snap {
                 id,
@@ -252,7 +254,7 @@ pub fn sync(lua: &Lua, dirty: Vec<(Ref, usize)>) {
         }
         if let Err(e) = sync_slot(lua, &helper, animator, slot) {
             if let Ok(mut w) = crate::runtime::world(lua) {
-                w.output.push((crate::app::Level::Warn, format!("Animator replication: {e}")));
+                w.output.push((rustudio_core::log::Level::Warn, format!("Animator replication: {e}")));
             }
         }
     }

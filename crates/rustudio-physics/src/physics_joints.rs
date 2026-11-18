@@ -85,7 +85,7 @@ impl Physics {
     /// An attachment's end: its part's body and its frame there.
     fn joint_end(&self, doc: &Document, att: Ref) -> Option<End> {
         let part_d = attachment_part(doc, att)?;
-        let att_world = crate::attachment::world(doc, att, false)?;
+        let att_world = rustudio_core::attachment::world(doc, att, false)?;
         let part_doc = xform_of(doc, part_d)?;
         // (a client-owned mover read from the client document: its part's server copy)
         let part = self.hums.desc_remap.get(&part_d).copied().unwrap_or(part_d);
@@ -158,7 +158,7 @@ impl Physics {
             // ignores joints).
             if self.studio.is_some() {
                 if bool_prop(doc, r, "Enabled", true) {
-                    if let Some((p0, p1)) = crate::physics::joint_parts(doc, r) {
+                    if let Some((p0, p1)) = joint_parts(doc, r) {
                         if let (Some(c0), Some(c1)) = (self.collider_of_part(p0), self.collider_of_part(p1)) {
                             let (a, b) = (c0.into_raw_parts().0, c1.into_raw_parts().0);
                             no_collide.insert((a.min(b), a.max(b)));
@@ -469,7 +469,7 @@ impl Physics {
 }
 
 /// Studio solver path (RUSTUDIO_SOLVER=studio): the constraint Instances as
-/// Studio's connectors (src/solver/joints, JOINT I). Every frame each tracked
+/// Studio's connectors (crates/rustudio-physics/src/solver/joints, JOINT I). Every frame each tracked
 /// constraint's properties and attachments are read into a `Desc`; the solver keeps
 /// one connector set per Instance (kept impulses survive property changes).
 fn studio_end(e: &End) -> solver_joints::End {
@@ -605,6 +605,9 @@ impl Physics {
             } else {
                 sv.joints.keep(*r);
             }
+        }
+        for (r, d) in &self.hums.foreign_descs {
+            sv.joints.upsert(*r, d);
         }
         sv.joints.end_sync();
         c.sig = sig;

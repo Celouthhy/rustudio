@@ -24,7 +24,7 @@ pub struct GuiVertex {
     pub light: [f32; 3],
     /// Studs from the camera (fog).
     pub dist: f32,
-    /// Particles, beams and trails (round 25, src/effects.rs): the clip-space
+    /// Particles, beams and trails (round 25, crates/rustudio-render/src/effects.rs): the clip-space
     /// w, with `ndc` and `depth` holding clip x, y and z, so the GPU clips at
     /// the near plane and interpolates perspective-correctly. 0 for GUIs.
     pub clip_w: f32,
@@ -812,13 +812,13 @@ fn fx_constants() -> String {
     let w = egui::epaint::WHITE_UV;
     format!(
         "const FX_VOXEL: f32 = {:?};\nconst FX_GRID_BORDER: f32 = {:?};\nconst FX_LOCAL_REACH: f32 = {:?};\nconst FX_LOCAL_SLOPE: f32 = {:?};\nconst FX_LIGHT_INTENSITY: f32 = {:?};\nconst FX_LIGHT_CAP: f32 = {:?};\nconst FX_LIGHT_TOWARD_CAMERA: f32 = {:?};\nconst FX_WHITE_UV = vec2<f32>({:?}, {:?});\n",
-        crate::terrain::VOXEL,
-        crate::mech::LIGHTGRID_BORDER,
-        crate::mech::FX_LOCAL_REACH,
-        crate::mech::FX_LOCAL_SLOPE,
-        crate::mech::LIGHT_INTENSITY,
-        crate::mech::FX_LIGHT_CAP,
-        crate::mech::FX_LIGHT_TOWARD_CAMERA,
+        rustudio_core::terrain::VOXEL,
+        rustudio_core::mech::LIGHTGRID_BORDER,
+        rustudio_core::mech::FX_LOCAL_REACH,
+        rustudio_core::mech::FX_LOCAL_SLOPE,
+        rustudio_core::mech::LIGHT_INTENSITY,
+        rustudio_core::mech::FX_LIGHT_CAP,
+        rustudio_core::mech::FX_LIGHT_TOWARD_CAMERA,
         w.x,
         w.y,
     )
@@ -871,10 +871,10 @@ impl WorldGuiPass {
             source: wgpu::ShaderSource::Wgsl(
                 format!(
                     "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{SHADER}",
-                    crate::mech::EVSM_POS_EXP,
-                    crate::mech::EVSM_NEG_EXP,
-                    crate::mech::EVSM_SHADOW_BIAS,
-                    crate::mech::EVSM_BLEED_CUT,
+                    rustudio_core::mech::EVSM_POS_EXP,
+                    rustudio_core::mech::EVSM_NEG_EXP,
+                    rustudio_core::mech::EVSM_SHADOW_BIAS,
+                    rustudio_core::mech::EVSM_BLEED_CUT,
                     fx_constants(),
                 )
                 .into(),
@@ -1348,7 +1348,7 @@ impl WorldGuiPass {
         let device = &rs.device;
         let t = tone_curve.unwrap_or([0.0; 5]);
         let u: [f32; 16] = [
-            t[0], t[1], t[2], t[3], t[4], if tone_curve.is_some() { 1.0 } else { 0.0 }, crate::mech::NEAR, crate::mech::FX_LIGHT_CLAMP,
+            t[0], t[1], t[2], t[3], t[4], if tone_curve.is_some() { 1.0 } else { 0.0 }, rustudio_core::mech::NEAR, rustudio_core::mech::FX_LIGHT_CLAMP,
             fog[0], fog[1], fog[2], fog[3], fog_rgb[0], fog_rgb[1], fog_rgb[2], 0.0,
         ];
         let mut u = u.to_vec();
@@ -1508,7 +1508,7 @@ impl WorldGuiPass {
                 Kind::Particles => 2 * (end - start),
                 _ => (end - start) / 3,
             };
-            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI3D, 1, tris as u64);
+            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::UI3D, 1, tris as u64);
             match kind {
                 Kind::Particles => pass.draw(0..6, *start..*end),
                 _ => pass.draw_indexed(*start..*end, 0, 0..1),
@@ -1570,11 +1570,11 @@ impl WorldGuiPass {
         fog_rgb: [f32; 3],
     ) -> bool {
         let up = {
-            let _b = crate::bench::scope("fx_upload");
+            let _b = rustudio_core::bench::scope("fx_upload");
             self.upload(rs, depth, batches, fx, tone_curve, fog, fog_rgb)
         };
         let Some(up) = up else { return false };
-        let _b = crate::bench::scope("fx_encode");
+        let _b = rustudio_core::bench::scope("fx_encode");
         let device = &rs.device;
         if self.fx_tex.as_ref().is_none_or(|(s, _)| *s != size) {
             let view = device

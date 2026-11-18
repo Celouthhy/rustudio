@@ -125,7 +125,7 @@ pub struct DraggerSettings {
 }
 
 fn path() -> PathBuf {
-    let base = crate::paths::config();
+    let base = rustudio_core::paths::config();
     base.join("rustudio").join("layout.json")
 }
 
@@ -134,33 +134,33 @@ impl Harness {
     pub fn plain(&self) -> bool {
         self.selftest.is_none()
             && !crate::selftest::running()
-            && self.bench.is_none()
-            && self.screenshot.is_none()
+            && self.run.bench.is_none()
+            && self.run.screenshot.is_none()
             && self.ui_shots.is_none()
-            && self.actions.is_empty()
-            && self.shots.is_empty()
-            && !self.start_play
+            && self.run.input.actions.is_empty()
+            && self.run.shots.is_empty()
+            && !self.run.start_play
             && self.open_roblox.is_none()
             && self.roblox_picker.is_none()
             && !self.roblox_settings
-            && self.result.is_none()
-            && !self.fail_on_error
-            && self.end_after.is_none()
-            && !self.no_ui
+            && self.run.result.is_none()
+            && !self.run.fail_on_error
+            && self.run.end_after.is_none()
+            && !self.run.no_ui
     }
 }
 
 impl Harness {
-    /// The in-game settings (src/game_settings.rs) are the user's: kept for
+    /// The in-game settings (crates/rustudio-core/src/game_settings.rs) are the user's: kept for
     /// any run a person plays in (`--play` / opening a Roblox place too),
     /// never for tests, benches, screenshots or scripted input.
     pub fn keeps_game_settings(&self) -> bool {
         self.selftest.is_none()
-            && self.bench.is_none()
-            && self.screenshot.is_none()
+            && self.run.bench.is_none()
+            && self.run.screenshot.is_none()
             && self.ui_shots.is_none()
-            && self.actions.is_empty()
-            && self.shots.is_empty()
+            && self.run.input.actions.is_empty()
+            && self.run.shots.is_empty()
             && std::env::var_os("RUSTUDIO_NO_LAYOUT").is_none()
     }
 }
@@ -236,11 +236,11 @@ impl Layout {
         if let Some(v) = self.show_grid { ed.show_grid = v; }
         if let Some(v) = self.grid_size.and_then(finite).filter(|v| *v > 0.0) { ed.ui.grid_size = v; }
         if let Some(v) = self.show_gui { ed.ui.show_gui = v; }
-        if let Some(v) = self.snap_move { ed.snap_move = v; }
-        if let Some(v) = self.move_inc.and_then(finite).filter(|v| *v > 0.0) { ed.move_inc = v; }
-        if let Some(v) = self.snap_rotate { ed.snap_rotate = v; }
-        if let Some(v) = self.rotate_inc.and_then(finite).filter(|v| *v > 0.0) { ed.rotate_inc = v; }
-        if let Some(v) = self.local_space { ed.local_space = v; }
+        if let Some(v) = self.snap_move { ed.game.snap_move = v; }
+        if let Some(v) = self.move_inc.and_then(finite).filter(|v| *v > 0.0) { ed.game.move_inc = v; }
+        if let Some(v) = self.snap_rotate { ed.game.snap_rotate = v; }
+        if let Some(v) = self.rotate_inc.and_then(finite).filter(|v| *v > 0.0) { ed.game.rotate_inc = v; }
+        if let Some(v) = self.local_space { ed.game.local_space = v; }
         if let Some(d) = self.dragger {
             ed.physical_drag = d.physical;
             ed.collisions = d.collisions;
@@ -398,11 +398,11 @@ impl Saver {
             show_grid: Some(ed.show_grid),
             grid_size: Some(ed.ui.grid_size),
             show_gui: Some(ed.ui.show_gui),
-            snap_move: Some(ed.snap_move),
-            move_inc: Some(ed.move_inc),
-            snap_rotate: Some(ed.snap_rotate),
-            rotate_inc: Some(ed.rotate_inc),
-            local_space: Some(ed.local_space),
+            snap_move: Some(ed.game.snap_move),
+            move_inc: Some(ed.game.move_inc),
+            snap_rotate: Some(ed.game.snap_rotate),
+            rotate_inc: Some(ed.game.rotate_inc),
+            local_space: Some(ed.game.local_space),
             dragger: Some(DraggerSettings {
                 physical: ed.physical_drag,
                 collisions: ed.collisions,

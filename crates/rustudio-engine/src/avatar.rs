@@ -7,9 +7,8 @@ use rbx_dom_weak::types::{Content, ContentId, Enum, Ref, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder, WeakDom};
 use rustudio_account::avatar::{parse_avatar, AvatarInfo};
 
-use crate::app::Editor;
-use crate::assets::SharedClient;
-use crate::doc;
+use rustudio_core::assets::SharedClient;
+use rustudio_core::doc;
 use crate::rig::{BodyColors, Scales};
 
 /// What a character should look like.
@@ -299,17 +298,6 @@ pub fn look_from_info(
     Ok(look)
 }
 
-impl Editor {
-    /// Puts the avatar's clothing, face and accessories on a new character
-    /// (server DataModel; they replicate like any other instances).
-    pub fn dress_character(&mut self, model: Ref) {
-        let Some(look) = self.account.avatar().cloned() else {
-            return;
-        };
-        dress(&mut self.doc, model, &look);
-    }
-}
-
 /// Puts a look's clothing, face and accessories on a character model.
 pub fn dress(doc: &mut doc::Document, model: Ref, look: &AvatarLook) {
     let no_face = put_on_body(doc, model, look);
@@ -392,7 +380,7 @@ pub fn place_allows_animation_packs(doc: &doc::Document) -> bool {
             .map(|i| i.referent())
     });
     match rules {
-        Some(r) => crate::scene::enum_u32(doc.prop(r, "AnimationPacksMode")).unwrap_or(0) == 0,
+        Some(r) => rustudio_render::scene::enum_u32(doc.prop(r, "AnimationPacksMode")).unwrap_or(0) == 0,
         None => true,
     }
 }
@@ -508,7 +496,7 @@ pub fn put_on_custom_clips(doc: &mut doc::Document, model: Ref, clips: &[(&str, 
 /// joints alone. Legacy hats with no matching attachment go on the Head by
 /// AttachmentPoint. A Handle that already has an AccessoryWeld is left be.
 pub fn weld_accessory(dom: &mut WeakDom, model: Ref, acc: Ref) {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     let ident = Xform {
         pos: glam::Vec3::ZERO,
         rot: glam::Mat3::IDENTITY,
@@ -595,7 +583,7 @@ pub fn weld_accessory(dom: &mut WeakDom, model: Ref, acc: Ref) {
 /// attachment to the body attachment of the same name, the Handle placed
 /// so the two coincide. Without a matching attachment: weld_accessory.
 pub fn hold_accessory(dom: &mut WeakDom, model: Ref, acc: Ref) {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     let ident = Xform { pos: glam::Vec3::ZERO, rot: glam::Mat3::IDENTITY };
     let kids = |dom: &WeakDom, r: Ref| -> Vec<Ref> { dom.get_by_ref(r).map(|i| i.children().to_vec()).unwrap_or_default() };
     let cf = |dom: &WeakDom, r: Ref, k: &str| match dom.get_by_ref(r).and_then(|i| i.properties.get(&ustr(k))) {
@@ -659,7 +647,7 @@ fn child_named(doc: &doc::Document, parent: Ref, name: &str) -> Option<Ref> {
 /// asked anonymously and cached; None when that form isn't served.
 pub fn meshpart_accessory(id: u64) -> Option<Vec<u8>> {
     use std::io::Read;
-    let cache = crate::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_accessory.bin"));
+    let cache = rustudio_core::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_accessory.bin"));
     if let Ok(b) = std::fs::read(&cache) {
         if !b.is_empty() {
             return Some(b);
@@ -701,7 +689,7 @@ fn head_for_rig(client: &SharedClient, id: u64, r15: bool, legacy: Vec<u8>) -> V
     if !r15 {
         return legacy;
     }
-    let cache = crate::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_head.bin"));
+    let cache = rustudio_core::assets::cache_dir().join(format!("assets/{id}_avatar_meshpart_head.bin"));
     if let Ok(b) = std::fs::read(&cache) {
         if !b.is_empty() {
             return b;

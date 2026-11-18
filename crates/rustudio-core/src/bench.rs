@@ -35,7 +35,7 @@ fn instr_on() -> bool {
 /// This thread's user-space instructions retired so far (perf_event_open
 /// on itself; 0 if unavailable).
 #[cfg(target_os = "linux")]
-pub(crate) fn instructions() -> u64 {
+pub fn instructions() -> u64 {
     thread_local! {
         static FD: i32 = unsafe {
             // struct perf_event_attr: type, size, config, …, flags.
@@ -63,7 +63,7 @@ pub(crate) fn instructions() -> u64 {
 /// like instructions don't stretch while the thread waits for a core. The
 /// report says so (`work_unit`): cycles, not instructions.
 #[cfg(windows)]
-pub(crate) fn instructions() -> u64 {
+pub fn instructions() -> u64 {
     use windows_sys::Win32::System::{Threading::GetCurrentThread, WindowsProgramming::QueryThreadCycleTime};
     let mut cycles = 0u64;
     // SAFETY: the current thread's pseudo-handle and a u64 out-pointer.
@@ -72,7 +72,7 @@ pub(crate) fn instructions() -> u64 {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-pub(crate) fn instructions() -> u64 {
+pub fn instructions() -> u64 {
     0
 }
 
@@ -283,45 +283,9 @@ pub fn sites_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_API_SITES").is_some())
 }
 
-/// Counts one engine call from `lua`'s running code (see `sites_on`).
-pub fn site(lua: &mlua::Lua, kind: &'static str, name: &str) {
-    if !sites_on() || !lua_prof_on() {
-        return;
-    }
-    let frame = |level: usize| {
-        lua.inspect_stack(level, |d| {
-            let src = d
-                .source()
-                .short_src
-                .map(|s| s.trim_start_matches(['=', '@']).to_string())
-                .unwrap_or_default();
-            (src, d.current_line().unwrap_or(0))
-        })
-    };
-    let mut near: Option<(String, usize)> = None;
-    let mut game: Option<(String, usize)> = None;
-    for level in 0..24 {
-        let Some((src, line)) = frame(level) else { break };
-        if src.is_empty() || src == "[C]" {
-            continue;
-        }
-        if near.is_none() {
-            near = Some((src.clone(), line as usize));
-        }
-        if !src.starts_with("rustudio.") {
-            game = Some((src, line as usize));
-            break;
-        }
-    }
-    let fmt = |f: &Option<(String, usize)>| match f {
-        Some((s, l)) => format!("{s}:{l}"),
-        None => "(engine)".to_string(),
-    };
-    let key = if near == game {
-        format!("{kind} {name} @ {}", fmt(&near))
-    } else {
-        format!("{kind} {name} @ {} <- {}", fmt(&near), fmt(&game))
-    };
+/// Counts one engine call at `key` (built by `lua_bridge::site` from the Lua
+/// stack; see `sites_on`).
+pub fn record_site(key: String) {
     SITES.with(|m| *m.borrow_mut().entry(key).or_insert(0) += 1);
 }
 
@@ -446,6 +410,23 @@ fn thread_cpu_ms() -> f64 {
     0.0
 }
 
+/// GPU timing (`gpu_timing::take` in render): the bench asks render for the
+/// GPU milliseconds per label and each finished frame's total. Installed once
+/// by `gpu_timing::init`; not installed, the bench reports no GPU figures.
+static GPU_TIMING: std::sync::OnceLock<fn() -> (Vec<(&'static str, f64)>, Vec<f64>)> =
+    std::sync::OnceLock::new();
+
+pub fn set_gpu_timing(take: fn() -> (Vec<(&'static str, f64)>, Vec<f64>)) {
+    let _ = GPU_TIMING.set(take);
+}
+
+fn gpu_take() -> (Vec<(&'static str, f64)>, Vec<f64>) {
+    match GPU_TIMING.get() {
+        Some(take) => take(),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
 /// Collects frame intervals for a fixed time after a warm-up.
 pub struct Bench {
     pub out: Option<PathBuf>,
@@ -523,12 +504,12 @@ impl Bench {
         if self.measuring.is_none() {
             if clock.duration_since(started).as_secs_f32() < self.warmup {
                 self.last = Some(now);
-                crate::gpu_timing::take();
+                gpu_take();
                 return false;
             }
             // This frame's sections are partly from before: it isn't counted.
             take_sections();
-            crate::gpu_timing::take();
+            gpu_take();
             take_lua();
             take_api();
             LUA_ON.with(|c| c.set(true));
@@ -544,7 +525,7 @@ impl Bench {
         let mut frame_sections = take_sections();
         // GPU spans that finished since the last frame (a frame or two late),
         // in GPU milliseconds whatever the bench's unit.
-        let (gpu, gpu_totals) = crate::gpu_timing::take();
+        let (gpu, gpu_totals) = gpu_take();
         frame_sections.extend(gpu.into_iter().map(|(n, ms)| (n, ms, 1)));
         let gpu_last = gpu_totals.last().copied().unwrap_or(-1.0) as f32;
         self.gpu_frames.extend(gpu_totals);
@@ -713,5 +694,71 @@ impl Bench {
             report["work_unit"] = note.into();
         }
         report
+    }
+}
+
+// ------------------------------------------------------- frame counters
+
+/// Engine counters Stats reads, fed by the renderer, the GUI passes,
+/// physics and replication (one call each; see services.md). They live here,
+/// in core, so the renderer and physics can reach them; the Engine's Stats
+/// domain reads them through `services::perf`.
+pub mod perf {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::Mutex;
+
+    pub const SCENE: usize = 0;
+    pub const SHADOW: usize = 2;
+    pub const UI2D: usize = 4;
+    pub const UI3D: usize = 6;
+
+    /// This frame's running counts: (calls, triangles) per kind.
+    static ACC: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    #[derive(Clone, Copy, Default)]
+    pub struct Frame {
+        pub n: [u64; 8],
+        pub cpu_s: f64,
+        pub gpu_s: f64,
+    }
+    static LAST: Mutex<Frame> = Mutex::new(Frame { n: [0; 8], cpu_s: 0.0, gpu_s: 0.0 });
+
+    /// One draw of `kind`: `calls` draw calls covering `tris` triangles.
+    pub fn draw(kind: usize, calls: u64, tris: u64) {
+        ACC[kind].fetch_add(calls, Relaxed);
+        ACC[kind + 1].fetch_add(tris, Relaxed);
+    }
+
+    /// The renderer finished a frame: its counts become the last frame's.
+    /// `cpu_s`: the frame's render encoding on the CPU; `gpu_s`: GPU time
+    /// when known (0 otherwise).
+    pub fn end_frame(cpu_s: f64, gpu_s: f64) {
+        let mut f = Frame { n: [0; 8], cpu_s, gpu_s };
+        for (i, a) in ACC.iter().enumerate() {
+            f.n[i] = a.swap(0, Relaxed);
+        }
+        if let Ok(mut l) = LAST.lock() {
+            *l = f;
+        }
+    }
+
+    pub fn frame() -> Frame {
+        LAST.lock().map(|f| *f).unwrap_or_default()
+    }
+
+    // --------------------------------------------------------- contacts
+
+    static CONTACTS: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
+
+    /// Physics stepped DataModel `doc`: its touching collider pairs.
+    pub fn set_contacts(doc: u64, n: usize) {
+        if let Ok(mut m) = CONTACTS.lock() {
+            m.get_or_insert_with(HashMap::new).insert(doc, n);
+        }
+    }
+
+    pub fn contacts(doc: u64) -> usize {
+        CONTACTS.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(&doc).copied())).unwrap_or(0)
     }
 }

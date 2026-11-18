@@ -20,7 +20,7 @@ use super::permissions;
 use super::runtime::{NoRuntime, PluginRuntime};
 use super::watcher::{self, Watcher};
 use super::{InstalledMeta, PluginKind, PluginSource, Store};
-use crate::assets::SharedClient;
+use rustudio_core::assets::SharedClient;
 
 pub struct Synced {
     pub user_id: u64,

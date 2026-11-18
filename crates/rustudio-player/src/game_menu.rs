@@ -161,7 +161,7 @@ struct Asked {
     fullscreen: Option<bool>,
 }
 
-impl Editor {
+impl Game {
     /// Esc during Play opens (and closes) the in-game menu, as in Roblox; a
     /// focused TextBox or the chat box take Esc first. On a confirmation
     /// page Esc goes back to the tab it came from (SettingsHub:PopMenu).
@@ -171,7 +171,7 @@ impl Editor {
         }
         // Esc closes the inspect menu first (its back arrow does too).
         {
-            let mut sh = crate::gui::share();
+            let mut sh = rustudio_engine::gui::share();
             if sh.inspect.is_some() {
                 sh.inspect = None;
                 sh.inspect_closed = true;
@@ -246,7 +246,7 @@ impl Editor {
     /// the right; then a 100 px row per item, 16 px apart (placeholder rows
     /// while loading). Buying is not wired: it never spends Robux here.
     fn inspect_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        let Some(view) = crate::gui::share().inspect.clone() else { return };
+        let Some(view) = rustudio_engine::gui::share().inspect.clone() else { return };
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(rect);
         let panel = Rect::from_min_max(
@@ -261,7 +261,7 @@ impl Editor {
         let back = Rect::from_center_size(a, Vec2::splat(32.0));
         let resp = ui.interact(back, ui.id().with("inspect_back"), Sense::click());
         if resp.clicked() {
-            let mut sh = crate::gui::share();
+            let mut sh = rustudio_engine::gui::share();
             sh.inspect = None;
             sh.inspect_closed = true;
             return;
@@ -275,7 +275,7 @@ impl Editor {
         let max_scroll = (content_h - panel.height()).max(0.0);
         let scroll = (view.scroll - wheel).clamp(0.0, max_scroll);
         if scroll != view.scroll {
-            if let Some(v) = crate::gui::share().inspect.as_mut() {
+            if let Some(v) = rustudio_engine::gui::share().inspect.as_mut() {
                 v.scroll = scroll;
             }
         }
@@ -291,7 +291,7 @@ impl Editor {
         clip.text(
             Pos2::new(x0 + 2.0, top + 231.0),
             egui::Align2::LEFT_CENTER,
-            format!("\u{23E3}{}", view.robux),
+            format!("{} Robux", view.robux),
             font(&ctx, 16.0, Weight::Regular),
             white(0.85),
         );
@@ -310,7 +310,7 @@ impl Editor {
                     white(1.0),
                 );
                 let p = match price {
-                    Some(p) => format!("\u{23E3}{p}"),
+                    Some(p) => format!("{p} Robux"),
                     None => "Off sale".to_string(),
                 };
                 clip.text(
@@ -422,12 +422,12 @@ impl Editor {
     fn menu_apply(&mut self, ctx: &egui::Context, asked: Asked, rects: HashMap<&'static str, Rect>) {
         let now = self.menu_clock();
         if let Some(on) = asked.fullscreen {
-            if on != self.ui.fullscreen {
-                self.ui.fullscreen = on;
+            if on != self.fullscreen {
+                self.fullscreen = on;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
             }
         }
-        let keep = self.harness.keeps_game_settings();
+        let keep = self.keep_game_settings;
         let Some(s) = self.play.as_mut() else { return };
         let g = &mut s.game;
         g.menu.rects = rects;
@@ -441,7 +441,7 @@ impl Editor {
             g.menu.page = p;
         }
         if keep && (asked.sensitivity.is_some() || asked.volume.is_some() || asked.inverted.is_some()) {
-            crate::game_settings::update(|saved| {
+            rustudio_core::game_settings::update(|saved| {
                 if let Some(x) = asked.sensitivity {
                     saved.sensitivity = Some(step_to_sensitivity(x));
                 }
@@ -460,7 +460,7 @@ impl Editor {
             ));
         }
         if let Some(v) = asked.volume {
-            let changed = v != (crate::audio::master_volume() * 10.0 + 0.5).floor() as u32;
+            let changed = v != (rustudio_engine::audio::master_volume() * 10.0 + 0.5).floor() as u32;
             g.menu.volume = Some(v);
             let f = v as f32 / 10.0;
             g.menu.lua.push(format!(
@@ -468,15 +468,15 @@ impl Editor {
             ));
             match g.audio.as_mut() {
                 Some(a) => a.set_master(f),
-                None => crate::audio::set_master_global(f),
+                None => rustudio_engine::audio::set_master_global(f),
             }
             // GameSettings.lua: each ValueChanged plays VolumeChangeSound
             // (rbxasset://sounds/uuhhh.mp3) from the start at Volume = level / 10.
             if changed {
-                if let Some(b) = crate::assets::resolve("rbxasset://sounds/uuhhh.mp3", None)
+                if let Some(b) = rustudio_core::assets::resolve("rbxasset://sounds/uuhhh.mp3", None)
                     .and_then(|p| std::fs::read(p).ok())
                 {
-                    let a = g.audio.get_or_insert_with(crate::audio::Audio::new);
+                    let a = g.audio.get_or_insert_with(rustudio_engine::audio::Audio::new);
                     let _ = a.play(u64::MAX, std::sync::Arc::new(b), f, 1.0, false, 0.0, Default::default());
                 }
             }
@@ -580,7 +580,7 @@ impl Editor {
             let icon_s = 24.0;
             let total = icon_s + 10.0 + galley.size().x;
             let x0 = r.center().x - total / 2.0;
-            crate::ti::paint(
+            rustudio_engine::ti::paint(
                 painter,
                 Rect::from_min_size(Pos2::new(x0, r.center().y - icon_s / 2.0), Vec2::splat(icon_s)),
                 icon,
@@ -714,7 +714,7 @@ impl Editor {
             MenuPage::Settings => self.menu_settings(ui, &p, view, top, interactive, asked),
             MenuPage::Captures => {
                 let c = Pos2::new(view.center().x, top.y + 120.0);
-                crate::ti::paint(&p, Rect::from_center_size(c, Vec2::splat(48.0)), "photo", white(0.5));
+                rustudio_engine::ti::paint(&p, Rect::from_center_size(c, Vec2::splat(48.0)), "photo", white(0.5));
                 p.text(
                     c + Vec2::new(0.0, 48.0),
                     egui::Align2::CENTER_CENTER,
@@ -872,9 +872,9 @@ impl Editor {
             _ => None,
         };
         let sens = num(ugs("MouseSensitivity")).unwrap_or(0.52);
-        let vol = num(ugs("MasterVolume")).unwrap_or(crate::audio::master_volume() as f64);
+        let vol = num(ugs("MasterVolume")).unwrap_or(rustudio_engine::audio::master_volume() as f64);
         let inverted = matches!(ugs("CameraYInverted"), Some(mlua::Value::Boolean(true)));
-        let full = self.ui.fullscreen;
+        let full = self.fullscreen;
         let label_f = font(&ctx, 16.0 * NOMINAL, Weight::Medium);
         let w = view.width();
         let row = |n: usize| Rect::from_min_size(top + Vec2::new(0.0, 50.0 * n as f32), Vec2::new(w, 50.0));
@@ -1091,7 +1091,7 @@ impl Editor {
                 white(if dim { 0.5 } else { 1.0 }),
             );
             if n < 3 {
-                crate::ti::paint(
+                rustudio_engine::ti::paint(
                     p,
                     Rect::from_center_size(Pos2::new(d.max.x - 20.0, d.center().y), Vec2::splat(18.0)),
                     "chevron-down",

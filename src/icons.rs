@@ -46,7 +46,7 @@ pub fn logo_rgba(size: u32) -> Vec<u8> {
 pub fn paint_class_icon(p: &Painter, r: Rect, class: &str) {
     if paint_part_icon(p, r, class, None) { return; }
     let (name, color) = crate::class_icons::icon_for(class);
-    crate::ti::paint(p, r.expand(1.0), name, color);
+    rustudio_engine::ti::paint(p, r.expand(1.0), name, color);
 }
 
 pub fn class_icon(ui: &mut egui::Ui, class: &str, size: f32) {

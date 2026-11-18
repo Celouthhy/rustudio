@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 /// Per-instance ids Studio makes fresh on every load or save.
 const VOLATILE: &[&str] = &["UniqueId", "HistoryId", "SourceAssetId", "Capabilities", "DefinesCapabilities"];
@@ -178,7 +178,7 @@ fn same(a: &str, b: &str) -> bool {
 /// Terrain voxels compared cell by cell (material, occupancy byte, water):
 /// None when they agree, else a summary of where they don't.
 fn voxel_diff(studio: &Variant, ours: Option<&Variant>) -> Option<String> {
-    use crate::terrain::Voxels;
+    use rustudio_core::terrain::Voxels;
     let bytes = |v: Option<&Variant>| match v {
         Some(Variant::BinaryString(b)) => Some(AsRef::<[u8]>::as_ref(b).to_vec()),
         _ => None,
@@ -219,7 +219,7 @@ fn voxel_diff(studio: &Variant, ours: Option<&Variant>) -> Option<String> {
 /// and how many cells have it (for working out how a template's terrain
 /// was made).
 pub fn voxel_layers(bytes: &[u8]) -> Vec<(i32, Vec<((u8, u8, u16), usize)>)> {
-    let v = crate::terrain::Voxels::decode(bytes).unwrap();
+    let v = rustudio_core::terrain::Voxels::decode(bytes).unwrap();
     let Some((lo, hi)) = v.bounds() else { return Vec::new() };
     (lo[1]..=hi[1])
         .map(|y| {
@@ -394,7 +394,7 @@ pub fn generate(base: &Document, others: &[(&str, &Document)]) -> String {
     let mut s = String::new();
     s.push_str("//! Studio's generic templates as rustudio builds them offline: generated\n");
     s.push_str("//! by `start_page::tests::generate_builtin_templates` from the DataModels\n");
-    s.push_str("//! Studio holds after opening each template place (offline Studio, File >\n");
+    s.push_str("//! Studio holds after opening each template place (File >\n");
     s.push_str("//! Save to File As). Only the values rustudio's class defaults don't give\n");
     s.push_str("//! are listed. Regenerate rather than edit.\n\n");
     s.push_str("use super::templates::{Inst, Patch, V::*};\n\n");

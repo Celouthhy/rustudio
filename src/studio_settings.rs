@@ -8,7 +8,7 @@
 //! labels, order and defaults are generated into studio_settings_schema.rs.
 //!
 //! One store for the process: the dialog edits it, settings().Studio and
-//! friends read and write it from Luau (src/domains/services.rs), and the
+//! friends read and write it from Luau (crates/rustudio-engine/src/domains/services.rs), and the
 //! editor reads the wired ones where it used fixed numbers before (camera
 //! speeds, selection / hover outline, script editor and Output fonts and
 //! colours, script timeout, soft snap margin, physics sleep, main volume…).
@@ -76,7 +76,7 @@ pub struct Def {
 /// The dialog's pages in order.
 pub const PAGES: &[&str] = &["Studio", "Selection", "Script Editor", "Diagnostics", "Network", "Physics", "Rendering"];
 
-/// The page after Studio's: rustudio's own options (src/rustudio_settings.rs).
+/// The page after Studio's: rustudio's own options (crates/rustudio-core/src/rustudio_settings.rs).
 pub const RUSTUDIO_PAGE: usize = PAGES.len();
 const RUSTUDIO_PAGE_NAME: &str = "rustudio";
 
@@ -115,7 +115,7 @@ impl Def {
 }
 
 fn default_dir(name: &str) -> String {
-    crate::paths::data().join("rustudio").join(name).display().to_string()
+    rustudio_core::paths::data().join("rustudio").join(name).display().to_string()
 }
 
 /// Index of (class, member) in DEFS.
@@ -149,12 +149,13 @@ fn store() -> &'static RwLock<Store> {
 }
 
 fn default_file() -> PathBuf {
-    crate::paths::config().join("rustudio").join("studio-settings.json")
+    rustudio_core::paths::config().join("rustudio").join("studio-settings.json")
 }
 
 /// Startup: a run a person drives reads and keeps the user's settings
 /// (RUSTUDIO_STUDIO_SETTINGS already chose a file otherwise).
 pub fn init(persist: bool) {
+    install_hooks();
     let mut s = store().write().unwrap();
     if s.file.is_none() && persist {
         let f = default_file();
@@ -163,6 +164,24 @@ pub fn init(persist: bool) {
     }
     drop(s);
     apply_all();
+}
+
+/// The hooks the code below studio reads this store through, installed once:
+/// the engine's settings() store and ScriptTimeoutLength
+/// (crates/rustudio-engine/src/domains/settings_host.rs) and the flag reader physics and Play use
+/// (`rustudio_settings::studio_flag`). Every start-up path that builds a
+/// runtime calls this (through `init`; `#[cfg(test)]` code that builds one
+/// without the app's start-up calls it too).
+pub fn install_hooks() {
+    // The engine's view of the store (settings() items and the runtime's
+    // ScriptTimeoutLength, crates/rustudio-engine/src/domains/settings_host.rs): this is that hook.
+    rustudio_engine::runtime::domains::settings_host::install(&HOST);
+    // Physics and Play read Studio Settings from below the engine crate
+    // through rustudio_settings (core): this is that reader.
+    rustudio_core::rustudio_settings::install_studio_flag(|class, prop| match get(class, prop) {
+        Some(Val::Bool(b)) => Some(b),
+        _ => None,
+    });
 }
 
 fn load_into(s: &mut Store, f: &std::path::Path) {
@@ -285,7 +304,7 @@ pub fn reset_all() {
 fn apply(i: usize) {
     let d = &DEFS[i];
     if (d.class, d.prop) == ("Studio", "Main Volume") {
-        crate::audio::set_studio_main(num("Studio", "Main Volume", 1.0) as f32);
+        rustudio_engine::audio::set_studio_main(num("Studio", "Main Volume", 1.0) as f32);
     }
 }
 
@@ -333,28 +352,40 @@ pub fn studio(prop: &str, or: f64) -> f64 {
 
 /// Studio Settings > Camera > Camera Speed: fly studs/s (mech::FLY_SPEED at 1.5).
 pub fn fly_speed() -> f32 {
-    crate::mech::FLY_BASE_STEP * studio("Camera Speed", crate::mech::CAMERA_SPEED as f64) as f32 * crate::mech::FLY_TICK_HZ
+    rustudio_core::mech::FLY_BASE_STEP * studio("Camera Speed", rustudio_core::mech::CAMERA_SPEED as f64) as f32 * rustudio_core::mech::FLY_TICK_HZ
 }
 
 /// Camera > Shift Speed: the wheel's studs per notch with Shift, and the
 /// fly speed factor with Shift.
 pub fn camera_shift_speed() -> f32 {
-    studio("Camera Shift Speed", crate::mech::FLY_SHIFT_FACTOR as f64) as f32
+    studio("Camera Shift Speed", rustudio_core::mech::FLY_SHIFT_FACTOR as f64) as f32
 }
 
 /// Camera > Scroll Speed: studs per wheel notch.
 pub fn camera_scroll_speed() -> f32 {
-    studio("Camera Mouse Wheel Speed", crate::mech::WHEEL_STEP as f64) as f32
+    studio("Camera Mouse Wheel Speed", rustudio_core::mech::WHEEL_STEP as f64) as f32
 }
 
 /// Camera > Scroll Towards Cursor Position.
 pub fn camera_zoom_to_mouse() -> bool {
-    flag("Studio", "Camera Zoom to Mouse Position", crate::mech::WHEEL_ZOOM_TO_MOUSE)
+    flag("Studio", "Camera Zoom to Mouse Position", rustudio_core::mech::WHEEL_ZOOM_TO_MOUSE)
 }
 
 /// Camera > Pan Speed (a factor, default 1).
 pub fn camera_pan_speed() -> f32 {
     studio("Camera Pan Speed", 1.0).max(0.0) as f32
+}
+
+/// The Camera page as the camera reads it (camera.rs takes a CameraPrefs:
+/// the store is not reachable from the renderer).
+pub fn camera_prefs() -> rustudio_render::camera::CameraPrefs {
+    rustudio_render::camera::CameraPrefs {
+        fly_speed: fly_speed(),
+        shift_speed: camera_shift_speed(),
+        scroll_speed: camera_scroll_speed(),
+        zoom_to_mouse: camera_zoom_to_mouse(),
+        pan_speed: camera_pan_speed(),
+    }
 }
 
 /// Script Editor > Theme: the colours the editor's highlighter uses.
@@ -389,12 +420,12 @@ pub fn script_colors() -> ScriptColors {
 
 /// Selection > Selection Line Thickness (2 = mech::SELECTION_OUTLINE_PX).
 pub fn selection_outline_px() -> f32 {
-    (crate::mech::SELECTION_OUTLINE_PX * studio("Selection Line Thickness", 2.0) as f32 / 2.0).clamp(0.0, 32.0)
+    (rustudio_core::mech::SELECTION_OUTLINE_PX * studio("Selection Line Thickness", 2.0) as f32 / 2.0).clamp(0.0, 32.0)
 }
 
 /// Selection > Hover Line Thickness (4 = mech::HOVER_OUTLINE_PX).
 pub fn hover_outline_px() -> f32 {
-    (crate::mech::HOVER_OUTLINE_PX * studio("Hover Line Thickness", 4.0) as f32 / 4.0).clamp(0.0, 32.0)
+    (rustudio_core::mech::HOVER_OUTLINE_PX * studio("Hover Line Thickness", 4.0) as f32 / 4.0).clamp(0.0, 32.0)
 }
 
 /// Studio shows Color3 as floor(c × 255).
@@ -572,7 +603,7 @@ impl Dialog {
         q.is_empty() || d.label.to_lowercase().contains(&q)
     }
 
-    fn matches_opt(&self, o: &crate::rustudio_settings::Opt) -> bool {
+    fn matches_opt(&self, o: &rustudio_core::rustudio_settings::Opt) -> bool {
         let q = self.search.trim().to_lowercase();
         q.is_empty() || o.label.to_lowercase().contains(&q) || RUSTUDIO_PAGE_NAME.contains(&q)
     }
@@ -618,7 +649,7 @@ impl Dialog {
         // Search bar (Studio: 26 px, the magnifier, "Search...").
         let sr = Rect::from_min_size(full.min + Vec2::new(0.0, 10.0), Vec2::new(full.width(), 26.0));
         p.rect_filled(sr, 0.0, c::SEARCH);
-        crate::ti::paint(&p, Rect::from_center_size(Pos2::new(sr.min.x + 15.0, sr.center().y), Vec2::splat(16.0)), "search", c::TEXT_DIM);
+        rustudio_engine::ti::paint(&p, Rect::from_center_size(Pos2::new(sr.min.x + 15.0, sr.center().y), Vec2::splat(16.0)), "search", c::TEXT_DIM);
         let te = Rect::from_min_max(Pos2::new(sr.min.x + 28.0, sr.min.y + 3.0), Pos2::new(sr.max.x - 26.0, sr.max.y - 3.0));
         let mut search = self.search.clone();
         ui.put(
@@ -633,7 +664,7 @@ impl Dialog {
         if !search.is_empty() {
             let xr = Rect::from_center_size(Pos2::new(sr.max.x - 14.0, sr.center().y), Vec2::splat(14.0));
             let x = ui.interact(xr, egui::Id::new("studio_settings_search_x"), Sense::click());
-            crate::ti::paint(&p, xr, "x", if x.hovered() { c::TEXT } else { c::TEXT_DIM });
+            rustudio_engine::ti::paint(&p, xr, "x", if x.hovered() { c::TEXT } else { c::TEXT_DIM });
             if x.clicked() {
                 search.clear();
             }
@@ -647,7 +678,7 @@ impl Dialog {
         let mut visible: Vec<usize> = (0..PAGES.len())
             .filter(|&i| DEFS.iter().any(|d| d.page == PAGES[i] && self.matches(d)))
             .collect();
-        if crate::rustudio_settings::OPTS.iter().any(|o| self.matches_opt(o)) {
+        if rustudio_core::rustudio_settings::OPTS.iter().any(|o| self.matches_opt(o)) {
             visible.push(RUSTUDIO_PAGE);
         }
         if !visible.contains(&self.page) {
@@ -809,7 +840,7 @@ impl Dialog {
                 let br = Rect::from_center_size(Pos2::new(vx + 10.0, r.center().y), Vec2::splat(15.0));
                 if *b {
                     p.rect_filled(br, 2.0, c::CHECK_ON);
-                    crate::ti::paint(&p, br.shrink(1.0), "check", c::CHECK_MARK);
+                    rustudio_engine::ti::paint(&p, br.shrink(1.0), "check", c::CHECK_MARK);
                 } else {
                     p.rect_filled(br, 2.0, c::CHECK_OFF);
                 }
@@ -826,6 +857,7 @@ impl Dialog {
                 let width = vr.width().clamp(140.0, 320.0);
                 let mut picked = None;
                 egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(vr.left_bottom()), ui.layer_id())
+                    .kind(egui::PopupKind::Menu)
                     .open_memory(None)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                     .width(width)
@@ -906,11 +938,11 @@ impl Dialog {
 const DESC_FONT: f32 = 11.0;
 
 impl Dialog {
-    /// rustudio's own options (src/rustudio_settings.rs): the grid's look,
+    /// rustudio's own options (crates/rustudio-core/src/rustudio_settings.rs): the grid's look,
     /// each row followed by its description; a row an environment variable
     /// overrides shows that and can't be changed.
     fn rustudio_grid(&mut self, ui: &mut egui::Ui) {
-        use crate::rustudio_settings::{self as rs, OptKind, Shown, OPTS};
+        use rustudio_core::rustudio_settings::{self as rs, OptKind, Shown, OPTS};
         let rows: Vec<usize> = (0..OPTS.len()).filter(|&i| self.matches_opt(&OPTS[i])).collect();
         let w = ui.available_width();
         let font = FontId::proportional(FONT);
@@ -974,7 +1006,7 @@ impl Dialog {
                     let on = if dim { c::TEXT_DIM } else { c::CHECK_ON };
                     if b {
                         p.rect_filled(br, 2.0, on);
-                        crate::ti::paint(&p, br.shrink(1.0), "check", c::CHECK_MARK);
+                        rustudio_engine::ti::paint(&p, br.shrink(1.0), "check", c::CHECK_MARK);
                     } else {
                         p.rect_filled(br, 2.0, c::CHECK_OFF);
                     }
@@ -992,6 +1024,7 @@ impl Dialog {
                     let width = vr.width().clamp(140.0, 320.0);
                     let mut picked = None;
                     egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(vr.left_bottom()), ui.layer_id())
+                        .kind(egui::PopupKind::Menu)
                         .open_memory(None)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                         .width(width)
@@ -1059,7 +1092,7 @@ impl Dialog {
 fn paint_category(ui: &egui::Ui, r: Rect, cat: &str, open: bool) {
     let p = ui.painter();
     let tri = Rect::from_center_size(Pos2::new(r.min.x + 9.0, r.center().y), Vec2::splat(12.0));
-    crate::ti::paint(p, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, c::TEXT);
+    rustudio_engine::ti::paint(p, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, c::TEXT);
     let mut job = egui::text::LayoutJob::default();
     job.append(
         cat,
@@ -1076,12 +1109,6 @@ fn paint_category(ui: &egui::Ui, r: Rect, cat: &str, open: bool) {
 }
 
 // ------------------------------------------------------------------ Luau (settings())
-
-/// The settings() items the dialog has rows for (their members go through
-/// the store; GameSettings, LuaSettings and TaskScheduler stay as they were).
-pub fn is_item_class(class: &str) -> bool {
-    matches!(class, "Studio" | "DebugSettings" | "NetworkSettings" | "PhysicsSettings" | "RenderSettings")
-}
 
 /// Reads settings().<item>.<member> for a row in the store: None for
 /// members the dialog doesn't have (the generic path answers those).
@@ -1105,17 +1132,18 @@ pub fn lua_get(lua: &mlua::Lua, class: &str, key: &str) -> mlua::Result<Option<m
         // Theme is a StudioTheme object and DisplayLanguage a string in
         // Studio; rustudio has neither object, so they're left unanswered.
         (Kind::Enum(en, _), Val::Enum(_)) if en == "StudioTheme" || en == "Language" => return Ok(None),
-        (Kind::Enum(en, _), Val::Enum(e)) => match crate::ltypes::LEnumItem::from_value(en, e) {
-            Some(item) => crate::ltypes::enum_value(lua, item)?,
+        (Kind::Enum(en, _), Val::Enum(e)) => match rustudio_engine::ltypes::LEnumItem::from_value(en, e) {
+            Some(item) => rustudio_engine::ltypes::enum_value(lua, item)?,
             None => return Ok(None),
         },
-        (Kind::Color, Val::Color(c)) => Value::UserData(lua.create_userdata(crate::ltypes::LColor3(c))?),
+        (Kind::Color, Val::Color(c)) => Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LColor3(c))?),
         (Kind::Str, Val::Str(s)) => Value::String(lua.create_string(s)?),
         _ => return Ok(None),
     }))
 }
 
-/// settings().<item>.<member> = value: Ok(true) when the store took it.
+/// settings().<item>.<member> = value: Ok(Some(changed)) when the store took
+/// it (changed: the stored value differs), None for a member without a row.
 pub fn lua_set(class: &str, key: &str, value: &mlua::Value) -> mlua::Result<Option<bool>> {
     use mlua::Value;
     let Some(i) = index(class, key) else { return Ok(None) };
@@ -1162,19 +1190,40 @@ pub fn lua_set(class: &str, key: &str, value: &mlua::Value) -> mlua::Result<Opti
             Val::Enum(e)
         }
         Kind::Color => match value {
-            Value::UserData(u) if u.borrow::<crate::ltypes::LColor3>().is_ok() => Val::Color(u.borrow::<crate::ltypes::LColor3>()?.0),
+            Value::UserData(u) if u.borrow::<rustudio_engine::ltypes::LColor3>().is_ok() => Val::Color(u.borrow::<rustudio_engine::ltypes::LColor3>()?.0),
             _ => return Err(bad("Color3")),
         },
     };
-    set(class, key, nv);
-    Ok(Some(true))
+    let changed = set(class, key, nv);
+    Ok(Some(changed))
+}
+
+/// The store as the engine sees it (crates/rustudio-engine/src/domains/settings_host.rs): the hook
+/// `init` installs, for the settings() items the `services` domain answers
+/// and the runtime's ScriptTimeoutLength. One for the process.
+struct Host;
+
+static HOST: Host = Host;
+
+impl rustudio_engine::runtime::domains::settings_host::StudioSettingsHost for Host {
+    fn lua_get(&self, lua: &mlua::Lua, class: &str, key: &str) -> mlua::Result<Option<mlua::Value>> {
+        lua_get(lua, class, key)
+    }
+
+    fn lua_set(&self, class: &str, key: &str, value: &mlua::Value) -> mlua::Result<Option<bool>> {
+        lua_set(class, key, value)
+    }
+
+    fn num(&self, class: &str, prop: &str, or: f64) -> f64 {
+        num(class, prop, or)
+    }
 }
 
 /// An EnumItem of `en`, its number, or an item's name.
 fn enum_from_lua(v: &mlua::Value, en: &str, items: &[(&str, u32, &str)]) -> Option<u32> {
     match v {
         mlua::Value::UserData(u) => {
-            let e = u.borrow::<crate::ltypes::LEnumItem>().ok()?;
+            let e = u.borrow::<rustudio_engine::ltypes::LEnumItem>().ok()?;
             (e.enum_type == en).then_some(e.value)
         }
         mlua::Value::Integer(n) => u32::try_from(*n).ok(),
@@ -1198,7 +1247,7 @@ mod tests {
         for d in DEFS {
             assert!(seen.insert((d.class, d.prop)), "{}.{} twice", d.class, d.prop);
             assert!(PAGES.contains(&d.page), "{}", d.page);
-            assert!(is_item_class(d.class), "{}", d.class);
+            assert!(rustudio_engine::runtime::domains::settings_host::is_item_class(d.class), "{}", d.class);
         }
         let count = |p: &str| DEFS.iter().filter(|d| d.page == p).count();
         assert_eq!(count("Selection"), 25);
@@ -1230,6 +1279,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_allow_sleep_false_keeps_dynamic_body_awake() {
+        use rustudio_core::doc::Document;
+        use rustudio_physics::physics::Physics;
+
+        // The overrides are process-global. Run each case in a fresh store.
+        if let Ok(expected) = std::env::var("RUSTUDIO_TEST_EXPECT_AWAKE") {
+            crate::studio_hooks::install();
+            let mut doc = Document::new_place();
+            let ws = doc.workspace().unwrap();
+            doc.set_prop_live(ws, rbx_dom_weak::ustr("Gravity"), rbx_dom_weak::types::Variant::Float32(0.0));
+            doc.dom.insert(ws, rbx_dom_weak::InstanceBuilder::new("Part")
+                .with_property("Anchored", false)
+                .with_property("CFrame", rbx_dom_weak::types::CFrame::new(
+                    rbx_dom_weak::types::Vector3::new(0.0, 20.0, 0.0),
+                    rbx_dom_weak::types::Matrix3::identity(),
+                )));
+            let mut physics = Physics::new(&mut doc);
+            assert_eq!(physics.awake(), 1);
+            for _ in 0..720 {
+                physics.step(&mut doc, 1.0 / 240.0);
+            }
+            assert_eq!(physics.awake(), expected.parse::<usize>().unwrap());
+            return;
+        }
+
+        let path = std::env::temp_dir().join(format!("rustudio-sleep-{}.json", std::process::id()));
+        for (allow_sleep, awake) in [(false, "1"), (true, "0")] {
+            std::fs::write(&path, format!(r#"{{"PhysicsSettings.AllowSleep":{allow_sleep}}}"#)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "studio_settings::tests::explicit_allow_sleep_false_keeps_dynamic_body_awake"])
+                .env("RUSTUDIO_STUDIO_SETTINGS", &path)
+                .env("RUSTUDIO_SOLVER", "rapier")
+                .env("RUSTUDIO_TEST_EXPECT_AWAKE", awake)
+                .output().unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
     /// settings() as Studio has it (Vinegar 0.747, checks/studio-settings/
     /// inventory.md): Instances, PluginSecurity members readable from the
     /// command bar, RobloxScript ones refused, writes reaching the store and
@@ -1237,10 +1327,10 @@ mod tests {
     /// kept out of settings() altogether.
     #[test]
     fn luau_settings_reads_and_writes_the_store() {
-        use crate::runtime::security::{with_main_identity, COMMAND, GAME};
-        let rt = crate::runtime::Runtime::new().unwrap();
-        let mut w = crate::runtime::World::new(crate::doc::Document::new_place(), crate::runtime::RunMode::Run);
-        w.side = crate::runtime::Side::Server;
+        use rustudio_engine::runtime::security::{with_main_identity, COMMAND, GAME};
+        let rt = crate::studio_hooks::new_runtime().unwrap();
+        let mut w = rustudio_engine::runtime::World::new(rustudio_core::doc::Document::new_place(), rustudio_engine::runtime::RunMode::Run);
+        w.side = rustudio_engine::runtime::Side::Server;
         rt.enter(w);
         rt.bind_globals().unwrap();
         let run = |id: u8, code: &str| -> String {

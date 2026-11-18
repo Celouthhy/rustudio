@@ -63,6 +63,8 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
         UNSUPPORTED.get_or_init(|| eprintln!("RUSTUDIO_GPU_TIMING: the adapter has no timestamp queries inside encoders"));
         return None;
     }
+    // The bench (core) asks for the timings through this callback.
+    rustudio_core::bench::set_gpu_timing(take);
     let bytes = MAX_QUERIES as u64 * 8;
     let slots = (0..RING)
         .map(|_| Slot {
@@ -97,6 +99,7 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
         totals: Vec::new(),
     })
 }
+
 
 fn write(st: &mut State, encoder: &mut wgpu::CommandEncoder) -> Option<u32> {
     let slot = &mut st.slots[st.cur?];

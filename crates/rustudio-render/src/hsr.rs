@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glam::{Vec2, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::scene::content_string;
 
 /// An HSR asset's blob, parsed.
@@ -126,7 +126,7 @@ fn load(id: u64) -> Result<Arc<Hsr>, String> {
     if let Some(h) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&id).cloned()) {
         return Ok(h);
     }
-    let bytes = crate::assets::public_cached(id)?;
+    let bytes = rustudio_core::assets::public_cached(id)?;
     let dom = Document::decode(&bytes)?;
     let inst = dom
         .descendants()
@@ -198,10 +198,10 @@ pub fn body_mesh(doc: &Document, part: Ref, mesh_id: &str) -> Look {
     let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()) else { return Look::None };
     let mut garments = Vec::new();
     for c in doc.dom.get_by_ref(model).map(|m| m.children().to_vec()).unwrap_or_default() {
-        if !doc.class_of(c).is_some_and(|k| crate::doc::is_a(&k, "Accoutrement")) {
+        if !doc.class_of(c).is_some_and(|k| rustudio_core::doc::is_a(&k, "Accoutrement")) {
             continue;
         }
-        let Some(h) = crate::default_scripts::child_named(doc, c, "Handle") else { continue };
+        let Some(h) = rustudio_core::default_scripts::child_named(doc, c, "Handle") else { continue };
         if !crate::wrap::is_layered_handle(doc, h) {
             continue;
         }
@@ -274,7 +274,7 @@ pub fn hidden_faces(body: &Hsr, mesh: u64, body_cage_uvs: &[Vec2], covered: &Has
 fn hidden_mesh(mesh_id: &str, body_hsr: u64, cage: &str, garments: &[Garment]) -> Result<Option<String>, String> {
     let mesh_no = asset_number(mesh_id).ok_or("no mesh id")?;
     let body = load(body_hsr)?;
-    let cage_uvs = raw_uvs(&crate::assets::content_blocking(cage)?).ok_or("cage format")?;
+    let cage_uvs = raw_uvs(&rustudio_core::assets::content_blocking(cage)?).ok_or("cage format")?;
     let mut covered = HashSet::new();
     for g in garments {
         let Ok(h) = load(g.hsr) else { continue };
@@ -282,7 +282,7 @@ fn hidden_mesh(mesh_id: &str, body_hsr: u64, cage: &str, garments: &[Garment]) -
         if g.mesh.is_none() || h.mesh_ids.first() != g.mesh.as_ref() {
             continue;
         }
-        let Some(uvs) = crate::assets::content_blocking(&g.inner).ok().and_then(|b| raw_uvs(&b)) else { continue };
+        let Some(uvs) = rustudio_core::assets::content_blocking(&g.inner).ok().and_then(|b| raw_uvs(&b)) else { continue };
         for (k, c) in h.covered.iter().enumerate() {
             if *c {
                 if let Some(uv) = uvs.get(k) {
@@ -295,8 +295,8 @@ fn hidden_mesh(mesh_id: &str, body_hsr: u64, cage: &str, garments: &[Garment]) -
     if !hide.iter().any(|h| *h) {
         return Ok(None);
     }
-    let bytes = crate::assets::content_blocking(mesh_id)?;
-    let m = crate::mesh::parse(&bytes)?;
+    let bytes = rustudio_core::assets::content_blocking(mesh_id)?;
+    let m = rustudio_core::mesh::parse(&bytes)?;
     if m.skin.is_some() {
         // (skinned body meshes keep every face: the skinning pass reads
         // the mesh by its own id)
@@ -335,7 +335,7 @@ fn hidden_mesh(mesh_id: &str, body_hsr: u64, cage: &str, garments: &[Garment]) -
     }
     let hash = blake3::hash(&b).to_hex().to_string();
     let id = format!("rbxtemp://rustudio/hsr/{}", &hash[..32]);
-    crate::assets::register_generated(&id, b);
+    rustudio_core::assets::register_generated(&id, b);
     Ok(Some(id))
 }
 
@@ -398,7 +398,7 @@ mod probe {
     #[ignore]
     fn wrap_props() {
         let Ok(p) = std::env::var("HSR_PROBE") else { return };
-        let dom = crate::doc::Document::decode(&std::fs::read(p).unwrap()).unwrap();
+        let dom = rustudio_core::doc::Document::decode(&std::fs::read(p).unwrap()).unwrap();
         for i in dom.descendants() {
             if i.class == "WrapTarget" || i.class == "WrapLayer" {
                 let mut k: Vec<String> = i.properties.iter().map(|(n, v)| format!("{n}={v:?}")).collect();

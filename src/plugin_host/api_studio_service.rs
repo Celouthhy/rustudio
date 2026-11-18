@@ -45,7 +45,7 @@ fn has_icon(class: &str) -> bool {
 }
 
 fn is_class(name: &str) -> bool {
-    crate::doc::db().classes.contains_key(name) || crate::api::get().is_some_and(|a| a.classes.contains_key(name))
+    rustudio_core::doc::db().classes.contains_key(name) || rustudio_core::api::get().is_some_and(|a| a.classes.contains_key(name))
 }
 
 /// Files PromptImportFile handed out: File instance → its path.
@@ -60,7 +60,7 @@ fn files(lua: &Lua) -> mlua::AppDataRefMut<'_, Files> {
 }
 
 fn vector2(lua: &Lua, x: f32, y: f32) -> mlua::Result<Value> {
-    Ok(Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(x, y)))?))
+    Ok(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::new(x, y)))?))
 }
 
 pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
@@ -100,7 +100,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
             // and meshes a plugin previews with it).
             let id = format!("rbxtemp://{}", this_id(this));
             if let Ok(b) = std::fs::read(&path) {
-                crate::assets::register_generated(&id, b);
+                rustudio_core::assets::register_generated(&id, b);
             }
             ret1(lstr(lua, &id)?)
         })(),
@@ -202,7 +202,7 @@ fn filters(v: &Value) -> mlua::Result<Vec<String>> {
 fn prompt_open(lua: &Lua, (kind, a, b): (String, Value, Value)) -> mlua::Result<(Option<u64>, Option<String>)> {
     match prompt_open_inner(lua, (kind, a, b)) {
         Ok(id) => Ok((Some(id), None)),
-        Err(e) => Ok((None, Some(crate::runtime::describe_error(&e)))),
+        Err(e) => Ok((None, Some(rustudio_engine::runtime::describe_error(&e)))),
     }
 }
 
@@ -222,7 +222,7 @@ fn prompt_open_inner(_lua: &Lua, (kind, a, b): (String, Value, Value)) -> mlua::
                 Value::String(s) => s.to_string_lossy(),
                 v => return Err(rt_err(format!("Unable to cast {} to string", v.type_name()))),
             };
-            if crate::ltypes::LEnumItem::from_name("AssetType", &t).is_none() {
+            if rustudio_engine::ltypes::LEnumItem::from_name("AssetType", &t).is_none() {
                 return Err(rt_err("Requested asset type is not supported."));
             }
             PromptKind::ExistingAssetId { asset_type: t }
@@ -282,7 +282,7 @@ fn prompt_poll(lua: &Lua, (id, kind, a_arg, extra): (u64, String, Value, Value))
             if let Some(p) = paths.into_iter().next() {
                 let sel: Vec<Ref> = world(lua)?.d().selection.clone();
                 if let Err(e) = world(lua)?.d().save_selection_to(&sel, &p) {
-                    world(lua)?.output.push((crate::app::Level::Error, format!("Save failed: {e}")));
+                    world(lua)?.output.push((rustudio_core::log::Level::Error, format!("Save failed: {e}")));
                 }
             }
             vec![Value::Boolean(true)]
@@ -297,7 +297,7 @@ fn prompt_poll(lua: &Lua, (id, kind, a_arg, extra): (u64, String, Value, Value))
 }
 
 /// ImportFbxAnimation: the file's animation as a KeyframeSequence in
-/// Workspace (src/fbx_anim.rs, api_fbx_anim.rs). After the pick, a rig
+/// Workspace (crates/rustudio-core/src/fbx_anim.rs, api_fbx_anim.rs). After the pick, a rig
 /// that isn't a Model is refused (Studio, measured with a Part); any file
 /// Studio can't read gives "Import failed".
 fn import_anim(lua: &Lua, path: &std::path::Path, rig: &Value, is_r15: &Value) -> Result<Value, String> {
@@ -307,8 +307,8 @@ fn import_anim(lua: &Lua, path: &std::path::Path, rig: &Value, is_r15: &Value) -
         return Err("A Model rig must be passed as the first argument".into());
     }
     let r15 = !matches!(is_r15, Value::Boolean(false));
-    let bytes = std::fs::read(path).map_err(|_| crate::fbx_anim::IMPORT_FAILED.to_string())?;
-    let clip = crate::fbx_anim::read(&bytes, r15)?;
+    let bytes = std::fs::read(path).map_err(|_| rustudio_core::fbx_anim::IMPORT_FAILED.to_string())?;
+    let clip = rustudio_core::fbx_anim::read(&bytes, r15)?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let r = super::fbx_anim::build(lua, &clip, &stem, r15)?;
     let v = inst_value(lua, r).map_err(|e| e.to_string())?;
@@ -323,10 +323,10 @@ fn import_anim(lua: &Lua, path: &std::path::Path, rig: &Value, is_r15: &Value) -
 }
 
 /// ImportFbxRig: the file's meshes as a parentless Model (rustudio's FBX
-/// importer, src/fbx.rs).
+/// importer, crates/rustudio-core/src/fbx.rs).
 fn import_3d(lua: &Lua, path: &std::path::Path, rig: bool, _extra: &Value) -> Result<Value, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-    if !crate::fbx::is_fbx(&bytes) {
+    if !rustudio_core::fbx::is_fbx(&bytes) {
         return Err("Unsupported file format".into());
     }
     if !rig {
@@ -338,7 +338,7 @@ fn import_3d(lua: &Lua, path: &std::path::Path, rig: bool, _extra: &Value) -> Re
         bytes.hash(&mut h);
         h.finish() >> 8
     };
-    let r = crate::runtime::ext::load_fbx(lua, id, &bytes).map_err(|e| e.to_string())?;
+    let r = rustudio_engine::runtime::ext::load_fbx(lua, id, &bytes).map_err(|e| e.to_string())?;
     if let Ok(mut w) = world(lua) {
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         if let Some(i) = w.dm().dom.get_by_ref_mut(r) {

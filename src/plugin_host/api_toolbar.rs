@@ -179,7 +179,7 @@ pub fn button_label(text: &str, id: &str, tooltip: &str) -> String {
 /// load order, each plugin's toolbars by name, buttons in creation order.
 /// `doc` is the document the VM's objects are in (the edit document, or a
 /// Play side's); a destroyed button keeps its last known look.
-pub fn ribbon(lua: &Lua, doc: &crate::doc::Document) -> Vec<RibbonGroup> {
+pub fn ribbon(lua: &Lua, doc: &rustudio_core::doc::Document) -> Vec<RibbonGroup> {
     let Some(v) = lua.app_data_ref::<vm::PluginVm>() else { return Vec::new() };
     let mut out = Vec::new();
     for p in &v.plugins {

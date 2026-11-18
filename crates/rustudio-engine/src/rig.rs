@@ -12,16 +12,21 @@ use glam::{Mat3, Vec3};
 use rbx_dom_weak::types::{CFrame, Color3uint8, Enum, Ref, Variant, Vector3};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 
-use crate::doc::{self, Document};
+use rustudio_core::body::{joint_frames, limb_of, Limb};
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::{cf_inv, cf_mul};
-use crate::math::Xform;
-use crate::mech;
-use crate::scene::{f32_of, vec3_of};
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
+use rustudio_render::scene::{f32_of, vec3_of};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RigType {
-    R6,
-    R15,
+pub use rustudio_core::rig_type::RigType;
+
+/// Whether a character part collides on Studio's spawned character.
+pub fn studio_collides(name: &str, rig: RigType) -> bool {
+    match rig {
+        RigType::R15 => matches!(name, "HumanoidRootPart" | "UpperTorso" | "LowerTorso" | "Head"),
+        RigType::R6 => matches!(name, "Torso" | "Head"),
+    }
 }
 
 /// Body colours (Roblox BodyColors), as RGB.
@@ -125,17 +130,6 @@ pub(crate) fn proportion_target(name: &str, proportion: f32, body_type: f32) -> 
     Vec3::ONE.lerp(n.lerp(sl, proportion), body_type)
 }
 
-/// Which body colour a part takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Limb {
-    Head,
-    Torso,
-    LeftArm,
-    RightArm,
-    LeftLeg,
-    RightLeg,
-    Root,
-}
 
 /// A body part of the default rig: name, size, centre (relative to the
 /// HumanoidRootPart centre), colour slot.
@@ -753,7 +747,7 @@ fn cframe12(c: [f32; 12]) -> CFrame {
 /// The Studio install's default character file for a rig type
 /// (content/avatar, read only).
 pub fn studio_character_file(rig: RigType) -> Option<std::path::PathBuf> {
-    let dir = crate::default_scripts::studio_dir()?.join("content/avatar");
+    let dir = rustudio_core::default_scripts::studio_dir()?.join("content/avatar");
     let p = match rig {
         RigType::R15 => dir.join("characterR15DynamicHeadV2.rbxm"),
         RigType::R6 => dir.join("character.rbxm"),
@@ -783,23 +777,6 @@ fn set(dom: &mut rbx_dom_weak::WeakDom, r: Ref, key: &str, v: impl Into<Variant>
     }
 }
 
-/// Which body colour an R6 / R15 part name takes.
-/// A character body part's name (R6 or R15, Head included).
-pub fn is_body_part_name(name: &str) -> bool {
-    limb_of(name).is_some()
-}
-
-fn limb_of(name: &str) -> Option<Limb> {
-    Some(match name {
-        "Head" => Limb::Head,
-        "Torso" | "UpperTorso" | "LowerTorso" => Limb::Torso,
-        "Left Arm" | "LeftUpperArm" | "LeftLowerArm" | "LeftHand" => Limb::LeftArm,
-        "Right Arm" | "RightUpperArm" | "RightLowerArm" | "RightHand" => Limb::RightArm,
-        "Left Leg" | "LeftUpperLeg" | "LeftLowerLeg" | "LeftFoot" => Limb::LeftLeg,
-        "Right Leg" | "RightUpperLeg" | "RightLowerLeg" | "RightFoot" => Limb::RightLeg,
-        _ => return None,
-    })
-}
 
 /// Inserts a character Model under `parent`: Roblox's own default body from
 /// the Studio install when there is one (real body-part meshes, cages,
@@ -915,8 +892,8 @@ fn studio_character(
                         _ => None,
                     },
                 )
-                .and_then(|s| crate::assets::asset_ref(&s));
-            let keep_v2 = head_mesh.is_some_and(|a| crate::assets::reachable(a.id));
+                .and_then(|s| rustudio_core::assets::asset_ref(&s));
+            let keep_v2 = head_mesh.is_some_and(|a| rustudio_core::assets::reachable(a.id));
             if let Some(old) = dom_child(dom, m, "Head").filter(|_| !keep_v2) {
                 if let Some(new) = take_from_file(&head_file, dom, m, "MeshPart") {
                     if let Some(neck) = dom_child(dom, old, "Neck") {
@@ -1132,7 +1109,7 @@ pub fn root_height(doc: &Document, model: Ref) -> f32 {
         .and_then(|r| vec3_of(doc.prop(r, "Size")))
         .map(|s| s.y * 0.5)
         .unwrap_or(1.0);
-    let r6 = humanoid.is_some_and(|h| crate::scene::enum_u32(doc.prop(h, "RigType")) == Some(0));
+    let r6 = humanoid.is_some_and(|h| rustudio_render::scene::enum_u32(doc.prop(h, "RigType")) == Some(0));
     // R6 characters stand on 2-stud legs below a 2-stud torso.
     if r6 {
         half + 2.0
@@ -1255,11 +1232,11 @@ impl Rig {
             // (AnimationConstraint is the rig's own; the rest hold parts
             // rigidly. Parts are read alias-aware: a live Team Create place
             // keeps a WeldConstraint's as Part0Internal / Part1Internal.)
-            let rigid = i.class != "AnimationConstraint" && crate::physics::is_rigid_joint(&i.class);
-            if !rigid || motors.contains(&i.referent()) || !crate::physics::joint_enabled(doc, i.referent()) {
+            let rigid = i.class != "AnimationConstraint" && rustudio_core::body::is_rigid_joint(&i.class);
+            if !rigid || motors.contains(&i.referent()) || !rustudio_core::body::joint_enabled(doc, i.referent()) {
                 continue;
             }
-            if let Some((a, b)) = crate::physics::joint_parts(doc, i.referent()) {
+            if let Some((a, b)) = rustudio_core::body::joint_parts(doc, i.referent()) {
                 edges.push((a, b));
             }
         }
@@ -1443,68 +1420,11 @@ pub fn write_pose(doc: &mut Document, pose: &[(Ref, Xform)], map: Option<&HashMa
     }
 }
 
-/// Humanoid states this simulation produces (Enum.HumanoidStateType names).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Running,
-    Jumping,
-    Freefall,
-    Landed,
-    Dead,
-    Seated,
-    Climbing,
-    Swimming,
-    FallingDown,
-    GettingUp,
-    PlatformStanding,
-    Ragdoll,
-    Physics,
-}
-
-impl State {
-    /// From an Enum.HumanoidStateType name (the states this simulation has).
-    pub fn from_name(n: &str) -> Option<State> {
-        Some(match n {
-            "Running" | "RunningNoPhysics" => State::Running,
-            "Jumping" => State::Jumping,
-            "Freefall" => State::Freefall,
-            "Landed" => State::Landed,
-            "Dead" => State::Dead,
-            "Seated" => State::Seated,
-            "Climbing" => State::Climbing,
-            "Swimming" => State::Swimming,
-            "FallingDown" => State::FallingDown,
-            "GettingUp" => State::GettingUp,
-            "PlatformStanding" => State::PlatformStanding,
-            "Ragdoll" => State::Ragdoll,
-            "Physics" => State::Physics,
-            _ => return None,
-        })
-    }
-
-    pub fn enum_name(self) -> &'static str {
-        match self {
-            State::Running => "Running",
-            State::Jumping => "Jumping",
-            State::Freefall => "Freefall",
-            State::Landed => "Landed",
-            State::Dead => "Dead",
-            State::Seated => "Seated",
-            State::Climbing => "Climbing",
-            State::Swimming => "Swimming",
-            State::FallingDown => "FallingDown",
-            State::GettingUp => "GettingUp",
-            State::PlatformStanding => "PlatformStanding",
-            State::Ragdoll => "Ragdoll",
-            State::Physics => "Physics",
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::xform_of;
+    use rustudio_render::scene::xform_of;
 
     fn spawn(rig: RigType) -> (Document, Ref) {
         let mut d = Document::new_place();
@@ -1940,33 +1860,6 @@ fn add_r15_no_collisions(dom: &mut rbx_dom_weak::WeakDom, model: Ref) {
     }
 }
 
-/// A joint's two parts and frames, for every class that holds parts by a
-/// C0 / C1 pair: JointInstances by Part0 / Part1 / C0 / C1, an
-/// AnimationConstraint by its attachments (Studio derives its Part0 /
-/// Part1 / C0 / C1 from them).
-pub fn joint_frames(doc: &Document, r: Ref) -> Option<(Ref, Ref, Xform, Xform)> {
-    let i = doc.dom.get_by_ref(r)?;
-    let refp = |k: &str| match i.properties.get(&ustr(k)) {
-        Some(Variant::Ref(x)) if x.is_some() && doc.dom.get_by_ref(*x).is_some() => Some(*x),
-        _ => None,
-    };
-    let cf = |x: Ref, k: &str| match doc.dom.get_by_ref(x).and_then(|i| i.properties.get(&ustr(k))) {
-        Some(Variant::CFrame(c)) => Xform::from_cframe(c),
-        _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
-    };
-    if i.class == "AnimationConstraint" {
-        if let (Some(a0), Some(a1)) = (refp("Attachment0"), refp("Attachment1")) {
-            let p0 = doc.dom.get_by_ref(a0)?.parent();
-            let p1 = doc.dom.get_by_ref(a1)?.parent();
-            let part = |p: Ref| doc.class_of(p).is_some_and(|k| doc::is_a(&k, "BasePart"));
-            if part(p0) && part(p1) {
-                return Some((p0, p1, cf(a0, "CFrame"), cf(a1, "CFrame")));
-            }
-            return None;
-        }
-    }
-    Some((refp("Part0")?, refp("Part1")?, cf(r, "C0"), cf(r, "C1")))
-}
 
 /// Joint classes posed by an Animator through Transform.
 pub fn is_animated_joint(class: &str) -> bool {

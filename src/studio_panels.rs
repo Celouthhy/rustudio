@@ -15,7 +15,7 @@ use rbx_dom_weak::types::{Enum, Ref, Variant};
 
 use crate::app::Editor;
 use crate::studio_ui::InsertPopup;
-use crate::theme;
+use rustudio_engine::theme;
 
 #[derive(Default, Clone)]
 pub struct ClassMeta {
@@ -28,7 +28,7 @@ pub fn class_meta() -> &'static HashMap<String, ClassMeta> {
     static M: OnceLock<HashMap<String, ClassMeta>> = OnceLock::new();
     M.get_or_init(|| {
         let mut out = HashMap::new();
-        let Some(dir) = crate::default_scripts::studio_dir() else {
+        let Some(dir) = rustudio_core::default_scripts::studio_dir() else {
             return out;
         };
         let Ok(text) = std::fs::read_to_string(dir.join("ReflectionMetadata.xml")) else {
@@ -67,7 +67,7 @@ pub fn member_meta() -> &'static HashMap<(String, String), (Option<i32>, bool)> 
     static M: OnceLock<HashMap<(String, String), (Option<i32>, bool)>> = OnceLock::new();
     M.get_or_init(|| {
         let mut out = HashMap::new();
-        let Some(dir) = crate::default_scripts::studio_dir() else {
+        let Some(dir) = rustudio_core::default_scripts::studio_dir() else {
             return out;
         };
         let Ok(text) = std::fs::read_to_string(dir.join("ReflectionMetadata.xml")) else {
@@ -109,14 +109,14 @@ const AVATAR_TYPES: [(&str, u32, &str); 3] = [
 
 impl Editor {
     fn starter_player(&self) -> Option<Ref> {
-        let root = self.doc.dom.root_ref();
-        self.doc.find_child(root, "StarterPlayer")
+        let root = self.game.doc.dom.root_ref();
+        self.game.doc.find_child(root, "StarterPlayer")
     }
 
     /// The place's avatar type (StarterPlayer.GameSettingsAvatar), Studio's default R15.
     pub fn avatar_type(&self) -> u32 {
         self.starter_player()
-            .and_then(|sp| crate::scene::enum_u32(self.doc.prop(sp, "GameSettingsAvatar")))
+            .and_then(|sp| rustudio_render::scene::enum_u32(self.game.doc.prop(sp, "GameSettingsAvatar")))
             .unwrap_or(1)
     }
 
@@ -131,7 +131,7 @@ impl Editor {
         }
         if let Some(sp) = self.starter_player() {
             let edit = vec![(sp, rbx_dom_weak::ustr("GameSettingsAvatar"), Variant::Enum(Enum::from_u32(v)))];
-            self.doc.set_props("Avatar Type", edit, None);
+            self.game.doc.set_props("Avatar Type", edit, None);
         }
     }
 
@@ -147,7 +147,7 @@ impl Editor {
         ui.add_space(6.0);
         let cur = self.avatar_type();
         let has_sp = self.starter_player().is_some();
-        ui.add_enabled_ui(has_sp && self.play.is_none(), |ui| {
+        ui.add_enabled_ui(has_sp && self.game.play.is_none(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Avatar Type");
                 for (label, v, tip) in AVATAR_TYPES {
@@ -162,8 +162,8 @@ impl Editor {
         if !has_sp {
             ui.label(RichText::new("This place has no StarterPlayer.").color(theme::WARN));
         }
-        let (rig, source) = self.rig_choice();
-        let name = if rig == crate::rig::RigType::R15 { "R15" } else { "R6" };
+        let (rig, source) = self.game.rig_choice();
+        let name = if rig == rustudio_engine::rig::RigType::R15 { "R15" } else { "R6" };
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Next Play: {name} (from the {})", source.label()))
@@ -178,7 +178,7 @@ impl Editor {
             parent,
             at,
             query: String::new(),
-            opened_frame: self.frame_no,
+            opened_frame: self.game.frame_no,
         });
     }
 
@@ -202,16 +202,16 @@ impl Editor {
                             .desired_width(230.0),
                     );
                     self.ui_rects.insert("insert.search", r.rect);
-                    if pop.opened_frame + 1 >= self.frame_no {
+                    if pop.opened_frame + 1 >= self.game.frame_no {
                         r.request_focus();
                     }
                     let q = pop.query.to_lowercase();
                     let meta = class_meta();
-                    let mut classes: Vec<&str> = crate::doc::db()
+                    let mut classes: Vec<&str> = rustudio_core::doc::db()
                         .classes
                         .keys()
                         .copied()
-                        .filter(|c| crate::doc::is_creatable(c) && c.to_lowercase().contains(&q))
+                        .filter(|c| rustudio_core::doc::is_creatable(c) && c.to_lowercase().contains(&q))
                         .collect();
                     let cat = |c: &str| {
                         meta.get(c)
@@ -260,7 +260,7 @@ impl Editor {
             });
         let outside = ctx.input(|i| i.pointer.any_pressed())
             && !ctx.pointer_interact_pos().is_some_and(|p| area.response.rect.contains(p))
-            && pop.opened_frame + 1 < self.frame_no;
+            && pop.opened_frame + 1 < self.game.frame_no;
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || outside {
             close = true;
         }

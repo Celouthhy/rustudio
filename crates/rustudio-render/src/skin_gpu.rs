@@ -22,7 +22,7 @@ use glam::Vec3;
 use egui_wgpu::wgpu;
 use wgpu::util::DeviceExt;
 
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 const SHADER: &str = r#"
 struct Params {
@@ -163,7 +163,7 @@ impl SkinGpu {
             usage: wgpu::BufferUsages::STORAGE,
         });
         self.bytes += (data.len() * 16) as u64;
-        crate::bench::add("skin_upload_bytes", 0.0, (data.len() * 16) as u64);
+        rustudio_core::bench::add("skin_upload_bytes", 0.0, (data.len() * 16) as u64);
         let s = Arc::new(Source { buf, corners: n as u32 });
         self.sources.insert(key.to_string(), s.clone());
         s
@@ -241,7 +241,7 @@ impl SkinGpu {
         ];
         queue.write_buffer(&job.params, 0, bytemuck::cast_slice(&params));
         self.bytes += 80;
-        crate::bench::add("skin_upload_bytes", 0.0, rows.len() as u64 * 16 + 80);
+        rustudio_core::bench::add("skin_upload_bytes", 0.0, rows.len() as u64 * 16 + 80);
         if !self.due.contains(&slot) {
             self.due.push(slot);
         }

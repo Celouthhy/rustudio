@@ -13,7 +13,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 /// Parts per wave, waves.
 const PER_WAVE: usize = 1000;
@@ -109,20 +109,20 @@ impl SelfTest {
             ed.set_document(doc);
             self.gc = GcTest {
                 t0: Some(std::time::Instant::now()),
-                mark: ed.log.len(),
+                mark: ed.game.log.len(),
                 ..Default::default()
             };
-            ed.start_play(crate::runtime::RunMode::Run);
+            ed.start_play(rustudio_engine::runtime::RunMode::Run);
             self.r4.phase = 241;
             return false;
         }
-        let lines: Vec<String> = ed.log[self.gc.mark.min(ed.log.len())..]
+        let lines: Vec<String> = ed.game.log[self.gc.mark.min(ed.game.log.len())..]
             .iter()
             .filter(|l| l.text.contains("GCTEST"))
             .map(|l| l.text.clone())
             .collect();
-        let tree = ed.doc.dom.descendants().count();
-        let counts = ed.play.as_ref().map(|s| s.gc_counts());
+        let tree = ed.game.doc.dom.descendants().count();
+        let counts = ed.game.play.as_ref().map(|s| s.gc_counts());
         if self.gc.base.is_none() {
             if let (Some(l), Some((_, _, slots))) = (lines.iter().find(|l| l.contains("base")), counts) {
                 self.gc.base = Some((tree, slots, kb(l)));

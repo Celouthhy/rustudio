@@ -1,30 +1,29 @@
 [workspace]
-members = [".", "crates/rustudio-account", "crates/rustudio-net"]
+members = [".", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.2.6"
+version = "0.3.0"
 
 [package]
 name = "rustudio"
-description = "A native Linux/Windows game editor for Roblox place and model files"
+description = "A native game editor for Roblox place and model files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 default-run = "rustudio"
 
-[features]
-# `cargo test --features skip-physics-tests`: leaves out physics.rs's test module, which
-# does not compile (mech items the capsule deletion removed), so the other tests can run.
-skip-physics-tests = []
-
 [dependencies]
 rustudio-account = { path = "crates/rustudio-account" }
+rustudio-core = { path = "crates/rustudio-core" }
+rustudio-physics = { path = "crates/rustudio-physics" }
+rustudio-render = { path = "crates/rustudio-render" }
+rustudio-engine = { path = "crates/rustudio-engine" }
+rustudio-player = { path = "crates/rustudio-player" }
 rustudio-net = { path = "crates/rustudio-net" }
 libc = "0.2"
-gilrs = "0.11"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }
 winit = { version = "0.30", default-features = false }
 egui = "0.36"
@@ -88,6 +87,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSMenu", "NSMenuItem", "NSEvent"] }
 
 [dev-dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+skrifa = "0.44"
+syn = "2"
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }
 
 [patch.crates-io]

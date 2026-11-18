@@ -1,5 +1,5 @@
 //! RUSTUDIO_SOLVER=studio: the player's character and the client's own loose parts
-//! (round HANG, solver/JOINTS-NOTES.md).
+//! (round HANG, Studio observations).
 //!
 //! A LocalScript that clones a part, destroys the original and unanchors the clone
 //! makes a part only the client has (client-side object scripts: a rope
@@ -52,7 +52,7 @@ fn debug() -> bool {
 /// RUSTUDIO_NO_CLIENT_LINK=1 or the rustudio option: off (A/B and perf
 /// checks; the studio path as before).
 pub fn off() -> bool {
-    !crate::rustudio_settings::client_link()
+    !rustudio_core::rustudio_settings::client_link()
 }
 const NEAR_LEAD_S: f32 = 0.25;
 /// Studs around the character within which a client part's static copy is kept,
@@ -336,7 +336,7 @@ impl Physics {
         let centre = gv(pbb.center().into());
         let jumped = self.link.statics_at.is_none_or(|c| (c - centre).length() > STATIC_MARGIN * 0.5);
         if frame % STATIC_EVERY == 1 || self.link.statics.is_empty() || jumped {
-            let _s = crate::bench::scope("pl_static_scan");
+            let _s = rustudio_core::bench::scope("pl_static_scan");
             self.link.statics_at = Some(centre);
             let area = pbb.loosened(STATIC_MARGIN + pspeed * STATIC_LEAD_S);
             // (The client world's broad phase: a walk over every part was ~5 ms a
@@ -360,8 +360,8 @@ impl Physics {
         }
         // Copies whose part went (or changed in the client's world): gone or rebuilt;
         // the rest where the part is now (a tweened anchored part).
-        let _t = crate::bench::scope("pl_static_track");
-        crate::bench::add("pl_statics", 0.0, self.link.statics.len() as u64);
+        let _t = rustudio_core::bench::scope("pl_static_track");
+        rustudio_core::bench::add("pl_statics", 0.0, self.link.statics.len() as u64);
         let mut stale: Vec<Ref> = Vec::new();
         for (r, sc) in &self.link.statics {
             match cp.parts.get(r) {

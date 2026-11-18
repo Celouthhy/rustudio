@@ -1,7 +1,7 @@
 //! Engine API domain: players_chat (Player, Players, StarterPlayer, Teams,
 //! the legacy Chat service, TextChatService and its whole TextChat stack,
 //! LocalizationService / LocalizationTable / Translator, PlayerViewService).
-//! See src/domains/mod.rs for the hook contract and
+//! See crates/rustudio-engine/src/domains/mod.rs for the hook contract and
 //! checks/parity/players_chat.md for what was measured in Studio.
 //!
 //! Studio-mode behaviour, where Roblox's backend can't be used for real:
@@ -265,7 +265,7 @@ fn side_name(lua: &Lua) -> mlua::Result<&'static str> {
 
 fn deprecated_persistence(lua: &Lua) -> mlua::Result<()> {
     world(lua)?.output.push((
-        crate::app::Level::Warn,
+        rustudio_core::log::Level::Warn,
         "DataPersistence is deprecated, please use DataStoreService instead.".into(),
     ));
     Ok(())
@@ -286,7 +286,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         return None;
     }
     let class = inst_meta(lua, this).map(|m| m.0).unwrap_or_default();
-    if !METHODS.iter().any(|(m, b)| *m == name && crate::doc::is_a(&class, b)) {
+    if !METHODS.iter().any(|(m, b)| *m == name && rustudio_core::doc::is_a(&class, b)) {
         return None;
     }
     Some(call_inner(lua, name, this, args))
@@ -299,7 +299,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
             let is_part = part.is_some_and(|p| {
                 world(lua)
                     .ok()
-                    .and_then(|w| w.d().class_of(p).map(|c| crate::doc::is_a(&c, "BasePart")))
+                    .and_then(|w| w.d().class_of(p).map(|c| rustudio_core::doc::is_a(&c, "BasePart")))
                     .unwrap_or(false)
             });
             let streaming = {
@@ -723,7 +723,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 k.push(msg.clone());
             }
             world(lua)?.output.push((
-                crate::app::Level::Info,
+                rustudio_core::log::Level::Info,
                 if msg.is_empty() {
                     "You have been kicked by this experience or its moderators.".to_string()
                 } else {
@@ -835,7 +835,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     let f: Option<Function> = lua.globals().get("__rs_pc_step").ok();
     if let Some(f) = f {
         if let Err(e) = f.call::<()>(()) {
-            world(lua)?.output.push((crate::app::Level::Error, crate::runtime::error_message(&e)));
+            world(lua)?.output.push((rustudio_core::log::Level::Error, crate::runtime::error_message(&e)));
         }
     }
     Ok(())
@@ -922,7 +922,7 @@ pub fn server_receive(lua: &Lua, player: Ref, channel: Ref, m: &Outgoing) -> Vec
         Ok(v) => v,
         Err(e) => {
             if let Ok(mut w) = world(lua) {
-                w.output.push((crate::app::Level::Error, crate::runtime::error_message(&e)));
+                w.output.push((rustudio_core::log::Level::Error, crate::runtime::error_message(&e)));
             }
             Vec::new()
         }
@@ -940,7 +940,7 @@ pub fn client_receive(lua: &Lua, channel: Ref, sender: i64, m: &Outgoing) {
     })();
     if let Err(e) = r {
         if let Ok(mut w) = world(lua) {
-            w.output.push((crate::app::Level::Error, crate::runtime::error_message(&e)));
+            w.output.push((rustudio_core::log::Level::Error, crate::runtime::error_message(&e)));
         }
     }
 }
@@ -1113,7 +1113,7 @@ pub fn chat_view(lua: &Lua) -> Option<ChatView> {
         // above its top.
         let pos = world(lua).ok().and_then(|w| {
             let d = w.d();
-            let xf = crate::scene::xform_of(d, adornee)?;
+            let xf = rustudio_render::scene::xform_of(d, adornee)?;
             let half = match d.prop(adornee, "Size") {
                 Some(Variant::Vector3(v)) => v.y / 2.0,
                 _ => 1.0,

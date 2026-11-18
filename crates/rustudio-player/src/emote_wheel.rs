@@ -11,8 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 use egui::{Color32, Pos2, Rect, Vec2};
 
-use crate::app::Editor;
-use crate::theme;
+use crate::game::Game;
+use rustudio_engine::theme;
 
 /// Animate's own emotes, for avatars with none equipped.
 const BUILT_IN: &[&str] = &["wave", "point", "cheer", "laugh", "dance", "dance2", "dance3"];
@@ -44,7 +44,7 @@ pub fn is_open() -> bool {
     wheel().lock().map(|w| w.open).unwrap_or(false)
 }
 
-impl Editor {
+impl Game {
     /// Draws the wheel over the game view; number keys pick from it while
     /// it's open (they're taken out of `slots`, the hotbar's).
     pub fn emote_wheel(&mut self, ui: &mut egui::Ui, rect: Rect, slots: &mut Vec<usize>) {
@@ -129,7 +129,7 @@ impl Editor {
                     painter.image(t.id(), r.shrink(cell * 0.1), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 }
                 None => {
-                    crate::ti::paint(&painter, Rect::from_center_size(r.center(), Vec2::splat(cell * 0.42)), "mood-happy", Color32::WHITE);
+                    rustudio_engine::ti::paint(&painter, Rect::from_center_size(r.center(), Vec2::splat(cell * 0.42)), "mood-happy", Color32::WHITE);
                 }
             }
             painter.text(r.min + Vec2::new(8.0, 6.0), egui::Align2::LEFT_TOP, slot.to_string(), egui::FontId::proportional(13.0), Color32::from_white_alpha(200));

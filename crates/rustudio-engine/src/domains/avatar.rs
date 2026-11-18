@@ -1,4 +1,4 @@
-//! Engine API domain: avatar. See src/domains/mod.rs for the hook contract.
+//! Engine API domain: avatar. See crates/rustudio-engine/src/domains/mod.rs for the hook contract.
 #![allow(unused_imports, unused_variables)]
 
 use mlua::{Lua, MultiValue, Value};
@@ -233,7 +233,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         .set_name("=rustudio.avatar.rules")
         .call(())?;
     let warnf = lua.create_function(|lua, msg: String| {
-        world(lua)?.output.push((crate::app::Level::Warn, msg));
+        world(lua)?.output.push((rustudio_core::log::Level::Warn, msg));
         Ok(())
     })?;
     lua.load(include_str!("avatar_aes.luau"))
@@ -258,7 +258,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         Ok(match web::poll_asset(job as u64) {
             None => MultiValue::from_iter([Value::Boolean(false)]),
             Some(Err(e)) => MultiValue::from_iter([Value::Nil, Value::String(lua.create_string(&e)?)]),
-            Some(Ok(bytes)) => match crate::doc::Document::decode(&bytes) {
+            Some(Ok(bytes)) => match rustudio_core::doc::Document::decode(&bytes) {
                 Err(e) => MultiValue::from_iter([Value::Nil, Value::String(lua.create_string(&e)?)]),
                 Ok(mut tmp) => {
                     let model = {
@@ -280,7 +280,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     // the points moved, or nil when the cages don't pair up.
     let wrap_rbf = lua.create_function(|lua, (rest, goal, mesh, pts): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)| {
         let v = |f: &[f32]| -> Vec<glam::Vec3> { f.chunks_exact(3).map(|c| glam::Vec3::new(c[0], c[1], c[2])).collect() };
-        match crate::cage_rbf::fit_points_near(&v(&rest), &v(&goal), &v(&mesh), &v(&pts)) {
+        match rustudio_core::cage_rbf::fit_points_near(&v(&rest), &v(&goal), &v(&mesh), &v(&pts)) {
             Some(out) => Ok(Value::Table(lua.create_sequence_from(out.iter().flat_map(|p| [p.x, p.y, p.z]))?)),
             None => Ok(Value::Nil),
         }

@@ -72,7 +72,7 @@ pub fn install(lua:&Lua)->mlua::Result<()> {
         match result {
             Ok(bytes)=>{
                 let id=format!("rbxtemp://rustudio/capture/{token}.png");
-                crate::assets::register_generated(&id,bytes);
+                rustudio_core::assets::register_generated(&id,bytes);
                 let r=crate::runtime::ext::create_any(lua,"ScreenshotCapture")?;
                 let (place,universe)={let w=world(lua)?;let d=w.d();let root=d.dom.root_ref();let get=|key|match d.prop(root,key){Some(Variant::Int64(n))=>n,_=>0};(get("PlaceId"),get("GameId"))};
                 lua.app_data_mut::<Captures>().unwrap().objects.insert(r,Info{time:LDateTime::now().millis,id:id.clone(),place,universe});
@@ -157,7 +157,7 @@ M.TakeScreenshotCaptureAsync=function(self,callback,params) capture(self,callbac
 "#).set_name("=rustudio.assets_cloud.capture").exec()
 }
 pub fn prop_get(lua:&Lua,r:Ref,class:&str,key:&str)->mlua::Result<Option<Value>> {
-    if !crate::doc::is_a(class,"Capture"){return Ok(None)}
+    if !rustudio_core::doc::is_a(class,"Capture"){return Ok(None)}
     let captures=lua.app_data_ref::<Captures>().unwrap();
     let Some(info)=captures.objects.get(&r) else{return Ok(None)};
     Ok(match key {

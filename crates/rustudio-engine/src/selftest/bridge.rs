@@ -1,8 +1,10 @@
 //! The Luau ↔ Instance/Enum bridge as scripts observe it (Studio probes;
-//! src/cmeta.rs): metatables, namecall, method functions, Lua-written
+//! crates/rustudio-engine/src/cmeta.rs): metatables, namecall, method functions, Lua-written
 //! methods that yield, Enum types and the index/newindex errors.
 
-use super::*;
+use crate::runtime::{RunMode, Runtime, Side, World};
+use rbx_dom_weak::InstanceBuilder;
+use rustudio_core::doc::Document;
 
 /// Runs `src` as a client LocalScript for `frames` steps; Output lines
 /// without their location suffix.

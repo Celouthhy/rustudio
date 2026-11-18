@@ -36,7 +36,7 @@ fn has(out: &[String], want: &str) -> bool {
 
 #[test]
 fn history_model_matches_studio() {
-    use crate::doc::{Change, FinishOp};
+    use rustudio_core::doc::{Change, FinishOp};
     let mut d = Document::new_place();
     let ws = d.workspace().unwrap();
     // A script's insert + waypoint, then a rename with no waypoint: Undo
@@ -143,7 +143,7 @@ fn change_history_service_in_a_plugin() {
 /// clone out of the DataModel although its old parent is gone.
 #[test]
 fn undo_takes_out_a_clone_whose_orphan_parent_is_gone() {
-    use crate::doc::Change;
+    use rustudio_core::doc::Change;
     let mut d = Document::new_place();
     let ws = d.workspace().unwrap();
     let none = rbx_dom_weak::types::Ref::none();
@@ -237,7 +237,7 @@ fn prompts_answer_plugin_dialogs() {
     let txt = dir.join("hello.txt");
     std::fs::write(&txt, b"hi there").unwrap();
     let fbx = dir.join("Crate.fbx");
-    std::fs::write(&fbx, crate::fbx::sample([200.0, 100.0, 50.0], [0.0, 0.0, 0.0])).unwrap();
+    std::fs::write(&fbx, rustudio_core::fbx::sample([200.0, 100.0, 50.0], [0.0, 0.0, 0.0])).unwrap();
     let mut doc = Document::new_place();
     let mut h = PluginHost::default();
     h.load(source(
@@ -332,7 +332,7 @@ fn import_fbx_animation_matches_studio() {
     let txt = dir.join("notes.txt");
     std::fs::write(&txt, b"not a model\n").unwrap();
     let mesh = dir.join("mesh.fbx");
-    std::fs::write(&mesh, crate::fbx::sample([100.0, 100.0, 100.0], [0.0, 0.0, 0.0])).unwrap();
+    std::fs::write(&mesh, rustudio_core::fbx::sample([100.0, 100.0, 100.0], [0.0, 0.0, 0.0])).unwrap();
     let wave = fixtures.join("wave.fbx").display().to_string();
     let cases = r#"[{"label":"nilrig","rig":"nil","r15":true},{"label":"cancel","rig":"Rig","r15":true},
         {"label":"text","rig":"Rig","r15":true},{"label":"mesh","rig":"Rig","r15":true},
@@ -423,8 +423,8 @@ fn theme_switch_fires_theme_changed() {
     frames(&mut h, &mut doc, 2);
     assert!(has(&lines(&mut h), "ready"));
     // The person picks the other theme in Studio Settings.
-    let other = if crate::runtime::domains::plugin::theme::theme_name() == "Dark" { "Light" } else { "Dark" };
-    h.with_edit(&mut doc, |rt| crate::runtime::domains::plugin::theme::watch_theme_as(&rt.lua, other).unwrap());
+    let other = if crate::plugin_host::api::theme::theme_name() == "Dark" { "Light" } else { "Dark" };
+    h.with_edit(&mut doc, |rt| crate::plugin_host::api::theme::watch_theme_as(&rt.lua, other).unwrap());
     frames(&mut h, &mut doc, 1);
     let out = lines(&mut h);
     assert!(has(&out, "theme changed"), "{out:#?}");
@@ -459,9 +459,9 @@ fn editor_calls_autocomplete_and_analysis_callbacks() {
     assert!(has(&lines(&mut h), "registered"));
     // What the script editor does as the person types (script_editor.rs).
     let items = h
-        .with_edit(&mut doc, |rt| crate::runtime::domains::plugin::script_editor::autocomplete(&rt.lua, s, 1, 4).unwrap())
+        .with_edit(&mut doc, |rt| crate::plugin_host::api::script_editor::autocomplete(&rt.lua, s, 1, 4).unwrap())
         .unwrap();
-    let diags = h.with_edit(&mut doc, |rt| crate::runtime::domains::plugin::script_editor::analyze(&rt.lua, s).unwrap()).unwrap();
+    let diags = h.with_edit(&mut doc, |rt| crate::plugin_host::api::script_editor::analyze(&rt.lua, s).unwrap()).unwrap();
     assert_eq!(items, vec![("printHello".to_string(), "printHello()".to_string())]);
     assert_eq!(diags, vec![(1, "lint: AcScript".to_string())]);
     let out = lines(&mut h);

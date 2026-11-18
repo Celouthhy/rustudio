@@ -11,8 +11,8 @@ use std::sync::OnceLock;
 
 use egui::{Align2, Color32, FontFamily, FontId, Painter, Rect};
 
-const OUTLINE: &[u8] = include_bytes!("../assets/tabler/tabler-icons.ttf");
-const FILLED: &[u8] = include_bytes!("../assets/tabler/tabler-icons-filled.ttf");
+const OUTLINE: &[u8] = include_bytes!("../../../assets/tabler/tabler-icons.ttf");
+const FILLED: &[u8] = include_bytes!("../../../assets/tabler/tabler-icons-filled.ttf");
 
 fn table(text: &'static str) -> HashMap<&'static str, char> {
     text.lines()
@@ -25,12 +25,12 @@ fn table(text: &'static str) -> HashMap<&'static str, char> {
 
 fn outline() -> &'static HashMap<&'static str, char> {
     static T: OnceLock<HashMap<&'static str, char>> = OnceLock::new();
-    T.get_or_init(|| table(include_str!("../assets/tabler/codepoints.txt")))
+    T.get_or_init(|| table(include_str!("../../../assets/tabler/codepoints.txt")))
 }
 
 fn filled() -> &'static HashMap<&'static str, char> {
     static T: OnceLock<HashMap<&'static str, char>> = OnceLock::new();
-    T.get_or_init(|| table(include_str!("../assets/tabler/codepoints-filled.txt")))
+    T.get_or_init(|| table(include_str!("../../../assets/tabler/codepoints-filled.txt")))
 }
 
 /// rustudio's own drawn icons (not glyphs). `rs-model`: three coloured
@@ -84,6 +84,12 @@ pub fn glyph(name: &str) -> Option<(char, FontFamily)> {
     }
 }
 
+/// A bundled icon for use as button or label text.
+pub fn text(name: &str, size: f32) -> egui::RichText {
+    let (glyph, family) = glyph(name).expect("named Tabler icon");
+    egui::RichText::new(glyph.to_string()).font(FontId::new(size, family))
+}
+
 /// Paints icon `name` centred in `r`, sized to fit.
 pub fn paint(p: &Painter, r: Rect, name: &str, color: Color32) {
     if name == "rs-model" {
@@ -106,9 +112,13 @@ pub fn paint(p: &Painter, r: Rect, name: &str, color: Color32) {
     );
 }
 
-/// Adds the icon fonts and Studio's Builder Sans to egui.
-pub fn install(ctx: &egui::Context) {
+/// Fonts available even without Studio content or system fonts.
+pub fn bundled_fonts() -> egui::FontDefinitions {
     let mut defs = egui::FontDefinitions::default();
+    // Egui already embeds Hack for monospace. Reuse its arrows and symbols
+    // when the proportional and emoji faces have no matching glyph.
+    let symbols = defs.families[&FontFamily::Monospace][0].clone();
+    defs.families.entry(FontFamily::Proportional).or_default().push(symbols);
     defs.font_data.insert(
         "tabler".into(),
         std::sync::Arc::new(egui::FontData::from_static(OUTLINE)),
@@ -123,7 +133,13 @@ pub fn install(ctx: &egui::Context) {
         FontFamily::Name("tabler-filled".into()),
         vec!["tabler-filled".into()],
     );
-    let fonts = crate::assets::content_dir().join("fonts");
+    defs
+}
+
+/// Adds the icon fonts and Studio's Builder Sans to egui.
+pub fn install(ctx: &egui::Context) {
+    let mut defs = bundled_fonts();
+    let fonts = rustudio_core::assets::content_dir().join("fonts");
     for (key, file, family) in [
         ("builder-sans", "BuilderSans-Regular.otf", FontFamily::Proportional),
         ("builder-sans-bold", "BuilderSans-Bold.otf", FontFamily::Name("bold".into())),

@@ -16,8 +16,8 @@ use rbx_dom_weak::types::{BrickColor, Color3, Color3uint8, CustomPhysicalPropert
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
-use crate::doc;
-use crate::math::Xform;
+use rustudio_core::doc;
+use rustudio_core::math::Xform;
 use crate::props_layout::{Category, Frame, Row};
 
 const ROW_H: f32 = 21.0;
@@ -119,8 +119,8 @@ pub const PROPS_FILTER_ID: &str = "properties_filter";
 
 /// The Properties panel's title: Studio's "Properties - Class "Name"".
 pub fn panel_title(ed: &Editor) -> String {
-    let sel = &ed.doc.selection;
-    match sel.first().and_then(|r| ed.doc.dom.get_by_ref(*r)) {
+    let sel = &ed.game.doc.selection;
+    match sel.first().and_then(|r| ed.game.doc.dom.get_by_ref(*r)) {
         Some(i) if sel.len() > 1 => format!("Properties - {} \"{}\" (+{} more)", i.class, i.name, sel.len() - 1),
         Some(i) => format!("Properties - {} \"{}\"", i.class, i.name),
         None => "Properties".into(),
@@ -175,7 +175,7 @@ pub(crate) fn nearest_brick(rgb: [u8; 3]) -> BrickColor {
     (1..=1032u16)
         .filter_map(BrickColor::from_number)
         .min_by_key(|b| {
-            let c = crate::scene::brick_rgb(*b);
+            let c = rustudio_render::scene::brick_rgb(*b);
             (0..3).map(|i| (c[i] as i32 - rgb[i] as i32).pow(2)).sum::<i32>()
         })
         .unwrap_or(BrickColor::MediumStoneGrey)
@@ -185,7 +185,7 @@ pub(crate) fn nearest_brick(rgb: [u8; 3]) -> BrickColor {
 fn brick_name(rgb: [u8; 3]) -> Option<String> {
     (1..=1032u16)
         .filter_map(BrickColor::from_number)
-        .find(|b| crate::scene::brick_rgb(*b) == rgb)
+        .find(|b| rustudio_render::scene::brick_rgb(*b) == rgb)
         .map(|b| b.to_string())
 }
 
@@ -209,7 +209,7 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
         Variant::Int64(i) => i.to_string(),
         Variant::Float32(f) => fmt_num(*f as f64),
         Variant::Float64(f) => fmt_num(*f),
-        Variant::Vector3(v) => fmt_v3(crate::math::v3(*v)),
+        Variant::Vector3(v) => fmt_v3(rustudio_core::math::v3(*v)),
         Variant::Vector2(v) => format!("{}, {}", fmt_num(v.x as f64), fmt_num(v.y as f64)),
         Variant::Vector3int16(v) => format!("{}, {}, {}", v.x, v.y, v.z),
         Variant::Vector2int16(v) => format!("{}, {}", v.x, v.y),
@@ -230,7 +230,7 @@ fn value_text(doc: &doc::Document, v: &Variant) -> String {
         Variant::Axes(a) => format!("{a:?}"),
         Variant::UniqueId(u) => u.to_string(),
         Variant::PhysicalProperties(_) => String::new(),
-        Variant::CFrame(cf) => fmt_v3(crate::math::v3(cf.position)),
+        Variant::CFrame(cf) => fmt_v3(rustudio_core::math::v3(cf.position)),
         other => format!("{:?}", other.ty()),
     }
 }
@@ -270,19 +270,19 @@ impl Editor {
         ui.add_space(2.0);
         self.props.drawn.clear();
         self.ui_rects.insert("props.panel", ui.max_rect());
-        let sel = self.doc.selection.clone();
+        let sel = self.game.doc.selection.clone();
         let Some(&first) = sel.first() else {
             self.hud.property_rows = 0;
             return;
         };
-        let Some(class) = self.doc.class_of(first).map(|c| c.to_string()) else {
+        let Some(class) = self.game.doc.class_of(first).map(|c| c.to_string()) else {
             return;
         };
         if self.props.active_for != Some(first) {
             self.props.active_for = Some(first);
             self.props.active_row = None;
         }
-        let can_collide = !matches!(self.doc.prop(first, "CanCollide"), Some(Variant::Bool(false)));
+        let can_collide = !matches!(self.game.doc.prop(first, "CanCollide"), Some(Variant::Bool(false)));
         let cats = self
             .props
             .cache
@@ -360,7 +360,7 @@ impl Editor {
         let painter = p.ui.painter();
         painter.rect_filled(r, 0.0, BAND);
         let tri = Rect::from_center_size(Pos2::new(r.min.x + 10.0, r.center().y), Vec2::splat(12.0));
-        crate::ti::paint(painter, tri, if folded { "caret-right-filled" } else { "caret-down-filled" }, TEXT);
+        rustudio_engine::ti::paint(painter, tri, if folded { "caret-right-filled" } else { "caret-down-filled" }, TEXT);
         painter.text(
             Pos2::new(r.min.x + INDENT, r.center().y),
             egui::Align2::LEFT_CENTER,
@@ -371,7 +371,7 @@ impl Editor {
         let mut clicked = resp.clicked();
         if let Some(hit) = plus_hit {
             let pr = Rect::from_center_size(Pos2::new(r.max.x - 14.0, r.center().y), Vec2::splat(14.0));
-            crate::ti::paint(p.ui.painter(), pr, "plus", TEXT);
+            rustudio_engine::ti::paint(p.ui.painter(), pr, "plus", TEXT);
             if clicked && resp.interact_pointer_pos().is_some_and(|q| pr.expand(3.0).contains(q)) {
                 *hit = true;
                 clicked = false;
@@ -400,7 +400,7 @@ impl Editor {
         let x = r.min.x + INDENT + depth * 18.0;
         if let Some(open) = arrow {
             let tri = Rect::from_center_size(Pos2::new(x - 15.0, r.center().y), Vec2::splat(11.0));
-            crate::ti::paint(&painter, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, color);
+            rustudio_engine::ti::paint(&painter, tri, if open { "caret-down-filled" } else { "caret-right-filled" }, color);
         }
         painter.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, name, FontId::proportional(FONT), color);
     }
@@ -424,8 +424,8 @@ impl Editor {
         let (pressed, down, pos, now, shift) =
             p.ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.time, i.modifiers.shift));
         // Count quick presses once a frame (1 = caret, 2 = word, 3 = all).
-        if pressed && self.props.press_frame != self.frame_no {
-            self.props.press_frame = self.frame_no;
+        if pressed && self.props.press_frame != self.game.frame_no {
+            self.props.press_frame = self.game.frame_no;
             let near = pos.zip(self.props.press_pos).is_some_and(|(a, b)| a.distance(b) < 6.0);
             self.props.press_count = if near && now - self.props.press_time < 0.4 { self.props.press_count % 3 + 1 } else { 1 };
             self.props.press_time = now;
@@ -517,21 +517,21 @@ impl Editor {
 
     fn prop_row(&mut self, p: &mut Painter, first: Ref, class: &str, name: &str, ro_api: bool, edits: &mut Vec<Edit>) {
         // ClassName / Parent aren't stored properties.
-        let parent_is_root = self.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.doc.dom.root_ref());
+        let parent_is_root = self.game.doc.dom.get_by_ref(first).is_some_and(|i| i.parent() == self.game.doc.dom.root_ref());
         let value = match name {
             "ClassName" => Some(Variant::String(class.to_string())),
-            "Name" => self.doc.dom.get_by_ref(first).map(|i| Variant::String(i.name.clone())),
-            "Parent" if parent_is_root => Some(Variant::String(self.doc.title.clone())),
-            "Parent" => self.doc.dom.get_by_ref(first).map(|i| Variant::Ref(i.parent())),
+            "Name" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::String(i.name.clone())),
+            "Parent" if parent_is_root => Some(Variant::String(self.game.doc.title.clone())),
+            "Parent" => self.game.doc.dom.get_by_ref(first).map(|i| Variant::Ref(i.parent())),
             // A Part resizes on every face by whole studs (Studio: "Right, Top,
             // Back, Left, Bottom, Front", 1).
-            "ResizeableFaces" if self.doc.prop(first, name).is_none() => {
+            "ResizeableFaces" if self.game.doc.prop(first, name).is_none() => {
                 Some(Variant::String("Right, Top, Back, Left, Bottom, Front".into()))
             }
-            "ResizeIncrement" if self.doc.prop(first, name).is_none() => Some(Variant::Int32(1)),
+            "ResizeIncrement" if self.game.doc.prop(first, name).is_none() => Some(Variant::Int32(1)),
             // A part keeps only Color; its BrickColor is the nearest palette
             // colour (Studio shows both).
-            "BrickColor" => self.doc.prop(first, name).or_else(|| match self.doc.prop(first, "Color") {
+            "BrickColor" => self.game.doc.prop(first, name).or_else(|| match self.game.doc.prop(first, "Color") {
                 Some(Variant::Color3uint8(c)) => Some(Variant::BrickColor(nearest_brick([c.r, c.g, c.b]))),
                 _ => None,
             }),
@@ -539,22 +539,22 @@ impl Editor {
             // them (captured RefPart 4×1.2×2 Plastic: Mass 6.72, AssemblyMass
             // inf when anchored, root itself, centre at its position).
             "Mass" | "AssemblyMass" | "AssemblyRootPart" | "AssemblyCenterOfMass" if doc::is_a(class, "BasePart") => {
-                let size = match self.doc.prop(first, "Size") {
+                let size = match self.game.doc.prop(first, "Size") {
                     Some(Variant::Vector3(s)) => s,
                     _ => Vector3::new(4.0, 1.2, 2.0),
                 };
-                let density = match self.doc.prop(first, "CustomPhysicalProperties") {
+                let density = match self.game.doc.prop(first, "CustomPhysicalProperties") {
                     Some(Variant::PhysicalProperties(PhysicalProperties::Custom(c))) => c.density(),
-                    _ => crate::mech::PART_DENSITY,
+                    _ => rustudio_core::mech::PART_DENSITY,
                 };
                 let mass = size.x * size.y * size.z * density;
-                let anchored = matches!(self.doc.prop(first, "Anchored"), Some(Variant::Bool(true)));
+                let anchored = matches!(self.game.doc.prop(first, "Anchored"), Some(Variant::Bool(true)));
                 Some(match name {
                     "Mass" => Variant::Float32(mass),
                     "AssemblyMass" if anchored => Variant::String("inf".into()),
                     "AssemblyMass" => Variant::Float32(mass),
                     "AssemblyRootPart" => Variant::Ref(first),
-                    _ => Variant::Vector3(crate::math::rv3(crate::scene::xform_of(&self.doc, first).map(|x| x.pos).unwrap_or_default())),
+                    _ => Variant::Vector3(rustudio_core::math::rv3(rustudio_render::scene::xform_of(&self.game.doc, first).map(|x| x.pos).unwrap_or_default())),
                 })
             }
             // Studio shows PhysicalProperties as a checkbox: Current is always
@@ -562,19 +562,19 @@ impl Editor {
             "CurrentPhysicalProperties" => Some(Variant::Bool(true)),
             // A script runs unless Disabled or Enabled = false (as Play reads it).
             "Enabled" if doc::is_a(class, "BaseScript") => Some(Variant::Bool(
-                !matches!(self.doc.prop(first, "Disabled"), Some(Variant::Bool(true)))
-                    && !matches!(self.doc.prop(first, "Enabled"), Some(Variant::Bool(false))),
+                !matches!(self.game.doc.prop(first, "Disabled"), Some(Variant::Bool(true)))
+                    && !matches!(self.game.doc.prop(first, "Enabled"), Some(Variant::Bool(false))),
             )),
             // A ScreenGui's AbsoluteSize is the view's size (Studio: 863, 675
             // for its 863×675 viewport).
             "AbsoluteSize" if doc::is_a(class, "LayerCollector") => {
-                let s = self.viewport_rect.size();
+                let s = self.game.viewport_rect.size();
                 Some(Variant::Vector2(Vector2::new(s.x.round(), s.y.round())))
             }
             // Every instance has a UniqueId in Studio; one not saved yet shows
             // its session id.
             "UniqueId"
-                if match self.doc.prop(first, name) {
+                if match self.game.doc.prop(first, name) {
                     Some(Variant::UniqueId(u)) => u.to_string().bytes().all(|c| c == b'0'),
                     other => other.is_none(),
                 } =>
@@ -582,10 +582,10 @@ impl Editor {
                 Some(Variant::String(format!("{first}")))
             }
             "CustomPhysicalProperties" => Some(Variant::Bool(matches!(
-                self.doc.prop(first, name),
+                self.game.doc.prop(first, name),
                 Some(Variant::PhysicalProperties(PhysicalProperties::Custom(_)))
             ))),
-            _ => self.doc.prop(first, name).or_else(|| typed_empty(class, name)),
+            _ => self.game.doc.prop(first, name).or_else(|| typed_empty(class, name)),
         };
         let ro = ro_api
             || matches!(name, "ClassName" | "UniqueId" | "IsInSandbox")
@@ -622,7 +622,7 @@ impl Editor {
                 let painter = p.ui.painter();
                 if *b {
                     painter.rect_filled(br, 2.0, if ro { READ_ONLY } else { Color32::from_rgb(230, 231, 233) });
-                    crate::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
+                    rustudio_engine::ti::paint(painter, br.shrink(1.0), "check", Color32::from_rgb(25, 26, 31));
                 } else {
                     painter.rect_filled(br, 2.0, BOX_OFF);
                 }
@@ -637,7 +637,7 @@ impl Editor {
                         (rgb, None)
                     }
                     Variant::Color3uint8(c) => ([c.r, c.g, c.b], None),
-                    Variant::BrickColor(b) => (crate::scene::brick_rgb(*b), Some(b.to_string())),
+                    Variant::BrickColor(b) => (rustudio_render::scene::brick_rgb(*b), Some(b.to_string())),
                     _ => unreachable!(),
                 };
                 let sw = Rect::from_min_size(Pos2::new(v.min.x + 2.0, v.center().y - 6.0), Vec2::splat(12.0));
@@ -665,7 +665,7 @@ impl Editor {
                         self.props.brick_popup = Some(crate::color_editors::BrickPopup {
                             prop: name.to_string(),
                             origin: v.left_bottom() + Vec2::new(0.0, 1.0),
-                            opened_frame: self.frame_no,
+                            opened_frame: self.game.frame_no,
                             hovered: None,
                         });
                     }
@@ -718,6 +718,7 @@ impl Editor {
                     const ITEM_H: f32 = 19.0;
                     let width = v.width().max(120.0);
                     egui::Popup::new(id, p.ui.ctx().clone(), egui::PopupAnchor::Position(v.left_bottom()), p.ui.layer_id())
+                        .kind(egui::PopupKind::Menu)
                         .open_memory(None)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                         .width(width)
@@ -752,10 +753,10 @@ impl Editor {
                 }
             }
             Variant::Vector3(v3) => {
-                let g = crate::math::v3(*v3);
+                let g = rustudio_core::math::v3(*v3);
                 if let Some(t) = self.text_cell(p, name, v, &fmt_v3(g), ro, clicked_value) {
                     if let Some(n) = parse_v3(&t) {
-                        edits.push(Edit::Prop(name.to_string(), Variant::Vector3(crate::math::rv3(n))));
+                        edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
                     }
                 }
                 if open {
@@ -767,7 +768,7 @@ impl Editor {
                             if let Ok(x) = t.trim().parse::<f32>() {
                                 let mut n = g;
                                 n[i] = x;
-                                edits.push(Edit::Prop(name.to_string(), Variant::Vector3(crate::math::rv3(n))));
+                                edits.push(Edit::Prop(name.to_string(), Variant::Vector3(rustudio_core::math::rv3(n))));
                             }
                         }
                     }
@@ -779,7 +780,7 @@ impl Editor {
                 self.slider_cell(p, name, other, spec, v, &resp, clicked_value, edits);
             }
             other => {
-                let shown = value_text(&self.doc, other);
+                let shown = value_text(&self.game.doc, other);
                 let editable = !ro
                     && matches!(other, Variant::String(_) | Variant::Int32(_) | Variant::Int64(_) | Variant::Float32(_) | Variant::Float64(_) | Variant::Vector2(_) | Variant::ContentId(_) | Variant::Content(_));
                 if let Some(t) = self.text_cell(p, name, v, &shown, ro, clicked_value && editable) {
@@ -837,8 +838,8 @@ impl Editor {
         let arrows = Rect::from_min_max(Pos2::new(spin.max.x - 12.0, spin.min.y), spin.max);
         let up = Rect::from_min_max(arrows.min, Pos2::new(arrows.max.x, arrows.center().y));
         let down = Rect::from_min_max(Pos2::new(arrows.min.x, arrows.center().y), arrows.max);
-        crate::ti::paint(&painter, Rect::from_center_size(up.center() + Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-up", TEXT);
-        crate::ti::paint(&painter, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
+        rustudio_engine::ti::paint(&painter, Rect::from_center_size(up.center() + Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-up", TEXT);
+        rustudio_engine::ti::paint(&painter, Rect::from_center_size(down.center() - Vec2::new(0.0, 1.5), Vec2::splat(9.0)), "chevron-down", TEXT);
         let text_rect = Rect::from_min_max(spin.min + Vec2::new(4.0, 0.0), Pos2::new(arrows.min.x - 2.0, spin.max.y));
         let on_text = resp.interact_pointer_pos().is_some_and(|q| text_rect.contains(q));
         if let Some(t) = self.text_cell(p, name, text_rect, &fmt_num(cur), false, clicked_value && on_text) {
@@ -856,11 +857,11 @@ impl Editor {
         ps::paint_slider(&painter, slider, spec.fraction(cur));
         let sresp = p.ui.interact(slider, p.ui.id().with(("slider", name)), Sense::click_and_drag());
         if sresp.drag_started() {
-            let originals = self
+            let originals = self.game
                 .doc
                 .selection
                 .iter()
-                .filter_map(|r| self.doc.prop(*r, name).map(|v| (*r, v)))
+                .filter_map(|r| self.game.doc.prop(*r, name).map(|v| (*r, v)))
                 .collect();
             self.props.slider_drag = Some(SliderDrag { prop: name.to_string(), originals });
             self.props.active_row = Some(name.to_string());
@@ -870,7 +871,7 @@ impl Editor {
             if (nv - cur).abs() > 1e-9 {
                 let refs: Vec<Ref> = self.props.slider_drag.as_ref().map(|d| d.originals.iter().map(|(r, _)| *r).collect()).unwrap_or_default();
                 for r in refs {
-                    self.doc.set_prop_live(r, ustr(name), number_like(value, nv));
+                    self.game.doc.set_prop_live(r, ustr(name), number_like(value, nv));
                 }
             }
         }
@@ -880,12 +881,12 @@ impl Editor {
                     .originals
                     .into_iter()
                     .filter_map(|(r, old)| {
-                        let new = self.doc.dom.get_by_ref(r)?.properties.get(&ustr(name)).cloned()?;
+                        let new = self.game.doc.dom.get_by_ref(r)?.properties.get(&ustr(name)).cloned()?;
                         (new != old).then(|| (r, ustr(name), Some(old), new))
                     })
                     .collect();
                 if !changes.is_empty() {
-                    self.doc.record_props(&format!("Set {name}"), changes);
+                    self.game.doc.record_props(&format!("Set {name}"), changes);
                 }
             }
         } else if sresp.clicked() {
@@ -897,31 +898,31 @@ impl Editor {
 
     /// Opens Studio's Select Color dialog for `prop` on the selection.
     pub fn open_color_dialog(&mut self, prop: &str, rgb: [u8; 3]) {
-        let originals = self.doc.selection.iter().filter_map(|r| self.doc.prop(*r, prop).map(|v| (*r, v))).collect();
-        self.props.color_dialog = Some(crate::color_editors::ColorDialog::new(prop, originals, rgb, self.frame_no));
+        let originals = self.game.doc.selection.iter().filter_map(|r| self.game.doc.prop(*r, prop).map(|v| (*r, v))).collect();
+        self.props.color_dialog = Some(crate::color_editors::ColorDialog::new(prop, originals, rgb, self.game.frame_no));
     }
 
     /// The BrickColor popup and the Select Color dialog, when open.
     fn color_editors_ui(&mut self, ctx: &egui::Context, edits: &mut Vec<Edit>) {
         use crate::color_editors::{brick_popup_ui, color_dialog_ui, BrickPick, DialogOut};
         if let Some(mut pop) = self.props.brick_popup.take() {
-            let first = self.doc.selection.first().copied();
-            let current = first.and_then(|r| match self.doc.prop(r, &pop.prop) {
+            let first = self.game.doc.selection.first().copied();
+            let current = first.and_then(|r| match self.game.doc.prop(r, &pop.prop) {
                 Some(Variant::BrickColor(b)) => Some(b),
-                _ => match self.doc.prop(r, "Color") {
+                _ => match self.game.doc.prop(r, "Color") {
                     Some(Variant::Color3uint8(c)) => Some(nearest_brick([c.r, c.g, c.b])),
                     _ => None,
                 },
             });
             self.ui_rects.insert("brick.popup", Rect::from_min_size(crate::color_editors::popup_origin(ctx, &pop), crate::color_editors::POPUP_SIZE));
-            match brick_popup_ui(ctx, &mut pop, current, self.frame_no) {
+            match brick_popup_ui(ctx, &mut pop, current, self.game.frame_no) {
                 BrickPick::None => self.props.brick_popup = Some(pop),
                 BrickPick::Close => {}
                 BrickPick::Picked(b) => edits.push(Edit::Prop(pop.prop.clone(), Variant::BrickColor(b))),
                 BrickPick::MoreColors => {
                     // Studio's More Colors opens the colour dialog on Color.
-                    let rgb = current.map(crate::scene::brick_rgb).unwrap_or([163, 162, 165]);
-                    let prop = if first.and_then(|r| self.doc.class_of(r)).is_some_and(|c| doc::is_a(&c, "BasePart")) { "Color" } else { pop.prop.as_str() };
+                    let rgb = current.map(rustudio_render::scene::brick_rgb).unwrap_or([163, 162, 165]);
+                    let prop = if first.and_then(|r| self.game.doc.class_of(r)).is_some_and(|c| doc::is_a(&c, "BasePart")) { "Color" } else { pop.prop.as_str() };
                     let prop = prop.to_string();
                     self.open_color_dialog(&prop, rgb);
                 }
@@ -930,14 +931,14 @@ impl Editor {
         if let Some(mut d) = self.props.color_dialog.take() {
             self.ui_rects.insert("color.dialog", Rect::from_min_size(crate::color_editors::dialog_origin(ctx), crate::color_editors::DIALOG_SIZE));
             let mut custom = self.props.custom_colors;
-            let out = color_dialog_ui(ctx, &mut d, &mut custom, self.frame_no);
+            let out = color_dialog_ui(ctx, &mut d, &mut custom, self.game.frame_no);
             self.props.custom_colors = custom;
             match out {
                 DialogOut::None => self.props.color_dialog = Some(d),
                 DialogOut::Changed(c) => {
                     // Live, as Studio: the part changes while the dialog is open.
                     for (r, old) in &d.originals {
-                        self.doc.set_prop_live(*r, ustr(&d.prop), color_variant(old, c));
+                        self.game.doc.set_prop_live(*r, ustr(&d.prop), color_variant(old, c));
                     }
                     self.props.color_dialog = Some(d);
                 }
@@ -949,13 +950,13 @@ impl Editor {
                         .map(|(r, old)| (*r, ustr(&d.prop), Some(old.clone()), color_variant(old, d.rgb)))
                         .collect();
                     for (r, n, _, v) in &changes {
-                        self.doc.set_prop_live(*r, *n, v.clone());
+                        self.game.doc.set_prop_live(*r, *n, v.clone());
                     }
-                    self.doc.record_props(&format!("Set {}", d.prop), changes);
+                    self.game.doc.record_props(&format!("Set {}", d.prop), changes);
                 }
                 DialogOut::Cancel => {
                     for (r, old) in &d.originals {
-                        self.doc.set_prop_live(*r, ustr(&d.prop), old.clone());
+                        self.game.doc.set_prop_live(*r, ustr(&d.prop), old.clone());
                     }
                 }
             }
@@ -993,17 +994,17 @@ impl Editor {
     }
 
     fn frame_value(&self, r: Ref, f: Frame) -> Option<Xform> {
-        let offset = cf_of(self.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+        let offset = cf_of(self.game.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
         match f {
-            Frame::PartCFrame => cf_of(self.doc.prop(r, "CFrame")),
-            Frame::PartOrigin => cf_of(self.doc.prop(r, "CFrame")).map(|c| mul(&c, &offset)),
+            Frame::PartCFrame => cf_of(self.game.doc.prop(r, "CFrame")),
+            Frame::PartOrigin => cf_of(self.game.doc.prop(r, "CFrame")).map(|c| mul(&c, &offset)),
             Frame::PivotOffset => Some(offset),
-            Frame::ModelOrigin | Frame::WorldPivot => cf_of(self.doc.prop(r, "WorldPivotData")).or_else(|| {
-                let pp = match self.doc.prop(r, "PrimaryPart") {
+            Frame::ModelOrigin | Frame::WorldPivot => cf_of(self.game.doc.prop(r, "WorldPivotData")).or_else(|| {
+                let pp = match self.game.doc.prop(r, "PrimaryPart") {
                     Some(Variant::Ref(p)) if p.is_some() => p,
                     _ => self.selected_parts().first().copied()?,
                 };
-                cf_of(self.doc.prop(pp, "CFrame"))
+                cf_of(self.game.doc.prop(pp, "CFrame"))
             }),
         }
     }
@@ -1011,7 +1012,7 @@ impl Editor {
     fn tags_section(&mut self, p: &mut Painter, first: Ref, edits: &mut Vec<Edit>) {
         let mut plus = false;
         self.band(p, "Tags", false, Some(&mut plus));
-        let tags: Vec<String> = match self.doc.prop(first, "Tags") {
+        let tags: Vec<String> = match self.game.doc.prop(first, "Tags") {
             Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
             _ => Vec::new(),
         };
@@ -1034,7 +1035,7 @@ impl Editor {
             let (r, v, resp) = Self::cells(p, &format!("tag:{t}"));
             Self::name_text(p, r, 0.0, &t, TEXT, None);
             let x = Rect::from_center_size(Pos2::new(v.max.x - 8.0, v.center().y), Vec2::splat(12.0));
-            crate::ti::paint(p.ui.painter(), x, "x", TEXT);
+            rustudio_engine::ti::paint(p.ui.painter(), x, "x", TEXT);
             if resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| x.expand(3.0).contains(q)) {
                 edits.push(Edit::RemoveTag(t));
             }
@@ -1044,12 +1045,12 @@ impl Editor {
     fn attributes_section(&mut self, p: &mut Painter, first: Ref) {
         let mut plus = false;
         self.band(p, "Attributes", false, Some(&mut plus));
-        let attrs: Vec<(String, String)> = match self.doc.prop(first, "Attributes") {
+        let attrs: Vec<(String, String)> = match self.game.doc.prop(first, "Attributes") {
             Some(Variant::Attributes(a)) => {
                 let mut v: Vec<(String, String)> = a
                     .iter()
                     .filter(|(k, _)| !k.starts_with("RBX_"))
-                    .map(|(k, v)| (k.clone(), value_text(&self.doc, v)))
+                    .map(|(k, v)| (k.clone(), value_text(&self.game.doc, v)))
                     .collect();
                 v.sort();
                 v
@@ -1075,31 +1076,31 @@ impl Editor {
                         let n = n.trim().to_string();
                         if !n.is_empty() {
                             for r in sel {
-                                self.doc.rename(*r, &n);
+                                self.game.doc.rename(*r, &n);
                             }
                         }
                     }
                 }
                 // A part's BrickColor sets its Color (the colour it is drawn with).
-                Edit::Prop(name, Variant::BrickColor(b)) if name == "BrickColor" && self.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "BasePart")) => {
-                    let rgb = crate::scene::brick_rgb(b);
+                Edit::Prop(name, Variant::BrickColor(b)) if name == "BrickColor" && self.game.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "BasePart")) => {
+                    let rgb = rustudio_render::scene::brick_rgb(b);
                     let changes = sel
                         .iter()
                         .copied()
-                        .filter(|r| self.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart")))
+                        .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart")))
                         .map(|r| (r, ustr("Color"), Variant::Color3uint8(Color3uint8::new(rgb[0], rgb[1], rgb[2]))))
                         .collect();
-                    self.doc.set_props("Set BrickColor", changes, None);
+                    self.game.doc.set_props("Set BrickColor", changes, None);
                 }
                 // A script's Enabled box sets Enabled and clears an old Disabled.
-                Edit::Prop(name, Variant::Bool(on)) if name == "Enabled" && self.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "BaseScript")) => {
+                Edit::Prop(name, Variant::Bool(on)) if name == "Enabled" && self.game.doc.class_of(first).is_some_and(|c| doc::is_a(&c, "BaseScript")) => {
                     let changes = sel
                         .iter()
                         .copied()
-                        .filter(|r| self.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BaseScript")))
+                        .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BaseScript")))
                         .flat_map(|r| [(r, ustr("Enabled"), Variant::Bool(on)), (r, ustr("Disabled"), Variant::Bool(!on))])
                         .collect();
-                    self.doc.set_props("Set Enabled", changes, None);
+                    self.game.doc.set_props("Set Enabled", changes, None);
                 }
                 // Ticking CustomPhysicalProperties starts from Plastic's values
                 // (density 0.7, friction 0.3, elasticity 0.5, weights 1).
@@ -1112,19 +1113,19 @@ impl Editor {
                     let changes = sel
                         .iter()
                         .copied()
-                        .filter(|r| self.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart")))
+                        .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart")))
                         .map(|r| (r, ustr("CustomPhysicalProperties"), v.clone()))
                         .collect();
-                    self.doc.set_props("Set CustomPhysicalProperties", changes, None);
+                    self.game.doc.set_props("Set CustomPhysicalProperties", changes, None);
                 }
                 Edit::Prop(name, v) => {
                     let targets: Vec<Ref> = sel
                         .iter()
                         .copied()
-                        .filter(|r| self.doc.class_of(*r).is_some_and(|c| has_prop(&c, &name)))
+                        .filter(|r| self.game.doc.class_of(*r).is_some_and(|c| has_prop(&c, &name)))
                         .collect();
                     let changes = targets.iter().map(|r| (*r, ustr(&name), v.clone())).collect();
-                    self.doc.set_props(&format!("Set {name}"), changes, Some(format!("prop:{name}:{targets:?}")));
+                    self.game.doc.set_props(&format!("Set {name}"), changes, Some(format!("prop:{name}:{targets:?}")));
                 }
                 Edit::Frame(f, pos, ori) => self.set_frame(first, f, pos, ori),
                 Edit::AddTag(t) => self.edit_tags(sel, |tags| {
@@ -1141,7 +1142,7 @@ impl Editor {
         let changes = sel
             .iter()
             .map(|r| {
-                let mut tags: Vec<String> = match self.doc.prop(*r, "Tags") {
+                let mut tags: Vec<String> = match self.game.doc.prop(*r, "Tags") {
                     Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
                     _ => Vec::new(),
                 };
@@ -1149,7 +1150,7 @@ impl Editor {
                 (*r, ustr("Tags"), Variant::Tags(Tags::from(tags)))
             })
             .collect();
-        self.doc.set_props("Set Tags", changes, None);
+        self.game.doc.set_props("Set Tags", changes, None);
     }
 
     /// Writes a Transform / Pivot row: CFrame directly; Origin by moving
@@ -1161,14 +1162,14 @@ impl Editor {
         let new = Xform::from_orientation_deg(pos.unwrap_or(cur.pos), ori.unwrap_or_else(|| cur.orientation_deg()));
         let cf = |x: &Xform| Variant::CFrame(x.to_cframe());
         match f {
-            Frame::PartCFrame => self.doc.set_props("Set CFrame", vec![(r, ustr("CFrame"), cf(&new))], None),
-            Frame::PivotOffset => self.doc.set_props("Set PivotOffset", vec![(r, ustr("PivotOffset"), cf(&new))], None),
+            Frame::PartCFrame => self.game.doc.set_props("Set CFrame", vec![(r, ustr("CFrame"), cf(&new))], None),
+            Frame::PivotOffset => self.game.doc.set_props("Set PivotOffset", vec![(r, ustr("PivotOffset"), cf(&new))], None),
             Frame::PartOrigin => {
-                let offset = cf_of(self.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+                let offset = cf_of(self.game.doc.prop(r, "PivotOffset")).unwrap_or(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY });
                 let part = mul(&new, &offset.inverse());
-                self.doc.set_props("Set Origin", vec![(r, ustr("CFrame"), cf(&part))], None);
+                self.game.doc.set_props("Set Origin", vec![(r, ustr("CFrame"), cf(&part))], None);
             }
-            Frame::WorldPivot => self.doc.set_props(
+            Frame::WorldPivot => self.game.doc.set_props(
                 "Set WorldPivot",
                 vec![(r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe())))],
                 None,
@@ -1176,15 +1177,15 @@ impl Editor {
             Frame::ModelOrigin => {
                 // Move every part of the model by new × old⁻¹.
                 let delta = mul(&new, &cur.inverse());
-                let mut changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = self
+                let mut changes: Vec<(Ref, rbx_dom_weak::Ustr, Variant)> = self.game
                     .doc
                     .dom
                     .descendants_of(r)
                     .map(|i| i.referent())
-                    .filter_map(|p| cf_of(self.doc.prop(p, "CFrame")).filter(|_| self.scene.get(p).is_some()).map(|c| (p, ustr("CFrame"), cf(&mul(&delta, &c)))))
+                    .filter_map(|p| cf_of(self.game.doc.prop(p, "CFrame")).filter(|_| self.game.scene.get(p).is_some()).map(|c| (p, ustr("CFrame"), cf(&mul(&delta, &c)))))
                     .collect();
                 changes.push((r, ustr("WorldPivotData"), Variant::OptionalCFrame(Some(new.to_cframe()))));
-                self.doc.set_props("Set Origin", changes, None);
+                self.game.doc.set_props("Set Origin", changes, None);
             }
         }
     }

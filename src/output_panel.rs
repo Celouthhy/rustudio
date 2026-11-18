@@ -19,7 +19,8 @@
 use egui::{Color32, FontId, RichText, Sense, Vec2};
 
 use crate::app::{Editor, Level, LogLine};
-use crate::theme;
+use rustudio_engine::runtime::{error_origin, STACK_MARK};
+use rustudio_engine::theme;
 
 pub const PRINT: Color32 = Color32::from_rgb(188, 190, 200);
 pub const WARN: Color32 = Color32::from_rgb(245, 118, 48);
@@ -65,19 +66,6 @@ pub struct Shown<'a> {
     pub message: &'a str,
     /// "Script:line" (the last part of the source path), when there is one.
     pub source: Option<String>,
-}
-
-/// Marks a stack-trace line (Studio's blue "Stack Begin" … "Stack End"
-/// after an error); not shown.
-pub const STACK_MARK: char = '\u{2063}';
-
-/// "Full.Name" and line of an error message's "Full.Name:line: ..." prefix.
-pub fn error_origin(msg: &str) -> Option<(&str, u32)> {
-    let mut it = msg.splitn(3, ':');
-    let path = it.next()?;
-    let line = it.next()?.trim().parse().ok()?;
-    it.next()?;
-    (!path.is_empty() && !path.contains(' ')).then_some((path, line))
 }
 
 fn short_loc(loc: &str) -> String {
@@ -312,6 +300,7 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
 impl Editor {
     pub fn output_ui(&mut self, ui: &mut egui::Ui) {
         self.ui_rects.insert("output.panel", ui.max_rect());
+        self.flush_output_changes();
         let st = &mut self.output_view;
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("out_messages")
@@ -354,15 +343,15 @@ impl Editor {
                     ui.checkbox(&mut st.show_source, "Show Source");
                 });
                 let (r, clear) = ui.allocate_exact_size(Vec2::new(24.0, 20.0), Sense::click());
-                crate::ti::paint(ui.painter(), r.shrink(2.0), "clear-all", theme::TEXT);
+                rustudio_engine::ti::paint(ui.painter(), r.shrink(2.0), "clear-all", theme::TEXT);
                 if clear.on_hover_text("Clear Output").clicked() {
-                    self.log.clear();
+                    self.game.log.clear();
                     st.log_cleared();
                 }
                 ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("Filter...").desired_width(240.0));
             });
         });
-        self.hud.output_lines = log_view(ui, &mut self.output_view, &self.log);
+        self.hud.output_lines = log_view(ui, &mut self.output_view, &self.game.log);
         let _ = RichText::new("");
     }
 }
@@ -634,7 +623,7 @@ mod tests {
                 line(Level::Warn, "[Server] third warning  —  ServerScriptService.C:3"),
             ];
             let ctx = egui::Context::default();
-            crate::ti::install(&ctx);
+            rustudio_engine::ti::install(&ctx);
             let mut v = View { ctx, t: 0.0, st: OutputState::default(), log, copied: None };
             v.frame(vec![]);
             v.frame(vec![]);

@@ -21,7 +21,7 @@
 
 use super::*;
 use crate::humanoid::{Body, Floor, Humanoid, StepIn};
-use crate::runtime::domains::world::part::part_mass;
+use crate::physics::part_mass;
 
 pub struct HumPart {
     pub part: Ref,
@@ -347,7 +347,9 @@ pub struct Hums {
     /// document has them; Place A's LinearVelocity / AlignOrientation), by client
     /// instance, their part mapped to the server's.
     pub(super) foreign: HashMap<Ref, Mover>,
-    /// Their client-only attachments: (server part, CFrame in it).
+    /// Client-created constraints solved as rows by the Studio solver, in document order.
+    pub(super) foreign_descs: Vec<(Ref, crate::solver::joints::instance::Desc)>,
+    /// The force-based movers' client-only attachments: (server part, CFrame in it).
     pub(super) foreign_att: HashMap<Ref, (Ref, Xform)>,
     /// Movers of client-owned assemblies whose values came from the client document
     /// (`set_owned_movers`): under RUSTUDIO_SOLVER=studio they push through
@@ -688,7 +690,7 @@ impl Physics {
             // 1.1133): the body parts' geometry is their box, the Head's its
             // mesh. They collide as that geometry too.
             let name = doc.dom.get_by_ref(*r).map(|i| i.name.clone()).unwrap_or_default();
-            let body_part = sig.mesh.is_some() && name != "Head" && crate::rig::is_body_part_name(&name);
+            let body_part = sig.mesh.is_some() && name != "Head" && rustudio_core::body::is_body_part_name(&name);
             if body_part {
                 sig.mesh = None;
                 sig.fidelity = crate::collision::FIDELITY_BOX;
@@ -709,7 +711,7 @@ impl Physics {
                 rp::MassProperties::new(com, pm.mass, rv(pm.inertia))
             };
             // Contacts use the part's own friction () and elasticity.
-            let props = crate::runtime::domains::world::part::phys_props(doc, *r);
+            let props = crate::physics::phys_props(doc, *r);
             let b = b
                 .mass_properties(rp::MassProperties::default())
                 .friction(props.friction)
@@ -758,7 +760,7 @@ impl Physics {
             let Some((_, mut sig)) = part_sig(doc, *r) else { continue };
             // (As add_humanoid builds it: body parts as their box.)
             let name = doc.dom.get_by_ref(*r).map(|i| i.name.clone()).unwrap_or_default();
-            if sig.mesh.is_some() && name != "Head" && crate::rig::is_body_part_name(&name) {
+            if sig.mesh.is_some() && name != "Head" && rustudio_core::body::is_body_part_name(&name) {
                 sig.mesh = None;
                 sig.fidelity = crate::collision::FIDELITY_BOX;
             }
@@ -817,7 +819,7 @@ impl Physics {
             }
             let Some(id) = sig.mesh.as_deref() else { continue };
             // (As add_humanoid builds it: body parts as their box.)
-            if inst.name != "Head" && crate::rig::is_body_part_name(&inst.name) {
+            if inst.name != "Head" && rustudio_core::body::is_body_part_name(&inst.name) {
                 continue;
             }
             // Stored pieces (PhysicalConfigData) and a Box fidelity don't wait.
@@ -851,7 +853,7 @@ impl Physics {
         // The parts' poses relative to the root as the document has them,
         // at the body's own pose.
         let Some(doc_root) = parts.iter().find(|(r, _)| *r == root).map(|(_, x)| *x) else { return };
-        use crate::ltypes::{cf_inv, cf_mul};
+        use rustudio_core::math::{cf_inv, cf_mul};
         let inv = cf_inv(&doc_root);
         let placed: Vec<(Ref, Xform)> = parts.iter().map(|(r, x)| (*r, cf_mul(&xf, &cf_mul(&inv, x)))).collect();
         self.add_humanoid(doc, model, root, &placed);
@@ -1161,6 +1163,7 @@ impl Physics {
             self.by_collider.remove(&p.collider);
             self.hums.of_part.remove(&p.part);
         }
+        self.hums.foreign_descs.retain(|(_, d)| d.a.body != Some(h.body) && d.b.body != Some(h.body));
         self.world.remove_body(h.body);
         self.dyn_version += 1;
     }
@@ -1475,7 +1478,7 @@ impl Physics {
             // RUSTUDIO_SOLVER=studio: the solver itself does what the rest of this
             // function emulates on rapier (restitution rows, the 0.05 slop / 0.7
             // depenetration, the level-2 2h solve with the assembly out of the solver
-            // in between, the arbiter's slots 0 / 6): solver/CHAR-NOTES.md "Retired".
+            // in between, the arbiter's slots 0 / 6): Studio observations.
             // A body between its solves is not moved, so what scripts read is the body.
             let all: Vec<Ref> = self.hums.by_model.keys().copied().collect();
             for m in all {
@@ -1700,6 +1703,7 @@ impl Physics {
     /// the client document; replicated ones are the server's already).
     pub fn set_client_movers(&mut self, cd: &Document, c2s: &std::collections::HashMap<Ref, Ref>, client_model: Ref) {
         self.hums.foreign.clear();
+        self.hums.foreign_descs.clear();
         self.hums.foreign_att.clear();
         let Some(cws) = cd.workspace() else { return };
         let found: Vec<Ref> = cd
@@ -1712,6 +1716,21 @@ impl Physics {
         for r in found {
             let Some(mut m) = read_mover(cd, cws, r) else { continue };
             let Some(sp) = c2s.get(&m.part).copied() else { continue };
+            // The fallback's velocity and orientation servos compute a wrench for
+            // one world tick. An adaptive body may integrate it over several
+            // ticks at once, so a rigid correction can overshoot and grow.
+            // Use the same solver rows as for server-created constraints.
+            if self.studio.is_some() && matches!(m.law, Law::LinearVelocity { .. } | Law::AlignOrientation { .. }) {
+                let parts = [m.att0, m.att1].into_iter().flatten()
+                    .filter_map(|a| rustudio_core::body::attachment_part(cd, a));
+                self.hums.desc_remap.extend(parts.filter_map(|p| c2s.get(&p).map(|s| (p, *s))));
+                let desc = self.studio_desc(cd, cws, r);
+                self.hums.desc_remap.clear();
+                if let Some(desc) = desc {
+                    self.hums.foreign_descs.push((r, desc));
+                    continue;
+                }
+            }
             m.part = sp;
             for a in [&mut m.att0, &mut m.att1] {
                 let Some(ar) = *a else { continue };
@@ -2055,7 +2074,7 @@ impl Physics {
             let Some(hb) = self.hums.by_model.get_mut(&model) else { continue };
             let handle = hb.body;
             if let Some(sv) = self.studio.as_mut() {
-                // RUSTUDIO_SOLVER=studio (solver/CHAR-NOTES.md): the Humanoid's level
+                // RUSTUDIO_SOLVER=studio (Studio observations): the Humanoid's level
                 // is its slot-3 request (Studio(body, req, 3), STEP
                 // §3.7); the solver's arbiter combines it with the body's own slots 0,
                 // 4, 6 and applies debounce and the rise rule. The forces are external
@@ -2312,17 +2331,17 @@ impl Physics {
         let props = if doc.class_of(part).is_some_and(|c| c == "Terrain") {
             let name = self
                 .terrain_material_under(at + Vec3::Y * 0.1)
-                .map(crate::terrain::material_name)
+                .map(rustudio_core::terrain::material_name)
                 .unwrap_or("Grass");
-            crate::ltypes::LPhysicalProperties::for_material(name)
+            rustudio_core::mech::PhysicalProperties::for_material(name)
         } else if let Some((f, w)) = self.link.friction_of(part) {
             // A client part's stand-in or copy (physics_client_link.rs): the server's
             // document doesn't have it.
-            crate::ltypes::LPhysicalProperties { friction: f, friction_weight: w, ..crate::ltypes::LPhysicalProperties::for_material("Plastic") }
+            rustudio_core::mech::PhysicalProperties { friction: f, friction_weight: w, ..rustudio_core::mech::PhysicalProperties::for_material("Plastic") }
         } else {
-            crate::runtime::domains::world::part::phys_props(doc, part)
+            crate::physics::phys_props(doc, part)
         };
-        let plastic = crate::ltypes::LPhysicalProperties::for_material("Plastic");
+        let plastic = rustudio_core::mech::PhysicalProperties::for_material("Plastic");
         let wsum = props.friction_weight + plastic.friction_weight;
         if wsum <= crate::humanoid::EPS {
             return 0.0;

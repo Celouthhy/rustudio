@@ -1,5 +1,5 @@
 //! Plugin:ImportFbxAnimation(rig, isR15): the picked FBX file's animation
-//! (src/fbx_anim.rs) as a KeyframeSequence, as Studio 0.747 makes it
+//! (crates/rustudio-core/src/fbx_anim.rs) as a KeyframeSequence, as Studio 0.747 makes it
 //! (measured: captures/fbxanim-studio.txt, studio_fbxanim.py). The dialog,
 //! its "No file selected" cancel and the yield are api_studio_service.rs's.
 //!
@@ -30,11 +30,11 @@ use rbx_dom_weak::types::{BinaryString, CFrame, Enum, Ref, Variant};
 use rbx_dom_weak::InstanceBuilder;
 
 use super::*;
-use crate::fbx_anim::{Clip, Xf};
-use crate::math::Xform;
+use rustudio_core::fbx_anim::{Clip, Xf};
+use rustudio_core::math::Xform;
 
 fn enum_value(e: &str, name: &str) -> Variant {
-    let v = crate::ltypes::LEnumItem::from_name(e, name).map(|i| i.value as u32).unwrap_or(0);
+    let v = rustudio_engine::ltypes::LEnumItem::from_name(e, name).map(|i| i.value as u32).unwrap_or(0);
     Variant::Enum(Enum::from_u32(v))
 }
 

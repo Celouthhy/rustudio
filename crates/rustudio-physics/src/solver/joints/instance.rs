@@ -792,7 +792,7 @@ impl Inst {
                     (0, true) | (2, _) => 1 << 1,
                     (1, true) | (3, _) => 1 << 2,
                     _ => {
-                        crate::todo_spec!("JOINT Open 11: AlignAxisToChord's helper (AlignType PrimaryAxisLookAt) — no rows");
+                        crate::todo_spec!("JOINT Open 11: AlignAxisToChord's helper  (AlignType PrimaryAxisLookAt) — no rows");
                         0
                     }
                 };

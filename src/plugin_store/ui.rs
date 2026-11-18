@@ -14,8 +14,8 @@ use egui::{Align, Color32, Layout, RichText, Sense, Vec2};
 use super::manager::PluginManager;
 use super::permissions::{self, Ask};
 use super::{PluginKind, PluginSource};
-use crate::assets::SharedClient;
-use crate::theme;
+use rustudio_core::assets::SharedClient;
+use rustudio_engine::theme;
 
 #[derive(Default)]
 pub struct ManageUi {
@@ -200,7 +200,7 @@ fn card(ui: &mut egui::Ui, m: &mut PluginManager, client: Option<SharedClient>, 
             }
             None => {
                 ui.painter().rect_filled(r, 2.0, Color32::from_rgb(60, 62, 70));
-                crate::ti::paint(ui.painter(), r.shrink(14.0), if p.kind == PluginKind::Local { "file" } else { "plug" }, theme::TEXT_DIM);
+                rustudio_engine::ti::paint(ui.painter(), r.shrink(14.0), if p.kind == PluginKind::Local { "file" } else { "plug" }, theme::TEXT_DIM);
             }
         }
         ui.add_space(14.0);
@@ -309,14 +309,16 @@ fn perm_summary(ui: &mut egui::Ui, m: &mut PluginManager, p: &PluginSource) {
         }
         if !perms.http.is_empty() {
             let ok = perms.http.values().filter(|v| **v).count();
-            ui.label(RichText::new(format!("HTTP Requests  ✓ {ok}")).small());
+            ui.label(RichText::new("HTTP Requests").small());
+            ui.label(rustudio_engine::ti::text("check", 12.0));
+            ui.label(RichText::new(ok.to_string()).small());
             ui.label(RichText::new("|").small().color(theme::TEXT_DIM));
         }
         if let Some(si) = perms.script_injection {
             ui.label(RichText::new(if si { "Script Injection Allowed" } else { "Script Injection Denied" }).small());
             ui.label(RichText::new("|").small().color(theme::TEXT_DIM));
         }
-        if ui.small_button("✎").on_hover_text("Edit permissions").clicked() {
+        if ui.small_button(rustudio_engine::ti::text("pencil", 12.0)).on_hover_text("Edit permissions").clicked() {
             m.ui.perms_page = Some(p.id.clone());
         }
     });

@@ -35,8 +35,8 @@ use glam::{Mat3, Quat, Vec3};
 use mlua::{Lua, Value};
 use rbx_dom_weak::types::{CFrame, Ref, Variant};
 
-use crate::doc::{self, Document};
-use crate::math::Xform;
+use rustudio_core::doc::{self, Document};
+use rustudio_core::math::Xform;
 
 pub const REACH: f32 = 0.9913;
 
@@ -62,7 +62,7 @@ fn refp(d: &Document, r: Ref, k: &str) -> Option<Ref> {
     }
 }
 fn num(d: &Document, r: Ref, k: &str, def: f32) -> f32 {
-    crate::scene::f32_of(d.prop(r, k)).unwrap_or(def)
+    rustudio_render::scene::f32_of(d.prop(r, k)).unwrap_or(def)
 }
 fn is_a(d: &Document, r: Ref, base: &str) -> bool {
     d.class_of(r).is_some_and(|c| doc::is_a(&c, base))
@@ -99,7 +99,7 @@ fn joint_above(d: &Document, scope: Ref, part: Ref) -> Option<Link> {
         if matches!(d.prop(r, "Enabled"), Some(Variant::Bool(false))) {
             return None;
         }
-        let (p0, p1, c0, c1) = crate::rig::joint_frames(d, r)?;
+        let (p0, p1, c0, c1) = rustudio_core::body::joint_frames(d, r)?;
         if p1 != part {
             return None;
         }
@@ -199,7 +199,7 @@ fn target_frame(d: &Document, ik: Ref) -> Option<Xform> {
     let base = if is_a(d, t, "BasePart") {
         cf_or(d, t, "CFrame")
     } else if is_a(d, t, "Attachment") {
-        crate::attachment::world(d, t, true)?
+        rustudio_core::attachment::world(d, t, true)?
     } else if is_a(d, t, "Model") {
         let pp = refp(d, t, "PrimaryPart")?;
         cf_or(d, pp, "CFrame")
@@ -214,7 +214,7 @@ fn pole_point(d: &Document, ik: Ref) -> Option<Vec3> {
     if is_a(d, p, "BasePart") {
         Some(cf_or(d, p, "CFrame").pos)
     } else if is_a(d, p, "Attachment") {
-        crate::attachment::world(d, p, true).map(|x| x.pos)
+        rustudio_core::attachment::world(d, p, true).map(|x| x.pos)
     } else {
         None
     }

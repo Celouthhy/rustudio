@@ -4,7 +4,7 @@
 //! drawn first.
 
 #[path = "env_probe_gpu.rs"]
-mod env_probe_gpu;
+pub mod env_probe_gpu;
 #[path = "vf_render.rs"]
 pub mod vf;
 
@@ -17,7 +17,7 @@ use glam::{Mat4, Vec3};
 use rbx_dom_weak::types::Ref;
 use wgpu::util::DeviceExt;
 
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 /// The scene is lit in linear light into this target...
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -48,7 +48,7 @@ pub struct LightShadows {
 
 impl LightShadows {
     fn new(device: &wgpu::Device) -> Self {
-        let side = crate::mech::LSHADOW_ATLAS;
+        let side = rustudio_core::mech::LSHADOW_ATLAS;
         let tex = |label: &str, format, usage| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -75,7 +75,7 @@ impl LightShadows {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let n = crate::mech::LSHADOW_MAX_LIGHTS.max(1);
+        let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS.max(1);
         let slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("light shadow slots"),
             size: (n * (6 * 64 + 16)) as u64,
@@ -120,8 +120,8 @@ impl LightShadows {
     /// 1/0.94896), near LSHADOW_NEAR, far its Range.
     fn faces(pos: Vec3, range: f32) -> [(Mat4, Vec3); 6] {
         let axes = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
-        let fov = 2.0 * crate::mech::LSHADOW_TAN_HALF_FOV.atan();
-        let proj = Mat4::perspective_rh(fov, 1.0, crate::mech::LSHADOW_NEAR, range.max(crate::mech::LSHADOW_NEAR * 2.0));
+        let fov = 2.0 * rustudio_core::mech::LSHADOW_TAN_HALF_FOV.atan();
+        let proj = Mat4::perspective_rh(fov, 1.0, rustudio_core::mech::LSHADOW_NEAR, range.max(rustudio_core::mech::LSHADOW_NEAR * 2.0));
         axes.map(|a| {
             let up = if a.y.abs() > 0.5 { Vec3::Z } else { Vec3::Y };
             (proj * Mat4::look_to_rh(pos, a, up), a)
@@ -132,7 +132,7 @@ const SAMPLES: u32 = 4;
 /// DepthOfFieldEffect intensity from which Studio runs the reduced near chain
 /// instead of the full-resolution cheap pass (shader.wgsl DOF_CHEAP_BELOW).
 const DOF_CHEAP_BELOW: f32 = 0.22;
-const SHADOW_SIZE: u32 = crate::mech::SHADOW_MAP_TEXELS;
+const SHADOW_SIZE: u32 = rustudio_core::mech::SHADOW_MAP_TEXELS;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -204,16 +204,7 @@ pub struct LightRaw {
     pub surface_v: [f32; 4],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq)]
-pub struct Vertex {
-    pub pos: [f32; 3],
-    pub normal: [f32; 3],
-    pub uv: [f32; 2],
-    pub projection: [f32; 4],
-    /// Per-vertex colour (sRGB 0..1); alpha 0 = use the part's Color.
-    pub color: [f32; 4],
-}
+pub use rustudio_core::vertex::Vertex;
 
 /// Box-projected UVs for built-in shapes. Each face is seen from outside
 /// with its image upright: the front face (−Z) has image-left at +X (the
@@ -362,11 +353,11 @@ pub struct Frame<'a> {
     /// Terrain.Clouds (clouds.rs), drawn with the sky.
     pub clouds: Option<crate::clouds::CloudsLook>,
     /// The scene environment probe's work this frame (env_probe.rs).
-    pub probe: Option<crate::env_probe::ProbeFrame>,
+    pub probe: Option<env_probe_gpu::ProbeFrame>,
 }
 
 /// Studs per side of the cells static parts are grouped into.
-const CELL: f32 = crate::mech::RENDER_CELL;
+const CELL: f32 = rustudio_core::mech::RENDER_CELL;
 
 /// Which pass a draw belongs to; None = blended part, sorted every frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -464,7 +455,7 @@ mod gpu_tests {
         limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
         let mut renderer = Renderer::new(&device, &queue);
-        let mut vox = crate::terrain::Voxels::empty();
+        let mut vox = rustudio_core::terrain::Voxels::empty();
         // Same FillBlock: x,z in [0,32), y in [-16,0), full Grass voxels.
         for x in 0..8 { for y in -4..0 { for z in 0..8 { vox.set([x,y,z],2,1.0); } } }
         let mut rows = Vec::new();
@@ -472,7 +463,7 @@ mod gpu_tests {
             renderer.clear_terrain();
             for y in -1..=0 { for x in -1..=0 { for z in -1..=0 {
                 let key = [x,y,z];
-                let geometry = crate::terrain::grass_geometry_density(&vox,key,length,1.0);
+                let geometry = rustudio_core::terrain::grass_geometry_density(&vox,key,length,1.0);
                 let positions: Vec<_> = geometry.cells.iter().map(|cell| cell.batch.blades.iter().map(|&(_,first)| geometry.vertices[first..first+3].iter().map(|v|v.pos).collect::<Vec<_>>()).collect::<Vec<_>>()).collect();
                 renderer.set_terrain_grass_geometry(&device,key,geometry);
                 if let Some(chunk) = renderer.terrain_grass.get(&key) {
@@ -483,7 +474,7 @@ mod gpu_tests {
                 }
             } } }
         }
-        std::fs::write("checks/grass-full-re/integrated-selection/renderer-selection.json",serde_json::to_vec(&rows).unwrap()).unwrap();
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/../../checks/grass-full-re/integrated-selection/renderer-selection.json"),serde_json::to_vec(&rows).unwrap()).unwrap();
     }
 
     /// Every pipeline of the 3D view, built on this machine's GPU with the
@@ -627,7 +618,7 @@ struct Item {
 
 /// Same place within float noise: a CFrame write of the same value comes
 /// back through the scene's transform maths with its low bits changed.
-fn near_xf(a: &crate::math::Xform, b: &crate::math::Xform) -> bool {
+fn near_xf(a: &rustudio_core::math::Xform, b: &rustudio_core::math::Xform) -> bool {
     a.pos.abs_diff_eq(b.pos, 1e-4) && a.rot.abs_diff_eq(b.rot, 1e-5)
 }
 
@@ -680,7 +671,7 @@ fn bias_of(draws: &[PartDraw]) -> f32 {
             v.to_bits().hash(&mut h);
         }
     }
-    (h.finish() % 16) as f32 * crate::mech::DEPTH_BIAS_STEP
+    (h.finish() % 16) as f32 * rustudio_core::mech::DEPTH_BIAS_STEP
 }
 
 fn spread(v: u64) -> u64 {
@@ -871,7 +862,7 @@ struct GrassRange {
 impl GrassRange {
     fn count(&self, camera: Vec3) -> u32 {
         let distance = camera.distance(camera.clamp(self.lo, self.hi));
-        let cap = crate::mech::GRASS_RADIUS;
+        let cap = rustudio_core::mech::GRASS_RADIUS;
         let factor = (2.0 / (1.0 + distance.min(cap) / cap) - 1.0).clamp(0.0, 1.0);
         let group = if self.near {3} else {1};
         let limit = ((self.allocated / group) as f32 * factor).trunc() as usize * group;
@@ -1501,7 +1492,7 @@ impl Renderer {
         });
         let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lights"),
-            size: (crate::mech::MAX_LIGHTS.max(1) * std::mem::size_of::<LightRaw>()) as u64,
+            size: (rustudio_core::mech::MAX_LIGHTS.max(1) * std::mem::size_of::<LightRaw>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1599,7 +1590,7 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             // Also the material maps' sampler: Studio's anisotropic filter
             // at the device default (mech::TEXTURE_ANISOTROPY).
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
+            anisotropy_clamp: rustudio_core::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
         let lshadow = LightShadows::new(device);
@@ -1722,7 +1713,7 @@ impl Renderer {
             // Mipmapped and anisotropic, like Studio: finely tiled textures
             // average out at a distance instead of sparkling.
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
+            anisotropy_clamp: rustudio_core::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
         let glass_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2020,7 +2011,7 @@ impl Renderer {
             }],
         });
         let terrain_vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<crate::terrain::TerrainVertex>() as u64,
+            array_stride: std::mem::size_of::<rustudio_core::terrain::TerrainVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
         };
@@ -2545,7 +2536,7 @@ impl Renderer {
                 }
                 // The scene environment probe's current slot, level 0 (env_probe.rs).
                 for f in 0..6 {
-                    let size = [crate::env_probe::SIZE; 2];
+                    let size = [env_probe_gpu::SIZE; 2];
                     if let Some((w,h,data)) = self.read_hdr_layer(rs, &self.probe.slots[self.probe.cur], size, f) {
                         let _ = std::fs::write(format!("{path}.probe{f}-{w}x{h}"), data);
                     }
@@ -2677,15 +2668,9 @@ impl Renderer {
                 .create_view(&Default::default())
         });
         let (w, h) = (width.max(1), height.max(1));
-        let ready = READY_MIPS.with(|c| {
-            let mut c = c.borrow_mut();
-            match c.as_ref() {
-                Some((p, _)) if *p == rgba.as_ptr() as usize => c.take().map(|m| m.1),
-                _ => None,
-            }
-        });
+        let ready = rustudio_core::texture::ready_mips(rgba);
         let mips = if rgba.len() == (w * h * 4) as usize {
-            ready.unwrap_or_else(|| mip_chain(w, h, rgba))
+            ready.unwrap_or_else(|| rustudio_core::texture::mip_chain(w, h, rgba))
         } else {
             rgba.to_vec()
         };
@@ -2858,7 +2843,7 @@ impl Renderer {
     /// part shaders at (roughness, N·V) as PrecomputedBRDFTexture. Without the
     /// file a 1×1 (1, 0): Fresnel F0 alone.
     fn brdf_lut_view(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
-        let file = crate::assets::resolve("rbxasset://textures/brdfLUT.dds", None)
+        let file = rustudio_core::assets::resolve("rbxasset://textures/brdfLUT.dds", None)
             .and_then(|p| std::fs::read(p).ok());
         let parsed = file.and_then(|b| {
             if b.len() < 148 || &b[0..4] != b"DDS " || &b[84..88] != b"DX10" {
@@ -3016,7 +3001,7 @@ impl Renderer {
                     view_formats: &[],
                 },
                 wgpu::util::TextureDataOrder::LayerMajor,
-                &mip_chain(w, h, rgba),
+                &rustudio_core::texture::mip_chain(w, h, rgba),
             )
             .create_view(&Default::default())
     }
@@ -3040,7 +3025,7 @@ impl Renderer {
         &mut self,
         device: &wgpu::Device,
         key: [i32; 3],
-        verts: &[crate::terrain::TerrainVertex],
+        verts: &[rustudio_core::terrain::TerrainVertex],
     ) {
         // (the sun's cascades and the lights' shadow maps hold the terrain)
         self.static_gen += 1;
@@ -3083,7 +3068,7 @@ impl Renderer {
         &mut self,
         device: &wgpu::Device,
         key: [i32; 3],
-        verts: &[crate::terrain::TerrainVertex],
+        verts: &[rustudio_core::terrain::TerrainVertex],
     ) {
         let had = self.terrain_chunks.remove(&key);
         self.set_terrain_chunk(device, key, verts);
@@ -3105,7 +3090,7 @@ impl Renderer {
         }
     }
 
-    pub fn set_terrain_grass_geometry(&mut self, device: &wgpu::Device, key: [i32;3], geometry: crate::terrain::GrassGeometry) {
+    pub fn set_terrain_grass_geometry(&mut self, device: &wgpu::Device, key: [i32;3], geometry: rustudio_core::terrain::GrassGeometry) {
         let mut vertices = Vec::new();
         let mut ranges = Vec::new();
         for cell in geometry.cells {
@@ -3636,7 +3621,7 @@ impl Renderer {
     }
 
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
-        let _b = crate::bench::scope("fx_post_again");
+        let _b = rustudio_core::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
@@ -3760,7 +3745,7 @@ impl Renderer {
         self.vf.base = Some(globals);
         self.gui_fog = Self::gui_fog(&frame.globals);
         self.gui_lightgrid = frame.globals.lightgrid;
-        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, crate::mech::SUN_DIST, crate::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
+        self.gui_sun_params = [if frame.globals.sun_color[3] < 0.5 { 1.0 } else { 0.0 }, rustudio_core::mech::SUN_DIST, rustudio_core::mech::HYBRID_LERP_SLOPE, if frame.shadows { 1.0 } else { 0.0 }];
         self.gui_sun = crate::world_gui::SunCascades { local: frame.globals.sun_casc, sphere: frame.globals.sun_sphere, rect: frame.globals.sun_rect };
         let mut stats = RenderStats {
             rebuilds: self.stats.rebuilds,
@@ -3771,16 +3756,16 @@ impl Renderer {
         // New parts join the static batches once they've settled.
         let settled = self
             .pending_at
-            .is_none_or(|t| t.elapsed().as_secs_f32() >= crate::mech::STATIC_SETTLE_S);
+            .is_none_or(|t| t.elapsed().as_secs_f32() >= rustudio_core::mech::STATIC_SETTLE_S);
         let compact = self.st.hidden > 1024 && self.st.hidden * 4 > self.st.raw.len();
         if (self.pending > 0
             && (self.st.batches.is_empty()
-                || ((settled || self.pending > crate::mech::PENDING_MAX)
-                    && self.last_rebuild.elapsed().as_secs_f32() >= crate::mech::STATIC_REBUILD_MIN_S)))
+                || ((settled || self.pending > rustudio_core::mech::PENDING_MAX)
+                    && self.last_rebuild.elapsed().as_secs_f32() >= rustudio_core::mech::STATIC_REBUILD_MIN_S)))
             || compact
         {
             self.last_rebuild = Instant::now();
-            let _p = crate::bench::scope("render_static_rebuild");
+            let _p = rustudio_core::bench::scope("render_static_rebuild");
             self.rebuild_static(device, queue);
             stats.rebuilds += 1;
         }
@@ -3794,7 +3779,7 @@ impl Renderer {
         let planes = frustum(frame.cull_view_proj);
         // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
         let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
-        let lod_k = crate::mech::LOD_MIN_PX / focal;
+        let lod_k = rustudio_core::mech::LOD_MIN_PX / focal;
 
         // Static batches: frustum test per cell, then trim the smallest parts.
         let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
@@ -3978,7 +3963,7 @@ impl Renderer {
             queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(frame.lines));
         }
 
-        let n_lights = frame.lights.len().min(crate::mech::MAX_LIGHTS);
+        let n_lights = frame.lights.len().min(rustudio_core::mech::MAX_LIGHTS);
         self.gui_n_lights = n_lights as u32;
         if n_lights > 0 {
             queue.write_buffer(
@@ -4035,7 +4020,7 @@ impl Renderer {
                 if !box_visible(&sp, b.lo, b.hi) {
                     continue;
                 }
-                let r_min = lod_k * box_distance(cam, b.lo, b.hi) * crate::mech::SHADOW_LOD_SCALE;
+                let r_min = lod_k * box_distance(cam, b.lo, b.hi) * rustudio_core::mech::SHADOW_LOD_SCALE;
                 let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
                 let n = radii.partition_point(|r| *r >= r_min) as u32;
                 if n == 0 {
@@ -4071,7 +4056,7 @@ impl Renderer {
                 let cast =
                     |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
                         if let Some(mesh) = self.meshes.get(key.0) {
-                            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
+                            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
                             pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                             pass.draw(0..mesh.count, range);
                         }
@@ -4106,7 +4091,7 @@ impl Renderer {
                     for (solid,c) in self.terrain_chunks.values().map(|c|(true,c)).chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c|(false,c))) {
                         pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
                         if box_visible(&sp, c.lo, c.hi) {
-                            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (c.count / 3) as u64);
+                            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (c.count / 3) as u64);
                             pass.set_vertex_buffer(0, c.vbuf.slice(..));
                             if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
                         else { for range in &c.grass_ranges {
@@ -4128,7 +4113,7 @@ impl Renderer {
                 .iter()
                 .filter(|l| l.extra[3] >= 0.0)
                 .map(|l| (l.extra[3] as usize, Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]), l.pos_range[3]))
-                .filter(|s| s.0 < crate::mech::LSHADOW_MAX_LIGHTS)
+                .filter(|s| s.0 < rustudio_core::mech::LSHADOW_MAX_LIGHTS)
                 .collect();
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -4143,7 +4128,7 @@ impl Renderer {
             };
             if !slots.is_empty() && self.lshadow.key != Some(key) {
                 self.lshadow.key = Some(key);
-                let n = crate::mech::LSHADOW_MAX_LIGHTS;
+                let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
                 let mut face_data = vec![0u8; n * 6 * LSHADOW_FACE_STRIDE as usize];
                 for (slot, pos, range) in &slots {
@@ -4161,8 +4146,8 @@ impl Renderer {
                 }
                 queue.write_buffer(&self.lshadow.slots_buf, 0, bytemuck::cast_slice(&slot_data));
                 queue.write_buffer(&self.lshadow.face_buf, 0, &face_data);
-                let far_p = crate::mech::EVSM_POS_EXP.exp() as f64;
-                let far_n = -(-crate::mech::EVSM_NEG_EXP).exp() as f64;
+                let far_p = rustudio_core::mech::EVSM_POS_EXP.exp() as f64;
+                let far_n = -(-rustudio_core::mech::EVSM_NEG_EXP).exp() as f64;
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("light shadows"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4189,8 +4174,8 @@ impl Renderer {
                 pass.set_pipeline(&self.lshadow_pipe);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
-                let cols = crate::mech::LSHADOW_ATLAS / crate::mech::LSHADOW_FACE;
-                let face_px = crate::mech::LSHADOW_FACE;
+                let cols = rustudio_core::mech::LSHADOW_ATLAS / rustudio_core::mech::LSHADOW_FACE;
+                let face_px = rustudio_core::mech::LSHADOW_FACE;
                 for (slot, pos, range) in &slots {
                     // The static cells the light reaches.
                     let near: Vec<&Batch> = self
@@ -4208,7 +4193,7 @@ impl Renderer {
                         pass.set_bind_group(1, &self.lshadow.face_bg, &[k * LSHADOW_FACE_STRIDE as u32]);
                         for b in &near {
                             if let Some(mesh) = self.meshes.get(b.key.0) {
-                                crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
+                                rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
                                 pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                                 pass.draw(0..mesh.count, b.start..b.start + b.count);
                             }
@@ -4237,7 +4222,7 @@ impl Renderer {
             };
             pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
             pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-            crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
+            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
             pass.draw(0..mesh.count, range);
             *calls += 1;
         };
@@ -4247,12 +4232,12 @@ impl Renderer {
         // pyramid and convolves mips 1 and 2.
         if let Some(pf) = frame.probe.as_ref() {
             for task in &pf.tasks {
-                if let crate::env_probe::Task::Face(f) = *task {
-                    let (fwd, up) = crate::env_probe::face_basis(f);
+                if let env_probe_gpu::Task::Face(f) = *task {
+                    let (fwd, up) = env_probe_gpu::face_basis(f);
                     let centre = pf.centre;
                     let fov = std::f32::consts::FRAC_PI_2;
-                    let reverse = Mat4::perspective_rh(fov, 1.0, crate::env_probe::FAR, crate::mech::NEAR);
-                    let ordinary = Mat4::perspective_rh(fov, 1.0, crate::mech::NEAR, crate::env_probe::FAR);
+                    let reverse = Mat4::perspective_rh(fov, 1.0, env_probe_gpu::FAR, rustudio_core::mech::NEAR);
+                    let ordinary = Mat4::perspective_rh(fov, 1.0, rustudio_core::mech::NEAR, env_probe_gpu::FAR);
                     let view = Mat4::look_to_rh(centre, fwd, up);
                     let view_rel = Mat4::look_to_rh(Vec3::ZERO, fwd, up);
                     let mut pg = globals;
@@ -4513,7 +4498,7 @@ impl Renderer {
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
                     if box_visible(&planes, c.lo, c.hi) {
-                        crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::SCENE, 1, (c.count / 3) as u64);
+                        rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (c.count / 3) as u64);
                         pass.set_vertex_buffer(0, c.vbuf.slice(..));
                         if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
                         else { for range in &c.grass_ranges {
@@ -4742,7 +4727,7 @@ impl Renderer {
             c.after_submit();
         }
         self.stats = stats;
-        crate::runtime::domains::services::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
+        rustudio_core::bench::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
         self.texture_id
     }
 }
@@ -4881,7 +4866,7 @@ impl Renderer {
         }
         if !verts.is_empty() {
             queue.write_buffer(&m.vbuf, first as u64 * std::mem::size_of::<Vertex>() as u64, bytemuck::cast_slice(verts));
-            crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+            rustudio_core::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
         }
         true
     }
@@ -4913,7 +4898,7 @@ impl Renderer {
             })
             .collect();
         queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
-        crate::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
+        rustudio_core::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
         if m.storage {
             self.skin.again(index);
         }
@@ -4942,7 +4927,7 @@ impl Renderer {
                 let i = self.add_mesh_with(device, &base.positions, &base.normals, &base.uvs, &base.colors, &[], true);
                 let b = base.positions.len() as u64 * std::mem::size_of::<Vertex>() as u64;
                 self.skin.bytes += b;
-                crate::bench::add("skin_upload_bytes", 0.0, b);
+                rustudio_core::bench::add("skin_upload_bytes", 0.0, b);
                 i
             }
         };
@@ -5021,7 +5006,7 @@ impl Renderer {
             if d.mat_layer >= 0 && d.custom_mesh.is_none() && d.tex_mode == TexMode::None {
                 // Studio returns no offset for a MaterialVariant.
                 let variant = self.materials.cpu.get(d.mat_layer as usize)
-                    .is_some_and(|m| crate::matpack::is_variant_pack(m.pack));
+                    .is_some_and(|m| rustudio_core::texture_pack::is_variant_pack(m.pack));
                 let off = if variant { [0.0; 2] } else { crate::matpack::uv_offset(d.size, d.material_id, identity) };
                 d.uvt[2] = off[0];
                 d.uvt[3] = off[1];
@@ -5114,7 +5099,7 @@ impl Renderer {
         for r in &self.per_frame {
             let Some(item) = self.items.get_mut(r) else { continue };
             if item.state == ItemState::Dynamic
-                && item.moved.elapsed().as_secs_f32() >= crate::mech::DYNAMIC_SETTLE_S
+                && item.moved.elapsed().as_secs_f32() >= rustudio_core::mech::DYNAMIC_SETTLE_S
                 && item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some())
             {
                 item.state = ItemState::Pending;
@@ -5301,7 +5286,7 @@ const NO_SHADOW_BIT: u32 = 1 << 19;
 
 // selects PlasticReflection only for 256/272; tiled
 // materials (including Metal) keep their texture-driven metalness/roughness.
-pub(crate) fn material_reflectance(material: u32, reflectance: f32) -> f32 {
+pub fn material_reflectance(material: u32, reflectance: f32) -> f32 {
     match material {
         256 | 272 | 1568 => reflectance.clamp(0.0, 1.0),
         _ => 0.0,
@@ -5346,8 +5331,8 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 
 /// shader.wgsl with the measured constants from mech.rs put in front.
 fn shader_source() -> String {
-    let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", crate::mech::GRASS_RADIUS, crate::mech::GRASS_FADE_LEN, crate::mech::GRASS_NEAR_RADIUS, crate::mech::GRASS_NEAR_FADE_LEN);
-    use crate::mech as m;
+    let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", rustudio_core::mech::GRASS_RADIUS, rustudio_core::mech::GRASS_FADE_LEN, rustudio_core::mech::GRASS_NEAR_RADIUS, rustudio_core::mech::GRASS_NEAR_FADE_LEN);
+    use rustudio_core::mech as m;
     let [a, b, c, d, e] = m::TONE_CURVE;
     format!(
         "const SUN_DIST: f32 = {:?};\nconst HYBRID_LERP_SLOPE: f32 = {:?};\nconst TONE_A: f32 = {a:?};\nconst TONE_B: f32 = {b:?};\nconst TONE_C: f32 = {c:?};\nconst TONE_D: f32 = {d:?};\nconst TONE_E: f32 = {e:?};\nconst BLOOM_SIGMA_NARROW: f32 = {:?};\nconst BLOOM_SIGMA_WIDE: f32 = {:?};\nconst BLOOM_WIDE_SHARE: f32 = {:?};\nconst BLOOM_GAIN: f32 = {:?};\nconst BLOOM_MAX_RADIUS: i32 = {};\nconst ATMOS_BAND_DEG: f32 = {:?};\nconst ATMOS_BAND_POW: f32 = {:?};\nconst ATMOS_BAND_FLOOR: f32 = {:?};\nconst ENV_SPEC_LOD_SPAN: f32 = {:?};\nconst LIGHTGRID_BORDER: f32 = {:?};\nconst LIGHTOCC_DENSITY: f32 = {:?};\nconst LIGHTOCC_START_VOXELS: f32 = {:?};\nconst LIGHTOCC_LIGHT_SKIP_VOXELS: f32 = {:?};\nconst LIGHTOCC_MAX_STEPS: f32 = {:?};\nconst ATMOS_T_EPS: f32 = {:?};\nconst ATMOS_FOG_MIP: f32 = {:?};\nconst ATMOS_ENV_CUBE_LEVELS: f32 = {:?};\nconst ENV_SPEC_FADE: f32 = {:?};\nconst ENV_ROUGH_BASE: f32 = {:?};\nconst ENV_ROUGH_SCALE: f32 = {:?};\nconst ENV_SPEC_MIP_PER_ROUGHNESS: f32 = {:?};\nconst ENV_REFLECT_UP_GAIN: f32 = {:?};\nconst SSAO_DEPTH_SCALE: f32 = {:?};\nconst SSAO_DEPTH_MAX: f32 = {:?};\nconst SSAO_RADIUS_K: f32 = {:?};\nconst SSAO_RADIUS_MIN_TEXELS: f32 = {:?};\nconst SSAO_RADIUS_MAX_TEXELS: f32 = {:?};\nconst SSAO_SAMPLES: u32 = {}u;\nconst SSAO_DEPTH_GAIN: f32 = {:?};\nconst SSAO_BLUR_K: f32 = {:?};\nconst SSAO_BLUR_DEPTH: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MIN: f32 = {:?};\nconst SSAO_BLUR_DEPTH_MAX: f32 = {:?};\nconst SSAO_UPSAMPLE_DEPTH: f32 = {:?};\nconst EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\nconst LSHADOW_COLS: u32 = {}u;\nconst LSHADOW_CELL: f32 = {:?};\n{}",
@@ -5433,7 +5418,7 @@ fn pbr_mips_preserve_linear_channels() {
 
 /// Six square faces, each with its mip chain, layer-major (a cube upload).
 pub fn cube_mips(size: u32, faces: &[Vec<u8>; 6]) -> Vec<u8> {
-    let mut data: Vec<u8> = faces.iter().flat_map(|f| mip_chain(size, size, f)).collect();
+    let mut data: Vec<u8> = faces.iter().flat_map(|f| rustudio_core::texture::mip_chain(size, size, f)).collect();
     ggx_prefilter_cube(size, &mut data);
     data
 }
@@ -5448,7 +5433,7 @@ pub fn cube_mips(size: u32, faces: &[Vec<u8>; 6]) -> Vec<u8> {
 /// Importance-sampled GGX (α = roughness², as the FS's sun term), N = V,
 /// reading the box chain at the sample's solid angle.
 fn ggx_prefilter_cube(size: u32, data: &mut [u8]) {
-    use crate::mech as m;
+    use rustudio_core::mech as m;
     let levels = mip_levels(size, size) as usize;
     let base = (size.max(1) / m::ENV_PREFILTER_SIZE.min(size.max(1))).trailing_zeros() as usize;
     if base + 1 >= levels {
@@ -5598,80 +5583,6 @@ fn cube_face_mapping_round_trips() {
     }
 }
 
-thread_local! {
-    /// Mips made off the main thread for the image being uploaded (its
-    /// pixels' address and the chain): see [`with_mips`].
-    static READY_MIPS: std::cell::RefCell<Option<(usize, Vec<u8>)>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The mip chain add_texture would make for `img` (None when it makes none).
-pub fn mip_chain_for(img: &crate::texture::Rgba) -> Option<Vec<u8>> {
-    let (w, h) = (img.width.max(1), img.height.max(1));
-    (img.pixels.len() == (w * h * 4) as usize).then(|| mip_chain(w, h, &img.pixels))
-}
-
-/// Runs `upload` (which adds `pixels` as a texture) with `mips` already made
-/// for it: add_texture takes them instead of building the chain itself.
-pub fn with_mips<R>(pixels: &[u8], mips: Option<Vec<u8>>, upload: impl FnOnce() -> R) -> R {
-    let Some(m) = mips else { return upload() };
-    READY_MIPS.with(|c| *c.borrow_mut() = Some((pixels.as_ptr() as usize, m)));
-    let r = upload();
-    READY_MIPS.with(|c| c.borrow_mut().take());
-    r
-}
-
-fn mip_chain(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
-    use std::sync::OnceLock;
-    static TO_LIN: OnceLock<[f32; 256]> = OnceLock::new();
-    let to_lin = TO_LIN.get_or_init(|| std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2)));
-    // round(v^(1/2.2) * 255) without powf: the byte whose rounding interval
-    // holds v (thresholds ((s - 0.5) / 255)^2.2). powf per channel per texel
-    // made mip chains a large share of a map load's texture time.
-    static TH: OnceLock<[f32; 255]> = OnceLock::new();
-    let th = TH.get_or_init(|| std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2)));
-    let to_srgb = |v: f32| th.partition_point(|&t| t <= v) as u8;
-    // (exactly the chain's size: growing a Vec of level 0 by doubling held
-    // half as much again as the chain needs)
-    let mut total = rgba.len();
-    let (mut cw, mut ch) = (w, h);
-    while cw > 1 || ch > 1 {
-        (cw, ch) = ((cw / 2).max(1), (ch / 2).max(1));
-        total += (cw * ch * 4) as usize;
-    }
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(rgba);
-    let (mut cw, mut ch) = (w, h);
-    let mut prev = rgba.to_vec();
-    while cw > 1 || ch > 1 {
-        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
-        let mut next = vec![0u8; (nw * nh * 4) as usize];
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut acc = [0f32; 4];
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let sx = (x * 2 + dx).min(cw - 1);
-                    let sy = (y * 2 + dy).min(ch - 1);
-                    let o = ((sy * cw + sx) * 4) as usize;
-                    for c in 0..3 {
-                        acc[c] += to_lin[prev[o + c] as usize];
-                    }
-                    acc[3] += prev[o + 3] as f32;
-                }
-                let o = ((y * nw + x) * 4) as usize;
-                for c in 0..3 {
-                    next[o + c] = to_srgb(acc[c] * 0.25);
-                }
-                next[o + 3] = (acc[3] * 0.25 + 0.5) as u8;
-            }
-        }
-        out.extend_from_slice(&next);
-        prev = next;
-        cw = nw;
-        ch = nh;
-    }
-    out
-}
-
 pub fn mat_cols(m: Mat4) -> [[f32; 4]; 4] {
     m.to_cols_array_2d()
 }
@@ -5737,7 +5648,7 @@ pub(crate) fn ball_outline_points() -> impl Iterator<Item = Vec3> {
     }))
 }
 
-pub(crate) fn outline_triangles(kind: MeshKind) -> &'static [[Vec3; 3]] {
+pub fn outline_triangles(kind: MeshKind) -> &'static [[Vec3; 3]] {
     static TRIANGLES: std::sync::OnceLock<Vec<Vec<[Vec3; 3]>>> = std::sync::OnceLock::new();
     &TRIANGLES.get_or_init(|| build_meshes().iter().map(|vertices|
         vertices.chunks_exact(3).map(|t| [Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos)]).collect()
@@ -5902,7 +5813,8 @@ thread_local! {
 }
 
 /// The next part texture upload on this thread replaces slot `index`
-/// instead of taking a new one (assets.rs, for EditableImage updates).
-pub fn reuse_texture_slot(index: u32) {
-    REUSE_TEXTURE_SLOT.with(|c| c.set(Some(index)));
+/// instead of taking a new one (assets.rs, for EditableImage updates; `None`
+/// when the image has none to replace).
+pub fn reuse_texture_slot(index: Option<u32>) {
+    REUSE_TEXTURE_SLOT.with(|c| c.set(index));
 }

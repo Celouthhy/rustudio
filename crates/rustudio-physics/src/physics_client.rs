@@ -158,13 +158,13 @@ impl ClientSim {
             }
             p.queued.insert(r);
         }
-        let sc = crate::bench::scope("pc_sync");
+        let sc = rustudio_core::bench::scope("pc_sync");
         p.sync(cd);
         drop(sc);
         for r in &self.keep_awake {
             p.wake_part(*r);
         }
-        let _ex = crate::bench::scope("pc_near");
+        let _ex = rustudio_core::bench::scope("pc_near");
         let mut requeue: Vec<Ref> = Vec::new();
         // A new body of the client's gets its neighbourhood before it moves
         // (arriving later, a neighbour can appear inside it and kick it).
@@ -298,12 +298,12 @@ impl ClientSim {
         // finds the client's own anchored parts near it there (physics_client_link.rs).
         if p.asms.is_empty() {
             if !p.parts.is_empty() {
-                let _b = crate::bench::scope("pc_broad");
+                let _b = rustudio_core::bench::scope("pc_broad");
                 p.world.detect_collisions(&(), &());
             }
             return StepResult::default();
         }
-        let _sc = crate::bench::scope("pc_step");
+        let _sc = rustudio_core::bench::scope("pc_step");
         p.step(cd, dt)
     }
 }

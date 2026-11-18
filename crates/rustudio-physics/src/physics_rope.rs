@@ -19,7 +19,7 @@ impl Physics {
 
     fn rope_endpoint(&self, doc: &Document, att: Ref) -> Option<(Option<rp::RigidBodyHandle>, Vec3)> {
         let part = Self::attachment_part(doc, att)?;
-        let world = crate::attachment::world(doc, att, false)?.pos;
+        let world = rustudio_core::attachment::world(doc, att, false)?.pos;
         let local = xform_of(doc, part).map(|xf| xf.rot.transpose() * (world - xf.pos));
         let point = match (local, self.part_xform(doc, part)) {
             (Some(local), Some(xf)) => xf.apply(local),

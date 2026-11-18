@@ -152,7 +152,7 @@ fn enum_item(lua: &Lua, ty: &str, name: &str) -> mlua::Result<Value> {
 }
 
 fn warn(lua: &Lua, msg: &str) -> mlua::Result<()> {
-    world(lua)?.output.push((crate::app::Level::Warn, msg.to_string()));
+    world(lua)?.output.push((rustudio_core::log::Level::Warn, msg.to_string()));
     Ok(())
 }
 

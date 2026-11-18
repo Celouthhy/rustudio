@@ -97,7 +97,7 @@ pub fn cache_dir() -> PathBuf {
 /// An optional local asset store: a folder of `<id>` or `<id>.<ext>` files,
 /// named by `RUSTUDIO_LOCAL_ASSETS`. Off unless that is set. Read only.
 pub fn local_assets_dir() -> Option<PathBuf> {
-    // (or the rustudio option: src/rustudio_settings.rs)
+    // (or the rustudio option: crates/rustudio-core/src/rustudio_settings.rs)
     crate::rustudio_settings::local_assets()
 }
 
@@ -283,7 +283,7 @@ fn legacy_table(content: &Path) -> HashMap<String, u64> {
         .canonicalize()
         .ok()
         .and_then(|c| c.parent().map(|p| p.join("PlatformContent/pc")));
-    include_str!("../assets/legacy-content.tsv")
+    include_str!("../../../assets/legacy-content.tsv")
         .lines()
         .filter(|l| !l.starts_with('#'))
         .filter_map(|l| l.split_once('\t'))
@@ -782,7 +782,7 @@ fn opted_in_file(id: &str) -> Option<PathBuf> {
 
 /// Whether place content (a property's image, mesh or sound) may load given
 /// whether scripts are running. Roblox never loads local files for a place;
-/// rustudio's editor does (MECHANICS.md), but not while scripts run: what is
+/// rustudio's editor does (docs/MECHANICS.md), but not while scripts run: what is
 /// rendered or played can be read back (CaptureService +
 /// CreateEditableImageAsync, GetWaveformAsync, AudioAnalyzer, raycasts and
 /// unions against a mesh). Checked before any cache keyed by id (#16).
@@ -1109,7 +1109,7 @@ impl AssetStore {
         !self.pending.is_empty()
     }
 
-    /// --fixed-dt (src/sim_clock.rs): waits until every download in flight
+    /// --fixed-dt (crates/rustudio-core/src/sim_clock.rs): waits until every download in flight
     /// has finished (at most `max`), so an asset asked for in one frame is
     /// handed out by the next `poll`, however slow the network or machine.
     pub fn wait_pending(&mut self, max: std::time::Duration) {
@@ -1210,7 +1210,9 @@ fn load_mesh_projected(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>,
 
 /// Uploads positions, normals, UVs and (possibly empty) per-corner colours.
 pub type MeshUpload<'a> = dyn FnMut(&[Vec3], &[Vec3], &[Vec2], &[glam::Vec4], &[glam::Vec4]) -> u32 + 'a;
-pub type TextureUpload<'a> = dyn FnMut(&Rgba) -> u32 + 'a;
+/// Uploads an image; the second argument is the texture slot it replaces
+/// (`None`: a new one), so the slot itself stays with the renderer.
+pub type TextureUpload<'a> = dyn FnMut(&Rgba, Option<u32>) -> u32 + 'a;
 
 /// Loaded meshes by content id (None = failed for good).
 #[derive(Default)]
@@ -1347,14 +1349,14 @@ impl MeshCache {
     /// A live EditableMesh copy (runtime/editable.rs): built from the mesh
     /// itself the first time, then patched in place by the viewport. None
     /// when `id` isn't live (or its mesh is gone: then its bytes hold it).
-    pub fn live(&mut self, id: &str, upload: &mut dyn FnMut(&[crate::render::Vertex]) -> u32) -> Option<LoadedMesh> {
-        if !crate::runtime::editable::is_live(id) {
+    pub fn live(&mut self, id: &str, upload: &mut dyn FnMut(&[crate::vertex::Vertex]) -> u32) -> Option<LoadedMesh> {
+        if !crate::editable_source::is_live(id) {
             return None;
         }
         if let Some(Some(m)) = self.entries.get(id) {
             return Some(*m);
         }
-        let (verts, extent) = crate::runtime::editable::live_build(id)?;
+        let (verts, extent) = crate::editable_source::live_build(id)?;
         if verts.is_empty() {
             return None;
         }
@@ -1494,20 +1496,18 @@ impl TextureCache {
     /// An EditableImage's pixels (`rbxtemp://rustudio/editable/img/<n>@<gen>`),
     /// re-uploaded in place when they changed.
     fn editable_image(&mut self, id: &str, upload: &mut TextureUpload) -> Option<LoadedTexture> {
-        let (base, gen) = crate::runtime::editable::image_key(id)?;
+        let (base, gen) = crate::editable_source::image_key(id)?;
         let held = self.editable_gens.get(base).copied();
         if held.is_some_and(|h| h >= gen) {
             if let Some(Some(t)) = self.entries.get(base) {
                 return Some(t.clone());
             }
         }
-        let Some((now, img)) = crate::runtime::editable::image_pixels(id) else {
+        let Some((now, img)) = crate::editable_source::image_pixels(id) else {
             return self.entries.get(base).cloned().flatten();
         };
-        if let Some(Some(old)) = self.entries.get(base) {
-            crate::render::reuse_texture_slot(old.index);
-        }
-        let index = upload(&img);
+        let reuse = self.entries.get(base).and_then(|t| t.map(|t| t.index));
+        let index = upload(&img, reuse);
         let t = LoadedTexture { index, width: img.width, height: img.height };
         self.entries.insert(base.to_string(), Some(t));
         self.editable_gens.insert(base.to_string(), now.max(gen));
@@ -1575,7 +1575,7 @@ impl TextureCache {
                     let t0 = std::time::Instant::now();
                     // (the chain holds level 0 too; made in add_texture otherwise)
                     self.upload_bytes += mips.as_ref().map_or(img.pixels.len() * 4 / 3, |m| m.len());
-                    let index = crate::render::with_mips(&img.pixels, mips, || upload(&img));
+                    let index = crate::texture::with_mips(&img.pixels, mips, || upload(&img, None));
                     self.upload_ms += t0.elapsed().as_secs_f32() * 1000.0;
                     let t = LoadedTexture { index, width: img.width, height: img.height };
                     if self.pinned.contains(id) {
@@ -1631,7 +1631,7 @@ impl TextureCache {
     /// file (in this frame: rare, a composite made after its inputs went).
     pub fn pixels(&mut self, id: &str, doc_dir: Option<&Path>, store: &mut AssetStore) -> Option<Arc<Rgba>> {
         if id.starts_with("rbxtemp://rustudio/editable/") {
-            return crate::runtime::editable::image_pixels(id).map(|(_, img)| Arc::new(img));
+            return crate::editable_source::image_pixels(id).map(|(_, img)| Arc::new(img));
         }
         if let Some(px) = self.pixels.get(id) {
             return Some(px.clone());
@@ -1705,7 +1705,7 @@ impl TextureCache {
         if let Some(i) = self.composites.get(key) {
             return Some(*i);
         }
-        let base = crate::runtime::editable::strip_generations(key)?;
+        let base = crate::editable_source::strip_generations(key)?;
         self.editable_composites.get(&base).filter(|(full, _)| full == key).map(|(_, i)| *i)
     }
 
@@ -1721,7 +1721,7 @@ impl TextureCache {
         }
         // Made from an EditableImage: one GPU slot per composite, whatever
         // the generation (the old one is replaced, not leaked).
-        let stripped = crate::runtime::editable::strip_generations(key);
+        let stripped = crate::editable_source::strip_generations(key);
         let mut reuse = None;
         if let Some(base) = &stripped {
             if let Some((full, i)) = self.editable_composites.get(base) {
@@ -1732,10 +1732,7 @@ impl TextureCache {
             }
         }
         let img = build()?;
-        if let Some(i) = reuse {
-            crate::render::reuse_texture_slot(i);
-        }
-        let i = upload(&img);
+        let i = upload(&img, reuse);
         match stripped {
             Some(base) => {
                 self.editable_composites.insert(base, (key.to_string(), i));
@@ -2508,11 +2505,11 @@ mod tests {
         for _ in 0..10 {
             cache.poll_decoded();
             cache.upload_ms = UPLOAD_BUDGET_MS + 1.0;
-            assert!(cache.image("rbxassetid://987654321", None, &mut store, &mut |_| panic!("over budget")).is_none());
+            assert!(cache.image("rbxassetid://987654321", None, &mut store, &mut |_, _| panic!("over budget")).is_none());
             assert!(cache.decoded.contains_key("rbxassetid://987654321"));
         }
         cache.poll_decoded();
-        cache.image("rbxassetid://987654321", None, &mut store, &mut |_| panic!("failed decode"));
+        cache.image("rbxassetid://987654321", None, &mut store, &mut |_, _| panic!("failed decode"));
         assert!(cache.decoded.is_empty());
         assert!(cache.failed("rbxassetid://987654321"));
     }
@@ -2596,7 +2593,7 @@ mod tests {
         let locals = [format!("file://{}", path.display()), path.display().to_string(), "private.png".to_string()];
         let mut store = AssetStore::default();
         let mut textures = TextureCache::default();
-        let mut up = |_: &Rgba| 7u32;
+        let mut up = |_: &Rgba, _: Option<u32>| 7u32;
         // Edit: local files render (and land in the texture cache).
         for id in &locals {
             assert!(matches!(store.content(id, Some(&dir)), Fetch::Ready(b) if *b == bytes), "{id}");

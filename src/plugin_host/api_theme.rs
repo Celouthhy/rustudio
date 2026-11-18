@@ -111,13 +111,13 @@ fn theme_instance(lua: &Lua, name: &'static str) -> mlua::Result<Value> {
     inst_value(lua, r)
 }
 
-fn enum_arg(v: &Value, en: &str) -> mlua::Result<Option<crate::ltypes::LEnumItem>> {
+fn enum_arg(v: &Value, en: &str) -> mlua::Result<Option<rustudio_engine::ltypes::LEnumItem>> {
     let item = match v {
         Value::Nil => return Ok(None),
-        Value::String(s) => crate::ltypes::LEnumItem::from_name(en, &s.to_string_lossy()),
-        Value::Integer(i) => crate::ltypes::LEnumItem::from_value(en, *i as u32),
-        Value::Number(n) => crate::ltypes::LEnumItem::from_value(en, *n as u32),
-        v => opt_ud::<crate::ltypes::LEnumItem>(v).filter(|e| e.enum_type == en),
+        Value::String(s) => rustudio_engine::ltypes::LEnumItem::from_name(en, &s.to_string_lossy()),
+        Value::Integer(i) => rustudio_engine::ltypes::LEnumItem::from_value(en, *i as u32),
+        Value::Number(n) => rustudio_engine::ltypes::LEnumItem::from_value(en, *n as u32),
+        v => opt_ud::<rustudio_engine::ltypes::LEnumItem>(v).filter(|e| e.enum_type == en),
     };
     item.map(Some).ok_or_else(|| rt_err(format!("Unable to cast value to {en}")))
 }
@@ -138,7 +138,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
             .and_then(|t| t.get(&color.name))
             .map(|row| row[modifier.min(4)])
             .unwrap_or([0.0, 0.0, 0.0]);
-        ret1(Value::UserData(lua.create_userdata(crate::ltypes::LColor3(c))?))
+        ret1(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LColor3(c))?))
     })())
 }
 
@@ -169,7 +169,7 @@ pub fn watch_theme_as(lua: &Lua, now: &'static str) -> mlua::Result<bool> {
     // settings().Studio, as a plugin would get it (identity 5).
     let f = lua.load("return settings().Studio").set_name("=plugin.theme").into_function()?;
     let th = lua.create_thread(f)?;
-    crate::runtime::security::set(&th, crate::runtime::security::PLUGIN_IDENT);
+    rustudio_engine::runtime::security::set(&th, rustudio_engine::runtime::security::PLUGIN_IDENT);
     let Some(studio) = th.resume::<Value>(()).ok().and_then(|v| opt_inst(&v)) else { return Ok(false) };
     let mut w = world(lua)?;
     w.fire(studio, "Changed", vec![Value::String(lua.create_string("Theme")?)]);

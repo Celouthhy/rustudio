@@ -4,7 +4,7 @@
 //! Play / Pause / Stop on the left, the ribbon tabs in the middle, the
 //! account at the right) and the ribbon tabs (Home, Model, Avatar, UI,
 //! Script, Plugins). What rustudio can't do yet is shown disabled, never
-//! left out or faked. Names and icons are rustudio's own (Tabler, src/ti.rs).
+//! left out or faked. Names and icons are rustudio's own (Tabler, crates/rustudio-engine/src/ti.rs).
 //!
 //! This file: the state and the menus' contents; studio_actions.rs: what
 //! each item does; studio_ribbon.rs: the top row and the ribbon.
@@ -100,7 +100,6 @@ pub struct UiState {
     /// windows; `EmbeddedWindow`: the backend can't, so inside the main one).
     pub popped_class: Option<egui::ViewportClass>,
     pub zoom: f32,
-    pub fullscreen: bool,
     pub show_gui: bool,
     pub grid_size: f32,
     pub about: bool,
@@ -123,9 +122,8 @@ impl Default for UiState {
             viewport_hidden: false,
             popped_class: None,
             zoom: 1.0,
-            fullscreen: false,
             show_gui: true,
-            grid_size: crate::mech::GRID_SPACING,
+            grid_size: rustudio_core::mech::GRID_SPACING,
             about: false,
             studio_settings: Default::default(),
             insert_popup: None,
@@ -135,7 +133,7 @@ impl Default for UiState {
 }
 
 fn recent_file() -> PathBuf {
-    let base = crate::paths::config();
+    let base = rustudio_core::paths::config();
     base.join("rustudio").join("recent.txt")
 }
 
@@ -392,8 +390,8 @@ pub const MENUS: &[(&str, &[M])] = &[
 
 /// A shortcut as this system writes it. The tables use Studio's Windows
 /// names, and "Ctrl" is the command key (egui's COMMAND): on macOS
-/// "Ctrl+Shift+S" shows as "⇧⌘S" and "Alt+P" as "⌥P", in Apple's modifier
-/// order (⌥⇧⌘), like Studio for Mac; elsewhere unchanged.
+/// "Ctrl+Shift+S" shows as "⇧⌘S" and "Alt+P" as "Option+P", in Apple modifier
+/// order, like Studio for Mac; elsewhere unchanged.
 pub fn shortcut_label(s: &str) -> std::borrow::Cow<'_, str> {
     if !cfg!(target_os = "macos") || s.is_empty() {
         return s.into();
@@ -405,13 +403,13 @@ fn mac_shortcut_label(s: &str) -> String {
     let parts: Vec<&str> = s.split('+').collect();
     let (key, mods) = (parts[parts.len() - 1], &parts[..parts.len() - 1]);
     let mut out = String::new();
-    for (name, sym) in [("Alt", "⌥"), ("Shift", "⇧"), ("Ctrl", "⌘")] {
+    for (name, sym) in [("Alt", "Option+"), ("Shift", "⇧"), ("Ctrl", "⌘")] {
         if mods.contains(&name) {
             out.push_str(sym);
         }
     }
     out.push_str(match key {
-        "Del" => "⌫",
+        "Del" => "Delete",
         k => k,
     });
     out
@@ -510,10 +508,10 @@ mod tests {
     #[test]
     fn mac_shortcut_labels() {
         assert_eq!(mac_shortcut_label("Ctrl+Shift+S"), "⇧⌘S");
-        assert_eq!(mac_shortcut_label("Ctrl+Alt+F6"), "⌥⌘F6");
-        assert_eq!(mac_shortcut_label("Alt+P"), "⌥P");
+        assert_eq!(mac_shortcut_label("Ctrl+Alt+F6"), "Option+⌘F6");
+        assert_eq!(mac_shortcut_label("Alt+P"), "Option+P");
         assert_eq!(mac_shortcut_label("F5"), "F5");
-        assert_eq!(mac_shortcut_label("Del"), "⌫");
+        assert_eq!(mac_shortcut_label("Del"), "Delete");
     }
 
     /// Every menu shortcut parses.

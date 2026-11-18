@@ -41,10 +41,10 @@ pub fn poll(key: &str, job: Job) -> Poll {
     let key = key.to_string();
     std::thread::spawn(move || {
         let r = (|| {
-            if !crate::assets::wait_for_session(std::time::Duration::from_secs(20)) {
+            if !rustudio_core::assets::wait_for_session(std::time::Duration::from_secs(20)) {
                 return Err("HTTP 401 (Unauthorized)".to_string());
             }
-            let shared = crate::assets::session_client().ok_or("HTTP 401 (Unauthorized)")?;
+            let shared = rustudio_core::assets::session_client().ok_or("HTTP 401 (Unauthorized)")?;
             let guard = shared.lock().map_err(|_| "account busy".to_string())?;
             let c = guard.as_ref().ok_or("HTTP 401 (Unauthorized)")?;
             job(c)

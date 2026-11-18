@@ -1,4 +1,4 @@
-//! Stubs: every member a game script may reach (src/api_stubs.rs, generated
+//! Stubs: every member a game script may reach (crates/rustudio-core/src/api_stubs.rs, generated
 //! by tools/gen_stubs.py from api-dump.json) exists even before rustudio
 //! implements it, so no game dies on "is not a valid member" or indexing nil.
 //! The runtime consults this only after its own lookups fail, so real
@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use super::*;
-use crate::api::Kind;
-use crate::api_stubs::{Stub, STUBS};
+use rustudio_core::api::Kind;
+use rustudio_core::api_stubs::{Stub, STUBS};
 
 /// Callbacks with real behaviour (BindableFunction / RemoteFunction invokes).
 pub const REAL_CALLBACKS: &[&str] = &["OnInvoke", "OnServerInvoke", "OnClientInvoke"];
@@ -37,7 +37,7 @@ fn table() -> &'static HashMap<String, &'static Stub> {
 /// The stub for `member` on an instance of `class` (declared there or on a
 /// superclass).
 pub fn lookup(class: &str, member: &str) -> Option<&'static Stub> {
-    let api = crate::api::get();
+    let api = rustudio_core::api::get();
     let mut cur = Some(class.to_string());
     while let Some(c) = cur {
         if let Some(s) = table().get(&format!("{c}.{member}")) {
@@ -146,7 +146,7 @@ fn function(lua: &Lua, s: &'static Stub) -> mlua::Result<Value> {
     }
     let raw = lua.create_function(move |lua, args: MultiValue| {
         let this = opt_inst(&arg(&args, 0)).unwrap_or_else(Ref::none);
-        crate::telemetry::gap(lua, "stub-call", s.class, s.member);
+        crate::lua_bridge::gap(lua, "stub-call", s.class, s.member);
         warn_stub_once(lua, s);
         let r = value(lua, this, s).map(|v| {
             if s.default.is_empty() {
@@ -172,7 +172,7 @@ pub fn index(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<V
     if s.kind == Kind::Callback && REAL_CALLBACKS.contains(&s.member) {
         return Ok(Some(Value::Nil));
     }
-    crate::telemetry::gap(lua, "stub", s.class, s.member);
+    crate::lua_bridge::gap(lua, "stub", s.class, s.member);
     Ok(Some(match s.kind {
         Kind::Property | Kind::Callback => {
             let kept: Option<Table> = store(lua)?.get(slot(r))?;
@@ -184,7 +184,7 @@ pub fn index(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<V
         }
         Kind::Function => function(lua, s)?,
         Kind::Event => {
-            crate::telemetry::event_used(lua, class, key);
+            crate::lua_bridge::event_used(lua, class, key);
             signal(lua, r, key)?
         }
     }))
@@ -202,7 +202,7 @@ pub fn assign(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua:
             "Unable to assign property {key}. Property is read only"
         )));
     }
-    crate::telemetry::gap(lua, "stub-write", s.class, s.member);
+    crate::lua_bridge::gap(lua, "stub-write", s.class, s.member);
     let st = store(lua)?;
     let t: Table = match st.get::<Option<Table>>(slot(r))? {
         Some(t) => t,
@@ -226,7 +226,7 @@ pub fn assign(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua:
 /// value when there is one, else the "not implemented" error as before.
 pub fn unimplemented_call(lua: &Lua, this: Ref, class: &str, name: &str) -> mlua::Result<MultiValue> {
     if let Some(s) = lookup(class, name).filter(|s| s.kind == Kind::Function) {
-        crate::telemetry::gap(lua, "stub-call", s.class, s.member);
+        crate::lua_bridge::gap(lua, "stub-call", s.class, s.member);
         warn_stub_once(lua, s);
         let v = value(lua, this, s)?;
         return Ok(if s.default.is_empty() {
@@ -235,6 +235,6 @@ pub fn unimplemented_call(lua: &Lua, this: Ref, class: &str, name: &str) -> mlua
             MultiValue::from_iter([v])
         });
     }
-    crate::telemetry::gap(lua, "call-unimplemented", class, name);
+    crate::lua_bridge::gap(lua, "call-unimplemented", class, name);
     Err(rt_err(format!("{name} is not implemented in rustudio yet")))
 }

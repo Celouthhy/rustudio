@@ -8,7 +8,7 @@
 
 use glam::{DVec3, Vec3};
 
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 const EPS: f64 = 1e-5;
 
@@ -751,7 +751,7 @@ mod tests {
             .map(|(t, c)| (t.map(|p| p.as_vec3()), c))
             .collect();
         let blob = csgmdl(&tris).unwrap();
-        let m = crate::mesh::parse(&blob).unwrap();
+        let m = rustudio_core::mesh::parse(&blob).unwrap();
         assert_eq!(m.positions.len(), 36);
         assert_eq!(m.min, Vec3::splat(-2.0));
         assert_eq!(m.max, Vec3::splat(2.0));

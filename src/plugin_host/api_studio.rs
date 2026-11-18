@@ -26,7 +26,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, _this: Ref, args: &MultiValue) -
             let is_src = world(lua)?
                 .d()
                 .class_of(script)
-                .is_some_and(|c| crate::doc::is_a(&c, "LuaSourceContainer"));
+                .is_some_and(|c| rustudio_core::doc::is_a(&c, "LuaSourceContainer"));
             // (Not a script: Studio does nothing and raises nothing, F48.)
             if !is_src {
                 return ret0();
@@ -51,7 +51,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, _this: Ref, args: &MultiValue) -
         // Deactivation sees the new tool).
         "SelectRibbonTool" => (|| {
             require_args(args, 2)?;
-            let tool = opt_ud::<crate::ltypes::LEnumItem>(&argv(args, 1))
+            let tool = opt_ud::<rustudio_engine::ltypes::LEnumItem>(&argv(args, 1))
                 .filter(|e| e.enum_type == "RibbonTool")
                 .ok_or_else(|| rt_err("Unable to cast value to RibbonTool"))?;
             // Applied after the caller yields (measured in Studio: right after
@@ -106,7 +106,7 @@ fn parent_of(lua: &Lua, r: Ref) -> mlua::Result<Ref> {
 }
 
 fn csg(lua: &Lua, name: &str, parts: &[Ref]) -> mlua::Result<MultiValue> {
-    use crate::runtime::domains::geometry::ops;
+    use rustudio_engine::runtime::domains::geometry::ops;
     match name {
         "Union" | "Intersect" => {
             let r = ops::editor_csg(lua, name, parts)?;
@@ -154,7 +154,7 @@ fn separate_one(lua: &Lua, op: Ref) -> mlua::Result<Vec<Ref>> {
     let (bytes, parent) = {
         let w = world(lua)?;
         let d = w.d();
-        let ok = d.class_of(op).is_some_and(|c| crate::doc::is_a(&c, "PartOperation"));
+        let ok = d.class_of(op).is_some_and(|c| rustudio_core::doc::is_a(&c, "PartOperation"));
         if !ok {
             return Ok(Vec::new());
         }
@@ -165,7 +165,7 @@ fn separate_one(lua: &Lua, op: Ref) -> mlua::Result<Vec<Ref>> {
         };
         (b, d.dom.get_by_ref(op).map(|i| i.parent()).unwrap_or_else(Ref::none))
     };
-    let Ok(mut tmp) = crate::doc::Document::decode(&bytes) else {
+    let Ok(mut tmp) = rustudio_core::doc::Document::decode(&bytes) else {
         return Err(rt_err("Separate failed: the union has no part data"));
     };
     let mut made = Vec::new();

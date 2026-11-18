@@ -1,4 +1,4 @@
-//! What differs between desktops besides folders (src/paths.rs): process
+//! What differs between desktops besides folders (crates/rustudio-core/src/paths.rs): process
 //! statistics, the desktop trash, system fonts, shared library names.
 
 use std::path::Path;

@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use rbx_dom_weak::types::{Ref, Variant};
 use serde_json::{json, Value as J};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::project::{self, FileKind};
-use crate::project_values::{resolve, to_json};
+use rustudio_core::project_values::{resolve, to_json};
 
 /// The containers offered (path under the DataModel, on by default).
 pub const CONTAINERS: &[(&str, bool)] = &[
@@ -104,14 +104,14 @@ fn file_safe(name: &str) -> String {
 /// rustudio's Studio overrides, else the reflection database's
 /// (superclasses followed).
 fn default_of(class: &str, prop: &str) -> Option<std::borrow::Cow<'static, Variant>> {
-    if let Some(v) = crate::doc::studio_default(class, prop) {
+    if let Some(v) = rustudio_core::doc::studio_default(class, prop) {
         return Some(std::borrow::Cow::Owned(v));
     }
     reflection_default(class, prop).map(std::borrow::Cow::Borrowed)
 }
 
 fn reflection_default(class: &str, prop: &str) -> Option<&'static Variant> {
-    let db = crate::doc::db();
+    let db = rustudio_core::doc::db();
     let mut cur = db.classes.get(class)?;
     loop {
         if let Some(v) = cur.default_properties.get(prop) {

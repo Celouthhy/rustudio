@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use crate::terrain::{Voxels, WATER};
+use rustudio_core::terrain::{Voxels, WATER};
 
 // SmoothGrid material indices used here.
 const ROCK: u8 = 8;
@@ -826,9 +826,9 @@ pub fn import(v: &mut Voxels, lo: [i32; 3], size: [i32; 3], hm: &Image, cm: Opti
 /// with Air (FillOperation in Replace mode, as RegionSeaLevel sets it up).
 pub fn sea_level(v: &mut Voxels, lo: [i32; 3], size: [i32; 3], evaporate: bool) {
     if evaporate {
-        crate::terrain_region::replace_box(v, lo, size, WATER, AIR);
+        rustudio_core::terrain_region::replace_box(v, lo, size, WATER, AIR);
     } else {
-        crate::terrain_region::replace_box(v, lo, size, AIR, WATER);
+        rustudio_core::terrain_region::replace_box(v, lo, size, AIR, WATER);
     }
 }
 
@@ -942,7 +942,7 @@ mod tests {
                     let (mat, occ) = v.get(lo[0] + x, lo[1] + y, lo[2] + z);
                     if mat != AIR && occ > 0.0 {
                         h = y as f32 + occ;
-                        m = crate::terrain::material_name(mat);
+                        m = rustudio_core::terrain::material_name(mat);
                         break;
                     }
                 }
@@ -960,7 +960,7 @@ mod tests {
     #[ignore]
     fn write_generated_place() {
         let Ok(path) = std::env::var("RUSTUDIO_TERRAIN_PLACE") else { return };
-        let mut doc = crate::doc::Document::new_place();
+        let mut doc = rustudio_core::doc::Document::new_place();
         let ws = doc.workspace().expect("workspace");
         for name in ["Baseplate", "SpawnLocation"] {
             if let Some(r) = doc.find_child(ws, name) {

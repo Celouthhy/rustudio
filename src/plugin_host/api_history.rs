@@ -13,7 +13,7 @@ use mlua::{Lua, MultiValue, Value};
 use rbx_dom_weak::types::Ref;
 
 use super::*;
-use crate::doc::{Change, FinishOp, HistoryEvent};
+use rustudio_core::doc::{Change, FinishOp, HistoryEvent};
 
 /// Instances an undo made inside the VM took to the editor's limbo, lent
 /// back to the DOM for the frame so handlers can read them (the host
@@ -133,7 +133,7 @@ fn finish_op(v: &Value) -> mlua::Result<FinishOp> {
     }
     let name = match v {
         Value::String(s) => s.to_string_lossy(),
-        _ => match opt_ud::<crate::ltypes::LEnumItem>(v) {
+        _ => match opt_ud::<rustudio_engine::ltypes::LEnumItem>(v) {
             Some(e) if e.enum_type == "FinishRecordingOperation" => e.name.to_string(),
             Some(_) => return Err(rt_err("Unable to cast EnumItem to FinishRecordingOperation")),
             None => return Err(rt_err(format!("Unable to cast {} to FinishRecordingOperation", v.type_name()))),

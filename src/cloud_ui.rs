@@ -18,8 +18,8 @@ use rustudio_account::{
 };
 
 use crate::app::{Editor, Level, PendingAction};
-use crate::doc::{DocKind, Document};
-use crate::theme;
+use rustudio_core::doc::{DocKind, Document};
+use rustudio_engine::theme;
 
 type Listing = Option<Result<Vec<Experience>, String>>;
 
@@ -243,7 +243,7 @@ pub struct CloudUi {
     /// Play pressed while the opened place was still loading: it starts once
     /// the place (and so its PlaceId / GameId) is in, as Studio only lets Play
     /// run on a loaded DataModel.
-    play_when_loaded: Option<crate::runtime::RunMode>,
+    play_when_loaded: Option<rustudio_engine::runtime::RunMode>,
 }
 
 fn live_source_text(value:&rustudio_net::replicator::PropValue)->Option<String> {
@@ -268,11 +268,11 @@ fn is_local_live_instance(
         }
         if instance.parent() == doc.dom.root_ref() {
             let class = instance.class.as_str();
-            if crate::doc::UNSAVED_SERVICES.contains(&class) {
+            if rustudio_core::doc::UNSAVED_SERVICES.contains(&class) {
                 return true;
             }
             return model.server_id(current).is_none()
-                && crate::doc::db().classes.get(class).is_some_and(|descriptor| {
+                && rustudio_core::doc::db().classes.get(class).is_some_and(|descriptor| {
                     descriptor.tags.contains(&ClassTag::Service)
                         && (current == reference || descriptor.tags.contains(&ClassTag::NotReplicated))
                 });
@@ -383,7 +383,7 @@ impl CloudUi {
 
     /// The API for a job: the session's (a downloader copy, so the account
     /// lock isn't held), or the self-test's mock.
-    fn factory(&self, client: Option<crate::assets::SharedClient>) -> ApiFactory {
+    fn factory(&self, client: Option<rustudio_core::assets::SharedClient>) -> ApiFactory {
         if let Some(f) = &self.api_override {
             return f.clone();
         }
@@ -426,7 +426,7 @@ impl CloudUi {
     }
 
     /// Fills the open tab's list (and Recent's icons).
-    pub fn refresh(&mut self, client: Option<crate::assets::SharedClient>, tab: PickerTab) {
+    pub fn refresh(&mut self, client: Option<rustudio_core::assets::SharedClient>, tab: PickerTab) {
         let api = self.factory(client);
         match tab {
             PickerTab::Recent => {
@@ -445,7 +445,7 @@ impl CloudUi {
         }
     }
 
-    fn load_group(&mut self, client: Option<crate::assets::SharedClient>, group: u64) {
+    fn load_group(&mut self, client: Option<rustudio_core::assets::SharedClient>, group: u64) {
         let api = self.factory(client);
         self.reset_list(api, ExperienceSource::Group(group));
     }
@@ -467,7 +467,7 @@ impl CloudUi {
         });
     }
 
-    fn load_places(&mut self, client: Option<crate::assets::SharedClient>, universe: u64) {
+    fn load_places(&mut self, client: Option<rustudio_core::assets::SharedClient>, universe: u64) {
         self.places.insert(universe, Ok(Vec::new()));
         self.spawn(self.factory(client), move |a, tx| {
             let r = a.ok_or_else(Self::signed_out).and_then(|a| a.places(universe).map_err(|e| e.0));
@@ -475,7 +475,7 @@ impl CloudUi {
         });
     }
 
-    fn load_versions(&mut self, client: Option<crate::assets::SharedClient>, place: u64) {
+    fn load_versions(&mut self, client: Option<rustudio_core::assets::SharedClient>, place: u64) {
         self.versions.insert(place, Ok(Vec::new()));
         self.spawn(self.factory(client), move |a, tx| {
             let r = a.ok_or_else(Self::signed_out).and_then(|a| a.versions(place).map_err(|e| e.0));
@@ -498,7 +498,7 @@ impl CloudUi {
         self.open_cancelled = self.opening;
     }
 
-    pub fn request_experience_icons(&mut self, client: Option<crate::assets::SharedClient>, ids: Vec<u64>) {
+    pub fn request_experience_icons(&mut self, client: Option<rustudio_core::assets::SharedClient>, ids: Vec<u64>) {
         self.request_icons(self.factory(client), ids);
     }
 
@@ -528,7 +528,7 @@ impl CloudUi {
     /// `version`) downloads; the cached copy when Roblox can't be asked.
     pub fn start_open(
         &mut self,
-        client: Option<crate::assets::SharedClient>,
+        client: Option<rustudio_core::assets::SharedClient>,
         place: u64,
         version: Option<u64>,
         as_copy: bool,
@@ -618,7 +618,7 @@ impl CloudUi {
     /// Published), serializing the submitted snapshot on the save worker.
     fn start_save(
         &mut self,
-        client: Option<crate::assets::SharedClient>,
+        client: Option<rustudio_core::assets::SharedClient>,
         doc: &Document,
         mut job: SaveJob,
         overwrite: bool,
@@ -669,7 +669,7 @@ impl CloudUi {
 impl Editor {
     /// The editor's side of the cloud jobs, once a frame.
     pub fn cloud_poll(&mut self, ctx: &egui::Context) {
-        let checked = !matches!(self.account.state, crate::account_ui::SessionState::Checking(_));
+        let checked = !matches!(self.game.account.state, crate::account_ui::SessionState::Checking(_));
         if checked {
             if let Some((p, v, copy)) = self.cloud.open_when_ready.take() {
                 self.perform_open_cloud(p, v, copy);
@@ -677,7 +677,7 @@ impl Editor {
             if let Some(tab) = self.cloud.picker_when_ready.take() {
                 self.cloud.open = true;
                 self.cloud.tab = tab;
-                let client = self.account.shared_client();
+                let client = self.game.account.shared_client();
                 self.cloud.refresh(client, tab);
             }
         }
@@ -719,7 +719,7 @@ impl Editor {
                     self.cloud.opening = self.cloud.opening.saturating_sub(1);
                     let j = self.cloud.join.get_or_insert_with(|| crate::join_ui::JoinProgress::new(o.place_id));
                     j.found(o.universe_id, &o.name, &o.experience);
-                    let api = self.cloud.factory(self.account.shared_client());
+                    let api = self.cloud.factory(self.game.account.shared_client());
                     self.cloud.request_icons(api, vec![o.universe_id]);
                     self.info(format!(
                         "Team Create is on for {} (universe {}): joining the live session",
@@ -737,7 +737,7 @@ impl Editor {
                     self.cloud.open_error = Some(e);
                 }
                 Msg::Status(u, st) => {
-                    if self.doc.cloud.as_ref().is_some_and(|o| o.universe_id == u) {
+                    if self.game.doc.cloud.as_ref().is_some_and(|o| o.universe_id == u) {
                         let line = st.describe();
                         if st.enabled == Some(true) || st.can_edit() == Some(false) {
                             self.warn(line);
@@ -774,8 +774,8 @@ impl Editor {
             }
         }
         // The window title, as Studio's: the place's name.
-        let dirty = if self.doc.dirty() { " •" } else { "" };
-        let title = format!("{}{dirty} - rustudio", if self.doc.title.is_empty() { "Untitled" } else { &self.doc.title });
+        let dirty = if self.game.doc.dirty() { " •" } else { "" };
+        let title = format!("{}{dirty} - rustudio", if self.game.doc.title.is_empty() { "Untitled" } else { &self.game.doc.title });
         if title != self.cloud.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.cloud.window_title = title;
@@ -837,7 +837,7 @@ impl Editor {
     }
 
     pub fn perform_open_cloud(&mut self, place: u64, version: Option<u64>, as_copy: bool) {
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         self.cloud.start_open(client, place, version, as_copy);
     }
 
@@ -854,7 +854,7 @@ impl Editor {
                 self.cloud.open_error = None;
                 self.cloud.live = Some(LiveView {
                     session, model: rustudio_net::model::LiveModel::new(),
-                    origin: self.cloud.live_origin.take(), place, universe, document_id: None, requested_document_id: self.doc.id,
+                    origin: self.cloud.live_origin.take(), place, universe, document_id: None, requested_document_id: self.game.doc.id,
                     owner_user: None, own_player: None, publish_service: None, save_pending: None, sync_failed: false, drafts: crate::live_drafts::DraftStore::for_place(place), script_service: None, script_configuration_sent: false, next_script_request: 1, script_commits: HashMap::new(),
                     last_presence: std::time::Instant::now(), last_camera: None, locally_deleted: HashSet::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None,
                 });
@@ -882,7 +882,7 @@ impl Editor {
     }
     /// Play asked for while [`Self::place_loading`]: held until the place is in.
     /// True when it was held.
-    pub fn defer_play_until_loaded(&mut self, mode: crate::runtime::RunMode)->bool {
+    pub fn defer_play_until_loaded(&mut self, mode: rustudio_engine::runtime::RunMode)->bool {
         if !self.place_loading() { return false; }
         if self.cloud.play_when_loaded.replace(mode).is_none() {
             self.info("Play starts once the place has finished loading".to_string());
@@ -890,21 +890,21 @@ impl Editor {
         true
     }
     pub fn live_team_create_ids(&self)->Option<(u64,u64)> {
-        self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.doc.id)).map(|l|(l.universe,l.place))
+        self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id)).map(|l|(l.universe,l.place))
     }
 
     pub fn live_team_create_place(&self)->Option<u64> {
-        self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.doc.id)).map(|l|l.place)
+        self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id)).map(|l|l.place)
     }
 
     pub fn live_script_has_draft(&self,reference:rbx_types::Ref)->Option<bool> {
-        let live=self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.doc.id))?;
+        let live=self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id))?;
         let id=live.model.server_id(reference)?;
         Some(live.drafts.get(id).is_some())
     }
 
     pub fn live_draft_toolbar(&mut self,ui:&mut egui::Ui,reference:rbx_types::Ref) {
-        let Some(live)=self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.doc.id)) else {return;};
+        let Some(live)=self.cloud.live.as_ref().filter(|l|l.document_id==Some(self.game.doc.id)) else {return;};
         let Some(id)=live.model.server_id(reference) else {return;};
         let Some(draft)=live.drafts.get(id).cloned() else {
             ui.label(egui::RichText::new("Live script edits are kept as private drafts until you commit them").small().color(theme::TEXT_DIM));
@@ -928,7 +928,7 @@ impl Editor {
         if action==1 {
             let live=self.cloud.live.as_mut().unwrap();
             let result=live.drafts.commit_text(id,conflict).and_then(|text| {
-                let inst=self.doc.dom.get_by_ref(reference).ok_or("The script was removed")?;
+                let inst=self.game.doc.dom.get_by_ref(reference).ok_or("The script was removed")?;
                 let guid=inst.properties.get(&"ScriptGuid".into()).and_then(|v| if let rbx_types::Variant::String(g)=v {Some(g.clone())} else {None});
                 if let (Some(service),Some(guid))=(live.script_service,guid) {
                     if !live.script_configuration_sent {
@@ -954,13 +954,13 @@ impl Editor {
         let Some(live)=self.cloud.live.as_mut() else {return;};
         let Some(id)=live.model.server_id(reference) else {return;};
         if let Some(source)=live.drafts.discard(id) {
-            self.doc.set_props("Discard script draft",vec![(reference,"Source".into(),rbx_types::Variant::String(source.clone()))],None);
+            self.game.doc.set_props("Discard script draft",vec![(reference,"Source".into(),rbx_types::Variant::String(source.clone()))],None);
             if let Some(buf)=self.scripts.bufs.get_mut(&reference) {buf.text=source;}
         }
     }
 
     fn sync_live_tree(&mut self, live: &mut LiveView, reference: rbx_types::Ref) -> Result<(), String> {
-        let Some(inst) = self.doc.dom.get_by_ref(reference) else {
+        let Some(inst) = self.game.doc.dom.get_by_ref(reference) else {
             if !live.locally_deleted.insert(reference) { return Ok(()); }
             if let Some(id) = live.model.server_id(reference) {
                 live.session.send_delete(id).map_err(|e| e.to_string())?;
@@ -978,12 +978,12 @@ impl Editor {
         let mut index = 0;
         while index < nodes.len() {
             let r = nodes[index]; index += 1;
-            if let Some(i) = self.doc.dom.get_by_ref(r) { nodes.extend_from_slice(i.children()); }
+            if let Some(i) = self.game.doc.dom.get_by_ref(r) { nodes.extend_from_slice(i.children()); }
             let id = live.session.allocate_id().map_err(|e| e.to_string())?;
             live.model.bind_local(id, r);
         }
         for r in nodes {
-            let inst = self.doc.dom.get_by_ref(r).ok_or("A new live instance disappeared")?;
+            let inst = self.game.doc.dom.get_by_ref(r).ok_or("A new live instance disappeared")?;
             let id = live.model.server_id(r).unwrap();
             let parent = live.model.server_id(inst.parent()).ok_or("A new live parent is unavailable")?;
             let mut props = vec![("Name".into(), rustudio_net::replicator::PropValue::String(inst.name.clone()))];
@@ -1003,30 +1003,30 @@ impl Editor {
     fn poll_live_team_create(&mut self, ctx: &egui::Context) {
         use rustudio_net::live::LiveEvent;
         let Some(mut live) = self.cloud.live.take() else { return; };
-        if live.document_id.unwrap_or(live.requested_document_id) != self.doc.id { return; }
+        if live.document_id.unwrap_or(live.requested_document_id) != self.game.doc.id { return; }
         if live.document_id.is_some() {
-            if let crate::doc::Marks::Some(mut marks) = self.doc.marks_for(crate::doc::Reader::TeamCreate) {
-                marks.sort_by_key(|mark| matches!(mark, crate::doc::Mark::Tree(_)));
+            if let rustudio_core::doc::Marks::Some(mut marks) = self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate) {
+                marks.sort_by_key(|mark| matches!(mark, rustudio_core::doc::Mark::Tree(_)));
                 let mut sent = HashSet::new();
                 let mut sent_trees = HashSet::new();
                 for mark in marks {
-                    use crate::doc::Mark;
+                    use rustudio_core::doc::Mark;
                     let (Mark::Prop(reference, _) | Mark::Tree(reference)) = mark;
-                    if is_local_live_instance(&self.doc, &live.model, reference) {
+                    if is_local_live_instance(&self.game.doc, &live.model, reference) {
                         continue;
                     }
                     match mark {
                         Mark::Prop(reference, name) if sent.insert((reference, name)) => {
                             let Some(id) = live.model.server_id(reference) else { continue; };
-                            let Some(inst) = self.doc.dom.get_by_ref(reference) else { continue; };
+                            let Some(inst) = self.game.doc.dom.get_by_ref(reference) else { continue; };
                             if name.as_str()=="Source" {
-                                if let Some(rbx_types::Variant::String(text))=self.doc.prop(reference,"Source") {
+                                if let Some(rbx_types::Variant::String(text))=self.game.doc.prop(reference,"Source") {
                                     if let Err(error)=live.drafts.edit(id,text) {self.warn(error);}
                                 }
                                 continue;
                             }
                             let value = if name.as_str() == "Name" { Some(rbx_types::Variant::String(inst.name.clone())) }
-                                else { self.doc.prop(reference, name.as_str()) };
+                                else { self.game.doc.prop(reference, name.as_str()) };
                             if let Some(value) = value.and_then(|v| live_value(&v, &live.model)) {
                                 if let Err(e) = live.session.send_property(id, inst.class.to_string(), name.to_string(), value) { live.sync_failed=true;self.warn(e.to_string()); }
                             } else { live.sync_failed=true;self.warn(format!("Team Create cannot synchronize {name} yet")); }
@@ -1064,9 +1064,9 @@ impl Editor {
         // update only that instead of rebuilding everything (a full rebuild
         // per batch reset every particle and hitched ~twice a second, when a
         // collaborator's camera presence arrived).
-        let mut live_marks: Vec<crate::doc::Mark> = Vec::new();
+        let mut live_marks: Vec<rustudio_core::doc::Mark> = Vec::new();
         let mut live_rebuild = false;
-        let was_dirty = self.doc.dirty();
+        let was_dirty = self.game.doc.dirty();
         // Limit UI work per frame while retaining the stream's batch ordering.
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_millis(12) {
@@ -1089,7 +1089,7 @@ impl Editor {
                 LiveEvent::Batch(ops) => {
                     let joining = live.document_id.is_none();
                     if live.document_id.is_some() {
-                        std::mem::swap(live.model.dom_mut(), &mut self.doc.dom);
+                        std::mem::swap(live.model.dom_mut(), &mut self.game.doc.dom);
                     }
                     for op in ops {
                         if let rustudio_net::replicator::RepOp::Event {id,name,args} = &op {
@@ -1124,12 +1124,12 @@ impl Editor {
                                         _ => None,
                                     };
                                     if let Some(version) = version {
-                                        if let Some(origin) = self.doc.cloud.as_mut() {
+                                        if let Some(origin) = self.game.doc.cloud.as_mut() {
                                             origin.version = version;
                                         }
                                         self.cloud.last_saved = Some((version, save.vt));
                                     }
-                                    self.doc.mark_saved_at(save.revision);
+                                    self.game.doc.mark_saved_at(save.revision);
                                     self.info(if save.vt == VersionType::Published { "Team Create server confirmed publication" } else { "Team Create server confirmed the save" });
                                     if save.from_dialog && self.cloud_upload_mode().is_some() {
                                         self.cloud.upload_result = Some(Ok(version));
@@ -1178,7 +1178,7 @@ impl Editor {
                         live.model.apply(op);
                         // Unions whose geometry just arrived on the 0xa5 channel.
                         for r in live.model.take_resolved() {
-                            live_marks.push(crate::doc::Mark::Prop(r, rbx_dom_weak::ustr("SolidMeshHolder")));
+                            live_marks.push(rustudio_core::doc::Mark::Prop(r, rbx_dom_weak::ustr("SolidMeshHolder")));
                         }
                         // The time of day as the server sends it (2026-11-05: rustudio
                         // joined Place B at ~02:xx while the place saves 14:00).
@@ -1194,8 +1194,8 @@ impl Editor {
                         if let Some((id, prop)) = touched {
                             match live.model.reference(id).filter(|r| live.model.dom_mut().get_by_ref(*r).is_some()) {
                                 Some(r) => live_marks.push(match prop {
-                                    Some(name) => crate::doc::Mark::Prop(r, rbx_dom_weak::ustr(&name)),
-                                    None => crate::doc::Mark::Tree(r),
+                                    Some(name) => rustudio_core::doc::Mark::Prop(r, rbx_dom_weak::ustr(&name)),
+                                    None => rustudio_core::doc::Mark::Tree(r),
                                 }),
                                 // A NewInstance parked until its parent arrives
                                 // touches nothing yet; a pending drain later
@@ -1214,7 +1214,7 @@ impl Editor {
                         if let Some(reference) = collaborator.and_then(|id| live.model.reference(id)) { live.collaborators.insert(reference); }
                     }
                     if live.document_id.is_some() {
-                        std::mem::swap(live.model.dom_mut(), &mut self.doc.dom);
+                        std::mem::swap(live.model.dom_mut(), &mut self.game.doc.dom);
                         changed = true;
                     }
                     if joining {
@@ -1232,11 +1232,11 @@ impl Editor {
                         let mut document = Document::from_play_dom(dom, format!("{title} (Live)"));
                         document.cloud = live.origin.clone();
                         self.set_document(document);
-                        live.document_id = Some(self.doc.id);
-                        self.doc.marks_for(crate::doc::Reader::TeamCreate);
-                        live.collaborators = self.doc.dom.descendants().filter(|inst| inst.class.as_str()=="Collaborator").map(|inst| inst.referent()).collect();
-                        live.publish_service = self.doc.dom.descendants().find(|i| i.class.as_str()=="TeamCreatePublishService").and_then(|i| live.model.server_id(i.referent()));
-                        live.script_service=self.doc.dom.descendants().find(|i|i.class.as_str()=="LiveScriptingService").and_then(|i|live.model.server_id(i.referent()));
+                        live.document_id = Some(self.game.doc.id);
+                        self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate);
+                        live.collaborators = self.game.doc.dom.descendants().filter(|inst| inst.class.as_str()=="Collaborator").map(|inst| inst.referent()).collect();
+                        live.publish_service = self.game.doc.dom.descendants().find(|i| i.class.as_str()=="TeamCreatePublishService").and_then(|i| live.model.server_id(i.referent()));
+                        live.script_service=self.game.doc.dom.descendants().find(|i|i.class.as_str()=="LiveScriptingService").and_then(|i|live.model.server_id(i.referent()));
                         self.cloud.open = false;
                         self.info(format!("Joined live Team Create place {}: {} instances", live.place, live.model.instance_count()));
                     }
@@ -1259,44 +1259,44 @@ impl Editor {
             }
         }
         if changed {
-            if live_rebuild || live_marks.len() > crate::mech::JOURNAL_READER_LAG / 2 {
-                self.doc.mark_all();
+            if live_rebuild || live_marks.len() > rustudio_core::mech::JOURNAL_READER_LAG / 2 {
+                self.game.doc.mark_all();
             } else {
                 for m in live_marks {
                     match m {
-                        crate::doc::Mark::Prop(r, name) => self.doc.mark_prop(r, name),
-                        crate::doc::Mark::Tree(r) => self.doc.mark_tree(r),
+                        rustudio_core::doc::Mark::Prop(r, name) => self.game.doc.mark_prop(r, name),
+                        rustudio_core::doc::Mark::Tree(r) => self.game.doc.mark_tree(r),
                     }
                 }
             }
-            self.doc.marks_for(crate::doc::Reader::TeamCreate); // Do not echo server changes.
-            if !was_dirty { self.doc.mark_saved_at(self.doc.revision); }
+            self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate); // Do not echo server changes.
+            if !was_dirty { self.game.doc.mark_saved_at(self.game.doc.revision); }
         }
         if ctx.input(|i| !i.raw.events.is_empty()) {live.last_activity=std::time::Instant::now();}
         if live.document_id.is_some() && live.last_presence.elapsed() >= std::time::Duration::from_millis(200) {
-            let camera = [self.cam.pos.x, self.cam.pos.y, self.cam.pos.z, self.cam.yaw, self.cam.pitch];
+            let camera = [self.game.cam.pos.x, self.game.cam.pos.y, self.game.cam.pos.z, self.game.cam.yaw, self.game.cam.pitch];
             if live.last_camera != Some(camera) {
                 if let Some(id) = live.own_player {
-                    let right = self.cam.right(); let up = self.cam.up(); let back = -self.cam.forward();
-                    let value = rustudio_net::replicator::PropValue::CFrame { pos: self.cam.pos.to_array(),
+                    let right = self.game.cam.right(); let up = self.game.cam.up(); let back = -self.game.cam.forward();
+                    let value = rustudio_net::replicator::PropValue::CFrame { pos: self.game.cam.pos.to_array(),
                         rot: [right.x, up.x, back.x, right.y, up.y, back.y, right.z, up.z, back.z] };
                     if live.session.send_property(id, "Player".into(), "CloudEditCameraCoordinateFrame".into(), value).is_ok() { live.last_camera = Some(camera); }
                 }
             }
             if let Some(player)=live.own_player {
-                if live.last_selection.as_ref()!=Some(&self.doc.selection) {
-                    let refs=self.doc.selection.iter().filter_map(|r|live.model.server_id(*r)).take(512).map(|id|rustudio_net::replicator::PropValue::Ref(Some(id))).collect();
-                    if live.session.send_event(player,"Player".into(),"CloudEditSelectionChanged".into(),vec![rustudio_net::replicator::PropValue::Array(refs)]).is_ok() {live.last_selection=Some(self.doc.selection.clone());}
+                if live.last_selection.as_ref()!=Some(&self.game.doc.selection) {
+                    let refs=self.game.doc.selection.iter().filter_map(|r|live.model.server_id(*r)).take(512).map(|id|rustudio_net::replicator::PropValue::Ref(Some(id))).collect();
+                    if live.session.send_event(player,"Player".into(),"CloudEditSelectionChanged".into(),vec![rustudio_net::replicator::PropValue::Array(refs)]).is_ok() {live.last_selection=Some(self.game.doc.selection.clone());}
                 }
                 let active=live.last_activity.elapsed()<std::time::Duration::from_secs(300);
                 if live.last_active!=Some(active) && live.session.send_property(player,"Player".into(),"CloudEditPlayerActive".into(),rustudio_net::replicator::PropValue::Bool(active)).is_ok() {live.last_active=Some(active);}
             }
             live.last_presence = std::time::Instant::now();
         }
-        if live.document_id.is_some() && self.hud.viewport_drawn && self.viewport_rect.is_positive() {
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("live_collaborator_cameras"))).with_clip_rect(self.viewport_rect);
+        if live.document_id.is_some() && self.hud.viewport_drawn && self.game.viewport_rect.is_positive() {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("live_collaborator_cameras"))).with_clip_rect(self.game.viewport_rect);
             for reference in &live.collaborators {
-                let Some(inst) = self.doc.dom.get_by_ref(*reference) else { continue; };
+                let Some(inst) = self.game.doc.dom.get_by_ref(*reference) else { continue; };
                 if matches!(inst.properties.get(&"UserId".into()), Some(rbx_types::Variant::Int64(id)) if Some(*id as u64)==live.owner_user) { continue; }
                 let color = match inst.properties.get(&"CollaboratorColor3".into()) {
                     Some(rbx_types::Variant::Color3(c)) => egui::Color32::from_rgb((c.r*255.0) as u8,(c.g*255.0) as u8,(c.b*255.0) as u8),
@@ -1307,16 +1307,16 @@ impl Editor {
                     if let Some(selection)=live.selections.get(&player) {
                         for id in selection {
                             if let Some(reference)=live.model.reference(*id) {
-                                if let Some(part)=self.scene.get(reference) {self.draw_box(&painter,self.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}
-                                else {for inst in self.doc.dom.descendants_of(reference).take(512) {if let Some(part)=self.scene.get(inst.referent()) {self.draw_box(&painter,self.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}}}
+                                if let Some(part)=self.game.scene.get(reference) {self.draw_box(&painter,self.game.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}
+                                else {for inst in self.game.doc.dom.descendants_of(reference).take(512) {if let Some(part)=self.game.scene.get(inst.referent()) {self.draw_box(&painter,self.game.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}}}
                             }
                         }
                     }
                 }
                 let Some(rbx_types::Variant::CFrame(frame)) = inst.properties.get(&"CFrame".into()) else { continue; };
                 let world = glam::Vec3::new(frame.position.x, frame.position.y, frame.position.z);
-                let Some(point) = self.cam.project(self.viewport_rect, world) else { continue; };
-                if !self.viewport_rect.contains(point) { continue; }
+                let Some(point) = self.game.cam.project(self.game.viewport_rect, world) else { continue; };
+                if !self.game.viewport_rect.contains(point) { continue; }
                 let name = match inst.properties.get(&"Username".into()) { Some(rbx_types::Variant::String(s)) => s.as_str(), _ => inst.name.as_str() };
                 painter.rect_filled(egui::Rect::from_center_size(point, egui::vec2(12.0,9.0)), 2.0, color);
                 painter.text(point+egui::vec2(0.0,11.0), egui::Align2::CENTER_TOP, name, egui::FontId::proportional(12.0), color);
@@ -1348,17 +1348,17 @@ impl Editor {
             self.warn(error);
             return;
         }
-        self.cloud.upload_mode = Some((self.doc.id, vt));
+        self.cloud.upload_mode = Some((self.game.doc.id, vt));
         self.cloud.upload_result = None;
     }
 
     pub fn cloud_upload_mode(&self) -> Option<VersionType> {
-        self.cloud.upload_mode.filter(|(doc, _)| *doc == self.doc.id).map(|(_, vt)| vt)
+        self.cloud.upload_mode.filter(|(doc, _)| *doc == self.game.doc.id).map(|(_, vt)| vt)
     }
 
     pub fn cloud_upload_pending(&self) -> bool {
         self.cloud.save_pending || self.cloud.live.as_ref().is_some_and(|live|
-            live.document_id == Some(self.doc.id) && live.save_pending.is_some())
+            live.document_id == Some(self.game.doc.id) && live.save_pending.is_some())
     }
 
     pub fn cloud_upload_result(&self) -> Option<&Result<Option<u64>, String>> {
@@ -1375,7 +1375,7 @@ impl Editor {
             return Err("Universe and place IDs must be positive numbers".into());
         }
 
-        let target = self.live_team_create_ids().or_else(|| self.doc.cloud.as_ref()
+        let target = self.live_team_create_ids().or_else(|| self.game.doc.cloud.as_ref()
             .map(|origin| (origin.universe_id, origin.place_id)));
         if let Some((linked_universe, linked_place)) = target {
             if place == linked_place {
@@ -1390,10 +1390,10 @@ impl Editor {
     }
 
     fn check_cloud_submission(&self) -> Result<(), String> {
-        if self.doc.kind != DocKind::Place {
+        if self.game.doc.kind != DocKind::Place {
             return Err("Open a place (.rbxl) to save or publish to Roblox".into());
         }
-        if self.play.is_some() {
+        if self.game.play.is_some() {
             return Err("Stop the play session before saving to Roblox".into());
         }
         if self.cloud_upload_pending() {
@@ -1411,21 +1411,21 @@ impl Editor {
 
     fn save_linked_cloud(&mut self, vt: VersionType, overwrite: bool, from_dialog: bool) -> Result<(), String> {
         self.check_cloud_submission()?;
-        if let Some(live) = self.cloud.live.as_mut().filter(|live| live.document_id == Some(self.doc.id)) {
+        if let Some(live) = self.cloud.live.as_mut().filter(|live| live.document_id == Some(self.game.doc.id)) {
             if live.sync_failed {
                 return Err("Some local edits have not synchronized; retain a local copy and reopen the live place before saving".into());
             }
             if live.drafts.has_unsubmitted() {
                 return Err("Commit or discard your script drafts before saving the live place".into());
             }
-            live.save_pending = Some(LiveSave { revision: self.doc.revision, vt, from_dialog, sent: None });
+            live.save_pending = Some(LiveSave { revision: self.game.doc.revision, vt, from_dialog, sent: None });
             if from_dialog {
                 self.cloud.upload_result = None;
             }
             self.info("Requesting a save from the Team Create server…");
             return Ok(());
         }
-        let origin = self.doc.cloud.clone().ok_or("This place has no Roblox destination")?;
+        let origin = self.game.doc.cloud.clone().ok_or("This place has no Roblox destination")?;
         if origin.team_create == Some(true) && !origin.local_copy {
             return Err("The Team Create session disconnected. Save a local copy to preserve your edits, then reopen the live place.".into());
         }
@@ -1439,8 +1439,8 @@ impl Editor {
     ) {
         let relink = origin.is_none() && self.live_team_create_ids().is_none();
         let job = SaveJob {
-            document: self.doc.id,
-            revision: self.doc.revision,
+            document: self.game.doc.id,
+            revision: self.game.doc.revision,
             universe,
             place,
             vt,
@@ -1451,12 +1451,12 @@ impl Editor {
         if from_dialog {
             self.cloud.upload_result = None;
         }
-        self.cloud.start_save(self.account.shared_client(), &self.doc, job, overwrite);
+        self.cloud.start_save(self.game.account.shared_client(), &self.game.doc, job, overwrite);
     }
 
     fn finish_cloud_save(&mut self, job: SaveJob, result: Result<SaveOutcome, String>) {
         self.cloud.save_pending = false;
-        let current = self.doc.id == job.document;
+        let current = self.game.doc.id == job.document;
         let action = if job.vt == VersionType::Published { "Published" } else { "Saved" };
         match result {
             Ok(SaveOutcome::Saved { version }) => {
@@ -1465,16 +1465,16 @@ impl Editor {
                 if current {
                     if job.relink && self.live_team_create_ids().is_none() {
                         if let Some(origin) = job.origin {
-                            self.doc.title.clone_from(&origin.name);
-                            self.doc.cloud = Some(origin);
+                            self.game.doc.title.clone_from(&origin.name);
+                            self.game.doc.cloud = Some(origin);
                             self.cloud.status = None;
-                            self.doc.mark_saved_at(job.revision);
+                            self.game.doc.mark_saved_at(job.revision);
                         }
-                    } else if let Some(origin) = self.doc.cloud.as_mut().filter(|origin|
+                    } else if let Some(origin) = self.game.doc.cloud.as_mut().filter(|origin|
                         (origin.universe_id, origin.place_id) == (job.universe, job.place))
                     {
                         origin.version = version;
-                        self.doc.mark_saved_at(job.revision);
+                        self.game.doc.mark_saved_at(job.revision);
                     }
                     if job.from_dialog && self.cloud_upload_mode().is_some() {
                         self.cloud.upload_result = Some(Ok(Some(version)));
@@ -1534,7 +1534,7 @@ impl Editor {
         let mut open_guid=None;
         let live=self.cloud.live.as_ref();
         let peers:Vec<_>=live.into_iter().flat_map(|live|live.collaborators.iter().filter_map(|r| {
-            let inst=self.doc.dom.get_by_ref(*r)?;
+            let inst=self.game.doc.dom.get_by_ref(*r)?;
             let user=match inst.properties.get(&"UserId".into()) {Some(rbx_types::Variant::Int64(v))=>*v as u64,_=>0};
             let own=Some(user)==live.owner_user;
             let name=match inst.properties.get(&"Username".into()) {Some(rbx_types::Variant::String(v))=>v.clone(),_=>inst.name.clone()};
@@ -1544,7 +1544,7 @@ impl Editor {
             let line=match inst.properties.get(&"CurScriptLineNumber".into()) {Some(rbx_types::Variant::Int64(v))=>*v,_=>0};
             Some((name,own,frame,idle,guid,line))
         })).collect();
-        let universe=live.map(|l|l.universe).or_else(||self.doc.cloud.as_ref().map(|o|o.universe_id));
+        let universe=live.map(|l|l.universe).or_else(||self.game.doc.cloud.as_ref().map(|o|o.universe_id));
         egui::Window::new("Live Collaborators").id(egui::Id::new("live_collaborators_window")).open(&mut self.cloud.live_collaborators_open).show(ctx,|ui| {
             if self.cloud.live.is_none() {ui.label("Open a Team Create place to join its live session.");}
             for (name,own,frame,idle,guid,line) in peers {
@@ -1557,13 +1557,13 @@ impl Editor {
             if let Some(universe)=universe {ui.hyperlink_to("Manage collaborators",format!("https://create.roblox.com/dashboard/creations/experiences/{universe}/collaborators"));}
         });
         if let Some(frame)=fly {
-            self.cam.pos=glam::Vec3::new(frame.position.x,frame.position.y,frame.position.z);
+            self.game.cam.pos=glam::Vec3::new(frame.position.x,frame.position.y,frame.position.z);
             let m=frame.orientation;
-            self.cam.set_rotation(glam::Mat3::from_cols_array(&[m.x.x,m.y.x,m.z.x,m.x.y,m.y.y,m.z.y,m.x.z,m.y.z,m.z.z]));
-            self.cam.focus=self.cam.pos+self.cam.forward()*32.0;
+            self.game.cam.set_rotation(glam::Mat3::from_cols_array(&[m.x.x,m.y.x,m.z.x,m.x.y,m.y.y,m.z.y,m.x.z,m.y.z,m.z.z]));
+            self.game.cam.focus=self.game.cam.pos+self.game.cam.forward()*32.0;
         }
         if let Some(guid)=open_guid {
-            if let Some(reference)=self.doc.dom.descendants().find(|i| matches!(i.properties.get(&"ScriptGuid".into()),Some(rbx_types::Variant::String(g)) if *g==guid)).map(|i|i.referent()) {self.open_script.push(reference);}
+            if let Some(reference)=self.game.doc.dom.descendants().find(|i| matches!(i.properties.get(&"ScriptGuid".into()),Some(rbx_types::Variant::String(g)) if *g==guid)).map(|i|i.referent()) {self.open_script.push(reference);}
         }
     }
 
@@ -1612,9 +1612,9 @@ impl Editor {
             }
             Some(1) => {
                 self.cloud.conflict = None;
-                if let Some(p) = self.doc.cloud.as_ref().map(|o| o.place_id) {
+                if let Some(p) = self.game.doc.cloud.as_ref().map(|o| o.place_id) {
                     // The person chose to drop their changes.
-                    let copy = self.doc.cloud.as_ref().is_some_and(|o| o.local_copy);
+                    let copy = self.game.doc.cloud.as_ref().is_some_and(|o| o.local_copy);
                     self.perform_open_cloud(p, Some(c.server), copy);
                 }
             }
@@ -1627,7 +1627,7 @@ impl Editor {
     /// the person says so.
     fn copy_save_modal(&mut self, ctx: &egui::Context) {
         let Some(vt) = self.cloud.confirm_copy_save else { return };
-        let exp = self.doc.cloud.as_ref().map(|o| o.experience.clone()).unwrap_or_default();
+        let exp = self.game.doc.cloud.as_ref().map(|o| o.experience.clone()).unwrap_or_default();
         let mut pick: Option<bool> = None;
         egui::Modal::new(egui::Id::new("cloud_copy_save")).show(ctx, |ui| {
             ui.set_max_width(460.0);
@@ -1685,7 +1685,7 @@ impl Editor {
             return;
         }
         let mut open = true;
-        let origin = self.doc.cloud.clone();
+        let origin = self.game.doc.cloud.clone();
         let mut refresh = false;
         egui::Window::new("Experience Settings")
             .open(&mut open)
@@ -1724,7 +1724,7 @@ impl Editor {
                             "the saved version on Roblox".into()
                         },
                     );
-                    row("Version", format!("{}{}", o.version, if self.doc.dirty() { " (unsaved changes)" } else { "" }));
+                    row("Version", format!("{}{}", o.version, if self.game.doc.dirty() { " (unsaved changes)" } else { "" }));
                     row("Cached at", self.cloud.cache.dir(o.place_id).display().to_string());
                 });
                 ui.separator();
@@ -1758,8 +1758,8 @@ impl Editor {
                 }
             });
         if refresh {
-            if let Some(u) = self.doc.cloud.as_ref().map(|o| o.universe_id) {
-                let api = self.cloud.factory(self.account.shared_client());
+            if let Some(u) = self.game.doc.cloud.as_ref().map(|o| o.universe_id) {
+                let api = self.cloud.factory(self.game.account.shared_client());
                 self.cloud.spawn(api, move |a, tx| {
                     if let Some(a) = a {
                         let _ = tx.send(Msg::Status(u, a.team_create(u)));
@@ -1776,7 +1776,7 @@ impl Editor {
         if !self.cloud.open {
             return;
         }
-        self.account.restore();
+        self.game.account.restore();
         let mut open = true;
         let mut todo: Vec<PickerDo> = Vec::new();
         egui::Window::new("Open from Roblox")
@@ -1788,7 +1788,7 @@ impl Editor {
         if !open {
             self.cloud.open = false;
         }
-        let client = self.account.shared_client();
+        let client = self.game.account.shared_client();
         for t in todo {
             match t {
                 PickerDo::Tab(tab) => {
@@ -1843,13 +1843,13 @@ impl Editor {
                 PickerDo::Forget(p) => {
                     let _ = self.cloud.cache.forget(p);
                 }
-                PickerDo::Account => self.account.open = true,
+                PickerDo::Account => self.game.account.open = true,
             }
         }
     }
 
     fn picker_contents(&mut self, ui: &mut egui::Ui, todo: &mut Vec<PickerDo>) {
-        let signed = self.account.signed_in();
+        let signed = self.game.account.signed_in();
         let c = &mut self.cloud;
         ui.horizontal(|ui| {
             for t in PickerTab::ALL {
@@ -1869,7 +1869,7 @@ impl Editor {
         if !signed {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{}: only places cached on this computer open.", self.account.status_short()))
+                    RichText::new(format!("{}: only places cached on this computer open.", self.game.account.status_short()))
                         .color(theme::WARN),
                 );
                 if ui.small_button("Roblox account…").clicked() {

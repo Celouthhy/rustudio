@@ -29,7 +29,7 @@ use rbx_dom_weak::WeakDom;
 use super::api::{self, Failure, Http};
 use super::categories::Kind;
 use super::model::Asset;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 /// Where an insert goes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -159,7 +159,7 @@ pub fn prepare(h: &dyn Http, job: u64, mut asset: Asset, target: Target, cancel:
                 return Err(Failure::Cancelled);
             }
             stage(2);
-            let dom = crate::doc::Document::decode(&bytes).map_err(|e| Failure::Other(format!("The asset file can't be read: {e}")))?;
+            let dom = rustudio_core::doc::Document::decode(&bytes).map_err(|e| Failure::Other(format!("The asset file can't be read: {e}")))?;
             let scripts = dom
                 .descendants()
                 .filter(|i| matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript"))
@@ -178,7 +178,7 @@ pub fn waypoint(id: u64, kind: Kind) -> String {
 // ------------------------------------------------------------- placement
 
 fn is_part(class: &str) -> bool {
-    crate::doc::is_a(class, "BasePart")
+    rustudio_core::doc::is_a(class, "BasePart")
 }
 
 /// World AABB of the BaseParts under `roots` in `dom`.
@@ -293,7 +293,7 @@ pub enum Home {
 }
 
 pub fn home_of(class: &str, sub_types: &[String]) -> Home {
-    if crate::doc::is_a(class, "Sky") || crate::doc::is_a(class, "Atmosphere") || class == "Sky" || class == "Atmosphere" {
+    if rustudio_core::doc::is_a(class, "Sky") || rustudio_core::doc::is_a(class, "Atmosphere") || class == "Sky" || class == "Atmosphere" {
         Home::Lighting
     } else if sub_types.iter().any(|s| s == "MaterialPack") {
         Home::MaterialService

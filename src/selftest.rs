@@ -11,7 +11,7 @@ use rbx_dom_weak::InstanceBuilder;
 use serde_json::json;
 
 use crate::app::{Editor, Tool};
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::viewport::Handle;
 
 mod duplicate_drag;
@@ -255,7 +255,7 @@ impl SelfTest {
     }
 
     fn part_pos(ed: &Editor, r: Ref) -> Option<Vec3> {
-        crate::scene::xform_of(&ed.doc, r).map(|x| x.pos)
+        rustudio_render::scene::xform_of(&ed.game.doc, r).map(|x| x.pos)
     }
 
     /// Advances the script one frame; returns true when finished.
@@ -305,30 +305,30 @@ impl SelfTest {
             self.fid_spawn();
         }
         let f = self.frame;
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         if f > 2 && self.modifiers != Modifiers::NONE && self.queue.is_empty() {
             self.modifiers = Modifiers::NONE;
         }
         if f == 1 {
             // The older steps watch the server side while playing.
-            ed.play_shows_client = false;
+            ed.game.play_shows_client = false;
         }
         match f {
             // 1. Fly the camera forward with W.
             10 => {
                 // Studio opens with snapping off; tick both boxes like a user would.
-                ed.snap_move = true;
-                ed.snap_rotate = true;
-                self.cam_start = ed.cam.pos;
+                ed.game.snap_move = true;
+                ed.game.snap_rotate = true;
+                self.cam_start = ed.game.cam.pos;
                 self.queue.push(Event::PointerMoved(vp.center()));
                 self.queue.push(key(Key::W, true, Modifiers::NONE));
             }
             // Studio-speed flying (107 studs/s): 10 frames ≈ 18 studs.
             20 => self.queue.push(key(Key::W, false, Modifiers::NONE)),
-            45 => self.cam_moved = (ed.cam.pos - self.cam_start).length(),
+            45 => self.cam_moved = (ed.game.cam.pos - self.cam_start).length(),
             // 2. Click the Part button in the toolbar.
             50 => {
-                self.parts_before = ed.doc.count_class("BasePart");
+                self.parts_before = ed.game.doc.count_class("BasePart");
                 match ed.ui_rects.get("insert.part") {
                     Some(r) => {
                         let c = r.center();
@@ -357,8 +357,8 @@ impl SelfTest {
                 });
             }
             55 => {
-                let sel = ed.doc.selection.first().copied();
-                if ed.doc.count_class("BasePart") == self.parts_before + 1 {
+                let sel = ed.game.doc.selection.first().copied();
+                if ed.game.doc.count_class("BasePart") == self.parts_before + 1 {
                     self.part = sel;
                     self.part_start = sel.and_then(|r| Self::part_pos(ed, r)).unwrap_or_default();
                 } else {
@@ -386,8 +386,8 @@ impl SelfTest {
                     .map(|(_, p)| *p);
                 match (handle, self.part) {
                     (Some(p), Some(_)) => {
-                        let a = ed.cam.project(vp, self.part_start);
-                        let b = ed.cam.project(vp, self.part_start + Vec3::X * 4.0);
+                        let a = ed.game.cam.project(vp, self.part_start);
+                        let b = ed.game.cam.project(vp, self.part_start + Vec3::X * 4.0);
                         self.drag_dir = match (a, b) {
                             (Some(a), Some(b)) => (b - a).normalized(),
                             _ => Vec2::X,
@@ -424,7 +424,7 @@ impl SelfTest {
                     .unwrap_or(self.part_start);
                 self.part_moved = now;
                 let d = now - self.part_start;
-                let snapped = (d.x / ed.move_inc - (d.x / ed.move_inc).round()).abs() < 1e-3;
+                let snapped = (d.x / ed.game.move_inc - (d.x / ed.game.move_inc).round()).abs() < 1e-3;
                 let ok_part = d.x >= 1.0 && d.y.abs() < 1e-3 && d.z.abs() < 1e-3 && snapped;
                 let ok_cam = self.cam_moved > 1.0;
                 self.steps.push(Step {
@@ -432,15 +432,15 @@ impl SelfTest {
                     passed: ok_part && ok_cam,
                     detail: format!(
                         "W flew the camera {:.1} studs; dragging the Move tool's X arrow 150 px moved the new part {:+.2} studs on X (snapped to {} studs: {snapped})",
-                        self.cam_moved, d.x, ed.move_inc
+                        self.cam_moved, d.x, ed.game.move_inc
                     ),
                 });
                 // 4. Duplicate with Ctrl+D.
-                self.parts_before = ed.doc.count_class("BasePart");
+                self.parts_before = ed.game.doc.count_class("BasePart");
                 self.press_combo(CTRL, Key::D);
             }
             86 => {
-                let n = ed.doc.count_class("BasePart");
+                let n = ed.game.doc.count_class("BasePart");
                 if n != self.parts_before + 1 {
                     self.notes.push(format!(
                         "Ctrl+D: expected {} parts, found {n}",
@@ -450,7 +450,7 @@ impl SelfTest {
                 self.press_combo(CTRL, Key::Z); // undo duplicate
             }
             92 => {
-                if ed.doc.count_class("BasePart") != self.parts_before {
+                if ed.game.doc.count_class("BasePart") != self.parts_before {
                     self.notes.push("Ctrl+Z did not undo the duplicate".into());
                 }
                 self.press_combo(CTRL, Key::Z); // undo move
@@ -475,8 +475,8 @@ impl SelfTest {
                 }
                 // Save and reload through the real file format.
                 let path = std::env::temp_dir().join("rustudio-selftest.rbxl");
-                let before = ed.doc.count_class("BasePart");
-                let roundtrip = ed
+                let before = ed.game.doc.count_class("BasePart");
+                let roundtrip = ed.game
                     .doc
                     .encode_all(false)
                     .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()))
@@ -494,7 +494,7 @@ impl SelfTest {
                     "clicked Part to insert, Ctrl+D duplicated, Ctrl+Z undid the duplicate and the move, Ctrl+Y redid it, the place saved and reloaded as .rbxl with {before} parts"
                 );
                 // Undoing the duplicate cleared the selection: click the part to select it again.
-                match ed.cam.project(vp, self.part_moved) {
+                match ed.game.cam.project(vp, self.part_moved) {
                     Some(c) => {
                         self.drag_from = c;
                         self.queue.push(Event::PointerMoved(c));
@@ -518,7 +518,7 @@ impl SelfTest {
                 });
             }
             108 => {
-                self.clicked = self.part.is_some_and(|p| ed.doc.selection == vec![p]);
+                self.clicked = self.part.is_some_and(|p| ed.game.doc.selection == vec![p]);
                 self.press_combo(CTRL, Key::Num4); // Rotate tool
             }
             // 5. Drag the Y ring 60 degrees around the gizmo centre.
@@ -534,12 +534,12 @@ impl SelfTest {
                         }
                     })
                     .map(|(_, p)| *p);
-                let center = ed.cam.project(vp, self.part_moved);
+                let center = ed.game.cam.project(vp, self.part_moved);
                 match (ring, center) {
                     (Some(p), Some(c)) => {
                         self.orient_before = self
                             .part
-                            .and_then(|r| crate::scene::xform_of(&ed.doc, r))
+                            .and_then(|r| rustudio_render::scene::xform_of(&ed.game.doc, r))
                             .map(|x| x.orientation_deg().y)
                             .unwrap_or(0.0);
                         self.ring_center = c;
@@ -575,11 +575,11 @@ impl SelfTest {
             126 => {
                 let after = self
                     .part
-                    .and_then(|r| crate::scene::xform_of(&ed.doc, r))
+                    .and_then(|r| rustudio_render::scene::xform_of(&ed.game.doc, r))
                     .map(|x| x.orientation_deg().y)
                     .unwrap_or(0.0);
                 self.turned = ((after - self.orient_before + 540.0) % 360.0) - 180.0;
-                let on_step = (self.turned / ed.rotate_inc - (self.turned / ed.rotate_inc).round())
+                let on_step = (self.turned / ed.game.rotate_inc - (self.turned / ed.game.rotate_inc).round())
                     .abs()
                     < 1e-2;
                 if self.turned.abs() < 1.0 || !on_step {
@@ -588,7 +588,7 @@ impl SelfTest {
                 }
                 self.size_before = self
                     .part
-                    .and_then(|r| crate::scene::vec3_of(ed.doc.prop(r, "Size")))
+                    .and_then(|r| rustudio_render::scene::vec3_of(ed.game.doc.prop(r, "Size")))
                     .unwrap_or_default();
                 self.press_combo(CTRL, Key::Num3); // Scale tool
             }
@@ -605,11 +605,11 @@ impl SelfTest {
                         }
                     })
                     .map(|(_, p)| *p);
-                let xf = self.part.and_then(|r| crate::scene::xform_of(&ed.doc, r));
+                let xf = self.part.and_then(|r| rustudio_render::scene::xform_of(&ed.game.doc, r));
                 match (handle, xf) {
                     (Some(p), Some(xf)) => {
-                        let a = ed.cam.project(vp, xf.pos);
-                        let b = ed.cam.project(vp, xf.pos + xf.rot.x_axis * 4.0);
+                        let a = ed.game.cam.project(vp, xf.pos);
+                        let b = ed.game.cam.project(vp, xf.pos + xf.rot.x_axis * 4.0);
                         self.drag_dir = match (a, b) {
                             (Some(a), Some(b)) => (b - a).normalized(),
                             _ => Vec2::X,
@@ -642,7 +642,7 @@ impl SelfTest {
             144 => {
                 let size = self
                     .part
-                    .and_then(|r| crate::scene::vec3_of(ed.doc.prop(r, "Size")))
+                    .and_then(|r| rustudio_render::scene::vec3_of(ed.game.doc.prop(r, "Size")))
                     .unwrap_or_default();
                 let grow = size.x - self.size_before.x;
                 if grow < 1.0 || (grow - grow.round()).abs() > 1e-3 {
@@ -656,7 +656,7 @@ impl SelfTest {
                     detail: if ok {
                         format!(
                             "{}; Rotate tool ring drag turned it {:+.0}° ({}° snap); Scale tool handle drag grew Size.X by {grow:.0} studs",
-                            self.act_detail, self.turned, ed.rotate_inc
+                            self.act_detail, self.turned, ed.game.rotate_inc
                         )
                     } else {
                         self.notes.join("; ")
@@ -748,16 +748,16 @@ impl SelfTest {
 
     /// Regression checks for the playtest notes, then the play-mode checks.
     fn tick_more(&mut self, f: u64, ed: &mut Editor) -> bool {
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         match f {
             // ---- camera look direction + cursor grab (right-drag) ----
             160 => {
-                ed.doc.selection.clear();
+                ed.game.doc.selection.clear();
                 ed.tool = Tool::Select;
-                ed.cam = crate::camera::Camera::default();
-                self.look.fwd0 = ed.cam.forward();
-                self.look.right0 = ed.cam.right();
-                self.look.pitch0 = ed.cam.pitch;
+                ed.game.cam = rustudio_render::camera::Camera::default();
+                self.look.fwd0 = ed.game.cam.forward();
+                self.look.right0 = ed.game.cam.right();
+                self.look.pitch0 = ed.game.cam.pitch;
                 self.look.center = vp.center();
                 self.press(vp.center(), PointerButton::Secondary, Modifiers::NONE);
             }
@@ -768,15 +768,15 @@ impl SelfTest {
             // Then raw motion only: a locked cursor stays put while the mouse moves.
             163..=172 => self.queue.push(Event::MouseMoved(Vec2::new(15.0, 0.0))),
             173 => {
-                self.look.mid_grabbed = ed.look_grab.is_some();
-                self.look.mid_log = ed.cursor_log.clone();
-                let fwd = ed.cam.forward();
+                self.look.mid_grabbed = ed.game.look_grab.is_some();
+                self.look.mid_log = ed.game.cursor_log.clone();
+                let fwd = ed.game.cam.forward();
                 self.look.turn_right = fwd.dot(self.look.right0);
                 self.look.yaw_deg = self.look.fwd0.angle_between(fwd).to_degrees();
             }
             174..=178 => self.queue.push(Event::MouseMoved(Vec2::new(0.0, 15.0))),
             179 => {
-                self.look.pitch_drop = (self.look.pitch0 - ed.cam.pitch).to_degrees();
+                self.look.pitch_drop = (self.look.pitch0 - ed.game.cam.pitch).to_degrees();
                 let p = self.look.center + Vec2::new(10.0, 0.0);
                 self.release(p, PointerButton::Secondary, Modifiers::NONE);
             }
@@ -791,7 +791,7 @@ impl SelfTest {
                         l.yaw_deg, l.turn_right, l.pitch_drop
                     ),
                 });
-                let tail: Vec<&str> = ed
+                let tail: Vec<&str> = ed.game
                     .cursor_log
                     .iter()
                     .rev()
@@ -815,7 +815,7 @@ impl SelfTest {
                     &["grab:none", "show"]
                 };
                 let tail = &tail[tail.len().saturating_sub(want.len())..];
-                let restored = ed.look_grab.is_none() && tail == want;
+                let restored = ed.game.look_grab.is_none() && tail == want;
                 self.steps.push(Step {
                     step: "cursor-grab",
                     passed: l.mid_grabbed && grabbed && restored,
@@ -829,22 +829,22 @@ impl SelfTest {
             }
             // ---- Explorer reveal on viewport selection ----
             190 => {
-                let ws = ed.doc.default_parent();
+                let ws = ed.game.doc.default_parent();
                 for i in 0..40 {
-                    ed.doc.insert(
+                    ed.game.doc.insert(
                         ws,
                         InstanceBuilder::new("Folder").with_name(format!("Filler{i:02}")),
                     );
                 }
-                let fa = ed
+                let fa = ed.game
                     .doc
                     .insert(ws, InstanceBuilder::new("Folder").with_name("FolderA"));
-                let ma = ed
+                let ma = ed.game
                     .doc
                     .insert(fa, InstanceBuilder::new("Model").with_name("ModelA"));
-                let pa = ed.doc.insert(
+                let pa = ed.game.doc.insert(
                     ma,
-                    crate::doc::new_part(
+                    rustudio_core::doc::new_part(
                         "PartA",
                         1,
                         Vec3::new(-5.0, 3.0, -20.0),
@@ -852,12 +852,12 @@ impl SelfTest {
                         [200, 80, 80],
                     ),
                 );
-                let fb = ed
+                let fb = ed.game
                     .doc
                     .insert(ws, InstanceBuilder::new("Folder").with_name("FolderB"));
-                let pb = ed.doc.insert(
+                let pb = ed.game.doc.insert(
                     fb,
-                    crate::doc::new_part(
+                    rustudio_core::doc::new_part(
                         "PartB",
                         1,
                         Vec3::new(5.0, 3.0, -20.0),
@@ -873,14 +873,14 @@ impl SelfTest {
                     fb,
                     pb,
                 };
-                ed.cam = crate::camera::Camera::default();
-                ed.cam.pos = Vec3::new(0.0, 10.0, 2.0);
-                ed.cam.pitch = -0.3;
-                ed.doc.selection.clear();
+                ed.game.cam = rustudio_render::camera::Camera::default();
+                ed.game.cam.pos = Vec3::new(0.0, 10.0, 2.0);
+                ed.game.cam.pitch = -0.3;
+                ed.game.doc.selection.clear();
                 ed.explorer.expanded.clear();
             }
             193 => {
-                let p = ed
+                let p = ed.game
                     .cam
                     .project(vp, Vec3::new(-5.0, 3.0, -20.0))
                     .unwrap_or(vp.center());
@@ -893,15 +893,15 @@ impl SelfTest {
                 let e = &ed.explorer;
                 self.reveal_notes.push(format!(
                     "click PartA → selected ModelA: {}, Workspace+FolderA expanded: {}, ModelA row on screen: {}",
-                    ed.doc.selection == vec![r.ma],
+                    ed.game.doc.selection == vec![r.ma],
                     e.expanded.contains(&r.ws) && e.expanded.contains(&r.fa),
                     e.visible.contains(&r.ma)
                 ));
-                self.reveal_ok &= ed.doc.selection == vec![r.ma]
+                self.reveal_ok &= ed.game.doc.selection == vec![r.ma]
                     && e.expanded.contains(&r.ws)
                     && e.expanded.contains(&r.fa)
                     && e.visible.contains(&r.ma);
-                let p = ed
+                let p = ed.game
                     .cam
                     .project(vp, Vec3::new(5.0, 3.0, -20.0))
                     .unwrap_or(vp.center());
@@ -914,12 +914,12 @@ impl SelfTest {
             206 => {
                 let r = self.reveal;
                 let e = &ed.explorer;
-                let ok = ed.doc.selection == vec![r.ma, r.pb]
+                let ok = ed.game.doc.selection == vec![r.ma, r.pb]
                     && e.expanded.contains(&r.fb)
                     && e.visible.contains(&r.pb);
                 self.reveal_notes.push(format!(
                     "Ctrl+click PartB → multi-select [ModelA, PartB]: {}, FolderB expanded: {}, PartB row on screen: {}",
-                    ed.doc.selection == vec![r.ma, r.pb],
+                    ed.game.doc.selection == vec![r.ma, r.pb],
                     e.expanded.contains(&r.fb),
                     e.visible.contains(&r.pb)
                 ));
@@ -935,15 +935,15 @@ impl SelfTest {
             216 => {
                 let r = self.reveal;
                 let e = &ed.explorer;
-                let restored = ed.doc.exists(r.pa) && ed.doc.exists(r.pb);
+                let restored = ed.game.doc.exists(r.pa) && ed.game.doc.exists(r.pb);
                 let ok = restored
-                    && ed.doc.selection == vec![r.ma, r.pb]
+                    && ed.game.doc.selection == vec![r.ma, r.pb]
                     && e.expanded.contains(&r.fa)
                     && e.expanded.contains(&r.fb)
                     && e.visible.contains(&r.pb);
                 self.reveal_notes.push(format!(
                     "Delete then (all collapsed) Ctrl+Z → objects back: {restored}, selection restored: {}, both folders re-expanded: {}, PartB row on screen: {}",
-                    ed.doc.selection == vec![r.ma, r.pb],
+                    ed.game.doc.selection == vec![r.ma, r.pb],
                     e.expanded.contains(&r.fa) && e.expanded.contains(&r.fb),
                     e.visible.contains(&r.pb)
                 ));
@@ -1008,28 +1008,28 @@ impl SelfTest {
         match f {
             // ---- Luau runtime under Run (F8) ----
             230 => {
-                let root = ed.doc.dom.root_ref();
-                let rs = ed.doc.find_child(root, "ReplicatedStorage").unwrap_or(root);
-                let sss = ed
+                let root = ed.game.doc.dom.root_ref();
+                let rs = ed.game.doc.find_child(root, "ReplicatedStorage").unwrap_or(root);
+                let sss = ed.game
                     .doc
                     .find_child(root, "ServerScriptService")
                     .unwrap_or(root);
-                ed.doc.insert(
+                ed.game.doc.insert(
                     rs,
                     InstanceBuilder::new("ModuleScript")
                         .with_name("Lib")
                         .with_property("Source", LIB_SRC.to_string()),
                 );
-                self.probe = ed.doc.insert(
+                self.probe = ed.game.doc.insert(
                     sss,
                     InstanceBuilder::new("Script")
                         .with_name("Probe")
                         .with_property("Source", PROBE_SRC.to_string()),
                 );
-                let ws = ed.doc.default_parent();
-                let lava = ed.doc.insert(
+                let ws = ed.game.doc.default_parent();
+                let lava = ed.game.doc.insert(
                     ws,
-                    crate::doc::new_part(
+                    rustudio_core::doc::new_part(
                         "Lava",
                         1,
                         Vec3::new(0.0, 0.6, -10.0),
@@ -1044,41 +1044,41 @@ impl SelfTest {
                     ),
                 );
                 let _ = lava;
-                if let Some(sps) = ed
+                if let Some(sps) = ed.game
                     .doc
                     .find_child(root, "StarterPlayer")
-                    .and_then(|sp| ed.doc.find_child(sp, "StarterPlayerScripts"))
+                    .and_then(|sp| ed.game.doc.find_child(sp, "StarterPlayerScripts"))
                 {
-                    ed.doc.insert(
+                    ed.game.doc.insert(
                         sps,
                         InstanceBuilder::new("LocalScript")
                             .with_name("Hello")
                             .with_property("Source", LOCAL_SRC.to_string()),
                     );
                 }
-                self.edit_parts = ed.doc.count_class("BasePart");
-                self.log_mark = ed.log.len();
+                self.edit_parts = ed.game.doc.count_class("BasePart");
+                self.log_mark = ed.game.log.len();
                 tap(&mut self.queue, Key::F8, Modifiers::NONE);
             }
             300 => {
-                let out: Vec<String> = ed.log[self.log_mark.min(ed.log.len())..]
+                let out: Vec<String> = ed.game.log[self.log_mark.min(ed.game.log.len())..]
                     .iter()
                     .map(|l| l.text.clone())
                     .collect();
                 let has = |needle: &str| out.iter().any(|l| l.contains(needle));
-                let faller_y = ed
+                let faller_y = ed.game
                     .doc
                     .workspace()
-                    .and_then(|ws| ed.doc.find_named(ws, "Faller"))
-                    .and_then(|r| crate::scene::xform_of(&ed.doc, r))
+                    .and_then(|ws| ed.game.doc.find_named(ws, "Faller"))
+                    .and_then(|r| rustudio_render::scene::xform_of(&ed.game.doc, r))
                     .map(|x| x.pos.y);
-                let script_part = ed
+                let script_part = ed.game
                     .doc
                     .workspace()
-                    .and_then(|ws| ed.doc.find_named(ws, "ScriptPart"))
+                    .and_then(|ws| ed.game.doc.find_named(ws, "ScriptPart"))
                     .is_some();
                 let checks = [
-                    ("Run started", ed.is_playing()),
+                    ("Run started", ed.game.is_playing()),
                     (
                         "require + print with script:line",
                         has("sum 5  —  ServerScriptService.Probe:2"),
@@ -1109,14 +1109,14 @@ impl SelfTest {
                 tap(&mut self.queue, Key::F5, Modifiers::SHIFT);
             }
             304 => {
-                let restored = !ed.is_playing()
-                    && ed.doc.exists(self.probe)
-                    && ed
+                let restored = !ed.game.is_playing()
+                    && ed.game.doc.exists(self.probe)
+                    && ed.game
                         .doc
                         .workspace()
-                        .and_then(|ws| ed.doc.find_named(ws, "ScriptPart"))
+                        .and_then(|ws| ed.game.doc.find_named(ws, "ScriptPart"))
                         .is_none()
-                    && ed.doc.count_class("BasePart") == self.edit_parts;
+                    && ed.game.doc.count_class("BasePart") == self.edit_parts;
                 self.luau_notes
                     .push(format!("Shift+F5 restored the edit DataModel: {restored}"));
                 self.steps.push(Step {
@@ -1124,12 +1124,12 @@ impl SelfTest {
                     passed: self.luau_ok && restored,
                     detail: self.luau_notes.join("; "),
                 });
-                self.log_mark = ed.log.len();
+                self.log_mark = ed.game.log.len();
                 tap(&mut self.queue, Key::F5, Modifiers::NONE);
             }
             // ---- Play (F5): character, walking, jumping, touch scripts ----
             310 => {
-                self.char_start = ed
+                self.char_start = ed.game
                     .play
                     .as_ref()
                     .and_then(|p| p.character.as_ref())
@@ -1138,7 +1138,7 @@ impl SelfTest {
             }
             370 => self.queue.push(key(Key::W, false, Modifiers::NONE)),
             374 => {
-                let pos = ed
+                let pos = ed.game
                     .play
                     .as_ref()
                     .and_then(|p| p.character.as_ref())
@@ -1153,7 +1153,7 @@ impl SelfTest {
             }
             378 => self.queue.push(key(Key::Space, false, Modifiers::NONE)),
             375..=400 => {
-                if let Some(p) = ed.play.as_ref().and_then(|p| p.character.as_ref()) {
+                if let Some(p) = ed.game.play.as_ref().and_then(|p| p.character.as_ref()) {
                     self.max_y = self.max_y.max(p.body.pos.y);
                 }
             }
@@ -1161,23 +1161,23 @@ impl SelfTest {
         }
         match f {
             402 => {
-                let out: Vec<String> = ed.log[self.log_mark.min(ed.log.len())..]
+                let out: Vec<String> = ed.game.log[self.log_mark.min(ed.game.log.len())..]
                     .iter()
                     .map(|l| l.text.clone())
                     .collect();
                 let has = |needle: &str| out.iter().any(|l| l.contains(needle));
-                let s = ed.play.as_ref();
+                let s = ed.game.play.as_ref();
                 let character = s.and_then(|p| p.character.as_ref());
                 let player_ok = s.is_some_and(|p| {
-                    p.player.is_some() && matches!(ed.doc.prop(p.player, "Character"), Some(rbx_dom_weak::types::Variant::Ref(c)) if Some(c) == character.map(|c| c.model))
+                    p.player.is_some() && matches!(ed.game.doc.prop(p.player, "Character"), Some(rbx_dom_weak::types::Variant::Ref(c)) if Some(c) == character.map(|c| c.model))
                 });
                 // The view is the client's CurrentCamera, which Roblox's
                 // CameraModule keeps on the character (Focus at the head).
                 let client = s.and_then(|p| {
-                    if p.showing == crate::runtime::Side::Client {
-                        Some(&ed.doc)
+                    if p.showing == rustudio_engine::runtime::Side::Client {
+                        Some(&ed.game.doc)
                     } else {
-                        ed.play_other_doc()
+                        ed.game.play_other_doc()
                     }
                 });
                 let cam_follows = character.is_some_and(|c| {
@@ -1190,9 +1190,9 @@ impl SelfTest {
                             Some(rbx_dom_weak::types::Variant::CFrame(f)) => Some(Vec3::new(f.position.x, f.position.y, f.position.z)),
                             _ => None,
                         });
-                        let at = cam.and_then(|cam| crate::scene::xform_of(d, cam)).map(|x| x.pos);
+                        let at = cam.and_then(|cam| rustudio_render::scene::xform_of(d, cam)).map(|x| x.pos);
                         // (Watching the server side leaves the editor camera free.)
-                        let shown = s.is_some_and(|p| p.showing == crate::runtime::Side::Server) || at.is_some_and(|p| (p - ed.cam.pos).length() < 0.01);
+                        let shown = s.is_some_and(|p| p.showing == rustudio_engine::runtime::Side::Server) || at.is_some_and(|p| (p - ed.game.cam.pos).length() < 0.01);
                         matches!((focus, at), (Some(f), Some(p)) if (f - c.body.pos).length() < 4.0 && (p - f).length() > 5.0) && shown
                     })
                 });
@@ -1225,9 +1225,9 @@ impl SelfTest {
                 tap(&mut self.queue, Key::F5, Modifiers::SHIFT);
             }
             406 => {
-                let restored = !ed.is_playing()
-                    && ed.doc.count_class("BasePart") == self.edit_parts
-                    && ed.doc.count_class("Humanoid") == 0;
+                let restored = !ed.game.is_playing()
+                    && ed.game.doc.count_class("BasePart") == self.edit_parts
+                    && ed.game.doc.count_class("Humanoid") == 0;
                 self.play_notes
                     .push(format!("Shift+F5 restored the edit DataModel: {restored}"));
                 self.steps.push(Step {
@@ -1312,9 +1312,9 @@ impl SelfTest {
     /// Playtest round 3: wheel zoom toward the cursor, scaled by distance;
     /// fly speed ramps up while held and resets after a pause.
     fn tick_cam(&mut self, f: u64, ed: &mut Editor) -> bool {
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         let reset_cam = |ed: &mut Editor| {
-            ed.cam = crate::camera::Camera::default();
+            ed.game.cam = rustudio_render::camera::Camera::default();
             ed.fly_held = 0.0;
             ed.fly_idle = 10.0;
             ed.last_zoom = None;
@@ -1323,27 +1323,27 @@ impl SelfTest {
             410 => {
                 reset_cam(ed);
                 self.cam.ok = true;
-                self.cam.pos0 = ed.cam.pos;
-                self.cam.fwd0 = ed.cam.forward();
+                self.cam.pos0 = ed.game.cam.pos;
+                self.cam.fwd0 = ed.game.cam.forward();
                 // Lower right of the view: the baseplate, well off-centre.
                 let p = vp.min + egui::vec2(vp.width() * 0.8, vp.height() * 0.8);
                 self.queue.push(Event::PointerMoved(p));
                 self.queue.push(wheel_notch());
             }
             413 => {
-                let moved = ed.cam.pos - self.cam.pos0;
+                let moved = ed.game.cam.pos - self.cam.pos0;
                 let (ok, note) = match ed.last_zoom {
                     Some((dir, Some(hit))) => {
                         let along = moved.normalize_or_zero().dot(dir);
                         let off_centre = moved.normalize_or_zero().dot(self.cam.fwd0);
                         // Studio: a fixed "Camera Mouse Wheel Speed" step toward the mouse.
                         let ok = along > 0.999
-                            && (moved.length() - crate::mech::WHEEL_STEP).abs() < 0.01
+                            && (moved.length() - rustudio_core::mech::WHEEL_STEP).abs() < 0.01
                             && off_centre < 0.995;
                         (ok, format!(
                             "one notch over the baseplate {hit:.1} studs away moved the camera {:.2} studs along the cursor ray (Studio: {}; alignment {along:.4}; vs screen centre {off_centre:.3})",
                             moved.length(),
-                            crate::mech::WHEEL_STEP
+                            rustudio_core::mech::WHEEL_STEP
                         ))
                     }
                     other => (
@@ -1354,18 +1354,18 @@ impl SelfTest {
                 self.cam.ok &= ok;
                 self.cam.notes.push(note);
                 reset_cam(ed);
-                self.cam.pos0 = ed.cam.pos;
+                self.cam.pos0 = ed.game.cam.pos;
                 // Near the top: open sky, nothing under the cursor.
                 let p = vp.min + egui::vec2(vp.width() * 0.5, vp.height() * 0.06);
                 self.queue.push(Event::PointerMoved(p));
                 self.queue.push(wheel_notch());
             }
             416 => {
-                let moved = ed.cam.pos - self.cam.pos0;
+                let moved = ed.game.cam.pos - self.cam.pos0;
                 let (ok, note) = match ed.last_zoom {
                     Some((dir, None)) => {
                         let along = moved.normalize_or_zero().dot(dir);
-                        (along > 0.999 && (moved.length() - crate::mech::WHEEL_STEP).abs() < 0.01, format!("one notch into empty sky moved {:.1} studs along the cursor ray (alignment {along:.4})", moved.length()))
+                        (along > 0.999 && (moved.length() - rustudio_core::mech::WHEEL_STEP).abs() < 0.01, format!("one notch into empty sky moved {:.1} studs along the cursor ray (alignment {along:.4})", moved.length()))
                     }
                     other => (false, format!("sky zoom: unexpected {other:?}")),
                 };
@@ -1382,7 +1382,7 @@ impl SelfTest {
                 self.queue.push(key(Key::W, true, Modifiers::NONE));
             }
             417..=570 => {
-                let step = (ed.cam.pos - self.cam.prev).length();
+                let step = (ed.game.cam.pos - self.cam.prev).length();
                 if f == 419 {
                     self.cam.early = step;
                 }
@@ -1396,11 +1396,11 @@ impl SelfTest {
             // Keys released (Studio resets its hold counter at once), then move again.
             671 => self.queue.push(key(Key::W, true, Modifiers::NONE)),
             674 => {
-                self.cam.after_reset = (ed.cam.pos - self.cam.prev).length();
+                self.cam.after_reset = (ed.game.cam.pos - self.cam.prev).length();
                 self.queue.push(key(Key::W, false, Modifiers::NONE));
             }
             676 => {
-                let base = crate::mech::FLY_SPEED / 60.0;
+                let base = rustudio_core::mech::FLY_SPEED / 60.0;
                 let c = &self.cam;
                 let ramp = c.late / c.early.max(1e-6);
                 // Studio's rule: base step for 120 ticks, then
@@ -1424,81 +1424,81 @@ impl SelfTest {
             680.. => return self.tick_m3(f, ed),
             _ => {}
         }
-        self.cam.prev = ed.cam.pos;
+        self.cam.prev = ed.game.cam.pos;
         false
     }
 
     /// Milestone 3: client/server Play, R15 character, asset pipeline.
     fn tick_m3(&mut self, f: u64, ed: &mut Editor) -> bool {
-        use crate::runtime::Side;
+        use rustudio_engine::runtime::Side;
         let tap = |q: &mut Vec<Event>, k: Key, m: Modifiers| {
             q.push(key(k, true, m));
             q.push(key(k, false, m));
         };
         let has = |ed: &Editor, mark: usize, needle: &str| {
-            ed.log[mark.min(ed.log.len())..]
+            ed.game.log[mark.min(ed.game.log.len())..]
                 .iter()
                 .any(|l| l.text.contains(needle))
         };
         match f {
             680 => {
-                ed.cam = crate::camera::Camera::default();
-                let root = ed.doc.dom.root_ref();
-                let child = |ed: &Editor, n: &str| ed.doc.find_child(root, n).unwrap_or(root);
+                ed.game.cam = rustudio_render::camera::Camera::default();
+                let root = ed.game.doc.dom.root_ref();
+                let child = |ed: &Editor, n: &str| ed.game.doc.find_child(root, n).unwrap_or(root);
                 let (ss, rs, sss) = (
                     child(ed, "ServerStorage"),
                     child(ed, "ReplicatedStorage"),
                     child(ed, "ServerScriptService"),
                 );
-                ed.doc
+                ed.game.doc
                     .insert(ss, InstanceBuilder::new("Folder").with_name("Secret"));
-                ed.doc
+                ed.game.doc
                     .insert(rs, InstanceBuilder::new("RemoteEvent").with_name("Ping"));
-                ed.doc
+                ed.game.doc
                     .insert(rs, InstanceBuilder::new("RemoteFunction").with_name("Ask"));
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sss,
                     InstanceBuilder::new("Script")
                         .with_name("Srv")
                         .with_property("Source", SRV_SRC.to_string()),
                 );
-                if let Some(sps) = ed
+                if let Some(sps) = ed.game
                     .doc
                     .find_child(root, "StarterPlayer")
-                    .and_then(|sp| ed.doc.find_child(sp, "StarterPlayerScripts"))
+                    .and_then(|sp| ed.game.doc.find_child(sp, "StarterPlayerScripts"))
                 {
-                    ed.doc.insert(
+                    ed.game.doc.insert(
                         sps,
                         InstanceBuilder::new("LocalScript")
                             .with_name("Cli")
                             .with_property("Source", CLI_SRC.to_string()),
                     );
                 }
-                if let Some(scs) = ed
+                if let Some(scs) = ed.game
                     .doc
                     .find_child(root, "StarterPlayer")
-                    .and_then(|sp| ed.doc.find_child(sp, "StarterCharacterScripts"))
+                    .and_then(|sp| ed.game.doc.find_child(sp, "StarterCharacterScripts"))
                 {
-                    ed.doc.insert(
+                    ed.game.doc.insert(
                         scs,
                         InstanceBuilder::new("LocalScript")
                             .with_name("Swing")
                             .with_property("Source", SWING_SRC.to_string()),
                     );
                 }
-                ed.play_rig = Some(crate::rig::RigType::R15);
-                self.m3.mark = ed.log.len();
-                self.m3.edit_parts = ed.doc.count_class("BasePart");
+                ed.game.play_rig = Some(rustudio_engine::rig::RigType::R15);
+                self.m3.mark = ed.game.log.len();
+                self.m3.edit_parts = ed.game.doc.count_class("BasePart");
                 tap(&mut self.queue, Key::F5, Modifiers::NONE);
             }
             // Walk, then jump, while the remotes do their work.
             690 => self.queue.push(key(Key::W, true, Modifiers::NONE)),
             691..=730 => {
-                if let Some(ch) = ed.play.as_ref().and_then(|p| p.character.as_ref()) {
-                    let leg = ed.doc.find_named(ch.model, "LeftUpperLeg");
-                    let root = crate::scene::xform_of(&ed.doc, ch.rig.root);
+                if let Some(ch) = ed.game.play.as_ref().and_then(|p| p.character.as_ref()) {
+                    let leg = ed.game.doc.find_named(ch.model, "LeftUpperLeg");
+                    let root = rustudio_render::scene::xform_of(&ed.game.doc, ch.rig.root);
                     if let (Some(leg), Some(root)) =
-                        (leg.and_then(|l| crate::scene::xform_of(&ed.doc, l)), root)
+                        (leg.and_then(|l| rustudio_render::scene::xform_of(&ed.game.doc, l)), root)
                     {
                         let rel = root.rot.transpose() * leg.rot;
                         let angle = rel.y_axis.angle_between(Vec3::Y);
@@ -1514,13 +1514,13 @@ impl SelfTest {
             734 => self.queue.push(key(Key::Space, false, Modifiers::NONE)),
             790 => {
                 let mark = self.m3.mark;
-                let s = ed.play.as_ref();
-                let other = ed.play_other_doc();
-                let server = &ed.doc;
-                let ws_named = |d: &crate::doc::Document, n: &str| {
+                let s = ed.game.play.as_ref();
+                let other = ed.game.play_other_doc();
+                let server = &ed.game.doc;
+                let ws_named = |d: &rustudio_core::doc::Document, n: &str| {
                     d.workspace().and_then(|w| d.find_named(w, n)).is_some()
                 };
-                let kids = |d: &crate::doc::Document, n: &str| {
+                let kids = |d: &rustudio_core::doc::Document, n: &str| {
                     d.find_child(d.dom.root_ref(), n)
                         .and_then(|x| d.dom.get_by_ref(x))
                         .map(|i| i.children().len())
@@ -1558,7 +1558,7 @@ impl SelfTest {
                             // (Motor6Ds with StarterPlayer.AvatarJointUpgrade off).
                             .filter(|i| {
                                 i.class
-                                    == if crate::rig::joint_upgrade(server) {
+                                    == if rustudio_engine::rig::joint_upgrade(server) {
                                         "AnimationConstraint"
                                     } else {
                                         "Motor6D"
@@ -1567,17 +1567,17 @@ impl SelfTest {
                             .count()
                     })
                     .unwrap_or(0);
-                let r15 = ch.is_some_and(|c| c.rig_type == crate::rig::RigType::R15);
+                let r15 = ch.is_some_and(|c| c.rig_type == rustudio_engine::rig::RigType::R15);
                 let upright = ch
-                    .and_then(|c| crate::scene::xform_of(server, c.rig.root))
+                    .and_then(|c| rustudio_render::scene::xform_of(server, c.rig.root))
                     .is_some_and(|x| x.rot.y_axis.y > 0.999);
                 let owned = ch.zip(other).zip(s).is_some_and(|((c, cd), p)| {
-                    let sc = crate::scene::xform_of(server, c.rig.root);
+                    let sc = rustudio_render::scene::xform_of(server, c.rig.root);
                     let cc = p
                         .map
                         .s2c
                         .get(&c.rig.root)
-                        .and_then(|r| crate::scene::xform_of(cd, *r));
+                        .and_then(|r| rustudio_render::scene::xform_of(cd, *r));
                     matches!((sc, cc), (Some(a), Some(b)) if (a.pos - b.pos).length() < 1e-3)
                 });
                 let log = s.map(|p| p.state_log.join(" → ")).unwrap_or_default();
@@ -1609,11 +1609,11 @@ impl SelfTest {
             }
             791 => self.release(self.m3.click, PointerButton::Primary, Modifiers::NONE),
             795 => {
-                let viewing_client = ed.play.as_ref().is_some_and(|p| p.showing == Side::Client)
-                    && ed
+                let viewing_client = ed.game.play.as_ref().is_some_and(|p| p.showing == Side::Client)
+                    && ed.game
                         .doc
                         .workspace()
-                        .and_then(|w| ed.doc.find_named(w, "ClientOnly"))
+                        .and_then(|w| ed.game.doc.find_named(w, "ClientOnly"))
                         .is_some();
                 self.m3.cs_notes.push(format!(
                     "Explorer switched to the client view: {viewing_client}"
@@ -1622,9 +1622,9 @@ impl SelfTest {
                 tap(&mut self.queue, Key::F5, Modifiers::SHIFT);
             }
             800 => {
-                let restored = !ed.is_playing()
-                    && ed.doc.count_class("BasePart") == self.m3.edit_parts
-                    && ed.doc.count_class("Humanoid") == 0;
+                let restored = !ed.game.is_playing()
+                    && ed.game.doc.count_class("BasePart") == self.m3.edit_parts
+                    && ed.game.doc.count_class("Humanoid") == 0;
                 self.m3
                     .cs_notes
                     .push(format!("Stop restored the edit DataModel: {restored}"));
@@ -1640,7 +1640,7 @@ impl SelfTest {
                 });
                 // Asset pipeline, offline: a cache filled as a download would.
                 let ok = (|| -> Result<(), String> {
-                    let mesh = crate::assets::cache_path(crate::assets::AssetRef {
+                    let mesh = rustudio_core::assets::cache_path(rustudio_core::assets::AssetRef {
                         id: 900001,
                         version: None,
                     });
@@ -1654,7 +1654,7 @@ impl SelfTest {
                     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
                         .map_err(|e| e.to_string())?;
                     std::fs::write(
-                        crate::assets::cache_path(crate::assets::AssetRef {
+                        rustudio_core::assets::cache_path(rustudio_core::assets::AssetRef {
                             id: 900002,
                             version: None,
                         }),
@@ -1665,12 +1665,12 @@ impl SelfTest {
                 if let Err(e) = ok {
                     self.m3.asset_notes.push(format!("cache setup failed: {e}"));
                 }
-                let ws = ed.doc.default_parent();
+                let ws = ed.game.doc.default_parent();
                 use rbx_dom_weak::types::{CFrame, ContentId, Enum, Vector3};
                 let at = |x: f32| {
                     CFrame::new(Vector3::new(x, 3.0, -8.0), CFrame::identity().orientation)
                 };
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     InstanceBuilder::new("MeshPart")
                         .with_name("CachedMesh")
@@ -1680,9 +1680,9 @@ impl SelfTest {
                         .with_property("MeshId", ContentId::from("rbxassetid://900001"))
                         .with_property("TextureID", ContentId::from("rbxassetid://900002")),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
-                    crate::doc::new_part(
+                    rustudio_core::doc::new_part(
                         "Sign",
                         1,
                         Vec3::new(0.0, 3.0, -8.0),
@@ -1696,11 +1696,11 @@ impl SelfTest {
                             .with_property("Face", Enum::from_u32(5)),
                     ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     InstanceBuilder::new("Model")
                         .with_name("Mannequin")
-                        .with_child(crate::doc::new_part(
+                        .with_child(rustudio_core::doc::new_part(
                             "Torso",
                             1,
                             Vec3::new(6.0, 3.0, -8.0),
@@ -1718,7 +1718,7 @@ impl SelfTest {
                 );
             }
             812 => {
-                let [meshes, textured, decals, clothed] = ed.draw_stats;
+                let [meshes, textured, decals, clothed] = ed.game.draw_stats;
                 let ok = meshes >= 1 && textured >= 2 && decals >= 1 && clothed >= 1;
                 self.m3.asset_notes.push(format!(
                     "from the asset cache (rbxassetid → ~/.cache/rustudio layout): {meshes} mesh drawn, {textured} textured parts (MeshPart TextureID + Shirt on a Torso), {decals} decal quad, {clothed} clothed body part"
@@ -1826,7 +1826,7 @@ struct R4Test {
     phase: u8,
     started: u64,
     mark: usize,
-    bench: Option<crate::bench::Bench>,
+    bench: Option<rustudio_core::bench::Bench>,
     perf_place: Option<PathBuf>,
 }
 
@@ -1921,17 +1921,17 @@ tool.Activated:Connect(function() print("activated " .. tool.Name) end)
 
 impl SelfTest {
     fn tick_r4(&mut self, f: u64, ed: &mut Editor) -> bool {
-        use crate::doc::new_part;
+        use rustudio_core::doc::new_part;
         use rbx_dom_weak::types::{ContentId, Enum};
         let has = |ed: &Editor, mark: usize, needle: &str| {
-            ed.log[mark.min(ed.log.len())..]
+            ed.game.log[mark.min(ed.game.log.len())..]
                 .iter()
                 .any(|l| l.text.contains(needle))
         };
         match self.r4.phase {
             // Content folder: rbxasset:// meshes and textures from our own files.
             0 => {
-                let dir = crate::assets::content_dir();
+                let dir = rustudio_core::assets::content_dir();
                 let _ = std::fs::create_dir_all(dir.join("fonts"));
                 let _ = std::fs::create_dir_all(dir.join("textures"));
                 let _ = std::fs::create_dir_all(dir.join("sounds"));
@@ -1942,8 +1942,8 @@ impl SelfTest {
                 let _ = img.save(dir.join("textures/selftest.png"));
                 let _ = std::fs::write(dir.join("sounds/selftest.wav"), wav(0.2));
                 ed.set_document(Document::new_place());
-                let ws = ed.doc.workspace().expect("workspace");
-                ed.doc.insert(
+                let ws = ed.game.doc.workspace().expect("workspace");
+                ed.game.doc.insert(
                     ws,
                     new_part(
                         "Gem",
@@ -1965,7 +1965,7 @@ impl SelfTest {
                             ),
                     ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     new_part(
                         "Face",
@@ -1987,7 +1987,7 @@ impl SelfTest {
                 self.r4.started = f;
             }
             1 if f >= self.r4.started + 10 => {
-                let [meshes, textured, decals, _] = ed.draw_stats;
+                let [meshes, textured, decals, _] = ed.game.draw_stats;
                 let ok = meshes >= 1 && textured >= 1 && decals >= 1;
                 self.steps.push(Step {
                     step: "content-folder",
@@ -2001,14 +2001,14 @@ impl SelfTest {
             // In-game APIs during Play.
             2 => {
                 ed.set_document(Document::new_place());
-                let root = ed.doc.dom.root_ref();
-                let ws = ed.doc.workspace().expect("workspace");
-                let sss = ed.doc.find_child(root, "ServerScriptService").expect("sss");
-                let pack = ed
+                let root = ed.game.doc.dom.root_ref();
+                let ws = ed.game.doc.workspace().expect("workspace");
+                let sss = ed.game.doc.find_child(root, "ServerScriptService").expect("sss");
+                let pack = ed.game
                     .doc
                     .find_child(root, "StarterPack")
                     .expect("starter pack");
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     new_part(
                         "Button",
@@ -2019,7 +2019,7 @@ impl SelfTest {
                     )
                     .with_child(InstanceBuilder::new("ClickDetector")),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     InstanceBuilder::new("Sound")
                         .with_name("Beep")
@@ -2028,13 +2028,13 @@ impl SelfTest {
                             ContentId::from("rbxasset://sounds/selftest.wav"),
                         ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sss,
                     InstanceBuilder::new("Script")
                         .with_name("Game")
                         .with_property("Source", GAME_SERVER_SRC.to_string()),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     pack,
                     InstanceBuilder::new("Tool")
                         .with_name("Wand")
@@ -2054,18 +2054,18 @@ impl SelfTest {
                                 .with_property("Source", TOOL_SRC.to_string()),
                         ),
                 );
-                self.r4.mark = ed.log.len();
-                ed.start_play(crate::runtime::RunMode::Play);
+                self.r4.mark = ed.game.log.len();
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 3;
                 self.r4.started = f;
             }
             3 => {
                 let t = f - self.r4.started;
-                let button = ed
+                let button = ed.game
                     .doc
                     .workspace()
-                    .and_then(|ws| ed.doc.find_named(ws, "Button"));
-                if let (Some(s), Some(b)) = (ed.play.as_mut(), button) {
+                    .and_then(|ws| ed.game.doc.find_named(ws, "Button"));
+                if let (Some(s), Some(b)) = (ed.game.play.as_mut(), button) {
                     use crate::play::game::Pointer;
                     let side = s.showing;
                     match t {
@@ -2103,7 +2103,7 @@ impl SelfTest {
                     .copied()
                     .filter(|w| has(ed, self.r4.mark, w))
                     .collect();
-                let hits_ok = ed.log[self.r4.mark.min(ed.log.len())..].iter().any(|l| {
+                let hits_ok = ed.game.log[self.r4.mark.min(ed.game.log.len())..].iter().any(|l| {
                     l.text.contains("explosion hits") && !l.text.contains("explosion hits 0")
                 });
                 if (found.len() == want.len() && t > 40) || t > 1200 {
@@ -2112,7 +2112,7 @@ impl SelfTest {
                         .copied()
                         .filter(|w| !found.contains(w))
                         .collect();
-                    let slots = ed.play.as_ref().map(|s| s.game.slots.len()).unwrap_or(0);
+                    let slots = ed.game.play.as_ref().map(|s| s.game.slots.len()).unwrap_or(0);
                     ed.stop_play();
                     self.steps.push(Step {
                         step: "game-api",
@@ -2181,11 +2181,11 @@ impl SelfTest {
                 let place = std::env::var_os("RUSTUDIO_PERF_PLACE")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
-                        [crate::mech::PERF_PLACE, crate::mech::PERF_PLACE_FALLBACK]
+                        [rustudio_core::mech::PERF_PLACE, rustudio_core::mech::PERF_PLACE_FALLBACK]
                             .iter()
                             .map(PathBuf::from)
                             .find(|p| p.exists())
-                            .unwrap_or_else(|| PathBuf::from(crate::mech::PERF_PLACE))
+                            .unwrap_or_else(|| PathBuf::from(rustudio_core::mech::PERF_PLACE))
                     });
                 if !place.exists() {
                     self.steps.push(Step {
@@ -2200,14 +2200,14 @@ impl SelfTest {
                     return false;
                 }
                 ed.open_path(place.clone());
-                ed.fixed_dt = None;
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.game.fixed_dt = None;
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.perf_place = Some(place);
-                self.r4.bench = Some(crate::bench::Bench::new(
+                self.r4.bench = Some(rustudio_core::bench::Bench::new(
                     None,
                     "perf",
                     true,
-                    crate::mech::SELFTEST_PERF_SECONDS,
+                    rustudio_core::mech::SELFTEST_PERF_SECONDS,
                 ));
                 self.r4.phase = 5;
             }
@@ -2225,18 +2225,18 @@ impl SelfTest {
                     let low = report["low1_fps"].as_f64().unwrap_or(0.0);
                     let avg_ms = report["avg_frame_ms"].as_f64().unwrap_or(0.0);
                     let low_ms = report["low1_frame_ms"].as_f64().unwrap_or(0.0);
-                    let parts = ed.scene.parts.len();
+                    let parts = ed.game.scene.parts.len();
                     ed.stop_play();
-                    ed.fixed_dt = Some(1.0 / 60.0);
+                    ed.game.fixed_dt = Some(1.0 / 60.0);
                     self.steps.push(Step {
                         step: "perf",
-                        passed: avg >= crate::mech::PERF_MIN_FPS as f64,
+                        passed: avg >= rustudio_core::mech::PERF_MIN_FPS as f64,
                         detail: format!(
                             "{}: {parts} parts, Play for {} s at the window size: average {avg_ms:.2} ms/frame ({avg:.0} fps), 1% low {low_ms:.2} ms ({low:.0} fps); target ≥ {} fps; machine load average {} on {} cores",
                             self.r4.perf_place.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-                            crate::mech::SELFTEST_PERF_SECONDS,
-                            crate::mech::PERF_MIN_FPS,
-                            crate::platform::load_average(),
+                            rustudio_core::mech::SELFTEST_PERF_SECONDS,
+                            rustudio_core::mech::PERF_MIN_FPS,
+                            rustudio_core::platform::load_average(),
                             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
                         ),
                     });
@@ -2298,17 +2298,17 @@ const FBX_ASSET_ID: u64 = 9_000_000_000_000_001;
 
 impl SelfTest {
     fn tick_r6(&mut self, f: u64, ed: &mut Editor) -> bool {
-        use crate::doc::new_part;
+        use rustudio_core::doc::new_part;
         use rbx_dom_weak::types::{Color3, ContentId, Enum, UDim, UDim2, Variant, Vector2};
         let has = |ed: &Editor, mark: usize, needle: &str| {
-            ed.log[mark.min(ed.log.len())..]
+            ed.game.log[mark.min(ed.game.log.len())..]
                 .iter()
                 .any(|l| l.text.contains(needle))
         };
         let t = f.saturating_sub(self.r6.started);
         // The client's GUI objects by path below PlayerGui.
         let gui_obj = |ed: &Editor, path: &[&str]| -> Option<Ref> {
-            let d = &ed.doc;
+            let d = &ed.game.doc;
             let players = d.find_child(d.dom.root_ref(), "Players")?;
             let lp = match d.prop(players, "LocalPlayer") {
                 Some(Variant::Ref(r)) => r,
@@ -2340,20 +2340,20 @@ impl SelfTest {
             // text, image, button, text box) and a SurfaceGui on a part.
             10 => {
                 // From here Play opens on the client's view, as in Studio.
-                ed.play_shows_client = true;
+                ed.game.play_shows_client = true;
                 ed.set_document(Document::new_place());
-                let root = ed.doc.dom.root_ref();
-                let ws = ed.doc.workspace().expect("workspace");
-                let sg = ed.doc.find_child(root, "StarterGui").expect("starter gui");
-                let sp = ed
+                let root = ed.game.doc.dom.root_ref();
+                let ws = ed.game.doc.workspace().expect("workspace");
+                let sg = ed.game.doc.find_child(root, "StarterGui").expect("starter gui");
+                let sp = ed.game
                     .doc
                     .find_child(root, "StarterPlayer")
                     .expect("starter player");
-                let sps = ed
+                let sps = ed.game
                     .doc
                     .find_child(sp, "StarterPlayerScripts")
                     .unwrap_or_else(|| {
-                        ed.doc.dom.insert(
+                        ed.game.doc.dom.insert(
                             sp,
                             InstanceBuilder::new("StarterPlayerScripts")
                                 .with_name("StarterPlayerScripts"),
@@ -2362,7 +2362,7 @@ impl SelfTest {
                 let u2 = |xs: f32, xo: i32, ys: f32, yo: i32| {
                     UDim2::new(UDim::new(xs, xo), UDim::new(ys, yo))
                 };
-                ed.doc.insert(
+                ed.game.doc.insert(
                     ws,
                     new_part(
                         "Board",
@@ -2372,7 +2372,7 @@ impl SelfTest {
                         [40, 40, 60],
                     ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sg,
                     InstanceBuilder::new("ScreenGui")
                         .with_name("Hud")
@@ -2434,7 +2434,7 @@ impl SelfTest {
                                 ),
                         ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sg,
                     InstanceBuilder::new("SurfaceGui")
                         .with_name("BoardGui")
@@ -2449,7 +2449,7 @@ impl SelfTest {
                                 .with_property("TextScaled", true),
                         ),
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sps,
                     InstanceBuilder::new("LocalScript")
                         .with_name("GuiTest")
@@ -2459,10 +2459,10 @@ impl SelfTest {
                 std::env::set_var("RUSTUDIO_GUI_DEBUG", "1");
                 self.r6 = R6Test {
                     started: f,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     ..Default::default()
                 };
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 11;
             }
             11 => match t {
@@ -2473,8 +2473,8 @@ impl SelfTest {
                         gui_obj(ed, &["Hud", "Panel", "Title"]),
                         gui_obj(ed, &["Hud", "Panel", "Go"]),
                     );
-                    let lay = |r: Option<Ref>| r.and_then(|r| ed.gui.layout.get(&r).copied());
-                    let inset = crate::mech::GUI_TOP_INSET;
+                    let lay = |r: Option<Ref>| r.and_then(|r| ed.game.gui.layout.get(&r).copied());
+                    let inset = rustudio_core::mech::GUI_TOP_INSET;
                     let want_go = [30.0, 80.0 - inset + 10.0 + 30.0 + 8.0];
                     match (lay(panel), lay(title), lay(go)) {
                         (Some(p), Some(ti), Some(g)) => {
@@ -2487,7 +2487,7 @@ impl SelfTest {
                             self.r6.ok = ok;
                             self.r6.notes.push(format!(
                                 "panel at ({:.0}, {:.0}) {:.0}×{:.0}; Go button at ({:.0}, {:.0}) {:.0}×{:.0} (expected ({}, {}) 120×40 from the padding and list layout); title TextScaled bounds {:?}; {} shapes drawn",
-                                p.pos[0], p.pos[1], p.size[0], p.size[1], g.pos[0], g.pos[1], g.size[0], g.size[1], want_go[0], want_go[1], ti.text.map(|t| [t[0].round(), t[1].round()]), ed.gui.drawn
+                                p.pos[0], p.pos[1], p.size[0], p.size[1], g.pos[0], g.pos[1], g.size[0], g.size[1], want_go[0], want_go[1], ti.text.map(|t| [t[0].round(), t[1].round()]), ed.game.gui.drawn
                             ));
                         }
                         other => {
@@ -2498,20 +2498,20 @@ impl SelfTest {
                             ));
                         }
                     }
-                    if let Some(p) = go.and_then(|g| ed.gui.screen_center(g)) {
+                    if let Some(p) = go.and_then(|g| ed.game.gui.screen_center(g)) {
                         click(&mut self.queue, p, true);
                     }
                 }
                 62 => {
                     if let Some(p) =
-                        gui_obj(ed, &["Hud", "Panel", "Go"]).and_then(|g| ed.gui.screen_center(g))
+                        gui_obj(ed, &["Hud", "Panel", "Go"]).and_then(|g| ed.game.gui.screen_center(g))
                     {
                         click(&mut self.queue, p, false);
                     }
                 }
                 70 | 72 => {
                     if let Some(p) = gui_obj(ed, &["Hud", "Panel", "NameBox"])
-                        .and_then(|g| ed.gui.screen_center(g))
+                        .and_then(|g| ed.game.gui.screen_center(g))
                     {
                         click(&mut self.queue, p, t == 70);
                     }
@@ -2523,7 +2523,7 @@ impl SelfTest {
                 }
                 80 | 82 => {
                     if let Some(p) =
-                        gui_obj(ed, &["BoardGui", "Press"]).and_then(|g| ed.gui.screen_center(g))
+                        gui_obj(ed, &["BoardGui", "Press"]).and_then(|g| ed.game.gui.screen_center(g))
                     {
                         click(&mut self.queue, p, t == 80);
                     } else if t == 80 {
@@ -2540,7 +2540,7 @@ impl SelfTest {
                         .filter(|w| !has(ed, self.r6.mark, w))
                         .collect();
                     if !missing.is_empty() {
-                        let lines: Vec<String> = ed.log[self.r6.mark.min(ed.log.len())..]
+                        let lines: Vec<String> = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                             .iter()
                             .filter(|l| {
                                 (l.text.contains("[gui]") && !l.text.contains("Input"))
@@ -2569,12 +2569,12 @@ impl SelfTest {
                 let _ = std::fs::create_dir_all(&dir);
                 let _ = std::fs::write(
                     dir.join(format!("{FBX_ASSET_ID}.fbx")),
-                    crate::fbx::sample([200.0, 100.0, 300.0], [500.0, 0.0, 0.0]),
+                    rustudio_core::fbx::sample([200.0, 100.0, 300.0], [500.0, 0.0, 0.0]),
                 );
                 std::env::set_var("RUSTUDIO_LOCAL_ASSETS", &dir);
                 ed.set_document(Document::new_place());
-                let root = ed.doc.dom.root_ref();
-                let sss = ed.doc.find_child(root, "ServerScriptService").expect("sss");
+                let root = ed.game.doc.dom.root_ref();
+                let sss = ed.game.doc.find_child(root, "ServerScriptService").expect("sss");
                 let src = format!(
                     r#"local m = game:GetService("InsertService"):LoadAsset({FBX_ASSET_ID})
 m.Parent = workspace
@@ -2585,7 +2585,7 @@ for _, d in m:GetDescendants() do
 	end
 end"#
                 );
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sss,
                     InstanceBuilder::new("Script")
                         .with_name("LoadPack")
@@ -2593,16 +2593,16 @@ end"#
                 );
                 self.r6 = R6Test {
                     started: f,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     assets_dir: Some(dir),
                     ..Default::default()
                 };
-                ed.start_play(crate::runtime::RunMode::Run);
+                ed.start_play(rustudio_engine::runtime::RunMode::Run);
                 self.r4.phase = 21;
             }
             21 if t >= 30 => {
-                let [meshes, ..] = ed.draw_stats;
-                let line = ed.log[self.r6.mark.min(ed.log.len())..]
+                let [meshes, ..] = ed.game.draw_stats;
+                let line = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                     .iter()
                     .find(|l| l.text.contains("fbx part"))
                     .map(|l| l.text.clone());
@@ -2626,30 +2626,30 @@ end"#
             // Lobby camera: no character, the render-step bindings in priority order.
             30 => {
                 ed.set_document(Document::new_place());
-                let root = ed.doc.dom.root_ref();
-                if let Some(players) = ed.doc.find_child(root, "Players") {
-                    if let Some(i) = ed.doc.dom.get_by_ref_mut(players) {
+                let root = ed.game.doc.dom.root_ref();
+                if let Some(players) = ed.game.doc.find_child(root, "Players") {
+                    if let Some(i) = ed.game.doc.dom.get_by_ref_mut(players) {
                         i.properties.insert(
                             rbx_dom_weak::ustr("CharacterAutoLoads"),
                             Variant::Bool(false),
                         );
                     }
                 }
-                let sp = ed
+                let sp = ed.game
                     .doc
                     .find_child(root, "StarterPlayer")
                     .expect("starter player");
-                let sps = ed
+                let sps = ed.game
                     .doc
                     .find_child(sp, "StarterPlayerScripts")
                     .unwrap_or_else(|| {
-                        ed.doc.dom.insert(
+                        ed.game.doc.dom.insert(
                             sp,
                             InstanceBuilder::new("StarterPlayerScripts")
                                 .with_name("StarterPlayerScripts"),
                         )
                     });
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sps,
                     InstanceBuilder::new("LocalScript")
                         .with_name("LobbyCamera")
@@ -2657,27 +2657,27 @@ end"#
                 );
                 self.r6 = R6Test {
                     started: f,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     ..Default::default()
                 };
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 31;
             }
             31 if t >= 40 => {
-                let character = ed.play.as_ref().is_some_and(|s| s.character.is_some());
-                let pos = ed.cam.pos;
-                let look = ed.cam.forward();
+                let character = ed.game.play.as_ref().is_some_and(|s| s.character.is_some());
+                let pos = ed.game.cam.pos;
+                let look = ed.game.cam.forward();
                 let want_look = (Vec3::ZERO - Vec3::new(0.0, 10.0, 50.0)).normalize();
-                let fov = ed.cam.fov_deg;
+                let fov = ed.game.cam.fov_deg;
                 let ok = !character
                     && (pos - Vec3::new(0.0, 10.0, 50.0)).length() < 0.01
                     && look.dot(want_look) > 0.999
                     && (fov - 50.0).abs() < 0.01;
-                let errors = ed.log[self.r6.mark.min(ed.log.len())..]
+                let errors = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                     .iter()
                     .filter(|l| l.level == crate::app::Level::Error)
                     .count();
-                let first_error = ed.log[self.r6.mark.min(ed.log.len())..]
+                let first_error = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
                     .iter()
                     .find(|l| l.level == crate::app::Level::Error)
                     .map(|l| l.text.clone())

@@ -17,7 +17,7 @@ use glam::Vec3;
 use rbx_dom_weak::types::{CFrame, Color3, Enum, Vector3};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 fn control() -> Document {
     let mut doc = Document::new_place();

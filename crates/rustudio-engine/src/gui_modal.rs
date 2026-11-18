@@ -4,18 +4,19 @@
 //! (Studio's API docs). UserInputService.MouseBehavior keeps the game's
 //! value; only the effective lock changes (viewport.rs update_game_mouse).
 //!
-//! As Studio does it:
-//! - the PlayerGui walks its children, keeps the layer collectors and asks
-//!   each.
-//! - a layer collector answers false when it isn't Enabled; otherwise true
-//!   if any Modal button registered with it is shown: with
-//!   FFlagOnlyVisibleFramesAllowModal (on by default) by the full test
-//!   below, else by the button's own visibility.
-//! - shown: the button and its ancestors are visible, its layer collector
-//!   exists and is Enabled, its absolute rect has an area, every GuiObject
-//!   ancestor up to the collector with ClipsDescendants clips it and leaves
-//!   some area, the collector's own clip too, and what's left lies on the
-//!   screen.
+//! Studio (Studio, 2026-11-09 build):
+//! - Studio: the PlayerGui walks its children (16-byte shared pointers
+//!   at..), keeps the layer collectors and asks each.
+//! - Studio: a layer collector answers false when it isn't Enabled
+//!   (); otherwise true if any Modal button registered with it
+//!   (..) is shown: with FFlagOnlyVisibleFramesAllowModal
+//!   (Studio, on by default) by Studio(button, 0, 0, 1, 1), else
+//!   by the button's own visibility.
+//! - Studio: the button and its ancestors are visible,
+//!   its layer collector exists and is Enabled, its absolute rect has an
+//!   area, every GuiObject ancestor up to the collector with
+//!   ClipsDescendants (vtable) clips it and leaves some area, the
+//!   collector's own clip () too, and what's left lies on the screen.
 //!
 //! Here the GUI walk's layout (gui.rs `layout`, AbsolutePosition space) gives
 //! the rects; an object the walk didn't lay out isn't drawn, so isn't shown.
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::gui::GuiBox;
 
 fn flag(d: &Document, r: Ref, name: &str, default: bool) -> bool {

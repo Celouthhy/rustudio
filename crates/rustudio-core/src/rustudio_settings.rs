@@ -27,6 +27,34 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+/// Which solver steps the bodies (`RUSTUDIO_SOLVER`, read once per process).
+/// Unset or empty = `studio` (the default since the solver landed on master);
+/// `rapier` = the old physics, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverKind {
+    /// `rapier`: rapier's PhysicsPipeline (collision + solver + integration), the
+    /// physics before the port; no longer the default.
+    Rapier,
+    /// `studio` (default; also unset / empty): Studio's legacy solver (dual LDL + PGS, "Solve Batch"), what Studio
+    /// 0.747 runs with workspace.NextGenerationPhysicsSolver = Default. Hooks: DUAL,
+    /// DUALROWS, JOINT, STEP.
+    Studio,
+    /// `studio-nextgen`: the primal ("next generation") solver Roblox is rolling
+    /// out (NextGenerationPhysicsSolver = Enabled). Hooks: ITER, LINSYS, CONTACT,
+    /// JOINT, STEP.
+    StudioNextGen,
+}
+
+impl SolverKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SolverKind::Rapier => "rapier",
+            SolverKind::Studio => "studio",
+            SolverKind::StudioNextGen => "studio-nextgen",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OptKind {
     Bool,
@@ -208,19 +236,18 @@ fn env(name: &str) -> Option<String> {
 
 /// The solver: `RUSTUDIO_SOLVER` (as before: unset/empty/studio, rapier,
 /// studio-nextgen; anything else studio with a note), then saved, then studio.
-pub fn resolve_solver(env: Option<&str>, saved: Option<&Value>) -> crate::solver::SolverKind {
-    use crate::solver::SolverKind as K;
+pub fn resolve_solver(env: Option<&str>, saved: Option<&Value>) -> SolverKind {
     match env {
-        Some("studio") | Some("") => K::Studio,
-        Some("studio-nextgen") => K::StudioNextGen,
-        Some("rapier") => K::Rapier,
+        Some("studio") | Some("") => SolverKind::Studio,
+        Some("studio-nextgen") => SolverKind::StudioNextGen,
+        Some("rapier") => SolverKind::Rapier,
         Some(other) => {
             eprintln!("RUSTUDIO_SOLVER={other:?}: unknown (studio|rapier|studio-nextgen), using studio");
-            K::Studio
+            SolverKind::Studio
         }
         None => match saved.and_then(Value::as_str) {
-            Some("rapier") => K::Rapier,
-            _ => K::Studio,
+            Some("rapier") => SolverKind::Rapier,
+            _ => SolverKind::Studio,
         },
     }
 }
@@ -253,7 +280,7 @@ pub fn resolve_local_assets(env: Option<&str>, saved: Option<&Value>) -> Option<
     (!p.is_empty()).then(|| PathBuf::from(p))
 }
 
-pub fn solver_now() -> crate::solver::SolverKind {
+pub fn solver_now() -> SolverKind {
     resolve_solver(env("RUSTUDIO_SOLVER").as_deref(), saved("solver").as_ref())
 }
 
@@ -319,26 +346,24 @@ fn latched<T: Copy>(cell: &AtomicU8, now: impl Fn() -> T, enc: impl Fn(T) -> u8,
     }
 }
 
-fn enc_solver(k: crate::solver::SolverKind) -> u8 {
-    use crate::solver::SolverKind as K;
+fn enc_solver(k: SolverKind) -> u8 {
     match k {
-        K::Studio => 0,
-        K::Rapier => 1,
-        K::StudioNextGen => 2,
+        SolverKind::Studio => 0,
+        SolverKind::Rapier => 1,
+        SolverKind::StudioNextGen => 2,
     }
 }
 
-fn dec_solver(n: u8) -> crate::solver::SolverKind {
-    use crate::solver::SolverKind as K;
+fn dec_solver(n: u8) -> SolverKind {
     match n {
-        1 => K::Rapier,
-        2 => K::StudioNextGen,
-        _ => K::Studio,
+        1 => SolverKind::Rapier,
+        2 => SolverKind::StudioNextGen,
+        _ => SolverKind::Studio,
     }
 }
 
 /// The solver of this Play session (crate::solver::kind()).
-pub fn solver() -> crate::solver::SolverKind {
+pub fn solver() -> SolverKind {
     latched(&SOLVER, solver_now, enc_solver, dec_solver)
 }
 
@@ -355,9 +380,27 @@ pub fn client_link() -> bool {
     latched(&CLIENT_LINK, client_link_now, u8::from, |n| n != 0)
 }
 
+/// Studio Settings values read from below the studio crate: `physics` (solver
+/// AllowSleep) and `play` (Clear Output On Start) ask here instead of
+/// importing src/studio_settings.rs. The studio crate installs the reader at
+/// start-up (`studio_settings::init`); with none installed, `or` stands.
+static STUDIO_FLAG: std::sync::OnceLock<fn(&str, &str) -> Option<bool>> = std::sync::OnceLock::new();
+
+pub fn studio_flag(class: &str, prop: &str, or: bool) -> bool {
+    match STUDIO_FLAG.get().and_then(|read| read(class, prop)) {
+        Some(b) => b,
+        None => or,
+    }
+}
+
+/// Installs `studio_flag`'s reader, once (studio_settings::init).
+pub fn install_studio_flag(read: fn(&str, &str) -> Option<bool>) {
+    let _ = STUDIO_FLAG.set(read);
+}
+
 /// Play start, before the physics is built: re-reads the options the
 /// physics keeps for a whole session. Returns the solver.
-pub fn latch_for_play() -> crate::solver::SolverKind {
+pub fn latch_for_play() -> SolverKind {
     let k = solver_now();
     SOLVER.store(enc_solver(k) + 1, Ordering::Relaxed);
     SPIN_GUARD.store(u8::from(spin_guard_now()) + 1, Ordering::Relaxed);
@@ -388,7 +431,7 @@ pub enum Shown {
 
 pub fn shown(o: &Opt) -> Shown {
     match o.key {
-        "solver" => Shown::Choice(if solver_now() == crate::solver::SolverKind::Rapier { 1 } else { 0 }),
+        "solver" => Shown::Choice(if solver_now() == SolverKind::Rapier { 1 } else { 0 }),
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),
         "live_data" => Shown::Bool(live_data_now()),
@@ -401,7 +444,7 @@ pub fn shown(o: &Opt) -> Shown {
 
 /// Greyed because another option makes it meaningless (spin guard under Legacy).
 pub fn inactive(o: &Opt) -> Option<&'static str> {
-    (o.key == "spin_guard" && solver_now() == crate::solver::SolverKind::Rapier).then_some("Legacy solver")
+    (o.key == "spin_guard" && solver_now() == SolverKind::Rapier).then_some("Legacy solver")
 }
 
 /// The default of an on/off option (only Use live DataStores starts off).
@@ -426,19 +469,18 @@ pub fn set_path(key: &str, v: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::SolverKind as K;
     use serde_json::json;
 
     #[test]
     fn env_beats_saved_beats_default() {
         // Solver.
-        assert_eq!(resolve_solver(None, None), K::Studio);
-        assert_eq!(resolve_solver(None, Some(&json!("rapier"))), K::Rapier);
-        assert_eq!(resolve_solver(None, Some(&json!("studio-nextgen"))), K::Studio, "not offered in the UI");
-        assert_eq!(resolve_solver(Some("studio"), Some(&json!("rapier"))), K::Studio);
-        assert_eq!(resolve_solver(Some(""), Some(&json!("rapier"))), K::Studio);
-        assert_eq!(resolve_solver(Some("rapier"), None), K::Rapier);
-        assert_eq!(resolve_solver(Some("studio-nextgen"), Some(&json!("rapier"))), K::StudioNextGen);
+        assert_eq!(resolve_solver(None, None), SolverKind::Studio);
+        assert_eq!(resolve_solver(None, Some(&json!("rapier"))), SolverKind::Rapier);
+        assert_eq!(resolve_solver(None, Some(&json!("studio-nextgen"))), SolverKind::Studio, "not offered in the UI");
+        assert_eq!(resolve_solver(Some("studio"), Some(&json!("rapier"))), SolverKind::Studio);
+        assert_eq!(resolve_solver(Some(""), Some(&json!("rapier"))), SolverKind::Studio);
+        assert_eq!(resolve_solver(Some("rapier"), None), SolverKind::Rapier);
+        assert_eq!(resolve_solver(Some("studio-nextgen"), Some(&json!("rapier"))), SolverKind::StudioNextGen);
         // Spin guard.
         assert!(resolve_spin_guard(None, None));
         assert!(!resolve_spin_guard(None, Some(&json!(false))));

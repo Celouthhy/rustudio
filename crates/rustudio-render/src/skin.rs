@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 use glam::{Mat3, Vec2, Vec3, Vec4};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
-use crate::math::Xform;
+use rustudio_core::doc::Document;
+use rustudio_core::math::Xform;
 
 /// A skinned mesh in the renderer's normalized space (unit box), with what
 /// is needed to deform it.
@@ -33,12 +33,12 @@ pub struct Base {
     pub colors: Vec<Vec4>,
     pub extent: Vec3,
     pub center: Vec3,
-    pub skin: crate::mesh::Skin,
+    pub skin: rustudio_core::mesh::Skin,
     /// Unique vertices: the first corner of each, and each corner's vertex.
     pub firsts: Vec<u32>,
     pub corner_unique: Vec<u32>,
     /// The mesh's FACS rig (dynamic heads), posed by a FaceControls child.
-    pub facs: Option<crate::runtime::domains::avatar::face::Facs>,
+    pub facs: Option<rustudio_core::mesh::Facs>,
     /// Every corner's weights sum to 255/255 (else even the rest pose
     /// moves: Studio pulls the missing weight toward the world origin).
     pub whole: bool,
@@ -50,13 +50,13 @@ static BASES: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
 
 /// The skinned base of a mesh, parsed once from its bytes.
 pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
-    if !crate::assets::place_content_ok(id) {
+    if !rustudio_core::assets::place_content_ok(id) {
         return None;
     }
     if let Some(b) = BASES.lock().ok()?.get(id) {
         return b.clone();
     }
-    let b = crate::mesh::parse(bytes).ok().and_then(|m| {
+    let b = rustudio_core::mesh::parse(bytes).ok().and_then(|m| {
         let skin = m.skin.clone()?;
         if skin.corner_bones.len() != m.positions.len() || skin.bones.is_empty() {
             return None;
@@ -77,7 +77,7 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
             extent,
             center,
             skin,
-            facs: crate::runtime::domains::avatar::face::parse_mesh_facs(bytes),
+            facs: rustudio_core::mesh::parse_mesh_facs(bytes),
         }))
     });
     if let Ok(mut g) = BASES.lock() {
@@ -163,14 +163,14 @@ fn uniques(corner_vertex: &[u32], corners: usize) -> (Vec<u32>, Vec<u32>) {
 pub fn bone_hosts(doc: &Document, part: Ref) -> Vec<Ref> {
     let mut hosts = vec![part];
     let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
-        doc.class_of(*m).is_some_and(|c| crate::doc::is_a(&c, "Model"))
+        doc.class_of(*m).is_some_and(|c| rustudio_core::doc::is_a(&c, "Model"))
     }) else {
         return hosts;
     };
     let mut edges = Vec::new();
     for i in doc.dom.descendants_of(model) {
-        if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(doc, i.referent()) {
-            if let Some(e) = crate::physics::joint_parts(doc, i.referent()) {
+        if rustudio_core::body::is_rigid_joint(&i.class) && rustudio_core::body::joint_enabled(doc, i.referent()) {
+            if let Some(e) = rustudio_core::body::joint_parts(doc, i.referent()) {
                 edges.push(e);
             }
         }
@@ -226,7 +226,7 @@ pub fn has_bones(doc: &Document, part: Ref) -> bool {
     // A Bone under another part of its assembly (`bone_hosts`): the joints
     // under its model, grouped once per model.
     let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
-        doc.class_of(*m).is_some_and(|c| crate::doc::is_a(&c, "Model"))
+        doc.class_of(*m).is_some_and(|c| rustudio_core::doc::is_a(&c, "Model"))
     }) else {
         return false;
     };
@@ -269,8 +269,8 @@ impl ModelRig {
             i
         }
         for i in doc.dom.descendants_of(model) {
-            if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(doc, i.referent()) {
-                if let Some((a, b)) = crate::physics::joint_parts(doc, i.referent()) {
+            if rustudio_core::body::is_rigid_joint(&i.class) && rustudio_core::body::joint_enabled(doc, i.referent()) {
+                if let Some((a, b)) = rustudio_core::body::joint_parts(doc, i.referent()) {
                     let mut at = |r: Ref| {
                         *slot.entry(r).or_insert_with(|| {
                             parent.push(parent.len() as u32);
@@ -347,7 +347,7 @@ pub fn rig_changed() {
 
 /// Whether instances of this class change which Bones skin a part.
 pub fn rig_class(class: &str) -> bool {
-    matches!(class, "Bone" | "FaceControls") || crate::physics::is_rigid_joint(class)
+    matches!(class, "Bone" | "FaceControls") || rustudio_core::body::is_rigid_joint(class)
 }
 
 /// A part's mesh bones resolved to Bone instances (by mesh bone index),
@@ -375,7 +375,7 @@ pub fn lookup(doc: &Document, part: Ref, base: &Base) -> Arc<Lookup> {
             return l;
         }
     }
-    let _s = crate::bench::scope("skin_lookup");
+    let _s = rustudio_core::bench::scope("skin_lookup");
     let mut by_name: HashMap<&str, Ref> = HashMap::new();
     fn own<'d>(doc: &'d Document, h: Ref, by_name: &mut HashMap<&'d str, Ref>) {
         for i in doc.dom.descendants_of(h) {
@@ -400,10 +400,10 @@ pub fn lookup(doc: &Document, part: Ref, base: &Base) -> Arc<Lookup> {
         // The Bone and the Bones / Attachments above it (its frame's chain).
         let mut cur = *b;
         while let Some(i) = doc.dom.get_by_ref(cur) {
-            if crate::doc::is_a(&i.class, "BasePart") || !seen.insert(cur) {
+            if rustudio_core::doc::is_a(&i.class, "BasePart") || !seen.insert(cur) {
                 break;
             }
-            if i.class == "Bone" || crate::doc::is_a(&i.class, "Attachment") {
+            if i.class == "Bone" || rustudio_core::doc::is_a(&i.class, "Attachment") {
                 deps.push(cur);
             }
             cur = i.parent();
@@ -443,7 +443,7 @@ fn facs_offsets(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> HashMap<
         Some(Variant::Float64(v)) => v as f32,
         _ => 0.0,
     };
-    for (name, p, r) in crate::runtime::domains::avatar::face::pose(f, &value) {
+    for (name, p, r) in rustudio_core::mesh::pose(f, &value) {
         if p == [0.0; 3] && r == [0.0; 3] {
             continue;
         }
@@ -515,10 +515,10 @@ impl Frames<'_> {
         let mut up = i.parent();
         let parent = loop {
             let Some(p) = doc.dom.get_by_ref(up) else { break id };
-            if crate::doc::is_a(&p.class, "Attachment") {
+            if rustudio_core::doc::is_a(&p.class, "Attachment") {
                 break self.world(up);
             }
-            if crate::doc::is_a(&p.class, "BasePart") {
+            if rustudio_core::doc::is_a(&p.class, "BasePart") {
                 break if p.class == "Terrain" { id } else { cf(doc, up, "CFrame") };
             }
             up = p.parent();
@@ -709,7 +709,7 @@ pub fn cpu_skinning() -> bool {
 /// mesh bone, part space) and the part's scale, or None at rest.
 pub fn pose(doc: &Document, part: Ref, base: &Base) -> Option<(Vec<Xform>, Vec3, Vec3)> {
     let scale = scale_of(doc, part, base);
-    let _sc = crate::bench::scope("skin_matrices");
+    let _sc = rustudio_core::bench::scope("skin_matrices");
     let mats = matrices(doc, part, base, scale)?;
     Some((mats, scale, origin_of(doc, part)))
 }
@@ -756,7 +756,7 @@ pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
         colors: Vec::new(),
         extent: base.extent,
         center: base.center,
-        skin: crate::mesh::Skin {
+        skin: rustudio_core::mesh::Skin {
             bones: base.skin.bones.clone(),
             corner_bones: Vec::new(),
             corner_weights: Vec::new(),
@@ -778,7 +778,7 @@ pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
             base.extent.x * base.extent.z,
             base.extent.x * base.extent.y,
         );
-        if crate::viewport::decal_face_of(geo) != Some(face) {
+        if crate::scene::decal_face_of(geo) != Some(face) {
             continue;
         }
         let n_norm = ((p[1] - p[0]).cross(p[2] - p[0])).normalize_or_zero();
@@ -790,7 +790,7 @@ pub fn decal_base(base: &Base, key: &str, face: u32) -> Option<Arc<Base>> {
             // bounds: Studio's rows on the minifig, bounds centre y 2.95,
             // sit 2.95 studs off a centred projection; past the image's
             // edge it clamps)
-            out.uvs.push(crate::viewport::decal_face_uv(face, *v + base.center / base.extent));
+            out.uvs.push(crate::scene::decal_face_uv(face, *v + base.center / base.extent));
             out.skin.corner_bones.push(base.skin.corner_bones[c]);
             out.skin.corner_weights.push(base.skin.corner_weights[c]);
             if with_ids {
@@ -820,14 +820,14 @@ pub fn skinned_mesh(
     upload: &mut dyn FnMut(Option<u32>, &[Vec3], &[Vec3], &[Vec2], &[Vec4]) -> u32,
 ) -> Option<u32> {
     let (mats, scale, origin) = pose(doc, part, base)?;
-    let sc = crate::bench::scope("skin_deform");
+    let sc = rustudio_core::bench::scope("skin_deform");
     let (p, n) = deform(base, &mats, scale, origin);
     drop(sc);
     let have = slot_of(part, p.len());
-    let _sc = crate::bench::scope("skin_upload");
+    let _sc = rustudio_core::bench::scope("skin_upload");
     let idx = upload(have, &p, &n, &base.uvs, &base.colors);
     // Bench: vertex bytes sent (a full Vertex per corner).
-    crate::bench::add("skin_upload_bytes", 0.0, p.len() as u64 * 64);
+    rustudio_core::bench::add("skin_upload_bytes", 0.0, p.len() as u64 * 64);
     set_slot(part, idx, p.len());
     Some(idx)
 }
@@ -835,7 +835,7 @@ pub fn skinned_mesh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::{Skin, SkinBone};
+    use rustudio_core::mesh::{Skin, SkinBone};
 
     fn base() -> Base {
         // Two corners: one fully on bone 0, one fully on bone 1 (child).
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn bone_instances_drive_the_mesh() {
         use rbx_dom_weak::InstanceBuilder;
-        let mut doc = crate::doc::Document::new_place();
+        let mut doc = rustudio_core::doc::Document::new_place();
         let ws = doc.workspace().unwrap();
         let part = doc.dom.insert(ws, InstanceBuilder::new("MeshPart").with_name("Head")
             .with_property("Size", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0))
@@ -918,14 +918,14 @@ mod cache_probe {
     fn probe_mesh_file() {
         let Ok(p) = std::env::var("SKIN_PROBE") else { return };
         let b = std::fs::read(p).unwrap();
-        let m = crate::mesh::parse(&b).unwrap();
+        let m = rustudio_core::mesh::parse(&b).unwrap();
         println!("corners {} skin {:?}", m.positions.len(), m.skin.as_ref().map(|s| (s.bones.len(), s.corner_bones.len())));
         if let Some(s) = &m.skin {
             for bn in s.bones.iter().take(8) {
                 println!("bone {} parent {:?} pos {:?}", bn.name, bn.parent, bn.pos);
             }
         }
-        let f = crate::runtime::domains::avatar::face::parse_mesh_facs(&b);
+        let f = rustudio_core::mesh::parse_mesh_facs(&b);
         println!("facs {:?}", f.as_ref().map(|f| (f.bones.len(), f.controls.len(), f.cols, f.two.len(), f.three.len())));
         if let Some(f) = f {
             println!("controls {:?}", &f.controls);

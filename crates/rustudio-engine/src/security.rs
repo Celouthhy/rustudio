@@ -185,7 +185,7 @@ fn leak(s: &str) -> &'static str {
 fn dump_path() -> std::path::PathBuf {
     std::env::var_os("RUSTUDIO_API_DUMP")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::paths::resource("api-dump.json"))
+        .unwrap_or_else(|| rustudio_core::paths::resource("api-dump.json"))
 }
 
 fn parse(text: &str) -> Option<Rules> {
@@ -613,7 +613,7 @@ pub fn install_globals(lua: &Lua) -> mlua::Result<()> {
     // printidentity's second line in a plugin thread (src/plugin_host).
     g.set(
         "__rs_plugin_asset",
-        lua.create_function(|lua, ()| Ok(crate::plugin_host::vm::running_asset_id(lua)))?,
+        lua.create_function(|lua, ()| Ok(super::domains::running_asset_id(lua)))?,
     )?;
     Ok(())
 }
@@ -638,7 +638,7 @@ pub fn seal(lua: &Lua) -> mlua::Result<()> {
     // DataModel; src/plugin_host/api_studio_service.rs).
     let plugin_manager = lua.create_function(move |lua, ()| {
         let r = check_global(lua, "PluginManager").and_then(|_| {
-            crate::runtime::domains::plugin::studio_service::plugin_manager(lua).map(|v| MultiValue::from_iter([v]))
+            super::domains::plugin_manager(lua).map(|v| MultiValue::from_iter([v]))
         });
         checked(lua, r)
     })?;
@@ -816,7 +816,12 @@ mod tests {
         for want in [
             "Current identity is 1",
             "settings true",
-            "pm PluginManagerInterface", // Studio 0.747 (checks/plugins/ref/captures/load-run1.txt)
+            // Engine-only tests run without studio's plugin domain registered,
+            // so the hook's default answers: PluginManager() is nil. With
+            // studio (which registers src/plugin_host/api.rs at start-up) it is
+            // a PluginManagerInterface (Studio 0.747, load-run1.txt); the
+            // plugin checks cover that side.
+            "pm nil",
             "datacost true",
             "src false The current thread cannot read 'SourceAssetId' (lacking capability RobloxScript)",
             "spawned 1",

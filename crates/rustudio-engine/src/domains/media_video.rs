@@ -64,7 +64,7 @@ fn vpx() -> Option<&'static Vpx> {
     static LIB: OnceLock<Option<Vpx>> = OnceLock::new();
     LIB.get_or_init(|| unsafe {
         let mut h = std::ptr::null_mut();
-        for name in crate::platform::shared_library_names("vpx", &["12", "11", "9"]) {
+        for name in rustudio_core::platform::shared_library_names("vpx", &["12", "11", "9"]) {
             h = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
             if !h.is_null() {
                 break;
@@ -296,7 +296,7 @@ fn opus() -> Option<&'static Opus> {
     static LIB: OnceLock<Option<Opus>> = OnceLock::new();
     LIB.get_or_init(|| unsafe {
         let mut h = std::ptr::null_mut();
-        for name in crate::platform::shared_library_names("opus", &["0"]) {
+        for name in rustudio_core::platform::shared_library_names("opus", &["0"]) {
             h = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
             if !h.is_null() {
                 break;
@@ -629,6 +629,6 @@ mod tests {
     }
 
     fn dirs_assets() -> Option<std::path::PathBuf> {
-        Some(crate::paths::data().join("rustudio/assets"))
+        Some(rustudio_core::paths::data().join("rustudio/assets"))
     }
 }

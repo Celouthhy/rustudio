@@ -66,7 +66,7 @@ pub fn stored(class: &str, key: &str) -> Option<Kind> {
         _ => return None,
     };
     // Only names the API dump has (so a typo'd key stays "not a valid member").
-    crate::api::get()
+    rustudio_core::api::get()
         .and_then(|a| a.lookup(class, key))
         .map(|_| k)
 }
@@ -160,18 +160,18 @@ fn parent_part(lua: &Lua, r: Ref) -> mlua::Result<Option<Ref>> {
         return Ok(None);
     };
     Ok(d.class_of(p)
-        .filter(|c| crate::doc::is_a(c, "BasePart"))
+        .filter(|c| rustudio_core::doc::is_a(c, "BasePart"))
         .map(|_| p))
 }
 
-fn cframe_prop(lua: &Lua, r: Ref, name: &str) -> mlua::Result<crate::math::Xform> {
+fn cframe_prop(lua: &Lua, r: Ref, name: &str) -> mlua::Result<rustudio_core::math::Xform> {
     Ok(match world(lua)?.d().prop(r, name) {
-        Some(Variant::CFrame(cf)) => crate::math::Xform::from_cframe(&cf),
-        _ => crate::math::Xform { pos: glam::Vec3::ZERO, rot: glam::Mat3::IDENTITY },
+        Some(Variant::CFrame(cf)) => rustudio_core::math::Xform::from_cframe(&cf),
+        _ => rustudio_core::math::Xform { pos: glam::Vec3::ZERO, rot: glam::Mat3::IDENTITY },
     })
 }
 
-fn cf_value(lua: &Lua, xf: crate::math::Xform) -> mlua::Result<Value> {
+fn cf_value(lua: &Lua, xf: rustudio_core::math::Xform) -> mlua::Result<Value> {
     Ok(Value::UserData(lua.create_userdata(crate::ltypes::LCFrame(xf))?))
 }
 
@@ -184,7 +184,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         let v = world(lua)?.d().prop(r, key).unwrap_or_else(|| default_variant(k));
         return Ok(Some(variant_to_lua(lua, &v, enum_name(k))?));
     }
-    if crate::doc::is_a(class, "BaseWrap") {
+    if rustudio_core::doc::is_a(class, "BaseWrap") {
         let local = match key {
             "CageOriginWorld" => "CageOrigin",
             "ImportOriginWorld" => "ImportOrigin",
@@ -198,7 +198,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         };
         return Ok(Some(cf_value(lua, xf)?));
     }
-    if crate::doc::is_a(class, "Accoutrement") {
+    if rustudio_core::doc::is_a(class, "Accoutrement") {
         let ap = cframe_prop(lua, r, "AttachmentPoint")?;
         let v = match key {
             "AttachmentPos" => ap.pos,
@@ -222,12 +222,12 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         store(lua, r, key, v)?;
         return Ok(true);
     }
-    if crate::doc::is_a(class, "BaseWrap")
+    if rustudio_core::doc::is_a(class, "BaseWrap")
         && matches!(key, "CageOriginWorld" | "ImportOriginWorld" | "ReferenceOriginWorld")
     {
         return Err(rt_err(format!("Unable to assign property {key}. Property is read only")));
     }
-    if crate::doc::is_a(class, "Accoutrement")
+    if rustudio_core::doc::is_a(class, "Accoutrement")
         && matches!(key, "AttachmentPos" | "AttachmentRight" | "AttachmentUp" | "AttachmentForward")
     {
         let Some(v) = opt_ud::<crate::ltypes::LVector3>(value).map(|v| v.0) else {
@@ -267,6 +267,6 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
 
 pub fn write_acts(class: &str, key: &str) -> bool {
     stored(class, key).is_some()
-        || (crate::doc::is_a(class, "Accoutrement")
+        || (rustudio_core::doc::is_a(class, "Accoutrement")
             && matches!(key, "AttachmentPos" | "AttachmentRight" | "AttachmentUp" | "AttachmentForward"))
 }

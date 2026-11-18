@@ -12,9 +12,9 @@ use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use rbx_dom_weak::types::Ref;
 
 use crate::app::Editor;
-use crate::doc::{DocKind, Document};
+use rustudio_core::doc::{DocKind, Document};
 use crate::icons;
-use crate::theme;
+use rustudio_engine::theme;
 
 const ROW_H: f32 = 20.0;
 const INDENT: f32 = 14.0;
@@ -198,13 +198,13 @@ impl Editor {
             self.explorer.focused = panel.contains(p);
         }
         // During Play: which DataModel to inspect.
-        if let Some(showing) = self
+        if let Some(showing) = self.game
             .play
             .as_ref()
-            .filter(|p| p.mode == crate::runtime::RunMode::Play)
+            .filter(|p| p.mode == rustudio_engine::runtime::RunMode::Play)
             .map(|p| p.showing)
         {
-            use crate::runtime::Side;
+            use rustudio_engine::runtime::Side;
             let mut pick = showing;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("View").small().color(theme::TEXT_DIM));
@@ -237,7 +237,7 @@ impl Editor {
                 let x = ui.interact(x_rect, egui::Id::new("explorer_search_clear"), Sense::click());
                 let x = x.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Clear search");
                 let col = if x.hovered() { Color32::WHITE } else { theme::TEXT_DIM };
-                crate::ti::paint(ui.painter(), x_rect, "x", col);
+                rustudio_engine::ti::paint(ui.painter(), x_rect, "x", col);
                 self.ui_rects.insert("explorer.search_clear", x_rect);
                 if x.clicked() {
                     self.explorer.filter.clear();
@@ -246,9 +246,9 @@ impl Editor {
         });
         // Clearing the search keeps what was picked in it in view.
         if self.explorer.filter.trim().is_empty() && !self.explorer.last_filter.trim().is_empty() {
-            let sel = self.doc.selection.clone();
+            let sel = self.game.doc.selection.clone();
             for &s in &sel {
-                self.explorer.expand_ancestors(&self.doc, s);
+                self.explorer.expand_ancestors(&self.game.doc, s);
             }
             if let Some(&last) = sel.last() {
                 self.explorer.scroll_to = Some(last);
@@ -259,15 +259,15 @@ impl Editor {
         }
         ui.add_space(2.0);
         let key = (
-            self.doc.id,
-            self.doc.tree_revision,
+            self.game.doc.id,
+            self.game.doc.tree_revision,
             expanded_key(&self.explorer),
             self.explorer.filter.clone(),
         );
         let rows = match &self.explorer.rows_cache {
             Some((k, rows)) if *k == key => rows.clone(),
             _ => {
-                let (rows, forced) = flatten(&self.doc, &self.explorer);
+                let (rows, forced) = flatten(&self.game.doc, &self.explorer);
                 let rows = std::rc::Rc::new(rows);
                 self.explorer.forced_open = forced;
                 self.explorer.rows_cache = Some((key, rows.clone()));
@@ -323,7 +323,7 @@ impl Editor {
             if rest.height() > 4.0 {
                 let resp = ui.allocate_rect(rest, Sense::click());
                 if let Some(p) = resp.dnd_release_payload::<DragRefs>() {
-                    actions.push(RowAction::Reparent(p.0.clone(), self.doc.default_parent()));
+                    actions.push(RowAction::Reparent(p.0.clone(), self.game.doc.default_parent()));
                 }
                 if resp.clicked() {
                     actions.push(RowAction::ClearSelection);
@@ -365,7 +365,7 @@ impl Editor {
         if !(up || down || left || right) {
             return;
         }
-        let cur = self.doc.selection.last().copied();
+        let cur = self.game.doc.selection.last().copied();
         let idx = cur.and_then(|c| rows.iter().position(|(r, _)| *r == c));
         if up || down {
             let next = match idx {
@@ -383,10 +383,10 @@ impl Editor {
                         // (the moving end last: it is the one the next arrow moves)
                         sel.retain(|x| *x != r);
                         sel.push(r);
-                        self.doc.selection = sel;
+                        self.game.doc.selection = sel;
                     }
                 } else {
-                    self.doc.selection = vec![r];
+                    self.game.doc.selection = vec![r];
                     self.explorer.anchor = Some(r);
                 }
                 self.explorer.scroll_to = Some(r);
@@ -396,13 +396,13 @@ impl Editor {
         let Some(c) = cur else {
             return;
         };
-        let has_kids = self.doc.dom.get_by_ref(c).is_some_and(|i| !i.children().is_empty());
+        let has_kids = self.game.doc.dom.get_by_ref(c).is_some_and(|i| !i.children().is_empty());
         if left {
             if self.explorer.expanded.contains(&c) {
                 self.explorer.expanded.remove(&c);
-            } else if let Some(p) = self.doc.dom.get_by_ref(c).map(|i| i.parent()) {
-                if p != self.doc.dom.root_ref() && !p.is_none() {
-                    self.doc.selection = vec![p];
+            } else if let Some(p) = self.game.doc.dom.get_by_ref(c).map(|i| i.parent()) {
+                if p != self.game.doc.dom.root_ref() && !p.is_none() {
+                    self.game.doc.selection = vec![p];
                     self.explorer.anchor = Some(p);
                     self.explorer.scroll_to = Some(p);
                 }
@@ -410,8 +410,8 @@ impl Editor {
         } else if right && has_kids {
             if !self.explorer.expanded.contains(&c) {
                 self.explorer.expanded.insert(c);
-            } else if let Some(first) = sorted_children(&self.doc, c).first() {
-                self.doc.selection = vec![*first];
+            } else if let Some(first) = sorted_children(&self.game.doc, c).first() {
+                self.game.doc.selection = vec![*first];
                 self.explorer.anchor = Some(*first);
                 self.explorer.scroll_to = Some(*first);
             }
@@ -419,19 +419,19 @@ impl Editor {
     }
 
     fn explorer_row(&mut self, ui: &mut egui::Ui, r: Ref, depth: usize, actions: &mut Vec<RowAction>) {
-        let Some(inst) = self.doc.dom.get_by_ref(r) else {
+        let Some(inst) = self.game.doc.dom.get_by_ref(r) else {
             return;
         };
         let name = inst.name.clone();
         let class = inst.class.to_string();
-        let shape = self.doc.prop(r, "Shape").and_then(|v| match v {
+        let shape = self.game.doc.prop(r, "Shape").and_then(|v| match v {
             rbx_types::Variant::Enum(e) => Some(e.to_u32()),
             rbx_types::Variant::EnumItem(e) => Some(e.value),
             _ => None,
         });
         let parent = inst.parent();
         let has_children = !inst.children().is_empty();
-        let selected = self.doc.selection.contains(&r);
+        let selected = self.game.doc.selection.contains(&r);
         let expanded = self.explorer.expanded.contains(&r) || self.explorer.forced_open.contains(&r);
 
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click_and_drag());
@@ -480,7 +480,7 @@ impl Editor {
         let tri_rect = Rect::from_center_size(Pos2::new(x0 + 6.0, rect.center().y), Vec2::splat(12.0));
         if has_children {
             let glyph = if expanded { "caret-down-filled" } else { "caret-right-filled" };
-            crate::ti::paint(&painter, tri_rect, glyph, theme::TEXT_DIM);
+            rustudio_engine::ti::paint(&painter, tri_rect, glyph, theme::TEXT_DIM);
         }
         let icon_rect = Rect::from_center_size(Pos2::new(x0 + 22.0, rect.center().y), Vec2::splat(16.0));
         if !icons::paint_part_icon(&painter, icon_rect, &class, shape) {
@@ -498,7 +498,7 @@ impl Editor {
             if p.hovered() {
                 painter.rect_filled(plus_rect.expand(1.0), 3.0, theme::ACTIVE_TAB);
             }
-            crate::ti::paint(&painter, plus_rect, "plus", if p.hovered() { Color32::WHITE } else { theme::TEXT });
+            rustudio_engine::ti::paint(&painter, plus_rect, "plus", if p.hovered() { Color32::WHITE } else { theme::TEXT });
             self.explorer.plus_rect = Some((r, plus_rect));
         }
 
@@ -556,7 +556,7 @@ impl Editor {
             // pressed row, and a drop on a plugin widget carries no instances
             // (Data "", MimeType "roblox/selection"), so plugins read Selection
             // (checks/plugins/ref/captures/xdrag.txt S1, S5, S7).
-            let refs = if selected { self.doc.selection.clone() } else { vec![r] };
+            let refs = if selected { self.game.doc.selection.clone() } else { vec![r] };
             if !selected && !ui.input(|i| i.modifiers.command || i.modifiers.shift) {
                 actions.push(RowAction::Click(r, false, false));
             }
@@ -564,7 +564,7 @@ impl Editor {
         }
         // A Toolbox card dropped on this row: inserted into it.
         if resp.dnd_hover_payload::<crate::toolbox::ui::ToolboxDrag>().is_some() {
-            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, crate::theme::SELECT), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, rustudio_engine::theme::SELECT), egui::StrokeKind::Inside);
         }
         // (egui's dnd_release_payload takes whatever payload there is, of
         // any type: ask only for the kind being carried, or an Explorer drag
@@ -698,41 +698,41 @@ impl Editor {
                     let b = rows.iter().position(|(x, _)| *x == r);
                     if let (Some(a), Some(b)) = (a, b) {
                         let (lo, hi) = (a.min(b), a.max(b));
-                        self.doc.selection = rows[lo..=hi].iter().map(|(x, _)| *x).collect();
+                        self.game.doc.selection = rows[lo..=hi].iter().map(|(x, _)| *x).collect();
                         return;
                     }
                 }
                 if toggle {
-                    if let Some(pos) = self.doc.selection.iter().position(|s| *s == r) {
-                        self.doc.selection.remove(pos);
+                    if let Some(pos) = self.game.doc.selection.iter().position(|s| *s == r) {
+                        self.game.doc.selection.remove(pos);
                     } else {
-                        self.doc.selection.push(r);
+                        self.game.doc.selection.push(r);
                     }
                 } else {
-                    self.doc.selection = vec![r];
+                    self.game.doc.selection = vec![r];
                 }
                 self.explorer.anchor = Some(r);
             }
-            RowAction::ClearSelection => self.doc.selection.clear(),
+            RowAction::ClearSelection => self.game.doc.selection.clear(),
             RowAction::StartRename(r) => {
-                let name = self.doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
+                let name = self.game.doc.dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default();
                 self.explorer.renaming = Some((r, name));
             }
             RowAction::Rename(r, name) => {
                 self.explorer.renaming = None;
                 let name = name.trim();
                 if !name.is_empty() {
-                    self.doc.rename(r, name);
+                    self.game.doc.rename(r, name);
                 }
             }
             RowAction::Reparent(refs, parent) => {
-                if refs.iter().all(|r| self.doc.dom.get_by_ref(*r).is_some_and(|i| i.parent() == parent)) {
+                if refs.iter().all(|r| self.game.doc.dom.get_by_ref(*r).is_some_and(|i| i.parent() == parent)) {
                     return; // dropped beside itself: nothing moves
                 }
-                let n = self.doc.reparent(&refs, parent);
+                let n = self.game.doc.reparent(&refs, parent);
                 if n > 0 {
                     self.explorer.expanded.insert(parent);
-                    let pname = self.doc.dom.get_by_ref(parent).map(|i| i.name.clone()).unwrap_or_default();
+                    let pname = self.game.doc.dom.get_by_ref(parent).map(|i| i.name.clone()).unwrap_or_default();
                     self.info(format!("Moved {n} object(s) into {pname}"));
                 } else if !refs.contains(&parent) {
                     self.warn("Cannot move there (services, the root, or into its own descendant)");
@@ -747,21 +747,21 @@ impl Editor {
                 self.open_insert_popup(parent, at);
             }
             RowAction::ImportModel(parent) => {
-                self.doc.selection = vec![parent];
+                self.game.doc.selection = vec![parent];
                 self.insert_from_file();
             }
             RowAction::SaveSelection => self.save_selection(),
             RowAction::GroupFolder => {
-                let sel = self.doc.selection.clone();
-                if let Some(f) = self.doc.group_as(&sel, "Folder") {
+                let sel = self.game.doc.selection.clone();
+                if let Some(f) = self.game.doc.group_as(&sel, "Folder") {
                     self.select(vec![f]);
                 }
             }
             RowAction::Action(act) => self.run_action(act),
             RowAction::SelectChildren(r) => {
-                let kids = sorted_children(&self.doc, r);
+                let kids = sorted_children(&self.game.doc, r);
                 self.explorer.expanded.insert(r);
-                self.doc.selection = kids;
+                self.game.doc.selection = kids;
             }
             RowAction::OpenScript(r) => {
                 self.open_script.push(r);

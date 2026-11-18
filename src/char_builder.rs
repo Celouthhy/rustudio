@@ -16,10 +16,10 @@ use rbx_dom_weak::{ustr, InstanceBuilder};
 use rustudio_account::characters::{self, Outfit, Person, Thumb};
 
 use crate::app::Editor;
-use crate::avatar::{self, AvatarLook};
-use crate::doc;
-use crate::rig::{self, RigType};
-use crate::theme;
+use rustudio_engine::avatar::{self, AvatarLook};
+use rustudio_core::doc;
+use rustudio_engine::rig::{self, RigType};
+use rustudio_engine::theme;
 
 /// Studio's presets (RigGenerator/Src/RigPresets): label, masculine outfit,
 /// feminine outfit.
@@ -229,7 +229,7 @@ fn tab_button(ui: &mut egui::Ui, icon: &str, label: &str, on: bool) -> bool {
         p.rect_filled(r, 4.0, theme::HOVER_BG);
     }
     let col = if on { Color32::WHITE } else { theme::TEXT_DIM };
-    crate::ti::paint(p, Rect::from_center_size(egui::pos2(r.min.x + 14.0, r.center().y), Vec2::splat(15.0)), icon, col);
+    rustudio_engine::ti::paint(p, Rect::from_center_size(egui::pos2(r.min.x + 14.0, r.center().y), Vec2::splat(15.0)), icon, col);
     p.text(egui::pos2(r.min.x + 25.0, r.center().y), egui::Align2::LEFT_CENTER, label, font, col);
     if on {
         p.rect_filled(Rect::from_min_max(egui::pos2(r.min.x + 4.0, r.max.y - 2.0), egui::pos2(r.max.x - 4.0, r.max.y)), 1.0, theme::ACCENT);
@@ -293,7 +293,7 @@ impl CharBuilder {
                     Pick::Outfit { .. } => "shirt",
                     Pick::User { .. } => "user",
                 };
-                crate::ti::paint(ui.painter(), Rect::from_center_size(img.center(), Vec2::splat(34.0)), icon, theme::TEXT_DIM);
+                rustudio_engine::ti::paint(ui.painter(), Rect::from_center_size(img.center(), Vec2::splat(34.0)), icon, theme::TEXT_DIM);
             }
         }
         if busy {
@@ -437,7 +437,7 @@ impl Editor {
     }
 
     fn pick_character(&mut self, pick: Pick) {
-        if self.play.is_some() {
+        if self.game.play.is_some() {
             self.warn("Stop the playtest to insert a character");
             return;
         }
@@ -457,13 +457,13 @@ impl Editor {
         if !self.chars.building.insert(pick.clone()) {
             return;
         }
-        let Some(client) = self.account.shared_client() else {
+        let Some(client) = self.game.account.shared_client() else {
             self.chars.building.remove(&pick);
             self.chars.pending.retain(|p| p.0 != pick);
             self.chars.status = Some((false, "Sign in to download avatars and outfits".into()));
             return;
         };
-        let me = self.account.user_id().unwrap_or(0);
+        let me = self.game.account.user_id().unwrap_or(0);
         self.chars.status = Some((true, format!("Downloading {}…", pick.label())));
         let tx = self.chars.tx.clone();
         std::thread::spawn(move || {
@@ -584,7 +584,7 @@ impl Editor {
         let m = rig::insert_character(&mut tmp.dom, root, &name, rig_type, &look.colors, &scales, humanoid);
         avatar::dress(&mut tmp, m, &look);
         if animate {
-            crate::default_scripts::insert_character_scripts(&mut tmp, m, rig_type);
+            rustudio_core::default_scripts::insert_character_scripts(&mut tmp, m, rig_type);
             if rig_type == RigType::R15 {
                 avatar::put_on_animations(&mut tmp, m, &look);
             }
@@ -601,7 +601,7 @@ impl Editor {
             .into_iter()
             .filter_map(|c| {
                 let i = tmp.dom.get_by_ref(c)?;
-                doc::is_a(&i.class, "BasePart").then(|| (c, crate::play::studio_collides(&i.name, rig_type)))
+                doc::is_a(&i.class, "BasePart").then(|| (c, rustudio_engine::rig::studio_collides(&i.name, rig_type)))
             })
             .collect();
         for (c, on) in body {
@@ -629,7 +629,7 @@ impl Editor {
         // Stand it where the screen centre hits, facing the camera.
         let mut target = self.spawn_point(glam::Vec3::ZERO);
         if !starter {
-            let fwd = self.cam.forward();
+            let fwd = self.game.cam.forward();
             let right = glam::Vec3::new(-fwd.z, 0.0, fwd.x).normalize_or(glam::Vec3::X);
             for _ in 0..40 {
                 if !self.chars.placed.iter().any(|p| (*p - target).length() < 3.0) {
@@ -640,7 +640,7 @@ impl Editor {
             self.chars.placed.push(target);
         }
         let facing = {
-            let f = self.cam.pos - target;
+            let f = self.game.cam.pos - target;
             f.z.atan2(f.x)
         };
         place_model(&mut tmp, m, target, facing);
@@ -659,28 +659,28 @@ impl Editor {
             }
         };
         let parent = if starter {
-            let rootd = self.doc.dom.root_ref();
-            let Some(sp) = self.doc.find_child(rootd, "StarterPlayer") else {
+            let rootd = self.game.doc.dom.root_ref();
+            let Some(sp) = self.game.doc.find_child(rootd, "StarterPlayer") else {
                 self.error("This place has no StarterPlayer");
                 return;
             };
-            let old: Vec<Ref> = self
+            let old: Vec<Ref> = self.game
                 .doc
                 .dom
                 .get_by_ref(sp)
                 .map(|i| i.children().to_vec())
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|c| self.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == "StarterCharacter"))
+                .filter(|c| self.game.doc.dom.get_by_ref(*c).is_some_and(|i| i.name == "StarterCharacter"))
                 .collect();
             if !old.is_empty() {
-                self.doc.remove(&old);
+                self.game.doc.remove(&old);
             }
             sp
         } else {
-            self.doc.workspace().unwrap_or_else(|| self.doc.default_parent())
+            self.game.doc.workspace().unwrap_or_else(|| self.game.doc.default_parent())
         };
-        let refs = self.doc.paste(&bytes, parent, "Insert character");
+        let refs = self.game.doc.paste(&bytes, parent, "Insert character");
         self.select(refs);
         let what = format!("{} ({})", pick.label(), if rig_type == RigType::R15 { "R15" } else { "R6" });
         self.info(if starter {
@@ -703,13 +703,13 @@ impl Editor {
         if self.chars.building.len() + self.chars.pending.len() > 0 || self.chars.search_due.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        let me = self.account.user_id();
-        let signed_in = self.account.signed_in();
+        let me = self.game.account.user_id();
+        let signed_in = self.game.account.signed_in();
         // Lists the tab needs.
         if signed_in {
             if self.chars.tab == Tab::Outfits && self.chars.outfits.is_none() {
                 self.chars.outfits = Some(Vec::new());
-                if let (Some(client), Some(uid)) = (self.account.shared_client(), me) {
+                if let (Some(client), Some(uid)) = (self.game.account.shared_client(), me) {
                     let tx = self.chars.tx.clone();
                     std::thread::spawn(move || {
                         let r = client
@@ -725,7 +725,7 @@ impl Editor {
             }
             if self.chars.tab == Tab::Friends && self.chars.friends.is_none() {
                 self.chars.friends = Some(Vec::new());
-                if let (Some(client), Some(uid)) = (self.account.shared_client(), me) {
+                if let (Some(client), Some(uid)) = (self.game.account.shared_client(), me) {
                     let tx = self.chars.tx.clone();
                     std::thread::spawn(move || {
                         let r = client
@@ -748,7 +748,7 @@ impl Editor {
                 self.chars.searched = q.clone();
                 if q.is_empty() {
                     self.chars.results = None;
-                } else if let Some(client) = self.account.shared_client() {
+                } else if let Some(client) = self.game.account.shared_client() {
                     self.chars.results = None;
                     let tx = self.chars.tx.clone();
                     std::thread::spawn(move || {
@@ -836,7 +836,7 @@ impl Editor {
                 let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
                 ui.painter().rect_filled(r, 5.0, theme::PANEL_DARK);
                 ui.painter().rect_stroke(r, 5.0, egui::Stroke::new(1.0, theme::DIVIDER), egui::StrokeKind::Inside);
-                crate::ti::paint(ui.painter(), Rect::from_center_size(egui::pos2(r.min.x + 15.0, r.center().y), Vec2::splat(15.0)), "search", theme::TEXT_DIM);
+                rustudio_engine::ti::paint(ui.painter(), Rect::from_center_size(egui::pos2(r.min.x + 15.0, r.center().y), Vec2::splat(15.0)), "search", theme::TEXT_DIM);
                 let edit = egui::TextEdit::singleline(&mut cb.query)
                     .hint_text("Find a player by name or id")
                     .frame(egui::Frame::NONE)
@@ -848,7 +848,7 @@ impl Editor {
                 if !cb.query.is_empty() {
                     let x = Rect::from_center_size(egui::pos2(r.max.x - 14.0, r.center().y), Vec2::splat(18.0));
                     let xr = ui.interact(x, ui.id().with("char-search-clear"), Sense::click());
-                    crate::ti::paint(ui.painter(), x.shrink(2.0), "x", if xr.hovered() { theme::TEXT } else { theme::TEXT_DIM });
+                    rustudio_engine::ti::paint(ui.painter(), x.shrink(2.0), "x", if xr.hovered() { theme::TEXT } else { theme::TEXT_DIM });
                     if xr.clicked() {
                         cb.query.clear();
                         cb.searched.clear();
@@ -964,7 +964,7 @@ impl Editor {
 /// Moves a model so its feet stand on `ground` (its root over it), turned
 /// `yaw` radians about Y from the rig's built facing.
 fn place_model(d: &mut doc::Document, m: Ref, ground: glam::Vec3, yaw: f32) {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     let parts: Vec<Ref> = d.dom.descendants_of(m).filter(|i| doc::is_a(&i.class, "BasePart")).map(|i| i.referent()).collect();
     let xf = |d: &doc::Document, r: Ref| match d.dom.get_by_ref(r).and_then(|i| i.properties.get(&ustr("CFrame"))) {
         Some(Variant::CFrame(c)) => Some(Xform::from_cframe(c)),
@@ -1038,7 +1038,7 @@ fn fix_color_types(d: &mut doc::Document, m: Ref) {
 /// in the rest pose: Part1 = Part0 · C0 · C1⁻¹ (Motor6D, Weld, ManualWeld,
 /// Snap, Glue), either way round, each part once.
 fn solve_rest_pose(d: &mut doc::Document, m: Ref) {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     use std::collections::{HashMap, HashSet, VecDeque};
     let cf = |d: &doc::Document, r: Ref, k: &str| match d.dom.get_by_ref(r).and_then(|i| i.properties.get(&ustr(k))) {
         Some(Variant::CFrame(c)) => Some(Xform::from_cframe(c)),

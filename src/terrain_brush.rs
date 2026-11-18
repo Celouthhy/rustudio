@@ -18,7 +18,7 @@
 
 use glam::Vec3;
 
-use crate::terrain::{Voxels, VOXEL, WATER};
+use rustudio_core::terrain::{Voxels, VOXEL, WATER};
 
 pub const VR: f32 = VOXEL;
 /// Constants.MinimumOccupancy / MaximumOccupancy / MinimumSmooth.

@@ -97,7 +97,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             };
             Ok(match made {
                 Ok(r) => (true, inst_value(lua, r)?),
-                Err(e) => (false, Value::String(lua.create_string(crate::runtime::error_message(&e))?)),
+                Err(e) => (false, Value::String(lua.create_string(rustudio_engine::runtime::error_message(&e))?)),
             })
         })?;
         lua.load(CREATE_YIELDS).set_name("=rustudio.plugin_widgets").call::<()>(make)?;
@@ -121,7 +121,7 @@ fn dock_info(lua: &Lua, v: &Value) -> mlua::Result<Option<vm::DockInfo>> {
     let t: Option<mlua::Table> = read.call(v.clone())?;
     let Some(t) = t else { return Ok(None) };
     let state: Value = t.get("InitialDockState")?;
-    let state = opt_ud::<crate::ltypes::LEnumItem>(&state).map(|e| e.name.clone()).unwrap_or_else(|| "Right".into());
+    let state = opt_ud::<rustudio_engine::ltypes::LEnumItem>(&state).map(|e| e.name.clone()).unwrap_or_else(|| "Right".into());
     Ok(Some(vm::DockInfo {
         initial_dock_state: state,
         initial_enabled: t.get("InitialEnabled")?,
@@ -204,7 +204,7 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
             Some(i) => crate::plugin_host::widgets_ui::initial_size(&i.initial_dock_state, i.float_x, i.float_y),
             None => [0.0, 0.0],
         };
-        world(lua)?.input.gui_layout.insert(r, crate::gui::GuiBox { size, ..Default::default() });
+        world(lua)?.input.gui_layout.insert(r, rustudio_engine::gui::GuiBox { size, ..Default::default() });
         if !edit {
             // (a Play copy's: kept when the client's game GUI lays out anew)
             crate::plugin_host::widgets_ui::note_play_laid(r);
@@ -219,7 +219,7 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
 }
 
 /// The testing domain's per-instance store (BindToClose's callback,
-/// HostWidgetWasRestored live there: src/domains/testing.rs `store`).
+/// HostWidgetWasRestored live there: crates/rustudio-engine/src/domains/testing.rs `store`).
 fn store_table(lua: &Lua, r: Ref) -> mlua::Result<mlua::Table> {
     let all: mlua::Table = match lua.named_registry_value::<mlua::Table>("rs_testing_store") {
         Ok(t) => t,
@@ -245,13 +245,13 @@ fn set_store(lua: &Lua, r: Ref, key: &str, v: Value) -> mlua::Result<()> {
 /// The user closed widget `r`'s panel: its BindToClose callback runs if
 /// it set one (the widget stays; the plugin decides), else Enabled turns
 /// false (the panel closes, the Enabled changed signal fires).
-pub fn close(rt: &crate::runtime::Runtime, r: Ref) {
+pub fn close(rt: &rustudio_engine::runtime::Runtime, r: Ref) {
     let lua = &rt.lua;
     let cb = store_table(lua, r).and_then(|t| t.get::<Value>("__close")).unwrap_or(Value::Nil);
     match cb {
         Value::Function(f) => {
-            if let Ok(th) = crate::runtime::domains::assets_cloud::scene::create_thread(lua, f) {
-                crate::runtime::resume(lua, &th, Vec::new());
+            if let Ok(th) = rustudio_engine::runtime::domains::assets_cloud::scene::create_thread(lua, f) {
+                rustudio_engine::runtime::resume(lua, &th, Vec::new());
             }
         }
         _ => rt.set(r, "Enabled", Value::Boolean(false)),
@@ -270,7 +270,7 @@ pub fn drag_active() -> bool {
 /// PluginDragEntered / Moved / Left / Dropped on widget `r` with the drag's
 /// data: a plain table {Sender, MimeType, Data, MouseIcon, DragIcon,
 /// HotSpot} (F58: typeof table; Sender / MimeType / Data as given).
-pub fn drag_fire(rt: &crate::runtime::Runtime, r: Ref, name: &str) {
+pub fn drag_fire(rt: &rustudio_engine::runtime::Runtime, r: Ref, name: &str) {
     let lua = &rt.lua;
     let Ok(info) = lua.named_registry_value::<mlua::Table>("rs_plugin_drag") else { return };
     let ev = (|| -> mlua::Result<mlua::Table> {
@@ -289,14 +289,14 @@ pub fn drag_fire(rt: &crate::runtime::Runtime, r: Ref, name: &str) {
 /// instances dragged onto it. Studio 0.747 gives the same plain table for
 /// one or several instances; the instances themselves are the Selection
 /// (checks/plugins/ref/captures/xdrag.txt).
-pub fn explorer_drag_fire(rt: &crate::runtime::Runtime, r: Ref, name: &str) {
+pub fn explorer_drag_fire(rt: &rustudio_engine::runtime::Runtime, r: Ref, name: &str) {
     let lua = &rt.lua;
     let ev = (|| -> mlua::Result<mlua::Table> {
         let t = lua.create_table()?;
         for (k, v) in [("Sender", "Explorer"), ("MimeType", "roblox/selection"), ("Data", ""), ("MouseIcon", ""), ("DragIcon", "")] {
             t.set(k, lstr(lua, v)?)?;
         }
-        t.set("HotSpot", Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::ZERO))?))?;
+        t.set("HotSpot", Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::ZERO))?))?;
         Ok(t)
     })();
     if let Ok(t) = ev {
@@ -323,9 +323,9 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
         })(),
         // Widget pixels from the panel's content top-left (title bar not
         // included); 0, 0 when the mouse isn't over it (F47, F55).
-        (_, "GetRelativeMousePosition") if crate::doc::is_a(class, "PluginGui") => (|| {
+        (_, "GetRelativeMousePosition") if rustudio_core::doc::is_a(class, "PluginGui") => (|| {
             let p = crate::plugin_host::widgets_ui::live(this).rel.unwrap_or([0.0, 0.0]);
-            ret1(Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::new(p[0], p[1])))?))
+            ret1(Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::new(p[0], p[1])))?))
         })(),
         // A drag of plugin data: widgets the mouse passes over hear
         // PluginDragEntered / Moved / Left and Dropped where it's let go
@@ -342,7 +342,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
                 t.set(k, if v.is_nil() { lstr(lua, "")? } else { v })?;
             }
             let hs: Value = info.get("HotSpot")?;
-            t.set("HotSpot", if hs.is_nil() { Value::UserData(lua.create_userdata(crate::ltypes::LVector2(glam::Vec2::ZERO))?) } else { hs })?;
+            t.set("HotSpot", if hs.is_nil() { Value::UserData(lua.create_userdata(rustudio_engine::ltypes::LVector2(glam::Vec2::ZERO))?) } else { hs })?;
             lua.set_named_registry_value("rs_plugin_drag", t)?;
             DRAG.store(true, std::sync::atomic::Ordering::Relaxed);
             ret0()

@@ -24,7 +24,7 @@
 //!   error, "HttpError: ConnectFail" / "DnsResolve", plugins skipping
 //!   HttpEnabled, the request headers Studio adds.
 //! - rustudio's own choices, each waiting on a Studio measurement (listed in
-//!   ROAM-TASK-3.md): the headers string's format; Error codes and messages
+//!   Studio tests): the headers string's format; Error codes and messages
 //!   for transport failures, a refused upgrade, a failed Send ("HttpError:
 //!   ConnectionClosed"), a handshake timeout; no Closed after Error; a TCP
 //!   drop without a close frame giving Closed; Send's text-vs-binary choice
@@ -105,7 +105,9 @@ struct Cancel {
     opened: AtomicBool,
     agent: Mutex<Option<ureq::Agent>>,
     /// Tests: the transport's next writes fail (as a reset connection's).
-    #[cfg(test)]
+    /// (Set only by `break_writes_for`, which studio's plugin-host test calls:
+    /// that test is a crate away once the engine is one, so the switch is
+    /// built in every run and stays false outside tests.)
     fail_writes: AtomicBool,
 }
 
@@ -165,9 +167,9 @@ impl Drop for WorkerGuard {
     }
 }
 
-/// How many worker threads are still running for URLs containing `part`.
-#[cfg(test)]
-pub(crate) fn workers_for(part: &str) -> usize {
+/// How many worker threads are still running for URLs containing `part`
+/// (studio's plugin-host test: the connections' threads end with the plugin).
+pub fn workers_for(part: &str) -> usize {
     workers().lock().unwrap().values().filter(|u| u.contains(part)).count()
 }
 
@@ -175,9 +177,9 @@ pub(crate) fn workers_for(part: &str) -> usize {
 /// contains `part` fail as on a reset connection (the transport dying under
 /// an open connection). (Shutting the real socket's send side down can't
 /// stand in for this on Windows: shutdown on the socket can give
-/// WSAENOTCONN there.)
-#[cfg(test)]
-pub(crate) fn break_writes_for(part: &str) -> usize {
+/// WSAENOTCONN there.) studio's plugin-host test calls this, so it is built
+/// in every run; nothing outside a test calls it.
+pub fn break_writes_for(part: &str) -> usize {
     let ids: Vec<u64> = workers().lock().unwrap().iter().filter(|(_, u)| u.contains(part)).map(|(i, _)| *i).collect();
     let t = table().lock().unwrap();
     let mut n = 0;
@@ -196,7 +198,6 @@ fn ws_send<S: std::io::Read + std::io::Write>(
     m: tungstenite::Message,
     cancel: &Cancel,
 ) -> tungstenite::Result<()> {
-    #[cfg(test)]
     if cancel.fail_writes.load(Ordering::SeqCst) {
         return Err(tungstenite::Error::Io(std::io::ErrorKind::ConnectionReset.into()));
     }

@@ -121,7 +121,7 @@ pub fn call(_: &Lua, _: &str, _: Ref, _: &MultiValue) -> Option<mlua::Result<Mul
 }
 
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
-    if key == "IsFinished" && crate::doc::is_a(class, "Pages") {
+    if key == "IsFinished" && rustudio_core::doc::is_a(class, "Pages") {
         return Ok(is_finished(lua, r).map(Value::Boolean));
     }
     Ok(None)
@@ -165,7 +165,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             Some(Value::String(s)) => s.to_str()?.to_string(),
             _ => return Err(err("Pages class expected")),
         };
-        if !crate::doc::is_a(&class, "Pages") {
+        if !rustudio_core::doc::is_a(&class, "Pages") {
             return Err(err(format!("{class} is not a Pages class")));
         }
         let r = crate::runtime::ext::create_any(lua, &class)?;
@@ -239,11 +239,11 @@ pub fn step(_: &Lua, _: f64) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use crate::runtime::{RunMode, Runtime, World};
     use rbx_dom_weak::InstanceBuilder;
 
-    fn run(src: &str) -> (bool, Vec<(crate::app::Level, String)>) {
+    fn run(src: &str) -> (bool, Vec<(rustudio_core::log::Level, String)>) {
         let mut d = Document::new_place();
         let parent = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
         let script = d.dom.insert(

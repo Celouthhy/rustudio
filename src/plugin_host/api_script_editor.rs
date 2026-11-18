@@ -142,7 +142,7 @@ fn arg_script(lua: &Lua, args: &MultiValue, i: usize) -> mlua::Result<Ref> {
         Value::Nil => return Err(rt_err(format!("Argument {i} missing or nil"))),
         v => opt_inst(v).ok_or_else(|| rt_err(format!("Unable to cast {} to Instance", v.type_name())))?,
     };
-    let ok = world(lua)?.d().class_of(r).is_some_and(|c| crate::doc::is_a(&c, "LuaSourceContainer"));
+    let ok = world(lua)?.d().class_of(r).is_some_and(|c| rustudio_core::doc::is_a(&c, "LuaSourceContainer"));
     if !ok {
         return Err(rt_err(format!("Argument {i} is invalid: expected 'LuaSourceContainer' instance type")));
     }
@@ -607,7 +607,7 @@ pub fn autocomplete(lua: &Lua, script: Ref, line: i64, character: i64) -> mlua::
             }
             Ok(_) => {
                 world(lua)?.output.push((
-                    crate::app::Level::Error,
+                    rustudio_core::log::Level::Error,
                     format!("ScriptEditorService: Callback {name} did not return exactly one value, sending default response"),
                 ));
             }
@@ -655,7 +655,7 @@ pub fn analyze(lua: &Lua, script: Ref) -> mlua::Result<Vec<(i64, String)>> {
                 }
             }
             Ok(_) => world(lua)?.output.push((
-                crate::app::Level::Error,
+                rustudio_core::log::Level::Error,
                 format!("ScriptEditorService: Callback {name} did not return exactly one value, sending default response"),
             )),
             Err(e) => report_error_in(lua, &e),
@@ -666,7 +666,7 @@ pub fn analyze(lua: &Lua, script: Ref) -> mlua::Result<Vec<(i64, String)>> {
 
 fn report_error_in(lua: &Lua, e: &mlua::Error) {
     if let Ok(mut w) = world(lua) {
-        w.output.push((crate::app::Level::Error, crate::runtime::describe_error(e)));
+        w.output.push((rustudio_core::log::Level::Error, rustudio_engine::runtime::describe_error(e)));
     }
 }
 

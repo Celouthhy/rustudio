@@ -30,8 +30,8 @@ use mlua::{Lua, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
-use crate::runtime::security;
-use crate::runtime::{world, Runtime};
+use rustudio_engine::runtime::security;
+use rustudio_engine::runtime::{world, Runtime};
 
 use super::PluginId;
 
@@ -192,7 +192,7 @@ pub fn script_env(lua: &Lua, r: Ref, env: &Table) -> mlua::Result<()> {
         return Ok(());
     }
     if let Some(root) = plugin_root_of(lua, r) {
-        env.raw_set("plugin", crate::runtime::inst_value(lua, root)?)?;
+        env.raw_set("plugin", rustudio_engine::runtime::inst_value(lua, root)?)?;
     }
     Ok(())
 }
@@ -200,7 +200,7 @@ pub fn script_env(lua: &Lua, r: Ref, env: &Table) -> mlua::Result<()> {
 /// printidentity's asset id for the running plugin thread: the plugin of
 /// the nearest Lua function's `script` (-2, a local plugin's, otherwise).
 pub fn running_asset_id(lua: &Lua) -> i64 {
-    let Some(script) = crate::runtime::running_script(lua) else { return -2 };
+    let Some(script) = rustudio_engine::runtime::running_script(lua) else { return -2 };
     let Some(root) = plugin_root_of(lua, script) else { return -2 };
     lua.app_data_ref::<PluginVm>()
         .and_then(|v| v.by_root(root).map(|p| p.asset_id))
@@ -294,7 +294,7 @@ pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
                 continue;
             }
             // RunContext: Legacy 0, Server 1, Client 2, Plugin 3.
-            match crate::scene::enum_u32(d.prop(r, "RunContext")).unwrap_or(0) {
+            match rustudio_render::scene::enum_u32(d.prop(r, "RunContext")).unwrap_or(0) {
                 0 => now.push(r),
                 3 => later.push(r),
                 _ => {}
@@ -373,7 +373,7 @@ pub fn unload(rt: &Runtime, id: PluginId) {
     rt.fire_bare(p.root, "Unloading", vec![]);
     rt.dispatch();
     // Its open PluginMenu popups close (their ShowAsync return nil).
-    crate::runtime::domains::plugin::menus::close_plugin_menus(lua, id);
+    crate::plugin_host::api::menus::close_plugin_menus(lua, id);
     if let Some(mut v) = vm(lua) {
         if v.active == Some(id) {
             v.active = None;
@@ -403,7 +403,7 @@ pub fn unload(rt: &Runtime, id: PluginId) {
     }
     rt.stop_code_of(&code);
     // Its WebStreamClients' connections end with it.
-    crate::runtime::domains::services::close_streams_of(lua, &code);
+    rustudio_engine::runtime::domains::services::close_streams_of(lua, &code);
     for r in p.owned.iter().chain(p.mouse.iter()) {
         let parented = world(lua).is_ok_and(|w| w.d().dom.get_by_ref(*r).is_some_and(|i| i.parent().is_some()));
         if parented {

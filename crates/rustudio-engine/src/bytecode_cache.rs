@@ -61,7 +61,7 @@ fn memory() -> &'static Mutex<Memory> {
 }
 
 fn dir() -> PathBuf {
-    crate::assets::cache_dir().join("bytecode")
+    rustudio_core::assets::cache_dir().join("bytecode")
 }
 
 /// Bytecode for a script's source, compiled once per process (and kept on

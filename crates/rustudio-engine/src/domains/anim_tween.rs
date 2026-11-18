@@ -1,12 +1,14 @@
-//! TweenService stepped natively, as Studio does.
+//! TweenService stepped natively, as Studio does (Studio,
+//! notes in Studio measurements).
 //!
 //! Studio: TweenService steps (profiler "TweenService") inside the UI
 //! layout update (before "UpdateUILayouts"), so a
 //! client steps its tweens right after the PreRender handlers with the render
 //! frame's dt; a server (no render) steps them after Heartbeat with
-//! Heartbeat's dt (measured with probes). The generic
-//! stepper: drops dead entries, moves
-//! the tweens Played since the last step into the active list (for each: a newer tween takes over the properties it shares with older
+//! Heartbeat's dt (probes t_order / studio_t_order_*.txt). The generic
+//! stepper `updateGenericTweens`: drops dead entries, moves
+//! the tweens Played since the last step into the active list (Studio
+//! for each: a newer tween takes over the properties it shares with older
 //! ones; an older one left with none is Cancelled), then steps the list
 //! from the back (float dt) and swap-removes the ones that
 //! finished. So tweens finishing in the same step fire Completed in reverse
@@ -192,7 +194,7 @@ fn lerp(lua: &Lua, a: &Value, b: &Value, k: f64, int: bool) -> mlua::Result<Valu
     }
     if let (Some(x), Some(y)) = (ud::<LCFrame>(a), ud::<LCFrame>(b)) {
         let q = Quat::from_mat3(&x.0.rot).slerp(Quat::from_mat3(&y.0.rot), kf);
-        return LCFrame(crate::math::Xform { pos: x.0.pos.lerp(y.0.pos, kf), rot: Mat3::from_quat(q) }).into_lua(lua);
+        return LCFrame(rustudio_core::math::Xform { pos: x.0.pos.lerp(y.0.pos, kf), rot: Mat3::from_quat(q) }).into_lua(lua);
     }
     if let (Some(x), Some(y)) = (ud::<LColor3>(a), ud::<LColor3>(b)) {
         return LColor3([0, 1, 2].map(|i| x.0[i] + (y.0[i] - x.0[i]) * kf)).into_lua(lua);

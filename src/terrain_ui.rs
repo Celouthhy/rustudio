@@ -8,7 +8,7 @@
 
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
 
-use crate::theme;
+use rustudio_engine::theme;
 
 /// Studio's colours for these controls (sampled in the offline Studio, dark theme).
 pub const TAB_BAR: Color32 = Color32::from_rgb(32, 34, 39);
@@ -102,10 +102,10 @@ pub fn tiles<T: Copy + PartialEq>(ui: &mut Ui, items: &[(T, &str, TileIcon)], cu
                 p.rect_filled(tr, 3.0, theme::HOVER_BG);
             }
             let ic = Rect::from_center_size(pos2(tr.center().x, tr.min.y + 21.0), Vec2::splat(26.0));
-            crate::ti::paint(p, ic, icon.icon, Color32::WHITE);
+            rustudio_engine::ti::paint(p, ic, icon.icon, Color32::WHITE);
             if let Some((m, c)) = icon.mark {
                 let mr = Rect::from_center_size(ic.right_top() + vec2(-1.0, 3.0), Vec2::splat(13.0));
-                crate::ti::paint(p, mr, m, c);
+                rustudio_engine::ti::paint(p, mr, m, c);
             }
             p.text(pos2(tr.center().x, tr.max.y - 13.0), Align2::CENTER_CENTER, *name, font(), theme::TEXT);
             if resp.clicked() {
@@ -129,7 +129,7 @@ pub fn section(ui: &mut Ui, title: &str) -> bool {
     }
     let p = ui.painter();
     let chev = Rect::from_center_size(pos2(r.min.x + 17.0, r.center().y), Vec2::splat(14.0));
-    crate::ti::paint(p, chev, if open { "chevron-down" } else { "chevron-right" }, theme::TEXT);
+    rustudio_engine::ti::paint(p, chev, if open { "chevron-down" } else { "chevron-right" }, theme::TEXT);
     p.text(pos2(r.min.x + INDENT, r.center().y), Align2::LEFT_CENTER, title, header_font(ui), Color32::WHITE);
     open
 }
@@ -205,7 +205,7 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, value: &mut T, opts: &[(T, Se
                 ui.painter().text(sr.center(), Align2::CENTER_CENTER, *t, f, theme::TEXT);
             }
             Seg::Icon(ic) => {
-                crate::ti::paint(p, Rect::from_center_size(sr.center(), Vec2::splat(30.0)), ic, theme::TEXT);
+                rustudio_engine::ti::paint(p, Rect::from_center_size(sr.center(), Vec2::splat(30.0)), ic, theme::TEXT);
             }
         }
     }
@@ -296,7 +296,7 @@ pub fn checkbox(ui: &mut Ui, value: &mut bool, text: Option<&str>) -> bool {
     let p = ui.painter();
     if *value {
         p.rect_filled(b, 3.0, Color32::WHITE);
-        crate::ti::paint(p, b.shrink(2.0), "check", Color32::from_rgb(25, 26, 31));
+        rustudio_engine::ti::paint(p, b.shrink(2.0), "check", Color32::from_rgb(25, 26, 31));
     } else {
         p.rect_stroke(b, 3.0, Stroke::new(1.0, if resp.hovered() { theme::TEXT_DIM } else { BORDER }), StrokeKind::Inside);
     }
@@ -391,7 +391,7 @@ pub fn image_box(ui: &mut Ui, name: Option<&str>, preview: Option<&egui::Texture
     } else if let Some(n) = name {
         p.text(r.center(), Align2::CENTER_CENTER, n, FontId::proportional(11.0), theme::TEXT_DIM);
     } else {
-        crate::ti::paint(p, Rect::from_center_size(r.center(), Vec2::splat(22.0)), "photo-plus", theme::TEXT_DIM);
+        rustudio_engine::ti::paint(p, Rect::from_center_size(r.center(), Vec2::splat(22.0)), "photo-plus", theme::TEXT_DIM);
     }
     resp
 }
@@ -415,12 +415,12 @@ pub fn material_grid(ui: &mut Ui, id: &str, items: &[u8], current: u8) -> Option
                 let br = Rect::from_center_size(cr.center(), Vec2::splat(r * 2.0));
                 p.image(tex.id(), br, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             } else {
-                let col = crate::terrain::material_color(*m);
+                let col = rustudio_core::terrain::material_color(*m);
                 ball(p, cr.center(), r, Color32::from_rgb(col[0], col[1], col[2]));
             }
             let stroke = if *m == current { Stroke::new(1.0, theme::ACCENT) } else { Stroke::new(1.0, BORDER) };
             p.rect_stroke(cr, 4.0, stroke, StrokeKind::Inside);
-            if resp.on_hover_text(crate::terrain::material_name(*m)).clicked() {
+            if resp.on_hover_text(rustudio_core::terrain::material_name(*m)).clicked() {
                 out = Some(*m);
             }
         }
@@ -437,20 +437,20 @@ fn textured_ball(ctx: &egui::Context, m: u8) -> Option<egui::TextureHandle> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<(u8, bool), egui::TextureHandle>>> = OnceLock::new();
-    let use2022 = crate::terrain::use2022();
+    let use2022 = rustudio_core::terrain::use2022();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(t) = cache.lock().ok()?.get(&(m, use2022)) {
         return Some(t.clone());
     }
-    let mat = crate::terrain_mat::material(m, use2022)?;
+    let mat = rustudio_core::terrain_mat::material(m, use2022)?;
     let pack = mat.faces[0].as_ref().map(|t| t.pack).filter(|p| *p != 0)?;
-    let maps = match crate::matpack::terrain_pack_preview(pack, 0xff80_8080) {
-        crate::matpack::Lookup::Ready(maps) => maps,
-        crate::matpack::Lookup::Pending => {
+    let maps = match rustudio_render::matpack::terrain_pack_preview(pack, 0xff80_8080) {
+        rustudio_render::matpack::Lookup::Ready(maps) => maps,
+        rustudio_render::matpack::Lookup::Pending => {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
             return None;
         }
-        crate::matpack::Lookup::Unavailable(_) => return None,
+        rustudio_render::matpack::Lookup::Unavailable(_) => return None,
     };
     let image = ball_image(&maps.preview, BALL_PX);
     let tex = ctx.load_texture(format!("terrain-ball-{m}-{use2022}"), image, egui::TextureOptions::LINEAR);
@@ -466,7 +466,7 @@ const BALL_PX: usize = 96;
 /// the upper left; anti-aliased edge.
 fn ball_image(albedo: &[u8], px: usize) -> egui::ColorImage {
     // The mip about 2 texels per screen pixel across one wrap.
-    let levels = crate::matpack::preview_levels();
+    let levels = rustudio_render::matpack::preview_levels();
     let want = (px as u32).max(1);
     let (off, size) = levels.iter().copied().find(|(_, s)| *s <= want).unwrap_or(levels[0]);
     let size = size as usize;

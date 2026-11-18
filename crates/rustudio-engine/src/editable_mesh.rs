@@ -24,7 +24,7 @@ use glam::{Vec2, Vec3};
 use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 
 pub const K_VERTEX: u64 = 1;
 pub const K_NORMAL: u64 = 2;
@@ -686,7 +686,7 @@ impl Mesh {
     /// virtual; a root's parent reads 0) and every vertex's four envelope
     /// slots as stored, zero weights included. A MeshPart made from it is
     /// skinned and deforms with Bones named like the mesh's.
-    pub fn from_stored(d: &crate::mesh::Stored, skin: Option<&crate::mesh::Skin>) -> Mesh {
+    pub fn from_stored(d: &rustudio_core::mesh::Stored, skin: Option<&rustudio_core::mesh::Skin>) -> Mesh {
         let mut m = Mesh::default();
         let bone_ids: Vec<u64> = match skin {
             Some(sk) if d.major >= 4 && sk.vertex_bones.len() == d.pos.len() => {
@@ -775,7 +775,7 @@ impl Mesh {
 
     /// A mesh file's triangles: corners at one position share a vertex, as
     /// the file's indices do.
-    pub fn from_mesh_data(d: &crate::mesh::MeshData) -> Mesh {
+    pub fn from_mesh_data(d: &rustudio_core::mesh::MeshData) -> Mesh {
         let mut m = Mesh::default();
         let key3 = |v: Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
         let mut vmap: HashMap<[u32; 3], u64> = HashMap::new();
@@ -2085,11 +2085,11 @@ mod skinned_file_tests {
     #[test]
     fn skinned_file_keeps_its_skeleton() {
         for bytes in [
-            &include_bytes!("../checks/mesh-deform/meshes/minifig-v400.mesh")[..],
-            &include_bytes!("../checks/mesh-deform/meshes/minifig-v600.mesh")[..],
+            &include_bytes!("../../../checks/mesh-deform/meshes/minifig-v400.mesh")[..],
+            &include_bytes!("../../../checks/mesh-deform/meshes/minifig-v600.mesh")[..],
         ] {
-            let st = crate::mesh::stored(bytes).unwrap();
-            let skin = crate::mesh::parse(bytes).unwrap().skin;
+            let st = rustudio_core::mesh::stored(bytes).unwrap();
+            let skin = rustudio_core::mesh::parse(bytes).unwrap().skin;
             let m = Mesh::from_stored(&st, skin.as_ref());
             let bones = m.bones.ids();
             assert_eq!(bones.len(), 23);

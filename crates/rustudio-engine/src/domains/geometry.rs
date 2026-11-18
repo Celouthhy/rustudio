@@ -1,7 +1,7 @@
-//! Engine API domain: geometry. See src/domains/mod.rs for the hook contract.
+//! Engine API domain: geometry. See crates/rustudio-engine/src/domains/mod.rs for the hook contract.
 //!
 //! - PathfindingService / Path / PathWaypoint: geometry_nav.rs.
-//! - EditableMesh / EditableImage: src/editable.rs + src/editable_mesh.rs
+//! - EditableMesh / EditableImage: crates/rustudio-engine/src/editable.rs + crates/rustudio-engine/src/editable_mesh.rs
 //!   (hooked from runtime_ext.rs).
 #![allow(unused_imports, unused_variables)]
 

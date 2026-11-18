@@ -6,7 +6,7 @@ use egui::{Color32, Rect, Sense, Vec2};
 
 use crate::app::{Editor, Tool};
 use crate::studio_ui::{run_type_key, tab_rect_key, RibbonTab, RunType};
-use crate::theme;
+use rustudio_engine::theme;
 
 /// The dragger settings drop-down's popup id (the `dragger_menu` action opens it).
 pub(crate) const DRAGGER_MENU_ID: &str = "dragger_menu";
@@ -41,7 +41,7 @@ pub fn ribbon_button(ui: &mut egui::Ui, icon: &str, label: &str, active: bool, e
     };
     let icon_color = ribbon_icon_color(icon);
     let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(0.55) };
-    crate::ti::paint(p, icon_r, icon, icon_color);
+    rustudio_engine::ti::paint(p, icon_r, icon, icon_color);
     p.text(egui::pos2(r.center().x, r.max.y - 7.0), egui::Align2::CENTER_CENTER, label, font, col);
     resp
 }
@@ -71,7 +71,7 @@ fn top_icon(ui: &mut egui::Ui, icon: &str, color: Color32, enabled: bool) -> egu
         ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
     }
     let col = if enabled { color } else { color.gamma_multiply(0.35) };
-    crate::ti::paint(ui.painter(), r.shrink2(Vec2::new(6.0, 4.0)), icon, col);
+    rustudio_engine::ti::paint(ui.painter(), r.shrink2(Vec2::new(6.0, 4.0)), icon, col);
     resp
 }
 
@@ -90,7 +90,7 @@ impl Editor {
     /// Under the menus: run type, Play / Pause / Stop, the ribbon tabs in
     /// the middle, the account at the right (Studio's layout).
     pub fn studio_top_row(&mut self, ui: &mut egui::Ui) {
-        let mode = self.play.as_ref().map(|p| p.mode);
+        let mode = self.game.play.as_ref().map(|p| p.mode);
         let full = ui.max_rect();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
@@ -168,18 +168,18 @@ impl Editor {
                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
                 // The account: a round button and its menu (Add Account, Log Out).
                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
-                let signed = self.account.signed_in();
+                let signed = self.game.account.signed_in();
                 let fill = if signed { theme::ACCENT.gamma_multiply(0.8) } else { theme::PANEL_ALT };
                 ui.painter().circle_filled(r.center(), 12.0, fill);
-                crate::ti::paint(ui.painter(), r.shrink(5.0), "user", theme::TEXT);
+                rustudio_engine::ti::paint(ui.painter(), r.shrink(5.0), "user", theme::TEXT);
                 self.ui_rects.insert("account", r);
-                let resp = resp.on_hover_text(self.account.status_short());
+                let resp = resp.on_hover_text(self.game.account.status_short());
                 if resp.clicked() {
-                    self.account.open = !self.account.open;
-                    self.account.adding = false;
+                    self.game.account.open = !self.game.account.open;
+                    self.game.account.adding = false;
                 }
                 top_icon(ui, "bell", theme::TEXT, false).on_hover_text("Notifications: not in rustudio yet");
-                let tc = match (&self.doc.cloud, &self.cloud.status) {
+                let tc = match (&self.game.doc.cloud, &self.cloud.status) {
                     (Some(o), Some((u, s))) if *u == o.universe_id => s.describe(),
                     _ => "Open a Team Create place to see its live collaborators".into(),
                 };
@@ -387,7 +387,7 @@ impl Editor {
         self.ui_rects.insert("insert.part", resp.rect);
         self.hud.toolbar_buttons += 1;
         let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
-        crate::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
         let ar = ui.interact(arrow, egui::Id::new("part_arrow"), Sense::click());
         if enabled && resp.clicked() && !ar.hovered() {
             *act = Some("part".into());
@@ -418,7 +418,7 @@ impl Editor {
         let resp = ribbon_button(ui, if self.physical_drag { "atom-2" } else { "geometry" }, mode, false, true);
         self.ui_rects.insert("model.geometric", resp.rect);
         let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
-        crate::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
         let resp = resp.on_hover_text("Dragger settings: movement mode, collisions, joins and snapping");
         egui::Popup::menu(&resp)
             .id(egui::Id::new(DRAGGER_MENU_ID))
@@ -480,21 +480,21 @@ impl Editor {
             ui.add_space(6.0);
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.snap_move, "").on_hover_text("Snap moves to the grid");
+                ui.checkbox(&mut self.game.snap_move, "").on_hover_text("Snap moves to the grid");
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                crate::ti::paint(ui.painter(), r, "arrows-move", theme::TEXT_DIM);
-                let dv = egui::DragValue::new(&mut self.move_inc).range(0.01..=512.0).speed(0.1).suffix(" studs");
-                if ui.add(dv).changed() && self.move_inc > 0.0 {
-                    self.snap_move = true;
+                rustudio_engine::ti::paint(ui.painter(), r, "arrows-move", theme::TEXT_DIM);
+                let dv = egui::DragValue::new(&mut self.game.move_inc).range(0.01..=512.0).speed(0.1).suffix(" studs");
+                if ui.add(dv).changed() && self.game.move_inc > 0.0 {
+                    self.game.snap_move = true;
                 }
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.snap_rotate, "").on_hover_text("Snap rotation");
+                ui.checkbox(&mut self.game.snap_rotate, "").on_hover_text("Snap rotation");
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                crate::ti::paint(ui.painter(), r, "rotate", theme::TEXT_DIM);
-                let dv = egui::DragValue::new(&mut self.rotate_inc).range(0.1..=180.0).speed(0.5).suffix("°");
-                if ui.add(dv).changed() && self.rotate_inc > 0.0 {
-                    self.snap_rotate = true;
+                rustudio_engine::ti::paint(ui.painter(), r, "rotate", theme::TEXT_DIM);
+                let dv = egui::DragValue::new(&mut self.game.rotate_inc).range(0.1..=180.0).speed(0.5).suffix("°");
+                if ui.add(dv).changed() && self.game.rotate_inc > 0.0 {
+                    self.game.snap_rotate = true;
                 }
             });
         });
@@ -513,12 +513,12 @@ mod tests {
         let mut missing = Vec::new();
         for w in quoted.windows(2) {
             let calls = ["rb(ui, ", "top_icon(ui, ", "class_menu_button(ui, ", "rb_class(ui, ", "ribbon_button(ui, "];
-            if calls.iter().any(|p| w[0].ends_with(p)) && !crate::ti::has(w[1]) {
+            if calls.iter().any(|p| w[0].ends_with(p)) && !rustudio_engine::ti::has(w[1]) {
                 missing.push(w[1]);
             }
         }
         for i in ["pointer", "arrows-move", "resize", "rotate-clockwise-2", "user", "chevron-down", "rotate", "check"] {
-            if !crate::ti::has(i) {
+            if !rustudio_engine::ti::has(i) {
                 missing.push(i);
             }
         }

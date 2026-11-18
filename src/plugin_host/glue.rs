@@ -13,8 +13,8 @@ impl Editor {
             // Studio is signed in before plugins run (GetStudioUserId, the
             // installed list): a --no-ui run lets the session check answer
             // first, as Play's start does (at most 10 s).
-            if self.harness.no_ui {
-                for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(10), false) {
+            if self.harness.run.no_ui {
+                for (level, text) in self.game.account.settle_for_play(std::time::Duration::from_secs(10), false) {
                     self.push_log(level, text);
                 }
             }
@@ -41,19 +41,19 @@ impl Editor {
         self.plugin_ui_flush();
         // (Before the session check answers: the cached signed-in profile, as
         // the plugin store uses; Studio has the id before plugins run.)
-        let uid = self.account.user_id().unwrap_or_else(|| {
+        let uid = self.game.account.user_id().unwrap_or_else(|| {
             if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() { 0 } else { crate::plugin_store::current_user_id() }
         });
         super::settings::set_user_id(uid);
         // Plugin.GridSize / GetJoinMode read the editor's toolbar settings
         // (Play keeps them current while it runs).
-        if self.play.is_none() {
-            crate::runtime::domains::testing::set_editor_state(crate::runtime::domains::testing::EditorState {
-                snap_move: self.snap_move,
-                move_inc: self.move_inc,
-                snap_rotate: self.snap_rotate,
-                rotate_inc: self.rotate_inc,
-                local_space: self.local_space,
+        if self.game.play.is_none() {
+            rustudio_engine::runtime::domains::testing::set_editor_state(rustudio_engine::runtime::domains::testing::EditorState {
+                snap_move: self.game.snap_move,
+                move_inc: self.game.move_inc,
+                snap_rotate: self.game.snap_rotate,
+                rotate_inc: self.game.rotate_inc,
+                local_space: self.game.local_space,
                 collisions: self.collisions,
                 join_surfaces: self.join_surfaces,
             });
@@ -61,23 +61,23 @@ impl Editor {
         // GetSelectedRibbonTool reads the editor's tool; while a plugin is
         // the active tool it keeps the last ribbon tool.
         if self.plugins.active_plugin().is_none() && !matches!(self.tool, crate::app::Tool::None) {
-            crate::runtime::domains::plugin::studio::set_ribbon_tool(self.tool.label());
+            crate::plugin_host::api::studio::set_ribbon_tool(self.tool.label());
         }
         // Headless with no prompt answers scheduled: permission prompts are
         // refused instead of waiting forever.
-        let answers = self.harness.actions.iter().any(|(_, a)| matches!(a, crate::app::HarnessAction::UiAction(n) if n.starts_with("plugin-prompt:")));
-        super::permissions::set_auto_deny(self.harness.no_ui && !answers);
-        let rendering = self.play.is_none();
-        let realtime = self.fixed_dt.is_none() && !crate::sim_clock::on();
-        match self.play_saved_doc_mut() {
+        let answers = self.harness.run.input.actions.iter().any(|(_, a)| matches!(a, crate::app::HarnessAction::UiAction(n) if n.starts_with("plugin-prompt:")));
+        super::permissions::set_auto_deny(self.harness.run.no_ui && !answers);
+        let rendering = self.game.play.is_none();
+        let realtime = self.game.fixed_dt.is_none() && !rustudio_core::sim_clock::on();
+        match self.game.play_saved_doc_mut() {
             Some(doc) => {
                 // (Play holds the edit document meanwhile.)
-                let doc: *mut crate::doc::Document = doc;
-                // SAFETY: `doc` lives in self.play, which plugin_tick
+                let doc: *mut rustudio_core::doc::Document = doc;
+                // SAFETY: `doc` lives in self.game.play, which plugin_tick
                 // doesn't touch while the host runs.
                 self.plugins.tick(unsafe { &mut *doc }, dt, rendering, realtime);
             }
-            None => self.plugins.tick(&mut self.doc, dt, rendering, realtime),
+            None => self.plugins.tick(&mut self.game.doc, dt, rendering, realtime),
         }
         self.plugin_ui_after_tick();
         self.plugin_output();
@@ -96,7 +96,7 @@ impl Editor {
         for req in super::script_docs::take_requests() {
             match req {
                 super::script_docs::EditorReq::Show(script, line) => {
-                    if self.play.is_none() {
+                    if self.game.play.is_none() {
                         self.open_script.push(script);
                         if let Some(l) = line {
                             super::script_docs::set_selection(script, (l.max(1), 1, l.max(1), 1), false);
@@ -114,7 +114,7 @@ impl Editor {
                 }
                 super::EditorRequest::OpenWikiPage(url) => {
                     self.push_log(Level::Info, format!("A plugin opened {url}"));
-                    if !self.harness.no_ui {
+                    if !self.harness.run.no_ui {
                         super::prompts::open_url_later(url);
                     }
                 }

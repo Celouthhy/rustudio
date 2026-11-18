@@ -28,7 +28,7 @@ use rustudio_account::{
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 const BASEPLATE: u64 = 95206881;
 const BASEPLATE_UNIVERSE: u64 = 28220420;
@@ -223,7 +223,7 @@ impl SelfTest {
                     .map(|(s, _)| *s)
                     .collect();
                 self.cloud_note(bad.is_empty(), format!("place IDs and links parse ({} cases; wrong: {bad:?})", cases.len()));
-                if ed.account.signed_in() {
+                if ed.game.account.signed_in() {
                     ed.perform_open_cloud(BASEPLATE, None, false);
                     self.cloud_next(f, 1);
                 } else {
@@ -249,11 +249,11 @@ impl SelfTest {
             }
             // The download.
             1 => {
-                let got = ed.doc.cloud.as_ref().is_some_and(|o| o.place_id == BASEPLATE);
+                let got = ed.game.doc.cloud.as_ref().is_some_and(|o| o.place_id == BASEPLATE);
                 if !got && ed.cloud.open_error.is_none() && waited < 60 {
                     return false;
                 }
-                match ed.doc.cloud.clone().filter(|_| got) {
+                match ed.game.doc.cloud.clone().filter(|_| got) {
                     Some(o) => {
                         let ok = o.universe_id == BASEPLATE_UNIVERSE
                             && o.creator_id == TEMPLATES
@@ -262,7 +262,7 @@ impl SelfTest {
                             && o.name == "Baseplate";
                         self.cloud_note(ok, format!(
                             "opened from Roblox: {:?} place {} version {} universe {} by {} ({} {}); tab title {:?}",
-                            o.name, o.place_id, o.version, o.universe_id, o.creator_label(), o.creator_type.as_str(), o.creator_id, ed.doc.title
+                            o.name, o.place_id, o.version, o.universe_id, o.creator_label(), o.creator_type.as_str(), o.creator_id, ed.game.doc.title
                         ));
                         self.cloud.version = o.version;
                         let cached = ed.cloud.cache.cached_versions(BASEPLATE);
@@ -271,12 +271,12 @@ impl SelfTest {
                             cached.contains(&o.version) && recent == Some(BASEPLATE),
                             format!("cached versions {cached:?} at {}; first in Recent: {recent:?}", ed.cloud.cache.dir(BASEPLATE).display()),
                         );
-                        let parts = ed.doc.dom.descendants().count();
+                        let parts = ed.game.doc.dom.descendants().count();
                         self.cloud_note(parts > 5, format!("{parts} instances"));
                     }
                     None => self.cloud_note(false, format!(
                         "Baseplate didn't open in {waited} s: {:?} (cloud jobs running: {}, signed in: {})",
-                        ed.cloud.open_error, ed.cloud.busy(), ed.account.signed_in()
+                        ed.cloud.open_error, ed.cloud.busy(), ed.game.account.signed_in()
                     )),
                 }
                 self.cloud_next(f, 2);
@@ -306,7 +306,7 @@ impl SelfTest {
                     return false;
                 }
                 let e = ed.cloud.open_error.clone().unwrap_or_default();
-                let still = ed.doc.cloud.as_ref().is_some_and(|o| o.place_id == BASEPLATE);
+                let still = ed.game.doc.cloud.as_ref().is_some_and(|o| o.place_id == BASEPLATE);
                 self.cloud_note(
                     e.contains("won't give this account place 100000005") && still,
                     format!("no access: {e:?}; the open document stays: {still}"),
@@ -315,19 +315,19 @@ impl SelfTest {
             }
             // Play reports the ids.
             4 => {
-                let root = ed.doc.dom.root_ref();
-                let sss = ed.doc.find_child(root, "ServerScriptService").unwrap_or_else(|| {
-                    ed.doc.dom.insert(root, InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"))
+                let root = ed.game.doc.dom.root_ref();
+                let sss = ed.game.doc.find_child(root, "ServerScriptService").unwrap_or_else(|| {
+                    ed.game.doc.dom.insert(root, InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"))
                 });
-                ed.doc.insert(
+                ed.game.doc.insert(
                     sss,
                     InstanceBuilder::new("Script").with_name("CloudIds").with_property(
                         "Source",
                         "print(\"cloud ids\", game.PlaceId, game.GameId, game.CreatorId, game.CreatorType, game.PlaceVersion)".to_string(),
                     ),
                 );
-                self.cloud.mark = ed.log.len();
-                ed.start_play(crate::runtime::RunMode::Run);
+                self.cloud.mark = ed.game.log.len();
+                ed.start_play(rustudio_engine::runtime::RunMode::Run);
                 self.cloud_next(f, 5);
             }
             5 if since >= 30 => {
@@ -335,7 +335,7 @@ impl SelfTest {
                     "cloud ids {BASEPLATE} {BASEPLATE_UNIVERSE} {TEMPLATES} Enum.CreatorType.User {}",
                     self.cloud.version
                 );
-                let line = ed.log[self.cloud.mark.min(ed.log.len())..]
+                let line = ed.game.log[self.cloud.mark.min(ed.game.log.len())..]
                     .iter()
                     .find(|l| l.text.contains("cloud ids"))
                     .map(|l| l.text.clone());
@@ -375,17 +375,17 @@ impl SelfTest {
                 }
                 let uploads = self.mock_upload_requests();
                 let want = self.cloud.version + 2;
-                let v = ed.doc.cloud.as_ref().map(|o| o.version);
+                let v = ed.game.doc.cloud.as_ref().map(|o| o.version);
                 let upload = uploaded_bytes(&uploads, BASEPLATE, want, false);
                 let bytes_ok = upload.and_then(|bytes| Document::from_place_bytes(bytes, String::new()).ok())
                     .is_some_and(|doc| doc.dom.descendants().any(|i| i.name == "CloudIds"));
                 let ok = ed.cloud.last_saved == Some((want, VersionType::Saved))
                     && v == Some(want)
-                    && !ed.doc.dirty()
+                    && !ed.game.doc.dirty()
                     && bytes_ok;
                 self.cloud_note(ok, format!(
                     "Overwrite: saved revision {:?}, document at {v:?}, dirty={}, session upload snapshot={bytes_ok}, error {:?}",
-                    ed.cloud.last_saved, ed.doc.dirty(), ed.cloud.save_error
+                    ed.cloud.last_saved, ed.game.doc.dirty(), ed.cloud.save_error
                 ));
                 ed.ui_action(&egui::Context::default(), "publish");
                 self.cloud_next(f, 8);
@@ -400,28 +400,28 @@ impl SelfTest {
                 let published = uploads.get(3..)
                     .and_then(|requests| uploaded_bytes(requests, BASEPLATE, want, true))
                     .is_some();
-                let version = ed.doc.cloud.as_ref().map(|o| o.version);
+                let version = ed.game.doc.cloud.as_ref().map(|o| o.version);
                 self.cloud_note(
-                    complete && published && version == Some(want) && !ed.doc.dirty(),
+                    complete && published && version == Some(want) && !ed.game.doc.dirty(),
                     format!("Publish: session upload and poll={published}, result={:?}, document at {version:?}, error {:?}",
                         ed.cloud.last_saved, ed.cloud.save_error),
                 );
                 // Signed out: the cached copy reopens.
                 ed.cloud.api_override = Some(Arc::new(|| None));
-                self.cloud.mark = ed.log.len();
+                self.cloud.mark = ed.game.log.len();
                 ed.cloud.open_error = None;
                 ed.perform_open_cloud(BASEPLATE, None, false);
                 self.cloud_next(f, 9);
             }
             9 => {
-                let reopened = ed.log[self.cloud.mark.min(ed.log.len())..]
+                let reopened = ed.game.log[self.cloud.mark.min(ed.game.log.len())..]
                     .iter()
                     .any(|l| l.text.contains("this is the copy cached at"));
                 if !reopened && ed.cloud.open_error.is_none() && waited < 20 && self.cloud.mock.is_some() {
                     return false;
                 }
                 if self.cloud.mock.is_some() {
-                    let v = ed.doc.cloud.as_ref().map(|o| o.version);
+                    let v = ed.game.doc.cloud.as_ref().map(|o| o.version);
                     self.cloud_note(
                         reopened && v == Some(self.cloud.version + 3),
                         format!("signed out, reopened from the cache: {reopened} (version {v:?}); error {:?}", ed.cloud.open_error),
@@ -437,7 +437,7 @@ impl SelfTest {
                     let accepted = ed.submit_cloud_upload(AS_UNIVERSE, AS_PLACE, VersionType::Published);
                     self.cloud_note(saved_mode && published_mode && accepted.is_ok() && ed.cloud_upload_pending(),
                         format!("As routes: Saved={saved_mode}, Published={published_mode}, submission={accepted:?}"));
-                    ed.doc.insert(ed.doc.dom.root_ref(), InstanceBuilder::new("Folder").with_name("EditAfterSubmit"));
+                    ed.game.doc.insert(ed.game.doc.dom.root_ref(), InstanceBuilder::new("Folder").with_name("EditAfterSubmit"));
                     self.cloud_next(f, 10);
                     return false;
                 }
@@ -448,7 +448,7 @@ impl SelfTest {
                     return false;
                 }
                 let want = self.cloud.version + 4;
-                let linked = ed.doc.cloud.as_ref().is_some_and(|o|
+                let linked = ed.game.doc.cloud.as_ref().is_some_and(|o|
                     (o.universe_id, o.place_id, o.version) == (AS_UNIVERSE, AS_PLACE, want));
                 let recent = ed.cloud.cache.recent().first().is_some_and(|r| r.origin.place_id == AS_PLACE);
                 let uploads = self.mock_upload_requests();
@@ -461,10 +461,10 @@ impl SelfTest {
                         doc.dom.descendants().any(|i| i.name == "CloudIds")
                             && !doc.dom.descendants().any(|i| i.name == "EditAfterSubmit")
                     });
-                self.cloud_note(linked && recent && cached && snapshot && ed.doc.dirty()
+                self.cloud_note(linked && recent && cached && snapshot && ed.game.doc.dirty()
                     && ed.cloud_upload_result() == Some(&Ok(Some(want))),
                     format!("Publish As: relinked={linked}, recent={recent}, cached upload bytes={cached}, published snapshot={snapshot}, dirty={}, result={:?}",
-                        ed.doc.dirty(), ed.cloud_upload_result()));
+                        ed.game.doc.dirty(), ed.cloud_upload_result()));
                 ed.close_cloud_upload();
                 ed.ui_action(&egui::Context::default(), "save_roblox");
                 self.cloud_next(f, 11);
@@ -479,10 +479,10 @@ impl SelfTest {
                     .and_then(|requests| uploaded_bytes(requests, AS_PLACE, want, false))
                     .and_then(|bytes| Document::from_place_bytes(bytes, String::new()).ok())
                     .is_some_and(|doc| doc.dom.descendants().any(|i| i.name == "EditAfterSubmit"));
-                let linked = ed.doc.cloud.as_ref().is_some_and(|o|
+                let linked = ed.game.doc.cloud.as_ref().is_some_and(|o|
                     (o.universe_id, o.place_id, o.version) == (AS_UNIVERSE, AS_PLACE, want));
                 self.cloud_note(saved && linked && ed.cloud.last_saved == Some((want, VersionType::Saved))
-                    && !ed.doc.dirty(), format!("Save after relinking: saved later edit={saved}, linked={linked}, dirty={}", ed.doc.dirty()));
+                    && !ed.game.doc.dirty(), format!("Save after relinking: saved later edit={saved}, linked={linked}, dirty={}", ed.game.doc.dirty()));
                 self.cloud_next(f, 12);
             }
             12 => {
@@ -493,7 +493,7 @@ impl SelfTest {
                     passed: self.cloud.ok,
                     detail: std::mem::take(&mut self.cloud.notes).join("; "),
                 });
-                ed.account.drop_session();
+                ed.game.account.drop_session();
                 self.r4.phase = 94;
             }
             _ => {}

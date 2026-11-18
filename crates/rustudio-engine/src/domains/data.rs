@@ -1,6 +1,6 @@
 //! Data options. Backend parity remains incomplete: see checks/parity/data.md.
 //! Pages (DataStore*Pages, MemoryStoreHashMapPages) go through the shared
-//! Pages implementation (src/domains/pages.rs).
+//! Pages implementation (crates/rustudio-engine/src/domains/pages.rs).
 use crate::runtime::World;
 use mlua::{Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::Ref;
@@ -173,10 +173,11 @@ pub fn scratch_universe() -> u64 {
         .unwrap_or(0)
 }
 
+
 /// Whether this Play keeps DataStores, MemoryStores and Messaging in memory.
 /// A published place other than the scratch experience does, unless the
 /// user opts in (RUSTUDIO_LIVE_DATA=1 or Studio Settings > rustudio > Use
-/// live DataStores, src/rustudio_settings.rs; latched at Play start). RUSTUDIO_LOCAL_DATASTORE=1
+/// live DataStores, crates/rustudio-core/src/rustudio_settings.rs; latched at Play start). RUSTUDIO_LOCAL_DATASTORE=1
 /// (a test aid) keeps everything in memory regardless: a Play of a live game must never
 /// read-modify-write real players' saves (the local player's own save
 /// included) or publish to its live servers.
@@ -184,10 +185,9 @@ pub fn local_mode_for(universe: u64) -> bool {
     if std::env::var("RUSTUDIO_LOCAL_DATASTORE").as_deref() == Ok("1") {
         return true;
     }
-    let scratch = scratch_universe();
     universe != 0
-        && (scratch == 0 || universe != scratch)
-        && !crate::rustudio_settings::live_data()
+        && universe != scratch_universe()
+        && !rustudio_core::rustudio_settings::live_data()
 }
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
@@ -250,7 +250,7 @@ fn install_mode(lua: &Lua, local_mode: bool) -> mlua::Result<()> {
     )?;
     let report = lua.create_function(|lua, error: String| {
         if let Some(mut world) = lua.app_data_mut::<World>() {
-            world.output.push((crate::app::Level::Error, error));
+            world.output.push((rustudio_core::log::Level::Error, error));
         }
         Ok(())
     })?;
@@ -276,7 +276,7 @@ mod tests {
     use super::*;
     #[test]
     fn data_runtime_integration() {
-        use crate::doc::Document;
+        use rustudio_core::doc::Document;
         use crate::runtime::{RunMode, Runtime};
         use rbx_dom_weak::InstanceBuilder;
         let mut d = Document::new_place();

@@ -35,10 +35,10 @@ fn xy(s: &str) -> Option<Vec2> {
 
 impl Editor {
     fn ptr_path(&self, path: &str) -> Option<Ref> {
-        let mut r = self.doc.dom.root_ref();
+        let mut r = self.game.doc.dom.root_ref();
         for name in path.split('/').filter(|n| !n.is_empty()) {
-            let i = self.doc.dom.get_by_ref(r)?;
-            r = i.children().iter().copied().find(|c| self.doc.dom.get_by_ref(*c).is_some_and(|c| c.name == name))?;
+            let i = self.game.doc.dom.get_by_ref(r)?;
+            r = i.children().iter().copied().find(|c| self.game.doc.dom.get_by_ref(*c).is_some_and(|c| c.name == name))?;
         }
         Some(r)
     }
@@ -56,8 +56,8 @@ impl Editor {
                 match self.explorer.row_rects.iter().find(|(x, _)| *x == r) {
                     Some((_, rect)) => Pos2::new(rect.min.x + 60.0_f32.min(rect.width() / 2.0), rect.center().y),
                     None => {
-                        let mut a = self.doc.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or(Ref::none());
-                        while let Some(i) = self.doc.dom.get_by_ref(a) {
+                        let mut a = self.game.doc.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or(Ref::none());
+                        while let Some(i) = self.game.doc.dom.get_by_ref(a) {
                             self.explorer.expanded.insert(a);
                             a = i.parent();
                         }
@@ -91,16 +91,16 @@ impl Editor {
                 }
             }
             "view" => {
-                if !self.viewport_rect.is_finite() {
+                if !self.game.viewport_rect.is_finite() {
                     return Err("no 3D view".into());
                 }
-                self.viewport_rect.min + xy(rest).ok_or("bad X,Y")?
+                self.game.viewport_rect.min + xy(rest).ok_or("bad X,Y")?
             }
             "face" => {
                 let (path, face) = rest.rsplit_once(':').ok_or("want PATH:FACE")?;
                 let r = self.ptr_path(path).ok_or("no such instance")?;
-                let xf = crate::scene::xform_of(&self.doc, r).ok_or("not a part")?;
-                let size = crate::scene::vec3_of(self.doc.prop(r, "Size")).ok_or("no Size")?;
+                let xf = rustudio_render::scene::xform_of(&self.game.doc, r).ok_or("not a part")?;
+                let size = rustudio_render::scene::vec3_of(self.game.doc.prop(r, "Size")).ok_or("no Size")?;
                 let n = match face {
                     "Right" => glam::Vec3::X,
                     "Top" => glam::Vec3::Y,
@@ -111,10 +111,10 @@ impl Editor {
                     _ => return Err("face: Right, Top, Back, Left, Bottom or Front".into()),
                 };
                 let world = xf.pos + xf.rot * (n * size * 0.5);
-                if !self.viewport_rect.is_finite() {
+                if !self.game.viewport_rect.is_finite() {
                     return Err("no 3D view".into());
                 }
-                self.cam.project(self.viewport_rect, world).filter(|p| self.viewport_rect.contains(*p)).ok_or("face not in view")?
+                self.game.cam.project(self.game.viewport_rect, world).filter(|p| self.game.viewport_rect.contains(*p)).ok_or("face not in view")?
             }
             _ => return Err(format!("unknown target kind {kind}")),
         };

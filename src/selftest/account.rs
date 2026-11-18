@@ -19,7 +19,7 @@ use rbx_dom_weak::InstanceBuilder;
 use super::{SelfTest, Step};
 use crate::account_ui::SessionState;
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 const JACKET: u64 = 8516620262;
 const V2_HEAD_MESH: u64 = 123480233606534;
@@ -73,8 +73,8 @@ fn place(avatar: Option<u32>, dress: bool) -> Document {
 }
 
 fn character(ed: &Editor) -> Option<rbx_dom_weak::types::Ref> {
-    let ws = ed.doc.workspace()?;
-    crate::default_scripts::child_named(&ed.doc, ws, &ed.player_name())
+    let ws = ed.game.doc.workspace()?;
+    rustudio_core::default_scripts::child_named(&ed.game.doc, ws, &ed.game.player_name())
 }
 
 impl SelfTest {
@@ -85,7 +85,7 @@ impl SelfTest {
         match self.r4.phase {
             // The session, through the app's own account code.
             84 => {
-                ed.account.check_now();
+                ed.game.account.check_now();
                 self.r6 = super::R6Test {
                     started: f,
                     t0: Some(std::time::Instant::now()),
@@ -94,19 +94,19 @@ impl SelfTest {
                 self.r4.phase = 85;
             }
             85 => {
-                if matches!(ed.account.state, SessionState::Checking(_)) && waited < 45 {
+                if matches!(ed.game.account.state, SessionState::Checking(_)) && waited < 45 {
                     return false;
                 }
                 self.step_session(ed);
                 ed.set_document(place(Some(1), false));
-                ed.play_rig = Some(crate::rig::RigType::R6);
+                ed.game.play_rig = Some(rustudio_engine::rig::RigType::R6);
                 self.r6 = super::R6Test {
                     started: f,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     t0: Some(std::time::Instant::now()),
                     ..Default::default()
                 };
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 86;
             }
             // Picker R6 against a place that asks for R15.
@@ -120,11 +120,11 @@ impl SelfTest {
                 ));
                 self.r6.ok = rig == "R6" && torso && said;
                 ed.stop_play();
-                ed.play_rig = None;
+                ed.game.play_rig = None;
                 ed.set_document(place(Some(1), false));
-                self.r6.mark = ed.log.len();
+                self.r6.mark = ed.game.log.len();
                 self.r6.started = f;
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 87;
             }
             // Auto: the place's setting decides.
@@ -145,7 +145,7 @@ impl SelfTest {
             }
             // Catalog assets (needs the session).
             88 => {
-                if !ed.account.signed_in() {
+                if !ed.game.account.signed_in() {
                     self.steps.push(Step {
                         step: "catalog-assets",
                         passed: true,
@@ -157,19 +157,19 @@ impl SelfTest {
                 ed.set_document(place(Some(1), true));
                 self.r6 = super::R6Test {
                     started: f,
-                    mark: ed.log.len(),
+                    mark: ed.game.log.len(),
                     t0: Some(std::time::Instant::now()),
                     ..Default::default()
                 };
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.r4.phase = 89;
             }
             89 => {
-                let fit = character(ed).map(|m| crate::wrap::fitted(&ed.doc, m));
+                let fit = character(ed).map(|m| rustudio_render::wrap::fitted(&ed.game.doc, m));
                 let pending = !matches!(
                     fit,
-                    Some(crate::wrap::Lookup::Ready(_) | crate::wrap::Lookup::Failed(_))
-                ) || !ed.draw_cache.waiting.is_empty();
+                    Some(rustudio_render::wrap::Lookup::Ready(_) | rustudio_render::wrap::Lookup::Failed(_))
+                ) || !ed.game.draw_cache.waiting.is_empty();
                 if (pending && waited < 90) || since < 90 {
                     return false;
                 }
@@ -191,17 +191,17 @@ impl SelfTest {
         let Some(m) = character(ed) else {
             return ("no character".into(), false, false);
         };
-        let doc = &ed.doc;
+        let doc = &ed.game.doc;
         let rig = doc
             .dom
             .descendants_of(m)
             .find(|i| i.class == "Humanoid")
-            .and_then(|h| crate::scene::enum_u32(doc.prop(h.referent(), "RigType")))
+            .and_then(|h| rustudio_render::scene::enum_u32(doc.prop(h.referent(), "RigType")))
             .map(|v| if v == 0 { "R6" } else { "R15" })
             .unwrap_or("?")
             .to_string();
-        let torso = crate::default_scripts::child_named(doc, m, "Torso").is_some();
-        let said = ed.log[self.r6.mark.min(ed.log.len())..]
+        let torso = rustudio_core::default_scripts::child_named(doc, m, "Torso").is_some();
+        let said = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
             .iter()
             .any(|l| l.text.contains(line));
         (rig, torso, said)
@@ -215,7 +215,7 @@ impl SelfTest {
         let mut ok = true;
         // The cookie itself is only ever compared, never shown.
         let cookie = session::keyring_cookie().or_else(|| session::file_cookie().ok().flatten());
-        let state = ed.account.state.clone();
+        let state = ed.game.account.state.clone();
         match (&cookie, &state) {
             (Some(c), SessionState::SignedIn(who)) => {
                 notes.push(format!("signed in as {who} from the login keyring"));
@@ -264,7 +264,7 @@ impl SelfTest {
         ok &= fake_ok && cache_miss;
         // The real cookie appears nowhere the person or the checks see.
         if let Some(c) = &cookie {
-            let leaked = ed.log.iter().any(|l| c.appears_in(&l.text))
+            let leaked = ed.game.log.iter().any(|l| c.appears_in(&l.text))
                 || notes.iter().any(|n| c.appears_in(n));
             notes.push(format!("cookie in Output or results: {leaked}"));
             ok &= !leaked;
@@ -276,18 +276,18 @@ impl SelfTest {
         });
     }
 
-    fn step_catalog(&mut self, ed: &mut Editor, fit: Option<crate::wrap::Lookup>) {
+    fn step_catalog(&mut self, ed: &mut Editor, fit: Option<rustudio_render::wrap::Lookup>) {
         let mut notes = Vec::new();
         let mut ok = true;
-        let doc = &ed.doc;
+        let doc = &ed.game.doc;
         let m = character(ed);
         // The current dynamic head, drawn from its Draco mesh.
-        let head = m.and_then(|m| crate::default_scripts::child_named(doc, m, "Head"));
+        let head = m.and_then(|m| rustudio_core::default_scripts::child_named(doc, m, "Head"));
         let head_mesh = head
-            .and_then(|h| crate::scene::content_string(doc.prop(h, "MeshContent")))
+            .and_then(|h| rustudio_render::scene::content_string(doc.prop(h, "MeshContent")))
             .unwrap_or_default();
         let head_drawn = head
-            .and_then(|h| ed.renderer.as_ref()?.item_draws(h)?.first().copied())
+            .and_then(|h| ed.game.renderer.as_ref()?.item_draws(h)?.first().copied())
             .is_some_and(|d| d.custom_mesh.is_some());
         let head_ok = head_mesh.ends_with(&V2_HEAD_MESH.to_string()) && head_drawn;
         notes.push(format!(
@@ -295,7 +295,7 @@ impl SelfTest {
         ));
         ok &= head_ok;
         // The catalog garment.
-        let loaded = ed.log[self.r6.mark.min(ed.log.len())..].iter().any(|l| {
+        let loaded = ed.game.log[self.r6.mark.min(ed.game.log.len())..].iter().any(|l| {
             l.text
                 .contains("catalog jacket Jacket-HoodedWithShirt-Gray")
         });
@@ -304,7 +304,7 @@ impl SelfTest {
         ));
         ok &= loaded;
         match fit {
-            Some(crate::wrap::Lookup::Ready(fit)) => {
+            Some(rustudio_render::wrap::Lookup::Ready(fit)) => {
                 let parts: std::collections::HashSet<_> =
                     fit.pieces.iter().map(|p| p.part).collect();
                 // How much of the garment lies outside each body part's box
@@ -312,7 +312,7 @@ impl SelfTest {
                 let (mut outside, mut total) = (0usize, 0usize);
                 for p in &fit.pieces {
                     let size =
-                        crate::scene::vec3_of(doc.prop(p.part, "Size")).unwrap_or(glam::Vec3::ONE);
+                        rustudio_render::scene::vec3_of(doc.prop(p.part, "Size")).unwrap_or(glam::Vec3::ONE);
                     for v in &p.positions {
                         total += 1;
                         let h = size * 0.5;
@@ -334,7 +334,7 @@ impl SelfTest {
                 ));
                 ok &= n > 0 && hits * 10 >= n * 9 && parts.len() >= 5 && frac > 0.6;
             }
-            Some(crate::wrap::Lookup::Failed(e)) => {
+            Some(rustudio_render::wrap::Lookup::Failed(e)) => {
                 ok = false;
                 notes.push(format!("fitting failed: {e}"));
             }
@@ -365,8 +365,8 @@ impl SelfTest {
                 notes.push(format!(
                     "not fitted ({}; {tree:?})",
                     match other {
-                        Some(crate::wrap::Lookup::Pending) => "still fitting",
-                        Some(crate::wrap::Lookup::None) =>
+                        Some(rustudio_render::wrap::Lookup::Pending) => "still fitting",
+                        Some(rustudio_render::wrap::Lookup::None) =>
                             "no layered garment or no WrapTargets found",
                         _ => "no character",
                     }
@@ -374,10 +374,10 @@ impl SelfTest {
             }
         }
         if let Ok(dir) = std::env::var("RUSTUDIO_SELFTEST_SHOTS") {
-            if let Some((w, h, px)) = ed
+            if let Some((w, h, px)) = ed.game
                 .renderer
                 .as_ref()
-                .zip(ed.render_state.as_ref())
+                .zip(ed.game.render_state.as_ref())
                 .and_then(|(r, rs)| r.read_frame(rs))
             {
                 if let Some(img) = image::RgbaImage::from_raw(w, h, px) {

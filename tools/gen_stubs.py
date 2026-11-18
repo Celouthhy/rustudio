@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates src/api_stubs.rs from api-dump.json: every member a game script
+"""Generates crates/rustudio-core/src/api_stubs.rs from api-dump.json: every member a game script
 may reach (Security None; properties by their read security) with a typed
 default, so a member rustudio doesn't implement yet still exists — reads give
 the default, writes are kept, calls return the typed empty value, events are
@@ -10,14 +10,14 @@ Left out: members tagged NotScriptable, and the classes only plugins or
 Studio itself reach (names containing Plugin or Studio, and the editor
 services below).
 
-    python3 tools/gen_stubs.py            # rewrites src/api_stubs.rs
+    python3 tools/gen_stubs.py            # rewrites crates/rustudio-core/src/api_stubs.rs
 """
 import json
 import os
 
 APP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DUMP = os.path.join(APP, "api-dump.json")
-OUT = os.path.join(APP, "src", "api_stubs.rs")
+OUT = os.path.join(APP, "crates", "rustudio-core", "src", "api_stubs.rs")
 
 EDITOR_ONLY = {
     "Selection", "ChangeHistoryService", "ScriptEditorService", "DraggerService",

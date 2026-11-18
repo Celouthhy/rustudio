@@ -12,6 +12,9 @@ use super::*;
 /// RUSTUDIO_PLUGIN_DATA is process-wide, so a second folder set by another
 /// module's tests would move the files under a running test).
 pub(crate) fn temp_data() {
+    // (the engine's `__rs_…` internals are hidden in the shipped binary and
+    // in a non-test build of the engine crate; plugin tests drive them)
+    rustudio_engine::globals_parity::show_internals(true);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let dir = std::env::temp_dir().join(format!("rustudio-plugin-test-{}", std::process::id()));
@@ -429,7 +432,7 @@ fn play_copies_run_with_play_values() {
     let out = lines(&mut h);
     assert!(has(&out, "dm true false true true"), "{out:#?}");
     // A Play server: the same plugin loads again there.
-    let rt = Runtime::new().unwrap();
+    let rt = crate::studio_hooks::new_runtime().unwrap();
     rt.enter(World::new(doc.clone_for_play("p".into()), RunMode::Play));
     rt.bind_globals().unwrap();
     h.load_into_play(&rt);
@@ -515,4 +518,17 @@ fn input_object_changed_and_property_signals_fire_once_per_write() {
     frames(&mut h, &mut doc, 2);
     let out = lines(&mut h);
     assert!(has(&out, "io 1 UserInputState,Position false user_IoSignals.rbxmx.Main:9: Nope is not a valid property name."), "{out:#?}");
+}
+
+#[test]
+fn command_identity_gets_plugin_manager_interface() {
+    use rustudio_engine::runtime::security::{with_main_identity, COMMAND};
+
+    let rt = crate::studio_hooks::new_runtime().unwrap();
+    rt.enter(World::new(Document::new_place(), RunMode::Run));
+    rt.bind_globals().unwrap();
+    let class = with_main_identity(&rt.lua, COMMAND, || {
+        rt.lua.load("return PluginManager().ClassName").eval::<String>()
+    }).unwrap();
+    assert_eq!(class, "PluginManagerInterface");
 }

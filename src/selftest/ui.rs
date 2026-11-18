@@ -18,7 +18,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{key, SelfTest, Step};
 use crate::app::Editor;
-use crate::runtime::RunMode;
+use rustudio_engine::runtime::RunMode;
 use crate::studio_ui::{run_type_key, RunType};
 
 pub(super) struct UiTest {
@@ -53,10 +53,10 @@ fn press(q: &mut Vec<Event>, p: Pos2, down: bool) {
 }
 
 fn children_named(ed: &Editor, parent: Ref, name: &str) -> usize {
-    ed.doc
+    ed.game.doc
         .dom
         .get_by_ref(parent)
-        .map(|i| i.children().iter().filter(|c| ed.doc.dom.get_by_ref(**c).is_some_and(|k| k.name == name)).count())
+        .map(|i| i.children().iter().filter(|c| ed.game.doc.dom.get_by_ref(**c).is_some_and(|k| k.name == name)).count())
         .unwrap_or(0)
 }
 
@@ -66,7 +66,7 @@ impl SelfTest {
         ed.ui_rects
             .get("explorer.search")
             .map(|r| r.center() + egui::vec2(0.0, 80.0))
-            .unwrap_or(Pos2::new(ed.viewport_rect.max.x + 60.0, ed.viewport_rect.center().y))
+            .unwrap_or(Pos2::new(ed.game.viewport_rect.max.x + 60.0, ed.game.viewport_rect.center().y))
     }
 
     pub(super) fn tick_ui(&mut self, f: u64, ed: &mut Editor) -> bool {
@@ -75,7 +75,7 @@ impl SelfTest {
         match (phase, t) {
             // ------------------------------------------------ Q / E camera-relative
             (100, _) if self.ui.started == 0 => {
-                if ed.play.is_some() {
+                if ed.game.play.is_some() {
                     ed.stop_play();
                 }
                 ed.new_place();
@@ -83,18 +83,18 @@ impl SelfTest {
             }
             (100, 3) => {
                 // Looking down at 40°: camera up is far from world up.
-                ed.cam.yaw = 0.3;
-                ed.cam.pitch = -0.7;
-                ed.cam.focus = ed.cam.pos + ed.cam.forward() * 20.0;
-                self.ui.cam0 = ed.cam.pos;
-                self.ui.up0 = ed.cam.up();
+                ed.game.cam.yaw = 0.3;
+                ed.game.cam.pitch = -0.7;
+                ed.game.cam.focus = ed.game.cam.pos + ed.game.cam.forward() * 20.0;
+                self.ui.cam0 = ed.game.cam.pos;
+                self.ui.up0 = ed.game.cam.up();
                 let p = Self::off_viewport(ed);
                 self.queue.push(Event::PointerMoved(p));
                 self.queue.push(key(Key::E, true, Modifiers::NONE));
             }
             (100, 13) => self.queue.push(key(Key::E, false, Modifiers::NONE)),
             (100, 16) => {
-                let d = ed.cam.pos - self.ui.cam0;
+                let d = ed.game.cam.pos - self.ui.cam0;
                 let dir = d.normalize_or_zero();
                 let along = dir.dot(self.ui.up0);
                 let world = dir.dot(glam::Vec3::Y);
@@ -112,14 +112,14 @@ impl SelfTest {
             }
             // --------------------------------- WASD off the viewport, not while typing
             (101, 1) => {
-                self.ui.cam0 = ed.cam.pos;
+                self.ui.cam0 = ed.game.cam.pos;
                 let p = Self::off_viewport(ed);
                 self.queue.push(Event::PointerMoved(p));
                 self.queue.push(key(Key::W, true, Modifiers::NONE));
             }
             (101, 9) => self.queue.push(key(Key::W, false, Modifiers::NONE)),
             (101, 11) => {
-                self.ui.moved_free = (ed.cam.pos - self.ui.cam0).length();
+                self.ui.moved_free = (ed.game.cam.pos - self.ui.cam0).length();
                 // Focus the Explorer's search field.
                 match ed.ui_rects.get("explorer.search").map(|r| r.center()) {
                     Some(c) => press(&mut self.queue, c, true),
@@ -131,13 +131,13 @@ impl SelfTest {
                 press(&mut self.queue, c, false);
             }
             (101, 15) => {
-                self.ui.cam0 = ed.cam.pos;
+                self.ui.cam0 = ed.game.cam.pos;
                 self.queue.push(key(Key::W, true, Modifiers::NONE));
                 self.queue.push(Event::Text("w".into()));
             }
             (101, 23) => self.queue.push(key(Key::W, false, Modifiers::NONE)),
             (101, 25) => {
-                let typing_moved = (ed.cam.pos - self.ui.cam0).length();
+                let typing_moved = (ed.game.cam.pos - self.ui.cam0).length();
                 let typed = ed.explorer.filter.contains('w');
                 let passed = self.ui.moved_free > 0.3 && typing_moved < 1e-4 && typed;
                 self.steps.push(Step {
@@ -158,9 +158,9 @@ impl SelfTest {
             }
             // ------------------------------------------------------- Ctrl+Shift+V
             (102, 1) => {
-                let ws = ed.doc.default_parent();
-                self.ui.folder = ed.doc.insert(ws, InstanceBuilder::new("Folder").with_name("PasteTarget"));
-                self.ui.part = ed.doc.insert(ws, InstanceBuilder::new("Part").with_name("PasteMe"));
+                let ws = ed.game.doc.default_parent();
+                self.ui.folder = ed.game.doc.insert(ws, InstanceBuilder::new("Folder").with_name("PasteTarget"));
+                self.ui.part = ed.game.doc.insert(ws, InstanceBuilder::new("Part").with_name("PasteMe"));
                 ed.select(vec![self.ui.part]);
                 ed.run_action("copy");
                 ed.select(vec![self.ui.folder]);
@@ -192,8 +192,8 @@ impl SelfTest {
                     ),
                 });
                 self.ui.notes.clear();
-                ed.explorer.expanded.insert(ed.doc.default_parent());
-                ed.doc.selection.clear();
+                ed.explorer.expanded.insert(ed.game.doc.default_parent());
+                ed.game.doc.selection.clear();
                 self.r4.phase = 103;
                 self.ui.started = f;
             }
@@ -223,11 +223,11 @@ impl SelfTest {
                 self.queue.push(key(Key::Enter, false, Modifiers::NONE));
             }
             (103, 20) => {
-                let n = ed
+                let n = ed.game
                     .doc
                     .dom
                     .get_by_ref(self.ui.folder)
-                    .map(|i| i.children().iter().filter(|c| ed.doc.class_of(**c).as_deref() == Some("PointLight")).count())
+                    .map(|i| i.children().iter().filter(|c| ed.game.doc.class_of(**c).as_deref() == Some("PointLight")).count())
                     .unwrap_or(0);
                 self.steps.push(Step {
                     step: "explorer-plus-insert",
@@ -265,7 +265,7 @@ impl SelfTest {
                 press(&mut self.queue, c, false);
             }
             (104, 16) => {
-                let mode = ed.play.as_ref().map(|p| p.mode);
+                let mode = ed.game.play.as_ref().map(|p| p.mode);
                 self.ui.ok = mode == Some(RunMode::Run);
                 self.ui.notes.push(format!("Play button started: {:?}", mode));
                 let c = ed.ui_rects.get("test.stop").map(|r| r.center()).unwrap_or_default();
@@ -276,12 +276,12 @@ impl SelfTest {
                 press(&mut self.queue, c, false);
             }
             (104, 21) => {
-                let stopped = ed.play.is_none();
+                let stopped = ed.game.play.is_none();
                 self.ui.ok &= stopped;
                 self.ui.notes.push(format!("Stop stopped it: {stopped}"));
                 // Test Here: Play with the character at the camera.
                 ed.ui.run_type = RunType::TestHere;
-                self.ui.cam0 = ed.cam.pos;
+                self.ui.cam0 = ed.game.cam.pos;
                 let c = ed.ui_rects.get("test.play").map(|r| r.center()).unwrap_or_default();
                 press(&mut self.queue, c, true);
             }
@@ -290,8 +290,8 @@ impl SelfTest {
                 press(&mut self.queue, c, false);
             }
             (104, 26) => {
-                let mode = ed.play.as_ref().map(|p| p.mode);
-                let here = ed.play_here == Some(self.ui.cam0);
+                let mode = ed.game.play.as_ref().map(|p| p.mode);
+                let here = ed.game.play_here == Some(self.ui.cam0);
                 self.ui.ok &= mode == Some(RunMode::Play) && here;
                 self.ui.notes.push(format!("Test Here started {:?} with the spawn at the camera: {here}", mode));
                 ed.stop_play();

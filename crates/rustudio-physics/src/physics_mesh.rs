@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glam::Vec3;
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 /// Enum.CollisionFidelity values.
 pub const FIDELITY_DEFAULT: u32 = 0;
@@ -344,7 +344,7 @@ pub const SWEEP_SHRINK: f32 = 0.05;
 /// (distance, world normal). A ray that starts inside any piece misses the
 /// whole part, as it misses a box it starts in (Studio: from inside one of
 /// Doorframe_a's pieces a ray passes the pieces beside it).
-pub fn ray(p: &Pieces, xf: &crate::math::Xform, scale: Vec3, o: Vec3, dir: Vec3, len: f32) -> Option<(f32, Vec3)> {
+pub fn ray(p: &Pieces, xf: &rustudio_core::math::Xform, scale: Vec3, o: Vec3, dir: Vec3, len: f32) -> Option<(f32, Vec3)> {
     let inv = xf.rot.transpose();
     let s = scale.max(Vec3::splat(1e-6));
     let lo = (inv * (o - xf.pos)) / s;
@@ -509,41 +509,45 @@ pub fn scale(initial: Vec3, size: Vec3) -> Vec3 {
     Vec3::new(s(initial.x, size.x), s(initial.y, size.y), s(initial.z, size.z))
 }
 
+/// A one-hull blob: a 2×2×2 cube encoded as Studio does (8 vertices,
+/// 12 triangles, 23 CLERS bits from Laser Tag's Trim_Kit_A blob).
+///
+/// (runtime_ext's raycast test in the root crate builds this hull, so it is
+/// not test-only code in this crate; its own tests use it too.)
+#[cfg(any(test, feature = "test-support"))]
+pub fn cube_blob() -> Vec<u8> {
+    let verts: [[f32; 3]; 8] = [
+        [-1.0, 1.0, -1.0],
+        [1.0, 1.0, 1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, -1.0, 1.0],
+        [-1.0, -1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ];
+    let mut raw = Vec::new();
+    for v in [1u32, 8, 12, 8, 12, 0, 23, 4, 96] {
+        raw.extend(v.to_le_bytes());
+    }
+    for v in [-1.0f32, -1.0, -1.0, 1.0, 1.0, 1.0] {
+        raw.extend(v.to_bits().to_le_bytes());
+    }
+    // The CLERS word of Laser Tag's blob 26 (one partial word).
+    raw.extend(0x0014_5bb7u32.to_le_bytes());
+    for v in verts.iter().flatten() {
+        raw.extend(v.to_bits().to_le_bytes());
+    }
+    let mut blob = b"CSGPHS".to_vec();
+    blob.extend(8u32.to_le_bytes());
+    blob.extend([2u8, 0]);
+    blob.extend(zstd::stream::encode_all(&raw[..], 3).unwrap());
+    blob
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// A one-hull blob: a 2×2×2 cube encoded as Studio does (8 vertices,
-    /// 12 triangles, 23 CLERS bits from Laser Tag's Trim_Kit_A blob).
-    pub(crate) fn cube_blob() -> Vec<u8> {
-        let verts: [[f32; 3]; 8] = [
-            [-1.0, 1.0, -1.0],
-            [1.0, 1.0, 1.0],
-            [1.0, 1.0, -1.0],
-            [-1.0, -1.0, -1.0],
-            [1.0, -1.0, -1.0],
-            [1.0, -1.0, 1.0],
-            [-1.0, -1.0, 1.0],
-            [-1.0, 1.0, 1.0],
-        ];
-        let mut raw = Vec::new();
-        for v in [1u32, 8, 12, 8, 12, 0, 23, 4, 96] {
-            raw.extend(v.to_le_bytes());
-        }
-        for v in [-1.0f32, -1.0, -1.0, 1.0, 1.0, 1.0] {
-            raw.extend(v.to_bits().to_le_bytes());
-        }
-        // The CLERS word of Laser Tag's blob 26 (one partial word).
-        raw.extend(0x0014_5bb7u32.to_le_bytes());
-        for v in verts.iter().flatten() {
-            raw.extend(v.to_bits().to_le_bytes());
-        }
-        let mut blob = b"CSGPHS".to_vec();
-        blob.extend(8u32.to_le_bytes());
-        blob.extend([2u8, 0]);
-        blob.extend(zstd::stream::encode_all(&raw[..], 3).unwrap());
-        blob
-    }
 
     #[test]
     fn decodes_a_one_hull_blob() {

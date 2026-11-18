@@ -10,9 +10,9 @@ use egui::{Event, Key, Modifiers, PointerButton, Vec2};
 
 use super::{key, SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::play::game::game_menu::MenuPage;
-use crate::runtime::Side;
+use rustudio_engine::runtime::Side;
 
 /// Every page the hover sweep visits, in order.
 const PAGES: [MenuPage; 7] = [
@@ -40,17 +40,17 @@ impl SelfTest {
     /// Phases 254..=255.
     pub(super) fn tick_pause_menu(&mut self, f: u64, ed: &mut Editor) -> bool {
         let t = f.saturating_sub(self.pmenu.started);
-        let vp = ed.viewport_rect;
+        let vp = ed.game.viewport_rect;
         match self.r4.phase {
             254 if self.pmenu.started == 0 => {
                 ed.set_document(Document::new_place());
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.pmenu = PauseMenuTest { started: f, ok: true, ..Default::default() };
             }
             // A client script holds LockCenter every frame (Place A does in a round)
             // and counts GuiService's menu signals.
             254 if t == 60 => {
-                let err = ed.run_luau(
+                let err = ed.game.run_luau(
                     Side::Client,
                     r#"
                     local UIS = game:GetService("UserInputService")
@@ -74,10 +74,10 @@ impl SelfTest {
                 self.queue.push(Event::PointerMoved(vp.center()));
             }
             254 if t == 80 => {
-                let held = ed.game_grab.is_some();
+                let held = ed.game.game_grab.is_some();
                 self.pmenu.ok &= held;
                 self.pmenu.notes.push(format!("LockCenter before the menu: grab held {held}"));
-                ed.cursor_log.clear();
+                ed.game.cursor_log.clear();
                 self.queue.push(key(Key::Escape, true, Modifiers::NONE));
                 self.queue.push(key(Key::Escape, false, Modifiers::NONE));
             }
@@ -86,12 +86,12 @@ impl SelfTest {
                 self.queue.push(Event::MouseMoved(Vec2::new(15.0, 0.0)));
             }
             254 if t == 110 => {
-                let open = ed.play.as_ref().is_some_and(|s| s.game.menu_open);
-                let released = ed.game_grab.is_none();
-                let shown = !ed.game_cursor_hidden;
-                let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
-                let log = ed.cursor_log.clone();
-                let err = ed.run_luau(
+                let open = ed.game.play.as_ref().is_some_and(|s| s.game.menu_open);
+                let released = ed.game.game_grab.is_none();
+                let shown = !ed.game.game_cursor_hidden;
+                let mb = ed.game.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
+                let log = ed.game.cursor_log.clone();
+                let err = ed.game.run_luau(
                     Side::Client,
                     "assert(game:GetService('GuiService').MenuIsOpen, 'MenuIsOpen false'); assert(_G.__menuOpened == 1, 'MenuOpened ' .. _G.__menuOpened)",
                 );
@@ -101,7 +101,7 @@ impl SelfTest {
                     "Esc: menu open {open}, grab released {released}, cursor shown {shown}, MouseBehavior still {mb} (LockCenter 1), cursor commands {log:?}, GuiService check {}",
                     err.as_deref().unwrap_or("ok")
                 ));
-                ed.cursor_log.clear();
+                ed.game.cursor_log.clear();
                 self.r4.phase = 255;
                 self.pmenu.started = f;
             }
@@ -112,7 +112,7 @@ impl SelfTest {
                 let k = (t / PAGE_FRAMES) as usize;
                 let at = t % PAGE_FRAMES;
                 if k >= PAGES.len() {
-                    let err = ed.run_luau(
+                    let err = ed.game.run_luau(
                         Side::Client,
                         &format!("assert(_G.__rmbEnded == {n} and _G.__rmbBegan == 0, ('right button in the menu: %d began, %d ended processed'):format(_G.__rmbBegan, _G.__rmbEnded))", n = PAGES.len()),
                     );
@@ -121,21 +121,21 @@ impl SelfTest {
                         "right-drags in the menu: presses unheard, releases end processed: {}",
                         err.as_deref().unwrap_or("ok")
                     ));
-                    if let Some(s) = ed.play.as_mut() {
+                    if let Some(s) = ed.game.play.as_mut() {
                         s.game.menu.page = MenuPage::People;
                     }
-                    ed.cursor_log.clear();
+                    ed.game.cursor_log.clear();
                     self.pmenu.swept = true;
                     self.pmenu.started = f;
                     return false;
                 }
                 let page = PAGES[k];
                 if at == 0 {
-                    if let Some(s) = ed.play.as_mut() {
+                    if let Some(s) = ed.game.play.as_mut() {
                         s.game.menu.page = page;
                     }
                 }
-                let area = ed.play.as_ref().and_then(|s| {
+                let area = ed.game.play.as_ref().and_then(|s| {
                     let r = &s.game.menu.rects;
                     if matches!(page, MenuPage::ConfirmReset | MenuPage::ConfirmLeave) {
                         r.get("container").copied()
@@ -173,18 +173,18 @@ impl SelfTest {
                     (3..=26, None) => {
                         self.pmenu.ok = false;
                         self.pmenu.notes.push(format!("{page:?}: no page drawn"));
-                        if let Some(s) = ed.play.as_mut() {
+                        if let Some(s) = ed.game.play.as_mut() {
                             s.game.menu.page = PAGES[(k + 1).min(PAGES.len() - 1)];
                         }
                         self.pmenu.started = f - (k as u64 + 1) * PAGE_FRAMES;
                     }
                     (36, _) => {
-                        let open = ed.play.as_ref().is_some_and(|s| s.game.menu_open);
-                        let shown = ed.play.as_ref().map(|s| s.game.menu.page);
-                        let free = ed.game_grab.is_none() && ed.look_grab.is_none();
-                        let visible = !ed.game_cursor_hidden;
-                        let mb = ed.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
-                        let log = std::mem::take(&mut ed.cursor_log);
+                        let open = ed.game.play.as_ref().is_some_and(|s| s.game.menu_open);
+                        let shown = ed.game.play.as_ref().map(|s| s.game.menu.page);
+                        let free = ed.game.game_grab.is_none() && ed.game.look_grab.is_none();
+                        let visible = !ed.game.game_cursor_hidden;
+                        let mb = ed.game.play.as_ref().map(|s| s.mouse_behavior).unwrap_or(9);
+                        let log = std::mem::take(&mut ed.game.cursor_log);
                         let grabbed = log.iter().any(|l| l.contains("grab") && !l.ends_with(":none") && !l.ends_with(":menu"));
                         let ok = open && shown == Some(page) && free && visible && !grabbed && mb == 1;
                         self.pmenu.ok &= ok;
@@ -197,7 +197,7 @@ impl SelfTest {
             }
             // Resume, clicked where the menu drew it.
             255 if t == 10 => {
-                match ed.play.as_ref().and_then(|s| s.game.menu.rects.get("resume").copied()) {
+                match ed.game.play.as_ref().and_then(|s| s.game.menu.rects.get("resume").copied()) {
                     Some(r) => {
                         let p = r.center();
                         self.queue.push(Event::PointerMoved(p));
@@ -217,10 +217,10 @@ impl SelfTest {
                 }
             }
             255 if t == 40 => {
-                let open = ed.play.as_ref().is_some_and(|s| s.game.menu_open);
-                let held = ed.game_grab.is_some();
-                let log = ed.cursor_log.clone();
-                let err = ed.run_luau(
+                let open = ed.game.play.as_ref().is_some_and(|s| s.game.menu_open);
+                let held = ed.game.game_grab.is_some();
+                let log = ed.game.cursor_log.clone();
+                let err = ed.game.run_luau(
                     Side::Client,
                     "assert(not game:GetService('GuiService').MenuIsOpen, 'MenuIsOpen true'); assert(_G.__menuClosed == 1, 'MenuClosed ' .. _G.__menuClosed)",
                 );

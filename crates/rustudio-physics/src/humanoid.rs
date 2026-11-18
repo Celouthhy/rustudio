@@ -17,7 +17,7 @@
 
 use glam::{Mat3, Vec3};
 
-use crate::rig::State;
+use rustudio_core::body::State;
 
 // ---------------------------------------------------------------- constants
 

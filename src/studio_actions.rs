@@ -7,9 +7,9 @@ use egui::{Rect, RichText, Sense, Vec2};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::app::{Editor, PendingAction, Tab, Tool};
-use crate::render::MeshKind;
+use rustudio_render::render::MeshKind;
 use crate::studio_ui::{menu_rect_key, menu_shortcuts, RunType, MENUS, M};
-use crate::theme;
+use rustudio_engine::theme;
 
 /// Studio's File menu is 233 px wide (checks/ui/studio/menu-File.png);
 /// the account menu uses this width.
@@ -31,7 +31,7 @@ pub(crate) fn menu_item_at(ui: &mut egui::Ui, label: &str, shortcut: &str, enabl
     let c = if enabled { theme::TEXT } else { theme::TEXT_DIM };
     if checked == Some(true) {
         let cr = Rect::from_center_size(egui::pos2(r.min.x + 11.0, r.center().y), Vec2::splat(14.0));
-        crate::ti::paint(p, cr, "check", c);
+        rustudio_engine::ti::paint(p, cr, "check", c);
     }
     let font = egui::FontId::proportional(13.0);
     p.text(egui::pos2(r.min.x + 24.0, r.center().y), egui::Align2::LEFT_CENTER, label, font.clone(), c);
@@ -69,16 +69,16 @@ fn sub_label(label: &str) -> egui::RichText {
 impl Editor {
     /// (enabled, checked) of a menu / ribbon action.
     pub fn action_state(&self, a: &str) -> (bool, Option<bool>) {
-        let sel = !self.doc.selection.is_empty();
+        let sel = !self.game.doc.selection.is_empty();
         let parts = !self.selected_parts().is_empty();
-        let playing = self.play.is_some();
+        let playing = self.game.play.is_some();
         let edit = !playing;
         let open = |n: &str| Some(self.ui.panels_open.contains(n));
         match a {
             "new" | "open" | "open_roblox" | "open_folder" | "close_place" | "import_model" => (edit, None),
             "save" | "save_as" => (edit, None),
             "save_roblox" | "save_roblox_as" | "publish" | "publish_as" => {
-                (edit && self.doc.kind == crate::doc::DocKind::Place, None)
+                (edit && self.game.doc.kind == rustudio_core::doc::DocKind::Place, None)
             }
             "export_project" => (edit, None),
             "project_settings" => (edit && self.project.is_some(), None),
@@ -93,25 +93,25 @@ impl Editor {
             "about" | "exit" | "studio_settings" => (true, None),
             "customize_shortcuts" => (true, Some(self.plugin_bar.shortcuts.open)),
             a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") => (true, None),
-            "undo" => (edit && self.doc.can_undo().is_some(), None),
-            "redo" => (edit && self.doc.can_redo().is_some(), None),
+            "undo" => (edit && self.game.doc.can_undo().is_some(), None),
+            "redo" => (edit && self.game.doc.can_redo().is_some(), None),
             "cut" | "copy" | "duplicate" | "delete" => (edit && sel, None),
             "paste" | "paste_original" => (edit && self.clipboard.is_some(), None),
             "paste_into" | "paste_into_original" => (edit && self.clipboard.is_some() && sel, None),
             "group" | "group_folder" => (edit && sel, None),
             "ungroup" => (
-                edit && self
+                edit && self.game
                     .doc
                     .selection
                     .iter()
-                    .any(|r| matches!(self.doc.class_of(*r).as_deref(), Some("Model" | "Folder"))),
+                    .any(|r| matches!(self.game.doc.class_of(*r).as_deref(), Some("Model" | "Folder"))),
                 None,
             ),
             "lock" => (edit && parts, Some(parts && self.all_parts("Locked"))),
             "anchor" => (edit && parts, Some(parts && self.all_parts("Anchored"))),
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
-            "full_screen" => (true, Some(self.ui.fullscreen)),
+            "full_screen" => (true, Some(self.game.fullscreen)),
             "show_grid" => (true, Some(self.show_grid)),
             "align_dragged" => (true, Some(self.align_dragged)),
             "dragger_menu" | "dragger_physical" | "dragger_geometric" => (true, None),
@@ -120,11 +120,11 @@ impl Editor {
             "grid_16" => (self.show_grid, Some(self.ui.grid_size == 16.0)),
             "show_ui" => (true, Some(self.ui.show_gui)),
             "screenshot" => (true, None),
-            "mute" => (true, Some(crate::audio::muted())),
+            "mute" => (true, Some(rustudio_engine::audio::muted())),
             "test" | "test_here" | "run" => (!playing, None),
             "break_never" => (false, Some(true)),
             "toggle_client_server" => (
-                self.play.as_ref().is_some_and(|p| p.mode == crate::runtime::RunMode::Play),
+                self.game.play.as_ref().is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Play),
                 None,
             ),
             "stop" => (playing, None),
@@ -157,26 +157,26 @@ impl Editor {
     pub fn all_parts(&self, prop: &str) -> bool {
         self.selected_parts()
             .iter()
-            .all(|r| matches!(self.doc.prop(*r, prop), Some(Variant::Bool(true))))
+            .all(|r| matches!(self.game.doc.prop(*r, prop), Some(Variant::Bool(true))))
     }
 
     /// Where a UI-tab insert goes: the first selected LayerCollector or GuiObject.
     pub fn gui_target(&self) -> Option<Ref> {
-        self.doc.selection.iter().copied().find(|r| {
-            self.doc
+        self.game.doc.selection.iter().copied().find(|r| {
+            self.game.doc
                 .class_of(*r)
-                .is_some_and(|c| crate::doc::is_a(&c, "GuiObject") || crate::doc::is_a(&c, "LayerCollector"))
+                .is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiObject") || rustudio_core::doc::is_a(&c, "LayerCollector"))
         })
     }
 
     /// Inserts go into the first selected object, else Workspace (Studio).
     pub fn insert_parent(&self) -> Ref {
-        self.doc.selection.first().copied().unwrap_or(self.doc.default_parent())
+        self.game.doc.selection.first().copied().unwrap_or(self.game.doc.default_parent())
     }
 
     fn service(&self, name: &str) -> Ref {
-        let root = self.doc.dom.root_ref();
-        self.doc.find_child(root, name).unwrap_or(self.doc.default_parent())
+        let root = self.game.doc.dom.root_ref();
+        self.game.doc.find_child(root, name).unwrap_or(self.game.doc.default_parent())
     }
 
     fn set_on_parts(&mut self, label: &str, prop: &str, v: bool) {
@@ -185,7 +185,7 @@ impl Editor {
             .into_iter()
             .map(|r| (r, rbx_dom_weak::ustr(prop), Variant::Bool(v)))
             .collect();
-        self.doc.set_props(label, edits, None);
+        self.game.doc.set_props(label, edits, None);
     }
 
     /// Runs a menu or ribbon action (disabled ones do nothing).
@@ -203,7 +203,7 @@ impl Editor {
             "project_settings" => self.open_settings_dialog(),
             "open_roblox" => {
                 self.cloud.open = true;
-                let client = self.account.shared_client();
+                let client = self.game.account.shared_client();
                 let tab = self.cloud.tab;
                 self.cloud.refresh(client, tab);
             }
@@ -212,7 +212,7 @@ impl Editor {
             a if a.starts_with("character:") => self.character_action(&a["character:".len()..]),
             // "Save to File": a place from Roblox goes to a file too (Ctrl+S
             // saves it to Roblox).
-            "save" if self.doc.cloud.is_some() || self.live_team_create_ids().is_some() => match self.doc.path.clone() {
+            "save" if self.game.doc.cloud.is_some() || self.live_team_create_ids().is_some() => match self.game.doc.path.clone() {
                 Some(p) => self.save_to(p),
                 None => self.save_as(),
             },
@@ -224,19 +224,19 @@ impl Editor {
                     "publish" | "publish_as" => VersionType::Published,
                     _ => VersionType::Saved,
                 };
-                let linked = self.doc.cloud.is_some() || self.live_team_create_ids().is_some();
+                let linked = self.game.doc.cloud.is_some() || self.live_team_create_ids().is_some();
                 if matches!(a, "save_roblox_as" | "publish_as") || !linked {
                     self.open_roblox_destination(vt);
-                } else if self.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
+                } else if self.game.doc.cloud.as_ref().is_some_and(|o| o.local_copy) {
                     self.cloud.confirm_copy_save = Some(vt);
                 } else {
                     self.save_cloud(vt, false);
                 }
             }
-            "account" => self.account.open = true,
+            "account" => self.game.account.open = true,
             "add_account" => {
-                self.account.open = true;
-                self.account.adding = true;
+                self.game.account.open = true;
+                self.game.account.adding = true;
             }
             "experience_settings" => self.cloud.settings_open = true,
             "avatar_settings" => self.ui.panel_requests.push((Tab::AvatarSettings, None)),
@@ -262,8 +262,8 @@ impl Editor {
             "paste_original" => self.run_action("paste"),
             "paste_into_original" => self.run_action("paste_into"),
             "group_folder" => {
-                let sel = self.doc.selection.clone();
-                if let Some(f) = self.doc.group_as(&sel, "Folder") {
+                let sel = self.game.doc.selection.clone();
+                if let Some(f) = self.game.doc.group_as(&sel, "Folder") {
                     self.select(vec![f]);
                 }
             }
@@ -276,19 +276,19 @@ impl Editor {
                 self.set_on_parts("Anchor", "Anchored", on);
             }
             "unlock_all" => {
-                let edits: Vec<_> = self
+                let edits: Vec<_> = self.game
                     .doc
                     .dom
                     .descendants()
-                    .filter(|i| crate::doc::is_a(i.class.as_str(), "BasePart"))
+                    .filter(|i| rustudio_core::doc::is_a(i.class.as_str(), "BasePart"))
                     .map(|i| (i.referent(), rbx_dom_weak::ustr("Locked"), Variant::Bool(false)))
                     .collect();
-                self.doc.set_props("Unlock All", edits, None);
+                self.game.doc.set_props("Unlock All", edits, None);
             }
             "select_all" => {
                 // Studio: everything directly in Workspace but the camera and terrain.
-                if let Some(ws) = self.doc.workspace() {
-                    let kids: Vec<Ref> = self
+                if let Some(ws) = self.game.doc.workspace() {
+                    let kids: Vec<Ref> = self.game
                         .doc
                         .dom
                         .get_by_ref(ws)
@@ -296,7 +296,7 @@ impl Editor {
                         .unwrap_or_default();
                     let all = kids
                         .into_iter()
-                        .filter(|r| !matches!(self.doc.class_of(*r).as_deref(), Some("Camera" | "Terrain")))
+                        .filter(|r| !matches!(self.game.doc.class_of(*r).as_deref(), Some("Camera" | "Terrain")))
                         .collect();
                     self.select(all);
                 }
@@ -304,8 +304,8 @@ impl Editor {
             "zoom_in" => self.ui.zoom = (self.ui.zoom + 0.1).min(2.0),
             "zoom_out" => self.ui.zoom = (self.ui.zoom - 0.1).max(0.6),
             "full_screen" => {
-                self.ui.fullscreen = !self.ui.fullscreen;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.ui.fullscreen));
+                self.game.fullscreen = !self.game.fullscreen;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.game.fullscreen));
             }
             "show_grid" => self.show_grid = !self.show_grid,
             "align_dragged" => self.align_dragged = !self.align_dragged,
@@ -317,7 +317,7 @@ impl Editor {
             "grid_16" => self.ui.grid_size = 16.0,
             "show_ui" => self.ui.show_gui = !self.ui.show_gui,
             "screenshot" => {
-                let dir = crate::paths::pictures();
+                let dir = rustudio_core::paths::pictures();
                 let _ = std::fs::create_dir_all(&dir);
                 let secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -327,9 +327,9 @@ impl Editor {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
             "mute" => {
-                let on = !crate::audio::muted();
-                crate::audio::set_muted_global(on);
-                if let Some(s) = self.play.as_mut() {
+                let on = !rustudio_engine::audio::muted();
+                rustudio_engine::audio::set_muted_global(on);
+                if let Some(s) = self.game.play.as_mut() {
                     s.game.set_muted(on);
                 }
             }
@@ -340,9 +340,9 @@ impl Editor {
             // Play in front (Explorer, viewport, the plugins' toolbars and
             // widgets); each Play still starts on the client.
             "toggle_client_server" => {
-                let side = match self.play.as_ref().map(|p| p.showing) {
-                    Some(crate::runtime::Side::Client) => crate::runtime::Side::Server,
-                    _ => crate::runtime::Side::Client,
+                let side = match self.game.play.as_ref().map(|p| p.showing) {
+                    Some(rustudio_engine::runtime::Side::Client) => rustudio_engine::runtime::Side::Server,
+                    _ => rustudio_engine::runtime::Side::Client,
                 };
                 self.show_play_side(side);
             }
@@ -371,13 +371,13 @@ impl Editor {
                 if let Some(q) = rest.strip_prefix("find:") {
                     self.plugin_store.ui.find = true;
                     self.plugin_store.ui.query = q.to_string();
-                    let client = self.account.shared_client();
+                    let client = self.game.account.shared_client();
                     self.plugin_store.search(client, q.to_string());
                 } else if let Some(id) = rest.strip_prefix("perms:") {
                     self.plugin_store.ui.perms_page = Some(id.to_string());
                 } else if let Some((on, id)) = rest.strip_prefix("enable:").map(|i| (true, i)).or_else(|| rest.strip_prefix("disable:").map(|i| (false, i))) {
                     // The Enabled switch on a plugin's card.
-                    let client = self.account.shared_client();
+                    let client = self.game.account.shared_client();
                     self.plugin_store.set_enabled(client, id, on);
                 }
             }
@@ -400,7 +400,7 @@ impl Editor {
             }
             "script" => {
                 // Into the selection, else ServerScriptService (Studio's Script button).
-                let p = match self.doc.selection.first() {
+                let p = match self.game.doc.selection.first() {
                     Some(r) => *r,
                     None => self.service("ServerScriptService"),
                 };
@@ -418,13 +418,13 @@ impl Editor {
                     .with_name("WeldConstraint")
                     .with_property("Part0", Variant::Ref(p0))
                     .with_property("Part1", Variant::Ref(p1));
-                let w = self.doc.insert(p0, builder);
+                let w = self.game.doc.insert(p0, builder);
                 self.select(vec![w]);
             }
             other => {
                 if let Some(class) = other.strip_prefix("class:") {
                     let class = class.to_string();
-                    let gui_class = class.starts_with("UI") || crate::doc::is_a(&class, "GuiObject");
+                    let gui_class = class.starts_with("UI") || rustudio_core::doc::is_a(&class, "GuiObject");
                     match self.gui_target().filter(|_| gui_class) {
                         Some(t) => self.insert_class(&class, t),
                         None => {
@@ -442,11 +442,11 @@ impl Editor {
     /// local Plugins folder, named after the first selected object, then
     /// loaded at once (Studio).
     pub fn save_local_plugin(&mut self) {
-        if self.doc.selection.is_empty() {
+        if self.game.doc.selection.is_empty() {
             self.warn("Select the plugin's objects in the Explorer first");
             return;
         }
-        let name = self.doc.dom.get_by_ref(self.doc.selection[0]).map(|i| i.name.to_string()).unwrap_or_else(|| "Plugin".into());
+        let name = self.game.doc.dom.get_by_ref(self.game.doc.selection[0]).map(|i| i.name.to_string()).unwrap_or_else(|| "Plugin".into());
         let _ = self.plugin_store.store.ensure_plugins_dir();
         let default = self.plugin_store.store.local_save_path(&name, "rbxmx");
         if std::env::var_os("RUSTUDIO_NO_DIALOGS").is_some() {
@@ -458,14 +458,14 @@ impl Editor {
             .add_filter("Roblox model", &["rbxmx", "rbxm"])
             .set_directory(&self.plugin_store.store.plugins_dir)
             .set_file_name(default.file_name().unwrap().to_string_lossy());
-        self.dialogs.start(Purpose::SaveLocalPlugin(self.doc.selection.clone()), d, Kind::SaveFile);
+        self.dialogs.start(Purpose::SaveLocalPlugin(self.game.doc.selection.clone()), d, Kind::SaveFile);
     }
 
     /// Writes the selection to `path` as a local plugin and loads it.
     pub fn save_local_plugin_to(&mut self, path: std::path::PathBuf) {
-        let sel = self.doc.selection.clone();
+        let sel = self.game.doc.selection.clone();
         let xml = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rbxmx"));
-        let bytes = match self.doc.encode(&self.doc.top_level(&sel), xml) {
+        let bytes = match self.game.doc.encode(&self.game.doc.top_level(&sel), xml) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Save as Local Plugin: {e}")),
         };
@@ -478,43 +478,43 @@ impl Editor {
     /// creator; new plugin or overwrite one the account owns), then the
     /// upload through the session.
     pub fn publish_as_plugin(&mut self) {
-        if self.doc.selection.is_empty() {
+        if self.game.doc.selection.is_empty() {
             self.warn("Select the plugin's objects in the Explorer first");
             return;
         }
-        if !self.account.signed_in() {
+        if !self.game.account.signed_in() {
             self.warn("Sign in to publish a plugin (File > Account)");
             return;
         }
-        let sel = self.doc.top_level(&self.doc.selection.clone());
-        let rbxm = match self.doc.encode(&sel, false) {
+        let sel = self.game.doc.top_level(&self.game.doc.selection.clone());
+        let rbxm = match self.game.doc.encode(&sel, false) {
             Ok(b) => b,
             Err(e) => return self.error(format!("Publish as Plugin: {e}")),
         };
-        let name = self.doc.dom.get_by_ref(sel[0]).map(|i| i.name.to_string()).unwrap_or_default();
-        let creator = self.account.shared_client().and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.who()))).unwrap_or_default();
+        let name = self.game.doc.dom.get_by_ref(sel[0]).map(|i| i.name.to_string()).unwrap_or_default();
+        let creator = self.game.account.shared_client().and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.who()))).unwrap_or_default();
         self.plugin_store.ui.publish = Some(crate::plugin_store::ui::PublishDialog { name, description: String::new(), creator, overwrite: String::new(), rbxm, error: None });
     }
 
     /// Starts the selected kind of test session (Studio's Play button).
     pub fn start_run(&mut self, t: RunType) {
-        use crate::runtime::RunMode;
-        if self.play.is_some() || !t.available() {
+        use rustudio_engine::runtime::RunMode;
+        if self.game.play.is_some() || !t.available() {
             return;
         }
         self.ui.run_type = t;
         match t {
             RunType::Test => {
-                self.play_here = None;
+                self.game.play_here = None;
                 self.start_play(RunMode::Play);
             }
             RunType::TestHere => {
                 // The character starts where the camera is (Studio's Test Here).
-                self.play_here = Some(self.cam.pos);
+                self.game.play_here = Some(self.game.cam.pos);
                 self.start_play(RunMode::Play);
             }
             RunType::Run => {
-                self.play_here = None;
+                self.game.play_here = None;
                 self.start_play(RunMode::Run);
             }
             RunType::ServerClients => {}
@@ -541,10 +541,10 @@ impl Editor {
                 self.ui_rects.insert(menu_rect_key(title), r.response.rect);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let dirty = if self.doc.dirty() { " •" } else { "" };
+                let dirty = if self.game.doc.dirty() { " •" } else { "" };
                 // A place from Roblox: its experience and creator, and
                 // whether Team Create is on (File > Experience Settings).
-                let cloud = match &self.doc.cloud {
+                let cloud = match &self.game.doc.cloud {
                     Some(o) => {
                         let tc = match self.cloud.status.as_ref().filter(|(u, _)| *u == o.universe_id) {
                             Some((_, s)) if s.enabled == Some(true) => " · Team Create on",
@@ -554,8 +554,8 @@ impl Editor {
                     }
                     None => String::new(),
                 };
-                let r = ui.label(RichText::new(format!("{}{dirty}{cloud} - rustudio", self.doc.title)).color(theme::TEXT_DIM));
-                if let Some((_, s)) = self.cloud.status.as_ref().filter(|_| self.doc.cloud.is_some()) {
+                let r = ui.label(RichText::new(format!("{}{dirty}{cloud} - rustudio", self.game.doc.title)).color(theme::TEXT_DIM));
+                if let Some((_, s)) = self.cloud.status.as_ref().filter(|_| self.game.doc.cloud.is_some()) {
                     r.on_hover_text(s.describe());
                 }
             });
@@ -624,9 +624,9 @@ impl Editor {
     /// and writes changed settings.
     pub fn studio_settings_ui(&mut self, ctx: &egui::Context) {
         if self.ui.studio_settings.open {
-            let instances = self.doc.dom.descendants_of(self.doc.dom.root_ref()).count() as i64;
-            let (models, players) = match self.play.as_ref() {
-                Some(p) if p.mode == crate::runtime::RunMode::Play => (3, 1),
+            let instances = self.game.doc.dom.descendants_of(self.game.doc.dom.root_ref()).count() as i64;
+            let (models, players) = match self.game.play.as_ref() {
+                Some(p) if p.mode == rustudio_engine::runtime::RunMode::Play => (3, 1),
                 Some(_) => (2, 0),
                 None => (1, 0),
             };
@@ -634,7 +634,7 @@ impl Editor {
         }
         self.ui.studio_settings.ui(ctx);
         crate::studio_settings::tick();
-        crate::rustudio_settings::tick();
+        rustudio_core::rustudio_settings::tick();
     }
 
     /// File > About rustudio.
@@ -650,7 +650,7 @@ impl Editor {
             .show(ctx, |ui| {
                 crate::icons::logo(ui, 32.0);
                 ui.label(RichText::new(format!("rustudio {}", env!("CARGO_PKG_VERSION"))).strong());
-                ui.label("A native Linux editor for Roblox places. Not made by Roblox.");
+                ui.label("A native editor for Roblox places. Not made by Roblox.");
                 ui.label("Icons: Tabler Icons (MIT). See CREDITS.md.");
             });
         self.ui.about = open;

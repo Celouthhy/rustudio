@@ -1,10 +1,10 @@
 //! Resolve Roblox Sound/SoundGroup properties without coupling the mixer to the DOM.
-use crate::{
-    audio_dsp::{rolloff, Effect, Settings},
+use crate::audio_dsp::{rolloff, Effect, Settings};
+use rustudio_core::{
     doc::{self, Document},
     math::Xform,
-    scene::{self, xform_of},
 };
+use rustudio_render::scene::{self, xform_of};
 use glam::{Mat3, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
 fn number(d: &Document, r: Ref, k: &str, default: f32) -> f32 {

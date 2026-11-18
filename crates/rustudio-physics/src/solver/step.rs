@@ -290,8 +290,8 @@ impl StudioSolver {
         // stops there): `ExternalHooks`.
         let hooks = ExternalHooks { inner: hooks, class: &self.shape_class };
         input_hash(self, world);
-        let ((), c0) = crate::bench::measure(|| world.detect_collisions(&hooks, events));
-        let ((), c1) = crate::bench::measure(|| {
+        let ((), c0) = rustudio_core::bench::measure(|| world.detect_collisions(&hooks, events));
+        let ((), c1) = rustudio_core::bench::measure(|| {
             self.bodies.gather(&world.bodies);
             // SLEEP §1 step 2: preContactStepSleepStage (wakes, state 2 → 3).
             self.sleep.pre_contact(&mut self.bodies, &super::sleep::World { contacts: &self.contacts, joints: &self.joints, rb: &world.bodies, colliders: &world.colliders, np: &world.narrow_phase }, phase);
@@ -311,7 +311,7 @@ impl StudioSolver {
                 }
             }
         });
-        let ((), c2) = crate::bench::measure(|| {
+        let ((), c2) = rustudio_core::bench::measure(|| {
             self.islands.build(&mut self.bodies, &self.contacts.list, &self.joints);
             self.islands.set_due(phase);
             // JOINTS: force items (JOINT I.14) on body A's own solve tick, and the
@@ -321,12 +321,12 @@ impl StudioSolver {
             self.joints.apply_level_requests(&mut self.bodies);
             boxes(&mut self.bodies, &self.islands, &world.bodies, &world.colliders);
         });
-        let ((), c3) = crate::bench::measure(|| {
+        let ((), c3) = rustudio_core::bench::measure(|| {
             let nrows = self.solve_islands(h, gravity, phase);
             self.stats.rows = nrows as u32;
             self.apply_queue();
         });
-        let ((), c4) = crate::bench::measure(|| {
+        let ((), c4) = rustudio_core::bench::measure(|| {
             kinematic(&mut self.bodies, h);
             self.bodies.scatter(&mut world.bodies, &mut world.colliders);
             super::sleep::sync_rapier(&self.bodies, &self.sleep.changed, &mut world.bodies);
@@ -1174,8 +1174,8 @@ fn integrate(bodies: &BodySet, s: usize, rec: &BodyRec, u: &[f32; 12], cfg: &Lev
 fn gyro_guarded(r0: &super::pose::M3, w0: Vec3, ib: &super::pose::M3, dt: f32) -> (super::pose::M3, Vec3) {
     use super::pose::{gyro_step, tol_of};
     let (r1, w1) = gyro_step(r0, w0, ib, dt, tol_of(dt));
-    // RUSTUDIO_SOLVER_GYRO_GUARD=off|0 or the rustudio option (src/rustudio_settings.rs).
-    if !crate::rustudio_settings::spin_guard() {
+    // RUSTUDIO_SOLVER_GYRO_GUARD=off|0 or the rustudio option (crates/rustudio-core/src/rustudio_settings.rs).
+    if !rustudio_core::rustudio_settings::spin_guard() {
         return (r1, w1);
     }
     // ½ ωᵀ R I Rᵀ ω = ½ ω_bᵀ I ω_b with ω_b = Rᵀω (row-major R).

@@ -10,7 +10,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{R6Test, SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 const CAM: Vec3 = Vec3::new(0.0, 50.0, 0.0);
 const BALL: Vec3 = Vec3::new(0.0, 50.0, -30.0);
@@ -42,9 +42,9 @@ const MAX_PETALS: f32 = 2.5;
 fn build(ed: &mut Editor) {
     ed.set_document(Document::new_place());
     ed.show_grid = false;
-    let root = ed.doc.dom.root_ref();
-    let ws = ed.doc.workspace().expect("workspace");
-    let start: Vec<Ref> = ed
+    let root = ed.game.doc.dom.root_ref();
+    let ws = ed.game.doc.workspace().expect("workspace");
+    let start: Vec<Ref> = ed.game
         .doc
         .dom
         .get_by_ref(ws)
@@ -53,25 +53,25 @@ fn build(ed: &mut Editor) {
     let parts: Vec<Ref> = start
         .into_iter()
         .filter(|c| {
-            ed.doc
+            ed.game.doc
                 .class_of(*c)
-                .is_some_and(|k| crate::doc::is_a(&k, "BasePart"))
+                .is_some_and(|k| rustudio_core::doc::is_a(&k, "BasePart"))
         })
         .collect();
-    ed.doc.remove(&parts);
-    let lighting = match ed.doc.find_child(root, "Lighting") {
+    ed.game.doc.remove(&parts);
+    let lighting = match ed.game.doc.find_child(root, "Lighting") {
         Some(l) => l,
-        None => ed
+        None => ed.game
             .doc
             .insert(root, InstanceBuilder::new("Lighting").with_name("Lighting")),
     };
-    let effects: Vec<Ref> = ed
+    let effects: Vec<Ref> = ed.game
         .doc
         .dom
         .get_by_ref(lighting)
         .map(|i| i.children().to_vec())
         .unwrap_or_default();
-    ed.doc.remove(&effects);
+    ed.game.doc.remove(&effects);
     let black = Variant::Color3(Color3::new(0.0, 0.0, 0.0));
     for (name, v) in [
         ("Brightness", Variant::Float32(0.0)),
@@ -84,17 +84,17 @@ fn build(ed: &mut Editor) {
         ("GlobalShadows", Variant::Bool(false)),
         ("FogEnd", Variant::Float32(100_000.0)),
     ] {
-        if let Some(i) = ed.doc.dom.get_by_ref_mut(lighting) {
+        if let Some(i) = ed.game.doc.dom.get_by_ref_mut(lighting) {
             i.properties.insert(rbx_dom_weak::ustr(name), v);
         }
     }
-    ed.doc.insert(
+    ed.game.doc.insert(
         ws,
         new_part("Ball", 0, BALL, Vec3::splat(4.0), [255, 170, 0])
             .with_property("Material", Enum::from_u32(288))
             .with_property("CastShadow", false),
     );
-    ed.doc.insert(
+    ed.game.doc.insert(
         ws,
         new_part(
             "Backdrop",
@@ -111,14 +111,14 @@ fn build(ed: &mut Editor) {
 /// The calibration view (held every frame: an earlier step may leave the
 /// camera orbiting or a key that flies it).
 fn place_camera(ed: &mut Editor) {
-    ed.view_render_size = Some(STUDIO_VIEW);
-    ed.cam.mode = crate::camera::CameraMode::Fly;
-    ed.cam.basis = None;
-    ed.cam.pos = CAM;
-    ed.cam.yaw = 0.0;
-    ed.cam.pitch = 0.0;
-    ed.cam.fov_deg = 70.0;
-    ed.cam.focus = BALL;
+    ed.game.view_render_size = Some(STUDIO_VIEW);
+    ed.game.cam.mode = rustudio_render::camera::CameraMode::Fly;
+    ed.game.cam.basis = None;
+    ed.game.cam.pos = CAM;
+    ed.game.cam.yaw = 0.0;
+    ed.game.cam.pitch = 0.0;
+    ed.game.cam.fov_deg = 70.0;
+    ed.game.cam.focus = BALL;
 }
 
 /// The glow's rings around `c` (pixels): per one-pixel ring past the edge,
@@ -220,10 +220,10 @@ impl SelfTest {
             place_camera(ed);
             return false;
         }
-        let frame = ed
+        let frame = ed.game
             .renderer
             .as_ref()
-            .zip(ed.render_state.as_ref())
+            .zip(ed.game.render_state.as_ref())
             .and_then(|(r, rs)| r.read_frame(rs));
         if let (Some(dir), Some((w, h, px))) = (std::env::var_os("RUSTUDIO_LIGHT_DUMP"), &frame) {
             let _ = image::save_buffer(
@@ -236,12 +236,12 @@ impl SelfTest {
         }
         // (the view was rendered at STUDIO_VIEW pixels: project onto that)
         let rect = egui::Rect::from_min_size(
-            ed.viewport_rect.min,
+            ed.game.viewport_rect.min,
             egui::vec2(STUDIO_VIEW[0] as f32, STUDIO_VIEW[1] as f32),
         );
         let mut notes = Vec::new();
         let mut ok = false;
-        match (&frame, ed.cam.project(rect, BALL)) {
+        match (&frame, ed.game.cam.project(rect, BALL)) {
             (Some(frame), Some(sp)) => {
                 let scale = frame.0 as f32 / rect.width().max(1.0);
                 let c = ((sp.x - rect.min.x) * scale, (sp.y - rect.min.y) * scale);
@@ -288,7 +288,7 @@ impl SelfTest {
             ),
         });
         ed.show_grid = true;
-        ed.view_render_size = None;
+        ed.game.view_render_size = None;
         ed.new_place();
         self.r4.phase = 117;
         false

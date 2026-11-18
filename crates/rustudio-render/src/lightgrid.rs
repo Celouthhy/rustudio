@@ -7,13 +7,13 @@
 //
 // - The grid is 8×4×8 chunks of 32×16×32 four-stud voxels (1024×256×1024
 //   studs) that follows the camera with a one-chunk hysteresis
-//   (FUN_144cd9980).
+//   (FUN_Studio).
 // - Each voxel has three occupancy bytes (FUN_146656750 and the shape
 // voxelizers…): the part's cover of the voxel
 //   seen along X, along Y and along Z (equal unless the part is thinner
 //   than a voxel), × (1 − Transparency) × 255.5, summed saturating; terrain
-//   adds its occupancy byte (not Air or Water) to all three (FUN_146657c10).
-// - Skylight (FUN_144cd3c80) runs down from the top: a voxel receives the
+//   adds its occupancy byte (not Air or Water) to all three (FUN_Studio).
+// - Skylight (FUN_Studio) runs down from the top: a voxel receives the
 //   rounded-up mean of the 8 voxels around the one above it (not that one),
 //   passes on that minus max(max(occX, occZ)·180 >> 8, occY), and stores
 //   252 − (255 − received)⁴ >> 24. Missing neighbours (outside the grid)
@@ -24,8 +24,8 @@
 
 use glam::Vec3;
 
-use crate::mech;
-use crate::terrain::{Voxels, WATER};
+use rustudio_core::mech;
+use rustudio_core::terrain::{Voxels, WATER};
 
 /// Voxels per chunk (X, Y, Z).
 pub const CHUNK: [usize; 3] = [32, 16, 32];
@@ -61,7 +61,7 @@ impl LightGrid {
 
 /// Where the grid starts (in chunks) for a camera at `cam`, given where it
 /// was: Studio moves it only when the camera's chunk leaves the middle two
-/// (FUN_144cd9980), then centres it on the nearest chunk corner.
+/// (FUN_Studio), then centres it on the nearest chunk corner.
 pub fn follow(prev: Option<[i32; 3]>, cam: Vec3) -> [i32; 3] {
     let c = mech::LIGHTGRID_CHUNKS.map(|n| n as i32);
     let half = [c[0] / 2, c[1] / 2, c[2] / 2];
@@ -90,7 +90,7 @@ fn ifloor(x: f32) -> i32 {
 
 // --------------------------------------------------------------- primitives
 
-/// The voxelizer's shape kinds (Studio's record type byte, FUN_146654ff0).
+/// The voxelizer's shape kinds (Studio's record type byte, FUN_Studio).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// CylinderMesh / Head SpecialMesh: a cylinder along Y.
@@ -104,7 +104,7 @@ pub enum Kind {
     Ball,
     CornerWedge,
     Wedge,
-    /// MeshPart / union (record type 9, FUN_146656f60): Studio fills a
+    /// MeshPart / union (record type 9, FUN_Studio): Studio fills a
     /// blob per convex piece of its physics (part box while unavailable).
     Mesh,
 }
@@ -121,7 +121,7 @@ pub struct Prim {
 }
 
 impl Prim {
-    pub fn new(kind: Kind, size: Vec3, xf: &crate::math::Xform, transparency: f32) -> Prim {
+    pub fn new(kind: Kind, size: Vec3, xf: &rustudio_core::math::Xform, transparency: f32) -> Prim {
         let m = xf.rot;
         let rot = [
             m.x_axis.x, m.y_axis.x, m.z_axis.x, m.x_axis.y, m.y_axis.y, m.z_axis.y, m.x_axis.z, m.y_axis.z,
@@ -140,7 +140,7 @@ impl Prim {
     }
 }
 
-/// The light grid's kind for a part: Studio's record type (FUN_146654ff0)
+/// The light grid's kind for a part: Studio's record type (FUN_Studio)
 /// from the SpecialMesh type (−1 none), a BlockMesh / CylinderMesh child,
 /// and the physics shape. File SpecialMeshes are not voxelized here;
 /// MeshParts and unions are selected separately by the scene.
@@ -239,7 +239,7 @@ impl Occupancy {
     }
 
     /// Adds the terrain: its occupancy byte where it isn't Air or Water
-    /// (FUN_146657c10), to all three planes, after the parts.
+    /// (FUN_Studio), to all three planes, after the parts.
     #[allow(dead_code)]
     pub fn add_terrain(&mut self, t: &Voxels) {
         if let Some(plane) = terrain_plane(t, self.origin) {
@@ -314,7 +314,7 @@ fn range(c: f32, h: f32, cmin: f32, max: i32, trim: f32) -> (i32, i32) {
     (lo, hi)
 }
 
-/// FUN_146655d20: |R| and, per local axis, 1 / cover cap and the offset of
+/// FUN_Studio: |R| and, per local axis, 1 / cover cap and the offset of
 /// the normalized cover of a thin, turned shape.
 fn turned_norms(r: &[f32; 9], cap: [f32; 3]) -> ([f32; 9], [f32; 3], [f32; 3]) {
     let m = r.map(f32::abs);
@@ -335,7 +335,7 @@ fn turned_norms(r: &[f32; 9], cap: [f32; 3]) -> ([f32; 9], [f32; 3], [f32; 3]) {
     (m, inv, off)
 }
 
-/// The three planes of a thin shape from its per-axis t (FUN_14664d9b0 and
+/// The three planes of a thin shape from its per-axis t (FUN_Studio and
 /// kin): each local axis's projection, turned into world X / Y / Z by |R|.
 fn project(t: [f32; 3], cap: [f32; 3], m: &[f32; 9], inv: [f32; 3], off: [f32; 3], k: f32) -> [i32; 3] {
     let cov = [0, 1, 2].map(|i| t[i].min(cap[i]).max(0.0));
@@ -476,7 +476,7 @@ fn voxelize(p: &Prim, cmin: [f32; 3], out: &mut dyn FnMut([usize; 3], [i32; 3]))
 }
 
 /// A mesh's convex pieces (part-space boxes) as Studio fills them
-/// (FUN_146656f60): per piece, a blob around its world box's centre,
+/// (FUN_Studio): per piece, a blob around its world box's centre,
 /// (1 − √q)³ with q = Σ (d·g / (2·half extent))² per world axis, taken over
 /// the world box only; g grows the blob in for parts over 75 studs.
 fn mesh_blob(p: &Prim, boxes: &[(Vec3, Vec3)], cmin: [f32; 3], k: f32, out: &mut dyn FnMut([usize; 3], [i32; 3])) {
@@ -525,8 +525,8 @@ fn mesh_blob(p: &Prim, boxes: &[(Vec3, Vec3)], cmin: [f32; 3], k: f32, out: &mut
     }
 }
 
-/// An axis-aligned block (also turned by multiples of 90°): FUN_14664ba10,
-/// thin ones FUN_14664ab70.
+/// An axis-aligned block (also turned by multiples of 90°): FUN_Studio,
+/// thin ones FUN_Studio.
 fn block_aligned(p: &Prim, cmin: [f32; 3], small: bool, k: f32, out: &mut dyn FnMut([usize; 3], [i32; 3])) {
     let r = &p.rot;
     let s = p.size;
@@ -587,7 +587,7 @@ fn block_aligned(p: &Prim, cmin: [f32; 3], small: bool, k: f32, out: &mut dyn Fn
     }
 }
 
-/// A turned block: FUN_146649f00, thin ones FUN_146649580.
+/// A turned block: FUN_Studio, thin ones FUN_146649580.
 fn block_turned(p: &Prim, cmin: [f32; 3], small: bool, k: f32, out: &mut dyn FnMut([usize; 3], [i32; 3])) {
     let r = &p.rot;
     let s = [p.size.x, p.size.y, p.size.z];
@@ -644,13 +644,13 @@ fn block_turned(p: &Prim, cmin: [f32; 3], small: bool, k: f32, out: &mut dyn FnM
 // ------------------------------------------------------------------ skylight
 
 /// What a voxel stores from the light it receives (0..255): 252 −
-/// (255 − v)⁴ >> 24 (the table FUN_144cd3c80 builds).
+/// (255 − v)⁴ >> 24 (the table FUN_Studio builds).
 fn store(v: i32) -> u8 {
     let d = (255 - v) as u32;
     (252 - ((d * d * d * d) >> 24)) as u8
 }
 
-/// Runs the skylight down through the occupancy (FUN_144cd3c80, the whole
+/// Runs the skylight down through the occupancy (FUN_Studio, the whole
 /// grid at once): two bytes per voxel, skylight and sun (255).
 pub fn skylight(occ: &Occupancy) -> LightGrid {
     let [nx, ny, nz] = dims();
@@ -682,7 +682,7 @@ pub fn skylight(occ: &Occupancy) -> LightGrid {
     LightGrid { origin: occ.origin, data, local: Vec::new() }
 }
 
-/// Solve Studio's directional sun channel (144cd34e0 and quadrant sweeps).
+/// Solve Studio's directional sun channel (Studio and quadrant sweeps).
 /// `sun` points toward the active celestial light. Below the horizon Studio
 /// uses the moon; callers passing the astronomical sun get that flip here.
 /// GlobalShadows=false callers should retain the initial 255 bytes instead.
@@ -738,7 +738,7 @@ pub fn sunlight(occ: &Occupancy, grid: &mut LightGrid, sun: Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     use glam::{Mat3, Vec3};
 
     #[test]
@@ -863,7 +863,7 @@ mod tests {
     }
 
     /// Times a full rebuild over terrain filling the grid's lower half.
-    /// cargo test --release --bin rustudio lightgrid_timing -- --ignored --nocapture
+    /// cargo test --release -p rustudio-render --lib lightgrid_timing -- --ignored --nocapture
     #[test]
     #[ignore]
     fn lightgrid_timing() {
@@ -888,7 +888,7 @@ mod tests {
     }
 
     /// Times a rebuild over a real place's parts and terrain at a point.
-    /// RS_LG_PLACE=…rbxl RS_LG_AT=x,y,z cargo test --release --bin rustudio
+    /// RS_LG_PLACE=…rbxl RS_LG_AT=x,y,z cargo test --release -p rustudio-render --lib
     /// lightgrid_place_timing -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -899,7 +899,7 @@ mod tests {
             .split(',')
             .map(|s| s.parse().unwrap())
             .collect();
-        let mut doc = crate::doc::Document::open(std::path::Path::new(&place)).unwrap();
+        let mut doc = rustudio_core::doc::Document::open(std::path::Path::new(&place)).unwrap();
         let mut scene = crate::scene::Scene::default();
         scene.sync(&mut doc);
         let v = Voxels::from_dom(&doc.dom).and_then(|r| r.ok());
@@ -932,7 +932,7 @@ mod tests {
     /// Compares against a Studio dump: set
     /// RS_LG_DUMP=prefix (prefix.hdr / .occ.bin / .sky.bin) and
     /// RS_LG_PARTS=parts.txt, or RS_LG_PLACE=place.rbxl for parts + terrain.
-    /// cargo test --release --bin rustudio lightgrid_vs_studio -- --ignored --nocapture
+    /// cargo test --release -p rustudio-render --lib lightgrid_vs_studio -- --ignored --nocapture
     #[test]
     #[ignore]
     fn lightgrid_vs_studio() {
@@ -981,7 +981,7 @@ mod tests {
             }
         }
         if let Ok(place) = std::env::var("RS_LG_PLACE") {
-            let mut doc = crate::doc::Document::open(std::path::Path::new(&place)).unwrap();
+            let mut doc = rustudio_core::doc::Document::open(std::path::Path::new(&place)).unwrap();
             if std::env::var("RS_LG_PARTS").is_err() {
                 let mut scene = crate::scene::Scene::default();
                 scene.sync(&mut doc);

@@ -5,11 +5,13 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use glam::Vec3;
 use rbx_dom_weak::types::{CFrame, Color3uint8, Enum, Ref, Variant, Vector3};
 use rbx_dom_weak::{ustr, InstanceBuilder, Ustr, WeakDom};
 use rbx_reflection::ClassTag;
 
 use crate::mech;
+use crate::math::Xform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocKind {
@@ -81,26 +83,26 @@ pub enum Reader {
     Query = 2,
     /// A project folder's file write-back (src/project.rs).
     Project = 3,
-    /// The client's own joints (src/client_joints.rs).
+    /// The client's own joints (crates/rustudio-physics/src/client_joints.rs).
     ClientJoints = 4,
-    /// The SurfaceGuis / BillboardGuis under Workspace (src/gui_input.rs).
+    /// The SurfaceGuis / BillboardGuis under Workspace (crates/rustudio-engine/src/gui_input.rs).
     Gui = 5,
-    /// FindFirstChild's name index (src/runtime.rs).
+    /// FindFirstChild's name index (crates/rustudio-engine/src/runtime.rs).
     Children = 6,
-    /// The lights under Workspace (src/lighting.rs).
+    /// The lights under Workspace (crates/rustudio-render/src/lighting.rs).
     Lights = 7,
     /// The client DataModel's anchored parts its LocalScripts move
-    /// (src/physics.rs follow_client).
+    /// (crates/rustudio-physics/src/physics.rs follow_client).
     ClientPhysics = 8,
-    /// ParticleEmitters, Beams and Trails under Workspace (src/effects.rs).
+    /// ParticleEmitters, Beams and Trails under Workspace (crates/rustudio-render/src/effects.rs).
     Effects = 9,
     /// Outgoing Team Create edits.
     TeamCreate = 10,
-    /// CollectionService's tag index (src/runtime_ext.rs GetTagged).
+    /// CollectionService's tag index (crates/rustudio-engine/src/runtime_ext.rs GetTagged).
     Tags = 11,
-    /// Sounds, audio / video instances and Wires (src/domains/media.rs).
+    /// Sounds, audio / video instances and Wires (crates/rustudio-engine/src/domains/media.rs).
     Media = 12,
-    /// Motors and IKControls (src/domains/anim.rs).
+    /// Motors and IKControls (crates/rustudio-engine/src/domains/anim.rs).
     Anim = 13,
     /// GUI boxes scripts listen to (runtime_ext::fire_layout_changes).
     Layout = 14,
@@ -133,7 +135,7 @@ struct Journal {
     marks: Vec<Mark>,
     /// Next sequence number each reader wants; None = hasn't read yet.
     read: [Option<u64>; 21],
-    /// The joint graph's position (src/domains/world_part.rs), read through
+    /// The joint graph's position (crates/rustudio-engine/src/domains/world_part.rs), read through
     /// `&self`: 0 = not reading, else the next sequence number + 1.
     graph_pos: std::sync::atomic::AtomicU64,
 }
@@ -187,7 +189,7 @@ pub use history::{studio_step_name, FinishOp, HistoryEvent};
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
 /// 1.981 from the database (round 21, terrain corpus place: its sun was twice
 /// Studio's).
-pub(crate) fn studio_default(class: &str, name: &str) -> Option<Variant> {
+pub fn studio_default(class: &str, name: &str) -> Option<Variant> {
     match (class, name) {
         ("Lighting", "Brightness") => Some(Variant::Float32(crate::mech::LIGHTING_BRIGHTNESS_DEFAULT)),
         // On in Studio; the reflection database's default is false, which
@@ -302,6 +304,36 @@ pub fn in_unsaved_service(d: &Document, r: Ref) -> bool {
     false
 }
 
+// ------------------------------------------- property readers (shared)
+
+#[inline]
+pub fn f32_of(v: Option<Variant>) -> Option<f32> {
+    match v? {
+        Variant::Float32(f) => Some(f),
+        Variant::Float64(f) => Some(f as f32),
+        Variant::Int32(i) => Some(i as f32),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn vec3_of(v: Option<Variant>) -> Option<Vec3> {
+    match v? {
+        Variant::Vector3(v) => Some(Vec3::new(v.x, v.y, v.z)),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn xform_of(doc: &Document, r: Ref) -> Option<Xform> {
+    match doc.prop(r, "CFrame")? {
+        // Old places can hold slightly skewed rotations: square them up so
+        // nothing draws stretched.
+        Variant::CFrame(cf) => Some(Xform::from_cframe(&cf).orthonormalized()),
+        _ => None,
+    }
+}
+
 /// `Instance:IsA` against the reflection database.
 pub fn is_a(class: &str, base: &str) -> bool {
     if class == base {
@@ -350,6 +382,82 @@ pub fn is_script_creatable(class: &str) -> bool {
         None => crate::api::get()
             .and_then(|a| a.classes.get(class))
             .is_some_and(|c| c.creatable && !c.service),
+    }
+}
+
+/// A property's enum item as its value (`Variant::Enum` / `Variant::EnumItem`).
+pub fn enum_u32(v: Option<Variant>) -> Option<u32> {
+    match v? {
+        Variant::Enum(e) => Some(e.to_u32()),
+        Variant::EnumItem(e) => Some(e.value),
+        _ => None,
+    }
+}
+
+/// The MaterialVariant a part is drawn with: its MaterialVariant name, else
+/// MaterialService's `<Material>Name` override for its Material; the variant
+/// (in MaterialService, same BaseMaterial) gives its ColorMap and StudsPerTile.
+/// MaterialService.Use2022Materials (absent: false, the pre-2022 table,
+/// which is what Studio draws for a place without the setting).
+pub fn use_2022_materials(doc: &Document) -> bool {
+    doc.find_child(doc.dom.root_ref(), "MaterialService")
+        .and_then(|ms| {
+            // Consult serialized values before reflection defaults: the API
+            // property can default false while the XML property stores true.
+            ["Use2022Materials", "Use2022MaterialsXml"]
+                .iter()
+                .find_map(|k| match doc.dom.get_by_ref(ms)?.properties.get(&rbx_dom_weak::ustr(k)).cloned() {
+                    Some(Variant::Bool(b)) => Some(b),
+                    _ => None,
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// A Content property's id as a string (an EditableImage / EditableMesh
+/// resolves to its current generated id), trimmed; None when empty.
+pub fn content_string(v: Option<Variant>) -> Option<String> {
+    match v? {
+        Variant::ContentId(c) => Some(c.as_str().to_string()),
+        Variant::Content(c) => c.as_uri().map(str::to_string).or_else(|| {
+            c.as_object().and_then(|o| crate::editable_source::content_uri(o, None))
+        }),
+        Variant::String(s) => Some(s),
+        _ => None,
+    }
+    // Roblox reads content ids trimmed (Place B has "…?id=125882923   ").
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// `Enum.<enum_type>.<name>`'s value, from the reflection database (else the
+/// API dump); a legacy name is the item it became (the dump's LegacyNames).
+pub fn enum_item_value(enum_type: &str, name: &str) -> Option<u32> {
+    enum_item_by_name(enum_type, name).map(|(_, value)| value)
+}
+
+/// The canonical name and value, preserving reflection's exact-name and
+/// legacy-name precedence before falling back to a dump-only enum.
+pub fn enum_item_by_name(enum_type: &str, name: &str) -> Option<(&'static str, u32)> {
+    match db().enums.get(enum_type) {
+        Some(e) => {
+            let (name, value) = e.items.get_key_value(name).or_else(|| {
+                let now = crate::api::get()?.legacy_enum_items.get(&(enum_type.to_string(), name.to_string()))?;
+                e.items.get_key_value(now.as_str())
+            })?;
+            Some((*name, *value))
+        }
+        None => crate::api::get()?.enums.get(enum_type)?.iter()
+            .find(|(n, _)| n == name).map(|(n, v)| (n.as_str(), *v)),
+    }
+}
+
+/// The name of `Enum.<enum_type>`'s item `value` (the reflection database,
+/// else the API dump).
+pub fn enum_item_name(enum_type: &str, value: u32) -> Option<String> {
+    match db().enums.get(enum_type) {
+        Some(e) => e.items.iter().find(|(_, v)| **v == value).map(|(k, _)| k.to_string()),
+        None => crate::api::get()?.enums.get(enum_type)?.iter().find(|(_, v)| *v == value).map(|(n, _)| n.clone()),
     }
 }
 
@@ -785,7 +893,7 @@ impl Document {
         if let Some(l) = self.find_child(root, "Lighting") {
             if let Some(i) = self.dom.get_by_ref_mut(l) {
                 let key = |k: &str| rbx_dom_weak::ustr(k);
-                let tech = crate::scene::enum_u32(i.properties.get(&key("Technology")).cloned());
+                let tech = enum_u32(i.properties.get(&key("Technology")).cloned());
                 if !i.properties.contains_key(&key("LightingStyle")) {
                     // Neither saved (Place A: its chapel is built at run time)
                     // reads Soft too: Studio's default.
@@ -826,7 +934,7 @@ impl Document {
 
     /// Copies the saveable tree so background serialization sees the revision
     /// that was submitted, while the editor keeps working on the original.
-    pub(crate) fn save_snapshot(&self) -> (WeakDom, Vec<Ref>) {
+    pub fn save_snapshot(&self) -> (WeakDom, Vec<Ref>) {
         let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
         let roots = self.dom.clone_multiple_into_external(&self.save_roots(), &mut dom);
         (dom, roots)
@@ -907,6 +1015,7 @@ impl Document {
         }
     }
 
+    #[inline]
     pub fn exists(&self, r: Ref) -> bool {
         self.dom.get_by_ref(r).is_some()
     }
@@ -954,6 +1063,7 @@ impl Document {
             .collect()
     }
 
+    #[inline]
     pub fn class_of(&self, r: Ref) -> Option<Ustr> {
         self.dom.get_by_ref(r).map(|i| i.class)
     }
@@ -964,6 +1074,7 @@ impl Document {
     }
 
     /// Reads a property, falling back to the class default.
+    #[inline]
     pub fn prop(&self, r: Ref, name: &str) -> Option<Variant> {
         self.prop_key(r, ustr(name))
     }
@@ -1000,7 +1111,7 @@ impl Document {
                 // current generated id; this instance redraws on its writes.
                 if let Some(uri) = c
                     .as_object()
-                    .and_then(|o| crate::runtime::editable::content_uri(o, Some((r, name))))
+                    .and_then(|o| crate::editable_source::content_uri(o, Some((r, name))))
                 {
                     return Some(Variant::ContentId(rbx_dom_weak::types::ContentId::from(uri)));
                 }
@@ -1031,7 +1142,7 @@ impl Document {
         }
     }
 
-    pub(crate) fn can_edit_structure(&self, r: Ref) -> bool {
+    pub fn can_edit_structure(&self, r: Ref) -> bool {
         r != self.dom.root_ref() && self.class_of(r).is_some_and(|c| !is_service(&c))
     }
 

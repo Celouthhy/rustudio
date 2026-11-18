@@ -33,9 +33,9 @@ use mlua::{Lua, MultiValue, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::util::*;
-use crate::doc;
+use rustudio_core::doc;
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 struct Interp {
@@ -131,7 +131,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
                 (
                     xf(d, this, "CFrame").unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }),
                     xf(d, this, "Focus").unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }),
-                    crate::scene::enum_u32(d.prop(this, "CameraType")) == Some(6),
+                    rustudio_render::scene::enum_u32(d.prop(this, "CameraType")) == Some(6),
                     d.id,
                 )
             };
@@ -179,7 +179,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             } else {
                 ("OrthographicMode", "Vertical")
             };
-            match crate::scene::enum_u32(world(lua)?.d().prop(r, key)).and_then(|v| LEnumItem::from_value(ty, v)) {
+            match rustudio_render::scene::enum_u32(world(lua)?.d().prop(r, key)).and_then(|v| LEnumItem::from_value(ty, v)) {
                 Some(e) => enum_value(lua, e)?,
                 None => enum_item(lua, ty, def)?,
             }

@@ -281,7 +281,7 @@ fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
         let th = domains::assets_cloud::scene::create_thread(lua, f.clone())
             .inspect(|th| super::security::set(th, ident));
         match th {
-            Ok(th) if crate::bench::lua_prof_on() => crate::bench::lua_timed(
+            Ok(th) if rustudio_core::bench::lua_prof_on() => rustudio_core::bench::lua_timed(
                 f.to_pointer() as usize ^ name_key(&key.1),
                 || format!("{} {}", function_label(&f), key.1),
                 || resume(lua, &th, args.to_vec()),
@@ -291,8 +291,8 @@ fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
         }
     }
     for th in waiters {
-        if crate::bench::lua_prof_on() {
-            crate::bench::lua_timed(
+        if rustudio_core::bench::lua_prof_on() {
+            rustudio_core::bench::lua_timed(
                 name_key(&key.1),
                 || format!("(Wait) {}", key.1),
                 || resume(lua, &th, args.to_vec()),

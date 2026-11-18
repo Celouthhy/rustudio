@@ -178,7 +178,7 @@ fn parent_box(lua: &Lua, r: Ref) -> mlua::Result<(Vec2, Vec2)> {
         let w = world(lua)?;
         let d = w.d();
         let p = d.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
-        let ok = d.class_of(p).is_some_and(|c| crate::doc::is_a(&c, "GuiBase2d"));
+        let ok = d.class_of(p).is_some_and(|c| rustudio_core::doc::is_a(&c, "GuiBase2d"));
         ok.then_some(p)
     };
     let p = parent.ok_or_else(|| rt_err("Attempting to use Path2D with invalid parent"))?;
@@ -249,7 +249,7 @@ fn as_udim2(lua: &Lua, p: Vec2, origin: Vec2, size: Vec2) -> mlua::Result<Value>
     let u = if size.x * size.y == 0.0 {
         world(lua)?
             .output
-            .push((crate::app::Level::Warn, "Path2D parent rectangle has zero area.".into()));
+            .push((rustudio_core::log::Level::Warn, "Path2D parent rectangle has zero area.".into()));
         LUDim2 {
             x: LUDim { scale: 0.0, offset: rel.x.round() as i32 },
             y: LUDim { scale: 0.0, offset: rel.y.round() as i32 },

@@ -24,11 +24,11 @@ use rbx_dom_weak::types::{
 use rbx_dom_weak::{ustr, InstanceBuilder};
 use rbx_reflection::{DataType, PropertyKind, PropertyTag, Scriptability};
 
-use crate::app::Level;
-use crate::doc::{self, Document};
+use rustudio_core::log::Level;
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use crate::math::Xform;
-use crate::mech;
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
 
 #[path = "runtime_signals.rs"]
 pub mod signal_timing;
@@ -183,7 +183,7 @@ pub struct World {
     pub states_disabled: HashMap<Ref, HashSet<String>>,
     /// PhysicsService collision groups: one table per Play session, shared
     /// by the server and client runtimes and the physics (replicated in Roblox).
-    pub groups: crate::collision_groups::Shared,
+    pub groups: rustudio_core::collision_groups::Shared,
     /// The signed-in person's avatar (Players:GetHumanoidDescriptionFromUserId
     /// for their user id, as a signed-in Studio answers), and the
     /// HumanoidDescriptions made from it (CreateHumanoidModelFromDescription
@@ -223,7 +223,7 @@ pub struct World {
     pub to_start: Vec<Ref>,
     /// Terrain edited by scripts this frame (Terrain:Fill…): its voxels,
     /// written back to SmoothGrid once per step (runtime_ext::flush_terrain).
-    pub terrain_edit: Option<(Ref, crate::terrain::Voxels)>,
+    pub terrain_edit: Option<(Ref, rustudio_core::terrain::Voxels)>,
     /// GuiBase2d AbsolutePosition / AbsoluteSize / AbsoluteRotation as
     /// scripts last saw them (read, or told by a change), and the Camera's
     /// ViewportSize: what `ext::fire_layout_changes` compares the new layout
@@ -272,7 +272,7 @@ impl World {
         if self.mode == RunMode::Edit {
             return false;
         }
-        let ctx = crate::scene::enum_u32(d.prop(r, "RunContext")).unwrap_or(0);
+        let ctx = rustudio_render::scene::enum_u32(d.prop(r, "RunContext")).unwrap_or(0);
         let root = d.dom.root_ref();
         let under = |class: &str| {
             d.find_child(root, class)
@@ -437,7 +437,7 @@ fn prune_layout_listeners(lua: &Lua) {
 }
 
 #[derive(Default)]
-struct Cache {
+pub struct Cache {
     /// Instance → its slot in `weak`. The userdata lives in `weak`, a Lua
     /// table with weak values, so an instance's Lua value is collected once
     /// no script can reach it (a strong map here kept every instance ever
@@ -559,7 +559,7 @@ fn fixed_dt_env() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_FIXED_DT").is_some_and(|v| !v.is_empty()))
 }
 
-pub(crate) fn world(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, World>> {
+pub fn world(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, World>> {
     lua.app_data_mut::<World>()
         .ok_or_else(|| rt_err("the play session has ended"))
 }
@@ -607,7 +607,7 @@ impl World {
             core_gui_off: HashSet::new(),
             humanoid_states: HashMap::new(),
             states_disabled: HashMap::new(),
-            groups: crate::collision_groups::shared(),
+            groups: rustudio_core::collision_groups::shared(),
             avatar: None,
             avatar_descs: HashSet::new(),
             listening: Default::default(),
@@ -690,7 +690,7 @@ impl World {
     }
 
     pub fn fire(&mut self, r: Ref, name: &str, args: Vec<Value>) {
-        crate::telemetry::fired(name);
+        rustudio_core::telemetry::fired(name);
         if name == "Changed" || name.starts_with("Tag") {
             domains::services::on_fire(self, r, name, &args);
         }
@@ -799,7 +799,7 @@ fn is_instance_class(class: &str) -> bool {
     if let Some(v) = CACHE.with(|c| c.borrow().get(class).copied()) {
         return v;
     }
-    let v = match crate::api::get() {
+    let v = match rustudio_core::api::get() {
         Some(api) if api.classes.contains_key(class) => api.is_a(class, "Instance"),
         _ => true,
     };
@@ -822,7 +822,7 @@ impl FromLua for LInst {
     }
 }
 
-fn opt_inst(v: &Value) -> Option<Ref> {
+pub fn opt_inst(v: &Value) -> Option<Ref> {
     match v {
         Value::UserData(u) => match u.borrow::<LInst>() {
             Ok(r) => Some(r.0),
@@ -832,7 +832,7 @@ fn opt_inst(v: &Value) -> Option<Ref> {
     }
 }
 
-fn opt_ud<T: Clone + 'static>(v: &Value) -> Option<T> {
+pub fn opt_ud<T: Clone + 'static>(v: &Value) -> Option<T> {
     if let Some(x) = crate::ltypes::vec_any::<T>(v) {
         return Some(x);
     }
@@ -847,7 +847,7 @@ macro_rules! inst_userdata {
 impl UserData for $ty {
     fn add_fields<F: UserDataFields<Self>>(f: &mut F) {
         f.add_meta_field("__type", $type_name);
-        // The bridge's C functions: unnamed,
+        // The bridge's C functions (crates/rustudio-engine/src/cmeta.rs, RE-BRIDGE.md): unnamed,
         // shared by every Instance; the metatable is locked (lock_bridge).
         f.add_meta_field_with("__namecall", |lua| {
             lua.named_registry_value::<Function>("rs_inst_namecall")
@@ -1283,7 +1283,7 @@ fn inst_meta(lua: &Lua, r: Ref) -> mlua::Result<(String, String, Ref)> {
 }
 
 /// An instance's class and parent, without copying its name.
-fn inst_class(lua: &Lua, r: Ref) -> mlua::Result<(rbx_dom_weak::Ustr, Ref)> {
+pub fn inst_class(lua: &Lua, r: Ref) -> mlua::Result<(rbx_dom_weak::Ustr, Ref)> {
     let w = world(lua)?;
     let i = w
         .d()
@@ -1316,20 +1316,22 @@ fn disp(class: rbx_dom_weak::Ustr, key: &str) -> Disp {
         return d;
     }
     let d = (|| {
-        if crate::api::get()
+        if rustudio_core::api::get()
             .and_then(|a| a.lookup(&class, key))
-            .is_some_and(|(_, m)| m.kind == crate::api::Kind::Callback)
+            .is_some_and(|(_, m)| m.kind == rustudio_core::api::Kind::Callback)
         {
             return Disp::Callback;
         }
         // Old scripts use deprecated spellings (findFirstChild, clone, remove…).
         let method = ext::canonical(key).unwrap_or(key);
-        for (m, base) in LUA_METHODS.iter().chain(ext::LUA_METHODS).chain(domains::LUA_METHODS.iter()) {
+        let domain_lua_methods = domains::lua_methods();
+        for (m, base) in LUA_METHODS.iter().chain(ext::LUA_METHODS).chain(domain_lua_methods) {
             if *m == method && doc::is_a(&class, base) {
                 return Disp::LuaMethod(m, base);
             }
         }
-        for (m, base) in METHODS.iter().chain(ext::METHODS).chain(editable::METHODS).chain(domains::METHODS.iter()) {
+        let domain_methods = domains::methods();
+        for (m, base) in METHODS.iter().chain(ext::METHODS).chain(editable::METHODS).chain(domain_methods) {
             if *m == method && doc::is_a(&class, base) {
                 return Disp::Method(m, base);
             }
@@ -1353,7 +1355,8 @@ fn method_owner(class: rbx_dom_weak::Ustr, name: &str) -> (bool, bool) {
         return v;
     }
     let core = METHODS.iter().any(|(m, b)| *m == name && doc::is_a(&class, b));
-    let extended = ext::METHODS.iter().chain(editable::METHODS).chain(domains::METHODS.iter()).any(|(m, b)| *m == name && doc::is_a(&class, b));
+    let domain_methods = domains::methods();
+    let extended = ext::METHODS.iter().chain(editable::METHODS).chain(domain_methods).any(|(m, b)| *m == name && doc::is_a(&class, b));
     CACHE.with(|c| c.borrow_mut().entry(class).or_default().insert(name.into(), (core, extended)));
     (core, extended)
 }
@@ -1381,7 +1384,7 @@ fn lua_method_args(name: &str, args: &MultiValue) -> mlua::Result<()> {
 }
 
 /// A method's function, one per descriptor (base, name) per VM as in
-/// Studio: a C function named after the method (src/cmeta.rs).
+/// Studio: a C function named after the method (crates/rustudio-engine/src/cmeta.rs).
 fn method_fn(lua: &Lua, name: &'static str, base: &'static str) -> mlua::Result<Function> {
     if let Some(f) = cache(lua)?.methods.get(&(base, name)) {
         return Ok(f.clone());
@@ -1396,8 +1399,8 @@ fn method_fn(lua: &Lua, name: &'static str, base: &'static str) -> mlua::Result<
         return Ok(f);
     }
     let raw = lua.create_function(move |lua, args: MultiValue| {
-        crate::bench::site(lua, "call", name);
-        let r = crate::bench::api_timed("call", name, || {
+        crate::lua_bridge::site(lua, "call", name);
+        let r = rustudio_core::bench::api_timed("call", name, || {
             checked(lua, member_self(lua, &args, base, name).and_then(|_| call_method(lua, name, args)))
         });
         signal_timing::flush_immediate(lua);
@@ -1452,14 +1455,14 @@ fn not_member(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Error {
     rt_err(format!("{key} is not a valid member of {class} \"{full}\""))
 }
 
-/// `inst:name(...)` (the Instance `__namecall`, src/cmeta.rs): the
+/// `inst:name(...)` (the Instance `__namecall`, crates/rustudio-engine/src/cmeta.rs): the
 /// method's results, or the Lua function to call for a Lua-written one.
 /// Only methods are callable: properties, events, children and unknown
 /// names are `not a valid member`.
 fn namecall(lua: &Lua, name: &str, atom: i32, args: MultiValue) -> mlua::Result<MultiValue> {
     let this = opt_inst(&arg(&args, 0)).ok_or_else(|| rt_err("Instance expected"))?;
     let class_u = inst_class(lua, this)?.0;
-    crate::telemetry::touch(class_u.as_str(), name);
+    rustudio_core::telemetry::touch(class_u.as_str(), name);
     let rt = routes::route(class_u, name, atom);
     // Capability gates (security.rs) answer for restricted members first,
     // as they do for reads.
@@ -1478,8 +1481,8 @@ fn namecall(lua: &Lua, name: &str, atom: i32, args: MultiValue) -> mlua::Result<
                     return Ok(MultiValue::from_iter([Value::Function(f.clone())]));
                 }
             }
-            crate::bench::site(lua, "call", m);
-            let r = crate::bench::api_timed("call", m, || {
+            crate::lua_bridge::site(lua, "call", m);
+            let r = rustudio_core::bench::api_timed("call", m, || {
                 checked(lua, call_method_routed(lua, m, args, this, class_u, &rt.method))
             });
             signal_timing::flush_immediate(lua);
@@ -1509,6 +1512,19 @@ fn namecall(lua: &Lua, name: &str, atom: i32, args: MultiValue) -> mlua::Result<
             checked(lua, Err(not_member(lua, this, class_u.as_str(), name)))
         }
     }
+}
+
+/// Marks a stack-trace line (Studio's blue "Stack Begin" … "Stack End"
+/// after an error); not shown.
+pub const STACK_MARK: char = '\u{2063}';
+
+/// "Full.Name" and line of an error message's "Full.Name:line: ..." prefix.
+pub fn error_origin(msg: &str) -> Option<(&str, u32)> {
+    let mut it = msg.splitn(3, ':');
+    let path = it.next()?;
+    let line = it.next()?.trim().parse().ok()?;
+    it.next()?;
+    (!path.is_empty() && !path.contains(' ')).then_some((path, line))
 }
 
 /// The cause of an error, without location or traceback.
@@ -1745,33 +1761,33 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             return (index_routed(lua, r, key, class_u, parent, rt).map(Fv::V), quiet);
         }
         Got::Name => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             let name = world(lua).map(|w| w.d().dom.get_by_ref(r).map(|i| i.name.clone()).unwrap_or_default());
             return (name.map(Fv::Str), quiet);
         }
         Got::Class => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Static(class_u.as_str())), quiet);
         }
         Got::Stored(Variant::String(s), _) => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Str(s)), quiet);
         }
         Got::Parent(p) => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Inst(p)), quiet);
         }
         Got::Stored(Variant::CFrame(cf), _) => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::CFrame(Xform::from_cframe(&cf))), quiet);
         }
         Got::Stored(v, en) => {
-            crate::telemetry::touch(class_u.as_str(), key);
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
             variant_to_lua(lua, &v, en)
         }
         Got::Default(v, en, canon) => {
-            crate::telemetry::touch(class_u.as_str(), key);
-            crate::telemetry::default_read(lua, class_u.as_str(), canon.as_str());
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
+            crate::lua_bridge::default_read(lua, class_u.as_str(), canon.as_str());
             variant_to_lua(lua, &v, en)
         }
     };
@@ -1879,7 +1895,7 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
         }
         _ => return None,
     };
-    crate::telemetry::touch(class, name);
+    rustudio_core::telemetry::touch(class, name);
     Some(out)
 }
 
@@ -1897,7 +1913,7 @@ fn parent_write(lua: &Lua, r: Ref, key: &str, atom: i32, p: Ref) -> Option<mlua:
     if !rt.plain_parent_write {
         return None;
     }
-    crate::telemetry::touch(class_u.as_str(), key);
+    rustudio_core::telemetry::touch(class_u.as_str(), key);
     // Domains whose newindex names Parent (testing's debugger objects) are
     // asked first, as in `newindex_routed`.
     if rt.ni_domains != 0 {
@@ -1928,7 +1944,7 @@ fn newindex_entry(lua: &Lua, r: Ref, key: &str, value: Value, atom: i32) -> mlua
     // (Studio's script-injection permission for installed plugins).
     // (Unanswered: the write is held until the prompt's answer.)
     if key == "Source" && security::current(lua) == security::PLUGIN_IDENT {
-        if crate::plugin_host::permissions::hold_source_write(lua, r, &value)? {
+        if domains::hold_source_write(lua, r, &value)? {
             return Ok(());
         }
     }
@@ -1949,7 +1965,7 @@ fn index_routed(
     rt: routes::Route,
 ) -> mlua::Result<Value> {
     let class: &str = class_u.as_str();
-    crate::telemetry::touch(class, key);
+    rustudio_core::telemetry::touch(class, key);
     match rt.special {
         routes::Special::None => {}
         routes::Special::Name => {
@@ -1972,7 +1988,7 @@ fn index_routed(
         Disp::LuaMethod(method, base) => return Ok(Value::Function(lua_method_fn(lua, method, base)?)),
         Disp::Method(method, base) => return Ok(Value::Function(method_fn(lua, method, base)?)),
         Disp::Event => {
-            crate::telemetry::event_used(lua, class, key);
+            crate::lua_bridge::event_used(lua, class, key);
             return signal(lua, r, key);
         }
         Disp::Other => {}
@@ -1999,11 +2015,11 @@ fn index_routed(
     // real capitalised member before any stub of the deprecated name; only
     // the ones Roblox has (in the API dump): `frame.transparency` is a child
     // named "transparency" there (VFX Suite's buttons), not Transparency.
-    let api_alias = |c: &str| crate::api::get().map_or(true, |a| a.lookup(c, key).is_some());
+    let api_alias = |c: &str| rustudio_core::api::get().map_or(true, |a| a.lookup(c, key).is_some());
     if let Some(cap) = capitalized(key).filter(|c| real_member(&class, c) && api_alias(&class)) {
         return index(lua, r, &cap);
     }
-    // A member rustudio has no behaviour for yet still exists (src/stubs.rs);
+    // A member rustudio has no behaviour for yet still exists (crates/rustudio-engine/src/stubs.rs);
     // members come before children, as in Roblox.
     if let Some(v) = stubs::index(lua, r, &class, key)? {
         return Ok(v);
@@ -2017,20 +2033,22 @@ fn index_routed(
             return Ok(v);
         }
     }
-    crate::telemetry::gap(lua, "missing", &class, key);
+    crate::lua_bridge::gap(lua, "missing", &class, key);
     Err(not_member(lua, r, &class, key))
 }
 
 /// Whether rustudio itself implements `name` on `class` (a method, an event
 /// or a reflected property), as opposed to answering it with a stub.
 fn real_member(class: &str, name: &str) -> bool {
+    let domain_lua_methods = domains::lua_methods();
+    let domain_methods = domains::methods();
     LUA_METHODS
         .iter()
         .chain(ext::LUA_METHODS)
-        .chain(domains::LUA_METHODS.iter())
+        .chain(domain_lua_methods)
         .chain(METHODS.iter())
         .chain(ext::METHODS)
-        .chain(editable::METHODS).chain(domains::METHODS.iter())
+        .chain(editable::METHODS).chain(domain_methods)
         .any(|(m, base)| *m == name && doc::is_a(class, base))
         || event_exists(class, name)
         || ext::event_exists(class, name)
@@ -2069,7 +2087,7 @@ fn attachment_frames(lua: &Lua, r: Ref) -> mlua::Result<(Xform, Xform)> {
             rot: glam::Mat3::IDENTITY,
         },
     };
-    let part = crate::attachment::parent(d, r, true).unwrap_or(Xform {
+    let part = rustudio_core::attachment::parent(d, r, true).unwrap_or(Xform {
         pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY,
     });
     Ok((local, part))
@@ -2108,8 +2126,8 @@ fn prop_get_routed(
 fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
     if class == "Bone" && matches!(key, "TransformedCFrame" | "TransformedWorldCFrame") {
         let d = world(lua)?;
-        let xf = if key == "TransformedCFrame" { crate::attachment::local(d.d(), r, true) }
-            else { crate::attachment::world(d.d(), r, true).unwrap_or(crate::attachment::local(d.d(), r, true)) };
+        let xf = if key == "TransformedCFrame" { rustudio_core::attachment::local(d.d(), r, true) }
+            else { rustudio_core::attachment::world(d.d(), r, true).unwrap_or(rustudio_core::attachment::local(d.d(), r, true)) };
         return Ok(Some(Value::UserData(lua.create_userdata(LCFrame(xf))?)));
     }
     if doc::is_a(class, "Attachment")
@@ -2244,7 +2262,7 @@ fn prop_get_plain(
     }
     // Answered from the reflection default: a gap if Roblox computes it.
     if let Some(canon) = defaulted {
-        crate::telemetry::default_read(lua, class, canon);
+        crate::lua_bridge::default_read(lua, class, canon);
     }
     match value {
         Some(v) => Ok(Some(variant_to_lua(lua, &v, enum_name)?)),
@@ -2259,7 +2277,7 @@ fn prop_get_plain(
     }
 }
 
-fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
+pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
     set_parent_opts(lua, r, new_parent, true)
 }
 
@@ -2376,11 +2394,11 @@ fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
     let mut welds: Vec<(Ref, Ref, Xform)> = Vec::new();
     for x in &inside {
         let Some(i) = d.dom.get_by_ref(*x) else { continue };
-        if i.class != "WeldConstraint" || !crate::physics::joint_enabled(d, *x) {
+        if i.class != "WeldConstraint" || !rustudio_core::body::joint_enabled(d, *x) {
             continue;
         }
         let Some(Variant::CFrame(c0)) = d.prop(*x, "CFrame0") else { continue };
-        if let Some((p0, p1)) = crate::physics::joint_parts(d, *x) {
+        if let Some((p0, p1)) = rustudio_core::body::joint_parts(d, *x) {
             // (a weld to a part outside the Workspace holds nothing: a clone's weld to
             // its template's part, still in ReplicatedStorage)
             let live = |p: Ref| part(Some(Variant::Ref(p))).is_some() && d.workspace().is_some_and(|ws| d.is_ancestor(ws, p));
@@ -2492,7 +2510,7 @@ fn primary_parts_leaving(w: &World, r: Ref, old: Ref, new_parent: Ref) -> Vec<(R
 /// the ancestors that listen, CollectionService's tag signals, Changed
 /// ("Parent") and AncestryChanged. Also used for edits made outside Lua
 /// (the editor, undo, Team Create) that the plugin host passes on.
-pub(crate) fn fire_parent_signals(
+pub fn fire_parent_signals(
     lua: &Lua,
     r: Ref,
     old: Ref,
@@ -2506,7 +2524,7 @@ pub(crate) fn fire_parent_signals(
 /// `descendants` (`r` still in place): the plugin host fires it before it
 /// takes an instance the editor removed out of the tree again, so handlers
 /// read its Parent as Studio's do (Immediate signals).
-pub(crate) fn fire_descendant_removing(lua: &Lua, old: Ref, descendants: &[Ref]) -> mlua::Result<()> {
+pub fn fire_descendant_removing(lua: &Lua, old: Ref, descendants: &[Ref]) -> mlua::Result<()> {
     let chain: Vec<Ref> = {
         let w = world(lua)?;
         let d = w.d();
@@ -2529,7 +2547,7 @@ pub(crate) fn fire_descendant_removing(lua: &Lua, old: Ref, descendants: &[Ref])
 
 /// `fire_parent_signals`, DescendantRemoving left out when `removing` is
 /// false (already fired by `fire_descendant_removing`).
-pub(crate) fn fire_parent_signals_opts(
+pub fn fire_parent_signals_opts(
     lua: &Lua,
     r: Ref,
     old: Ref,
@@ -2729,7 +2747,7 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
         // Place A Vfx emitter, made with Instance.new and then given Texture, drew
         // the default sparkle from TextureContent's default).
         if let Some(twin) = doc::content_twin(name) {
-            let uri = crate::scene::content_string(Some(v.clone())).unwrap_or_default();
+            let uri = rustudio_render::scene::content_string(Some(v.clone())).unwrap_or_default();
             let c = if uri.is_empty() {
                 rbx_dom_weak::types::Content::none()
             } else {
@@ -2774,7 +2792,7 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
         let mass_changed = name == "Size" && class.is_some_and(|c| doc::is_a(&c, "BasePart"));
         // Nobody listening to this instance or to game.ItemChanged
         // (services' on_fire), telemetry off: both fires below would do nothing.
-        if !w.listening.contains(&r) && !w.item_changed && !crate::telemetry::on() {
+        if !w.listening.contains(&r) && !w.item_changed && !rustudio_core::telemetry::on() {
             return Ok(());
         }
         // Changed's argument: the property name, or a ValueBase's new value.
@@ -2804,7 +2822,7 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
 fn fire_changed(lua: &Lua, r: Ref, key: &str) -> mlua::Result<()> {
     {
         let w = world(lua)?;
-        if !w.listening.contains(&r) && !w.item_changed && !crate::telemetry::on() {
+        if !w.listening.contains(&r) && !w.item_changed && !rustudio_core::telemetry::on() {
             return Ok(());
         }
     }
@@ -2877,7 +2895,7 @@ fn newindex_routed(
     rt: routes::Route,
 ) -> mlua::Result<()> {
     let class: &str = class_u.as_str();
-    crate::telemetry::touch(class, key);
+    rustudio_core::telemetry::touch(class, key);
     if (rt.ni_domains != 0 || domains::route_check_on())
         && domains::newindex_masked(lua, r, class, key, &value, rt.ni_domains)?
     {
@@ -3092,7 +3110,7 @@ fn newindex_routed(
         if stubs::assign(lua, r, class, key, &value)? {
             return Ok(());
         }
-        crate::telemetry::gap(lua, "missing", class, key);
+        crate::lua_bridge::gap(lua, "missing", class, key);
         let full = world(lua)?.full_name(r);
         return Err(rt_err(format!(
             "{key} is not a valid member of {class} \"{full}\""
@@ -3105,7 +3123,7 @@ fn newindex_routed(
         )));
     }
     if !info.acts {
-        crate::telemetry::plain_write(lua, class, canon);
+        crate::lua_bridge::plain_write(lua, class, canon);
     }
     let Some((ty, enum_name)) = info.ty else {
         return Err(rt_err(format!("Unable to assign property {key}")));
@@ -3169,7 +3187,7 @@ fn script_of_function(f: &Function) -> Option<Ref> {
 /// The script of the running code: the `script` of the nearest Lua
 /// function on the current thread's stack that has one (plugin_host's
 /// printidentity asset id).
-pub(crate) fn running_script(lua: &Lua) -> Option<Ref> {
+pub fn running_script(lua: &Lua) -> Option<Ref> {
     for level in 0..32 {
         match lua.inspect_stack(level, |d| script_of_function(&d.function())) {
             Some(Some(r)) => return Some(r),
@@ -3533,7 +3551,7 @@ fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>
     // Studio 0.744's classes (its API dump): a name it doesn't have is not a
     // valid Service name (FeatureMatchingService, measured), whatever the
     // reflection database (another version) says.
-    let api_class = crate::api::get().map(|a| a.classes.get(class));
+    let api_class = rustudio_core::api::get().map(|a| a.classes.get(class));
     if matches!(api_class, Some(None)) {
         return Err(rt_err(format!("'{class}' is not a valid Service name")));
     }
@@ -4473,7 +4491,7 @@ local yield, running = coroutine.yield, coroutine.running
 
 -- Engine calls return (ok, ...) and errors are rethrown here without a
 -- position, like Roblox's own: pcall gets "X is not a valid member of …"
--- alone (Studio's Place B Newer warns "DataStore unavailable: You must
+-- alone (a test place warns "DataStore unavailable: You must
 -- publish …"), and Output puts the script and line in the stack after it.
 local function check(ok, ...)
     if ok then return ... end
@@ -4496,7 +4514,7 @@ local function gate(self, verb)
     end
 end
 -- Studio: a non-function still answers a (dead) Connection; the failure
--- goes to Output as an error, not to the caller.
+-- goes to Output as an error, not to the caller (RE-DATATYPES signal.*).
 local function noop() end
 local function connect(self, fn, once)
     gate(self, "connect")
@@ -4571,7 +4589,7 @@ local FAILED = newproxy(false) -- a module whose code raised
 -- "@self/X" its child, "@game/Service/X" from the DataModel (estimated); ".." inside a
 -- path goes to the parent. Children are found, not waited for.
 local function require_path(path, ctx)
-    -- Studio's require raises without a position.
+    -- Studio's require raises without a position (RE-GLOBALS.md require.*).
     local function fail(why) error(string.format('error requiring "%s": %s', path, why), 0) end
     if typeof(ctx) ~= "Instance" then fail("could not get requiring context") end
     local node, rest
@@ -4680,7 +4698,7 @@ function require(m) return require_impl(m, nil) end
 
 __rs_lua_methods = {}
 -- A Lua-written method called on the wrong thing fails as Roblox's own do
--- (an admin script: `RemoteFunction.InvokeServer(workspace)` must say exactly this).
+-- (Adonis: `RemoteFunction.InvokeServer(workspace)` must say exactly this).
 -- typeof only: a script's proxy userdata must not see an __index.
 function __rs_member_check(self, class, name)
     if typeof(self) ~= "Instance" or not self:IsA(class) then
@@ -4691,7 +4709,7 @@ local member = __rs_member_check
 function __rs_lua_methods.WaitForChild(self, name, timeout)
     local c = self:FindFirstChild(name)
     if c then return c end
-    -- Studio names the instance as it was at the call (Place B's
+    -- Studio names the instance as it was at the call (a test place's
     -- CharacterAdded handler: 'Player:WaitForChild("Torso")', unparented).
     local start, warned, full = time(), false, self:GetFullName()
     -- Studio's warning names the script line that waits, not this prelude.
@@ -4818,9 +4836,10 @@ pub fn luau_flags() {
 
 impl Runtime {
     pub fn new() -> Result<Self, String> {
+        domains::plugin_api::freeze();
         luau_flags();
         let lua = Lua::new();
-        crate::load_trace::mark("runtime: Lua made");
+        rustudio_core::load_trace::mark("runtime: Lua made");
         // RUSTUDIO_DETERMINISTIC (test runs): Luau seeds math.random from the time and the
         // state's address; the default Animate script rolls its weighted variants with it,
         // and the chosen pose shapes the character. Seeded by creation order instead.
@@ -4831,9 +4850,9 @@ impl Runtime {
             let _ = lua.load(format!("math.randomseed({n})")).exec();
         }
         routes::install_atoms(&lua);
-        crate::load_trace::mark("runtime: atoms");
+        rustudio_core::load_trace::mark("runtime: atoms");
         crate::globals_parity::init_vm(&lua);
-        crate::load_trace::mark("runtime: globals parity");
+        rustudio_core::load_trace::mark("runtime: globals parity");
         // Studio compiles scripts at Luau -O1 (no inlining), so Output stacks
         // keep every frame; -O2 inlined local functions out of error stacks.
         // Studio's other compile options:
@@ -4874,8 +4893,12 @@ impl Runtime {
             if let Some(b) = lua.app_data_ref::<Budget>() {
                 if let Some(s) = b.start {
                     // Studio Settings > Debugger > Script Timeout Length
-                    // (0 or less: no limit).
-                    let limit = crate::studio_settings::studio("ScriptTimeoutLength", mech::SCRIPT_TIMEOUT_S as f64);
+                    // (0 or less: no limit; the default without the store).
+                    let limit = domains::settings_host::num(
+                        "Studio",
+                        "ScriptTimeoutLength",
+                        mech::SCRIPT_TIMEOUT_S as f64,
+                    );
                     if limit > 0.0 && s.elapsed() > Duration::from_secs_f64(limit.min(1e9)) {
                         // Name the script and line that ran too long.
                         let at = (0..32)
@@ -4909,9 +4932,9 @@ impl Runtime {
         let shared = lua.create_table().map_err(|e| e.to_string())?;
         interrupt_watchdog::register(callbacks as *mut mlua::ffi::lua_Callbacks);
         let rt = Runtime { lua, shared, callbacks };
-        crate::load_trace::mark("runtime: hooks");
+        rustudio_core::load_trace::mark("runtime: hooks");
         rt.install().map_err(|e| describe_error(&e))?;
-        crate::load_trace::mark("runtime: installed");
+        rustudio_core::load_trace::mark("runtime: installed");
         Ok(rt)
     }
 
@@ -5004,7 +5027,7 @@ impl Runtime {
                 sched(lua)?.timers.push(Timer {
                     at: now + t,
                     started: now,
-                    wall: crate::sim_clock::now(),
+                    wall: rustudio_core::sim_clock::now(),
                     thread: th.clone(),
                     args: Some(it.collect()),
                 });
@@ -5037,7 +5060,7 @@ impl Runtime {
                 sched(lua)?.timers.push(Timer {
                     at: now + t,
                     started: now,
-                    wall: crate::sim_clock::now(),
+                    wall: rustudio_core::sim_clock::now(),
                     thread: th,
                     args: Some(vec![]),
                 });
@@ -5064,7 +5087,7 @@ impl Runtime {
                 if let Some(t) = fixed_epoch_time(lua) {
                     return Ok(t);
                 }
-                Ok(crate::sim_clock::epoch_secs())
+                Ok(rustudio_core::sim_clock::epoch_secs())
             })?,
         )?;
         g.set("shared", lua.create_table()?)?;
@@ -5075,7 +5098,7 @@ impl Runtime {
             sched(lua)?.timers.push(Timer {
                 at: now + t.max(0.0),
                 started: now,
-                wall: crate::sim_clock::now(),
+                wall: rustudio_core::sim_clock::now(),
                 thread: th,
                 args: None,
             });
@@ -5154,8 +5177,8 @@ impl Runtime {
         let rs_index = lua.create_function(|lua, (this, key, atom): (LInst, mlua::LuaString, Option<i32>)| {
             let key = key.to_str()?;
             let key: &str = &key;
-            crate::bench::site(lua, "index", key);
-            crate::bench::api_timed("index", key, || {
+            crate::lua_bridge::site(lua, "index", key);
+            rustudio_core::bench::api_timed("index", key, || {
                 checked1(lua, index_entry(lua, this.0, key, atom.unwrap_or(-1)))
             })
             .inspect(|_| signal_timing::flush_immediate(lua))
@@ -5164,8 +5187,8 @@ impl Runtime {
             lua.create_function(|lua, (this, key, value, atom): (LInst, mlua::LuaString, Value, Option<i32>)| {
                 let key = key.to_str()?;
                 let key: &str = &key;
-                crate::bench::site(lua, "newindex", key);
-                crate::bench::api_timed("newindex", key, || {
+                crate::lua_bridge::site(lua, "newindex", key);
+                rustudio_core::bench::api_timed("newindex", key, || {
                     checked1(lua, newindex_entry(lua, this.0, key, value, atom.unwrap_or(-1)).map(|_| Value::Nil))
                 })
                 .inspect(|_| signal_timing::flush_immediate(lua))
@@ -5184,7 +5207,7 @@ impl Runtime {
                 rs_newindex,
                 mech::WAIT_MIN_S,
             ))?;
-        // Roblox's are C functions, and an admin script checks (src/cmeta.rs); the
+        // Roblox's are C functions, and Adonis checks (crates/rustudio-engine/src/cmeta.rs); the
         // prelude's Lua shims stay for anything that calls them directly.
         let _ = (inst_index, inst_newindex);
         let _ = wrap;
@@ -5381,10 +5404,10 @@ impl Runtime {
         g.set(
             "__rs_asset_ready",
             lua.create_function(|lua, id: f64| {
-                Ok(match crate::assets::public_prefetch(id as u64) {
-                    crate::assets::Fetch::Ready(_) => Value::Boolean(true),
-                    crate::assets::Fetch::Pending => Value::Boolean(false),
-                    crate::assets::Fetch::Unavailable(e) => Value::String(lua.create_string(&e)?),
+                Ok(match rustudio_core::assets::public_prefetch(id as u64) {
+                    rustudio_core::assets::Fetch::Ready(_) => Value::Boolean(true),
+                    rustudio_core::assets::Fetch::Pending => Value::Boolean(false),
+                    rustudio_core::assets::Fetch::Unavailable(e) => Value::String(lua.create_string(&e)?),
                 })
             })?,
         )?;
@@ -5414,20 +5437,20 @@ impl Runtime {
         g.set(
             "__rs_product_info",
             lua.create_function(|lua, (id, kind): (f64, String)| {
-                Ok(match crate::assets::product_info(id as u64, &kind) {
-                    crate::assets::Fetch::Ready(b) => (
+                Ok(match rustudio_core::assets::product_info(id as u64, &kind) {
+                    rustudio_core::assets::Fetch::Ready(b) => (
                         Value::String(lua.create_string(&b[..])?),
                         Value::Nil,
                     ),
-                    crate::assets::Fetch::Pending => (Value::Boolean(false), Value::Nil),
-                    crate::assets::Fetch::Unavailable(e) => {
+                    rustudio_core::assets::Fetch::Pending => (Value::Boolean(false), Value::Nil),
+                    rustudio_core::assets::Fetch::Unavailable(e) => {
                         (Value::Nil, Value::String(lua.create_string(&e)?))
                     }
                 })
             })?,
         )?;
         // ParticleEmitter:Emit(n) / :Clear() (n −1) for the viewport's
-        // particles (src/effects.rs), on this DataModel.
+        // particles (crates/rustudio-render/src/effects.rs), on this DataModel.
         g.set(
             "__rs_particles",
             lua.create_function(|lua, (inst, n): (LInst, f64)| {
@@ -5435,9 +5458,9 @@ impl Runtime {
                     return Ok(());
                 };
                 if n < 0.0 {
-                    crate::effects::clear(id, inst.0);
+                    rustudio_render::effects::clear(id, inst.0);
                 } else {
-                    crate::effects::emit(id, inst.0, n.min(100_000.0) as u32);
+                    rustudio_render::effects::emit(id, inst.0, n.min(100_000.0) as u32);
                 }
                 Ok(())
             })?,
@@ -5457,13 +5480,13 @@ impl Runtime {
                         Value::Nil
                     }
                     "unregister" => {
-                        crate::collision_groups::check_name(&a).map_err(rt_err)?;
+                        rustudio_core::collision_groups::check_name(&a).map_err(rt_err)?;
                         cg.unregister(&a);
                         Value::Nil
                     }
                     "rename" => {
-                        crate::collision_groups::check_name(&a).map_err(rt_err)?;
-                        crate::collision_groups::check_name(&b).map_err(rt_err)?;
+                        rustudio_core::collision_groups::check_name(&a).map_err(rt_err)?;
+                        rustudio_core::collision_groups::check_name(&b).map_err(rt_err)?;
                         cg.rename(&a, &b);
                         Value::Nil
                     }
@@ -5483,10 +5506,10 @@ impl Runtime {
                     "name" => {
                         // GetCollisionGroupName: ids 0..31.
                         let id = a.parse::<i64>().unwrap_or(-1);
-                        if !(0..crate::collision_groups::MAX_GROUPS as i64).contains(&id) {
+                        if !(0..rustudio_core::collision_groups::MAX_GROUPS as i64).contains(&id) {
                             return Err(rt_err(format!(
                                 "The Collision group Id must be between 0 and {}",
-                                crate::collision_groups::MAX_GROUPS
+                                rustudio_core::collision_groups::MAX_GROUPS
                             )));
                         }
                         let n = cg.names().get(id as usize).cloned().unwrap_or_default();
@@ -5552,7 +5575,7 @@ impl Runtime {
         security::seal(lua)?;
 
         // Script environments read the public globals through `shared`
-        // (src/globals_parity.rs: rustudio's own stay out of reach).
+        // (crates/rustudio-engine/src/globals_parity.rs: rustudio's own stay out of reach).
         let _ = g;
         crate::globals_parity::install(lua, &self.shared)?;
         Ok(())
@@ -5612,7 +5635,7 @@ impl Runtime {
         let instr_clock = std::env::var_os("RUSTUDIO_INSTR_CLOCK").is_some();
         // RUSTUDIO_GAME_CLOCK=1 (tests only, with RUSTUDIO_FIXED_DT): the
         // game's time, so wall-clock probes are deterministic on a loaded machine.
-        let game_clock = std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some() || crate::sim_clock::on();
+        let game_clock = std::env::var_os("RUSTUDIO_GAME_CLOCK").is_some() || rustudio_core::sim_clock::on();
         let clock = lua.create_function(move |lua, ()| {
             if game_clock {
                 // Each call costs GAME_CLOCK_CALL of virtual script time, so a script that
@@ -5623,7 +5646,7 @@ impl Runtime {
                 return Ok(world(lua).map(|w| w.time).unwrap_or(0.0) + 1000.0 + *e);
             }
             if instr_clock {
-                return Ok(crate::bench::instructions() as f64 * 1e-9);
+                return Ok(rustudio_core::bench::instructions() as f64 * 1e-9);
             }
             // (Unix only; elsewhere the wall clock below.)
             #[cfg(unix)]
@@ -5651,12 +5674,12 @@ impl Runtime {
             os.set("clock", clock)?;
             // --fixed-dt: os.time() (no table) and os.date(fmt) (no time)
             // on the simulated clock.
-            if crate::sim_clock::on() {
+            if rustudio_core::sim_clock::on() {
                 let date: Function = os.get("date")?;
                 os.set(
                     "date",
                     lua.create_function(move |_, (fmt, t): (Value, Option<f64>)| {
-                        let t = t.unwrap_or_else(|| crate::sim_clock::epoch_secs().floor());
+                        let t = t.unwrap_or_else(|| rustudio_core::sim_clock::epoch_secs().floor());
                         date.call::<mlua::MultiValue>((fmt, t))
                     })?,
                 )?;
@@ -5665,7 +5688,7 @@ impl Runtime {
                     "time",
                     lua.create_function(move |_, t: mlua::MultiValue| {
                         if t.is_empty() || matches!(t.front(), Some(Value::Nil)) {
-                            Ok(Value::Number(crate::sim_clock::epoch_secs().floor()))
+                            Ok(Value::Number(rustudio_core::sim_clock::epoch_secs().floor()))
                         } else {
                             orig.call::<Value>(t)
                         }
@@ -5719,7 +5742,7 @@ impl Runtime {
             .and_then(|f| domains::assets_cloud::scene::create_thread(lua,f))
             .inspect(|th| security::set(th, ident));
         match started {
-            Ok(th) if crate::bench::lua_prof_on() => crate::bench::lua_timed(
+            Ok(th) if rustudio_core::bench::lua_prof_on() => rustudio_core::bench::lua_timed(
                 th.to_pointer() as usize,
                 || format!("(start) {}", world(lua).map(|w| w.full_name(r)).unwrap_or_default()),
                 || resume(lua, &th, vec![]),
@@ -5783,24 +5806,24 @@ impl Runtime {
         // RUSTUDIO_FIXED_DT Play (test runs): no wall clock in what resumes when.
         let fixed_step = !realtime && fixed_dt_env();
         {
-            let _s = crate::bench::scope("rt_domains_step");
+            let _s = rustudio_core::bench::scope("rt_domains_step");
             let _ = domains::step(lua, dt);
         }
         // Frame signals (including the camera's RenderStepped callback) must
         // run before task.wait resumes at Heartbeat. Otherwise a script can
         // switch Custom back to Scriptable before the camera gets its frame.
         {
-            let _s = crate::bench::scope("rt_dispatch1");
+            let _s = rustudio_core::bench::scope("rt_dispatch1");
             self.dispatch();
         }
-        let _st = crate::bench::scope("rt_timers");
+        let _st = rustudio_core::bench::scope("rt_timers");
         let mut due: Vec<Timer> = {
             let Ok(mut s) = sched(lua) else { return };
             let (due, keep): (Vec<Timer>, Vec<Timer>) = std::mem::take(&mut s.timers)
                 .into_iter()
                 .partition(|t| {
                     t.at <= now + 1e-9
-                        || realtime && crate::sim_clock::since(t.wall).as_secs_f64() >= t.at - t.started
+                        || realtime && rustudio_core::sim_clock::since(t.wall).as_secs_f64() >= t.at - t.started
                 });
             s.timers = keep;
             due
@@ -5815,14 +5838,14 @@ impl Runtime {
                 .unwrap_or_else(|| {
                     // (RUSTUDIO_FIXED_DT runs: game time only; the wall clock would make
                     // the result depend on the machine's load. --fixed-dt: its simulated clock.)
-                    let real = if fixed_step { 0.0 } else { crate::sim_clock::since(t.wall).as_secs_f64() };
+                    let real = if fixed_step { 0.0 } else { rustudio_core::sim_clock::since(t.wall).as_secs_f64() };
                     vec![Value::Number((now - t.started).max(real))]
                 });
             resume_thread_timed(lua, &t.thread, args);
             // The frame budget is wall time: fixed-step runs (RUSTUDIO_FIXED_DT or
             // --fixed-dt) resume every due thread, so what runs in a frame doesn't
             // depend on how fast the machine is.
-            if !fixed_step && !crate::sim_clock::on() && started.elapsed().as_secs_f64() * 1000.0 > mech::SCRIPT_FRAME_BUDGET_MS {
+            if !fixed_step && !rustudio_core::sim_clock::on() && started.elapsed().as_secs_f64() * 1000.0 > mech::SCRIPT_FRAME_BUDGET_MS {
                 break;
             }
         }
@@ -5833,7 +5856,7 @@ impl Runtime {
             }
         }
         drop(_st);
-        let _s2 = crate::bench::scope("rt_dispatch2");
+        let _s2 = rustudio_core::bench::scope("rt_dispatch2");
         self.dispatch();
         drop(_s2);
         ext::flush_terrain(lua);
@@ -6063,7 +6086,7 @@ impl Runtime {
                 .app_data_mut::<World>()
                 .map(|mut w| std::mem::take(&mut w.to_start))
                 .unwrap_or_default();
-            let _sc = crate::bench::scope("dis_start");
+            let _sc = rustudio_core::bench::scope("dis_start");
             for s in starting {
                 let still = world(lua).map(|w| w.runs_here(s)).unwrap_or(false);
                 if still {
@@ -6087,12 +6110,12 @@ impl Runtime {
                 return;
             }
             drop(_sc);
-            let _sc = crate::bench::scope("dis_deferred");
+            let _sc = rustudio_core::bench::scope("dis_deferred");
             for (th, args) in deferred {
                 resume_thread_timed(lua, &th, args);
             }
             drop(_sc);
-            let _sc = crate::bench::scope("dis_events");
+            let _sc = rustudio_core::bench::scope("dis_events");
             for (r, name, args, seq, depth) in events {
                 if name.starts_with('\0') {
                     domains::anim::run_hook(lua, &name, &args);
@@ -6146,7 +6169,7 @@ fn report(lua: &Lua, e: &mlua::Error) {
 fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Option<String>)>) {
     let msg = describe_error(e);
     if frames.is_empty() {
-        if let Some((path, line)) = crate::output_panel::error_origin(&msg) {
+        if let Some((path, line)) = error_origin(&msg) {
             frames.push((path.to_string(), line, None));
         } else if let Some((path, line)) = callback_origin(e) {
             frames.push((path, line, None));
@@ -6156,7 +6179,7 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
         let Some(mut w) = lua.app_data_mut::<World>() else { return };
         w.output.push((Level::Error, msg.clone()));
         if !frames.is_empty() {
-            let mark = crate::output_panel::STACK_MARK;
+            let mark = STACK_MARK;
             w.output.push((Level::Info, format!("{mark}Stack Begin")));
             for (path, line, func) in &frames {
                 let text = match func {
@@ -6173,7 +6196,7 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
             let root = d.dom.root_ref();
             let sc = d.find_child(root, "ScriptContext")?;
             // An engine error has no prefix: the innermost frame's script.
-            let path = match crate::output_panel::error_origin(&msg) {
+            let path = match error_origin(&msg) {
                 Some((p, _)) => p,
                 None => frames.first().map(|f| f.0.as_str()).unwrap_or(""),
             };
@@ -6261,15 +6284,15 @@ fn thread_label(lua: &Lua, th: &Thread) -> String {
 
 /// `resume`, timed per thread while a bench runs.
 fn resume_thread_timed(lua: &Lua, th: &Thread, args: Vec<Value>) {
-    if crate::bench::lua_prof_on() && th.status() == ThreadStatus::Resumable {
-        crate::bench::lua_timed(th.to_pointer() as usize, || thread_label(lua, th), || resume(lua, th, args))
+    if rustudio_core::bench::lua_prof_on() && th.status() == ThreadStatus::Resumable {
+        rustudio_core::bench::lua_timed(th.to_pointer() as usize, || thread_label(lua, th), || resume(lua, th, args))
     } else {
         resume(lua, th, args)
     }
 }
 
 /// Resumes a coroutine under the script timeout, routing errors to Output.
-fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
+pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
     if th.status() != ThreadStatus::Resumable {
         return;
     }
@@ -6281,10 +6304,10 @@ fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
             b.start = Some(Instant::now());
         }
     }
-    let hitch = crate::bench::hitch_on().then(Instant::now);
+    let hitch = rustudio_core::bench::hitch_on().then(Instant::now);
     let label = hitch.map(|_| thread_label(lua, th));
     if hitch.is_some() && outermost {
-        crate::bench::hitch_api_take();
+        rustudio_core::bench::hitch_api_take();
     }
     if let Some(mut p) = lua.app_data_mut::<ProfileDepth>() {
         if !p.0.is_empty() {
@@ -6299,7 +6322,7 @@ fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
             let err = r.as_ref().err().map(|e| describe_error(e)).unwrap_or_default();
             eprintln!("HITCH resume {ms:.1} ms {l} / after {after} {err:.200}");
             if outermost && ms > 300.0 {
-                for (k, t, n) in crate::bench::hitch_api_take().into_iter().take(12) {
+                for (k, t, n) in rustudio_core::bench::hitch_api_take().into_iter().take(12) {
                     eprintln!("HITCH   {t:.1} ms {n}x {k}");
                 }
             }
@@ -6350,7 +6373,7 @@ fn compile_script(lua: &Lua, r: Ref, shared: &Table) -> mlua::Result<Function> {
     let _ = shared;
     let env = crate::globals_parity::new_env(lua, Some(inst_value(lua, r)?))?;
     // A Script inside a loaded plugin's tree also gets `plugin`.
-    crate::plugin_host::vm::script_env(lua, r, &env)?;
+    domains::script_env(lua, r, &env)?;
     // Big sources compile once (the other side of Play, the next run):
     // bytecode_cache.rs.
     match crate::bytecode_cache::get(&source) {
@@ -6689,7 +6712,7 @@ impl Runtime {
             return;
         };
         match domains::assets_cloud::scene::create_thread(&self.lua,f) {
-            Ok(th) if crate::bench::lua_prof_on() => crate::bench::lua_timed(
+            Ok(th) if rustudio_core::bench::lua_prof_on() => rustudio_core::bench::lua_timed(
                 name_key(name),
                 || format!("(rustudio) {name}"),
                 || resume(&self.lua, &th, args),
@@ -7064,7 +7087,7 @@ mod tests {
     #[test]
     fn error_stack_lines() {
         let out = run("local function inner()\n\terror(\"deep\")\nend\nlocal function outer()\n\tinner()\nend\nouter()\n");
-        let text: Vec<String> = out.iter().map(|(_, s)| s.replace(crate::output_panel::STACK_MARK, "")).collect();
+        let text: Vec<String> = out.iter().map(|(_, s)| s.replace(STACK_MARK, "")).collect();
         let at = text.iter().position(|t| t == "Stack Begin").expect("stack");
         assert_eq!(
             &text[at..at + 5],
@@ -7773,7 +7796,7 @@ mod bridge_tests;
 /// `Runtime::notify_prop` from inside Lua (ChangeHistoryService's undo,
 /// src/plugin_host/api_history.rs): Changed for a property changed outside
 /// the script's own write.
-pub(crate) fn notify_prop_in(lua: &Lua, r: Ref, name: &str) {
+pub fn notify_prop_in(lua: &Lua, r: Ref, name: &str) {
     let Ok(mut w) = world(lua) else { return };
     let root = w.d().dom.root_ref();
     if !w.listening.contains(&r) && !w.listening.contains(&root) {

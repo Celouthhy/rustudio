@@ -74,7 +74,7 @@ impl Default for Thumbs {
             started: false,
             retry: Vec::new(),
             inflight: HashSet::new(),
-            dir: crate::paths::cache().join("rustudio").join("toolbox-thumbs"),
+            dir: rustudio_core::paths::cache().join("rustudio").join("toolbox-thumbs"),
             ready: VecDeque::new(),
             uploaded_last_frame: 0,
             pending_tries: HashMap::new(),

@@ -121,7 +121,8 @@ shared.memoryLiveDone=true;print('MEMORY SCRATCH ROUNDTRIP PASSED',name)
     #[test]
     #[ignore = "writes only the explicitly authorized scratch universe via Studio UMS scope"]
     fn live_memory_scratch_roundtrip() {
-        use crate::{doc::Document,runtime::{RunMode,Runtime,World}};
+        use rustudio_core::doc::Document;
+        use crate::runtime::{RunMode,Runtime,World};
         use rbx_dom_weak::{types::Variant,ustr,InstanceBuilder};
         let mut d=Document::new_place();let root=d.dom.root_ref();
         let i=d.dom.get_by_ref_mut(root).unwrap();i.properties.insert(ustr("PlaceId"),Variant::Int64(10000000000008));i.properties.insert(ustr("GameId"),Variant::Int64(10000000007));
@@ -131,7 +132,7 @@ shared.memoryLiveDone=true;print('MEMORY SCRATCH ROUNDTRIP PASSED',name)
         for _ in 0..6000 {
             rt.step(0.02);
             if rt.lua.globals().get::<Table>("shared").unwrap().get::<bool>("memoryLiveDone").unwrap_or(false){return}
-            if rt.world_mut().unwrap().output.iter().any(|(l,_)|matches!(l,crate::app::Level::Error)){break}
+            if rt.world_mut().unwrap().output.iter().any(|(l,_)|matches!(l,rustudio_core::log::Level::Error)){break}
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("memory scratch roundtrip failed: {:?}",rt.world_mut().unwrap().output);

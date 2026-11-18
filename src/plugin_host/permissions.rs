@@ -10,16 +10,9 @@ use std::sync::RwLock;
 
 use mlua::Lua;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Decision {
-    Allow,
-    /// Refused: the error message the request raises.
-    Deny(String),
-    /// The person hasn't answered yet (Studio's prompt is up). Today the
-    /// request raises "HttpError: …permission pending" (
-    /// a waiting request needs services.luau to poll again).
-    Pending,
-}
+/// What a permission check decides (the engine's type: services.rs reads
+/// it for a request that waits).
+pub use rustudio_engine::runtime::domains::plugin_api::Decision;
 
 pub type HttpCheck = fn(plugin: &str, url: &str) -> Decision;
 pub type InjectionCheck = fn(plugin: &str) -> Decision;
@@ -41,21 +34,19 @@ pub fn set_injection_check(f: InjectionCheck) {
 
 /// The running plugin's Name, if the running code is a plugin's.
 pub fn running_plugin(lua: &Lua) -> Option<String> {
-    if crate::runtime::security::current(lua) != crate::runtime::security::PLUGIN_IDENT {
+    if rustudio_engine::runtime::security::current(lua) != rustudio_engine::runtime::security::PLUGIN_IDENT {
         return None;
     }
-    let script = crate::runtime::running_script(lua)?;
+    let script = rustudio_engine::runtime::running_script(lua)?;
     let root = super::vm::plugin_root_of(lua, script)?;
     lua.app_data_ref::<super::vm::PluginVm>()?.by_root(root).map(|p| p.name.clone())
 }
 
 /// The error a Pending decision raises: callers that can wait
 /// (HttpService's Luau side) test it with [`is_pending`] and ask again.
-const PENDING: &str = "rustudio: plugin permission pending";
-
-pub fn is_pending(e: &mlua::Error) -> bool {
-    e.to_string().contains(PENDING)
-}
+/// (The text lives in the engine: services.rs, above the plugin host,
+/// tests it.)
+pub use rustudio_engine::runtime::domains::plugin_api::{is_pending, PENDING};
 
 fn decide(d: Decision, _what: &str) -> mlua::Result<()> {
     match d {
@@ -185,7 +176,7 @@ pub fn retry_source_writes(lua: &Lua) -> bool {
         }
         let mut ready = Vec::new();
         let mut keep = Vec::new();
-        let here = |r| crate::runtime::world(lua).is_ok_and(|wd| wd.d().exists(r));
+        let here = |r| rustudio_engine::runtime::world(lua).is_ok_and(|wd| wd.d().exists(r));
         for w in h.drain(..) {
             // (Another runtime's write waits for that one.)
             if !here(w.script) {
@@ -207,19 +198,19 @@ pub fn retry_source_writes(lua: &Lua) -> bool {
                 let r = (|| -> mlua::Result<()> {
                     let f = lua.load("local s, v = ... s.Source = v").set_name(format!("={}", w.plugin)).into_function()?;
                     let th = lua.create_thread(f)?;
-                    crate::runtime::security::set(&th, crate::runtime::security::PLUGIN_IDENT);
-                    th.resume::<()>((crate::runtime::inst_value(lua, w.script)?, w.source))?;
+                    rustudio_engine::runtime::security::set(&th, rustudio_engine::runtime::security::PLUGIN_IDENT);
+                    th.resume::<()>((rustudio_engine::runtime::inst_value(lua, w.script)?, w.source))?;
                     Ok(())
                 })();
                 if let Err(e) = r {
-                    if let Ok(mut wd) = crate::runtime::world(lua) {
-                        wd.output.push((crate::app::Level::Error, crate::runtime::describe_error(&e)));
+                    if let Ok(mut wd) = rustudio_engine::runtime::world(lua) {
+                        wd.output.push((crate::app::Level::Error, rustudio_engine::runtime::describe_error(&e)));
                     }
                 }
                 any = true;
             }
             Decision::Deny(m) => {
-                if let Ok(mut wd) = crate::runtime::world(lua) {
+                if let Ok(mut wd) = rustudio_engine::runtime::world(lua) {
                     wd.output.push((crate::app::Level::Error, m));
                 }
             }

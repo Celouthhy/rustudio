@@ -17,12 +17,12 @@ use rbx_dom_weak::types::{BinaryString, Ref, Variant};
 use rbx_dom_weak::ustr;
 
 use crate::app::Editor;
-use crate::terrain::{self, Voxels, VOXEL, WATER};
+use rustudio_core::terrain::{self, Voxels, VOXEL, WATER};
 use crate::terrain_brush::{self as brush, BrushOp, FlattenMode, Pivot, PlaneLock, Shape};
 use crate::terrain_gen::{self as gen, Biome};
-use crate::terrain_region::{self as region, Region, Rot};
+use rustudio_core::terrain_region::{self as region, Region, Rot};
 use crate::terrain_ui::{self as tui, Seg, TileIcon};
-use crate::theme;
+use rustudio_engine::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -377,12 +377,12 @@ fn snap4(v: f32) -> f32 {
 
 impl Editor {
     fn terrain_ref(&self) -> Option<Ref> {
-        self.doc.workspace().and_then(|ws| self.doc.find_child(ws, "Terrain"))
+        self.game.doc.workspace().and_then(|ws| self.game.doc.find_child(ws, "Terrain"))
     }
 
     /// The voxels as the document holds them now.
     fn terrain_voxels(&self) -> Voxels {
-        match Voxels::from_dom(&self.doc.dom) {
+        match Voxels::from_dom(&self.game.doc.dom) {
             Some(Ok(v)) => v,
             _ => Voxels::empty(),
         }
@@ -395,7 +395,7 @@ impl Editor {
             self.warn("This place has no Workspace.Terrain.");
             return;
         };
-        self.doc.set_props(
+        self.game.doc.set_props(
             label,
             vec![(t, ustr("SmoothGrid"), Variant::BinaryString(BinaryString::from(v.encode())))],
             None,
@@ -403,7 +403,7 @@ impl Editor {
     }
 
     fn terrain_editing_allowed(&self) -> bool {
-        self.play.is_none() && self.doc.kind == crate::doc::DocKind::Place
+        self.game.play.is_none() && self.game.doc.kind == rustudio_core::doc::DocKind::Place
     }
 
     /// A box for Select / Generate / Import when there is none: Studio
@@ -412,7 +412,7 @@ impl Editor {
         if self.terrain_ed.selection.is_some() {
             return;
         }
-        let at = self.cam.pos + self.cam.forward() * 80.0;
+        let at = self.game.cam.pos + self.game.cam.forward() * 80.0;
         let mut b = RegionBox::from_studs([at.x, at.y.min(0.0), at.z], [64.0, 32.0, 64.0]);
         b.lo[1] = b.lo[1].min(-4);
         self.terrain_ed.selection = Some(b);
@@ -427,7 +427,7 @@ impl Editor {
         let mut action: Option<&'static str> = None;
         let sel_before = self.terrain_ed.selection;
         let tool_before = self.terrain_ed.tool;
-        let has_terrain = self.terrain_drawn.as_ref().is_some_and(|(_, _, v)| v.count() > 0)
+        let has_terrain = self.game.terrain_drawn.as_ref().is_some_and(|(_, _, v)| v.count() > 0)
             || self.terrain_voxels().count() > 0;
         ui.spacing_mut().item_spacing.y = 0.0;
         let te = &mut self.terrain_ed;
@@ -545,7 +545,7 @@ impl Editor {
         }
         let opts = gen::Options { biomes, blending: te.blending, caves: te.caves, biome_size: te.biome_size, seed: te.seed };
         // The grid's bytes as they are now; decoded on the worker.
-        let bytes: Vec<u8> = match self.doc.dom.get_by_ref(terrain).and_then(|i| i.properties.get(&ustr("SmoothGrid"))) {
+        let bytes: Vec<u8> = match self.game.doc.dom.get_by_ref(terrain).and_then(|i| i.properties.get(&ustr("SmoothGrid"))) {
             Some(Variant::BinaryString(s)) => AsRef::<[u8]>::as_ref(s).to_vec(),
             _ => Vec::new(),
         };
@@ -595,7 +595,7 @@ impl Editor {
                 self.terrain_ed.gen_progress = None;
                 // A different place (opened or new) since it started: dropped.
                 if self.terrain_ref() == Some(terrain) && self.terrain_editing_allowed() {
-                    self.doc.set_props(
+                    self.game.doc.set_props(
                         "Generate Terrain",
                         vec![(terrain, ustr("SmoothGrid"), Variant::BinaryString(BinaryString::from(bytes)))],
                         None,
@@ -717,9 +717,9 @@ impl Editor {
         // The point under the mouse: terrain (a snapshot of it while Draw
         // strokes, so it doesn't climb its own output), parts unless Ignore
         // Parts, else the y = 0 plane; Plane Lock puts it on its plane.
-        let look = self.cam.forward();
+        let look = self.game.cam.forward();
         let hit = pointer.filter(|p| rect.contains(*p)).and_then(|p| {
-            let ray = self.cam.ray(rect, p);
+            let ray = self.game.cam.ray(rect, p);
             let te = &self.terrain_ed;
             if op != BrushOp::Flatten {
                 let locked = match te.plane_lock {
@@ -735,7 +735,7 @@ impl Editor {
                 .stroke
                 .as_ref()
                 .and_then(|s| s.snapshot.as_ref())
-                .or(self.terrain_drawn.as_ref().map(|(_, _, v)| v));
+                .or(self.game.terrain_drawn.as_ref().map(|(_, _, v)| v));
             let mut best = v.and_then(|v| ray_voxels(v, ray.origin, ray.dir, 10000.0, te.ignore_water));
             if !te.ignore_parts {
                 if let Some(t) = self.ray_distance(&ray) {
@@ -758,7 +758,7 @@ impl Editor {
             || (resp.is_pointer_button_down_on() && down && self.terrain_ed.stroke.is_none());
         let editing_plane = op != BrushOp::Flatten && self.terrain_ed.plane_lock == PlaneLock::Manual && self.terrain_ed.editing_plane;
         if pressed && self.terrain_ed.stroke.is_none() && resp.hovered() && !b_held && !editing_plane {
-            let before = self.terrain_ref().and_then(|t| self.doc.prop(t, "SmoothGrid"));
+            let before = self.terrain_ref().and_then(|t| self.game.doc.prop(t, "SmoothGrid"));
             // Plane Lock Auto: the plane through the click, facing the
             // camera's nearest axis (frozen for the stroke).
             let plane = hit.map(|(p, _)| (p, brush::camera_look_plane(look)));
@@ -769,7 +769,7 @@ impl Editor {
             };
             // (decoded from the grid before the stroke; skipped for very
             // large terrains, where it would stall the click)
-            let small = self.terrain_drawn.as_ref().is_some_and(|(_, _, v)| v.count() < 2_000_000);
+            let small = self.game.terrain_drawn.as_ref().is_some_and(|(_, _, v)| v.count() < 2_000_000);
             let snapshot = (op == BrushOp::Draw && self.terrain_ed.plane_lock == PlaneLock::Off && small)
                 .then(|| grid_of(before.as_ref()));
             self.terrain_ed.stroke = Some(BrushStroke {
@@ -791,7 +791,7 @@ impl Editor {
                 stroke.last = std::time::Instant::now();
                 params.plane_y = stroke.plane_y;
                 let steps = if op == BrushOp::Flatten { ticks * brush::FLATTEN_STEPS_PER_FRAME } else { ticks.min(1) };
-                if let Some((id, r, mut v)) = self.terrain_drawn.take() {
+                if let Some((id, r, mut v)) = self.game.terrain_drawn.take() {
                     let mut changed: Option<([i32; 3], [i32; 3])> = None;
                     for _ in 0..steps {
                         if let Some((lo, hi)) = brush::step(&mut v, &params, p, &mut stroke.state) {
@@ -804,11 +804,11 @@ impl Editor {
                     if let Some((lo, hi)) = changed {
                         stroke.applied = true;
                         let water = params.material == WATER || !params.ignore_water;
-                        self.terrain_brushed = Some((v, crate::terrain::dirty_box(lo, hi), water));
-                        self.terrain_drawn = Some((id, r, Voxels::empty()));
-                        self.scene.terrain_dirty = true;
+                        self.game.terrain_brushed = Some((v, rustudio_core::terrain::dirty_box(lo, hi), water));
+                        self.game.terrain_drawn = Some((id, r, Voxels::empty()));
+                        self.game.scene.terrain_dirty = true;
                     } else {
-                        self.terrain_drawn = Some((id, r, v));
+                        self.game.terrain_drawn = Some((id, r, v));
                     }
                 }
             }
@@ -819,9 +819,9 @@ impl Editor {
         // OnFinish waypoint: "Draw", "Sculpt", …).
         let stroke = self.terrain_ed.stroke.take().expect("stroke");
         if stroke.applied {
-            if let (Some(t), Some((_, _, v))) = (self.terrain_ref(), self.terrain_drawn.as_ref()) {
+            if let (Some(t), Some((_, _, v))) = (self.terrain_ref(), self.game.terrain_drawn.as_ref()) {
                 let after = Variant::BinaryString(BinaryString::from(v.encode()));
-                if let Some(i) = self.doc.dom.get_by_ref_mut(t) {
+                if let Some(i) = self.game.doc.dom.get_by_ref_mut(t) {
                     i.properties.insert(ustr("SmoothGrid"), after.clone());
                 }
                 let name = match tool {
@@ -831,7 +831,7 @@ impl Editor {
                     Tool::Flatten => "Terrain Flatten",
                     _ => "Terrain Paint",
                 };
-                self.doc.record_props(name, vec![(t, ustr("SmoothGrid"), stroke.before, after)]);
+                self.game.doc.record_props(name, vec![(t, ustr("SmoothGrid"), stroke.before, after)]);
             }
         }
         true
@@ -845,7 +845,7 @@ impl Editor {
         let hh = p.height_studs() * 0.5;
         let fill = Color32::from_rgba_unmultiplied(235, 236, 240, 40);
         let line = Color32::from_rgba_unmultiplied(235, 236, 240, 110);
-        let proj = |q: Vec3| self.cam.project(rect, q);
+        let proj = |q: Vec3| self.game.cam.project(rect, q);
         let ring = |center: Vec3, u: Vec3, v: Vec3, rad: f32| -> Vec<Pos2> {
             (0..=48)
                 .filter_map(|i| {
@@ -857,7 +857,7 @@ impl Editor {
         let mut outline: Vec<Pos2> = Vec::new();
         match p.shape {
             Shape::Sphere => {
-                let to_cam = (self.cam.pos - c).normalize_or(Vec3::Y);
+                let to_cam = (self.game.cam.pos - c).normalize_or(Vec3::Y);
                 let u = to_cam.any_orthonormal_vector();
                 let v = to_cam.cross(u);
                 outline = ring(c, u, v, r);
@@ -1267,7 +1267,7 @@ pub fn ray_voxels(v: &Voxels, origin: Vec3, dir: Vec3, max: f32, ignore_water: b
 // ------------------------------------------------------------ region tools
 
 /// The box's twelve edges, on screen.
-fn box_edges(cam: &crate::camera::Camera, rect: Rect, b: &RegionBox) -> Vec<[Pos2; 2]> {
+fn box_edges(cam: &rustudio_render::camera::Camera, rect: Rect, b: &RegionBox) -> Vec<[Pos2; 2]> {
     let (lo, hi) = (b.min(), b.max());
     let corner = |i: usize| Vec3::new(if i & 1 != 0 { hi.x } else { lo.x }, if i & 2 != 0 { hi.y } else { lo.y }, if i & 4 != 0 { hi.z } else { lo.z });
     let mut out = Vec::new();
@@ -1317,7 +1317,7 @@ fn region_handle_at(handles: &[(RegionHandle, Vec<Pos2>)], p: Pos2) -> Option<Re
             1 => (pts[0] - p).length() - 3.0,
             _ => pts.windows(2).map(|w| dist_to_segment(p, w[0], w[1])).fold(f32::MAX, f32::min),
         };
-        if d < crate::mech::GIZMO_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
+        if d < rustudio_core::mech::GIZMO_HIT_PX && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, *h));
         }
     }
@@ -1354,9 +1354,9 @@ impl Editor {
                 let Some((content, at)) = self.terrain_ed.clipboard.clone() else {
                     return true;
                 };
-                let base = self.terrain_ref().and_then(|t| self.doc.prop(t, "SmoothGrid"));
+                let base = self.terrain_ref().and_then(|t| self.game.doc.prop(t, "SmoothGrid"));
                 self.terrain_ed.selection = Some(at);
-                self.terrain_ed.lift = Some(Lift { base, content, from: None, rot: region::IDENTITY, revision: self.doc.revision, base_grid: None, preview: None });
+                self.terrain_ed.lift = Some(Lift { base, content, from: None, rot: region::IDENTITY, revision: self.game.doc.revision, base_grid: None, preview: None });
                 self.place_lift("Terrain Paste");
                 self.terrain_ed.tool = Some(Tool::Transform);
                 return true;
@@ -1397,9 +1397,9 @@ impl Editor {
             }
             "duplicate" => {
                 // A copy lifted in place: moving it leaves the original.
-                let base = self.terrain_ref().and_then(|t| self.doc.prop(t, "SmoothGrid"));
+                let base = self.terrain_ref().and_then(|t| self.game.doc.prop(t, "SmoothGrid"));
                 let content = Region::copy(&grid_of(base.as_ref()), b.lo, b.size);
-                self.terrain_ed.lift = Some(Lift { base, content, from: None, rot: region::IDENTITY, revision: self.doc.revision, base_grid: None, preview: None });
+                self.terrain_ed.lift = Some(Lift { base, content, from: None, rot: region::IDENTITY, revision: self.game.doc.revision, base_grid: None, preview: None });
                 self.terrain_ed.tool = Some(Tool::Transform);
             }
             _ => {
@@ -1429,12 +1429,12 @@ impl Editor {
     /// Starts a Transform of what `at` holds, unless one is going on that
     /// nothing else has changed since.
     fn lift_region(&mut self, at: RegionBox) {
-        if self.terrain_ed.lift.as_ref().is_some_and(|l| l.revision == self.doc.revision) {
+        if self.terrain_ed.lift.as_ref().is_some_and(|l| l.revision == self.game.doc.revision) {
             return;
         }
-        let base = self.terrain_ref().and_then(|t| self.doc.prop(t, "SmoothGrid"));
+        let base = self.terrain_ref().and_then(|t| self.game.doc.prop(t, "SmoothGrid"));
         let content = Region::copy(&grid_of(base.as_ref()), at.lo, at.size);
-        self.terrain_ed.lift = Some(Lift { base, content, from: Some(at), rot: region::IDENTITY, revision: self.doc.revision, base_grid: None, preview: None });
+        self.terrain_ed.lift = Some(Lift { base, content, from: Some(at), rot: region::IDENTITY, revision: self.game.doc.revision, base_grid: None, preview: None });
     }
 
     /// Places the lifted terrain in the selected box, as one undo step
@@ -1447,7 +1447,7 @@ impl Editor {
         let mut v = grid_of(lift.base.as_ref());
         place(&mut v, &lift.content, lift.from, &lift.rot, b, self.terrain_ed.merge_empty);
         self.commit_terrain(label, &v);
-        let revision = self.doc.revision;
+        let revision = self.game.doc.revision;
         if let Some(l) = self.terrain_ed.lift.as_mut() {
             l.revision = revision;
             l.preview = Some((b, l.rot));
@@ -1461,10 +1461,10 @@ impl Editor {
         let Some(lift) = self.terrain_ed.lift.as_mut() else {
             return;
         };
-        if lift.revision != self.doc.revision || lift.preview == Some((to, rot)) {
+        if lift.revision != self.game.doc.revision || lift.preview == Some((to, rot)) {
             return;
         }
-        let Some((id, r, mut v)) = self.terrain_drawn.take() else {
+        let Some((id, r, mut v)) = self.game.terrain_drawn.take() else {
             return;
         };
         let base = lift.base_grid.get_or_insert_with(|| grid_of(lift.base.as_ref()));
@@ -1482,9 +1482,9 @@ impl Editor {
         let lo = [0, 1, 2].map(|k| boxes.iter().map(|b| b.lo[k]).min().unwrap_or(0));
         let hi = [0, 1, 2].map(|k| boxes.iter().map(|b| b.lo[k] + b.size[k] - 1).max().unwrap_or(0));
         lift.preview = Some((to, rot));
-        self.terrain_brushed = Some((v, terrain::dirty_box(lo, hi), water));
-        self.terrain_drawn = Some((id, r, Voxels::empty()));
-        self.scene.terrain_dirty = true;
+        self.game.terrain_brushed = Some((v, terrain::dirty_box(lo, hi), water));
+        self.game.terrain_drawn = Some((id, r, Voxels::empty()));
+        self.game.scene.terrain_dirty = true;
     }
 
     /// Turns the selected region `turns` quarter turns about an axis.
@@ -1506,8 +1506,8 @@ impl Editor {
 
     /// The ground under a screen point: the voxels, else the y = 0 plane.
     fn region_ground(&self, rect: Rect, p: Pos2) -> Option<Vec3> {
-        let ray = self.cam.ray(rect, p);
-        let v = self.terrain_drawn.as_ref().map(|(_, _, v)| v);
+        let ray = self.game.cam.ray(rect, p);
+        let v = self.game.terrain_drawn.as_ref().map(|(_, _, v)| v);
         v.and_then(|v| ray_voxels(v, ray.origin, ray.dir, 4000.0, true).map(|h| h.0)).or_else(|| {
             (ray.dir.y.abs() > 1e-4)
                 .then(|| -ray.origin.y / ray.dir.y)
@@ -1534,17 +1534,17 @@ impl Editor {
             return Vec::new();
         };
         let (c, half) = (b.center(), (b.max() - b.min()) * 0.5);
-        let wpp = self.cam.world_per_px(rect, c);
+        let wpp = self.game.cam.world_per_px(rect, c);
         let mut out = Vec::new();
         for axis in 0..3 {
             let dir = Vec3::AXES[axis];
             if tool == Tool::Transform {
-                let radius = (half.length() + 6.0 * wpp).max(crate::mech::GIZMO_RING_PX * wpp);
+                let radius = (half.length() + 6.0 * wpp).max(rustudio_core::mech::GIZMO_RING_PX * wpp);
                 let (u, v) = (Vec3::AXES[(axis + 1) % 3], Vec3::AXES[(axis + 2) % 3]);
                 let pts: Vec<Pos2> = (0..=64)
                     .filter_map(|i| {
                         let a = i as f32 / 64.0 * std::f32::consts::TAU;
-                        self.cam.project(rect, c + (u * a.cos() + v * a.sin()) * radius)
+                        self.game.cam.project(rect, c + (u * a.cos() + v * a.sin()) * radius)
                     })
                     .collect();
                 if pts.len() > 2 {
@@ -1555,12 +1555,12 @@ impl Editor {
                 let face = c + dir * sign as f32 * half[axis];
                 if tool == Tool::Transform {
                     let base = face + dir * sign as f32 * 6.0 * wpp;
-                    let tip = base + dir * sign as f32 * crate::mech::GIZMO_ARROW_PX * 0.55 * wpp;
-                    if let (Some(a), Some(t)) = (self.cam.project(rect, base), self.cam.project(rect, tip)) {
+                    let tip = base + dir * sign as f32 * rustudio_core::mech::GIZMO_ARROW_PX * 0.55 * wpp;
+                    if let (Some(a), Some(t)) = (self.game.cam.project(rect, base), self.game.cam.project(rect, tip)) {
                         out.push((RegionHandle::Arrow(axis, sign), vec![a, t]));
                     }
                 }
-                if let Some(p) = self.cam.project(rect, face) {
+                if let Some(p) = self.game.cam.project(rect, face) {
                     out.push((RegionHandle::Face(axis, sign), vec![p]));
                 }
             }
@@ -1592,8 +1592,8 @@ impl Editor {
             } else {
                 Color32::from_rgba_unmultiplied(180, 225, 255, 28)
             };
-            if let Some(c) = self.cam.project(rect, b.center()) {
-                let pts: Vec<Pos2> = box_edges(&self.cam, rect, &b).into_iter().flatten().collect();
+            if let Some(c) = self.game.cam.project(rect, b.center()) {
+                let pts: Vec<Pos2> = box_edges(&self.game.cam, rect, &b).into_iter().flatten().collect();
                 if pts.len() > 2 {
                     let _ = c;
                     let hull = convex_hull(pts);
@@ -1601,7 +1601,7 @@ impl Editor {
                 }
             }
             let edge = if tool == Tool::Transform { Color32::from_rgb(40, 90, 255) } else { Color32::WHITE };
-            for [a, c] in box_edges(&self.cam, rect, &b) {
+            for [a, c] in box_edges(&self.game.cam, rect, &b) {
                 painter.line_segment([a, c], Stroke::new(1.0, edge));
             }
         }
@@ -1642,7 +1642,7 @@ impl Editor {
                         if tool == Tool::Transform {
                             self.lift_region(b);
                         }
-                        let ray = self.cam.ray(rect, p);
+                        let ray = self.game.cam.ray(rect, p);
                         let (origin, start_param) = match h {
                             RegionHandle::Face(axis, sign) | RegionHandle::Arrow(axis, sign) => {
                                 let dir = Vec3::AXES[axis] * sign as f32;
@@ -1651,7 +1651,7 @@ impl Editor {
                             }
                             RegionHandle::Ring(_) => (b.center(), 0.0),
                         };
-                        let center_px = self.cam.project(rect, b.center()).unwrap_or(p);
+                        let center_px = self.game.cam.project(rect, b.center()).unwrap_or(p);
                         Some(RegionDrag {
                             handle: Some(h),
                             start: b,
@@ -1690,7 +1690,7 @@ impl Editor {
         // Held: the box follows the mouse in whole voxels.
         let mut turn_k = 0;
         if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
-            let ray = self.cam.ray(rect, p);
+            let ray = self.game.cam.ray(rect, p);
             let mut b = drag.start;
             match drag.handle {
                 None => {
@@ -1718,7 +1718,7 @@ impl Editor {
                     let pi = std::f32::consts::PI;
                     drag.turned += (a - drag.last_angle + pi).rem_euclid(2.0 * pi) - pi;
                     drag.last_angle = a;
-                    let facing = Vec3::AXES[axis].dot(self.cam.pos - drag.origin) > 0.0;
+                    let facing = Vec3::AXES[axis].dot(self.game.cam.pos - drag.origin) > 0.0;
                     let deg = if facing { -drag.turned.to_degrees() } else { drag.turned.to_degrees() };
                     turn_k = (deg / 90.0).round() as i32;
                     b = drag.start.rotated(&region::quarter_turns(axis, turn_k));
@@ -1753,14 +1753,14 @@ impl Editor {
             match drag.handle {
                 Some(RegionHandle::Ring(axis)) => {
                     self.terrain_ed.selection = Some(drag.start);
-                    let facing = Vec3::AXES[axis].dot(self.cam.pos - drag.origin) > 0.0;
+                    let facing = Vec3::AXES[axis].dot(self.game.cam.pos - drag.origin) > 0.0;
                     let deg = if facing { -drag.turned.to_degrees() } else { drag.turned.to_degrees() };
                     self.rotate_region(axis, (deg / 90.0).round() as i32);
                 }
                 Some(_) => self.place_lift("Terrain Transform"),
                 None => self.terrain_ed.lift = None,
             }
-            self.scene.terrain_dirty = true;
+            self.game.scene.terrain_dirty = true;
         }
         true
     }

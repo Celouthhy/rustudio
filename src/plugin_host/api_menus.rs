@@ -245,8 +245,8 @@ pub enum MenuView {
 
 /// `menu`'s entries, submenus expanded (a menu inside itself stops at a
 /// depth of 8). Text and titles are read live from `doc`.
-pub fn menu_view(lua: &Lua, doc: &crate::doc::Document, menu: Ref) -> Vec<MenuView> {
-    fn walk(lua: &Lua, doc: &crate::doc::Document, menu: Ref, depth: u32) -> Vec<MenuView> {
+pub fn menu_view(lua: &Lua, doc: &rustudio_core::doc::Document, menu: Ref) -> Vec<MenuView> {
+    fn walk(lua: &Lua, doc: &rustudio_core::doc::Document, menu: Ref, depth: u32) -> Vec<MenuView> {
         let s = |r: Ref, k: &str| match doc.prop(r, k) {
             Some(Variant::String(s)) => s,
             Some(Variant::ContentId(c)) => c.as_str().to_string(),
@@ -276,7 +276,7 @@ pub fn menu_view(lua: &Lua, doc: &crate::doc::Document, menu: Ref) -> Vec<MenuVi
 /// entry (1-based, separators not counted) and its Mth entry; anything else
 /// is an action's id, full ActionId or Text. Returns whether a popup was
 /// open.
-pub fn answer_top(lua: &Lua, doc: &crate::doc::Document, choice: &str) -> bool {
+pub fn answer_top(lua: &Lua, doc: &rustudio_core::doc::Document, choice: &str) -> bool {
     let Some(top) = open_menus(lua).last().cloned() else { return false };
     let c = choice.trim();
     if matches!(c.to_ascii_lowercase().as_str(), "" | "0" | "none" | "nil" | "escape") {

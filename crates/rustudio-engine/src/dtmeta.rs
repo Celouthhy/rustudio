@@ -347,7 +347,7 @@ unsafe extern "C-unwind" fn index_fn(l: *mut ffi::lua_State) -> c_int {
 static CFRAME_UD: std::sync::OnceLock<Option<(usize, u64, usize)>> = std::sync::OnceLock::new();
 
 fn probe_cframe(lua: &Lua) -> Option<(usize, u64, usize)> {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     let known = crate::ltypes::LCFrame(Xform {
         pos: glam::Vec3::new(1.5, -2.25, 3.125),
         rot: glam::Mat3::from_cols_array(&[0.25, 0.5, 0.75, -1.0, 2.0, -3.0, 4.5, 5.5, 6.5]),
@@ -380,13 +380,13 @@ fn probe_cframe(lua: &Lua) -> Option<(usize, u64, usize)> {
 }
 
 /// The CFrame at 1 (self already known to be one).
-unsafe fn cframe_at(l: *mut ffi::lua_State) -> Option<crate::math::Xform> {
+unsafe fn cframe_at(l: *mut ffi::lua_State) -> Option<rustudio_core::math::Xform> {
     unsafe { cframe_idx(l, 1) }
 }
 
 /// The CFrame at `i` (known to be one: its metatable checked), read from
 /// mlua's block as probed; None if the block doesn't look as probed.
-unsafe fn cframe_idx(l: *mut ffi::lua_State, i: c_int) -> Option<crate::math::Xform> {
+unsafe fn cframe_idx(l: *mut ffi::lua_State, i: c_int) -> Option<rustudio_core::math::Xform> {
     let (len, w0, at) = (*CFRAME_UD.get()?)?;
     unsafe {
         if ffi::lua_objlen(l, i) as usize != len {
@@ -423,7 +423,7 @@ unsafe fn native_get(l: *mut ffi::lua_State, meta: &TypeMeta) -> Option<c_int> {
                 Some(f(glam::Vec3::new(*p, *p.add(1), *p.add(2))).push(l))
             }
             "CFrame" => {
-                let f: fn(&crate::math::Xform) -> Pushed = match key {
+                let f: fn(&rustudio_core::math::Xform) -> Pushed = match key {
                     "Position" | "p" => |x| Pushed::Vec(x.pos),
                     "X" | "x" => |x| Pushed::Num(x.pos.x as f64),
                     "Y" | "y" => |x| Pushed::Num(x.pos.y as f64),
@@ -674,7 +674,7 @@ unsafe fn vec_at(l: *mut ffi::lua_State, i: c_int) -> Option<glam::Vec3> {
 }
 
 /// The CFrame at `i` when its metatable is the one at `mt` (a stack index).
-unsafe fn cframe_with_mt(l: *mut ffi::lua_State, i: c_int, mt: c_int) -> Option<crate::math::Xform> {
+unsafe fn cframe_with_mt(l: *mut ffi::lua_State, i: c_int, mt: c_int) -> Option<rustudio_core::math::Xform> {
     unsafe {
         if ffi::lua_type(l, i) != ffi::LUA_TUSERDATA || ffi::lua_getmetatable(l, i) == 0 {
             return None;
@@ -689,7 +689,7 @@ unsafe fn cframe_with_mt(l: *mut ffi::lua_State, i: c_int, mt: c_int) -> Option<
 }
 
 /// Pushes a new CFrame; false (nothing pushed) if it can't be made here.
-unsafe fn push_cframe(l: *mut ffi::lua_State, x: crate::math::Xform) -> bool {
+unsafe fn push_cframe(l: *mut ffi::lua_State, x: rustudio_core::math::Xform) -> bool {
     unsafe {
         if ffi::lua_checkstack(l, 3) == 0 {
             return false;
@@ -699,8 +699,8 @@ unsafe fn push_cframe(l: *mut ffi::lua_State, x: crate::math::Xform) -> bool {
     }
 }
 
-unsafe fn cf_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -> Option<crate::math::Xform> {
-    use crate::math::Xform;
+unsafe fn cf_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -> Option<rustudio_core::math::Xform> {
+    use rustudio_core::math::Xform;
     use glam::{EulerRot, Mat3, Vec3};
     unsafe {
         match (id, n) {
@@ -738,7 +738,7 @@ unsafe fn cf_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -
 /// CFrame `*` / `+` / `-` (op 1 / 2 / 3) on the two operands; the number
 /// of results pushed, None to take the implementation.
 unsafe fn cf_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_int> {
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     unsafe {
         let mt = ffi::lua_upvalueindex(4);
         if ffi::lua_type(l, mt) != ffi::LUA_TTABLE {
@@ -766,7 +766,7 @@ unsafe fn cf_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_i
 /// stack before the method name pushed at n + 1).
 unsafe fn cf_method_fast(l: *mut ffi::lua_State, name: &[u8], n: c_int) -> Option<c_int> {
     use crate::ltypes::{cf_inv, cf_mul};
-    use crate::math::Xform;
+    use rustudio_core::math::Xform;
     use glam::Quat;
     unsafe {
         let a = cframe_idx(l, 1)?;
@@ -1218,7 +1218,7 @@ mod tests {
         assert_eq!(run(&lua, &format!("return DateTime.fromUnixTimestampMillis({ms}):FormatLocalTime('LTS', 'en-us')")), want);
     }
 
-    /// RE-DATATYPES.md rows read / write / writeX / namecall / *.info.
+    /// the implementation rows read / write / writeX / namecall / *.info.
     #[test]
     fn members_and_raisers_like_studio() {
         let lua = lua();

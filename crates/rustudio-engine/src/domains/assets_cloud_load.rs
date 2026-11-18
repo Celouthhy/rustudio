@@ -15,7 +15,7 @@ pub fn model_bytes(bytes: &[u8]) -> &[u8] {
 }
 
 fn is_model_source(bytes: &[u8]) -> bool {
-    model_bytes(bytes).starts_with(b"<roblox") || crate::fbx::is_fbx(bytes)
+    model_bytes(bytes).starts_with(b"<roblox") || rustudio_core::fbx::is_fbx(bytes)
 }
 
 pub fn select_model_source(
@@ -27,14 +27,14 @@ pub fn select_model_source(
 }
 
 pub fn asset_bytes(id: u64) -> Result<Vec<u8>, String> {
-    let local = crate::assets::local_asset_path(id).and_then(|p| std::fs::read(p).ok());
-    select_model_source(local, || crate::assets::remote_cached(id).map(|b| (*b).clone()))
+    let local = rustudio_core::assets::local_asset_path(id).and_then(|p| std::fs::read(p).ok());
+    select_model_source(local, || rustudio_core::assets::remote_cached(id).map(|b| (*b).clone()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     // Actual session-delivered model for Place A Factory's decal 80366567625947.
     // SHA256 33da5e0f17e7945ee6942404aae24c0163b2377f91251ceb65219f3bd7d1cbe4.
     const FACTORY_DECAL: &[u8] = br#"<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">

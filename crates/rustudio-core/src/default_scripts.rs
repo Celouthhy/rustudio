@@ -45,7 +45,7 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use crate::doc::Document;
-use crate::rig::RigType;
+use crate::rig_type::RigType;
 
 /// The Studio install the default scripts are read from.
 pub fn studio_dir() -> Option<PathBuf> {
@@ -85,8 +85,8 @@ pub fn studio_dir() -> Option<PathBuf> {
             return Some(d);
         }
     }
-    let fallback = crate::paths::data().join("rustudio/studio");
-    has(&fallback).then_some(fallback)
+    let bundled = crate::paths::data().join("rustudio/studio");
+    has(&bundled).then_some(bundled)
 }
 
 const PLAYER_SCRIPTS: &str = "ExtraContent/scripts/PlayerScripts";
@@ -339,7 +339,7 @@ fn project_starter_player(path: &Path, base: &Path) -> Result<Node, String> {
 /// Workspace.PlayerScriptsUseInputActionSystem is Disabled (RolloutState 1).
 fn input_action_system_off(doc: &Document) -> bool {
     doc.workspace()
-        .is_some_and(|ws| crate::scene::enum_u32(doc.prop(ws, "PlayerScriptsUseInputActionSystem")) == Some(1))
+        .is_some_and(|ws| crate::doc::enum_u32(doc.prop(ws, "PlayerScriptsUseInputActionSystem")) == Some(1))
 }
 
 /// Puts the default player scripts into StarterPlayer.StarterPlayerScripts
@@ -535,8 +535,8 @@ mod tests {
         assert_eq!(doc.prop(ctx, "Sink"), Some(Variant::Bool(true)));
         let action = child(ctx, "Move");
         assert_eq!(doc.prop(action, "Enabled"), Some(Variant::Bool(false)));
-        let enum_of = |r, prop| crate::scene::enum_u32(doc.prop(r, prop));
-        let key = |name| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
+        let enum_of = |r, prop| crate::doc::enum_u32(doc.prop(r, prop));
+        let key = |name| crate::doc::enum_item_value("KeyCode", name);
         assert_eq!(enum_of(child(action, "Keyboard"), "Up"), key("W"));
         let gamepad = child(action, "Gamepad");
         assert_eq!(enum_of(gamepad, "KeyCode"), key("Thumbstick1"));
@@ -556,7 +556,7 @@ mod tests {
         let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
         let n = |p: Ref, name: &str| child_named(&d, p, name);
         let class = |r: Ref| d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
-        let enum_of = |r: Ref, k: &str| crate::scene::enum_u32(d.prop(r, k));
+        let enum_of = |r: Ref, k: &str| crate::doc::enum_u32(d.prop(r, k));
         // Studio's live tree at Play (0.747): StarterPlayer.PlayerModule, the
         // sounds script alone in StarterPlayerScripts.
         assert!(n(sps, "PlayerModule").is_none() && n(sps, "PlayerScriptsLoader").is_none());
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(class(mv), "InputAction");
         let kb = n(mv, "KeyboardPrimaryBinding").unwrap();
         assert_eq!(class(kb), "InputBinding");
-        let key = |name: &str| crate::ltypes::LEnumItem::from_name("KeyCode", name).map(|e| e.value);
+        let key = |name: &str| crate::doc::enum_item_value("KeyCode", name);
         assert_eq!(enum_of(kb, "Up"), key("W"));
         assert_eq!(enum_of(kb, "Left"), key("A"));
         fn len(d: &Document, r: Ref) -> usize {

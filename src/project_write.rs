@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::ProjectState;
-use crate::doc::{self, Document, Marks};
+use rustudio_core::doc::{self, Document, Marks};
 use crate::project::{self, data_path_for_file, FileKind, Origin};
-use crate::project_values::to_json;
+use rustudio_core::project_values::to_json;
 
 /// The line endings to write over a file's bytes: the project's setting,
 /// else the file's own (CRLF when it has any).
@@ -179,7 +179,7 @@ impl ProjectState {
         // RUSTUDIO_TRASH_DIR: an XDG-layout trash folder used on every
         // system instead of the desktop's own (tests).
         let own = std::env::var_os("RUSTUDIO_TRASH_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
-        if let Some(r) = own.is_none().then(|| crate::platform::native_trash(path)).flatten() {
+        if let Some(r) = own.is_none().then(|| rustudio_core::platform::native_trash(path)).flatten() {
             match r {
                 Ok(()) => {
                     self.log.push(format!("moved to trash: {}", path.display()));
@@ -191,7 +191,7 @@ impl ProjectState {
             return;
         }
         let base = own.unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(crate::paths::data).join("Trash")
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(rustudio_core::paths::data).join("Trash")
         });
         let (files, info) = (base.join("files"), base.join("info"));
         let _ = std::fs::create_dir_all(&files);

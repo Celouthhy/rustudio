@@ -9,28 +9,28 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 
 use crate::app::{Editor, Tool};
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::part_drag::studio_cases::{scene, CASES};
-use crate::render::MeshKind;
+use rustudio_render::render::MeshKind;
 
 impl Editor {
     fn drag_parity_camera(&mut self) {
-        self.cam = crate::camera::Camera::default();
-        self.cam.pos = Vec3::new(0.0, 20.0, 20.0);
-        let f = (Vec3::new(0.0, 2.0, 0.0) - self.cam.pos).normalize();
+        self.game.cam = rustudio_render::camera::Camera::default();
+        self.game.cam.pos = Vec3::new(0.0, 20.0, 20.0);
+        let f = (Vec3::new(0.0, 2.0, 0.0) - self.game.cam.pos).normalize();
         let r = f.cross(Vec3::Y).normalize();
-        self.cam.set_rotation(Mat3::from_cols(r, r.cross(f), -f));
-        self.cam.fov_deg = 70.0;
+        self.game.cam.set_rotation(Mat3::from_cols(r, r.cross(f), -f));
+        self.game.cam.fov_deg = 70.0;
     }
 
     /// Builds a case's place; returns name → Ref and what to select.
     fn drag_parity_place(&mut self, name: &str) -> (Vec<(&'static str, Ref)>, Vec<Ref>) {
-        self.doc = crate::doc::Document::new_place();
-        let ws = self.doc.workspace().unwrap();
-        let old: Vec<Ref> = self.doc.dom.get_by_ref(ws).unwrap().children().to_vec();
+        self.game.doc = rustudio_core::doc::Document::new_place();
+        let ws = self.game.doc.workspace().unwrap();
+        let old: Vec<Ref> = self.game.doc.dom.get_by_ref(ws).unwrap().children().to_vec();
         for c in old {
-            if self.doc.class_of(c).is_some_and(|k| crate::doc::is_a(&k, "BasePart") && k != "Terrain") {
-                self.doc.dom.destroy(c);
+            if self.game.doc.class_of(c).is_some_and(|k| rustudio_core::doc::is_a(&k, "BasePart") && k != "Terrain") {
+                self.game.doc.dom.destroy(c);
             }
         }
         let (solids, sel, pivot, _) = scene(name);
@@ -39,23 +39,23 @@ impl Editor {
             if !name.starts_with("model_nopp") && !name.starts_with("model_primary") && !name.starts_with("model_tiltpp") {
                 b = b.with_property("WorldPivotData", Variant::OptionalCFrame(Some(pivot.to_cframe())));
             }
-            self.doc.dom.insert(ws, b)
+            self.game.doc.dom.insert(ws, b)
         });
         let mut refs = Vec::new();
         for (n, s) in &solids {
             let shape = if s.kind == MeshKind::Wedge { 3 } else { 1 };
             let parent = if sel.contains(n) { model.unwrap_or(ws) } else { ws };
-            let r = self.doc.dom.insert(parent, crate::doc::new_part(n, shape, s.xf.pos, s.size, [163, 162, 165]));
-            self.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(s.xf.to_cframe()));
+            let r = self.game.doc.dom.insert(parent, rustudio_core::doc::new_part(n, shape, s.xf.pos, s.size, [163, 162, 165]));
+            self.game.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(s.xf.to_cframe()));
             if *n == "Baseplate" {
-                self.doc.set_prop_live(r, ustr("Locked"), Variant::Bool(true));
+                self.game.doc.set_prop_live(r, ustr("Locked"), Variant::Bool(true));
             }
             refs.push((*n, r));
         }
         if let Some(m) = model {
             if name.starts_with("model_primary") || name.starts_with("model_tiltpp") {
                 let b = refs.iter().find(|(n, _)| *n == "B").unwrap().1;
-                self.doc.set_prop_live(m, ustr("PrimaryPart"), Variant::Ref(b));
+                self.game.doc.set_prop_live(m, ustr("PrimaryPart"), Variant::Ref(b));
             }
             return (refs, vec![m]);
         }
@@ -70,8 +70,8 @@ impl Editor {
         for (name, press, release, grid, keys, expect) in CASES {
             self.drag_parity_camera();
             self.tool = Tool::Select;
-            self.snap_move = grid.is_some();
-            self.move_inc = grid.unwrap_or(1.0);
+            self.game.snap_move = grid.is_some();
+            self.game.move_inc = grid.unwrap_or(1.0);
             self.join_surfaces = false;
             // (Measured with these off: see part_drag::studio_cases.)
             self.align_dragged = false;
@@ -79,11 +79,11 @@ impl Editor {
             self.use_bounding_boxes = false;
             self.physical_drag = false;
             let (refs, select) = self.drag_parity_place(name);
-            self.scene = crate::scene::Scene::default();
+            self.game.scene = rustudio_render::scene::Scene::default();
             self.select(select);
-            self.scene.sync(&mut self.doc);
-            self.doc.clear_history();
-            let before: Vec<_> = refs.iter().map(|(_, r)| self.doc.prop(*r, "CFrame")).collect();
+            self.game.scene.sync(&mut self.game.doc);
+            self.game.doc.clear_history();
+            let before: Vec<_> = refs.iter().map(|(_, r)| self.game.doc.prop(*r, "CFrame")).collect();
             let (a, b) = (Pos2::new(press.0, press.1), Pos2::new(release.0, release.1));
             if !self.start_part_drag(rect, a, false) {
                 bad.push(format!("{name}: no drag started"));
@@ -91,21 +91,21 @@ impl Editor {
             }
             for k in 1..=12 {
                 self.update_part_drag(rect, a + (b - a) * (k as f32 / 12.0));
-                self.scene.sync(&mut self.doc);
+                self.game.scene.sync(&mut self.game.doc);
             }
             for c in keys.chars() {
                 self.rotate_part_drag(c == 't');
-                self.scene.sync(&mut self.doc);
+                self.game.scene.sync(&mut self.game.doc);
             }
             self.finish_part_drag();
-            let model = self.doc.selection.first().copied();
+            let model = self.game.doc.selection.first().copied();
             for (part, want) in expect.iter() {
                 let got = if *part == "M" {
-                    model.and_then(|m| crate::part_drag::editor_model_pivot(&self.doc, m))
+                    model.and_then(|m| crate::part_drag::editor_model_pivot(&self.game.doc, m))
                 } else {
                     refs.iter()
                         .find(|(n, _)| n == part)
-                        .and_then(|(_, r)| match self.doc.prop(*r, "CFrame") {
+                        .and_then(|(_, r)| match self.game.doc.prop(*r, "CFrame") {
                             Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(&cf)),
                             _ => None,
                         })
@@ -126,38 +126,38 @@ impl Editor {
                 }
             }
             // One undo puts everything back.
-            self.doc.undo();
-            let after: Vec<_> = refs.iter().map(|(_, r)| self.doc.prop(*r, "CFrame")).collect();
+            self.game.doc.undo();
+            let after: Vec<_> = refs.iter().map(|(_, r)| self.game.doc.prop(*r, "CFrame")).collect();
             if before != after {
                 bad.push(format!("{name}: undo didn't restore"));
             }
         }
         // Join Surfaces: the snapped baseplate drop welds Probe to Baseplate.
         self.drag_parity_camera();
-        self.snap_move = true;
-        self.move_inc = 1.0;
+        self.game.snap_move = true;
+        self.game.move_inc = 1.0;
         self.join_surfaces = true;
         let (refs, select) = self.drag_parity_place("flat_snap1");
-        self.scene = crate::scene::Scene::default();
+        self.game.scene = rustudio_render::scene::Scene::default();
         self.select(select);
-        self.scene.sync(&mut self.doc);
-        self.doc.clear_history();
+        self.game.scene.sync(&mut self.game.doc);
+        self.game.doc.clear_history();
         let probe = refs.iter().find(|(n, _)| *n == "Probe").unwrap().1;
         let base = refs.iter().find(|(n, _)| *n == "Baseplate").unwrap().1;
         self.start_part_drag(rect, Pos2::new(441.0, 319.0), false);
         self.update_part_drag(rect, Pos2::new(538.0, 298.0));
         self.finish_part_drag();
         self.join_surfaces = false;
-        let welds: Vec<Ref> = self.doc.dom.get_by_ref(probe).unwrap().children().iter().copied()
-            .filter(|c| self.doc.class_of(*c).is_some_and(|k| k == "Weld")).collect();
+        let welds: Vec<Ref> = self.game.doc.dom.get_by_ref(probe).unwrap().children().iter().copied()
+            .filter(|c| self.game.doc.class_of(*c).is_some_and(|k| k == "Weld")).collect();
         let ok = welds.len() == 1
-            && self.doc.prop(welds[0], "Part1") == Some(Variant::Ref(base))
-            && matches!(self.doc.prop(welds[0], "C1"), Some(Variant::CFrame(cf)) if (crate::math::v3(cf.position) - Vec3::new(6.0, 2.0, -7.0)).length() < 1e-3);
+            && self.game.doc.prop(welds[0], "Part1") == Some(Variant::Ref(base))
+            && matches!(self.game.doc.prop(welds[0], "C1"), Some(Variant::CFrame(cf)) if (rustudio_core::math::v3(cf.position) - Vec3::new(6.0, 2.0, -7.0)).length() < 1e-3);
         if !ok {
             bad.push(format!("join: {} welds", welds.len()));
         }
-        self.doc.undo();
-        if self.doc.dom.get_by_ref(probe).unwrap().children().iter().any(|c| self.doc.class_of(*c).is_some_and(|k| k == "Weld")) {
+        self.game.doc.undo();
+        if self.game.doc.dom.get_by_ref(probe).unwrap().children().iter().any(|c| self.game.doc.class_of(*c).is_some_and(|k| k == "Weld")) {
             bad.push("join: undo kept the weld".into());
         }
         let n = self.regression_dragger_modes(&mut bad);
@@ -166,28 +166,28 @@ impl Editor {
 
     /// A mode_cases scene as a place; the Probe is returned selected.
     fn dragger_mode_place(&mut self, name: &str, anchored: bool) -> Vec<(&'static str, Ref)> {
-        self.doc = crate::doc::Document::new_place();
-        let ws = self.doc.workspace().unwrap();
-        let old: Vec<Ref> = self.doc.dom.get_by_ref(ws).unwrap().children().to_vec();
+        self.game.doc = rustudio_core::doc::Document::new_place();
+        let ws = self.game.doc.workspace().unwrap();
+        let old: Vec<Ref> = self.game.doc.dom.get_by_ref(ws).unwrap().children().to_vec();
         for c in old {
-            if self.doc.class_of(c).is_some_and(|k| crate::doc::is_a(&k, "BasePart") && k != "Terrain") {
-                self.doc.dom.destroy(c);
+            if self.game.doc.class_of(c).is_some_and(|k| rustudio_core::doc::is_a(&k, "BasePart") && k != "Terrain") {
+                self.game.doc.dom.destroy(c);
             }
         }
         let mut refs = Vec::new();
         for (n, s) in crate::part_drag::mode_cases::scene(name) {
             let shape = if s.kind == MeshKind::Wedge { 3 } else { 1 };
-            let r = self.doc.dom.insert(ws, crate::doc::new_part(n, shape, s.xf.pos, s.size, [163, 162, 165]));
-            self.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(s.xf.to_cframe()));
-            self.doc.set_prop_live(r, ustr("Anchored"), Variant::Bool(n != "Probe" || anchored));
+            let r = self.game.doc.dom.insert(ws, rustudio_core::doc::new_part(n, shape, s.xf.pos, s.size, [163, 162, 165]));
+            self.game.doc.set_prop_live(r, ustr("CFrame"), Variant::CFrame(s.xf.to_cframe()));
+            self.game.doc.set_prop_live(r, ustr("Anchored"), Variant::Bool(n != "Probe" || anchored));
             if n == "Baseplate" {
-                self.doc.set_prop_live(r, ustr("Locked"), Variant::Bool(true));
+                self.game.doc.set_prop_live(r, ustr("Locked"), Variant::Bool(true));
             }
             refs.push((n, r));
         }
-        self.scene = crate::scene::Scene::default();
-        self.scene.sync(&mut self.doc);
-        self.doc.clear_history();
+        self.game.scene = rustudio_render::scene::Scene::default();
+        self.game.scene.sync(&mut self.game.doc);
+        self.game.doc.clear_history();
         refs
     }
 
@@ -195,11 +195,11 @@ impl Editor {
     /// returns its CFrame after.
     fn dragger_mode_drag(&mut self, refs: &[(&'static str, Ref)], a: Pos2, b: Pos2) -> Option<Xform> {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(crate::part_drag::mode_cases::W, crate::part_drag::mode_cases::H));
-        self.cam = crate::part_drag::mode_cases::camera();
+        self.game.cam = crate::part_drag::mode_cases::camera();
         // Studio's measured mouse rays, as pixels of this view.
         let px = |p: Pos2| -> Pos2 {
             crate::part_drag::mode_cases::studio_ray(p.x, p.y)
-                .and_then(|d| self.cam.project(rect, self.cam.pos + d * 10.0))
+                .and_then(|d| self.game.cam.project(rect, self.game.cam.pos + d * 10.0))
                 .unwrap_or(p)
         };
         let (a, b) = (px(a), px(b));
@@ -211,10 +211,10 @@ impl Editor {
         }
         for k in 1..=20 {
             self.update_part_drag(rect, a + (b - a) * (k as f32 / 20.0));
-            self.scene.sync(&mut self.doc);
+            self.game.scene.sync(&mut self.game.doc);
         }
         self.finish_part_drag();
-        match self.doc.prop(probe, "CFrame") {
+        match self.game.doc.prop(probe, "CFrame") {
             Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(&cf)),
             _ => None,
         }
@@ -229,8 +229,8 @@ impl Editor {
         self.join_surfaces = false;
         for (name, press, release, grid, align, bbox, snap, want) in crate::part_drag::mode_cases::CASES {
             n += 1;
-            self.snap_move = grid.is_some();
-            self.move_inc = grid.unwrap_or(1.0);
+            self.game.snap_move = grid.is_some();
+            self.game.move_inc = grid.unwrap_or(1.0);
             self.align_dragged = *align;
             self.use_bounding_boxes = *bbox;
             self.part_snap = *snap;
@@ -253,7 +253,7 @@ impl Editor {
             }
         }
         // Physical: (scene, anchored, collisions, release, Studio's result, tolerance).
-        self.snap_move = false;
+        self.game.snap_move = false;
         self.part_snap = true;
         self.align_dragged = true;
         self.use_bounding_boxes = false;
@@ -287,8 +287,8 @@ impl Editor {
         // Back to the defaults.
         self.physical_drag = false;
         self.collisions = false;
-        self.align_dragged = crate::mech::ALIGN_DRAGGED_BY_DEFAULT;
-        self.part_snap = crate::mech::PART_SNAP_ON_BY_DEFAULT;
+        self.align_dragged = rustudio_core::mech::ALIGN_DRAGGED_BY_DEFAULT;
+        self.part_snap = rustudio_core::mech::PART_SNAP_ON_BY_DEFAULT;
         n
     }
 }

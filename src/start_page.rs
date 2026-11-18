@@ -22,8 +22,7 @@ use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, Exper
 
 use crate::app::{Editor, PendingAction};
 use crate::cloud_ui::Paged;
-use crate::doc::Document;
-use crate::theme;
+use rustudio_engine::theme;
 use templates::{Kind, Source, TemplateInfo};
 
 mod builtin;
@@ -143,7 +142,7 @@ const CARD_H: f32 = THUMB_H + 50.0;
 const GAP: f32 = 16.0;
 
 impl StartPage {
-    fn api(ed_client: Option<crate::assets::SharedClient>, ep: rustudio_account::Endpoints) -> Option<CloudApi> {
+    fn api(ed_client: Option<rustudio_core::assets::SharedClient>, ep: rustudio_account::Endpoints) -> Option<CloudApi> {
         let session = {
             let g = ed_client.as_ref()?.lock().ok()?;
             g.as_ref()?.session.downloader()
@@ -153,7 +152,7 @@ impl StartPage {
 
     fn spawn(
         &mut self,
-        client: Option<crate::assets::SharedClient>,
+        client: Option<rustudio_core::assets::SharedClient>,
         ep: rustudio_account::Endpoints,
         f: impl FnOnce(Option<CloudApi>, &Sender<Msg>) + Send + 'static,
     ) {
@@ -216,12 +215,12 @@ impl Editor {
     /// Shows the Start Page (startup with nothing to open, File > Close Place).
     pub fn show_start_page(&mut self) {
         self.start.visible = true;
-        self.start.doc_id = self.doc.id;
+        self.start.doc_id = self.game.doc.id;
         self.start.url_error = None;
     }
 
-    fn start_client(&self) -> (Option<crate::assets::SharedClient>, rustudio_account::Endpoints) {
-        (self.account.shared_client(), self.cloud.endpoints.clone())
+    fn start_client(&self) -> (Option<rustudio_core::assets::SharedClient>, rustudio_account::Endpoints) {
+        (self.game.account.shared_client(), self.cloud.endpoints.clone())
     }
 
     /// (Re)loads every list: My Experiences, Shared with Me, the groups
@@ -343,25 +342,25 @@ impl Editor {
         if !self.start.visible {
             return false;
         }
-        if self.doc.id != self.start.doc_id {
+        if self.game.doc.id != self.start.doc_id {
             self.start.visible = false;
             return false;
         }
         let ctx = ui.ctx().clone();
-        self.account.restore();
+        self.game.account.restore();
         self.start.poll(&ctx);
         if !self.start.templates_asked {
             self.start_templates();
         }
         if self.start.opened.is_some() {
             self.start_finish_template();
-            if self.doc.id != self.start.doc_id {
+            if self.game.doc.id != self.start.doc_id {
                 self.start.visible = false;
                 return false;
             }
         }
         // Signing in (or the session check finishing) fills the lists.
-        let signed = self.account.signed_in();
+        let signed = self.game.account.signed_in();
         if signed && !self.start.loaded_signed_in {
             self.start.loaded_signed_in = true;
             self.start_load_all();
@@ -437,11 +436,11 @@ impl Editor {
                     self.ui.recent.retain(|r| *r != p);
                     crate::studio_ui::save_recent(&self.ui);
                 }
-                Do::Account => self.account.open = true,
+                Do::Account => self.game.account.open = true,
                 Do::Copy(s) => ctx.copy_text(s),
             }
         }
-        if self.start.busy() || self.cloud.busy() || self.account.busy() {
+        if self.start.busy() || self.cloud.busy() || self.game.account.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         true
@@ -453,8 +452,8 @@ impl Editor {
             ui.add_space(4.0);
             ui.label(RichText::new("rustudio").size(16.0).strong().color(theme::TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.account.signed_in() {
-                    self.account.status_short().trim_start_matches("Roblox: ").to_string()
+                let label = if self.game.account.signed_in() {
+                    self.game.account.status_short().trim_start_matches("Roblox: ").to_string()
                 } else {
                     "Sign in".to_string()
                 };
@@ -695,7 +694,7 @@ impl Editor {
                     .map(|r| r.origin.universe_id)
                     .filter(|u| !self.start.icons_asked.contains(u))
                     .collect();
-                if !missing.is_empty() && self.account.signed_in() {
+                if !missing.is_empty() && self.game.account.signed_in() {
                     self.start_icons(missing);
                 }
                 let now = unix_now();
@@ -783,7 +782,7 @@ impl Editor {
             }
         }
         if let Some(Err(e)) = &self.start.groups {
-            if self.account.signed_in() {
+            if self.game.account.signed_in() {
                 ui.label(RichText::new(format!("Groups: {e}")).small().color(theme::WARN));
             }
         }
@@ -934,7 +933,7 @@ impl Editor {
     }
 
     fn start_signed_out_or_loading(&self, ui: &mut egui::Ui, todo: &mut Vec<Do>) {
-        if self.account.signed_in() {
+        if self.game.account.signed_in() {
             ui.label(RichText::new("Loading…").color(theme::TEXT_DIM));
         } else {
             ui.label(RichText::new(signed_out()).color(theme::TEXT_DIM));
@@ -1007,7 +1006,7 @@ impl Editor {
             }
             Some(Err(e)) => {
                 ui.label(RichText::new(e).color(theme::WARN));
-                if !self.account.signed_in() && ui.button("Sign in…").clicked() {
+                if !self.game.account.signed_in() && ui.button("Sign in…").clicked() {
                     todo.push(Do::Account);
                 }
                 return;
@@ -1190,6 +1189,7 @@ mod tests {
     use super::*;
 
     use super::templates::{self, TemplateInfo};
+    use rustudio_core::doc::Document;
 
     fn info(place_id: u64) -> TemplateInfo {
         templates::measured().into_iter().find(|t| t.place_id == place_id).unwrap()
@@ -1396,10 +1396,10 @@ mod tests {
         let names: Vec<_> = d.dom.get_by_ref(ws).unwrap().children().iter().map(|r| d.dom.get_by_ref(*r).unwrap().name.clone()).collect();
         assert_eq!(names, ["Camera", "Terrain"]);
         // Studio's ground: solid Grass, voxels x/z -256..255, y -14..1.
-        let v = crate::terrain::Voxels::from_dom(&d.dom).unwrap().unwrap();
+        let v = rustudio_core::terrain::Voxels::from_dom(&d.dom).unwrap().unwrap();
         assert_eq!(v.bounds(), Some(([-256, -14, -256], [255, 1, 255])));
         assert_eq!(v.count(), 512 * 16 * 512);
-        let grass = crate::terrain::material_index("Grass").unwrap();
+        let grass = rustudio_core::terrain::material_index("Grass").unwrap();
         for p in [[-256, -14, -256], [255, 1, 255], [0, 1, 0], [100, -7, -200]] {
             assert_eq!(v.get_raw(p), (grass, 255, 0), "{p:?}");
         }

@@ -97,7 +97,8 @@ pub fn resource(name: &str) -> PathBuf {
             }
         }
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
+    // (crates/rustudio-core: the root crate's folder, where api-dump.json is)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(name)
 }
 
 #[cfg(test)]

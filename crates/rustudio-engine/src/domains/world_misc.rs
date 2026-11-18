@@ -52,9 +52,9 @@ use mlua::{Lua, MultiValue, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::util::*;
-use crate::doc;
+use rustudio_core::doc;
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 thread_local! {
@@ -109,7 +109,7 @@ fn dragger(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<
             let moves: Vec<(Ref, Xform)> = {
                 let w = world(lua)?;
                 let d = w.d();
-                let r = crate::math::Ray { origin: ray.origin, dir: ray.direction };
+                let r = rustudio_core::math::Ray { origin: ray.origin, dir: ray.direction };
                 let Some(ws) = d.workspace() else { return none() };
                 let mut best: Option<(f32, Ref)> = None;
                 for i in d.dom.descendants_of(ws) {
@@ -210,7 +210,7 @@ pub fn wireframes(doc: u64) -> Vec<(Ref, Wire)> {
 /// on top: the line shader reads those flags) and texts (world point,
 /// text, pixel size, colour).
 #[allow(clippy::type_complexity)]
-pub fn wire_geometry(d: &crate::doc::Document) -> (Vec<([f32; 3], [f32; 4])>, Vec<(Vec3, String, f32, [f32; 4])>) {
+pub fn wire_geometry(d: &rustudio_core::doc::Document) -> (Vec<([f32; 3], [f32; 4])>, Vec<(Vec3, String, f32, [f32; 4])>) {
     let mut lines = Vec::new();
     let mut texts = Vec::new();
     let root = d.dom.root_ref();
@@ -354,12 +354,12 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
     Some(match (class, name) {
         ("Beam", "SetTextureOffset") => {
             let id = world(lua).ok()?.d().id;
-            crate::effects::set_texture_offset(id, this, num_arg(args, 1).unwrap_or(0.0) as f32);
+            rustudio_render::effects::set_texture_offset(id, this, num_arg(args, 1).unwrap_or(0.0) as f32);
             none()
         }
         ("Trail", "Clear") => {
             let id = world(lua).ok()?.d().id;
-            crate::effects::clear(id, this);
+            rustudio_render::effects::clear(id, this);
             none()
         }
         ("ProceduralModel", "ForceGeneration") => one(Value::Boolean(true)),
@@ -459,7 +459,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         ("Tool", "GripRight") => vec3(lua, grip(lua, r)?.rot.x_axis)?,
         ("Tool", "GripUp") => vec3(lua, grip(lua, r)?.rot.y_axis)?,
         ("Decal", "ResampleMode") => {
-            match crate::scene::enum_u32(world(lua)?.d().prop(r, key)).and_then(|v| LEnumItem::from_value("ResamplerMode", v)) {
+            match rustudio_render::scene::enum_u32(world(lua)?.d().prop(r, key)).and_then(|v| LEnumItem::from_value("ResamplerMode", v)) {
                 Some(e) => enum_value(lua, e)?,
                 None => enum_item(lua, "ResamplerMode", "Default")?,
             }
@@ -474,7 +474,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                     for p in &parts {
                         for j in g.joints_of(*p) {
                             if d.class_of(j).is_some_and(|c| c == "HingeConstraint")
-                                && crate::scene::enum_u32(d.prop(j, "ActuatorType")) == Some(1)
+                                && rustudio_render::scene::enum_u32(d.prop(j, "ActuatorType")) == Some(1)
                             {
                                 seen.insert(j);
                             }

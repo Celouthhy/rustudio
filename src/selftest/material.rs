@@ -9,7 +9,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 /// (name, SurfaceType on every face, x): the surface row, front faces at z = 2.
 const SURFACES: [(&str, u32, f32); 4] = [
@@ -26,9 +26,9 @@ const STUDIO: [(f32, f32); 4] = [(125.0, 16.8), (122.0, 18.9), (104.0, 34.1), (1
 /// Mean grey level and its standard deviation over a 15 × 15 point patch.
 fn patch(ed: &Editor, frame: &(u32, u32, Vec<u8>), p: Vec3) -> Option<(f32, f32)> {
     let (w, h, px) = frame;
-    let rect = ed.viewport_rect;
+    let rect = ed.game.viewport_rect;
     let scale = *w as f32 / rect.width().max(1.0);
-    let sp = ed.cam.project(rect, p)?;
+    let sp = ed.game.cam.project(rect, p)?;
     let (cx, cy) = (
         ((sp.x - rect.min.x) * scale) as i64,
         ((sp.y - rect.min.y) * scale) as i64,
@@ -136,10 +136,10 @@ impl SelfTest {
             );
             ed.set_document(doc);
             ed.show_grid = false;
-            ed.cam.pos = Vec3::new(-3.0, 9.0, 18.0);
-            ed.cam.yaw = 0.0;
-            ed.cam.pitch = (-7.0f32).atan2(23.0);
-            ed.cam.fov_deg = 70.0;
+            ed.game.cam.pos = Vec3::new(-3.0, 9.0, 18.0);
+            ed.game.cam.yaw = 0.0;
+            ed.game.cam.pitch = (-7.0f32).atan2(23.0);
+            ed.game.cam.fov_deg = 70.0;
             self.r6 = super::R6Test {
                 started: f,
                 ..Default::default()
@@ -155,11 +155,13 @@ impl SelfTest {
         // constants at the shader consumed by the actual GPU pipeline.
         for reflectance in [0.0, 0.5, 1.0] {
             for material in [256, 272, 1568] {
-                ok &= crate::render::material_reflectance(material, reflectance) == reflectance;
+                ok &= rustudio_render::render::material_reflectance(material, reflectance) == reflectance;
             }
-            ok &= crate::render::material_reflectance(1088, reflectance) == 0.0;
+            ok &= rustudio_render::render::material_reflectance(1088, reflectance) == 0.0;
         }
-        let shader = include_str!("../shader.wgsl");
+        // (crates/rustudio-render/src/shader.wgsl;
+        // the same file the GPU pipeline compiles.)
+        let shader = include_str!("../../crates/rustudio-render/src/shader.wgsl");
         for law in [
             "mix(0.66, 1.0, (1.0 - alpha) * (1.0 - alpha))",
             "normal * (3.0 * (1.0 - eta))",
@@ -173,11 +175,11 @@ impl SelfTest {
         }
 
         let mut notes = Vec::new();
-        let installed = crate::default_scripts::studio_dir().is_some();
-        let frame = ed
+        let installed = rustudio_core::default_scripts::studio_dir().is_some();
+        let frame = ed.game
             .renderer
             .as_ref()
-            .zip(ed.render_state.as_ref())
+            .zip(ed.game.render_state.as_ref())
             .and_then(|(r, rs)| r.read_frame(rs));
         match (&frame, installed) {
             (Some(frame), true) => {
@@ -204,19 +206,19 @@ impl SelfTest {
         }
         // Studio's default terrain colours (its materials.json; GetMaterialColor in an offline Studio).
         let grass =
-            crate::terrain::material_color(crate::terrain::material_index("Grass").unwrap_or(2));
+            rustudio_core::terrain::material_color(rustudio_core::terrain::material_index("Grass").unwrap_or(2));
         let rock =
-            crate::terrain::material_color(crate::terrain::material_index("Rock").unwrap_or(8));
+            rustudio_core::terrain::material_color(rustudio_core::terrain::material_index("Rock").unwrap_or(8));
         let terrain_ok = !installed || (grass == [106, 127, 63] && rock == [102, 108, 111]);
         ok &= terrain_ok;
         notes.push(format!("terrain Grass {grass:?}, Rock {rock:?} (Studio's GetMaterialColor: [106, 127, 63], [102, 108, 111])"));
         // The MaterialVariant's ColorMap covers the part (six tiled quads).
-        let variant = ed
+        let variant = ed.game
             .doc
             .workspace()
-            .and_then(|ws| crate::default_scripts::child_named(&ed.doc, ws, "Variant"));
+            .and_then(|ws| rustudio_core::default_scripts::child_named(&ed.game.doc, ws, "Variant"));
         let quads = variant
-            .and_then(|v| ed.scene.parts.iter().find(|p| p.r == v))
+            .and_then(|v| ed.game.scene.parts.iter().find(|p| p.r == v))
             .map(|p| {
                 p.decals
                     .iter()

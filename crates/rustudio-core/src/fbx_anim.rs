@@ -701,7 +701,7 @@ pub fn read(bytes: &[u8], r15: bool) -> Result<Clip, String> {
 mod tests {
     use super::*;
 
-    const WAVE: &[u8] = include_bytes!("../checks/plugins/services/fixtures/fbxanim/wave.fbx");
+    const WAVE: &[u8] = include_bytes!("../../../checks/plugins/services/fixtures/fbxanim/wave.fbx");
 
     fn pose(c: &Clip, name: &str, frame: usize) -> Xf {
         c.bones.iter().find(|b| b.name == name).unwrap().poses[frame]

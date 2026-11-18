@@ -3,7 +3,7 @@
 
 use rbx_dom_weak::InstanceBuilder;
 
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 use crate::runtime::{RunMode, Runtime, World};
 
 pub fn run_with(src: &str, setup: impl FnOnce(&mut Document), steps: usize) -> String {
@@ -328,16 +328,16 @@ print(pcall(function() return GS:CreateBasicMeshPart(Enum.BasicMeshPartShape.Cap
 fn union_survey() {
     use rbx_dom_weak::types::Variant;
     let path = std::env::var("RS_UNION_SURVEY").unwrap();
-    let d = crate::doc::Document::open(std::path::Path::new(&path)).unwrap();
+    let d = rustudio_core::doc::Document::open(std::path::Path::new(&path)).unwrap();
     let mut n = 0;
     for r in d.subtree(d.dom.root_ref()) {
         let Some(c) = d.class_of(r) else { continue };
-        if !crate::doc::is_a(&c, "PartOperation") {
+        if !rustudio_core::doc::is_a(&c, "PartOperation") {
             continue;
         }
-        let Some(m) = crate::scene::union_mesh(&d, r) else { continue };
-        let Some(bytes) = crate::assets::generated(&m.id) else { continue };
-        let Ok(md) = crate::mesh::parse(&bytes) else { continue };
+        let Some(m) = rustudio_core::mesh::union_mesh(&d, r) else { continue };
+        let Some(bytes) = rustudio_core::assets::generated(&m.id) else { continue };
+        let Ok(md) = rustudio_core::mesh::parse(&bytes) else { continue };
         let v = |k: &str| match d.prop(r, k) {
             Some(Variant::Vector3(v)) => format!("{:.3},{:.3},{:.3}", v.x, v.y, v.z),
             _ => "-".into(),
@@ -354,7 +354,7 @@ fn union_survey() {
 }
 
 /// Runs `src`, then hands back the world's document.
-fn run_doc(src: &str, steps: usize) -> (String, crate::doc::Document) {
+fn run_doc(src: &str, steps: usize) -> (String, rustudio_core::doc::Document) {
     let mut d = Document::new_place();
     let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
     let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
@@ -433,12 +433,12 @@ print("parts", #workspace:GetPartBoundsInBox(CFrame.new(3.5,12.5,0),Vector3.new(
     assert!(out.contains("ray GS 13.00 GS 12.00 miss BP 13.00"), "{out}");
     assert!(out.contains("parts 1"), "{out}");
 
-    let check = |doc: &mut crate::doc::Document, label: &str| {
+    let check = |doc: &mut rustudio_core::doc::Document, label: &str| {
         let ws = doc.workspace().unwrap();
-        let find = |doc: &crate::doc::Document, n: &str| doc.find_named(ws, n).unwrap();
+        let find = |doc: &rustudio_core::doc::Document, n: &str| doc.find_named(ws, n).unwrap();
         let gs = find(doc, "GS");
         let bp = find(doc, "BP");
-        let draw = |r| crate::scene::part_draw(doc, doc.dom.get_by_ref(r).unwrap()).unwrap().draw.xf.pos;
+        let draw = |r| rustudio_render::scene::part_draw(doc, doc.dom.get_by_ref(r).unwrap()).unwrap().draw.xf.pos;
         assert!((draw(gs) - Vec3::new(1.0, 10.5, 0.0)).length() < 1e-3, "{label}: drawn at {:?}", draw(gs));
         assert!((draw(bp) - Vec3::new(41.0, 10.5, 0.0)).length() < 1e-3, "{label}: centred union drawn at {:?}", draw(bp));
         // 1-stud cubes dropped on it: x 2.5 lands on its top (13); x -2.6
@@ -446,18 +446,18 @@ print("parts", #workspace:GetPartBoundsInBox(CFrame.new(3.5,12.5,0),Vector3.new(
         // catch it at 12); with Box fidelity x 3.4 lands on the box top.
         // (Default fidelity is a convex decomposition: it rounds the
         // geometry's outer corners, as for MeshParts.)
-        let drop = |doc: &mut crate::doc::Document, x: f32| {
+        let drop = |doc: &mut rustudio_core::doc::Document, x: f32| {
             doc.dom.insert(ws, InstanceBuilder::new("Part").with_name("Drop")
                 .with_property("Size", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0))
-                .with_property("CFrame", crate::math::Xform { pos: Vec3::new(x, 16.0, 0.0), rot: glam::Mat3::IDENTITY }.to_cframe()))
+                .with_property("CFrame", rustudio_core::math::Xform { pos: Vec3::new(x, 16.0, 0.0), rot: glam::Mat3::IDENTITY }.to_cframe()))
         };
-        let settle = |doc: &mut crate::doc::Document, cubes: &[rbx_dom_weak::types::Ref]| -> Vec<f32> {
-            let mut p = crate::physics::Physics::new(doc);
+        let settle = |doc: &mut rustudio_core::doc::Document, cubes: &[rbx_dom_weak::types::Ref]| -> Vec<f32> {
+            let mut p = rustudio_physics::physics::Physics::new(doc);
             for _ in 0..120 {
                 p.sync(doc);
                 p.step(doc, 1.0 / 60.0);
             }
-            let ys = cubes.iter().map(|c| crate::scene::xform_of(doc, *c).unwrap().pos.y).collect();
+            let ys = cubes.iter().map(|c| rustudio_render::scene::xform_of(doc, *c).unwrap().pos.y).collect();
             doc.remove(cubes);
             ys
         };
@@ -474,7 +474,7 @@ print("parts", #workspace:GetPartBoundsInBox(CFrame.new(3.5,12.5,0),Vector3.new(
     let mut doc = doc;
     check(&mut doc, "made");
     let bytes = doc.encode_all(false).unwrap();
-    let mut back = crate::doc::Document::from_place_bytes(&bytes, "reload".into()).unwrap();
+    let mut back = rustudio_core::doc::Document::from_place_bytes(&bytes, "reload".into()).unwrap();
     check(&mut back, "reloaded");
 }
 

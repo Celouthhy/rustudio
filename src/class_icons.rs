@@ -1,5 +1,5 @@
 //! One icon per class for the Explorer, Insert Object and Properties: a
-//! Tabler glyph (src/ti.rs) chosen for what the class is, coloured by its
+//! Tabler glyph (crates/rustudio-engine/src/ti.rs) chosen for what the class is, coloured by its
 //! family (parts grey-blue, scripts by kind, GUI pink, values violet, lights
 //! amber, sound blue, physics teal...). Classes without their own entry take
 //! their family's glyph through the class hierarchy (`doc::is_a`).
@@ -265,7 +265,7 @@ pub fn icon_for(class: &str) -> (&'static str, Color32) {
     if let Some((_, i, c)) = TABLE.iter().find(|(k, _, _)| *k == class) {
         return (i, *c);
     }
-    let is = |b: &str| crate::doc::is_a(class, b);
+    let is = |b: &str| rustudio_core::doc::is_a(class, b);
     let family: &[(&str, &str, Color32)] = &[
         ("BasePart", "cube", PART),
         ("LuaSourceContainer", "file-code", SCRIPT),
@@ -294,7 +294,7 @@ pub fn icon_for(class: &str) -> (&'static str, Color32) {
             return (i, *c);
         }
     }
-    if crate::api::get().is_some_and(|a| a.classes.get(class).is_some_and(|k| k.service)) {
+    if rustudio_core::api::get().is_some_and(|a| a.classes.get(class).is_some_and(|k| k.service)) {
         return ("settings-2", SERVICE);
     }
     ("point", MISC)
@@ -311,7 +311,7 @@ mod tests {
             .chain(["cube", "file-code", "variable", "click", "square", "app-window", "adjustments",
                 "bulb", "color-filter", "link", "arrow-big-right", "adjustments-alt", "cylinder",
                 "photo", "shirt", "hanger", "box-margin", "box", "server", "settings-2", "point"])
-            .filter(|i| !crate::ti::has(i))
+            .filter(|i| !rustudio_engine::ti::has(i))
             .collect();
         assert!(missing.is_empty(), "not in Tabler: {missing:?}");
     }

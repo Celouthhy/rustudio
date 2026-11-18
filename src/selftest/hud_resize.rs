@@ -8,8 +8,8 @@
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
-use crate::runtime::Side;
+use rustudio_core::doc::Document;
+use rustudio_engine::runtime::Side;
 
 #[derive(Default)]
 pub(super) struct HudResizeTest {
@@ -72,17 +72,17 @@ impl SelfTest {
         match self.r4.phase {
             242 if self.hud.started == 0 => {
                 ed.set_document(Document::new_place());
-                ed.start_play(crate::runtime::RunMode::Play);
+                ed.start_play(rustudio_engine::runtime::RunMode::Play);
                 self.hud = HudResizeTest { started: f, ok: true, ..Default::default() };
             }
             242 if t == 60 => {
-                if let Some(e) = ed.run_luau(Side::Client, SETUP) {
+                if let Some(e) = ed.game.run_luau(Side::Client, SETUP) {
                     self.hud.ok = false;
                     self.hud.notes.push(format!("setup: {e}"));
                 }
             }
             242 if t == 90 => {
-                let before = ed.run_luau(Side::Client, CHECK);
+                let before = ed.game.run_luau(Side::Client, CHECK);
                 self.hud.ok &= before.is_none();
                 self.hud.notes.push(format!("before resize: {}", before.as_deref().unwrap_or("ok")));
                 // The 3D view changes size (the UI zoom: the window holds
@@ -93,8 +93,8 @@ impl SelfTest {
                 self.hud.started = f;
             }
             243 if t == 60 => {
-                let after = ed.run_luau(Side::Client, CHECK);
-                let signals = ed.run_luau(
+                let after = ed.game.run_luau(Side::Client, CHECK);
+                let signals = ed.game.run_luau(
                     Side::Client,
                     "assert(_G.__fits >= 2, 'AbsoluteSize never changed: fits ' .. _G.__fits); assert(_G.__vpChanged >= 1, 'ViewportSize never changed')",
                 );

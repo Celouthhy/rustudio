@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use super::*;
-use crate::runtime::domains::services::stream;
+use rustudio_engine::runtime::domains::services::stream;
 
 fn source(name: &str, src: &str) -> PluginSource {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));

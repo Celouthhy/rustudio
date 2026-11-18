@@ -9,10 +9,9 @@ use std::sync::Arc;
 use egui::{Color32, Pos2, Rect, Stroke};
 
 use super::*;
-use crate::audio::Audio;
-use crate::runtime::ext::SoundCmd;
-use crate::scene::vec3_of;
-use crate::theme;
+use rustudio_engine::audio::Audio;
+use rustudio_engine::runtime::ext::SoundCmd;
+use rustudio_render::scene::vec3_of;
 
 #[path = "game_menu.rs"]
 pub mod game_menu;
@@ -131,9 +130,9 @@ pub struct GameState {
     /// Sound ids that came back unavailable: not fetched again this session.
     sound_unavailable: HashSet<String>,
     /// GUI events from the viewport, fired on the client next tick.
-    pub gui_events: Vec<crate::gui::GuiEvent>,
+    pub gui_events: Vec<rustudio_engine::gui::GuiEvent>,
     /// Where the client's GUI objects were drawn (AbsolutePosition / AbsoluteSize).
-    pub gui_layout: HashMap<Ref, crate::gui::GuiBox>,
+    pub gui_layout: HashMap<Ref, rustudio_engine::gui::GuiBox>,
     /// Mouse buttons for UserInputService: (button, down, gameProcessedEvent).
     pub uis_mouse: Vec<(u8, bool, bool)>,
     /// The in-game menu (Esc) is open: the game gets no keys.
@@ -202,7 +201,7 @@ pub fn mouse_input_object(
         ("KeyCode", "KeyCode", "Unknown"),
     ] {
         if let Some(k) = LEnumItem::from_name(en, item) {
-            t.set(prop, crate::ltypes::enum_value(lua, k)?)?;
+            t.set(prop, rustudio_engine::ltypes::enum_value(lua, k)?)?;
         }
     }
     let (x, y) = at.unwrap_or((0.0, 0.0));
@@ -213,11 +212,11 @@ pub fn mouse_input_object(
     };
     t.set(
         "Position",
-        crate::ltypes::LVector3(Vec3::new(x, y, z)).into_value(),
+        rustudio_engine::ltypes::LVector3(Vec3::new(x, y, z)).into_value(),
     )?;
     t.set(
         "Delta",
-        crate::ltypes::LVector3(Vec3::ZERO).into_value(),
+        rustudio_engine::ltypes::LVector3(Vec3::ZERO).into_value(),
     )?;
     // As a real InputObject (a userdata), like UserInputService's.
     match lua.globals().get::<mlua::Function>("__rs_new_input_object") {
@@ -228,11 +227,11 @@ pub fn mouse_input_object(
 
 /// Fires the viewport's GUI events on the client: clicks, hover, text,
 /// selection and scrolling.
-pub fn fire_gui_events(rt: &Runtime, events: Vec<crate::gui::GuiEvent>, gui_service: Option<Ref>) {
-    use crate::gui::{GuiArg, GuiEvent};
+pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>, gui_service: Option<Ref>) {
+    use rustudio_engine::gui::{GuiArg, GuiEvent};
     let lua = &rt.lua;
     let debug = std::env::var_os("RUSTUDIO_GUI_DEBUG").is_some();
-    crate::runtime::domains::gui_input::focus_now(lua);
+    rustudio_engine::runtime::domains::gui_input::focus_now(lua);
     for ev in events {
         if debug
             && !matches!(
@@ -331,7 +330,7 @@ fn scrolls_mut(lua: &mlua::Lua) -> mlua::AppDataRefMut<'_, SmoothScrolls> {
 /// less the frame), from its last layout and its CanvasSize as it is now
 /// (so a canvas a script resized is seen before the next layout). None
 /// when the frame is gone.
-fn scroll_range(rt: &crate::runtime::Runtime, r: Ref) -> Option<(glam::Vec2, glam::Vec2)> {
+fn scroll_range(rt: &rustudio_engine::runtime::Runtime, r: Ref) -> Option<(glam::Vec2, glam::Vec2)> {
     let w = rt.world_mut()?;
     let doc = w.d();
     if !doc.exists(r) {
@@ -363,7 +362,7 @@ fn scroll_range(rt: &crate::runtime::Runtime, r: Ref) -> Option<(glam::Vec2, gla
 /// glides there in `step_smooth_scrolls`. Another notch during a glide
 /// adds to its target (Studio's two-notch capture); after a script wrote
 /// CanvasPosition the next notch starts from the script's value.
-fn scroll_by(rt: &crate::runtime::Runtime, r: Ref, d: [f32; 2]) {
+fn scroll_by(rt: &rustudio_engine::runtime::Runtime, r: Ref, d: [f32; 2]) {
     let Some((cur, max)) = scroll_range(rt, r) else {
         return;
     };
@@ -385,7 +384,7 @@ fn scroll_by(rt: &crate::runtime::Runtime, r: Ref, d: [f32; 2]) {
 /// canvas that shrank mid-glide pulls the target in, and the canvas never
 /// goes past either end (rustudio's rule; no Studio capture of a resize
 /// mid-glide).
-pub fn step_smooth_scrolls(rt: &crate::runtime::Runtime, dt: f32) {
+pub fn step_smooth_scrolls(rt: &rustudio_engine::runtime::Runtime, dt: f32) {
     let lua = &rt.lua;
     let todo: Vec<Ref> = match lua.app_data_ref::<SmoothScrolls>() {
         Some(m) if !m.0.is_empty() => m.0.keys().copied().collect(),
@@ -424,7 +423,7 @@ pub fn step_smooth_scrolls(rt: &crate::runtime::Runtime, dt: f32) {
             changed.then_some(out)
         };
         if let Some(v) = next {
-            if let Ok(u) = lua.create_userdata(crate::ltypes::LVector2(v)) {
+            if let Ok(u) = lua.create_userdata(rustudio_engine::ltypes::LVector2(v)) {
                 rt.set(r, "CanvasPosition", Value::UserData(u));
             }
         }
@@ -495,7 +494,7 @@ function ChatService:InternalApplyRobloxFilter(_, msg) return msg end
 return ChatService
 "#;
 
-impl Editor {
+impl Game {
     /// Adds ServerScriptService.ChatServiceRunner (with a ChatService module)
     /// when the place has none, so WaitForChild("ChatServiceRunner") returns.
     pub(super) fn add_chat_stub(&mut self) {
@@ -525,7 +524,7 @@ impl Editor {
     /// server's (Chatted, ShouldDeliverCallback) and back to the client
     /// (MessageReceived, the window and the bubble). Player:Kick too.
     fn pump_text_chat(&mut self) {
-        use crate::runtime::domains::players_chat as pc;
+        use rustudio_engine::runtime::domains::players_chat as pc;
         let Some(player) = self.play.as_ref().map(|p| p.player) else {
             return;
         };
@@ -657,7 +656,7 @@ impl Editor {
         let det = click_detector_in(cd, part)?;
         let max = f32_prop(cd, det, "MaxActivationDistance", mech::CLICK_DISTANCE);
         let at = self.character_pos();
-        let xf = crate::scene::xform_of(cd, part)?;
+        let xf = rustudio_render::scene::xform_of(cd, part)?;
         at.is_none_or(|at| (xf.pos - at).length() <= max).then_some(det)
     }
 
@@ -698,7 +697,7 @@ fn click_detector_in(d: &Document, part: Ref) -> Option<Ref> {
     }
 }
 
-impl Editor {
+impl Game {
     fn character_pos(&self) -> Option<Vec3> {
         self.play
             .as_ref()?
@@ -718,7 +717,7 @@ impl Editor {
         let Some(at) = self.character_pos() else {
             return true;
         };
-        let Some(xf) = crate::scene::xform_of(&self.doc, part) else {
+        let Some(xf) = rustudio_render::scene::xform_of(&self.doc, part) else {
             return false;
         };
         (xf.pos - at).length() <= max
@@ -739,7 +738,7 @@ impl Editor {
             // TextChatService chat: the line goes out through the target
             // channel's SendAsync (players_chat.luau), which fires Chatted.
             let tcs = self
-                .with_side(Side::Client, |rt, _, _| crate::runtime::domains::players_chat::chat_input(&rt.lua, &msg))
+                .with_side(Side::Client, |rt, _, _| rustudio_engine::runtime::domains::players_chat::chat_input(&rt.lua, &msg))
                 .unwrap_or(false);
             if tcs {
                 continue;
@@ -886,7 +885,7 @@ impl Editor {
         w.input.mouse_target = hit.map(|h| h.0);
         w.input.mouse_hit = Some(Xform {
             pos: hit.map(|h| h.1).unwrap_or(p.origin + p.dir * 1000.0),
-            rot: crate::ltypes::look_at(p.origin, p.origin + p.dir, Vec3::Y).rot,
+            rot: rustudio_engine::ltypes::look_at(p.origin, p.origin + p.dir, Vec3::Y).rot,
         });
     }
 
@@ -936,7 +935,7 @@ impl Editor {
             .play
             .as_ref()
             .and_then(|s| s.character.as_ref().map(|c| c.humanoid));
-        let mine = |h: Ref, ed: &Editor| -> bool {
+        let mine = |h: Ref, ed: &Game| -> bool {
             match side {
                 Side::Server => Some(h) == mine_server,
                 Side::Client => mine_server.and_then(|m| ed.client_of(m)) == Some(h),
@@ -1127,13 +1126,13 @@ impl Editor {
             .filter(|i| doc::is_a(&i.class, "BasePart"))
             .map(|i| i.referent())
             .collect();
-        let base = handle.and_then(|h| crate::scene::xform_of(&self.doc, h));
+        let base = handle.and_then(|h| rustudio_render::scene::xform_of(&self.doc, h));
         let offsets: Vec<(Ref, Xform)> = match base {
             Some(b) => parts
                 .iter()
                 .filter_map(|p| {
-                    crate::scene::xform_of(&self.doc, *p)
-                        .map(|x| (*p, crate::ltypes::cf_mul(&crate::ltypes::cf_inv(&b), &x)))
+                    rustudio_render::scene::xform_of(&self.doc, *p)
+                        .map(|x| (*p, rustudio_engine::ltypes::cf_mul(&rustudio_engine::ltypes::cf_inv(&b), &x)))
                 })
                 .collect(),
             None => Vec::new(),
@@ -1165,11 +1164,11 @@ impl Editor {
         }
         let parts: Vec<Ref> = cd.dom.descendants_of(tool).filter(|i| doc::is_a(&i.class, "BasePart")).map(|i| i.referent()).collect();
         let handle = tool_handle(cd, tool);
-        let base = handle.and_then(|h| crate::scene::xform_of(cd, h));
+        let base = handle.and_then(|h| rustudio_render::scene::xform_of(cd, h));
         let offsets: Vec<(Ref, Xform)> = match base {
             Some(b) => parts
                 .iter()
-                .filter_map(|p| crate::scene::xform_of(cd, *p).map(|x| (*p, crate::ltypes::cf_mul(&crate::ltypes::cf_inv(&b), &x))))
+                .filter_map(|p| rustudio_render::scene::xform_of(cd, *p).map(|x| (*p, rustudio_engine::ltypes::cf_mul(&rustudio_engine::ltypes::cf_inv(&b), &x))))
                 .collect(),
             None => Vec::new(),
         };
@@ -1215,10 +1214,10 @@ impl Editor {
         let model = ch.model;
         let d = &self.doc;
         let Some(hand) = d.find_named(model, "RightHand").or_else(|| d.find_named(model, "Right Arm")) else { return };
-        let Some(hx) = crate::scene::xform_of(d, hand) else { return };
+        let Some(hx) = rustudio_render::scene::xform_of(d, hand) else { return };
         let posed = self.client_tool_pose(&[(hand, hx)]);
         if let Some(cd) = self.play.as_mut().and_then(|s| s.other_doc.as_mut()) {
-            crate::rig::write_pose(cd, &posed, None);
+            rustudio_engine::rig::write_pose(cd, &posed, None);
         }
     }
 
@@ -1230,15 +1229,15 @@ impl Editor {
         let Some(s) = self.play.as_mut() else { return };
         let (Some(e), Some(cd)) = (s.game.client_tool.as_mut(), s.other_doc.as_ref()) else { return };
         let Some(handle) = tool_handle(cd, e.tool) else { return };
-        let Some(hx) = crate::scene::xform_of(cd, handle) else { return };
+        let Some(hx) = rustudio_render::scene::xform_of(cd, handle) else { return };
         let mut edges: Vec<(Ref, Ref)> = Vec::new();
         let mut in_tool: HashSet<Ref> = HashSet::new();
         for i in cd.dom.descendants_of(e.tool) {
             let r = i.referent();
             if doc::is_a(&i.class, "BasePart") {
                 in_tool.insert(r);
-            } else if crate::physics::is_rigid_joint(&i.class) && crate::physics::joint_enabled(cd, r) {
-                if let Some(ends) = crate::physics::joint_parts(cd, r) {
+            } else if rustudio_core::body::is_rigid_joint(&i.class) && rustudio_core::body::joint_enabled(cd, r) {
+                if let Some(ends) = rustudio_core::body::joint_parts(cd, r) {
                     edges.push(ends);
                 }
             }
@@ -1256,11 +1255,11 @@ impl Editor {
             }
         }
         let known: HashSet<Ref> = e.offsets.iter().map(|(r, _)| *r).collect();
-        let inv = crate::ltypes::cf_inv(&hx);
+        let inv = rustudio_engine::ltypes::cf_inv(&hx);
         let mut added = Vec::new();
         for r in reach.iter().filter(|r| !known.contains(r)) {
-            if let Some(x) = crate::scene::xform_of(cd, *r) {
-                e.offsets.push((*r, crate::ltypes::cf_mul(&inv, &x)));
+            if let Some(x) = rustudio_render::scene::xform_of(cd, *r) {
+                e.offsets.push((*r, rustudio_engine::ltypes::cf_mul(&inv, &x)));
                 added.push(*r);
             }
         }
@@ -1304,7 +1303,7 @@ impl Editor {
             _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
         };
         let Some(hand) = self.grip_frame(pose) else { return Vec::new() };
-        use crate::ltypes::{cf_inv, cf_mul};
+        use rustudio_engine::ltypes::{cf_inv, cf_mul};
         let handle_xf = cf_mul(&hand, &cf_inv(&grip));
         e.offsets.iter().map(|(r, off)| (*r, cf_mul(&handle_xf, off))).collect()
     }
@@ -1325,7 +1324,7 @@ impl Editor {
         if c0.rot.abs_diff_eq(Mat3::IDENTITY, 1e-4) {
             c0.rot = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
         }
-        Some(crate::ltypes::cf_mul(&hand_xf, &c0))
+        Some(rustudio_engine::ltypes::cf_mul(&hand_xf, &c0))
     }
 
     /// Forgets the equipped tool without putting it back in the Backpack
@@ -1394,7 +1393,7 @@ impl Editor {
                 rot: Mat3::IDENTITY,
             },
         };
-        use crate::ltypes::{cf_inv, cf_mul};
+        use rustudio_engine::ltypes::{cf_inv, cf_mul};
         let handle_xf = cf_mul(&cf_mul(&hand_xf, &c0), &cf_inv(&grip));
         e.offsets
             .iter()
@@ -1444,7 +1443,7 @@ impl Editor {
                 continue;
             }
             let r = i.referent();
-            let Some(xf) = crate::scene::xform_of(d, r) else {
+            let Some(xf) = rustudio_render::scene::xform_of(d, r) else {
                 continue;
             };
             let size = vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
@@ -1521,9 +1520,9 @@ impl Editor {
 
     // ------------------------------------------------------------- sounds
 
-    fn sound_bytes(&mut self, id: &str) -> crate::assets::Fetch {
-        use crate::assets::Fetch;
-        if !crate::assets::place_content_ok(id) {
+    fn sound_bytes(&mut self, id: &str) -> rustudio_core::assets::Fetch {
+        use rustudio_core::assets::Fetch;
+        if !rustudio_core::assets::place_content_ok(id) {
             return Fetch::Unavailable(format!("{id}: local files aren't place content while scripts run"));
         }
         let dir = self
@@ -1532,13 +1531,13 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
-        if let Some(path) = crate::assets::resolve(id, dir.as_deref()) {
+        if let Some(path) = rustudio_core::assets::resolve(id, dir.as_deref()) {
             return match std::fs::read(&path) {
                 Ok(b) => Fetch::Ready(Arc::new(b)),
                 Err(e) => Fetch::Unavailable(format!("{}: {e}", path.display())),
             };
         }
-        match crate::assets::asset_ref(id) {
+        match rustudio_core::assets::asset_ref(id) {
             Some(a) => self.assets.fetch(a),
             None => Fetch::Unavailable("no SoundId".into()),
         }
@@ -1628,7 +1627,7 @@ impl Editor {
         }
     }
 
-    fn audio_listener(&self) -> Option<(u32, Option<crate::math::Xform>, Option<Ref>)> {
+    fn audio_listener(&self) -> Option<(u32, Option<rustudio_core::math::Xform>, Option<Ref>)> {
         let s = self.play.as_ref()?;
         s.client
             .as_ref()
@@ -1656,12 +1655,12 @@ impl Editor {
                     d.prop(r, "PlaybackRegionsEnabled"),
                     Some(Variant::Bool(true))
                 ) {
-                    crate::audio::Region {
+                    rustudio_engine::audio::Region {
                         play: range("PlaybackRegion"),
                         looped: range("LoopRegion"),
                     }
                 } else {
-                    crate::audio::Region::default()
+                    rustudio_engine::audio::Region::default()
                 };
                 let id = match d.prop(r, "SoundId") {
                     Some(Variant::ContentId(c)) => c.as_str().to_string(),
@@ -1704,9 +1703,9 @@ impl Editor {
             *s.game.sound_fetches.entry(id.clone()).or_insert(0) += 1;
         }
         match self.sound_bytes(&id) {
-            crate::assets::Fetch::Ready(bytes) => {
+            rustudio_core::assets::Fetch::Ready(bytes) => {
                 let graph = self.sound_doc(server, client).map(|(d, r)| {
-                    crate::audio_scene::settings(
+                    rustudio_engine::audio_scene::settings(
                         d,
                         r,
                         self.cam.pos,
@@ -1750,12 +1749,12 @@ impl Editor {
                     self.reset_sound_doc_time(server, client);
                 }
             }
-            crate::assets::Fetch::Pending => {
+            rustudio_core::assets::Fetch::Pending => {
                 if let Some(t) = self.play.as_mut().and_then(|s| s.game.tracks.get_mut(&key)) {
                     t.pending = Some(id);
                 }
             }
-            crate::assets::Fetch::Unavailable(why) => {
+            rustudio_core::assets::Fetch::Unavailable(why) => {
                 // Given up on: no per-frame retry, one warning, the game goes on.
                 if let Some(s) = self.play.as_mut() {
                     if let Some(t) = s.game.tracks.get_mut(&key) {
@@ -1798,7 +1797,7 @@ impl Editor {
         &mut self,
         server: Option<Ref>,
         client: Option<Ref>,
-        f: impl Fn(&mut crate::runtime::ext::Inputs, Ref),
+        f: impl Fn(&mut rustudio_engine::runtime::ext::Inputs, Ref),
     ) {
         let Some(s) = self.play.as_mut() else { return };
         if let (Some(r), Some(w)) = (server, s.server.world.as_mut()) {
@@ -1874,7 +1873,7 @@ impl Editor {
                 finished.push((h, false));
                 continue;
             };
-            let Some(pos) = crate::scene::xform_of(&self.doc, root).map(|x| x.pos) else {
+            let Some(pos) = rustudio_render::scene::xform_of(&self.doc, root).map(|x| x.pos) else {
                 continue;
             };
             let mut to = target - pos;
@@ -2054,7 +2053,7 @@ impl Editor {
                     f32_prop(d, r, "Volume", 0.5).clamp(0., 10.),
                     f32_prop(d, r, "PlaybackSpeed", 1.),
                     matches!(d.prop(r, "Looped"), Some(Variant::Bool(true))),
-                    crate::audio_scene::settings(d, r, cam, self.cam.right(), self.audio_listener()),
+                    rustudio_engine::audio_scene::settings(d, r, cam, self.cam.right(), self.audio_listener()),
                 )
             });
             if let (Some((vol, speed, looped, (groups, settings))), Some(a)) = (
@@ -2163,7 +2162,7 @@ impl Editor {
         let ctx = ui.ctx().clone();
         // (LockCenter: the game's mouse is the middle of the view, wherever
         // the held system cursor is.)
-        let mut pointer = crate::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
+        let mut pointer = rustudio_engine::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
             let ray = self.cam.ray(rect, p);
             let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
             Pointer {
@@ -2182,7 +2181,7 @@ impl Editor {
             self.server_front();
             let terrain = self
                 .with_side(side, |rt, _, _| {
-                    crate::runtime::ext::mouse_terrain_hit(&rt.lua, o, d, crate::mech::MOUSE_RAY_LENGTH)
+                    rustudio_engine::runtime::ext::mouse_terrain_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH)
                 })
                 .flatten();
             self.shown_front();
@@ -2355,7 +2354,7 @@ impl Editor {
                 .map(|t| {
                     let d = if self.doc.exists(*t) { Some(&self.doc) } else { self.play_other_doc() };
                     let name = d.and_then(|d| d.dom.get_by_ref(*t)).map(|i| i.name.clone()).unwrap_or_default();
-                    let texture = crate::scene::content_string(d.and_then(|d| d.prop(*t, "TextureId")))
+                    let texture = rustudio_render::scene::content_string(d.and_then(|d| d.prop(*t, "TextureId")))
                         .unwrap_or_default();
                     (name, texture, Some(*t) == equipped)
                 })
@@ -2379,7 +2378,7 @@ impl Editor {
         self.server_front();
         let view = self
             .with_side(Side::Client, |rt, _, _| {
-                crate::runtime::domains::players_chat::chat_view(&rt.lua)
+                rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua)
             })
             .flatten();
         self.shown_front();
@@ -2443,7 +2442,7 @@ impl Editor {
                 // an offline Studio runs); "/" still opens the chat box.
                 s.game.chat_ready_frames += 1;
             }
-            if let Ok(mut l) = crate::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
+            if let Ok(mut l) = rustudio_engine::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
                 l.focused = s.game.chat_open;
             }
             if !menu {
@@ -2466,13 +2465,13 @@ impl Editor {
     /// The part under the game's mouse: the shown side's world query, as
     /// workspace:Raycast meets it; the drawn boxes only when that side has no
     /// runtime.
-    fn mouse_pick(&mut self, side: Side, ray: &crate::math::Ray) -> Option<(Ref, f32)> {
+    fn mouse_pick(&mut self, side: Side, ray: &rustudio_core::math::Ray) -> Option<(Ref, f32)> {
         let skip: Vec<Ref> = self.own_parts().into_iter().collect();
         let (o, d) = (ray.origin, ray.dir);
         // (with_side wants the server in front; the viewport has the shown side there)
         self.server_front();
         let hit = self.with_side(side, |rt, _, _| {
-            crate::runtime::ext::mouse_part_hit(&rt.lua, o, d, crate::mech::MOUSE_RAY_LENGTH, &skip)
+            rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, &skip)
         });
         self.shown_front();
         match hit {
@@ -2500,7 +2499,7 @@ impl Editor {
     }
 
     /// The nearest drawn part box along a ray (any part, locked or not).
-    fn pick_any(&self, ray: &crate::math::Ray) -> Option<(Ref, f32)> {
+    fn pick_any(&self, ray: &rustudio_core::math::Ray) -> Option<(Ref, f32)> {
         let own = self.own_parts();
         let mut best: Option<(f32, Ref)> = None;
         for (sp, b) in self.scene.parts.iter().zip(&self.scene.bounds) {
@@ -2561,9 +2560,9 @@ fn c32(c: [f32; 3], alpha: f32) -> Color32 {
 fn draw_text_chat(
     painter: &egui::Painter,
     rect: Rect,
-    v: &crate::runtime::domains::players_chat::ChatView,
+    v: &rustudio_engine::runtime::domains::players_chat::ChatView,
     open: bool,
-    cam: &crate::camera::Camera,
+    cam: &rustudio_render::camera::Camera,
 ) -> Option<Rect> {
     use egui::text::{LayoutJob, TextFormat};
     // ExpChat's container starts under the 58 px top bar.
@@ -2578,7 +2577,7 @@ fn draw_text_chat(
         Pos2::new(rect.min.x + 16.0, win.max.y),
         egui::vec2(win.width() - 16.0, 43.0),
     );
-    if let Ok(mut l) = crate::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
+    if let Ok(mut l) = rustudio_engine::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
         l.window = ([win.min.x - rect.min.x, win.min.y - rect.min.y - INSET], [win.width(), win.height()]);
         l.input = ([bar.min.x - rect.min.x, bar.min.y - rect.min.y - INSET], [bar.width(), bar.height()]);
         l.tabs = ([0.0, 0.0], [0.0, 0.0]);
@@ -2650,8 +2649,8 @@ fn draw_text_chat(
 fn draw_chat_bubbles(
     painter: &egui::Painter,
     rect: Rect,
-    v: &crate::runtime::domains::players_chat::ChatView,
-    cam: &crate::camera::Camera,
+    v: &rustudio_engine::runtime::domains::players_chat::ChatView,
+    cam: &rustudio_render::camera::Camera,
 ) {
     let b = &v.bubble;
     if b.enabled {
@@ -2699,7 +2698,7 @@ fn draw_chat_bubbles(
 }
 
 /// The legacy chat (LegacyChatService): recent lines bottom left.
-fn draw_legacy_chat(ed: &Editor, painter: &egui::Painter, rect: Rect, chat_on: bool) {
+fn draw_legacy_chat(ed: &Game, painter: &egui::Painter, rect: Rect, chat_on: bool) {
     let lines: Vec<String> = ed
         .play
         .as_ref()

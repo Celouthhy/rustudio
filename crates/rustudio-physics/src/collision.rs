@@ -111,7 +111,7 @@ fn cache_file(id: &str, fidelity: u32) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (CACHE_VERSION, id, fidelity).hash(&mut h);
-    crate::assets::cache_dir()
+    rustudio_core::assets::cache_dir()
         .join("collision")
         .join(format!("{:016x}.bin", h.finish()))
 }
@@ -160,7 +160,7 @@ fn save_cached(id: &str, fidelity: u32, hulls: &[Vec<Vec3>]) {
 
 /// The mesh's vertices (welded) and triangles in its unit box.
 fn mesh_geometry(id: &str) -> Option<(Vec<rp::Vector>, Vec<[u32; 3]>)> {
-    let tris = crate::assets::mesh_triangles(id)?;
+    let tris = rustudio_core::assets::mesh_triangles(id)?;
     let mut index: HashMap<[u32; 3], u32> = HashMap::new();
     let mut verts = Vec::new();
     let mut faces = Vec::with_capacity(tris.len());
@@ -194,7 +194,7 @@ const CONVEX_TOLERANCE: f32 = 0.01;
 fn is_convex(verts: &[rp::Vector], faces: &[[u32; 3]]) -> bool {
     use rapier3d::parry::transformation::try_convex_hull;
     // (flat or degenerate meshes fail here and go to V-HACD as before)
-    let Ok(Ok((hp, hf))) = crate::crash::recoverable(|| try_convex_hull(verts)) else {
+    let Ok(Ok((hp, hf))) = rustudio_core::crash::recoverable(|| try_convex_hull(verts)) else {
         return false;
     };
     if hf.len() < 4 {
@@ -249,7 +249,7 @@ fn compute(id: &str, fidelity: u32) -> Option<Vec<Vec<Vec3>>> {
         // mesh). That killed the collision worker, so every later mesh had
         // no collider and the character fell through the map. One bad mesh
         // now falls back to its single convex hull.
-        let decomposed = crate::crash::recoverable(|| {
+        let decomposed = rustudio_core::crash::recoverable(|| {
             let decomp = VHACD::decompose(&params(fidelity), &verts, &faces, true);
             decomp
                 .compute_exact_convex_hulls(&verts, &faces)
@@ -304,7 +304,7 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
         if fidelity == FIDELITY_HULL {
             let st = match compute(id, fidelity) {
                 Some(h) => State::Ready(Arc::new(h)),
-                None if crate::assets::mesh_triangles(id).is_none() => State::Missing(std::time::Instant::now()),
+                None if rustudio_core::assets::mesh_triangles(id).is_none() => State::Missing(std::time::Instant::now()),
                 None => State::Failed,
             };
             states.insert(key, st.clone());
@@ -313,7 +313,7 @@ pub fn hulls(id: &str, fidelity: u32) -> Lookup {
                 _ => Lookup::Unavailable,
             };
         }
-        if crate::assets::mesh_triangles(id).is_none() {
+        if rustudio_core::assets::mesh_triangles(id).is_none() {
             states.insert(key, State::Missing(std::time::Instant::now()));
             return Lookup::Unavailable;
         }
@@ -338,10 +338,10 @@ pub fn wait_ready(id: &str, fidelity: u32, timeout: std::time::Duration) -> Look
             // than taking the box and asking again 500 ms of wall clock later — that made a
             // part change shape on a load-dependent tick (RUSTUDIO_DETERMINISTIC runs,
             // CHAR-NOTES round CHAR-5 §4).
-            Lookup::Unavailable if !fetched && crate::assets::mesh_triangles(id).is_none() => {
+            Lookup::Unavailable if !fetched && rustudio_core::assets::mesh_triangles(id).is_none() => {
                 fetched = true;
-                let _ = crate::assets::content_blocking(id);
-                if crate::assets::mesh_triangles(id).is_none() {
+                let _ = rustudio_core::assets::content_blocking(id);
+                if rustudio_core::assets::mesh_triangles(id).is_none() {
                     return Lookup::Unavailable;
                 }
                 store().states.lock().expect("collision states").remove(&(id.to_string(), fidelity));
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn hull_and_decomposition_of_an_l_shape() {
         let id = "rbxtemp://rustudio/test/l-shape.obj";
-        crate::assets::register_generated(id, l_prism_obj().into_bytes());
+        rustudio_core::assets::register_generated(id, l_prism_obj().into_bytes());
         std::env::set_var(
             "RUSTUDIO_CACHE_DIR",
             std::env::temp_dir().join("rustudio-collision-test"),
@@ -556,7 +556,7 @@ mod tests {
             obj += &format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1);
         }
         let id = "rbxtemp://rustudio/test/open-ramp.obj";
-        crate::assets::register_generated(id, obj.into_bytes());
+        rustudio_core::assets::register_generated(id, obj.into_bytes());
         std::env::set_var(
             "RUSTUDIO_CACHE_DIR",
             std::env::temp_dir().join("rustudio-collision-test"),

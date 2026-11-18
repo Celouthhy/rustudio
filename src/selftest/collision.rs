@@ -9,7 +9,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::{new_part, Document};
+use rustudio_core::doc::{new_part, Document};
 
 const MESH: &str = "rbxtemp://rustudio/selftest/l-prism.obj";
 /// Part size: the L stands 8 studs tall; its empty corner is x, y in 0..4
@@ -19,9 +19,9 @@ const SIZE: f32 = 8.0;
 impl SelfTest {
     /// Phases 72..=73.
     pub(super) fn tick_collision(&mut self, f: u64, ed: &mut Editor) -> bool {
-        use crate::collision::{self as col, Lookup};
+        use rustudio_physics::collision::{self as col, Lookup};
         if self.r4.phase == 72 {
-            crate::assets::register_generated(MESH, col::l_prism_obj().into_bytes());
+            rustudio_core::assets::register_generated(MESH, col::l_prism_obj().into_bytes());
             let mut doc = Document::new_place();
             let ws = doc.workspace().expect("workspace");
             for (name, x, fid) in [
@@ -66,10 +66,10 @@ impl SelfTest {
         if t == 1 {
             let _ = col::hulls(MESH, col::FIDELITY_PRECISE);
         }
-        if !ed.is_playing() {
+        if !ed.game.is_playing() {
             let ready = matches!(col::hulls(MESH, col::FIDELITY_PRECISE), Lookup::Ready(_));
             if ready || t > 3000 {
-                ed.start_play(crate::runtime::RunMode::Run);
+                ed.start_play(rustudio_engine::runtime::RunMode::Run);
                 self.r6.started = f;
             }
             return false;
@@ -78,10 +78,10 @@ impl SelfTest {
             return false;
         }
         let y = |ed: &Editor, n: &str| {
-            ed.doc
+            ed.game.doc
                 .workspace()
-                .and_then(|ws| ed.doc.find_named(ws, n))
-                .and_then(|r| crate::scene::xform_of(&ed.doc, r))
+                .and_then(|ws| ed.game.doc.find_named(ws, n))
+                .and_then(|r| rustudio_render::scene::xform_of(&ed.game.doc, r))
                 .map(|x| x.pos.y)
                 .unwrap_or(f32::NAN)
         };

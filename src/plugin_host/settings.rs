@@ -14,23 +14,15 @@
 //! Studio or Vinegar folder.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use mlua::{Lua, Value};
 use serde_json::{Map, Value as Json};
 
 /// The signed-in user's id (0 signed out): the settings folder, and
-/// GetStudioUserId.
-static USER_ID: AtomicU64 = AtomicU64::new(0);
-
-pub fn set_user_id(id: u64) {
-    USER_ID.store(id, Ordering::Relaxed);
-}
-
-pub fn user_id() -> u64 {
-    USER_ID.load(Ordering::Relaxed)
-}
+/// GetStudioUserId. (It lives in the engine: StudioService.GetUserId reads
+/// it there too.)
+pub use rustudio_engine::runtime::domains::plugin_api::{set_user_id, user_id};
 
 /// Serializes reads and writes of the settings files (the edit and Play
 /// VMs share them).
@@ -39,7 +31,7 @@ static LOCK: Mutex<()> = Mutex::new(());
 pub fn data_root() -> PathBuf {
     match std::env::var_os("RUSTUDIO_PLUGIN_DATA") {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => crate::paths::data().join("plugin-data"),
+        _ => rustudio_core::paths::data().join("plugin-data"),
     }
 }
 
@@ -167,7 +159,7 @@ pub fn to_json(lua: &Lua, v: &Value, depth: usize) -> Option<Json> {
             let ty = lua_typeof(lua, v);
             match ty.as_str() {
                 "EnumItem" => {
-                    let name = ud.borrow::<crate::ltypes::LEnumItem>().map(|e| e.name.clone()).ok();
+                    let name = ud.borrow::<rustudio_engine::ltypes::LEnumItem>().map(|e| e.name.clone()).ok();
                     Json::String(name.unwrap_or_else(|| lua_tostring(lua, v)))
                 }
                 "Instance" | "RBXScriptSignal" | "RBXScriptConnection" => Json::String(ty),

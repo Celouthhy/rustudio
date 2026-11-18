@@ -8,8 +8,8 @@ use glam::Vec3;
 use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::camera::Camera;
-use crate::doc::{self, Document};
-use crate::mech;
+use rustudio_core::doc::{self, Document};
+use rustudio_core::mech;
 use crate::render::{mat_cols, Globals, LightRaw};
 use crate::scene::{enum_u32, f32_of, vec3_of, xform_of};
 
@@ -336,13 +336,13 @@ pub fn globals(
     let clock = f32_of(get("ClockTime"))
         .or_else(time_of_day)
         .map(mech::clock_time)
-.unwrap_or(mech::CLOCK_TIME); // clamp + whole seconds
+        .unwrap_or(mech::CLOCK_TIME); // clamp + whole seconds
     let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
     let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);
     let exposure = f32_of(get("ExposureCompensation")).unwrap_or(0.0);
     let env_diffuse = f32_of(get("EnvironmentDiffuseScale"))
         .unwrap_or(0.0)
-.clamp(0.0, mech::ENV_SCALE_MAX);
+        .clamp(0.0, mech::ENV_SCALE_MAX); // Studio
     let env_specular = f32_of(get("EnvironmentSpecularScale"))
         .unwrap_or(0.0)
         .clamp(0.0, mech::ENV_SCALE_MAX);
@@ -732,7 +732,7 @@ impl LightCache {
                     vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE),
                 )
             } else if doc::is_a(&hclass, "Attachment") {
-                let Some(xf) = crate::attachment::world(d, host, true) else { continue };
+                let Some(xf) = rustudio_core::attachment::world(d, host, true) else { continue };
                 (xf.pos, xf.rot, Vec3::ZERO)
             } else {
                 continue;
@@ -972,5 +972,25 @@ mod tests {
         assert_eq!(sky_faces(&d)[0], "rbxassetid://123");
         assert_eq!(effects(&d, None).dof, Some([4.72, 0.0, 0.0, 0.567]));
 
+    }
+
+    /// A Bone's Transform moves what hangs under it (selftest/attachment.rs
+    /// covers the frames themselves; this is the light that reads them).
+    #[test]
+    fn bone_light_uses_transformed_frame() {
+        use rustudio_core::math::Xform;
+        use glam::Mat3;
+        use rbx_dom_weak::InstanceBuilder;
+        let cf = |p: Vec3, r: Mat3| Variant::CFrame(Xform { pos: p, rot: r }.to_cframe());
+        let mut d = Document::new_place();
+        let ws = d.find_child(d.dom.root_ref(), "Workspace").unwrap();
+        let p = d.insert(ws, InstanceBuilder::new("Part").with_property("CFrame", cf(Vec3::new(10., 0., 0.), Mat3::IDENTITY)));
+        let b = d.insert(p, InstanceBuilder::new("Bone").with_property("CFrame", cf(Vec3::Y, Mat3::IDENTITY)).with_property("Transform", cf(Vec3::X, Mat3::IDENTITY)));
+        d.insert(b, InstanceBuilder::new("PointLight"));
+        let mut cache = LightCache::default();
+        assert!(cache.hosts(&mut d).contains(&p));
+        let lights = cache.gather(&mut d, &Camera::default(), &|_, _| true);
+        assert_eq!(lights.len(), 1);
+        assert_eq!(&lights[0].pos_range[..3], &[11., 1., 0.]);
     }
 }

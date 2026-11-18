@@ -1,7 +1,8 @@
 //! Member routes: what answers `inst.Member` for a class, worked out once
 //! per (class, member), as Studio's member descriptors are.
 //!
-//! Studio: Luau's `useratom` callback gives every string that is a known member name a 16-bit atom (its index
+//! Studio (Studio, static RE): Luau's `useratom` callback
+//! gives every string that is a known member name a 16-bit atom (its index
 //! in the global name table); the Instance `__index` / `__namecall`
 //! take the key's atom, find the member's
 //! descriptor in the class's table by atom (cached per call site), check
@@ -38,20 +39,23 @@ static ATOMS: LazyLock<Atoms> = LazyLock::new(|| {
             names.push(p.to_string());
         }
     }
-    if let Some(api) = crate::api::get() {
+    if let Some(api) = rustudio_core::api::get() {
         for c in api.classes.values() {
             names.extend(c.members.keys().cloned());
         }
     }
+    let dom_methods = domains::methods();
+    let dom_lua_methods = domains::lua_methods();
+    let dom_events = domains::events();
     let lists = METHODS
         .iter()
         .chain(LUA_METHODS)
         .chain(ext::METHODS)
         .chain(ext::LUA_METHODS)
         .chain(editable::METHODS)
-        .chain(domains::METHODS.iter())
-        .chain(domains::LUA_METHODS.iter())
-        .chain(domains::EVENTS.iter());
+        .chain(dom_methods)
+        .chain(dom_lua_methods)
+        .chain(dom_events);
     names.extend(lists.map(|(m, _)| m.to_string()));
     names.sort();
     names.dedup();
@@ -518,7 +522,7 @@ unsafe fn fast_index(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> std
             return -1;
         }
         let Some(r) = ud_ref(ffi::lua_touserdata(l, 1) as *const u8) else { return -1 };
-        if crate::bench::call_probes_on() {
+        if rustudio_core::bench::call_probes_on() {
             return -1;
         }
         // (No atom: a child's name, read off the stack.)
@@ -541,7 +545,7 @@ unsafe fn fast_index(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> std
         // (mlua's current thread: the caller, as in its own callbacks)
         lua.with_current_state(l, || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let (v, quiet) = crate::bench::api_timed("index", key, || index_entry_fast(lua, r, key, atom));
+                let (v, quiet) = rustudio_core::bench::api_timed("index", key, || index_entry_fast(lua, r, key, atom));
                 if !quiet {
                     signal_timing::flush_immediate(lua);
                 }
@@ -646,7 +650,7 @@ unsafe fn fast_newindex(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> 
     use mlua::ffi;
     unsafe {
         let Some(r) = self_ref(l, 7) else { return -1 };
-        if crate::bench::call_probes_on() {
+        if rustudio_core::bench::call_probes_on() {
             return -1;
         }
         let Some(&key) = ATOMS.names.get(atom as usize) else { return -1 };
@@ -665,7 +669,7 @@ unsafe fn fast_newindex(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> 
                 };
                 if let Some(p) = p {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::bench::api_timed("newindex", key, || parent_write(lua, r, key, atom, p))
+                        rustudio_core::bench::api_timed("newindex", key, || parent_write(lua, r, key, atom, p))
                     }));
                     match res {
                         Ok(None) => {}
@@ -690,7 +694,7 @@ unsafe fn fast_newindex(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> 
             }
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let value = stack_value(lua, l, 3, slot)?;
-                let v = crate::bench::api_timed("newindex", key, || newindex_entry(lua, r, key, value, atom));
+                let v = rustudio_core::bench::api_timed("newindex", key, || newindex_entry(lua, r, key, value, atom));
                 signal_timing::flush_immediate(lua);
                 v
             }));
@@ -732,7 +736,7 @@ unsafe fn fast_namecall(
         if n < 1 || self_ref(l, 4).is_none() {
             return -1;
         }
-        if crate::bench::call_probes_on() {
+        if rustudio_core::bench::call_probes_on() {
             return -1;
         }
         let Some(&name) = ATOMS.names.get(atom as usize) else { return -1 };
@@ -779,7 +783,7 @@ unsafe fn fast_namecall(
                 }
                 let r = self_ref(l, 4).unwrap_or_else(Ref::none);
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::bench::api_timed("call", name, || native_call(lua, r, name, atom, &nargs[..(n - 1) as usize]))
+                    rustudio_core::bench::api_timed("call", name, || native_call(lua, r, name, atom, &nargs[..(n - 1) as usize]))
                 }));
                 match res {
                     Ok(None) => {}

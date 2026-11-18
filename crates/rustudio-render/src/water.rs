@@ -159,7 +159,7 @@ impl WaterPass {
             min_filter: wgpu::FilterMode::Linear,
             // Mipmapped: far ripples average out instead of shimmering.
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: crate::mech::TEXTURE_ANISOTROPY,
+            anisotropy_clamp: rustudio_core::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
         WaterPass {
@@ -197,12 +197,12 @@ impl WaterPass {
     pub fn uniforms(&self, look: &WaterLook, size: [u32; 2]) -> WaterRaw {
         // The normal maps play through their frames (an estimate of Studio's
         // rate: WaterWaveSpeed 10 → 8 frames / s), blending between two.
-        let t = look.time * look.wave_speed.max(0.0) * crate::mech::WATER_FRAMES_PER_SPEED;
+        let t = look.time * look.wave_speed.max(0.0) * rustudio_core::mech::WATER_FRAMES_PER_SPEED;
         let n = self.layers.max(1) as f32;
         let a = t.floor().rem_euclid(n);
         let b = (a + 1.0).rem_euclid(n);
         // Waves (SmoothWater VS): y += (sin((z − x)k − φ) + sin((z + x)k + φ)) × amplitude.
-        let phase = look.time * look.wave_speed * crate::mech::WATER_WAVE_PHASE_PER_SPEED;
+        let phase = look.time * look.wave_speed * rustudio_core::mech::WATER_WAVE_PHASE_PER_SPEED;
         // Depth blend toward the water colour (Studio's CB3[2], updateWater
         // Studio): cover = clamp(depth × T / (1990 T + 10) + 1 − T), T
         // the transparency: at 0.3 a 50-stud bottom shows 28 %, the sky
@@ -211,13 +211,13 @@ impl WaterPass {
         let scale = clear / (1990.0 * clear + 10.0);
         WaterRaw {
             wave: [
-                crate::mech::WATER_WAVE_NUMBER,
+                rustudio_core::mech::WATER_WAVE_NUMBER,
                 phase,
-                look.wave_size.max(0.0) * crate::mech::WATER_WAVE_AMPLITUDE,
+                look.wave_size.max(0.0) * rustudio_core::mech::WATER_WAVE_AMPLITUDE,
                 t.fract(),
             ],
             frames: [a, b, scale, 1.0 - clear],
-            view: [size[0] as f32, size[1] as f32, crate::mech::WATER_WAVE_FADE, crate::mech::NEAR],
+            view: [size[0] as f32, size[1] as f32, rustudio_core::mech::WATER_WAVE_FADE, rustudio_core::mech::NEAR],
         }
     }
 }
@@ -227,9 +227,9 @@ fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureVie
     let mut frames: Vec<Vec<u8>> = Vec::new();
     for i in 1..=FRAMES {
         let id = format!("rbxasset://textures/water/normal_{i:02}.dds");
-        let img = crate::assets::resolve(&id, None)
+        let img = rustudio_core::assets::resolve(&id, None)
             .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| crate::texture::decode(&b).ok())
+            .and_then(|b| rustudio_core::texture::decode(&b).ok())
             .filter(|img| img.width == SIZE && img.height == SIZE);
         match img {
             Some(img) => frames.push(img.pixels),

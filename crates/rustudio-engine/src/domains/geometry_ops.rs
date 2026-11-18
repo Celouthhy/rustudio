@@ -22,9 +22,9 @@ use rbx_dom_weak::types::{Enum, Ref, SharedString, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 
 use super::csg::{self, Poly, Shape};
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 pub const METHODS: &[(&str, &str)] = &[
@@ -85,7 +85,7 @@ fn shape_of(doc: &Document, r: Ref) -> mlua::Result<Shape> {
         return Ok(Shape::CornerWedge);
     }
     if doc::is_a(class, "Part") {
-        return Ok(match crate::scene::enum_u32(doc.prop(r, "Shape")) {
+        return Ok(match rustudio_render::scene::enum_u32(doc.prop(r, "Shape")) {
             Some(0) => Shape::Ball,
             Some(2) => Shape::Cylinder,
             Some(3) => Shape::Wedge,
@@ -97,9 +97,9 @@ fn shape_of(doc: &Document, r: Ref) -> mlua::Result<Shape> {
         return Ok(Shape::Block);
     }
     let mesh_id = if class == "MeshPart" {
-        crate::scene::content_string(doc.prop(r, "MeshId")).or_else(|| crate::scene::content_string(doc.prop(r, "MeshContent")))
+        rustudio_render::scene::content_string(doc.prop(r, "MeshId")).or_else(|| rustudio_render::scene::content_string(doc.prop(r, "MeshContent")))
     } else if doc::is_a(class, "PartOperation") {
-        crate::scene::union_mesh(doc, r).map(|m| m.id)
+        rustudio_core::mesh::union_mesh(doc, r).map(|m| m.id)
     } else {
         return Err(rt_err(UNKNOWN));
     };
@@ -107,8 +107,8 @@ fn shape_of(doc: &Document, r: Ref) -> mlua::Result<Shape> {
         // An empty MeshPart is its box.
         return Ok(Shape::Block);
     };
-    let off = crate::mesh_bvh::union_offset(&id);
-    match crate::assets::mesh_triangles(&id) {
+    let off = rustudio_core::mesh_bvh::union_offset(&id);
+    match rustudio_core::assets::mesh_triangles(&id) {
         Some(t) => Ok(Shape::Mesh(t, off)),
         None => Err(rt_err("CSG: Improperly formed or stored Union. Missing child data. (error -6)")),
     }
@@ -119,8 +119,8 @@ fn polys_of(doc: &Document, r: Ref) -> mlua::Result<(Vec<Poly>, Xform)> {
     if !doc::is_a(&class, "BasePart") || class == "Terrain" {
         return Err(rt_err(UNKNOWN));
     }
-    let xf = crate::scene::xform_of(doc, r).ok_or_else(|| rt_err(UNKNOWN))?;
-    let size = crate::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::ONE);
+    let xf = rustudio_render::scene::xform_of(doc, r).ok_or_else(|| rt_err(UNKNOWN))?;
+    let size = rustudio_render::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::ONE);
     let shape = shape_of(doc, r)?;
     Ok((csg::part_polys(&shape, &xf, size, color_of(doc, r)), xf))
 }
@@ -283,7 +283,7 @@ fn csg_options(lua: &Lua, v: &Value) -> mlua::Result<Opts> {
                 want_bool(&val)?;
             }
             "UseDynamicConvexDecomposition" => {
-                world(lua)?.output.push((crate::app::Level::Warn, "UseDynamicConvexDecomposition is ignored because it is deprecated.".into()));
+                world(lua)?.output.push((rustudio_core::log::Level::Warn, "UseDynamicConvexDecomposition is ignored because it is deprecated.".into()));
             }
             _ => return Err(rt_err(format!("Key '{key}' is not a valid member of CSGOptions"))),
         }
@@ -407,7 +407,7 @@ fn fragment_sites(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiValue> {
         if !d.class_of(part).is_some_and(|c| doc::is_a(&c, "BasePart")) {
             return Err(rt_err("GeometryService:GenerateFragmentSites: Parameter 1 must be a BasePart."));
         }
-        (crate::scene::xform_of(d, part).unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }), crate::scene::vec3_of(d.prop(part, "Size")).unwrap_or(Vec3::ONE))
+        (rustudio_render::scene::xform_of(d, part).unwrap_or(Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY }), rustudio_render::scene::vec3_of(d.prop(part, "Size")).unwrap_or(Vec3::ONE))
     };
     let opts = arg(args, 1);
     option_keys(&opts, &["SiteSpacing", "Origin", "Radius"])?;
@@ -579,7 +579,7 @@ fn mesh_part_in(lua: &Lua, main: Option<Ref>, p: Piece) -> mlua::Result<Ref> {
         N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     };
     let id = format!("rbxtemp://rustudio/geometry/mesh/{n}");
-    crate::assets::register_generated(&id, p.blob.clone());
+    rustudio_core::assets::register_generated(&id, p.blob.clone());
     let mut w = world(lua)?;
     let d = w.dm();
     let mut b = InstanceBuilder::new("MeshPart").with_name("MeshPart");
@@ -758,7 +758,7 @@ fn constraints_to_preserve(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiVa
         let d = w.d();
         let boxes: Vec<(Ref, Xform, Vec3)> = dest
             .iter()
-            .filter_map(|r| Some((*r, crate::scene::xform_of(d, *r)?, crate::scene::vec3_of(d.prop(*r, "Size"))?)))
+            .filter_map(|r| Some((*r, rustudio_render::scene::xform_of(d, *r)?, rustudio_render::scene::vec3_of(d.prop(*r, "Size"))?)))
             .collect();
         let home = |p: Vec3| -> Option<Ref> {
             let mut best: Option<(Ref, f32)> = None;
@@ -772,9 +772,9 @@ fn constraints_to_preserve(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiVa
             best.map(|b| b.0)
         };
         let touching = |other: Ref| -> Vec<Ref> {
-            let (Some(oxf), Some(os)) = (crate::scene::xform_of(d, other), crate::scene::vec3_of(d.prop(other, "Size"))) else { return Vec::new() };
+            let (Some(oxf), Some(os)) = (rustudio_render::scene::xform_of(d, other), rustudio_render::scene::vec3_of(d.prop(other, "Size"))) else { return Vec::new() };
             let grow = Vec3::splat(2.0 * (tolerance + 0.01));
-            boxes.iter().filter(|(_, xf, s)| crate::query_shapes::obb_obb(xf, *s + grow, &oxf, os)).map(|b| b.0).collect()
+            boxes.iter().filter(|(_, xf, s)| rustudio_physics::query_shapes::obb_obb(xf, *s + grow, &oxf, os)).map(|b| b.0).collect()
         };
         let atts: Vec<Ref> = d
             .dom
@@ -830,7 +830,7 @@ fn constraints_to_preserve(lua: &Lua, args: &MultiValue) -> mlua::Result<MultiVa
                     if !atts.contains(&a) {
                         continue;
                     }
-                    let p = crate::attachment::world(d, a, true).map(|x| x.pos).unwrap_or(Vec3::ZERO);
+                    let p = rustudio_core::attachment::world(d, a, true).map(|x| x.pos).unwrap_or(Vec3::ZERO);
                     let h = home(p);
                     let mut row: Row = vec![("Attachment", a)];
                     if let Some(h) = h {

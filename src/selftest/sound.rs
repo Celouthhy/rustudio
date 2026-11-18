@@ -10,7 +10,7 @@ use rbx_dom_weak::InstanceBuilder;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::doc::Document;
+use rustudio_core::doc::Document;
 
 const SRC: &str = r#"local function mk(name, id, looped)
 	local s = Instance.new("Sound")
@@ -75,7 +75,7 @@ impl SelfTest {
     /// Phases 94..=95.
     pub(super) fn tick_sound(&mut self, f: u64, ed: &mut Editor) -> bool {
         if self.r4.phase == 94 {
-            let dir = crate::assets::content_dir().join("sounds");
+            let dir = rustudio_core::assets::content_dir().join("sounds");
             let _ = std::fs::create_dir_all(&dir);
             for (name, secs) in [
                 ("snd-once", 0.2),
@@ -101,15 +101,15 @@ impl SelfTest {
             ed.set_document(doc);
             self.r6 = super::R6Test {
                 started: f,
-                mark: ed.log.len(),
+                mark: ed.game.log.len(),
                 t0: Some(std::time::Instant::now()),
                 ..Default::default()
             };
-            ed.start_play(crate::runtime::RunMode::Run);
+            ed.start_play(rustudio_engine::runtime::RunMode::Run);
             self.r4.phase = 95;
             return false;
         }
-        let line = ed.log[self.r6.mark.min(ed.log.len())..]
+        let line = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
             .iter()
             .find(|l| l.text.contains("SNDTEST"))
             .map(|l| l.text.clone());
@@ -119,7 +119,7 @@ impl SelfTest {
         }
         let line = line.unwrap_or_else(|| "no SNDTEST line in 15 s".into());
         let id = |n: &str| format!("rbxasset://sounds/{n}");
-        let (starts, fetches, still_gone) = match ed.play.as_ref() {
+        let (starts, fetches, still_gone) = match ed.game.play.as_ref() {
             Some(s) => {
                 let g = &s.game;
                 let st = |n: &str| g.audio_starts_by_id.get(&id(n)).copied().unwrap_or(0);
@@ -132,7 +132,7 @@ impl SelfTest {
             }
             None => ([0; 3], 0, true),
         };
-        let warnings = ed.log[self.r6.mark.min(ed.log.len())..]
+        let warnings = ed.game.log[self.r6.mark.min(ed.game.log.len())..]
             .iter()
             .filter(|l| l.text.contains("snd-missing.ogg"))
             .count();
@@ -142,7 +142,7 @@ impl SelfTest {
             .nth(1)
             .and_then(|r| r.split_whitespace().next())
             .and_then(|v| v.parse::<f32>().ok());
-
+        // (Studio's IsPaused is `not Playing`, Studio: true once ended.)
         let ok = line.contains("once ended=1 wrapped=false playing=false paused=true")
             && line.contains("playing=true paused=false | region")
             && line

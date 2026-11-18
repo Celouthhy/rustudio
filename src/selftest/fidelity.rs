@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use super::{SelfTest, Step};
 use crate::app::Editor;
-use crate::mech;
+use rustudio_core::mech;
 
 const CORPUS: &str = include_str!("../../tools/fidelity/corpus.json");
 const STUDIO_SHOT: &str = concat!(
@@ -54,7 +54,7 @@ fn corpus_place_a() -> Option<(PathBuf, f64)> {
     let place_a = v.get("place_a")?;
     let path = place_a.get("path")?.as_str()?;
     let path = match path.strip_prefix("~/") {
-        Some(rest) => crate::paths::home().join(rest),
+        Some(rest) => rustudio_core::paths::home().join(rest),
         None => PathBuf::from(path),
     };
     Some((path, place_a.get("max_mae")?.as_f64()?))

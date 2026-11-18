@@ -64,7 +64,7 @@ pub fn take_end_request() -> Option<String> {
 /// After an EndTest stop: with RUSTUDIO_TEST_RESULT=FILE (a headless test
 /// run driven by an agent), writes {"value": EndTest's value, "output":
 /// [[level, text]…]} there and exits.
-pub fn report_test_run(value: &str, log: &[crate::app::LogLine]) {
+pub fn report_test_run(value: &str, log: &[rustudio_core::log::LogLine]) {
     let Some(path) = std::env::var_os("RUSTUDIO_TEST_RESULT") else {
         return;
     };

@@ -38,10 +38,10 @@ use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use rbx_dom_weak::types::Ref;
 
 use crate::app::{Editor, Level, Tool};
-use crate::runtime::domains::plugin::menus::{self, MenuView, OpenMenu};
-use crate::runtime::domains::plugin::toolbar::{self, RibbonButton, RibbonGroup};
-use crate::runtime::Side;
-use crate::theme;
+use crate::plugin_host::api::menus::{self, MenuView, OpenMenu};
+use crate::plugin_host::api::toolbar::{self, RibbonButton, RibbonGroup};
+use rustudio_engine::runtime::Side;
+use rustudio_engine::theme;
 
 use super::{Trigger, UiKind};
 
@@ -211,11 +211,11 @@ fn load_icon(id: &str) -> Result<egui::ColorImage, String> {
             .next()
             .map(|(_, b)| b)
             .ok_or("thumbnail not ready")?
-    } else if (id.starts_with("http://") || id.starts_with("https://")) && crate::assets::asset_ref(id).is_none() {
+    } else if (id.starts_with("http://") || id.starts_with("https://")) && rustudio_core::assets::asset_ref(id).is_none() {
         let mut resp = ureq::get(id).call().map_err(|e| e.to_string())?;
         resp.body_mut().with_config().limit(8 << 20).read_to_vec().map_err(|e| e.to_string())?
     } else {
-        crate::assets::content_blocking(id)?.as_ref().clone()
+        rustudio_core::assets::content_blocking(id)?.as_ref().clone()
     };
     match decode(&bytes) {
         Ok(img) => Ok(img),
@@ -229,7 +229,7 @@ fn load_icon(id: &str) -> Result<egui::ColorImage, String> {
             });
             match inner {
                 Some(n) if text.starts_with("<roblox") => {
-                    let b = crate::assets::content_blocking(&format!("rbxassetid://{n}"))?;
+                    let b = rustudio_core::assets::content_blocking(&format!("rbxassetid://{n}"))?;
                     decode(&b)
                 }
                 _ => Err(e),
@@ -301,25 +301,25 @@ impl Editor {
             self.plugin_activation_sync();
             return;
         }
-        let at = match self.play.as_ref() {
+        let at = match self.game.play.as_ref() {
             Some(p) => Where::Play(p.showing),
             None => Where::Edit,
         };
         let model = match at {
             Where::Edit => {
-                let doc = match self.play_saved_doc() {
+                let doc = match self.game.play_saved_doc() {
                     Some(d) => d,
-                    None => &self.doc,
+                    None => &self.game.doc,
                 };
                 match self.plugins.edit_lua() {
                     Some(lua) => snapshot(lua, doc),
                     None => UiModel::default(),
                 }
             }
-            Where::Play(side) => self
-                .with_play_side(side, |rt, _, _| match crate::runtime::world(&rt.lua) {
+            Where::Play(side) => self.game
+                .with_play_side(side, |rt, _, _| match rustudio_engine::runtime::world(&rt.lua) {
                     Ok(w) => {
-                        let d: &crate::doc::Document = w.d();
+                        let d: &rustudio_core::doc::Document = w.d();
                         snapshot(&rt.lua, d)
                     }
                     Err(_) => UiModel::default(),
@@ -381,14 +381,14 @@ impl Editor {
         }
         self.plugin_bar.last_tool = Some(self.tool);
         let shown = if active.is_some() { self.plugin_bar.saved_tool.unwrap_or(self.tool) } else { self.tool };
-        crate::runtime::domains::plugin::studio::set_ribbon_tool(ribbon_tool_name(shown));
+        crate::plugin_host::api::studio::set_ribbon_tool(ribbon_tool_name(shown));
     }
 
     /// Fires `event` on a plugin object of the VM whose toolbars are shown.
     pub fn plugin_fire(&mut self, r: Ref, event: &'static str) {
         match self.plugin_bar.model.at {
             Some(Where::Play(side)) => {
-                self.with_play_side(side, |rt, _, _| {
+                self.game.with_play_side(side, |rt, _, _| {
                     rt.fire(r, event, vec![]);
                     rt.dispatch();
                 });
@@ -445,7 +445,7 @@ impl Editor {
         self.plugin_bar.popup_pos.remove(&token);
         match self.plugin_bar.model.at {
             Some(Where::Play(side)) => {
-                self.with_play_side(side, |rt, _, _| menus::answer(&rt.lua, token, choice));
+                self.game.with_play_side(side, |rt, _, _| menus::answer(&rt.lua, token, choice));
             }
             _ => {
                 if let Some(lua) = self.plugins.edit_lua() {
@@ -643,16 +643,18 @@ impl Editor {
         let mut any_hovered = false;
         for (m, items) in &open {
             let pos = *self.plugin_bar.popup_pos.entry(m.token).or_insert(mouse);
-            let resp = egui::Area::new(egui::Id::new(("plugin_popup", m.token)))
-                .order(egui::Order::Foreground)
-                .fixed_pos(pos)
-                .show(ctx, |ui| {
-                    egui::Frame::menu(ui.style()).show(ui, |ui| {
-                        if let Some(r) = popup_items(ui, items, &shortcuts) {
-                            answer = Some((m.token, Some(r)));
-                        }
-                    })
-                });
+            let resp = egui::Popup::new(
+                egui::Id::new(("plugin_popup", m.token)), ctx.clone(), pos, egui::LayerId::background(),
+            )
+            .kind(egui::PopupKind::Menu)
+            .align_alternatives(&[])
+            .frame(egui::Frame::menu(&ctx.global_style()))
+            .show(|ui| {
+                if let Some(r) = popup_items(ui, items, &shortcuts) {
+                    answer = Some((m.token, Some(r)));
+                }
+            })
+            .expect("plugin popup is open");
             any_hovered |= resp.response.contains_pointer();
             self.plugin_bar.popup_rects.push((m.token, resp.response.rect));
         }
@@ -732,7 +734,7 @@ pub fn tool_for_ribbon(name: &str) -> Option<Tool> {
 }
 
 /// The UI model of a VM whose objects live in `doc`.
-fn snapshot(lua: &mlua::Lua, doc: &crate::doc::Document) -> UiModel {
+fn snapshot(lua: &mlua::Lua, doc: &rustudio_core::doc::Document) -> UiModel {
     let groups = toolbar::ribbon(lua, doc);
     let s = |r: Ref, k: &str| match doc.prop(r, k) {
         Some(rbx_dom_weak::types::Variant::String(s)) => s,

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use rbx_dom_weak::types::Variant;
 use serde_json::{json, Value};
 
-use crate::app::Editor;
+use crate::game::Game;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -41,7 +41,7 @@ fn kind_of(prop: &str) -> Option<Kind> {
 }
 
 /// Workspace.Model.Part, as GetFullName.
-fn full_name(doc: &crate::doc::Document, r: rbx_dom_weak::types::Ref) -> String {
+fn full_name(doc: &rustudio_core::doc::Document, r: rbx_dom_weak::types::Ref) -> String {
     let root = doc.dom.root_ref();
     let mut names = Vec::new();
     let mut at = r;
@@ -65,7 +65,7 @@ fn content_str(v: &Variant) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-impl Editor {
+impl Game {
     /// The report as JSON (the open DataModel; in Play the server's, whose
     /// parts are what both sides draw).
     pub fn asset_report(&self) -> Value {

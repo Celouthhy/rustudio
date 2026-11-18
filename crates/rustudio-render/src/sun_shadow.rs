@@ -5,11 +5,13 @@
 //! (ShadowEvsmVBlurL); the part and beam shaders pick a cascade by the
 //! distance to its sphere and test with Chebyshev on both warps.
 //!
-//! Measured from a running Studio: its cascade spheres (and sphere radius −
-//! blur for the shader), blur width and level, blur passes and their kernel
-//! weights, Globals and matrices.
+//! Sources: Studio (cascade spheres), Studio
+//! (ShadowObjectDirectionalNew: sphere radius − blur for the shader, blur
+//! width), Studio (blur level), Studio (blur passes
+//! and their kernel tables), shaders_vulkan_desktop.pack, and a running
+//! Studio's Globals / matrices / blur constants.
 
-use crate::mech;
+use rustudio_core::mech;
 use egui_wgpu::wgpu;
 use glam::{DVec3, Mat4, Vec3, Vec4};
 
@@ -19,9 +21,10 @@ const PASS_STRIDE: u64 = 256;
 const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Kernel tables by blur level − 1 (levels 1..24). Across: the centre weight
-/// and one per texel either side (9 floats a row; Studio's horizontal EVSM
-/// blur). Down: the centre weight and one per bilinear tap pair at these
-/// texel offsets (Studio's vertical EVSM blur).
+/// and one per texel either side (.data Studio, 9 floats a row; shader
+/// ShadowEvsmHBlurDFS_3..17 by table Studio). Down: the centre weight
+/// and one per bilinear tap pair at these texel offsets
+/// (Studio; ShadowEvsmVBlurLFS_3..9 by table Studio).
 const EVSM_H_WEIGHTS: [[f32; 9]; 24] = [
     [0.666666687, 0.166666672, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     [0.375, 0.25, 0.0625, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],

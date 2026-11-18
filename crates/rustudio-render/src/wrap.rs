@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glam::{Vec2, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
-use crate::math::Xform;
+use rustudio_core::doc::Document;
+use rustudio_core::math::Xform;
 use crate::scene::{content_string, f32_of, vec3_of, xform_of};
 
 /// A garment piece drawn with one body part, in that part's space.
@@ -184,8 +184,8 @@ pub fn draws_garment(doc: &Document, model: Ref, part: Ref) -> bool {
         return false;
     }
     m.children().iter().any(|c| {
-        doc.class_of(*c).is_some_and(|k| crate::doc::is_a(&k, "Accoutrement"))
-            && crate::default_scripts::child_named(doc, *c, "Handle")
+        doc.class_of(*c).is_some_and(|k| rustudio_core::doc::is_a(&k, "Accoutrement"))
+            && rustudio_core::default_scripts::child_named(doc, *c, "Handle")
                 .is_some_and(|h| is_layered_handle(doc, h) && attached_part(doc, h) == Some(part))
     })
 }
@@ -281,7 +281,7 @@ pub fn fitted(doc: &Document, model: Ref) -> Lookup {
                 });
             }
         } else if class == "Accessory" {
-            let Some(h) = crate::default_scripts::child_named(doc, *c, "Handle") else {
+            let Some(h) = rustudio_core::default_scripts::child_named(doc, *c, "Handle") else {
                 continue;
             };
             if !is_layered_handle(doc, h) {
@@ -325,10 +325,10 @@ pub fn fitted(doc: &Document, model: Ref) -> Lookup {
                 // 0.5 and 1 (set through the description, or on the WrapLayer
                 // and refitted; checks/mesh-deform/AUDIT.md (d)).
                 puffiness: f32_of(doc.prop(w, "Puffiness"))
-                    .unwrap_or(crate::mech::WRAP_PUFFINESS_DEFAULT)
+                    .unwrap_or(rustudio_core::mech::WRAP_PUFFINESS_DEFAULT)
                     .clamp(
-                        crate::mech::WRAP_PUFFINESS_MIN,
-                        crate::mech::WRAP_PUFFINESS_MAX,
+                        rustudio_core::mech::WRAP_PUFFINESS_MIN,
+                        rustudio_core::mech::WRAP_PUFFINESS_MAX,
                     ),
             });
         }
@@ -380,13 +380,13 @@ pub fn fitted(doc: &Document, model: Ref) -> Lookup {
     Lookup::Pending
 }
 
-fn mesh(id: &str) -> Result<crate::mesh::MeshData, String> {
-    let b = crate::assets::content_blocking(id)?;
-    crate::mesh::parse(&b).map_err(|e| format!("{id}: {e}"))
+fn mesh(id: &str) -> Result<rustudio_core::mesh::MeshData, String> {
+    let b = rustudio_core::assets::content_blocking(id)?;
+    rustudio_core::mesh::parse(&b).map_err(|e| format!("{id}: {e}"))
 }
 
 /// A cage's distinct vertices (position, uv), welded from the triangle list.
-fn cage_points(m: &crate::mesh::MeshData) -> Vec<(Vec3, Vec2)> {
+fn cage_points(m: &rustudio_core::mesh::MeshData) -> Vec<(Vec3, Vec2)> {
     let mut seen = HashMap::new();
     let mut out = Vec::new();
     for (p, uv) in m.positions.iter().zip(&m.uvs) {
@@ -411,7 +411,7 @@ fn place(xf: &Xform, origin: &Xform, fit: Vec3, p: Vec3) -> Vec3 {
     xf.apply(origin.apply(p * fit))
 }
 
-fn fit_scale(size: Vec3, m: &crate::mesh::MeshData) -> Vec3 {
+fn fit_scale(size: Vec3, m: &rustudio_core::mesh::MeshData) -> Vec3 {
     size / (m.max - m.min).max(Vec3::splat(1e-4))
 }
 
@@ -550,7 +550,7 @@ fn fit(job: &Job) -> Result<Fitted, String> {
                 .collect();
             let nu = uniq.len();
             uniq.extend(outer_pts.iter().map(|(p, _)| place(&l.xf, &l.outer_origin, s, *p)));
-            crate::cage_rbf::fit_points(&c_rest, &c_goal, &uniq).map(|q| {
+            rustudio_core::cage_rbf::fit_points(&c_rest, &c_goal, &uniq).map(|q| {
                 let corners: Vec<Vec3> = corner_ix.iter().map(|i| q[*i]).collect();
                 (corners, q[nu..].to_vec())
             })
@@ -696,13 +696,13 @@ fn fit(job: &Job) -> Result<Fitted, String> {
             let extent = (hi - lo).max(Vec3::splat(1e-4));
             // Bones: the body parts used, at their place in the owner's space.
             let used: Vec<usize> = (0..parts.len()).filter(|i| weight_by_part[*i] > 0.0 || *i == main).collect();
-            let bones: Vec<crate::mesh::SkinBone> = used
+            let bones: Vec<rustudio_core::mesh::SkinBone> = used
                 .iter()
                 .map(|&i| {
                     // (skin.rs binds at pos − center: the garment's own centre frame)
                     let b = parts[i].1;
                     let x = Xform { pos: inv.apply(b.pos), rot: inv.rot * b.rot };
-                    crate::mesh::SkinBone { name: format!("{:?}", parts[i].0), parent: None, rot: x.rot, pos: x.pos }
+                    rustudio_core::mesh::SkinBone { name: format!("{:?}", parts[i].0), parent: None, rot: x.rot, pos: x.pos }
                 })
                 .collect();
             let corner_bones = infl
@@ -735,7 +735,7 @@ fn fit(job: &Job) -> Result<Fitted, String> {
                 colors: Vec::new(),
                 extent,
                 center,
-                skin: crate::mesh::Skin {
+                skin: rustudio_core::mesh::Skin {
                     bones,
                     corner_bones,
                     corner_weights,

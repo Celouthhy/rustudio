@@ -23,7 +23,7 @@ pub mod packet_id {
     pub const SET_GLOBALS: u8 = 0x81;
     /// Replicator items [verified: capture].
     pub const DATA: u8 = 0x83;
-    /// `84 01 00 00 00` once after the schema [verified: capture].
+    /// Top-level marker after the schema, before the initial place data.
     pub const MARKER: u8 = 0x84;
     /// Flag/protocol sync: u8, u16 LE count, (u16-LE-len key, u16-LE-len value)* [verified: capture].
     pub const PROTOCOL_SYNC: u8 = 0x93;
@@ -625,6 +625,7 @@ pub struct Decoder {
     /// Undecoded tails of the initial-stream stages (records cross chunks).
     stage_buf: HashMap<u8, Vec<u8>>,
     began: bool,
+    pub(crate) initial_data_complete: bool,
     /// Items or values the decoder could not parse (kept for diagnostics).
     pub errors: Vec<String>,
     /// The 0xa5 transfer in progress: its key, compressed length, chunks.
@@ -937,9 +938,12 @@ impl Decoder {
                     args,
                 });
             }
-            // Marker id, not a count: capture marker 13 precedes nine items.
+            // Marker 13 follows the final JoinData chunk in the Place A and FTF
+            // captures. Other items can follow the marker in the same frame.
             0x10 => {
-                c.u32()?;
+                if c.u32()? == 13 {
+                    self.initial_data_complete = true;
+                }
             }
             // (child, new parent) [verified: capture: every nil-parent root of
             // the 0x0d batches is reparented by one of these]

@@ -4,10 +4,9 @@
 //! The four embedded Studio 0.746 templates contain flag names/build constants,
 //! never player JSON, tickets, cookies, or a captured shared-string cache.
 //!
-//! `Ready` means schema + initial instances + marker have arrived, followed by
-//! 1.5 seconds without another decoded initial-instance batch. This is a
-//! quiescence heuristic, not a protocol end-of-transfer acknowledgment. Updates
-//! continue after `Ready`; callers must continue draining `events`.
+//! `Ready` waits for the initial place data's end marker and a 1.5-second
+//! settle period for follow-up instances. Updates continue after `Ready`;
+//! callers must continue draining `events`.
 
 use crate::error::{NetError, Result};
 use crate::handshake::{self, ProtocolSyncTemplate, TicketTemplate};
@@ -292,8 +291,20 @@ struct InitialState {
     schema: bool,
     marker: bool,
     instances: bool,
+    initial_data_complete: bool,
     last_batch: Option<Instant>,
     delivering: bool,
+}
+
+impl InitialState {
+    fn can_finish(&self, now: Instant) -> bool {
+        self.schema
+            && self.marker
+            && self.instances
+            && self.initial_data_complete
+            && !self.delivering
+            && self.last_batch.is_some_and(|at| now.duration_since(at) >= QUIET_PERIOD)
+    }
 }
 
 async fn emit(tx: &mpsc::SyncSender<LiveEvent>, cancel: &AtomicBool, mut event: LiveEvent) -> bool {
@@ -470,10 +481,11 @@ async fn receive_lane(
         let mut state = initial.lock().unwrap();
         state.schema |= decoder.schema.is_some();
         state.marker |= frame[0] == packet_id::MARKER;
-        if instances {
-            state.instances = true;
+        if instances || (decoder.initial_data_complete && !state.initial_data_complete) {
             state.last_batch = Some(Instant::now());
         }
+        state.instances |= instances;
+        state.initial_data_complete = decoder.initial_data_complete;
         state.delivering = false;
     }
 }
@@ -592,12 +604,8 @@ async fn run(
                     if control_started { rtcio::send(&mut replication, &REP_CONTROL).await?; }
                     last_ping = Instant::now();
                 }
-                let quiet = {
-                    let state = initial.lock().unwrap();
-                    state.schema && state.marker && state.instances && !state.delivering
-                        && state.last_batch.is_some_and(|at| at.elapsed() >= QUIET_PERIOD)
-                };
-                if !ready && quiet {
+                let can_finish = !ready && initial.lock().unwrap().can_finish(Instant::now());
+                if can_finish {
                     if !emit(&tx, &cancel, LiveEvent::Ready).await { break; }
                     ready = true;
                 }
@@ -606,4 +614,33 @@ async fn run(
     }
     connection.close(0u32.into(), b"editor closed session");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_gap_before_the_end_of_initial_data_cannot_finish_a_join() {
+        let start = Instant::now();
+        let mut state = InitialState {
+            schema: true,
+            marker: true,
+            instances: true,
+            last_batch: Some(start),
+            ..InitialState::default()
+        };
+        let mut decoder = Decoder::new();
+        decoder.decode_frame(packet_id::DATA, &[0x10, 12, 0, 0, 0, 0]);
+        state.initial_data_complete = decoder.initial_data_complete;
+        assert!(!state.can_finish(start + QUIET_PERIOD));
+
+        decoder.decode_frame(packet_id::DATA, &[0x10, 13, 0, 0, 0, 0]);
+        assert!(decoder.errors.is_empty());
+        state.initial_data_complete = decoder.initial_data_complete;
+        let finished_at = start + QUIET_PERIOD * 2;
+        state.last_batch = Some(finished_at);
+        assert!(!state.can_finish(finished_at));
+        assert!(state.can_finish(finished_at + QUIET_PERIOD));
+    }
 }

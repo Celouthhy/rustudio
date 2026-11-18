@@ -13,7 +13,7 @@ use super::preview::PState;
 use super::thumbs::{self, Thumb};
 use super::{Ask, Nav};
 use crate::app::Editor;
-use crate::theme;
+use rustudio_engine::theme;
 
 /// The drag payload of a card (drop on the 3D view or an Explorer row).
 #[derive(Debug, Clone, Copy)]
@@ -122,10 +122,24 @@ pub fn open_url(url: &str) {
 
 /// Popups drawn in the panel's dark style (Areas take the context's
 /// default style, which can be the light one).
-fn popup_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    ui.set_style(ui.ctx().style_of(egui::Theme::Dark));
-    ui.visuals_mut().override_text_color = Some(theme::TEXT);
-    egui::Frame::new().fill(theme::PANEL_DARK).stroke(Stroke::new(1.0, theme::DIVIDER)).corner_radius(4.0).inner_margin(6.0).show(ui, add);
+fn toolbox_popup(
+    ui: &egui::Ui, id: &str, pos: Pos2, add: impl FnOnce(&mut egui::Ui),
+) -> egui::InnerResponse<()> {
+    let frame = egui::Frame::new()
+        .fill(theme::PANEL_DARK)
+        .stroke(Stroke::new(1.0, theme::DIVIDER))
+        .corner_radius(4.0)
+        .inner_margin(6.0);
+    egui::Popup::new(ui.id().with(id), ui.ctx().clone(), pos, ui.layer_id())
+        .kind(egui::PopupKind::Menu)
+        .align_alternatives(&[])
+        .frame(frame)
+        .show(|ui| {
+            ui.set_style(ui.ctx().style_of(egui::Theme::Dark));
+            ui.visuals_mut().override_text_color = Some(theme::TEXT);
+            add(ui);
+        })
+        .expect("toolbox popup is open")
 }
 
 fn bold(size: f32) -> FontId {
@@ -133,7 +147,7 @@ fn bold(size: f32) -> FontId {
 }
 
 fn icon(p: &egui::Painter, r: Rect, name: &str, c: Color32) {
-    crate::ti::paint(p, r, name, c);
+    rustudio_engine::ti::paint(p, r, name, c);
 }
 
 /// An icon button (square), returns the response.
@@ -262,7 +276,7 @@ impl Editor {
             Cmd::Choose(s) => tb.choose_suggestion(&s),
             Cmd::LoadMore(r) => tb.load_more(&r),
             Cmd::Retry(r) => tb.retry(&r),
-            Cmd::SignIn => self.account.open = true,
+            Cmd::SignIn => self.game.account.open = true,
             Cmd::Play(id) => tb.play(id),
             Cmd::Pause(id) => tb.pause(id),
             Cmd::Vote(id, v) => tb.mutate(super::api::vote_request(id, v), "vote"),
@@ -293,7 +307,7 @@ impl Editor {
                 ui.painter().rect_filled(Rect::from_min_size(Pos2::new(r.min.x, r.max.y - 2.0), Vec2::new(r.width(), 2.0)), 0.0, theme::ACCENT);
             }
             let name = if sel { format!("{}-filled", icons[i]) } else { icons[i].to_string() };
-            let name = if crate::ti::has(&name) { name } else { icons[i].to_string() };
+            let name = if rustudio_engine::ti::has(&name) { name } else { icons[i].to_string() };
             icon(ui.painter(), Rect::from_center_size(r.center(), Vec2::splat(18.0)), &name, if sel { LINK } else { theme::TEXT });
             if resp.clicked() {
                 self.toolbox.st.tab = *t;
@@ -396,86 +410,82 @@ impl Editor {
         if rows.is_empty() {
             return;
         }
-        egui::Area::new(ui.id().with("tbsuggest")).order(egui::Order::Foreground).fixed_pos(anchor.left_bottom() + Vec2::new(0.0, 2.0)).show(ui.ctx(), |ui| {
-            popup_frame(ui, |ui| {
-                ui.set_width(anchor.width() - 12.0);
-                for s in rows.iter().take(8) {
-                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
-                    if resp.hovered() {
-                        ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
-                    }
-                    icon(ui.painter(), Rect::from_center_size(Pos2::new(r.min.x + 12.0, r.center().y), Vec2::splat(14.0)), cat_icon(s.icon), theme::TEXT_DIM);
-                    let tw = r.width() - 32.0;
-                    let q = clipped(ui, &s.query, bold(13.0), theme::TEXT, tw, 1);
-                    ui.painter().galley(Pos2::new(r.min.x + 28.0, r.min.y + 3.0), q, theme::TEXT);
-                    let under = clipped(ui, &format!("in {}", s.label), FontId::proportional(11.5), theme::TEXT_DIM, tw, 1);
-                    ui.painter().galley(Pos2::new(r.min.x + 28.0, r.max.y - 3.0 - under.size().y), under, theme::TEXT_DIM);
-                    // (pressed while the text field still has focus)
-                    if resp.is_pointer_button_down_on() || resp.clicked() {
-                        self.toolbox.suggest = Default::default();
-                        cmds.push(Cmd::Choose(s.clone()));
-                    }
+        toolbox_popup(ui, "tbsuggest", anchor.left_bottom() + Vec2::new(0.0, 2.0), |ui| {
+            ui.set_width(anchor.width() - 12.0);
+            for s in rows.iter().take(8) {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
                 }
-            });
+                icon(ui.painter(), Rect::from_center_size(Pos2::new(r.min.x + 12.0, r.center().y), Vec2::splat(14.0)), cat_icon(s.icon), theme::TEXT_DIM);
+                let tw = r.width() - 32.0;
+                let q = clipped(ui, &s.query, bold(13.0), theme::TEXT, tw, 1);
+                ui.painter().galley(Pos2::new(r.min.x + 28.0, r.min.y + 3.0), q, theme::TEXT);
+                let under = clipped(ui, &format!("in {}", s.label), FontId::proportional(11.5), theme::TEXT_DIM, tw, 1);
+                ui.painter().galley(Pos2::new(r.min.x + 28.0, r.max.y - 3.0 - under.size().y), under, theme::TEXT_DIM);
+                // (pressed while the text field still has focus)
+                if resp.is_pointer_button_down_on() || resp.clicked() {
+                    self.toolbox.suggest = Default::default();
+                    cmds.push(Cmd::Choose(s.clone()));
+                }
+            }
         });
     }
 
     fn hamburger_popup(&mut self, ui: &mut egui::Ui, anchor: Pos2, cmds: &mut Vec<Cmd>) {
         let w = (ui.available_width() - 16.0).clamp(180.0, 260.0);
         let max_h = (ui.clip_rect().max.y - anchor.y - 20.0).max(160.0).min(520.0);
-        let area = egui::Area::new(ui.id().with("tbham")).order(egui::Order::Foreground).fixed_pos(anchor + Vec2::new(8.0, 0.0)).show(ui.ctx(), |ui| {
-            popup_frame(ui, |ui| {
-                ui.set_width(w);
-                egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
-                    for t in categories::TOP {
-                        let open = self.toolbox.ui.expanded.contains(t.key) || t.key == "3d" && self.toolbox.ui.expanded.is_empty();
-                        let kids = categories::children(t.key);
-                        let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
-                        if resp.hovered() {
-                            ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
-                        }
-                        icon(ui.painter(), Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(15.0)), cat_icon(t.icon), theme::TEXT);
-                        ui.painter().text(Pos2::new(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, t.label, bold(13.0), theme::TEXT);
-                        if !kids.is_empty() {
-                            icon(ui.painter(), Rect::from_center_size(Pos2::new(r.max.x - 14.0, r.center().y), Vec2::splat(12.0)), if open { "chevron-down" } else { "chevron-right" }, theme::TEXT_DIM);
-                        }
-                        if resp.clicked() {
-                            if kids.is_empty() {
-                                cmds.push(Cmd::Home);
-                                cmds.push(Cmd::Nav(Nav::Category(t.key.into())));
-                                self.toolbox.ui.hamburger = false;
-                            } else if open {
-                                self.toolbox.ui.expanded.remove(t.key);
-                                self.toolbox.ui.expanded.insert("");
-                            } else {
-                                self.toolbox.ui.expanded.insert(t.key);
-                            }
-                        }
-                        if open && !kids.is_empty() {
-                            let all = format!("All {}", t.label);
-                            let mut rows: Vec<(String, Nav)> = vec![(all, Nav::Category(t.key.into()))];
-                            for k in &kids {
-                                rows.push((k.label.to_string(), Nav::Results { cat: k.key.into(), query: String::new(), tile: None }));
-                            }
-                            for (label, nav) in rows {
-                                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
-                                if resp.hovered() {
-                                    ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
-                                }
-                                ui.painter().text(Pos2::new(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), theme::TEXT);
-                                if resp.clicked() {
-                                    cmds.push(Cmd::Home);
-                                    if !matches!(nav, Nav::Category(_)) {
-                                        cmds.push(Cmd::Nav(Nav::Category(t.key.into())));
-                                    }
-                                    cmds.push(Cmd::Nav(nav));
-                                    self.toolbox.ui.hamburger = false;
-                                }
-                            }
-                            ui.separator();
+        let area = toolbox_popup(ui, "tbham", anchor + Vec2::new(8.0, 0.0), |ui| {
+            ui.set_width(w);
+            egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                for t in categories::TOP {
+                    let open = self.toolbox.ui.expanded.contains(t.key) || t.key == "3d" && self.toolbox.ui.expanded.is_empty();
+                    let kids = categories::children(t.key);
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
+                    }
+                    icon(ui.painter(), Rect::from_center_size(Pos2::new(r.min.x + 14.0, r.center().y), Vec2::splat(15.0)), cat_icon(t.icon), theme::TEXT);
+                    ui.painter().text(Pos2::new(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, t.label, bold(13.0), theme::TEXT);
+                    if !kids.is_empty() {
+                        icon(ui.painter(), Rect::from_center_size(Pos2::new(r.max.x - 14.0, r.center().y), Vec2::splat(12.0)), if open { "chevron-down" } else { "chevron-right" }, theme::TEXT_DIM);
+                    }
+                    if resp.clicked() {
+                        if kids.is_empty() {
+                            cmds.push(Cmd::Home);
+                            cmds.push(Cmd::Nav(Nav::Category(t.key.into())));
+                            self.toolbox.ui.hamburger = false;
+                        } else if open {
+                            self.toolbox.ui.expanded.remove(t.key);
+                            self.toolbox.ui.expanded.insert("");
+                        } else {
+                            self.toolbox.ui.expanded.insert(t.key);
                         }
                     }
-                });
+                    if open && !kids.is_empty() {
+                        let all = format!("All {}", t.label);
+                        let mut rows: Vec<(String, Nav)> = vec![(all, Nav::Category(t.key.into()))];
+                        for k in &kids {
+                            rows.push((k.label.to_string(), Nav::Results { cat: k.key.into(), query: String::new(), tile: None }));
+                        }
+                        for (label, nav) in rows {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 3.0, theme::HOVER_BG);
+                            }
+                            ui.painter().text(Pos2::new(r.min.x + 32.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(13.0), theme::TEXT);
+                            if resp.clicked() {
+                                cmds.push(Cmd::Home);
+                                if !matches!(nav, Nav::Category(_)) {
+                                    cmds.push(Cmd::Nav(Nav::Category(t.key.into())));
+                                }
+                                cmds.push(Cmd::Nav(nav));
+                                self.toolbox.ui.hamburger = false;
+                            }
+                        }
+                        ui.separator();
+                    }
+                }
             });
         });
         if area.response.clicked_elsewhere() {
@@ -1047,7 +1057,7 @@ impl Editor {
             self.toolbox.preview.start(id);
             self.toolbox.pool.run(move |h| {
                 let r = super::insert::download(h, id, &|| false)
-                    .and_then(|b| crate::doc::Document::decode(&b).map_err(super::api::Failure::Other));
+                    .and_then(|b| rustudio_core::doc::Document::decode(&b).map_err(super::api::Failure::Other));
                 Some(super::Msg::PreviewModel { id, result: r })
             });
         }
@@ -1208,26 +1218,24 @@ impl Editor {
         }
         if self.toolbox.ui.more_menu {
             let pos = more.rect.left_top() - Vec2::new(0.0, 112.0);
-            let area = egui::Area::new(f.id().with("tbmore")).order(egui::Order::Foreground).fixed_pos(pos).show(f.ctx(), |ui| {
-                popup_frame(ui, |ui| {
-                    ui.set_width(150.0);
-                    if ui.button("Copy Link").clicked() {
-                        cmds.push(Cmd::Copy(super::api::store_url(id, kind)));
-                        self.toolbox.ui.more_menu = false;
-                    }
-                    if ui.button("Copy Asset ID").clicked() {
-                        cmds.push(Cmd::Copy(id.to_string()));
-                        self.toolbox.ui.more_menu = false;
-                    }
-                    if ui.button("View in Browser").clicked() {
-                        cmds.push(Cmd::Url(super::api::store_url(id, kind)));
-                        self.toolbox.ui.more_menu = false;
-                    }
-                    if ui.button("Report Item").clicked() {
-                        cmds.push(Cmd::Url(super::api::report_url(id)));
-                        self.toolbox.ui.more_menu = false;
-                    }
-                });
+            let area = toolbox_popup(&f, "tbmore", pos, |ui| {
+                ui.set_width(150.0);
+                if ui.button("Copy Link").clicked() {
+                    cmds.push(Cmd::Copy(super::api::store_url(id, kind)));
+                    self.toolbox.ui.more_menu = false;
+                }
+                if ui.button("Copy Asset ID").clicked() {
+                    cmds.push(Cmd::Copy(id.to_string()));
+                    self.toolbox.ui.more_menu = false;
+                }
+                if ui.button("View in Browser").clicked() {
+                    cmds.push(Cmd::Url(super::api::store_url(id, kind)));
+                    self.toolbox.ui.more_menu = false;
+                }
+                if ui.button("Report Item").clicked() {
+                    cmds.push(Cmd::Url(super::api::report_url(id)));
+                    self.toolbox.ui.more_menu = false;
+                }
             });
             if area.response.clicked_elsewhere() && !more.clicked() {
                 self.toolbox.ui.more_menu = false;
@@ -1849,11 +1857,9 @@ fn error_state(ui: &mut egui::Ui, msg: &str, mut retry: impl FnMut()) {
 }
 
 fn popup_below(ui: &mut egui::Ui, anchor: &egui::Response, id: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Area::new(ui.id().with(id)).order(egui::Order::Foreground).fixed_pos(anchor.rect.left_bottom() + Vec2::new(0.0, 4.0)).show(ui.ctx(), |ui| {
-        popup_frame(ui, |ui| {
-            ui.set_min_width(anchor.rect.width().max(140.0));
-            add(ui);
-        });
+    toolbox_popup(ui, id, anchor.rect.left_bottom() + Vec2::new(0.0, 4.0), |ui| {
+        ui.set_min_width(anchor.rect.width().max(140.0));
+        add(ui);
     });
 }
 

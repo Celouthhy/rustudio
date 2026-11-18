@@ -11,7 +11,7 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(&path).expect("read");
-        let doc = crate::doc::Document::decode(&bytes).expect("decode");
+        let doc = rustudio_core::doc::Document::decode(&bytes).expect("decode");
         let keys: Vec<String> = std::env::var("RUSTUDIO_DUMP_PROPS")
             .unwrap_or_else(|_| {
                 "MeshId,MeshContent,TextureID,Size,C0,C1,CFrame,Part0,Part1,Value,AnimationId,Scale,\
@@ -70,7 +70,7 @@ mod mesh_dump {
             .split(',')
         {
             if let Ok(b) = std::fs::read(p) {
-                match crate::mesh::parse(&b) {
+                match rustudio_core::mesh::parse(&b) {
                     Ok(m) => println!(
                         "{p}: min {:?} max {:?} verts {}",
                         m.min,
@@ -92,13 +92,13 @@ mod client_copy {
     #[ignore]
     fn client_copy_root() {
         let Ok(path) = std::env::var("RUSTUDIO_PLACE") else { return };
-        let doc = crate::doc::Document::open(std::path::Path::new(&path)).expect("open");
+        let doc = rustudio_core::doc::Document::open(std::path::Path::new(&path)).expect("open");
         let root = doc.dom.root_ref();
         let kids: Vec<String> = doc.dom.get_by_ref(root).unwrap().children().iter()
             .filter_map(|c| doc.dom.get_by_ref(*c)).map(|i| format!("{}:{}", i.class, i.name)).collect();
         println!("server root children ({}): {:?}", kids.len(), &kids[..kids.len().min(40)]);
         println!("server workspace {:?}", doc.workspace());
-        let (c, _) = crate::replicate::initial_client(&doc, "c".into());
+        let (c, _) = rustudio_engine::replicate::initial_client(&doc, "c".into());
         let ckids: Vec<String> = c.dom.get_by_ref(c.dom.root_ref()).unwrap().children().iter()
             .filter_map(|x| c.dom.get_by_ref(*x)).map(|i| format!("{}:{}", i.class, i.name)).collect();
         println!("client root children ({}): {:?}", ckids.len(), &ckids[..ckids.len().min(40)]);
@@ -117,7 +117,7 @@ mod light_dump {
     #[ignore]
     fn dump_lights() {
         let Ok(path) = std::env::var("RUSTUDIO_PLACE") else { return };
-        let doc = crate::doc::Document::open(std::path::Path::new(&path)).expect("open");
+        let doc = rustudio_core::doc::Document::open(std::path::Path::new(&path)).expect("open");
         let l = doc.find_child(doc.dom.root_ref(), "Lighting").unwrap();
         let li = doc.dom.get_by_ref(l).unwrap();
         for k in ["Technology", "LightingStyle", "PrioritizeLightingQuality"] {
@@ -163,9 +163,9 @@ mod project_diff {
         };
         let files = crate::project::project_files(std::path::Path::new(&proj));
         let (a, _) = crate::project_sync::open(&files[0]).expect("project");
-        let b = crate::doc::Document::open(std::path::Path::new(&place)).expect("place");
+        let b = rustudio_core::doc::Document::open(std::path::Path::new(&place)).expect("place");
         use std::collections::BTreeMap;
-        let paths = |d: &crate::doc::Document| {
+        let paths = |d: &rustudio_core::doc::Document| {
             let mut m: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
             for i in d.dom.descendants() {
                 let mut p = i.name.clone();
@@ -204,7 +204,7 @@ mod project_diff {
             println!("source {k} differs at {at} (lengths {} / {}):\n  project: {:?}\n  place:   {:?}", x.len(), y.len(), ctx(&x), ctx(&y));
         }
         // Every property, by path (first instance of a path wins).
-        let props = |d: &crate::doc::Document| {
+        let props = |d: &rustudio_core::doc::Document| {
             let mut m: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
             for i in d.dom.descendants() {
                 let mut p = i.name.clone();
@@ -253,7 +253,7 @@ mod attr_dump {
         let (Ok(path), Ok(name)) = (std::env::var("RUSTUDIO_PLACE"), std::env::var("RUSTUDIO_NAME")) else {
             return;
         };
-        let doc = crate::doc::Document::open(std::path::Path::new(&path)).expect("open");
+        let doc = rustudio_core::doc::Document::open(std::path::Path::new(&path)).expect("open");
         for i in doc.dom.descendants() {
             if i.name != name {
                 continue;

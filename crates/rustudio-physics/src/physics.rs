@@ -36,11 +36,12 @@ use rapier3d::prelude as rp;
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::ustr;
 
-use crate::doc::{self, Document};
-use crate::math::Xform;
-use crate::mech;
-use crate::scene::{enum_u32, f32_of, vec3_of, xform_of};
-use crate::terrain;
+use rustudio_core::doc::{self, enum_u32, f32_of, vec3_of, xform_of, Document};
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
+use rustudio_core::mech::PhysicalProperties;
+use rustudio_core::body::{attachment_part, is_rigid_joint, joint_enabled, joint_frames, joint_parts};
+use rustudio_core::terrain;
 
 fn rv(v: Vec3) -> rp::Vector {
     rp::Vector::new(v.x, v.y, v.z)
@@ -54,6 +55,195 @@ fn pose(xf: &Xform) -> rp::Pose {
     let q = Quat::from_mat3(&xf.rot).normalize();
     rp::Pose::from_parts(rv(xf.pos), rp::Rotation::from_xyzw(q.x, q.y, q.z, q.w))
 }
+
+// ------------------------------------------------------------------ mass
+
+/// A part's Size as a Vec3 (absent: None, so `part_mass` uses Vec3::ONE).
+fn part_size(d: &Document, r: Ref) -> Option<Vec3> {
+    match d.prop(r, "Size") {
+        Some(Variant::Vector3(v)) => Some(Vec3::new(v.x, v.y, v.z)),
+        _ => None,
+    }
+}
+
+/// The PhysicalProperties a part simulates with.
+pub fn phys_props(d: &Document, r: Ref) -> PhysicalProperties {
+    if let Some(Variant::PhysicalProperties(rbx_dom_weak::types::PhysicalProperties::Custom(c))) =
+        d.prop(r, "CustomPhysicalProperties")
+    {
+        let mut p = PhysicalProperties::for_material("Plastic");
+        p.density = c.density();
+        p.friction = c.friction();
+        p.elasticity = c.elasticity();
+        p.friction_weight = c.friction_weight();
+        p.elasticity_weight = c.elasticity_weight();
+        return p;
+    }
+    let mat = enum_u32(d.prop(r, "Material"))
+        .and_then(|v| doc::enum_item_name("Material", v))
+        .unwrap_or_else(|| "Plastic".into());
+    PhysicalProperties::for_material(&mat)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Block,
+    Ball,
+    Cylinder,
+    Wedge,
+    CornerWedge,
+}
+
+fn shape(d: &Document, r: Ref, class: &str) -> Shape {
+    match class {
+        "WedgePart" => return Shape::Wedge,
+        "CornerWedgePart" => return Shape::CornerWedge,
+        "Part" | "Seat" | "SpawnLocation" | "SkateboardPlatform" | "VehicleSeat" | "Platform" => {}
+        _ => return Shape::Block,
+    }
+    match enum_u32(d.prop(r, "Shape")) {
+        Some(0) => Shape::Ball,
+        Some(2) => Shape::Cylinder,
+        Some(3) => Shape::Wedge,
+        Some(4) => Shape::CornerWedge,
+        _ => Shape::Block,
+    }
+}
+
+/// One part's own mass (Massless ignored), centre of mass in its frame and
+/// principal inertia about that centre (its axes).
+#[derive(Clone, Copy)]
+pub struct PMass {
+    pub mass: f32,
+    pub com: Vec3,
+    pub inertia: Vec3,
+}
+
+/// `r` is the Handle of an Accessory (Accoutrement) worn by a character
+/// (a Model with a Humanoid).
+pub fn accessory_handle_on_character(d: &Document, r: Ref) -> bool {
+    let Some(i) = d.dom.get_by_ref(r) else { return false };
+    if i.name != "Handle" {
+        return false;
+    }
+    let Some(acc) = d.dom.get_by_ref(i.parent()) else { return false };
+    if !rustudio_core::doc::is_a(&acc.class, "Accoutrement") {
+        return false;
+    }
+    d.dom
+        .get_by_ref(acc.parent())
+        .is_some_and(|m| m.children().iter().any(|c| d.dom.get_by_ref(*c).is_some_and(|k| k.class == "Humanoid")))
+}
+
+pub fn part_mass(d: &Document, r: Ref) -> PMass {
+    let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
+    if class == "Terrain" {
+        return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
+    }
+    // An accessory's Handle on a character weighs nothing: Studio 0.747,
+    // a Handle Part of 5.6 mass reads GetMass() 0 once Humanoid:AddAccessory
+    // has it (Massless and CustomPhysicalProperties untouched, CanCollide
+    // false), and the character's AssemblyMass stays 14.2551 / 12.6
+    // (checks/humanoid-physics/measure/accessory-mass.md).
+    if accessory_handle_on_character(d, r) {
+        return PMass { mass: 0.0, com: Vec3::ZERO, inertia: Vec3::ZERO };
+    }
+    let s = part_size(d, r).unwrap_or(Vec3::ONE).max(Vec3::splat(0.05));
+    let rho = phys_props(d, r).density;
+    // A part's volume comes from its physics geometry when that
+    // is a mesh: a character's Head weighs its mesh (Studio's default R15 Head
+    // 0.7729, box 1.1133), its body parts their box (physics_humanoid.rs).
+    if let Some(m) = head_mesh_mass(d, r, &class, s, rho) {
+        return m;
+    }
+    let box_i = |m: f32, s: Vec3| {
+        Vec3::new(s.y * s.y + s.z * s.z, s.x * s.x + s.z * s.z, s.x * s.x + s.y * s.y) * (m / 12.0)
+    };
+    match shape(d, r, &class) {
+        Shape::Block => {
+            let m = rho * s.x * s.y * s.z;
+            PMass { mass: m, com: Vec3::ZERO, inertia: box_i(m, s) }
+        }
+        Shape::Ball => {
+            let rr = s.min_element() * 0.5;
+            let m = rho * 4.0 / 3.0 * std::f32::consts::PI * rr * rr * rr;
+            PMass { mass: m, com: Vec3::ZERO, inertia: Vec3::splat(0.4 * m * rr * rr) }
+        }
+        Shape::Cylinder => {
+            let rr = s.y.min(s.z) * 0.5;
+            let m = rho * std::f32::consts::PI * rr * rr * s.x;
+            let side = m * (3.0 * rr * rr + s.x * s.x) / 12.0;
+            PMass { mass: m, com: Vec3::ZERO, inertia: Vec3::new(0.5 * m * rr * rr, side, side) }
+        }
+        Shape::Wedge => {
+            let m = rho * s.x * s.y * s.z * 0.5;
+            PMass { mass: m, com: Vec3::new(0.0, -s.y / 6.0, s.z / 6.0), inertia: box_i(m, s) }
+        }
+        Shape::CornerWedge => {
+            let m = rho * s.x * s.y * s.z / 3.0;
+            PMass { mass: m, com: Vec3::new(s.x / 8.0, -s.y / 4.0, -s.z / 8.0), inertia: box_i(m, s) }
+        }
+    }
+}
+
+/// The Studio solver's mass record of a part (solver/mass.rs, STEP §5b [L2]): shape code
+/// prim, size, density. None where `part_mass` takes another route (terrain, a worn
+/// accessory's Handle, a character's mesh Head).
+pub fn studio_part_mass(d: &Document, r: Ref) -> Option<crate::solver::mass::PartMass> {
+    use crate::solver::mass;
+    let class = d.class_of(r).map(|c| c.to_string()).unwrap_or_default();
+    if class == "Terrain" || accessory_handle_on_character(d, r) {
+        return None;
+    }
+    let size = part_size(d, r).unwrap_or(Vec3::ONE);
+    let rho = phys_props(d, r).density;
+    if head_mesh_mass(d, r, &class, size.max(Vec3::splat(0.05)), rho).is_some() {
+        return None;
+    }
+    let code = match shape(d, r, &class) {
+        Shape::Ball => mass::BALL,
+        Shape::Cylinder => mass::CYLINDER,
+        Shape::Block => mass::BLOCK,
+        Shape::Wedge => mass::WEDGE,
+        Shape::CornerWedge => mass::CORNER_WEDGE,
+    };
+    Some(mass::part(code, size, rho))
+}
+
+/// A Humanoid character's MeshPart Head: mass, centre and inertia of its
+/// collision mesh (cached per mesh and size).
+fn head_mesh_mass(d: &Document, r: Ref, class: &str, s: Vec3, rho: f32) -> Option<PMass> {
+    if class != "MeshPart" || d.dom.get_by_ref(r)?.name != "Head" {
+        return None;
+    }
+    let parent = d.dom.get_by_ref(r)?.parent();
+    let has_humanoid = d.dom.get_by_ref(parent)?.children().iter().any(|c| d.class_of(*c).is_some_and(|k| k == "Humanoid"));
+    if !has_humanoid {
+        return None;
+    }
+    let id = match d.prop(r, "MeshId") {
+        Some(Variant::ContentId(c)) => c.as_str().to_string(),
+        Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+        _ => return None,
+    };
+    let fid = enum_u32(d.prop(r, "CollisionFidelity")).unwrap_or(crate::collision::FIDELITY_DEFAULT);
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<(String, [u32; 3], u32), (f32, Vec3, Vec3)>> = Default::default();
+    }
+    let key = (id.clone(), s.to_array().map(f32::to_bits), fid);
+    let unit = CACHE.with(|c| c.borrow().get(&key).copied()).or_else(|| {
+        let crate::collision::Lookup::Ready(h) = crate::collision::hulls(&id, fid) else { return None };
+        let shape = crate::collision::shape_from_hulls(&h, s)?;
+        let mp = shape.mass_properties(1.0);
+        let pi = mp.principal_inertia();
+        let com = mp.local_com;
+        let v = (mp.mass(), Vec3::new(com.x, com.y, com.z), Vec3::new(pi.x, pi.y, pi.z));
+        CACHE.with(|c| c.borrow_mut().insert(key, v));
+        Some(v)
+    })?;
+    Some(PMass { mass: unit.0 * rho, com: unit.1, inertia: unit.2 * rho })
+}
+
 
 /// The Humanoid's body box (HumShape's box, root frame) with its vertical
 /// edges cut off (round 26): at a wall's end Studio's box pivots round the
@@ -184,7 +374,7 @@ fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
             fid,
         )
     } else if doc::is_a(class.as_str(), "PartOperation") {
-        let mesh = crate::scene::union_mesh(doc, r).map(|m| std::sync::Arc::from(m.id));
+        let mesh = rustudio_core::mesh::union_mesh(doc, r).map(|m| std::sync::Arc::from(m.id));
         // A union collides with the convex pieces Studio stored in its
         // PhysicalConfigData, at the fidelity they were made for (the file
         // has no CollisionFidelity for unions either), anchored or not. Its
@@ -209,7 +399,7 @@ fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
     // part's CustomPhysicalProperties). Every part was Plastic at density
     // 0.7 here: a script's 20-mass platform (density 0.3125) weighed 44.8 on
     // its spring (checks/humanoid-physics probe T18).
-    let props = crate::runtime::domains::world::part::phys_props(doc, r);
+    let props = phys_props(doc, r);
     Some((
         xf,
         Sig {
@@ -225,7 +415,7 @@ fn part_sig(doc: &Document, r: Ref) -> Option<(Xform, Sig)> {
             elasticity: props.elasticity,
             friction_weight: props.friction_weight,
             elasticity_weight: props.elasticity_weight,
-            mass: if anchored { 0.0 } else { crate::runtime::domains::world::part::part_mass(doc, r).mass },
+            mass: if anchored { 0.0 } else { part_mass(doc, r).mass },
             massless: matches!(doc.prop(r, "Massless"), Some(Variant::Bool(true))),
         },
     ))
@@ -368,7 +558,7 @@ fn collider(sig: &Sig) -> (rp::ColliderBuilder, rp::Pose, bool) {
     // An off-centre union (GeometryService keeps the main part's CFrame):
     // its shape (mesh or Box fidelity) sits where its geometry is.
     // (Stored pieces are already placed about the part's CFrame.)
-    let off = sig.mesh.as_deref().filter(|_| sig.pieces == 0).map(crate::mesh_bvh::union_offset).unwrap_or(Vec3::ZERO) * sig.size;
+    let off = sig.mesh.as_deref().filter(|_| sig.pieces == 0).map(rustudio_core::mesh_bvh::union_offset).unwrap_or(Vec3::ZERO) * sig.size;
     if off != Vec3::ZERO {
         offset = rp::Pose::from_parts(rp::Vector::new(off.x, off.y, off.z), rp::Rotation::IDENTITY);
     }
@@ -382,73 +572,10 @@ fn collider(sig: &Sig) -> (rp::ColliderBuilder, rp::Pose, bool) {
     (b, offset, pending)
 }
 
-/// Whether a joint or constraint is on. WeldConstraint never saves or
-/// replicates `Enabled`: a file and the Team Create wire carry `State`
-/// (Studio saves 3 for an enabled weld and 0 for a disabled one; the live
-/// wire sends 1), so bit 0 is Enabled. A script's write lands in `Enabled`.
-pub fn joint_enabled(doc: &Document, j: Ref) -> bool {
-    let Some(i) = doc.dom.get_by_ref(j) else { return false };
-    match i.properties.get(&ustr("Enabled")) {
-        Some(Variant::Bool(b)) => return *b,
-        _ => {}
-    }
-    match i.properties.get(&ustr("State")) {
-        Some(Variant::Int32(s)) if i.class == "WeldConstraint" => s & 1 != 0,
-        _ => !matches!(doc.prop(j, "Enabled"), Some(Variant::Bool(false))),
-    }
-}
-
-/// The part an attachment belongs to (its nearest BasePart ancestor).
-pub fn attachment_part(doc: &Document, a: Ref) -> Option<Ref> {
-    let mut cur = doc.dom.get_by_ref(a)?.parent();
-    while let Some(i) = doc.dom.get_by_ref(cur) {
-        if doc::is_a(&i.class, "BasePart") {
-            return Some(cur);
-        }
-        cur = i.parent();
-    }
-    None
-}
-
-/// The two parts a rigid joint holds: Part0 / Part1 (alias-aware: files and
-/// the live wire keep a WeldConstraint's as Part0Internal / Part1Internal),
-/// or a RigidConstraint's attachments' parts.
-pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
-    let class = doc.class_of(j)?;
-    let pr = |k: &str| match doc.prop(j, k) {
-        Some(Variant::Ref(x)) if x.is_some() => Some(x),
-        _ => None,
-    };
-    if class == "RigidConstraint" {
-        return Some((
-            attachment_part(doc, pr("Attachment0")?)?,
-            attachment_part(doc, pr("Attachment1")?)?,
-        ));
-    }
-    Some((pr("Part0")?, pr("Part1")?))
-}
-
 /// In the client world a fixed collider moved by less than this (studs, and
 /// 1 − |q·q'|) stays put; the server's follow every write exactly.
 pub(super) const FOLLOWER_EPS_POS: f32 = 0.05;
 pub(super) const FOLLOWER_EPS_ROT: f32 = 1e-6;
-
-/// Joint classes that hold two parts rigidly together (one assembly).
-pub fn is_rigid_joint(class: &str) -> bool {
-    matches!(
-        class,
-        "RigidConstraint"
-            | "WeldConstraint"
-            | "Weld"
-            | "ManualWeld"
-            | "Motor6D"
-            | "Motor"
-            | "AnimationConstraint"
-            | "Snap"
-            | "Glue"
-            | "ManualGlue"
-    )
-}
 
 // ------------------------------------------------------------------ movers
 
@@ -1097,7 +1224,7 @@ pub struct Physics {
     voxels: Option<terrain::Voxels>,
     /// PhysicsService collision groups (shared with the session's runtimes)
     /// and the version last applied to the colliders.
-    pub groups: crate::collision_groups::Shared,
+    pub groups: rustudio_core::collision_groups::Shared,
     groups_seen: u64,
     /// The player character's CollisionGroup (its HumanoidRootPart's).
     pub char_group: String,
@@ -1238,9 +1365,9 @@ impl Physics {
             terrain_colliders: Vec::new(),
             terrain_tris: 0,
             voxels: None,
-            groups: crate::collision_groups::shared(),
+            groups: rustudio_core::collision_groups::shared(),
             groups_seen: 0,
-            char_group: crate::collision_groups::DEFAULT.to_string(),
+            char_group: rustudio_core::collision_groups::DEFAULT.to_string(),
             hums: Default::default(),
             link: Default::default(),
             client_owned: HashSet::default(),
@@ -1326,7 +1453,7 @@ impl Physics {
     fn prime(&mut self) {
         if self.studio.is_some() {
             // The Studio solver owns islands and sleep: rapier's pipeline never
-            // runs, so its island manager stays empty (src/solver/step.rs).
+            // runs, so its island manager stays empty (crates/rustudio-physics/src/solver/step.rs).
             self.world.detect_collisions(&(), &self.collector);
         } else {
             self.world.integration_parameters.dt = 1e-6;
@@ -1364,7 +1491,7 @@ impl Physics {
         let live = rigid && doc.is_ancestor(ws, j) && joint_enabled(doc, j);
         if live {
             let parts = if animc {
-                crate::rig::joint_frames(doc, j).map(|(a, b, _, _)| (a, b))
+                joint_frames(doc, j).map(|(a, b, _, _)| (a, b))
             } else {
                 joint_parts(doc, j)
             };
@@ -1416,7 +1543,7 @@ impl Physics {
     /// everything that shared an assembly with them.
     fn build(&mut self, doc: &Document, ws: Ref, seeds: HashSet<Ref>) {
         // 1. Close over welds and old assemblies.
-        let b1 = crate::bench::scope("pb_close");
+        let b1 = rustudio_core::bench::scope("pb_close");
         let mut all: HashSet<Ref> = HashSet::default();
         // (Sets are walked in ref order: with RUSTUDIO_DETERMINISTIC refs follow
         // creation order, and rapier's arena indices — the solver's body and contact
@@ -1435,7 +1562,7 @@ impl Physics {
             stack.extend(self.neighbours(r));
         }
         drop(b1);
-        let b2 = crate::bench::scope("pb_drop");
+        let b2 = rustudio_core::bench::scope("pb_drop");
         // 2. Drop what's there now.
         let mut all: Vec<Ref> = all.into_iter().collect();
         all.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
@@ -1443,7 +1570,7 @@ impl Physics {
             self.drop_part(*r);
         }
         drop(b2);
-        let b3 = crate::bench::scope("pb_sig");
+        let b3 = rustudio_core::bench::scope("pb_sig");
         // 3. Group the parts that should exist into assemblies.
         let mut info: HashMap<Ref, (Xform, Sig)> = HashMap::default();
         for r in &all {
@@ -1466,7 +1593,7 @@ impl Physics {
             }
         }
         drop(b3);
-        let _b4 = crate::bench::scope("pb_asm");
+        let _b4 = rustudio_core::bench::scope("pb_asm");
         let mut done: HashSet<Ref> = HashSet::default();
         let mut keys: Vec<Ref> = info.keys().copied().collect();
         keys.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
@@ -1514,7 +1641,7 @@ impl Physics {
                 if let (Some(sv), Some(co)) = (self.studio.as_mut(), self.world.colliders.get(c)) {
                     sv.note_collider(c, *r, co.shape());
                 }
-                if sig.mesh.as_deref().is_some_and(|m| crate::mesh_bvh::union_offset(m) != Vec3::ZERO) {
+                if sig.mesh.as_deref().is_some_and(|m| rustudio_core::mesh_bvh::union_offset(m) != Vec3::ZERO) {
                     self.union_offsets.insert(c, offset);
                 }
                 if let Some(f) = self.fresh.as_mut() {
@@ -1557,7 +1684,7 @@ impl Physics {
         // Studio Settings > Physics > Allow Sleep.
         let mut rb = rp::RigidBodyBuilder::dynamic()
             .pose(root_pose)
-            .can_sleep(crate::studio_settings::flag("PhysicsSettings", "AllowSleep", true));
+            .can_sleep(rustudio_core::rustudio_settings::studio_flag("PhysicsSettings", "AllowSleep", true));
         if upright {
             rb = rb.lock_rotations();
         }
@@ -1581,13 +1708,13 @@ impl Physics {
             let mp = if sig.massless && *r != root {
                 rp::MassProperties::default()
             } else {
-                let pm = crate::runtime::domains::world::part::part_mass(doc, *r);
+                let pm = part_mass(doc, *r);
                 if crate::solver::kind() != crate::solver::SolverKind::Rapier {
                     // Studio's own record (STEP §5b [L2]): the full tensor (a wedge's
                     // products of inertia), in the collider frame = the part's turned by
                     // `offset` (a cylinder's runs along Y in rapier, X in Roblox).
                     // (Only under the Studio solver, which leaves rapier's path as it was.)
-                    match crate::runtime::domains::world::part::studio_part_mass(doc, *r) {
+                    match studio_part_mass(doc, *r) {
                         Some(sm) => {
                             let o = glam::Mat3::from_quat(crate::solver::body::q(offset.rotation));
                             let ic = o.transpose() * sm.inertia() * o;
@@ -1683,7 +1810,7 @@ impl Physics {
     /// journal read that comes back All (the client's start-up flood)
     /// compares every part instead of dropping the batch.
     pub fn follow_client(&mut self, server: &Document, client: &mut Document, c2s: &std::collections::HashMap<Ref, Ref>) {
-        let _b = crate::bench::scope("ps_follow_client");
+        let _b = rustudio_core::bench::scope("ps_follow_client");
         let cframe = ustr("CFrame");
         let size = ustr("Size");
         let mut trees: Vec<Ref> = Vec::new();
@@ -1708,7 +1835,7 @@ impl Physics {
         // RUSTUDIO_SOLVER=studio: replicated parts the client took out of its Workspace
         // (physics_client_link.rs).
         if self.studio.is_some() && !client_link::off() && (all || !trees.is_empty()) {
-            let _l = crate::bench::scope("ps_link_trees");
+            let _l = rustudio_core::bench::scope("ps_link_trees");
             self.link_note_trees(server, client, c2s, &trees, all);
         }
         let mut seen: HashSet<Ref> = HashSet::default();
@@ -1795,7 +1922,7 @@ impl Physics {
         };
         let marks = match marks {
             doc::Marks::All => {
-                let _p = crate::bench::scope("ps_reconcile");
+                let _p = rustudio_core::bench::scope("ps_reconcile");
                 self.queued.clear();
                 self.reconcile(doc);
                 return;
@@ -1858,8 +1985,8 @@ impl Physics {
         for r in &seeds {
             self.note_other(doc, *r, &mut movers, &mut attachments, &mut terrain);
         }
-        let marks_scope = crate::bench::scope("ps_marks");
-        crate::bench::add("ps_mark_count", 0.0, marks.len() as u64);
+        let marks_scope = rustudio_core::bench::scope("ps_marks");
+        rustudio_core::bench::add("ps_mark_count", 0.0, marks.len() as u64);
         for m in marks {
             match m {
                 doc::Mark::Prop(r, name) => {
@@ -1934,7 +2061,7 @@ impl Physics {
             }
         }
         if terrain {
-            let _p = crate::bench::scope("ps_terrain");
+            let _p = rustudio_core::bench::scope("ps_terrain");
             self.build_terrain(doc);
         }
         seeds.retain(|r| {
@@ -1942,8 +2069,8 @@ impl Physics {
                 || doc.class_of(*r).is_some_and(|c| doc::is_a(&c, "BasePart"))
         });
         if !seeds.is_empty() {
-            let _p = crate::bench::scope("ps_build");
-            crate::bench::add("ps_seeds", 0.0, seeds.len() as u64);
+            let _p = rustudio_core::bench::scope("ps_build");
+            rustudio_core::bench::add("ps_seeds", 0.0, seeds.len() as u64);
             self.build(doc, ws, seeds.clone());
         }
         for r in moved {
@@ -2032,7 +2159,7 @@ impl Physics {
         self.voxels = None;
         self.terrain = Self::workspace_of(doc).and_then(|ws| doc.find_child(ws, "Terrain"));
         let Some(t) = self.terrain else { return };
-        let dec = crate::bench::scope("pt_decode");
+        let dec = rustudio_core::bench::scope("pt_decode");
         let voxels = match terrain::Voxels::from_dom(&doc.dom) {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
@@ -2045,10 +2172,10 @@ impl Physics {
             return;
         }
         drop(dec);
-        let mesh_scope = crate::bench::scope("pt_mesh");
+        let mesh_scope = rustudio_core::bench::scope("pt_mesh");
         let (pos, idx) = terrain::collision_mesh(&terrain::build_meshes(&voxels));
         drop(mesh_scope);
-        let _col = crate::bench::scope("pt_colliders");
+        let _col = rustudio_core::bench::scope("pt_colliders");
         self.voxels = Some(voxels);
         // Bucket triangles by the cell holding their centroid.
         let cell = mech::TERRAIN_COLLIDER_CELL.max(terrain::VOXEL);
@@ -3032,18 +3159,18 @@ impl Physics {
         let (hz, _, max_steps) = step_rate();
         let h = 1.0 / hz;
         self.accum = (self.accum + dt).min(h * max_steps as f32);
-        let _solve = crate::bench::scope("physics_solve");
-        let jsc = crate::bench::scope("ph_joints");
+        let _solve = rustudio_core::bench::scope("physics_solve");
+        let jsc = rustudio_core::bench::scope("ph_joints");
         {
-            let _a = crate::bench::scope("pj_apply_joints");
+            let _a = rustudio_core::bench::scope("pj_apply_joints");
             self.apply_joints(doc);
         }
         {
-            let _r = crate::bench::scope("pj_prune_ropes");
+            let _r = rustudio_core::bench::scope("pj_prune_ropes");
             self.prune_ropes(doc);
         }
         {
-            let _c = crate::bench::scope("pj_studio_constraints");
+            let _c = rustudio_core::bench::scope("pj_studio_constraints");
             if self.studio.is_some() {
                 let marks = doc.marks_for(doc::Reader::SolverJoints);
                 self.studio_constraints(doc, marks);
@@ -3063,17 +3190,17 @@ impl Physics {
         let stepped = self.accum > due;
         self.hums.frame_start = true;
         while self.accum > due {
-            let msc = crate::bench::scope("ph_movers");
+            let msc = rustudio_core::bench::scope("ph_movers");
             self.apply_movers(doc);
             self.apply_drags(doc.id);
             drop(msc);
-            let rsc = crate::bench::scope("ph_ropes_springs");
+            let rsc = rustudio_core::bench::scope("ph_ropes_springs");
             self.apply_ropes(doc, h);
             self.apply_springs(doc, h);
             drop(rsc);
             self.humanoid_forces(h);
             self.link_forces(h);
-            let wsc = crate::bench::scope("ph_world_step");
+            let wsc = rustudio_core::bench::scope("ph_world_step");
             self.world_step();
             drop(wsc);
             self.track_velocity_constraints();
@@ -3090,7 +3217,7 @@ impl Physics {
             // last step (read between frames; counting after every world
             // step only overwrote it).
             let external = self.studio.as_ref().map_or(0, |sv| sv.external_touching());
-            crate::runtime::domains::services::perf::set_contacts(doc.id, self.world.narrow_phase.contact_pairs().filter(|p| p.has_any_active_contact()).count() + external);
+            rustudio_core::bench::perf::set_contacts(doc.id, self.world.narrow_phase.contact_pairs().filter(|p| p.has_any_active_contact()).count() + external);
         }
         self.mover_events(doc);
         self.publish_live(doc.id);
@@ -3214,15 +3341,15 @@ impl Physics {
             let g = gv(world.gravity);
             let ((), work) = run_step(serial, || sv.step(world, g, hooks, collector));
             if let Some(c) = self.census.as_ref() {
-                crate::bench::add(c.section(), work, 1);
+                rustudio_core::bench::add(c.section(), work, 1);
             }
             for (name, cost) in sv.take_costs() {
-                crate::bench::add(name, cost, 1);
+                rustudio_core::bench::add(name, cost, 1);
             }
         } else {
             let ((), work) = run_step(serial, || world.step_with_events(hooks, collector));
             if let Some(c) = self.census.as_ref() {
-                crate::bench::add(c.section(), work, 1);
+                rustudio_core::bench::add(c.section(), work, 1);
             }
         }
         if let Some(c) = self.census.as_mut() {
@@ -3240,7 +3367,7 @@ impl Physics {
     fn part_groups(&self, doc: &Document, r: Ref) -> rp::InteractionGroups {
         let name = match doc.prop(r, "CollisionGroup") {
             Some(Variant::String(s)) if !s.is_empty() => s,
-            _ => crate::collision_groups::DEFAULT.to_string(),
+            _ => rustudio_core::collision_groups::DEFAULT.to_string(),
         };
         self.interaction(&name)
     }
@@ -3321,7 +3448,8 @@ impl Physics {
     /// a hit followed by a gap, then another hit or a sufficiently high first rung.
     #[cfg(test)]
     pub fn ladder_ahead(&self, doc: &Document, root: Vec3, dir: Vec3, own: &std::collections::HashSet<Ref>) -> bool {
-        self.ladder_ahead_scaled(doc, root, dir, mech::CLIMB_SCAN_HEIGHT, mech::CLIMB_REACH, own)
+        const CLIMB_SCAN_HEIGHT: f32 = 3.0; // Default R6 hip plus half root height.
+        self.ladder_ahead_scaled(doc, root, dir, CLIMB_SCAN_HEIGHT, mech::CLIMB_REACH, own)
     }
 
     #[cfg(test)]
@@ -3558,7 +3686,7 @@ impl Physics {
     }
 }
 
-/// Simulation facts shared with the runtimes (src/domains/world.rs) and
+/// Simulation facts shared with the runtimes (crates/rustudio-engine/src/domains/world.rs) and
 /// script requests going the other way, keyed by the simulated document's
 /// id (the server's DataModel in Play).
 pub mod live {
@@ -4277,9 +4405,7 @@ impl Physics {
     }
 }
 
-// (Uses mech items the capsule deletion removed: does not compile on master either.
-// `cargo test --features skip-physics-tests` builds the other tests.)
-#[cfg(all(test, not(feature = "skip-physics-tests")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     // (the module's maps hash with FxHash; the functions under test take std's sets)
@@ -4743,7 +4869,7 @@ mod tests {
     fn mesh_part_collides_by_its_decomposition() {
         use rbx_dom_weak::types::{ContentId, Enum};
         let id = "rbxtemp://rustudio/test/physics-l.obj";
-        crate::assets::register_generated(id, crate::collision::l_prism_obj().into_bytes());
+        rustudio_core::assets::register_generated(id, crate::collision::l_prism_obj().into_bytes());
         std::env::set_var(
             "RUSTUDIO_CACHE_DIR",
             std::env::temp_dir().join("rustudio-physics-mesh-test"),
@@ -5117,7 +5243,7 @@ mod tests {
         b
     }
 
-    /// Run with: cargo test --release --bin rustudio terrain_collider_perf -- --ignored --nocapture
+    /// Run with: cargo test --release -p rustudio-physics --lib terrain_collider_perf -- --ignored --nocapture
     #[test]
     #[ignore]
     fn terrain_collider_perf() {
@@ -5372,13 +5498,13 @@ mod tests {
 fn run_step(serial: bool, f: impl FnOnce() + Send) -> ((), f64) {
     let pool = if serial { None } else { par_pool() };
     let ((), work) = match pool {
-        Some(pool) => pool.install(|| crate::bench::measure(f)),
+        Some(pool) => pool.install(|| rustudio_core::bench::measure(f)),
         None => with_inline_pool(|pool| match pool.filter(|_| serial) {
-            Some(pool) => pool.install(|| crate::bench::measure(f)),
-            None => crate::bench::measure(f),
+            Some(pool) => pool.install(|| rustudio_core::bench::measure(f)),
+            None => rustudio_core::bench::measure(f),
         }),
     };
-    crate::bench::add("ph_step_thread", work, 1);
+    rustudio_core::bench::add("ph_step_thread", work, 1);
     ((), work)
 }
 

@@ -22,7 +22,7 @@
 //!   "loadPlugin … / Running plugin …"); plugins load when a place opens
 //!   (F3), not at the Start Page.
 //!
-//! rustudio's root is `<data>/rustudio` (src/paths.rs): `Plugins/` (unless
+//! rustudio's root is `<data>/rustudio` (crates/rustudio-core/src/paths.rs): `Plugins/` (unless
 //! Studio Settings > Plugins Dir points elsewhere) and `<userId>/InstalledPlugins/`.
 
 pub mod cli;
@@ -160,7 +160,7 @@ pub struct Store {
 pub fn default_root() -> PathBuf {
     std::env::var_os("RUSTUDIO_PLUGIN_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::paths::data().join("rustudio"))
+        .unwrap_or_else(|| rustudio_core::paths::data().join("rustudio"))
 }
 
 /// The local Plugins folder: Studio Settings > Plugins Dir (default

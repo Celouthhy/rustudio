@@ -253,7 +253,7 @@ pub fn build_contact_rows_primal(i: usize, islands: &Islands, store: &mut Contac
     if islands.manifolds(i).is_empty() {
         return;
     }
-    crate::todo_spec!("CONTACT §4 slot 11 primal rows (normal, 2 friction), §4.1 slot 14 penalty floor / compliance, §3 material");
+    crate::todo_spec!("CONTACT §4 slot 11  primal rows (normal, 2 friction), §4.1 slot 14 penalty floor / compliance, §3 material");
 }
 
 /// Next-gen path: joint / constraint rows of slot 11 (JOINT lane).

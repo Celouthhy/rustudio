@@ -37,9 +37,9 @@ use mlua::{Lua, MultiValue, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::util::*;
-use crate::doc::{self, Document};
+use rustudio_core::doc::{self, Document};
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 thread_local! {
@@ -54,14 +54,14 @@ fn one_attachment(d: &Document, r: Ref, class: &str) -> bool {
         "VectorForce" | "Torque" | "LinearVelocity" | "AngularVelocity" | "LineForce" | "Plane" => {
             class != "LineForce" && class != "Plane"
         }
-        "AlignPosition" | "AlignOrientation" => crate::scene::enum_u32(d.prop(r, "Mode")) == Some(0),
+        "AlignPosition" | "AlignOrientation" => rustudio_render::scene::enum_u32(d.prop(r, "Mode")) == Some(0),
         _ => false,
     }
 }
 
 /// Whether the constraint could act now (everything but "simulated yet").
 fn could_act(d: &Document, r: Ref, class: &str) -> bool {
-    let on = if class == "WeldConstraint" { crate::physics::joint_enabled(d, r) } else { boolp(d, r, "Enabled", true) };
+    let on = if class == "WeldConstraint" { rustudio_core::body::joint_enabled(d, r) } else { boolp(d, r, "Enabled", true) };
     if !on || !in_workspace(d, r) {
         return false;
     }
@@ -196,11 +196,11 @@ fn read_sensor(lua: &Lua, r: Ref, class: &str) -> mlua::Result<Vec<(String, Vec3
             ]
         }
         "FluidForceSensor" => {
-            let on = d.workspace().and_then(|ws| crate::scene::enum_u32(d.prop(ws, "FluidForces"))) == Some(1);
+            let on = d.workspace().and_then(|ws| rustudio_render::scene::enum_u32(d.prop(ws, "FluidForces"))) == Some(1);
             let (f, t, c) = match (on, part) {
                 (true, Some(p)) => {
                     let x = xf(d, p, "CFrame").unwrap_or(Xform { pos, rot: Mat3::IDENTITY });
-                    let wv = crate::physics::live::with_stats(d.id, |s| s.spin.get(&p).map(|s| s.0))
+                    let wv = rustudio_physics::physics::live::with_stats(d.id, |s| s.spin.get(&p).map(|s| s.0))
                         .flatten()
                         .unwrap_or(Vec3::ZERO);
                     let wind = d.workspace().and_then(|ws| v3p(d, ws, "GlobalWind")).unwrap_or(Vec3::ZERO);
@@ -251,7 +251,7 @@ fn fluid(d: &Document, part: Ref, x: &Xform, v: Vec3, w: Vec3) -> (Vec3, Vec3, V
 }
 
 fn sensor_value(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
-    let manual = crate::scene::enum_u32(world(lua)?.d().prop(r, "UpdateType")) == Some(1);
+    let manual = rustudio_render::scene::enum_u32(world(lua)?.d().prop(r, "UpdateType")) == Some(1);
     let readings = if manual {
         SENSED.with(|s| s.borrow().get(&r).cloned()).unwrap_or_default()
     } else {
@@ -306,11 +306,11 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
             vec3(lua, Vec3::ZERO).and_then(one)
         }
         "Fire" | "fire" if class == "RocketPropulsion" => {
-            crate::physics::live::rocket_fire(this);
+            rustudio_physics::physics::live::rocket_fire(this);
             none()
         }
         "Abort" if class == "RocketPropulsion" => {
-            crate::physics::live::rocket_abort(this);
+            rustudio_physics::physics::live::rocket_abort(this);
             none()
         }
         "Sense" if doc::is_a(class, "SensorBase") => (|| {
@@ -348,7 +348,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     // Enabled isn't saved or replicated: it comes from State (bit 0).
     if class == "WeldConstraint" && key == "Enabled" {
         let w = world(lua)?;
-        return Ok(Some(Value::Boolean(crate::physics::joint_enabled(w.d(), r))));
+        return Ok(Some(Value::Boolean(rustudio_core::body::joint_enabled(w.d(), r))));
     }
     if doc::is_a(class, "Constraint") {
         if key == "Active" {
@@ -457,7 +457,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         }
         // A new goal may be reached again (the store itself is the runtime's).
         ("BodyPosition", "Position") => {
-            crate::physics::live::bp_rearm(r);
+            rustudio_physics::physics::live::bp_rearm(r);
             Ok(false)
         }
         _ => Ok(false),
@@ -486,7 +486,7 @@ pub fn step(lua: &Lua, _dt: f64) -> mlua::Result<()> {
             Err(_) => return Ok(()),
         };
         let d = w.d();
-        (d.id, crate::physics::live::take_reached(d.id))
+        (d.id, rustudio_physics::physics::live::take_reached(d.id))
     };
     if !reached.is_empty() {
         let mut w = world(lua)?;

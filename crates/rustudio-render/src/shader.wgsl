@@ -1052,7 +1052,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     // Studio's opaque pass ignores VARYING2.w and texel alpha (MeshPart
     // TextureID, SpecialMesh TextureId: transparent texels draw their RGB);
     // once the part is translucent (Transparency > 0) both multiply alpha
-    // (2026-11-13 Studio quads, MECHANICS.md "Lighting model").
+    // (2026-11-13 Studio quads, docs/MECHANICS.md "Lighting model").
     let translucent = alpha < 0.999;
     if (translucent) {
         alpha = alpha * in.vtint.a;
@@ -2155,9 +2155,8 @@ fn vs_post(@builtin(vertex_index) i: u32) -> PostOut {
     return o;
 }
 
-// Bloom (docs/MECHANICS.md "Bloom"), as Studio's pyramid: a linear
-// down-sample, mip down-samples, then tent up-samples; the CPU picks the
-// pyramid size and level from the view's resolution.
+// Studio DownSampleGjoelLinearFS -> DownSampleGjoelMipFS -> UpSampleTentFS.
+// CPU size/resolution level selection: Studio.
 @group(1) @binding(2) var bloom_tex: texture_2d<f32>;
 
 fn bloom_source(hdr: vec3<f32>) -> vec3<f32> {

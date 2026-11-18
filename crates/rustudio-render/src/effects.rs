@@ -25,9 +25,9 @@ use glam::Mat3;
 use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::camera::Camera;
-use crate::doc::{self, Document};
-use crate::math::Xform;
-use crate::mech;
+use rustudio_core::doc::{self, Document};
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
 use crate::scene::{content_string, enum_u32, f32_of, vec3_of, xform_of};
 use crate::world_gui::{FxFrame, FxLook, FxParticle, FxVertex};
 
@@ -125,7 +125,7 @@ impl SceneLight {
         let [nx, ny, nz] = crate::lightgrid::dims();
         let dim = Vec3::new(nx as f32, ny as f32, nz as f32);
         // Voxel coordinates, texel centres at +0.5.
-        let q = p / crate::terrain::VOXEL - Vec3::new(g.origin[0] as f32, g.origin[1] as f32, g.origin[2] as f32);
+        let q = p / rustudio_core::terrain::VOXEL - Vec3::new(g.origin[0] as f32, g.origin[1] as f32, g.origin[2] as f32);
         if ((q / dim) - Vec3::splat(0.5)).abs().max_element() >= mech::LIGHTGRID_BORDER {
             return 1.0;
         }
@@ -487,7 +487,7 @@ enum Host {
 
 /// Invisible emitter volumes remain selectable in the editor. Only traverse
 /// attachments: arbitrary descendants in a model are not hosted by this part.
-pub(crate) fn is_emitter_host(d: &Document, part: Ref) -> bool {
+pub fn is_emitter_host(d: &Document, part: Ref) -> bool {
     fn contains(d: &Document, r: Ref) -> bool {
         d.dom.get_by_ref(r).is_some_and(|i| i.children().iter().any(|&child| {
             match d.class_of(child).as_deref() {
@@ -514,7 +514,7 @@ fn host_of(d: &Document, r: Ref) -> Host {
 /// An attachment's world transform: its parent part's CFrame × its own
 /// (as physics.rs attachment_xform), through Bones parented to Bones.
 fn attachment_world(d: &Document, a: Ref) -> Option<Xform> {
-    crate::attachment::world(d, a, true)
+    rustudio_core::attachment::world(d, a, true)
 }
 
 /// What an attachment's world frame reads (attachment::world): it, and
@@ -1785,7 +1785,7 @@ impl Effects {
     /// `FrameIn::glass`. Which parts are see-through is kept until the
     /// document's revision moves; where they are is read each frame.
     pub fn glass(&mut self, scene: &crate::scene::Scene, revision: u64, cam: &Camera) -> Vec<Glass> {
-        let _p = crate::bench::scope("fx_glass");
+        let _p = rustudio_core::bench::scope("fx_glass");
         let key = (scene.doc_id, revision, scene.parts.len());
         if self.glass_key != Some(key) {
             self.glass_key = Some(key);
@@ -1979,9 +1979,9 @@ impl Effects {
     /// (`drawn`), far to near. True while something is moving (keep
     /// repainting).
     pub fn frame(&mut self, f: FrameIn<'_>) -> bool {
-        let _p = crate::bench::scope("fx");
+        let _p = rustudio_core::bench::scope("fx");
         {
-            let _r = crate::bench::scope("fx_refresh");
+            let _r = rustudio_core::bench::scope("fx_refresh");
             self.refresh(f.doc);
         }
         let d: &Document = f.doc;
@@ -2058,7 +2058,7 @@ impl Effects {
         let mut n_particles = 0usize;
         let (mut t_sim, mut t_strip, mut t_cfg, mut t_pose) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let (mut t_trail, mut t_con) = (0.0f64, 0.0f64);
-        let _l = crate::bench::scope("fx_loop");
+        let _l = rustudio_core::bench::scope("fx_loop");
         let (mut n_beams, mut n_kept) = (0u64, 0u64);
         // Emitters nearest first get the particle budget.
         let mut emitters: Vec<(f32, Ref, Xform, Vec3)> = Vec::new();
@@ -2066,7 +2066,7 @@ impl Effects {
             if !d.exists(r) {
                 continue;
             }
-            let t0 = crate::bench::now();
+            let t0 = rustudio_core::bench::now();
             let cfg = self.cfg.entry(r).or_insert_with(|| {
                 match d.class_of(r).as_deref() {
                     Some("ParticleEmitter") => Cfg::Emitter(Box::new(emitter_cfg(d, r))),
@@ -2076,17 +2076,17 @@ impl Effects {
                     _ => Cfg::Trail(Box::new(trail_cfg(d, r))),
                 }
             });
-            let t1 = crate::bench::now();
+            let t1 = rustudio_core::bench::now();
             t_cfg += t1 - t0;
             let pose = Self::pose(&mut self.poses, &mut self.pose_deps, d, r, cfg);
-            t_pose += crate::bench::now() - t1;
+            t_pose += rustudio_core::bench::now() - t1;
             match cfg {
                 Cfg::Constraint(r) => {
-                    let t0 = crate::bench::now();
+                    let t0 = rustudio_core::bench::now();
                     if let Some(dr) = constraints::draw(d, *r, &view) {
                         if dr.dist < mech::FX_MAX_DIST { draws.push(dr); }
                     }
-                    t_con += crate::bench::now() - t0;
+                    t_con += rustudio_core::bench::now() - t0;
                 }
                 Cfg::Emitter(c) => {
                     let Pose::Host(Some((xf, size)), moving) = pose else { continue };
@@ -2100,9 +2100,9 @@ impl Effects {
                         continue;
                     }
                     let st = self.emitters.entry(r).or_default();
-                    let t0 = crate::bench::now();
+                    let t0 = rustudio_core::bench::now();
                     st.step(c, r, &xf, size, dt, emits.remove(&r).unwrap_or(0), moving, wind);
-                    t_sim += crate::bench::now() - t0;
+                    t_sim += rustudio_core::bench::now() - t0;
                     if !st.particles.is_empty() {
                         live = true;
                         emitters.push((dist, r, xf, size));
@@ -2112,7 +2112,7 @@ impl Effects {
                     if !c.enabled || c.a0.is_none() || c.a1.is_none() {
                         continue;
                     }
-                    let t0 = crate::bench::now();
+                    let t0 = rustudio_core::bench::now();
                     let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
                     if c.tex_speed != 0.0 {
                         live = true;
@@ -2145,7 +2145,7 @@ impl Effects {
                                 eprintln!("[fx pose check] beam {r:?} kept a stale strip");
                             }
                         }
-                        t_strip += crate::bench::now() - t0;
+                        t_strip += rustudio_core::bench::now() - t0;
                         if far < mech::FX_MAX_DIST {
                             draws.push(Draw { dist: far, texture: tex.0, wrap: tex.1, geom: Geom::Kept(r) });
                         }
@@ -2159,7 +2159,7 @@ impl Effects {
                             }
                         }
                     }
-                    t_strip += crate::bench::now() - t0;
+                    t_strip += rustudio_core::bench::now() - t0;
                     if let Some(dr) = dr {
                         if dr.dist < mech::FX_MAX_DIST {
                             draws.push(dr);
@@ -2168,7 +2168,7 @@ impl Effects {
                 }
                 Cfg::Trail(c) => {
                     let Pose::Ends(Some(x0), Some(x1)) = pose else { continue };
-                    let t0 = crate::bench::now();
+                    let t0 = rustudio_core::bench::now();
                     let st = self.trails.entry(r).or_default();
                     st.step(c, x0.pos, x1.pos, now);
                     if st.points.len() < 2 && !c.enabled {
@@ -2183,20 +2183,20 @@ impl Effects {
                             draws.push(dr);
                         }
                     }
-                    t_trail += crate::bench::now() - t0;
+                    t_trail += rustudio_core::bench::now() - t0;
                 }
             }
         }
         drop(_l);
-        crate::bench::add("fx_sim", t_sim, 1);
-        crate::bench::add("fx_cfg", t_cfg, 1);
-        crate::bench::add("fx_pose", t_pose, 1);
-        crate::bench::add("fx_trails", t_trail, 1);
-        crate::bench::add("fx_constraints", t_con, 1);
-        crate::bench::add("fx_list", 0.0, self.list.len() as u64);
-        crate::bench::add("fx_beams", t_strip, n_beams);
-        crate::bench::add("fx_beams_kept", 0.0, n_kept);
-        let _pd = crate::bench::scope("fx_pdraw");
+        rustudio_core::bench::add("fx_sim", t_sim, 1);
+        rustudio_core::bench::add("fx_cfg", t_cfg, 1);
+        rustudio_core::bench::add("fx_pose", t_pose, 1);
+        rustudio_core::bench::add("fx_trails", t_trail, 1);
+        rustudio_core::bench::add("fx_constraints", t_con, 1);
+        rustudio_core::bench::add("fx_list", 0.0, self.list.len() as u64);
+        rustudio_core::bench::add("fx_beams", t_strip, n_beams);
+        rustudio_core::bench::add("fx_beams_kept", 0.0, n_kept);
+        let _pd = rustudio_core::bench::scope("fx_pdraw");
         emitters.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut budget = mech::FX_PARTICLES_MAX;
         for (_, r, xf, _) in emitters {
@@ -2214,13 +2214,13 @@ impl Effects {
                 draws.push(dr);
             }
         }
-        crate::bench::add("fx_particles", 0.0, n_particles as u64);
+        rustudio_core::bench::add("fx_particles", 0.0, n_particles as u64);
         if std::env::var_os("RUSTUDIO_FX_TRACE").is_some() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
             eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim={:.3}", mech::FX_PARTICLES_MAX - budget, t_sim);
         }
 
         drop(_pd);
-        let _push = crate::bench::scope("fx_push");
+        let _push = rustudio_core::bench::scope("fx_push");
         // Far to near, so nearer effects blend over farther ones.
         draws.sort_by(|a, b| b.dist.total_cmp(&a.dist));
         let out = &mut self.out;
@@ -2529,7 +2529,7 @@ mod tests {
         occ.add_prim(&crate::lightgrid::Prim::new(
             crate::lightgrid::Kind::Block,
             Vec3::new(200.0, 4.0, 200.0),
-            &crate::math::Xform { pos: Vec3::new(0.0, 12.0, 0.0), rot: glam::Mat3::IDENTITY },
+            &rustudio_core::math::Xform { pos: Vec3::new(0.0, 12.0, 0.0), rot: glam::Mat3::IDENTITY },
             0.0,
         ));
         l.grid = Some(Arc::new(crate::lightgrid::skylight(&occ)));

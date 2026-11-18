@@ -61,7 +61,6 @@ pub fn init_vm(lua: &Lua) {
 /// "Internal globals visible to game scripts" and the inventory rows Studio
 /// reads as nil). `_G` and `shared` live in each script environment itself.
 pub fn hidden(name: &str) -> bool {
-    #[cfg(test)]
     if TEST_INTERNALS.with(|t| t.get()) && name.starts_with("__") {
         return false;
     }
@@ -74,10 +73,19 @@ pub fn hidden(name: &str) -> bool {
 
 // Unit tests of engine domains drive internals (`__rs_pages_list`,
 // `__ac_test_collect`…) from game scripts; this module's own tests turn
-// that off to see what Studio's scripts see.
-#[cfg(test)]
+// that off to see what Studio's scripts see. Off by default outside a test
+// build (and in the engine library as studio's or player's tests see it:
+// they call `show_internals(true)`), so the shipped binary never shows them.
 thread_local! {
-    pub static TEST_INTERNALS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub static TEST_INTERNALS: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
+}
+
+/// Shows (or hides) rustudio's `__…` internals to scripts in this thread's
+/// VMs. Studio's plugin and animation tests drive internals from scripts and
+/// call this; nothing in the shipped binary does.
+#[doc(hidden)]
+pub fn show_internals(on: bool) {
+    TEST_INTERNALS.with(|t| t.set(on));
 }
 
 fn reg<T: mlua::FromLua>(lua: &Lua, key: &str) -> mlua::Result<T> {
@@ -407,14 +415,14 @@ pub fn sync(lua: &Lua) -> mlua::Result<()> {
     // elapsedTime: seconds since the process started (Studio's includes its
     // whole session), not game time; tick(): local wall time.
     let since = crate::runtime::process_start();
-    // (--fixed-dt: both on the simulated clock, src/sim_clock.rs)
+    // (--fixed-dt: both on the simulated clock, crates/rustudio-core/src/sim_clock.rs)
     let elapsed = lua.create_function(move |_, ()| {
-        Ok(crate::sim_clock::seconds().unwrap_or_else(|| since.elapsed().as_secs_f64()))
+        Ok(rustudio_core::sim_clock::seconds().unwrap_or_else(|| since.elapsed().as_secs_f64()))
     })?;
     name_function(lua, &elapsed, "elapsedTime");
     public.raw_set("ElapsedTime", forwarder(lua, "ElapsedTime", elapsed.clone())?)?;
     public.raw_set("elapsedTime", elapsed)?;
-    let tick = lua.create_function(|_, ()| Ok(crate::sim_clock::epoch_secs() + local_offset()))?;
+    let tick = lua.create_function(|_, ()| Ok(rustudio_core::sim_clock::epoch_secs() + local_offset()))?;
     name_function(lua, &tick, "tick");
     public.raw_set("tick", tick)?;
     for (alias, of) in [("Spawn", "spawn"), ("Delay", "delay")] {
@@ -454,7 +462,7 @@ pub fn harness_env(lua: &Lua) -> mlua::Result<Table> {
 
 #[cfg(test)]
 mod tests {
-    use crate::doc::Document;
+    use rustudio_core::doc::Document;
     use crate::runtime::{RunMode, Runtime, Side, World};
     use rbx_dom_weak::InstanceBuilder;
 

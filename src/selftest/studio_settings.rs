@@ -111,27 +111,27 @@ impl SelfTest {
         }
         // …and act. Fly one second straight ahead: Camera Speed 3 is twice
         // the default 1.5.
-        let mut cam = crate::camera::Camera::default();
+        let mut cam = rustudio_render::camera::Camera::default();
         let start = cam.pos;
-        cam.fly(Vec3::new(0.0, 0.0, 1.0), 1.0, false, 1.0);
+        cam.fly(Vec3::new(0.0, 0.0, 1.0), 1.0, false, 1.0, &ss::camera_prefs());
         let flown = (cam.pos - start).length();
-        let fly_ok = (flown - crate::mech::FLY_SPEED * 2.0).abs() < 0.01;
+        let fly_ok = (flown - rustudio_core::mech::FLY_SPEED * 2.0).abs() < 0.01;
         // The wheel with Scroll Towards Cursor Position off: straight ahead,
         // whatever ray the cursor is on.
-        let mut cam = crate::camera::Camera::default();
+        let mut cam = rustudio_render::camera::Camera::default();
         let start = cam.pos;
         let fwd = cam.forward();
-        cam.zoom_toward(Vec3::X, 1.0, false);
+        cam.zoom_toward(Vec3::X, 1.0, false, &ss::camera_prefs());
         let moved = cam.pos - start;
-        let wheel_ok = (moved.normalize().dot(fwd) - 1.0).abs() < 1e-4 && (moved.length() - crate::mech::WHEEL_STEP).abs() < 0.01;
+        let wheel_ok = (moved.normalize().dot(fwd) - 1.0).abs() < 1e-4 && (moved.length() - rustudio_core::mech::WHEEL_STEP).abs() < 0.01;
         // Selection outline: thickness 4 is twice the default 2.
         let outline = ss::selection_outline_px();
-        let outline_ok = (outline - crate::mech::SELECTION_OUTLINE_PX * 2.0).abs() < 1e-4;
+        let outline_ok = (outline - rustudio_core::mech::SELECTION_OUTLINE_PX * 2.0).abs() < 1e-4;
         // Output keeps at most 100 lines.
         for i in 0..300 {
             ed.info(format!("studio settings line {i}"));
         }
-        let lines = ed.log.len();
+        let lines = ed.game.log.len();
         let output_ok = lines <= 100 && lines >= 80;
         // Script editor text: 14 pt.
         let font = ss::font_px("Studio", "Font");
@@ -142,7 +142,7 @@ impl SelfTest {
             "passed": ok,
             "values": values,
             "flown_studs_per_s": flown,
-            "base_fly_speed": crate::mech::FLY_SPEED,
+            "base_fly_speed": rustudio_core::mech::FLY_SPEED,
             "wheel_moved": [moved.x, moved.y, moved.z],
             "selection_outline_px": outline,
             "output_lines": lines,

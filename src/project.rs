@@ -33,8 +33,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder, WeakDom};
 use serde_json::Value as J;
 
-use crate::doc::Document;
-use crate::project_values::resolve;
+use rustudio_core::doc::Document;
+use rustudio_core::project_values::resolve;
 
 /// Script, value and model file kinds (the middleware Argon picks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ pub type Warnings = Vec<String>;
 /// A service by the reflection database, or one of the two player-script
 /// containers Argon and Rojo also infer from the name (Argon util.rs).
 pub fn is_service(name: &str) -> bool {
-    crate::doc::db()
+    rustudio_core::doc::db()
         .classes
         .get(name)
         .is_some_and(|c| c.tags.contains(&rbx_reflection::ClassTag::Service))

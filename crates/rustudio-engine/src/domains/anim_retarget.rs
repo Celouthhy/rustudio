@@ -26,8 +26,8 @@ use std::collections::HashMap;
 use glam::{Mat3, Quat, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
 
-use crate::doc::Document;
-use crate::math::Xform;
+use rustudio_core::doc::Document;
+use rustudio_core::math::Xform;
 
 /// FInt AnimatorRetargetInterpolateFKCorrectionMin/MaxAngleDeg (values at
 /// Studio; GetFastInt in Studio: 10 and 35).
@@ -366,7 +366,7 @@ pub fn build_character_rig(doc: &Document, model: Ref, root_part: Ref) -> Rig {
         if !crate::rig::is_animated_joint(&i.class) {
             continue;
         }
-        if let Some((p0, p1, c0, c1)) = crate::rig::joint_frames(doc, i.referent()) {
+        if let Some((p0, p1, c0, c1)) = rustudio_core::body::joint_frames(doc, i.referent()) {
             joints.push((p0, p1, c0, c1));
         }
     }

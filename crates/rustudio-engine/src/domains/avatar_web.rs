@@ -21,17 +21,17 @@ static JOBS: std::sync::LazyLock<Mutex<Jobs>> =
 
 /// The signed-in session, waiting briefly for a check still under way.
 fn session() -> Option<rustudio_account::session::Session> {
-    if !crate::assets::wait_for_session(std::time::Duration::from_secs(20)) {
+    if !rustudio_core::assets::wait_for_session(std::time::Duration::from_secs(20)) {
         return None;
     }
-    let client = crate::assets::session_client()?;
+    let client = rustudio_core::assets::session_client()?;
     let g = client.lock().ok()?;
     g.as_ref().map(|c| c.session.downloader())
 }
 
 /// The signed-in user's id (0 signed out).
 pub fn user_id() -> u64 {
-    crate::assets::session_client()
+    rustudio_core::assets::session_client()
         .and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.user_id())))
         .unwrap_or(0)
 }
@@ -107,7 +107,7 @@ pub fn start_asset(id: u64, format: Option<String>) -> u64 {
         j
     };
     std::thread::spawn(move || {
-        let cache = crate::assets::cache_dir().join(format!(
+        let cache = rustudio_core::assets::cache_dir().join(format!(
             "assets/{id}_{}.bin",
             format.as_deref().unwrap_or("vlatest")
         ));
@@ -115,7 +115,7 @@ pub fn start_asset(id: u64, format: Option<String>) -> u64 {
             Ok(b) if !b.is_empty() => Ok(b),
             _ => (|| {
                 if format.is_none() {
-                    return crate::assets::remote_cached(id).map(|b| (*b).clone());
+                    return rustudio_core::assets::remote_cached(id).map(|b| (*b).clone());
                 }
                 let s = session().ok_or_else(|| http_error(401))?;
                 let body = serde_json::json!([{ "assetId": id, "requestId": "0", "assetFormat": format }]).to_string();

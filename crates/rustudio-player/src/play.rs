@@ -19,17 +19,19 @@ use mlua::Value;
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{ustr, InstanceBuilder};
 
-use crate::app::{Editor, Level};
-use crate::camera::{Camera, CameraMode};
-use crate::doc::{self, Document};
-use crate::ltypes::LEnumItem;
-use crate::math::Xform;
-use crate::mech;
-use crate::physics::{CharBody, Physics};
-use crate::replicate::{self, RepMap};
-use crate::rig::{self, Rig, RigType, State};
-use crate::runtime::{RemoteKind, RepOp, RunMode, Runtime, Side, World};
-use crate::scene::f32_of;
+use crate::game::{Game, GameHost};
+use rustudio_render::camera::{Camera, CameraMode};
+use rustudio_core::doc::{self, Document};
+use rustudio_core::log::Level;
+use rustudio_engine::ltypes::LEnumItem;
+use rustudio_core::math::Xform;
+use rustudio_core::mech;
+use rustudio_physics::physics::{CharBody, Physics};
+use rustudio_engine::replicate::{self, RepMap};
+use rustudio_core::body::State;
+use rustudio_engine::rig::{self, Rig, RigType};
+use rustudio_engine::runtime::{RemoteKind, RepOp, RunMode, Runtime, Side, World};
+use rustudio_render::scene::f32_of;
 
 #[path = "play_game.rs"]
 pub mod game;
@@ -75,7 +77,7 @@ pub struct Character {
     /// character: a LocalScript setting Sit = false gets up).
     client_sit: bool,
     /// What Studio's Humanoid controller knows of the body (round 22).
-    pub shape: crate::physics::HumShape,
+    pub shape: rustudio_physics::physics::HumShape,
     /// The last frame was a floating mode (swim, climb, mover, seat).
     hum_mode_left: bool,
     /// A wall the body was pushed into last frame (its outward normal):
@@ -156,7 +158,7 @@ pub struct PlaySession {
     pub mode: RunMode,
     /// Place content loads only Roblox content while this session lives
     /// (assets::place_content_allowed).
-    _scripts_running: crate::assets::ScriptsRunning,
+    _scripts_running: rustudio_core::assets::ScriptsRunning,
     saved_doc: Option<Document>,
     saved_cam: Camera,
     saved_sel: Vec<Ref>,
@@ -176,7 +178,7 @@ pub struct PlaySession {
     respawn_at: Option<f64>,
     /// The dead character's parts the server took over (lane DEATH): server part → the
     /// client copy's interpolation buffer (physics::hum_body::Handover).
-    handover: HashMap<Ref, crate::physics::hum_body::Handover>,
+    handover: HashMap<Ref, rustudio_physics::physics::hum_body::Handover>,
     pub time: f64,
     keys_prev: HashSet<String>,
     /// Keys whose InputBegan was game-processed (pressed into a TextBox):
@@ -196,9 +198,9 @@ pub struct PlaySession {
     memstats_frames: u32,
     memstats_worst: f32,
     /// Places the parts of assemblies only the client has.
-    client_joints: crate::client_joints::ClientJoints,
-    /// The client DataModel's own simulation (src/physics_client.rs).
-    client_sim: crate::physics::client::ClientSim,
+    client_joints: rustudio_physics::client_joints::ClientJoints,
+    /// The client DataModel's own simulation (crates/rustudio-physics/src/physics_client.rs).
+    client_sim: rustudio_physics::physics::client::ClientSim,
     /// Touch changes between the client world's parts (client refs), fired on
     /// the client in its next script phase: Studio fires Touched where the
     /// part is simulated, so a LocalScript's clones (a pot lid and
@@ -344,11 +346,11 @@ fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> 
     let runtime = Runtime::new()?;
     runtime
         .install_side()
-        .map_err(|e| crate::runtime::describe_error(&e))?;
-    crate::load_trace::mark("runtime: side installed");
+        .map_err(|e| rustudio_engine::runtime::describe_error(&e))?;
+    rustudio_core::load_trace::mark("runtime: side installed");
     // --fixed-dt: this side's math.random / Random.new seeds, not the
-    // VM's address and the time (src/sim_clock.rs).
-    crate::sim_clock::seed_vm(&runtime.lua, if side == Side::Server { 1 } else { 2 });
+    // VM's address and the time (crates/rustudio-core/src/sim_clock.rs).
+    rustudio_engine::lua_bridge::seed_vm(&runtime.lua, if side == Side::Server { 1 } else { 2 });
     let mut world = World::new(Document::empty(), mode);
     world.doc = None;
     world.side = side;
@@ -359,7 +361,7 @@ fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> 
     })
 }
 
-impl Editor {
+impl Game {
     pub fn is_playing(&self) -> bool {
         self.play.is_some()
     }
@@ -406,7 +408,7 @@ impl Editor {
     }
 
     /// Switches the editor between the server's and the client's DataModel.
-    pub fn show_play_side(&mut self, side: Side) {
+    pub fn show_play_side(&mut self, side: Side, host: &mut dyn GameHost) {
         let Some(s) = self.play.as_mut() else { return };
         if s.showing == side || s.other_doc.is_none() {
             return;
@@ -416,9 +418,8 @@ impl Editor {
         }
         s.showing = side;
         self.doc.selection.clear();
-        self.scene = crate::scene::Scene::default();
-        self.explorer.expand_defaults(&self.doc);
-        self.drag = None;
+        self.scene = rustudio_render::scene::Scene::default();
+        host.document_changed(&self.doc);
     }
 
     /// Runs `f` with one side's runtime entered (its DataModel lent to Lua).
@@ -483,24 +484,20 @@ impl Editor {
         }
     }
 
-    pub fn start_play(&mut self, mode: RunMode) {
+    pub fn start_play(&mut self, mode: RunMode, host: &mut dyn GameHost, clear_output: bool, live_ids: Option<(u64, u64)>) {
         if self.play.is_some() {
             return;
         }
-        crate::load_trace::mark("play: start asked");
-        // Play on a place still loading waits for it (and so for its
-        // PlaceId / GameId), as Studio's Play only runs a loaded DataModel.
-        if self.defer_play_until_loaded(mode) {
-            return;
-        }
+        rustudio_core::load_trace::mark("play: start asked");
         // rustudio's per-session physics options (solver, spin guard, client
         // link): RUSTUDIO_* env, else the saved option, read once per Play.
-        let solver = crate::rustudio_settings::latch_for_play();
+        let solver = rustudio_core::rustudio_settings::latch_for_play();
         // Studio Settings > Output > Clear Output On Start, for runs a person
         // drives (harness logs and --log keep everything).
-        if self.harness.plain() && crate::studio_settings::flag("Studio", "Clear Output On Start", true) {
+        if clear_output {
             self.log.clear();
-            self.output_view.log_cleared();
+            self.log_cleared = true;
+            self.log_drained = 0;
         }
         // The local player is the signed-in account (identity and avatar),
         // as in Studio: a session check still running at Play is waited for.
@@ -515,19 +512,18 @@ impl Editor {
         let two = mode == RunMode::Play;
         // From before any script runs until the session ends: no local files
         // as place content (assets::place_content_allowed).
-        let scripts_running = crate::assets::ScriptsRunning::new();
+        let scripts_running = rustudio_core::assets::ScriptsRunning::new();
         // Cloud data stays in memory for any published place but the
         // scratch experience (domains::data::local_mode_for).
-        let universe = self
-            .live_team_create_ids()
+        let universe = live_ids
             .map(|(u, _)| u)
             .or_else(|| self.doc.cloud.as_ref().map(|o| o.universe_id))
             .unwrap_or(0);
-        crate::runtime::domains::data::PLAY_UNIVERSE
+        rustudio_engine::runtime::domains::data::PLAY_UNIVERSE
             .store(universe, std::sync::atomic::Ordering::Relaxed);
-        if crate::runtime::domains::data::local_mode_for(universe) && universe != 0 {
+        if rustudio_engine::runtime::domains::data::local_mode_for(universe) && universe != 0 {
             self.push_log(
-                crate::app::Level::Warn,
+                rustudio_core::log::Level::Warn,
                 format!(
                     "DataStores, MemoryStores and Messaging stay in memory for this Play \
                      (universe {universe} is a published game; Studio Settings > rustudio > \
@@ -535,7 +531,7 @@ impl Editor {
                 ),
             );
         }
-        if crate::rustudio_settings::live_data() {
+        if rustudio_core::rustudio_settings::live_data() {
             self.info("DataStores: live");
         }
         let server = match new_side(mode, Side::Server, two) {
@@ -556,7 +552,7 @@ impl Editor {
         } else {
             None
         };
-        crate::load_trace::mark("play: runtimes made");
+        rustudio_core::load_trace::mark("play: runtimes made");
         let label = if two { "Play" } else { "Run" };
         let mut server_doc = self
             .doc
@@ -603,16 +599,16 @@ impl Editor {
         }
         // Direct live joins have no REST CloudOrigin. Their session still
         // supplies the published identity required by game initialization.
-        if let Some((universe, place)) = self.live_team_create_ids() {
+        if let Some((universe, place)) = live_ids {
             let root = server_doc.dom.root_ref();
             if let Some(i) = server_doc.dom.get_by_ref_mut(root) {
                 i.properties.insert(ustr("PlaceId"), Variant::Int64(place as i64));
                 i.properties.insert(ustr("GameId"), Variant::Int64(universe as i64));
             }
         }
-        crate::load_trace::mark("play: server DataModel copied");
+        rustudio_core::load_trace::mark("play: server DataModel copied");
         let defaults = if two {
-            match crate::default_scripts::insert_player_scripts(&mut server_doc) {
+            match rustudio_core::default_scripts::insert_player_scripts(&mut server_doc) {
                 Ok(added) => added,
                 Err(error) => {
                     self.error(format!("Could not load Studio PlayerModule for Play: {error}"));
@@ -631,17 +627,17 @@ impl Editor {
         } else {
             (None, RepMap::default())
         };
-        crate::load_trace::mark("play: client DataModel replicated");
+        rustudio_core::load_trace::mark("play: client DataModel replicated");
         let saved_sel = std::mem::take(&mut self.doc.selection);
         let saved_doc = std::mem::replace(&mut self.doc, server_doc);
         let mut physics = Physics::new(&mut self.doc);
-        crate::load_trace::mark("play: physics built");
+        rustudio_core::load_trace::mark("play: physics built");
         self.info(format!("Physics solver: {}", solver.name()));
         // One collision-group table for the session: the server's scripts
         // set it, the client's queries and the physics read it.
         let mut server = server;
         let mut client = client;
-        let groups = crate::collision_groups::shared();
+        let groups = rustudio_core::collision_groups::shared();
         for w in [server.world.as_mut(), client.as_mut().and_then(|c| c.world.as_mut())]
             .into_iter()
             .flatten()
@@ -696,10 +692,10 @@ impl Editor {
         // The menu's settings from earlier playtests (volume, camera
         // sensitivity, inverted): onto the mixer now, and onto the client's
         // UserGameSettings on its first tick.
-        if self.harness.keeps_game_settings() {
-            let saved = crate::game_settings::load();
+        if self.keep_game_settings {
+            let saved = rustudio_core::game_settings::load();
             if let Some(v) = saved.volume {
-                crate::audio::set_master_global(v);
+                rustudio_engine::audio::set_master_global(v);
             }
             if let Some(s) = self.play.as_mut() {
                 s.game.menu.lua.extend(saved.client_lua());
@@ -711,9 +707,8 @@ impl Editor {
                 defaults.join(", ")
             ));
         }
-        self.drag = None;
-        self.scene = crate::scene::Scene::default();
-        self.explorer.expand_defaults(&self.doc);
+        self.scene = rustudio_render::scene::Scene::default();
+        host.document_changed(&self.doc);
         self.info(match mode {
             RunMode::Play => "▶ Play: a server and a client are running; WASD + Space to move, Shift+F5 to stop",
             RunMode::Run => "▶ Run: server scripts and physics running (no client, no character), Shift+F5 to stop",
@@ -724,7 +719,7 @@ impl Editor {
             if let Err(e) = rt.bind_globals() {
                 if let Some(mut w) = rt.world_mut() {
                     w.output
-                        .push((Level::Error, crate::runtime::describe_error(&e)));
+                        .push((Level::Error, rustudio_engine::runtime::describe_error(&e)));
                 }
             }
         };
@@ -732,17 +727,15 @@ impl Editor {
         if two {
             self.with_side(Side::Client, bind);
         }
-        crate::load_trace::mark("play: globals bound");
+        rustudio_core::load_trace::mark("play: globals bound");
         // Studio loads every plugin again in the Play server and client
         // DataModels (measured: each copy runs with IsEdit false).
-        let host = std::mem::take(&mut self.plugins);
-        self.with_side(Side::Server, |rt, _, _| host.load_into_play(rt));
+        self.with_side(Side::Server, |rt, _, _| host.load_plugins(rt));
         if two {
-            self.with_side(Side::Client, |rt, _, _| host.load_into_play(rt));
+            self.with_side(Side::Client, |rt, _, _| host.load_plugins(rt));
         }
-        self.plugins = host;
         self.with_side(Side::Server, |rt, _, _| rt.warm_queries());
-        crate::load_trace::mark("play: server queries warmed");
+        rustudio_core::load_trace::mark("play: server queries warmed");
         // Server scripts start first, as on a real server; the player joins
         // after (so Players:GetPlayers() is empty when they start).
         let server_scripts = self.server_scripts(None);
@@ -752,7 +745,7 @@ impl Editor {
             }
             rt.dispatch();
         });
-        crate::load_trace::mark("play: server scripts started");
+        rustudio_core::load_trace::mark("play: server scripts started");
         if two {
             self.create_player();
             let player = self
@@ -778,13 +771,13 @@ impl Editor {
                 }
                 rt.dispatch();
             });
-            crate::load_trace::mark("play: player added");
+            rustudio_core::load_trace::mark("play: player added");
             self.replicate_now();
-            crate::load_trace::mark("play: replicated");
+            rustudio_core::load_trace::mark("play: replicated");
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
-            crate::load_trace::mark("play: client queries warmed");
+            rustudio_core::load_trace::mark("play: client queries warmed");
             self.setup_client_player();
-            crate::load_trace::mark("play: client player set up");
+            rustudio_core::load_trace::mark("play: client player set up");
             // Players.CharacterAutoLoads false: no character until a script
             // calls Player:LoadCharacter (the client's camera is the scripts').
             if self.character_auto_loads() {
@@ -792,11 +785,11 @@ impl Editor {
             }
             // Studio shows the client's view while playing.
             if self.play_shows_client {
-                self.show_play_side(Side::Client);
+                self.show_play_side(Side::Client, host);
             }
         }
         self.start_autoplay_sounds();
-        crate::load_trace::mark("play: DataModels running");
+        rustudio_core::load_trace::mark("play: DataModels running");
     }
 
     /// Player.CharacterRemoving (on both sides) just before the old character
@@ -854,7 +847,7 @@ impl Editor {
         }
     }
 
-    pub fn stop_play(&mut self) {
+    pub fn stop_play(&mut self, host: &mut dyn GameHost) {
         // A game's orthographic camera ends with the session.
         self.cam.ortho = None;
         self.cam.stretch = 1.0;
@@ -863,12 +856,10 @@ impl Editor {
             self.fire_player_removing();
             // The Play DataModels' plugin copies unload with them, the
             // client's first (measured in Studio: PlayClient, then PlayServer).
-            let host = std::mem::take(&mut self.plugins);
-            self.with_side(Side::Client, |rt, _, _| host.unload_from_play(rt));
-            self.with_side(Side::Server, |rt, _, _| host.unload_from_play(rt));
-            self.plugins = host;
+            self.with_side(Side::Client, |rt, _, _| host.unload_plugins(rt));
+            self.with_side(Side::Server, |rt, _, _| host.unload_plugins(rt));
         }
-        crate::telemetry::flush();
+        rustudio_core::telemetry::flush();
         self.stop_all_sounds();
         self.cam.basis = None;
         let Some(mut s) = self.play.take() else {
@@ -879,9 +870,8 @@ impl Editor {
         }
         self.doc.selection = s.saved_sel.clone();
         self.cam = s.saved_cam.clone();
-        self.scene = crate::scene::Scene::default();
-        self.drag = None;
-        self.explorer.expand_defaults(&self.doc);
+        self.scene = rustudio_render::scene::Scene::default();
+        host.document_changed(&self.doc);
         self.info(format!(
             "■ Stopped after {:.1} s; the edit DataModel is back as it was",
             s.time
@@ -903,7 +893,7 @@ impl Editor {
         let mut out = Vec::new();
         for s in &roots {
             for i in d.dom.descendants_of(*s) {
-                let client = crate::scene::enum_u32(d.prop(i.referent(), "RunContext")) == Some(2);
+                let client = rustudio_render::scene::enum_u32(d.prop(i.referent(), "RunContext")) == Some(2);
                 if i.class == "Script" && !client && script_enabled(d, i.referent()) {
                     out.push(i.referent());
                 }
@@ -917,7 +907,7 @@ impl Editor {
                 let Some(svc) = d.find_child(root, name) else { continue };
                 for i in d.dom.descendants_of(svc) {
                     let r = i.referent();
-                    if i.class != "Script" || crate::scene::enum_u32(d.prop(r, "RunContext")) != Some(1) || !script_enabled(d, r) {
+                    if i.class != "Script" || rustudio_render::scene::enum_u32(d.prop(r, "RunContext")) != Some(1) || !script_enabled(d, r) {
                         continue;
                     }
                     let mut p = i.parent();
@@ -940,7 +930,7 @@ impl Editor {
 
     /// The local player's name: the signed-in account's, as in Studio; offline
     /// Studio's "Player" when signed out.
-    pub(crate) fn player_name(&self) -> String {
+    pub fn player_name(&self) -> String {
         self.account.names().map_or_else(|| mech::PLAYER_NAME.to_string(), |n| n.0)
     }
 
@@ -969,7 +959,7 @@ impl Editor {
         // Signed in: the account's AccountAge, verified badge and membership,
         // as a signed-in Studio's Play gives its local player (players_chat).
         if let Some(uid) = self.account.user_id() {
-            let id = crate::runtime::domains::players_chat::account_identity(uid as i64, std::time::Duration::from_secs(5));
+            let id = rustudio_engine::runtime::domains::players_chat::account_identity(uid as i64, std::time::Duration::from_secs(5));
             if let (Some(id), Some(inst)) = (id, self.doc.dom.get_by_ref_mut(player)) {
                 inst.properties.insert(ustr("AccountAge"), Variant::Int32(id.account_age));
                 inst.properties.insert(ustr("HasVerifiedBadge"), Variant::Bool(id.verified));
@@ -1118,7 +1108,7 @@ impl Editor {
             // RunContext = Client Scripts run anywhere replicated.
             for i in cdoc.dom.descendants() {
                 if i.class == "Script"
-                    && crate::scene::enum_u32(cdoc.prop(i.referent(), "RunContext")) == Some(2)
+                    && rustudio_render::scene::enum_u32(cdoc.prop(i.referent(), "RunContext")) == Some(2)
                     && script_enabled(cdoc, i.referent())
                     && !local.contains(&i.referent())
                 {
@@ -1139,13 +1129,13 @@ impl Editor {
     /// twice a second, and drops the freed instances from the replication
     /// pairs. Roblox's Lua GC does the same; without it every tracer, hole
     /// and effect part a game ever made stayed in memory for the session.
-    fn collect_garbage(&mut self, dt: f32) {
+    fn collect_garbage(&mut self, dt: f32, host: &dyn GameHost) {
         let Some(s) = self.play.as_mut() else { return };
         s.memstats_frames += 1;
         s.memstats_worst = s.memstats_worst.max(dt);
-        let pass = s.time - s.gc_at >= crate::mech::GC_INTERVAL;
+        let pass = s.time - s.gc_at >= rustudio_core::mech::GC_INTERVAL;
         {
-            let _sc = crate::bench::scope("p9_gc_step");
+            let _sc = rustudio_core::bench::scope("p9_gc_step");
             for side in [Side::Server, Side::Client] {
                 self.with_side(side, |rt, _, _| rt.gc_step(dt as f64));
             }
@@ -1158,26 +1148,26 @@ impl Editor {
         let fallen = std::mem::take(&mut s.engine_orphans);
         let player = s.player;
         let model = s.character.as_ref().map(|c| c.model).unwrap_or_else(Ref::none);
-        let due = crate::runtime::memstats_on() && s.time - s.memstats_at >= 5.0;
-        let _sc = crate::bench::scope("p9_collect");
+        let due = rustudio_engine::runtime::memstats_on() && s.time - s.memstats_at >= 5.0;
+        let _sc = rustudio_core::bench::scope("p9_collect");
         let (server_freed, srv) = self
             .with_side(Side::Server, |rt, _, map| {
                 for r in &fallen {
                     rt.note_orphan(*r);
                 }
                 // (Plugin roots and the objects plugins made stay: src/plugin_host.)
-                let plugin_pins = crate::plugin_host::vm::pinned(&rt.lua);
+                let plugin_pins = host.plugin_pins(&rt.lua);
                 let freed = rt.collect(
                     &|r| r == player || r == model || map.s2c.contains_key(&r) || plugin_pins.contains(&r),
-                    crate::mech::GC_BUDGET,
+                    rustudio_core::mech::GC_BUDGET,
                 );
                 (freed.len(), if due { rt.mem_stats() } else { String::new() })
             })
             .unwrap_or_default();
         let (client_freed, cli) = self
             .with_side(Side::Client, |rt, _, map| {
-                let plugin_pins = crate::plugin_host::vm::pinned(&rt.lua);
-                let freed = rt.collect(&|r| map.c2s.contains_key(&r) || plugin_pins.contains(&r), crate::mech::GC_BUDGET);
+                let plugin_pins = host.plugin_pins(&rt.lua);
+                let freed = rt.collect(&|r| map.c2s.contains_key(&r) || plugin_pins.contains(&r), rustudio_core::mech::GC_BUDGET);
                 (freed.len(), if due { rt.mem_stats() } else { String::new() })
             })
             .unwrap_or_default();
@@ -1191,7 +1181,7 @@ impl Editor {
         s.memstats_at = s.time;
         s.memstats_frames = 0;
         s.memstats_worst = 0.0;
-        let rss = crate::platform::resident_bytes().map(|b| (b / 1024).to_string()).unwrap_or_default();
+        let rss = rustudio_core::platform::resident_bytes().map(|b| (b / 1024).to_string()).unwrap_or_default();
         let time = s.time;
         let (rs2c, rc2s) = (s.map.s2c.len(), s.map.c2s.len());
         eprintln!(
@@ -1228,7 +1218,7 @@ impl Editor {
                     replicate::apply(server, rt, map, ops);
                 }
             }
-            let _sc = crate::bench::scope("rep_dispatch");
+            let _sc = rustudio_core::bench::scope("rep_dispatch");
             rt.dispatch();
         });
     }
@@ -1244,7 +1234,7 @@ impl Editor {
                 .client_world()
                 .map(|w| std::mem::take(&mut w.outbox))
                 .unwrap_or_default();
-            crate::runtime::domains::services::perf::remotes(false, &to_server);
+            rustudio_engine::runtime::domains::services::perf::remotes(false, &to_server);
             if std::env::var_os("RUSTUDIO_GUI_DEBUG").is_some() {
                 for m in &to_server {
                     let name = self
@@ -1274,11 +1264,11 @@ impl Editor {
                             continue;
                         };
                         match msg.kind {
-                            RemoteKind::Event if crate::runtime::domains::web_social::is_engine_msg(&msg.args) => {
-                                crate::runtime::domains::web_social::engine_message(rt,remote,player,&msg.args,&c2s)
+                            RemoteKind::Event if rustudio_engine::runtime::domains::web_social::is_engine_msg(&msg.args) => {
+                                rustudio_engine::runtime::domains::web_social::engine_message(rt,remote,player,&msg.args,&c2s)
                             }
-                            RemoteKind::Event if crate::runtime::domains::gui_input::is_engine_msg(&msg.args) => {
-                                crate::runtime::domains::gui_input::engine_message(rt, remote, player, &msg.args, &c2s)
+                            RemoteKind::Event if rustudio_engine::runtime::domains::gui_input::is_engine_msg(&msg.args) => {
+                                rustudio_engine::runtime::domains::gui_input::engine_message(rt, remote, player, &msg.args, &c2s)
                             }
                             RemoteKind::Event => rt.deliver_event(
                                 remote,
@@ -1306,7 +1296,7 @@ impl Editor {
                 Some(s) => s.map.gate_remotes(to_client),
                 None => to_client,
             };
-            crate::runtime::domains::services::perf::remotes(true, &to_client);
+            rustudio_engine::runtime::domains::services::perf::remotes(true, &to_client);
             if to_client.is_empty() {
                 if self.client_world().is_none_or(|w| w.outbox.is_empty()) {
                     break;
@@ -1318,9 +1308,9 @@ impl Editor {
                 let s2c = |s: Ref| m.s2c.get(&s).copied();
                 for msg in to_client {
                     match msg.kind {
-                        RemoteKind::Event if crate::runtime::domains::web_social::is_engine_msg(&msg.args) => {
+                        RemoteKind::Event if rustudio_engine::runtime::domains::web_social::is_engine_msg(&msg.args) => {
                             if let Some(remote)=m.s2c.get(&msg.inst).copied() {
-                                crate::runtime::domains::web_social::engine_message(rt,remote,Ref::none(),&msg.args,&s2c);
+                                rustudio_engine::runtime::domains::web_social::engine_message(rt,remote,Ref::none(),&msg.args,&s2c);
                             }
                         }
                         RemoteKind::Event => {
@@ -1368,8 +1358,8 @@ impl Editor {
                     && !matches!(d.prop(i.referent(), "Enabled"), Some(Variant::Bool(false)))
                     && fits(i.referent())
                 {
-                    if let Some(xf) = crate::scene::xform_of(d, i.referent()) {
-                        let size = crate::scene::vec3_of(d.prop(i.referent(), "Size"))
+                    if let Some(xf) = rustudio_render::scene::xform_of(d, i.referent()) {
+                        let size = rustudio_render::scene::vec3_of(d.prop(i.referent(), "Size"))
                             .unwrap_or(Vec3::ONE);
                         let top = xf.pos + Vec3::Y * (size.y * 0.5);
                         // rot_y(yaw) * -Z = (-sin yaw, 0, -cos yaw).
@@ -1487,7 +1477,7 @@ impl Editor {
                 // emote wheel read them from here).
                 if let Some(look) = self.account.avatar().filter(|l| !l.emotes.is_empty()).cloned() {
                     if let Some(h) = self.doc.dom.descendants_of(m).find(|i| i.class == "Humanoid").map(|i| i.referent()) {
-                        self.doc.dom.insert(h, crate::avatar::emote_description(&look));
+                        self.doc.dom.insert(h, rustudio_engine::avatar::emote_description(&look));
                     }
                 }
                 m
@@ -1517,12 +1507,12 @@ impl Editor {
             }
         }
         // Roblox's Health and Animate, unless the place brought its own.
-        crate::default_scripts::insert_character_scripts(&mut self.doc, m, rig_type);
+        rustudio_core::default_scripts::insert_character_scripts(&mut self.doc, m, rig_type);
         // Animations (R15 only, as on Roblox): the avatar's packages unless
         // the game picks Standard, then the game's per-slot overrides and
         // custom clips (game_avatar.rs).
         if rig_type == RigType::R15 && starter.is_none() {
-            let rules = crate::game_avatar::rules(&self.doc);
+            let rules = rustudio_engine::game_avatar::rules(&self.doc);
             let client = self.account.shared_client();
             let mut packs = if rules.player_packs {
                 self.account.avatar().map(|l| l.animations.clone()).unwrap_or_default()
@@ -1532,18 +1522,18 @@ impl Editor {
             for (kind, id) in &rules.overrides {
                 packs.retain(|p| &p.0 != kind);
                 if *id > 0 {
-                    match crate::game_avatar::package(client.as_ref(), *id) {
+                    match rustudio_engine::game_avatar::package(client.as_ref(), *id) {
                         Some(b) => packs.push((kind.clone(), *id, b)),
                         None => self.warn(format!("Game animation override {kind} {id} could not be downloaded")),
                     }
                 }
             }
-            let slots = crate::avatar::put_on_animation_packs(&mut self.doc, m, &packs);
+            let slots = rustudio_engine::avatar::put_on_animation_packs(&mut self.doc, m, &packs);
             if !slots.is_empty() {
                 let whose = if rules.overrides.is_empty() { "Avatar" } else { "Avatar / game" };
                 self.info(format!("{whose} animations: {}", slots.join(", ")));
             }
-            let clips = crate::avatar::put_on_custom_clips(&mut self.doc, m, &rules.clips);
+            let clips = rustudio_engine::avatar::put_on_custom_clips(&mut self.doc, m, &rules.clips);
             if !clips.is_empty() {
                 self.info(format!("Game animation clips: {}", clips.join(", ")));
             }
@@ -1577,7 +1567,7 @@ impl Editor {
             .into_iter()
             .filter_map(|c| {
                 let i = self.doc.dom.get_by_ref(c)?;
-                doc::is_a(&i.class, "BasePart").then(|| (c, studio_collides(&i.name, rig_type)))
+                doc::is_a(&i.class, "BasePart").then(|| (c, rig::studio_collides(&i.name, rig_type)))
             })
             .collect();
         for (c, on) in body {
@@ -1744,7 +1734,7 @@ impl Editor {
         let root = self.doc.dom.root_ref();
         self.doc
             .find_child(root, "StarterPlayer")
-            .and_then(|sp| crate::scene::enum_u32(self.doc.prop(sp, "GameSettingsAvatar")))
+            .and_then(|sp| rustudio_render::scene::enum_u32(self.doc.prop(sp, "GameSettingsAvatar")))
             .and_then(|v| match v {
                 0 => Some(RigType::R6),
                 1 => Some(RigType::R15),
@@ -1843,7 +1833,7 @@ impl Editor {
             .doc
             .dom
             .descendants_of(model)
-            .filter(|i| crate::rig::is_animated_joint(&i.class))
+            .filter(|i| rustudio_engine::rig::is_animated_joint(&i.class))
             .map(|i| i.referent())
             .collect();
         for m in &motors {
@@ -1851,7 +1841,7 @@ impl Editor {
             self.doc.mark_tree(*m);
         }
         // An upgraded R15 body's ball sockets are disabled with it (Studio).
-        for b in crate::rig::ball_sockets(&self.doc, model) {
+        for b in rustudio_engine::rig::ball_sockets(&self.doc, model) {
             if let Some(inst) = self.doc.dom.get_by_ref_mut(b) {
                 inst.properties.insert(ustr("Enabled"), Variant::Bool(false));
             }
@@ -2186,7 +2176,7 @@ impl Editor {
             });
             // Out of the seat: the capsule rises clear of the seat's top (it
             // sat sunk into it).
-            let top = crate::scene::xform_of(&self.doc, seat).map(|xf| {
+            let top = rustudio_render::scene::xform_of(&self.doc, seat).map(|xf| {
                 let h = match self.doc.prop(seat, "Size") {
                     Some(Variant::Vector3(v)) => v.y,
                     _ => 1.0,
@@ -2277,7 +2267,7 @@ impl Editor {
     }
 
     /// One frame of the play session.
-    pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32) {
+    pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32, host: &mut dyn GameHost, no_ui: bool, shift: bool) {
         let Some(mode) = self.play.as_ref().map(|p| p.mode) else {
             return;
         };
@@ -2293,25 +2283,20 @@ impl Editor {
         // Roblox steps the game by at most 1/15 s a frame: slower frames slow
         // time(), physics and animations, while waits keep wall time (World::realtime).
         let realtime = self.fixed_dt.is_none();
-        let dt = dt.clamp(0.0, crate::mech::MAX_FRAME_DT);
+        let dt = dt.clamp(0.0, rustudio_core::mech::MAX_FRAME_DT);
         // The in-game menu's Leave stops the session; Reset Character kills
         // the character on the server (Humanoid.Health = 0, as Roblox does).
         if self.play.as_ref().is_some_and(|s| s.game.leave_request) {
-            self.stop_play();
+            self.stop_play(host);
             return;
         }
         // StudioTestService:EndTest ends the session; the Studio services
         // read the editor's settings (runtime/domains/testing*.rs).
         {
-            use crate::runtime::domains::testing as t;
+            use rustudio_engine::runtime::domains::testing as t;
             if let Some(value) = t::take_end_request() {
-                self.stop_play();
-                // (--no-ui / --result runs end there: Editor::finish_run)
-                if self.harness.ends_on_end_test() {
-                    self.harness.end_value = Some(value);
-                } else {
-                    t::report_test_run(&value, &self.log);
-                }
+                self.stop_play(host);
+                host.end_test(value, &self.log);
                 return;
             }
             t::set_editor_state(t::EditorState {
@@ -2340,7 +2325,7 @@ impl Editor {
             .map(|s| std::mem::take(&mut s.game.menu.lua))
             .unwrap_or_default();
         for code in menu_lua {
-            if let Some(e) = self.run_luau_as(Side::Client, &code, crate::runtime::security::CORE) {
+            if let Some(e) = self.run_luau_as(Side::Client, &code, rustudio_engine::runtime::security::CORE) {
                 self.warn(format!("Settings: {e}"));
             }
         }
@@ -2352,7 +2337,7 @@ impl Editor {
         // from the keys labelled ZQSD on AZERTY (src/keys.rs).
         let textbox = self.gui.focus.is_some();
         // No-UI runs report every key Roblox has a KeyCode for (F5–F12, /).
-        let all_keys = self.harness.no_ui;
+        let all_keys = no_ui;
         let blocked = ctx.egui_wants_keyboard_input()
             || self.play.as_ref().is_some_and(|s| s.game.menu_open);
         let typing = blocked || textbox;
@@ -2368,7 +2353,7 @@ impl Editor {
             // egui reports modifiers apart from keys (shift-lock is LeftShift).
             let mods = ctx.input(|i| i.modifiers);
             for (on, name) in [
-                (mods.shift || self.harness.shift, "LeftShift"),
+                (mods.shift || shift, "LeftShift"),
                 (mods.ctrl, "LeftControl"),
                 (mods.alt, "LeftAlt"),
             ] {
@@ -2416,7 +2401,7 @@ impl Editor {
                 let shift = "LeftShift".to_string();
                 if !raw_keys.contains(&shift) && !s.keys_prev.contains(&shift) {
                     let taps = ctx.input(|i| {
-                        crate::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift)
+                        rustudio_engine::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift)
                     });
                     if taps > 0 {
                         b.push((shift.clone(), textbox));
@@ -2441,7 +2426,7 @@ impl Editor {
         };
 
         // 1. Server script changes from last frame reach physics.
-        let sc = crate::bench::scope("p1_physics_sync");
+        let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
             let s = self.play.as_mut().expect("playing");
             let w = s.server.world.as_mut().expect("server world");
@@ -2457,7 +2442,7 @@ impl Editor {
             // stand-ins the character stands on and pushes (studio path,
             // physics_client_link.rs).
             if studio_path() && mode == RunMode::Play {
-                let _l = crate::bench::scope("p1b_client_link");
+                let _l = rustudio_core::bench::scope("p1b_client_link");
                 let model = s.character.as_ref().map(|c| c.model);
                 s.physics.link_client_bodies(&s.client_sim, &s.map.c2s, model);
             }
@@ -2471,7 +2456,7 @@ impl Editor {
         // RunService events before the world steps fire before it, the
         // Humanoid steps between PreAnimation and the Animator.
         {
-            let _s = crate::bench::scope("p2a_lua_pre");
+            let _s = rustudio_core::bench::scope("p2a_lua_pre");
             // (CameraRelative's turn: on the studio path after the client's
             // RenderStepped, at the end of the last frame, `hum_face_camera`.)
             if mode == RunMode::Play && !studio_path() {
@@ -2480,7 +2465,7 @@ impl Editor {
             self.lua_pre_physics(mode, dt, 0);
         }
         // 2. Character (owned by the client: written to both DataModels).
-        let sc = crate::bench::scope("p2_character");
+        let sc = rustudio_core::bench::scope("p2_character");
         let mut char_touches: Vec<Ref> = Vec::new();
         let mut state_change: Option<(State, State)> = None;
         let mut seat_change: Option<SeatChange> = None;
@@ -2494,11 +2479,11 @@ impl Editor {
             hum_out = Some(self.hum_pre(dt));
         }
         {
-            let _s = crate::bench::scope("p2_npc_pre");
+            let _s = rustudio_core::bench::scope("p2_npc_pre");
             self.npc_pre(dt);
         }
         {
-            let _s = crate::bench::scope("p2b_lua_pre");
+            let _s = rustudio_core::bench::scope("p2b_lua_pre");
             self.lua_pre_physics(mode, dt, 1);
             // What the scripts did on Stepped / PreSimulation reaches this
             // frame's world steps.
@@ -2520,18 +2505,18 @@ impl Editor {
 
         drop(sc);
         // 3. Physics (server-authoritative for everything not owned by the client).
-        let sc = crate::bench::scope("p3_physics_step");
+        let sc = rustudio_core::bench::scope("p3_physics_step");
         self.sync_touch_interest();
         let result = {
             let s = self.play.as_mut().expect("playing");
             s.physics.step(&mut self.doc, dt)
         };
         {
-            let _s = crate::bench::scope("p3a_npc_post");
+            let _s = rustudio_core::bench::scope("p3a_npc_post");
             self.npc_post();
         }
         if let Some(mut o) = hum_out.take() {
-            let _s = crate::bench::scope("p3a_humanoid_post");
+            let _s = rustudio_core::bench::scope("p3a_humanoid_post");
             self.hum_post(&mut o);
             char_touches = std::mem::take(&mut o.touches);
             state_change = o.state_change;
@@ -2559,7 +2544,7 @@ impl Editor {
 
         drop(sc);
         // Touch events (CanTouch parts only).
-        let sc = crate::bench::scope("p3b_touch_prep");
+        let sc = rustudio_core::bench::scope("p3b_touch_prep");
         // (A part only the client has, met by its character (physics_client_link.rs),
         // is read from the client's document.)
         let client_doc = self.play.as_ref().and_then(|s| s.other_doc.as_ref());
@@ -2626,7 +2611,7 @@ impl Editor {
                         let Some(h) = m(*h) else { continue };
                         let item = |s: State| {
                             LEnumItem::from_name("HumanoidStateType", s.enum_name())
-                                .and_then(|e| crate::ltypes::enum_value(&rt.lua, e).ok())
+                                .and_then(|e| rustudio_engine::ltypes::enum_value(&rt.lua, e).ok())
                                 .unwrap_or(Value::Nil)
                         };
                         rt.fire(h, "StateChanged", vec![item(*old), item(*new)]);
@@ -2678,7 +2663,7 @@ impl Editor {
                     rt.fire(a, ev, vec![rt.inst(b)]);
                     rt.fire(b, ev, vec![rt.inst(a)]);
                     if *started {
-                        crate::rig::fire_humanoid_touched(rt, a, b);
+                        rustudio_engine::rig::fire_humanoid_touched(rt, a, b);
                     }
                     if let Some(t) = twin {
                         rt.fire(a, t, vec![rt.inst(b)]);
@@ -2691,7 +2676,7 @@ impl Editor {
                     if let Some(p) = m(*p) {
                         rt.fire(p, "Touched", vec![rt.inst(cp)]);
                         rt.fire(cp, "Touched", vec![rt.inst(p)]);
-                        crate::rig::fire_humanoid_touched(rt, cp, p);
+                        rustudio_engine::rig::fire_humanoid_touched(rt, cp, p);
                         // The character is simulated by its client.
                         if map.is_some() {
                             rt.fire(cp, "LocalSimulationTouched", vec![rt.inst(p)]);
@@ -2711,7 +2696,7 @@ impl Editor {
             if let Some((old, new)) = state_change {
                 let item = |s: State| {
                     LEnumItem::from_name("HumanoidStateType", s.enum_name())
-                        .and_then(|i| crate::ltypes::enum_value(&rt.lua, i).ok())
+                        .and_then(|i| rustudio_engine::ltypes::enum_value(&rt.lua, i).ok())
                         .unwrap_or(Value::Nil)
                 };
                 rt.fire(h, "StateChanged", vec![item(old), item(new)]);
@@ -2754,7 +2739,7 @@ impl Editor {
         };
         let seat_server = seat_change.as_ref().and_then(|c| c.seat);
         drop(sc);
-        let sc = crate::bench::scope("p4_server_lua");
+        let sc = rustudio_core::bench::scope("p4_server_lua");
         let root = self.doc.dom.root_ref();
         let run_service = self.doc.find_child(root, "RunService");
         let humanoid_server = humanoid_ref.is_some().then_some(humanoid_ref);
@@ -2797,18 +2782,18 @@ impl Editor {
 
         drop(sc);
         // 5. Replicate to the client, then client scripts.
-        let sc = crate::bench::scope("p5_replicate");
+        let sc = rustudio_core::bench::scope("p5_replicate");
         // The server's Animator track slots, then the frame's replication.
-        self.with_side(Side::Server, |rt, _, _| crate::anim_replicate::publish(&rt.lua));
+        self.with_side(Side::Server, |rt, _, _| rustudio_engine::anim_replicate::publish(&rt.lua));
         if let Some(s) = self.play.as_mut() {
             s.map.begin_frame(dt as f64);
         }
         self.replicate();
         self.handover_frame();
         drop(sc);
-        let sc = crate::bench::scope("p6_client_lua");
+        let sc = rustudio_core::bench::scope("p6_client_lua");
         if mode == RunMode::Play {
-            let prep = crate::bench::scope("p6a_prep");
+            let prep = rustudio_core::bench::scope("p6a_prep");
             // Server → client refs for just what this phase looks up (touches,
             // the character, humanoid states, moving parts): cloning the whole
             // map (Place B: 116k instances) was 0.75 ms a frame.
@@ -2930,16 +2915,16 @@ impl Editor {
             let mut client_velocities = client_velocities;
             client_velocities.extend(client_own.iter().map(|(r, m)| (*r, m.0)));
             drop(prep);
-            let lua_sc = crate::bench::scope("p6b_lua");
+            let lua_sc = rustudio_core::bench::scope("p6b_lua");
             let server_doc_id = self.doc.id;
             self.with_side(Side::Client, |rt, _, _| {
                 if let Some(mut w) = rt.world_mut() {
                     w.velocities = client_velocities;
                     // Angular velocities / awake counts for the client's
                     // scripts (domains/world_part.rs reads them by document).
-                    let _s = crate::bench::scope("p6b_mirror");
-                    crate::physics::live::mirror(server_doc_id, w.d().id, &map_s2c);
-                    crate::physics::live::overlay_spins(
+                    let _s = rustudio_core::bench::scope("p6b_mirror");
+                    rustudio_physics::physics::live::mirror(server_doc_id, w.d().id, &map_s2c);
+                    rustudio_physics::physics::live::overlay_spins(
                         w.d().id,
                         client_own.iter().map(|(r, m)| (*r, (m.1, m.2))),
                     );
@@ -2950,15 +2935,15 @@ impl Editor {
                         // (the client's plugin widgets keep their boxes:
                         // plugin_host/widgets_ui.rs lays them out)
                         let old = std::mem::replace(&mut w.input.gui_layout, gui_layout);
-                        crate::plugin_host::widgets_ui::keep_play_layout(&old, &mut w.input.gui_layout);
+                        host.keep_play_layout(&old, &mut w.input.gui_layout);
                     }
                     w.input.menu_open = menu_open;
                 }
                 // AbsoluteSize / AbsolutePosition / ViewportSize changes from
                 // the new layout (a resized window refits screen-sized GUIs).
                 {
-                    let _s = crate::bench::scope("p6b_layout_changes");
-                    let _ = crate::runtime::ext::fire_layout_changes(&rt.lua);
+                    let _s = rustudio_core::bench::scope("p6b_layout_changes");
+                    let _ = rustudio_engine::runtime::ext::fire_layout_changes(&rt.lua);
                 }
                 // GuiService.MenuOpened / MenuClosed (the Esc menu).
                 if let Some(gs) = gui_service {
@@ -3045,7 +3030,7 @@ impl Editor {
                     rt.fire(*a, ev, vec![rt.inst(*b)]);
                     rt.fire(*b, ev, vec![rt.inst(*a)]);
                     if *started {
-                        crate::rig::fire_humanoid_touched(rt, *a, *b);
+                        rustudio_engine::rig::fire_humanoid_touched(rt, *a, *b);
                     }
                     rt.fire(*a, twin, vec![rt.inst(*b)]);
                     rt.fire(*b, twin, vec![rt.inst(*a)]);
@@ -3058,7 +3043,7 @@ impl Editor {
                 if let Some(uis) = cuis {
                     let pad = |i: usize| {
                         LEnumItem::from_name("UserInputType", &format!("Gamepad{}", i + 1))
-                            .and_then(|e| crate::ltypes::enum_value(&rt.lua, e).ok())
+                            .and_then(|e| rustudio_engine::ltypes::enum_value(&rt.lua, e).ok())
                             .unwrap_or(Value::Nil)
                     };
                     for i in 0..8 {
@@ -3126,13 +3111,13 @@ impl Editor {
                 if let Some(mut w) = rt.world_mut() {
                     w.realtime = realtime;
                 }
-                let _s = crate::bench::scope("p6b_rt_step");
+                let _s = rustudio_core::bench::scope("p6b_rt_step");
                 if crs.is_none() {
                     rt.step(dt as f64);
                 }
             });
             drop(lua_sc);
-            let req = crate::bench::scope("p6c_requests");
+            let req = rustudio_core::bench::scope("p6c_requests");
             self.game_requests(Side::Client);
             self.read_client_input_state();
             // Shift lock / first person: the root turns to the camera RenderStepped
@@ -3143,14 +3128,14 @@ impl Editor {
             self.deliver_remotes();
             drop(req);
             // The client's own assemblies (its simulation step in Studio).
-            let _cj = crate::bench::scope("p6d_client_joints");
+            let _cj = rustudio_core::bench::scope("p6d_client_joints");
             if let Some(s) = self.play.as_mut() {
                 if let Some(cd) = s.other_doc.as_mut() {
                     s.client_joints.solve(cd, &s.map.c2s);
                 }
             }
             drop(_cj);
-            let _cp = crate::bench::scope("p6e_client_physics");
+            let _cp = rustudio_core::bench::scope("p6e_client_physics");
             let server_doc = self.doc.id;
             if let Some(s) = self.play.as_mut() {
                 // Velocities client scripts gave parts (the character's own
@@ -3178,7 +3163,7 @@ impl Editor {
                 // (RUSTUDIO_SOLVER=studio only: the rapier path keeps its behaviour.)
                 let player = s.player;
                 let roots: Vec<Ref> = if studio_path() {
-                    crate::runtime::domains::world::part::player_owned_roots_of(server_doc, player)
+                    rustudio_engine::runtime::domains::world::part::player_owned_roots_of(server_doc, player)
                 } else {
                     Vec::new()
                 };
@@ -3196,8 +3181,8 @@ impl Editor {
                     }
                     if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
                         let pick = |r: Ref| s.map.c2s.get(&r).is_some_and(|sr| s.physics.in_bodies(*sr, &owned));
-                        let sets = crate::physics::live::take_spin_sets_of(cid, pick);
-                        let adds = crate::physics::live::take_spins_of(cid, pick);
+                        let sets = rustudio_physics::physics::live::take_spin_sets_of(cid, pick);
+                        let adds = rustudio_physics::physics::live::take_spins_of(cid, pick);
                         for (r, w, add) in sets.into_iter().map(|(r, w)| (r, w, false)).chain(adds.into_iter().map(|(r, w)| (r, w, true))) {
                             if let Some(sr) = s.map.c2s.get(&r).copied() {
                                 s.physics.set_spin(sr, w, add);
@@ -3230,16 +3215,16 @@ impl Editor {
                     // client's document: the server's mirror goes back under
                     // them for scripts that run before the next frame's.
                     if s.client_sim.has_bodies() {
-                        crate::physics::live::mirror(server_doc_id, cd.id, &s.map.s2c);
+                        rustudio_physics::physics::live::mirror(server_doc_id, cd.id, &s.map.s2c);
                         let own = s.client_sim.own_motion(&s.map.c2s);
-                        crate::physics::live::overlay_spins(cd.id, own.into_iter().map(|(r, m)| (r, (m.1, m.2))));
+                        rustudio_physics::physics::live::overlay_spins(cd.id, own.into_iter().map(|(r, m)| (r, (m.1, m.2))));
                     }
                 }
             }
         }
         drop(sc);
 
-        self.collect_garbage(dt);
+        self.collect_garbage(dt, host);
 
         // 6. Deaths and respawns.
         let (died, reload) = server_out;
@@ -3281,13 +3266,13 @@ impl Editor {
                 Some(Variant::Ref(r)) if cd.exists(r) => r,
                 _ => cd.find_child(ws, "Camera")?,
             };
-            let xf = crate::scene::xform_of(cd, cam)?;
+            let xf = rustudio_render::scene::xform_of(cd, cam)?;
             let fov = f32_of(cd.prop(cam, "FieldOfView")).unwrap_or(mech::FOV_DEG);
             // ProjectionType Orthographic (domains/world_camera.rs).
-            let ortho = (crate::scene::enum_u32(cd.prop(cam, "ProjectionType")) == Some(1)).then(|| {
+            let ortho = (rustudio_render::scene::enum_u32(cd.prop(cam, "ProjectionType")) == Some(1)).then(|| {
                 (
                     f32_of(cd.prop(cam, "OrthographicSize")).unwrap_or(300.0),
-                    crate::scene::enum_u32(cd.prop(cam, "OrthographicMode")).unwrap_or(0),
+                    rustudio_render::scene::enum_u32(cd.prop(cam, "OrthographicMode")).unwrap_or(0),
                 )
             });
             let stretch = f32_of(cd.prop(cam, "ViewStretch")).unwrap_or(1.0);
@@ -3313,11 +3298,11 @@ impl Editor {
             if let Some(s) = self.play.as_ref() {
                 let root = s.character.as_ref().and_then(|c| {
                     let cr = s.map.s2c.get(&c.rig.root).copied()?;
-                    crate::scene::xform_of(s.other_doc.as_ref()?, cr)
+                    rustudio_render::scene::xform_of(s.other_doc.as_ref()?, cr)
                 });
                 if let Some(r) = root {
                     let yaw = |look: Vec3| (-look.x).atan2(-look.z);
-                    crate::app::tee_log(&format!(
+                    rustudio_core::log::tee_log(&format!(
                         "FEELR|{:.4}|{:.4}|{:.4},{:.4},{:.4}|{:.5}|{:.4},{:.4},{:.4}|{:.5}",
                         s.time,
                         dt,
@@ -3339,7 +3324,7 @@ impl Editor {
     /// Runs a Luau chunk on one side of the Play session (test harness);
     /// its prints go to Output like a script's. Returns an error message.
     pub fn run_luau(&mut self, side: Side, code: &str) -> Option<String> {
-        self.run_luau_as(side, code, crate::runtime::security::COMMAND)
+        self.run_luau_as(side, code, rustudio_engine::runtime::security::COMMAND)
     }
 
     /// `run_luau` at identity `id` (the in-game menu runs as a CoreScript).
@@ -3347,17 +3332,17 @@ impl Editor {
         self.server_front();
         let r = self.with_side(side, |rt, _, _| {
             // The given identity, for this chunk and what it spawns.
-            let out = crate::runtime::security::with_main_identity(&rt.lua, id, || {
+            let out = rustudio_engine::runtime::security::with_main_identity(&rt.lua, id, || {
                 // Scripts' _G and shared, with every host global.
-                let env = crate::globals_parity::harness_env(&rt.lua)?;
+                let env = rustudio_engine::globals_parity::harness_env(&rt.lua)?;
                 // As a thread, like the Studio command bar: the chunk may
                 // yield (task.wait), and its errors still come back here.
                 let f = rt.lua.load(code).set_name("=harness").set_environment(env).into_function()?;
-                let th = crate::runtime::domains::assets_cloud::scene::create_thread(&rt.lua, f)?;
+                let th = rustudio_engine::runtime::domains::assets_cloud::scene::create_thread(&rt.lua, f)?;
                 th.resume::<mlua::MultiValue>(()).map(|_| ())
             })
             .err()
-            .map(|e| crate::runtime::describe_error(&e));
+            .map(|e| rustudio_engine::runtime::describe_error(&e));
             rt.dispatch();
             out
         });
@@ -3369,7 +3354,7 @@ impl Editor {
     /// host): the server is put in front first and the shown side back
     /// after, so each side's runtime gets its own DataModel whichever side
     /// the editor shows.
-    pub(crate) fn with_play_side<R>(
+    pub fn with_play_side<R>(
         &mut self,
         side: Side,
         f: impl FnOnce(&Runtime, Option<&Document>, &mut RepMap) -> R,
@@ -3381,7 +3366,7 @@ impl Editor {
     }
 
     /// The Play session's sides (server, and the client in Play).
-    pub(crate) fn play_sides(&self) -> Vec<Side> {
+    pub fn play_sides(&self) -> Vec<Side> {
         match self.play.as_ref() {
             Some(s) if s.client.is_some() => vec![Side::Server, Side::Client],
             Some(_) => vec![Side::Server],
@@ -3391,7 +3376,7 @@ impl Editor {
 
     /// A side's Lua state between frames (read its app data; don't call
     /// into the runtime with it).
-    pub(crate) fn play_side_lua(&self, side: Side) -> Option<&mlua::Lua> {
+    pub fn play_side_lua(&self, side: Side) -> Option<&mlua::Lua> {
         let s = self.play.as_ref()?;
         match side {
             Side::Server => Some(&s.server.runtime.lua),
@@ -3400,7 +3385,7 @@ impl Editor {
     }
 
     /// A side's DataModel between frames (the shown one is `self.doc`).
-    pub(crate) fn play_side_doc_mut(&mut self, side: Side) -> Option<&mut Document> {
+    pub fn play_side_doc_mut(&mut self, side: Side) -> Option<&mut Document> {
         let s = self.play.as_mut()?;
         if s.showing == side {
             Some(&mut self.doc)
@@ -3460,7 +3445,7 @@ fn client_scripts(cd: &Document, under: &[Option<Ref>]) -> Vec<Ref> {
     for u in under.iter().flatten() {
         for i in cd.dom.descendants_of(*u) {
             let client_script = i.class == "Script"
-                && crate::scene::enum_u32(cd.prop(i.referent(), "RunContext")) == Some(2);
+                && rustudio_render::scene::enum_u32(cd.prop(i.referent(), "RunContext")) == Some(2);
             if (i.class == "LocalScript" || client_script) && script_enabled(cd, i.referent()) {
                 out.push(i.referent());
             }
@@ -3484,10 +3469,10 @@ fn character_pose(ch: &Character, transforms: &HashMap<Ref, Xform>) -> Vec<(Ref,
 /// (R6: the 2-stud legs), root size and the box its torso, head and
 /// root fill in the root's frame, from the root's bottom up (Studio's limbs
 /// don't collide; anything under the root's bottom is the floor rays' job).
-fn hum_shape(doc: &Document, model: Ref, root_lift: f32) -> crate::physics::HumShape {
+fn hum_shape(doc: &Document, model: Ref, root_lift: f32) -> rustudio_physics::physics::HumShape {
     let root = doc.find_named(model, "HumanoidRootPart");
-    let root_xf = root.and_then(|r| crate::scene::xform_of(doc, r));
-    let size = root.and_then(|r| crate::scene::vec3_of(doc.prop(r, "Size"))).unwrap_or(Vec3::new(2.0, 2.0, 1.0));
+    let root_xf = root.and_then(|r| rustudio_render::scene::xform_of(doc, r));
+    let size = root.and_then(|r| rustudio_render::scene::vec3_of(doc.prop(r, "Size"))).unwrap_or(Vec3::new(2.0, 2.0, 1.0));
     let hip = rig::root_height(doc, model) - size.y * 0.5;
     let mut lo = -size * 0.5;
     let mut hi = size * 0.5;
@@ -3496,11 +3481,11 @@ fn hum_shape(doc: &Document, model: Ref, root_lift: f32) -> crate::physics::HumS
             continue;
         }
         let r = inst.referent();
-        let s = crate::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::ONE);
+        let s = rustudio_render::scene::vec3_of(doc.prop(r, "Size")).unwrap_or(Vec3::ONE);
         if !matches!(inst.name.as_str(), "UpperTorso" | "LowerTorso" | "Torso" | "Head") {
             continue;
         }
-        let (Some(rx), Some(px)) = (root_xf, crate::scene::xform_of(doc, r)) else { continue };
+        let (Some(rx), Some(px)) = (root_xf, rustudio_render::scene::xform_of(doc, r)) else { continue };
         let inv = rx.rot.transpose();
         for i in 0..8 {
             let c = Vec3::new(
@@ -3521,31 +3506,23 @@ fn hum_shape(doc: &Document, model: Ref, root_lift: f32) -> crate::physics::HumS
     for inst in doc.dom.descendants_of(model) {
         if doc::is_a(&inst.class, "BasePart") {
             parts += 1;
-            if let Some(s) = crate::scene::vec3_of(doc.prop(inst.referent(), "Size")) {
+            if let Some(s) = rustudio_render::scene::vec3_of(doc.prop(inst.referent(), "Size")) {
                 mass += s.x * s.y * s.z * mech::PART_DENSITY;
             }
         }
     }
     let r6 = doc.find_named(model, "UpperTorso").is_none() && doc.find_named(model, "Torso").is_some();
-    crate::physics::HumShape { hip, root_size: size, box_lo: lo, box_hi: hi, root_lift, mass, parts, r6 }
-}
-
-/// Whether a character part collides on Studio's spawned character.
-pub(crate) fn studio_collides(name: &str, rig: RigType) -> bool {
-    match rig {
-        RigType::R15 => matches!(name, "HumanoidRootPart" | "UpperTorso" | "LowerTorso" | "Head"),
-        RigType::R6 => matches!(name, "Torso" | "Head"),
-    }
+    rustudio_physics::physics::HumShape { hip, root_size: size, box_lo: lo, box_hi: hi, root_lift, mass, parts, r6 }
 }
 
 /// RUSTUDIO_SOLVER=studio (or studio-nextgen): the Play-side changes that came with the
 /// Studio solver port (client-owned assemblies' script velocities, shift lock's turn
 /// before the frame is drawn) apply; the default rapier path keeps its old behaviour.
 fn studio_path() -> bool {
-    crate::solver::kind() != crate::solver::SolverKind::Rapier
+    rustudio_physics::solver::kind() != rustudio_physics::solver::SolverKind::Rapier
 }
 
-impl Editor {
+impl Game {
     /// The parts whose touches a script hears, on either side (`World::touch_refs`):
     /// the part itself, or every part of a character whose Humanoid.Touched is heard
     /// (rig.rs `fire_humanoid_touched`: the model's direct BasePart children). Given to

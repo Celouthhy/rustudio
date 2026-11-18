@@ -45,9 +45,9 @@ use mlua::{Lua, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 
 use super::util::*;
-use crate::doc;
+use rustudio_core::doc;
 use crate::ltypes::*;
-use crate::math::Xform;
+use rustudio_core::math::Xform;
 use crate::runtime::*;
 
 /// One drag in progress (per document: the server's).
@@ -128,7 +128,7 @@ pub fn event_args(
 }
 
 fn enum_or(d: &doc::Document, r: Ref, k: &str, def: u32) -> u32 {
-    crate::scene::enum_u32(d.prop(r, k)).unwrap_or(def)
+    rustudio_render::scene::enum_u32(d.prop(r, k)).unwrap_or(def)
 }
 
 /// The reference frame now (GetReferenceFrame's rule).
@@ -382,10 +382,10 @@ fn apply_motion(lua: &Lua, ray: &LRay, view: Xform, mode: bool) -> mlua::Result<
             // part's goal orientation for rotation styles.
             let delta = mul(&goal, &dr.start_pivot.inverse());
             let rotate = matches!(style, 5 | 6 | 7);
-            crate::physics::live::set_drag(
+            rustudio_physics::physics::live::set_drag(
                 id,
                 dr.part,
-                Some(crate::physics::live::DragGoal {
+                Some(rustudio_physics::physics::live::DragGoal {
                     grab_local: dr.part_start.inverse().apply(dr.hit),
                     goal: delta.apply(dr.hit),
                     goal_rot: rotate.then(|| Quat::from_mat3(&(delta.rot * dr.part_start.rot)).normalize()),
@@ -405,7 +405,7 @@ fn apply_motion(lua: &Lua, ray: &LRay, view: Xform, mode: bool) -> mlua::Result<
 pub fn end(lua: &Lua) -> mlua::Result<()> {
     let id = world(lua)?.d().id;
     let Some(dr) = DRAGS.with(|m| m.borrow_mut().remove(&id)) else { return Ok(()) };
-    crate::physics::live::set_drag(id, dr.part, None);
+    rustudio_physics::physics::live::set_drag(id, dr.part, None);
     let exists = world(lua)?.d().exists(dr.part);
     if let (Some(was), true) = (dr.restore_anchor, exists) {
         store_prop(lua, dr.part, "Anchored", Variant::Bool(was))?;

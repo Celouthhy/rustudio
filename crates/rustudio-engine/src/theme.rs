@@ -28,6 +28,9 @@ pub const WARN: Color32 = Color32::from_rgb(240, 200, 90);
 pub const ERROR: Color32 = Color32::from_rgb(240, 96, 86);
 
 pub fn apply(ctx: &egui::Context) {
+    // eframe can report the system theme after app creation. Select our
+    // dark style before customizing it so later frames keep using it.
+    ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.global_style()).clone();
     let v = &mut style.visuals;
     *v = egui::Visuals::dark();
@@ -84,4 +87,29 @@ pub fn dock_style(style: &egui::Style) -> egui_dock::Style {
     s.separator.color_dragged = SELECT;
     s.overlay.selection_color = ACCENT.gamma_multiply(0.4);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_style_survives_system_theme_changes() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+
+        for system_theme in [egui::Theme::Light, egui::Theme::Dark, egui::Theme::Light] {
+            let input = egui::RawInput {
+                system_theme: Some(system_theme),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                assert_eq!(ctx.theme(), egui::Theme::Dark);
+                assert!(ui.visuals().dark_mode);
+                assert_eq!(ui.visuals().widgets.inactive.bg_fill, PANEL_ALT);
+                assert_eq!(ui.visuals().override_text_color, Some(TEXT));
+            });
+            output.textures_delta.clear();
+        }
+    }
 }

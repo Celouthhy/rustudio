@@ -562,7 +562,7 @@ mod tests {
 
 /// Decodes textures on a few worker threads (a map load asks for hundreds at
 /// once; decoding them in the frame that asked froze it for seconds).
-/// A decoded image and its mip chain (render::mip_chain), both made on a
+/// A decoded image and its mip chain (`mip_chain`), both made on a
 /// decode worker so the upload on the main thread only copies.
 pub type Decoded = Result<(Rgba, Option<Vec<u8>>, Option<Waiting>), String>;
 
@@ -610,7 +610,7 @@ pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sende
                     std::thread::sleep(std::time::Duration::from_millis(4));
                 }
                 let r = decode(&bytes).map(|img| {
-                    let mips = crate::render::mip_chain_for(&img);
+                    let mips = mip_chain_for(&img);
                     let waiting = Waiting::new(img.pixels.len() + mips.as_ref().map_or(0, |m| m.len()));
                     (img, mips, Some(waiting))
                 });
@@ -622,4 +622,91 @@ pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sende
     if let Ok(tx) = pool.lock() {
         let _ = tx.send((bytes, done, id));
     }
+}
+
+thread_local! {
+    /// Mips made off the main thread for the image being uploaded (its
+    /// pixels' address and the chain): see [`with_mips`].
+    static READY_MIPS: std::cell::RefCell<Option<(usize, Vec<u8>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The mip chain add_texture would make for `img` (None when it makes none).
+fn mip_chain_for(img: &Rgba) -> Option<Vec<u8>> {
+    let (w, h) = (img.width.max(1), img.height.max(1));
+    (img.pixels.len() == (w * h * 4) as usize).then(|| mip_chain(w, h, &img.pixels))
+}
+
+/// Runs `upload` (which adds `pixels` as a texture) with `mips` already made
+/// for it: add_texture takes them instead of building the chain itself.
+pub fn with_mips<R>(pixels: &[u8], mips: Option<Vec<u8>>, upload: impl FnOnce() -> R) -> R {
+    let Some(m) = mips else { return upload() };
+    READY_MIPS.with(|c| *c.borrow_mut() = Some((pixels.as_ptr() as usize, m)));
+    let r = upload();
+    READY_MIPS.with(|c| c.borrow_mut().take());
+    r
+}
+
+/// The chain `with_mips` made for these pixels, for the upload running now.
+pub fn ready_mips(rgba: &[u8]) -> Option<Vec<u8>> {
+    READY_MIPS.with(|c| {
+        let mut c = c.borrow_mut();
+        match c.as_ref() {
+            Some((p, _)) if *p == rgba.as_ptr() as usize => c.take().map(|m| m.1),
+            _ => None,
+        }
+    })
+}
+
+/// An RGBA8 sRGB image followed by its mip levels, 2×2 texels averaged in
+/// linear light (see `add_texture`).
+pub fn mip_chain(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    use std::sync::OnceLock;
+    static TO_LIN: OnceLock<[f32; 256]> = OnceLock::new();
+    let to_lin = TO_LIN.get_or_init(|| std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2)));
+    // round(v^(1/2.2) * 255) without powf: the byte whose rounding interval
+    // holds v (thresholds ((s - 0.5) / 255)^2.2). powf per channel per texel
+    // made mip chains a large share of a map load's texture time.
+    static TH: OnceLock<[f32; 255]> = OnceLock::new();
+    let th = TH.get_or_init(|| std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2)));
+    let to_srgb = |v: f32| th.partition_point(|&t| t <= v) as u8;
+    // (exactly the chain's size: growing a Vec of level 0 by doubling held
+    // half as much again as the chain needs)
+    let mut total = rgba.len();
+    let (mut cw, mut ch) = (w, h);
+    while cw > 1 || ch > 1 {
+        (cw, ch) = ((cw / 2).max(1), (ch / 2).max(1));
+        total += (cw * ch * 4) as usize;
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(rgba);
+    let (mut cw, mut ch) = (w, h);
+    let mut prev = rgba.to_vec();
+    while cw > 1 || ch > 1 {
+        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut next = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0f32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let sx = (x * 2 + dx).min(cw - 1);
+                    let sy = (y * 2 + dy).min(ch - 1);
+                    let o = ((sy * cw + sx) * 4) as usize;
+                    for c in 0..3 {
+                        acc[c] += to_lin[prev[o + c] as usize];
+                    }
+                    acc[3] += prev[o + 3] as f32;
+                }
+                let o = ((y * nw + x) * 4) as usize;
+                for c in 0..3 {
+                    next[o + c] = to_srgb(acc[c] * 0.25);
+                }
+                next[o + 3] = (acc[3] * 0.25 + 0.5) as u8;
+            }
+        }
+        out.extend_from_slice(&next);
+        prev = next;
+        cw = nw;
+        ch = nh;
+    }
+    out
 }

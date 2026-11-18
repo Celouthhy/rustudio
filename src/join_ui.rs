@@ -9,7 +9,7 @@ use egui::{Color32, RichText};
 use rustudio_net::live::JoinStage;
 
 use crate::app::Editor;
-use crate::theme;
+use rustudio_engine::theme;
 
 /// No data for this long during a step: say it may be stuck.
 const STALL: Duration = Duration::from_secs(20);
@@ -144,7 +144,7 @@ fn step_row(ui: &mut egui::Ui, label: &str, mark: Mark, detail: Option<(String, 
     let p = ui.painter();
     let (text, time) = match &mark {
         Mark::Done(d) => {
-            crate::ti::paint(p, ir, "circle-check-filled", theme::SELECT);
+            rustudio_engine::ti::paint(p, ir, "circle-check-filled", theme::SELECT);
             (theme::TEXT_DIM, secs(*d))
         }
         Mark::Now(d) => {
@@ -152,7 +152,7 @@ fn step_row(ui: &mut egui::Ui, label: &str, mark: Mark, detail: Option<(String, 
             (theme::TEXT, secs(*d))
         }
         Mark::Failed(d) => {
-            crate::ti::paint(p, ir, "circle-x-filled", theme::ERROR);
+            rustudio_engine::ti::paint(p, ir, "circle-x-filled", theme::ERROR);
             (theme::TEXT, secs(*d))
         }
         Mark::Later => {
@@ -199,7 +199,7 @@ impl Editor {
                         None => {
                             let (r, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                             ui.painter().rect_filled(r, 10.0, theme::PANEL_ALT);
-                            crate::ti::paint(ui.painter(), r.shrink(28.0), "world", theme::TEXT_DIM);
+                            rustudio_engine::ti::paint(ui.painter(), r.shrink(28.0), "world", theme::TEXT_DIM);
                         }
                     }
                     ui.add_space(14.0);

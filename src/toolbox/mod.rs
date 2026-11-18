@@ -245,7 +245,7 @@ pub enum Ask {
 /// The audio card / detail player.
 #[derive(Default)]
 pub struct Player {
-    pub audio: Option<crate::audio::Audio>,
+    pub audio: Option<rustudio_engine::audio::Audio>,
     pub playing: Option<u64>,
     pub loading: Option<u64>,
     pub bytes: HashMap<u64, Arc<Vec<u8>>>,
@@ -353,7 +353,7 @@ fn persist_path() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("RUSTUDIO_TOOLBOX_STATE") {
         return p.into();
     }
-    crate::paths::config().join("rustudio").join("toolbox.json")
+    rustudio_core::paths::config().join("rustudio").join("toolbox.json")
 }
 
 fn load_persist() -> Persist {
@@ -752,7 +752,7 @@ impl Toolbox {
             }
             return;
         };
-        let a = self.player.audio.get_or_insert_with(crate::audio::Audio::new);
+        let a = self.player.audio.get_or_insert_with(rustudio_engine::audio::Audio::new);
         match a.play(id, b, 0.5, 1.0, false, 0.0, Default::default()) {
             Ok(()) => {
                 self.player.playing = Some(id);

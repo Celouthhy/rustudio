@@ -274,32 +274,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn boxes_match_brute_force() {
-        use crate::math::Xform;
-        let tris = Arc::new(soup(1500));
-        let bvh = MeshBvh::build(tris.clone());
-        let mesh = Xform { pos: Vec3::new(3.0, -1.0, 2.0), rot: glam::Mat3::from_rotation_y(0.7) };
-        let size = Vec3::new(40.0, 10.0, 25.0);
-        let mut s = 99u32;
-        let mut r = || {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
-        };
-        let mut hits = 0;
-        for _ in 0..800 {
-            let b = Xform {
-                pos: mesh.pos + Vec3::new(r() * 50.0, r() * 14.0, r() * 30.0),
-                rot: glam::Mat3::from_rotation_x(r()) * glam::Mat3::from_rotation_z(r()),
-            };
-            let bs = Vec3::new(r().abs() * 3.0 + 0.1, r().abs() * 6.0 + 0.1, r().abs() * 3.0 + 0.1);
-            let a = crate::query_shapes::obb_mesh(&b, bs, &mesh, size, &tris);
-            let c = crate::query_shapes::obb_mesh_bvh(&b, bs, &mesh, size, &bvh);
-            assert_eq!(a, c);
-            hits += a as u32;
-        }
-        assert!(hits > 20);
-    }
 }
 
 /// Where a union's geometry sits in its part, as a fraction of Size: the

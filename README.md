@@ -97,7 +97,7 @@ A downloaded copy checks for a newer release when it starts and can update
 itself (each download is checked against the release's `SHA256SUMS`); set
 `RUSTUDIO_NO_UPDATE_CHECK=1` to turn that off.
 
-**Build from source:** you need a Rust toolchain (1.85+) and a GPU with Vulkan (or OpenGL), or on
+**Build from source:** you need a stable Rust toolchain (1.95 or newer) and a GPU with Vulkan (or OpenGL), or on
 a Mac, macOS 11 or later (Metal).
 
 ```sh
@@ -148,13 +148,13 @@ architectures).
 
 | Platform | Status |
 |---|---|
-| Linux x86_64 (Wayland or X11) | Supported, and the only one tested |
+| Linux x86_64 (Wayland or X11) | Supported |
 | Linux ARM64 | Should build; untested |
 | macOS 11+ (Apple Silicon and Intel) | Builds and runs (tested on Apple Silicon); see below |
 | Windows x86_64 (MSVC) | Builds and runs (tested on Windows 11); see below |
 
-CI checks every push on Linux, Windows and macOS (where it also runs the
-tests and builds the app).
+CI checks and tests the workspace on Linux, Windows and macOS. CI also builds the
+macOS app.
 
 Windows is new, so a few things don't work there yet:
 
@@ -191,8 +191,9 @@ rustudio stores it in your login keyring (the Keychain on macOS). Details are in
 
 ## Docs
 
-- [docs/DEVELOPING.md](docs/DEVELOPING.md): command-line options, tests,
-  code layout
+The editor lives in the root crate, with the shared engine and player code under `crates/`. Build the standalone player from source with `cargo build -p rustudio-player`.
+
+- [docs/DEVELOPING.md](docs/DEVELOPING.md): workspace layout, command-line options, and tests.
 - [docs/MECHANICS.md](docs/MECHANICS.md): every tuning number and where it
   comes from
 - [docs/ENGINE-GAPS.md](docs/ENGINE-GAPS.md): engine API that's still missing

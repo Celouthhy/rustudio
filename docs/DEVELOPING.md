@@ -48,34 +48,49 @@ so they never open a window on your screen (`RUSTUDIO_VISIBLE_TESTS=1` shows
 them). gamescope's own lines (and its Xwayland's and Vulkan WSI layer's) stay
 out of the console: rustudio's stdout / stderr come through, gamescope's are
 shown only when the run fails. The self-test's last step opens your place
-(`RUSTUDIO_PERF_PLACE`, default the Place A build, else og.rbxl, in `src/mech.rs`) read-only,
+(set `RUSTUDIO_PERF_PLACE` to a local place file) read-only,
 plays it for 5 s and records the average and 1%-low frame times.
 
-## Layout of the code
+## Which crate do I edit?
 
+| Package | Edit here for |
+|---|---|
+| `rustudio` (root) | Studio UI, editing tools, plugins, and project workflows |
+| `rustudio-core` | Documents, undo, file I/O, math, assets, meshes, and terrain data |
+| `rustudio-physics` | Rigid bodies, collisions, queries, and humanoid physics |
+| `rustudio-render` | Rendering, shaders, lighting, skinning, and world-space GUIs |
+| `rustudio-engine` | Luau APIs, simulation, replication, GUIs, avatar, and audio |
+| `rustudio-player` | Play and Run, game input, the game menu, and the standalone window |
+| `rustudio-net` | Team Create connections and live synchronization |
+| `rustudio-account` | Sign-in, avatars, asset access, and publishing |
+
+Build the standalone player with `cargo build -p rustudio-player`.
+Use `cargo check --workspace --all-targets` and `cargo test --workspace` to check the full workspace.
+
+## Source paths
 
 | Path | What it does |
 |---|---|
-| `src/doc.rs` | the document: DOM, undo/redo, copy/paste, group, file I/O |
-| `src/render.rs`, `src/shader.wgsl` | wgpu renderer (offscreen MSAA texture shown in egui) |
-| `src/scene.rs` | turns parts and Lighting into draw data |
+| `crates/rustudio-core/src/doc.rs` | the document: DOM, undo/redo, copy/paste, group, file I/O |
+| `crates/rustudio-render/src/render.rs`, `crates/rustudio-render/src/shader.wgsl` | wgpu renderer (offscreen MSAA texture shown in egui) |
+| `crates/rustudio-render/src/scene.rs` | turns parts and Lighting into draw data |
 | `src/viewport.rs` | camera input, picking, selection boxes, gizmos |
 | `src/explorer.rs`, `src/properties.rs` | the Explorer and Properties panels |
 | `src/app.rs` | menus, toolbar, shortcuts, docking, screenshot harness |
 | `src/account_ui.rs` | the account window (background threads) |
 | `src/selftest.rs` | `--self-test` scripted input driver |
-| `src/runtime.rs`, `src/ltypes.rs` | Luau runtime: Instance API, signals, scheduler; Roblox datatypes |
-| `src/play.rs`, `src/physics.rs` | Play / Run / Stop, character, rapier3d physics; `physics::move_humanoid` is Studio's Humanoid controller (floor rays, hip spring, body box; docs/MECHANICS.md "Round 22") |
+| `crates/rustudio-engine/src/runtime.rs`, `crates/rustudio-engine/src/ltypes.rs` | Luau runtime: Instance API, signals, scheduler; Roblox datatypes |
+| `crates/rustudio-player/src/play.rs`, `crates/rustudio-physics/src/physics.rs` | Play / Run / Stop, character, rapier3d physics; `physics::move_humanoid` is Studio's Humanoid controller (floor rays, hip spring, body box; docs/MECHANICS.md "Round 22") |
 | `src/script_editor.rs` | script tabs: highlighting, line numbers, syntax check |
-| `src/replicate.rs` | server → client copy and per-frame replication |
-| `src/rig.rs`, `src/avatar.rs` | R15 / R6 rigs, posing from Motor6D.Transform, states; avatar loading and dressing |
-| `src/default_scripts.rs` | Roblox's default player / character scripts, read from the Studio install at Play |
-| `src/mesh.rs`, `src/texture.rs`, `src/assets.rs` | mesh parsing (Roblox mesh 1–7, OBJ), PNG/JPEG/DDS, asset download and cache, clothing |
-| `src/runtime_ext.rs`, `src/library.luau` | engine members beyond the core API (ClickDetector, Sound, Mouse, tags, raycasts…) and services written in Luau (TweenService, Debris, DataStores…) |
-| `src/play_game.rs` | in-game interaction in Play: clicks, chat, tools and hotbar, explosions, sounds, NPC MoveTo |
-| `src/terrain.rs`, `src/audio.rs` | voxel terrain (SmoothGrid) decoding and meshing; sound playback (rodio) |
-| `src/bench.rs` | frame-time measurement and the section timers |
-| `src/gui.rs`, `src/gui_walk.rs`, `src/gui_input.rs` | GUIs: fonts, images, rich text; layout and drawing of one GUI; placing GUIs on screen / surfaces / billboards and the mouse and keyboard |
-| `src/fbx.rs` | binary FBX reader and the Roblox-style import for `LoadAsset` |
+| `crates/rustudio-engine/src/replicate.rs` | server → client copy and per-frame replication |
+| `crates/rustudio-engine/src/rig.rs`, `crates/rustudio-engine/src/avatar.rs` | R15 / R6 rigs, posing from Motor6D.Transform, states; avatar loading and dressing |
+| `crates/rustudio-core/src/default_scripts.rs` | Roblox's default player / character scripts, read from the Studio install at Play |
+| `crates/rustudio-core/src/mesh.rs`, `crates/rustudio-core/src/texture.rs`, `crates/rustudio-core/src/assets.rs` | mesh parsing (Roblox mesh 1–7, OBJ), PNG/JPEG/DDS, asset download and cache, clothing |
+| `crates/rustudio-engine/src/runtime_ext.rs`, `crates/rustudio-engine/src/library.luau` | engine members beyond the core API (ClickDetector, Sound, Mouse, tags, raycasts…) and services written in Luau (TweenService, Debris, DataStores…) |
+| `crates/rustudio-player/src/play_game.rs` | in-game interaction in Play: clicks, chat, tools and hotbar, explosions, sounds, NPC MoveTo |
+| `crates/rustudio-core/src/terrain.rs`, `crates/rustudio-engine/src/audio.rs` | voxel terrain (SmoothGrid) decoding and meshing; sound playback (rodio) |
+| `crates/rustudio-core/src/bench.rs` | frame-time measurement and the section timers |
+| `crates/rustudio-engine/src/gui.rs`, `crates/rustudio-engine/src/gui_walk.rs`, `crates/rustudio-engine/src/gui_input.rs` | GUIs: fonts, images, rich text; layout and drawing of one GUI; placing GUIs on screen / surfaces / billboards and the mouse and keyboard |
+| `crates/rustudio-core/src/fbx.rs` | binary FBX reader and the Roblox-style import for `LoadAsset` |
 | `crates/rustudio-account` | the Roblox session (cookie, keyring, CSRF), profile and avatar, experiences, downloads, publishing |
 

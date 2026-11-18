@@ -437,7 +437,7 @@ now sit where Place A puts them (Attachment.WorldCFrame was missing).
 | Raycast, GetPartBoundsInBox / InRadius, GetPartsInPart, FindPartsInRegion3 | a 16-stud grid over the Workspace's parts, kept up to date from the document's change journal; rays walk it 64 studs at a time; parts covering more than 512 cells, and boxes over 4 096 cells, fall back to testing every part | estimated; Place A's nav grid (tens of thousands of include-list rays) now builds in 40 s, Studio's own time, instead of minutes |
 
 | Ray starting inside a part | a ray that starts inside a part's box doesn't hit that part | Roblox docs (raycasting); Place A's gun-near-a-wall check had pulled the gun back because its ray started inside a big collision part |
-| MeshParts / unions | queried by Studio's stored collision pieces (PhysicalConfigData, `CSGPHS` v8: convex hulls split by an Edgebreaker CLERS stream, plus explicit triangle pieces; src/physics_mesh.rs), stretched by Size / InitialSize; the blob also gives CollisionFidelity (type byte 1 Hull, 2 Default, 3 Precise, `BLOCK` Box: the file has no such property). Rays meet the pieces as stored; a ray starting inside any piece (or on a solid piece's face) skips the whole part; flat pieces are hit but never contain the origin. Spherecast / Blockcast / Shapecast meet the pieces scaled towards the part's centre by (half − 0.05) / half per axis, and skip only the pieces they start in. Box fidelity is the box. Without a blob: the mesh's own triangles (CollisionFidelity other than Box) | Studio encoder Studio / decoder Studio / CLERS writer Studio; Studio probes (checks/laser-tag-parity/raycast); Place A's "Terrain" collision meshes for the blob-less case |
+| MeshParts / unions | queried by Studio's stored collision pieces (PhysicalConfigData, `CSGPHS` v8: convex hulls split by an Edgebreaker CLERS stream, plus explicit triangle pieces; crates/rustudio-physics/src/physics_mesh.rs), stretched by Size / InitialSize; the blob also gives CollisionFidelity (type byte 1 Hull, 2 Default, 3 Precise, `BLOCK` Box: the file has no such property). Rays meet the pieces as stored; a ray starting inside any piece (or on a solid piece's face) skips the whole part; flat pieces are hit but never contain the origin. Spherecast / Blockcast / Shapecast meet the pieces scaled towards the part's centre by (half − 0.05) / half per axis, and skip only the pieces they start in. Box fidelity is the box. Without a blob: the mesh's own triangles (CollisionFidelity other than Box) | Studio encoder Studio / decoder Studio / CLERS writer Studio; Studio probes (checks/laser-tag-parity/raycast); Place A's "Terrain" collision meshes for the blob-less case |
 | CanQuery | only counts once CanCollide is off: a CanCollide part is queried whatever its CanQuery | Studio: Laser Tag's spawn forcefields and containment walls (CanCollide, CanQuery false) are hit |
 | Box contacts | rays: a ray that only touches an edge or corner (no length inside) misses; the normal is the face entered, or the faces entered together summed at an edge / corner ((-1, -1, 1) / √3 into a corner); a ray along a face's plane enters through the face ahead. Sweeps against boxes are exact (sphere: root of the centre-to-box distance; box: moving separating axes) | Studio probes; parry's GJK cast was up to 0.29 studs short on Laser Tag's 381-stud FLOOR |
 | CollisionGroup | RaycastParams / OverlapParams.CollisionGroup skips parts whose CollisionGroup was set not to collide with it (PhysicsService:CollisionGroupSetCollidable on that side) | Roblox docs; Place A's "WeaponRay" group |
@@ -515,7 +515,7 @@ LastInputTypeChanged, Humanoid.PlatformStanding.
 
 ### Gap telemetry and coverage
 
-`RUSTUDIO_GAPS=FILE` (src/telemetry.rs) records, against app/api-dump.json,
+`RUSTUDIO_GAPS=FILE` (crates/rustudio-core/src/telemetry.rs) records, against app/api-dump.json,
 every touch of a real member rustudio lacks (missing, call-unimplemented,
 default-only run-time properties, write-ignored, event-unwired), with the
 scripts. build.rs scans the engine's sources for the properties it reads or
@@ -540,7 +540,7 @@ fired 11 shots, downed, 0 error lines).
 
 ## Round 13: humanoid states, collision groups, Place A as a game
 
-### Collision groups (src/collision_groups.rs)
+### Collision groups (crates/rustudio-core/src/collision_groups.rs)
 
 PhysicsService groups were a Luau table in each script VM, so the client
 never saw the groups Place A's server registers: its weapon rays
@@ -847,7 +847,7 @@ in it, so `SEAT_COOLDOWN_S` stays an estimate.
 ## Round 14: API surface (from Studio)
 
 **Member access messages** (Luau instance bridge, Studio; strings at
-…). The stubs (src/stubs.rs) and the runtime
+…). The stubs (crates/rustudio-engine/src/stubs.rs) and the runtime
 use Studio's own wording:
 
 - `%s is not a valid member of %s "%s"` (, raised from
@@ -979,7 +979,7 @@ in corpus.json, run only when named: `fidelity.py run --places bloom`):
 
 | What | Studio does | Where |
 |---|---|---|
-| Humanoid.RootPart and Torso | both registered under "Data"; **one getter for both**. RootPart has no setter (ReadOnly), Torso has one. The slots are 16-byte part references in the order of the rig's name tables: R6, R15. So RootPart / Torso = HumanoidRootPart, else UpperTorso (R15) / Torso (R6). rustudio returned nil without a HumanoidRootPart and had no Torso at all before this round; both now follow this (`ROOT_PART_FALLBACK_R15` / `_R6`, src/runtime_ext.rs) | registration; getter (this − 0xc0) →; Torso (begins with permission checks; its body wasn't read, so a written Torso is stored as an ordinary value in rustudio) |
+| Humanoid.RootPart and Torso | both registered under "Data"; **one getter for both**. RootPart has no setter (ReadOnly), Torso has one. The slots are 16-byte part references in the order of the rig's name tables: R6, R15. So RootPart / Torso = HumanoidRootPart, else UpperTorso (R15) / Torso (R6). rustudio returned nil without a HumanoidRootPart and had no Torso at all before this round; both now follow this (`ROOT_PART_FALLBACK_R15` / `_R6`, crates/rustudio-engine/src/runtime_ext.rs) | registration; getter (this − 0xc0) →; Torso (begins with permission checks; its body wasn't read, so a written Torso is stored as an ordinary value in rustudio) |
 | FindFirstChild | a straight scan of the child list comparing the name's length, then its bytes; the **first** match in child order is the result, and it then passes an access check or the call returns nil (it does not go on to a later child of the same name). No index. rustudio's journal-kept name index (round 20) returns the same child: first in child order among same-named children; rustudio has no locked instances, so the check never applies | registration ("findFirstChild", arguments "name", "recursive") →; non-recursive → scan; recursive |
 | SelectionSurfaceGuiCullAngle | FInt **20**, by its name a limit on selecting (gamepad / GuiService selection) SurfaceGui objects seen at an angle; no reader references it directly, so what the 20 measures wasn't confirmed and rustudio doesn't use it. rustudio's own SurfaceGui cull is the face's side: drawn only when the camera is in front of the face (unchanged) | name set, value (FInt values sit 8 bytes before their name slot), |
 
@@ -1395,7 +1395,7 @@ Studio draws none of them in F4, but does draw the surface over the camera
 ## Round 25: particles, beams, trails
 
 ParticleEmitter, Beam and Trail were not drawn at all before this round.
-`src/effects.rs` simulates them on the CPU each frame (Edit and Play, the
+`crates/rustudio-render/src/effects.rs` simulates them on the CPU each frame (Edit and Play, the
 document the viewport shows) and hands their triangles to the round 23
 world GUI pass (`world_gui.rs`). That pass tests them against the scene's
 depth, lights them, and applies the tone curve and fog. Measured in the new
@@ -2455,7 +2455,7 @@ warnings around them. Studio shows none of it.
 | Check (an admin script 285 client) | Roblox | rustudio before | now |
 |---|---|---|---|
 | ReadOnly table `__index` (Shared.Service): `pcall(settings)` must fail | fails (Plugin capability) | succeeded: settings() only refused yieldable threads, and a metamethod never is. So every read of `client.X` ran the rt0001 handler, which kicks and returns nil (`Anti.AddDetector` nil → Anti_Cheat:723; client.Core etc. nil → 0x273A; the remote key nil → r10004) | refused unless the nearest non-C, non-rustudio caller is the harness |
-| indexInstance / newindexInstance / namecallInstance / indexEnum / namecallEnum: the raiser of `game.____________` (`debug.info(2, "f")` in the xpcall handler) | a C function: `[C]`, line -1, name "", arity 0; calling it with bad arguments fails with the same string each time | the prelude's `error` (name "error"), and for Enum an mlua callback whose error is a new userdata each call | unnamed C closures over the real implementation (src/cmeta.rs), which raise every failure as a string |
+| indexInstance / newindexInstance / namecallInstance / indexEnum / namecallEnum: the raiser of `game.____________` (`debug.info(2, "f")` in the xpcall handler) | a C function: `[C]`, line -1, name "", arity 0; calling it with bad arguments fails with the same string each time | the prelude's `error` (name "error"), and for Enum an mlua callback whose error is a new userdata each call | unnamed C closures over the real implementation (crates/rustudio-engine/src/cmeta.rs), which raise every failure as a string |
 | `RemoteFunction.InvokeServer(workspace)` | `Expected ':' not '.' calling member function InvokeServer` | sent an invoke for the Workspace | Lua-written methods (Invoke, InvokeServer, InvokeClient) check their self's class first (`__rs_member_check`) |
 
 The C closure costs one more nested C call per metamethod level, so the
@@ -2558,7 +2558,7 @@ either). Tests: `globals_parity::tests` (5).
 
 Probe rows matching Studio: **394 / 1250 before, 1230 / 1250 now.** The 20 left: Destroy (6 rows × 2 sides, only in Studio's earlier pass, not in the final corpus), and not bridge behaviour: `UserInputService.IsWindowFocused` exists here, `Player.Move` lacks Studio's WritePlayer capability refusal, RealtimeMedia is missing from the reflection database (GetService errors instead of nil), and GetEnums counts 656 enums (Studio 652: our database is a slightly different version).
 
-**Follow-up (reflection version).** `app/api-dump.json` is now Studio 0.744.0.7441077's own dump: the offline Studio copy (`Studio`, SHA256 81be5bc2…, the build every probe ran on) writes it with `OFFLINE_STUDIO_HIDDEN=1 offline-studio -API 'Z:\…\api.json'` and exits. Against the old dump: 942 classes (−FeatureMatchingService, FeatureMatchingSession, IntegrityService; +BulkImportService), 652 enums (−PlayerDeviceTrustDecision, PlayerDeviceTrustLevel; PartType loses Capsule), 11 members added, 50 gone, 10 changed. `tools/gen_stubs.py` regenerated src/api_stubs.rs (4646 → 4618 members). What scripts see now follows the dump:
+**Follow-up (reflection version).** `app/api-dump.json` is now Studio 0.744.0.7441077's own dump: the offline Studio copy (`Studio`, SHA256 81be5bc2…, the build every probe ran on) writes it with `OFFLINE_STUDIO_HIDDEN=1 offline-studio -API 'Z:\…\api.json'` and exits. Against the old dump: 942 classes (−FeatureMatchingService, FeatureMatchingSession, IntegrityService; +BulkImportService), 652 enums (−PlayerDeviceTrustDecision, PlayerDeviceTrustLevel; PartType loses Capsule), 11 members added, 50 gone, 10 changed. `tools/gen_stubs.py` regenerated crates/rustudio-core/src/api_stubs.rs (4646 → 4618 members). What scripts see now follows the dump:
 
 - `Enum:GetEnums()` and `Enum.X` are the dump's enums (api.rs keeps enums
   with no items, AudioCaptureMode / IntentReplicability); the rbx-dom
@@ -2587,7 +2587,7 @@ database was built here.
 | Check | Roblox | rustudio before | now |
 |---|---|---|---|
 | `getmetatable` of Instance, signal, connection, Enum, Enums, EnumItem | "The metatable is locked" | the metatable / false | locked (set raw: mlua refuses a `__metatable` field) |
-| Metamethod called with bad arguments (`f()`, `f(o)`, `f(o, {})`, `f(o, nil)`) | Luau's `missing argument #1 (Instance expected)` / `invalid argument #2 (string expected, got table)` with the caller's position; order per type (Instance, connection, EnumItem, Enum reads: self first; signals, Enums and every write: key first) | mlua's `bad argument #2: error converting Lua nil to string` | as Studio (src/cmeta.rs `Spec`, `luaL_typeerror`) |
+| Metamethod called with bad arguments (`f()`, `f(o)`, `f(o, {})`, `f(o, nil)`) | Luau's `missing argument #1 (Instance expected)` / `invalid argument #2 (string expected, got table)` with the caller's position; order per type (Instance, connection, EnumItem, Enum reads: self first; signals, Enums and every write: key first) | mlua's `bad argument #2: error converting Lua nil to string` | as Studio (crates/rustudio-engine/src/cmeta.rs `Spec`, `luaL_typeerror`) |
 | `o[1]` | `1 is not a valid member of Part "Part"` | — | number keys convert |
 | `game.XYZ` | `… of DataModel "Game"` | `"…"` empty | the DataModel by its name |
 | `inst:Method()` | a C `__namecall`, unnamed, different from `__index` | none: `__index` then a Lua closure | C `__namecall` reading `lua_namecallatom` on entry; one Rust call per namecall |
@@ -2625,7 +2625,7 @@ binaries), index Anchored 866 → 860, newindex 808 → 790, namecall IsA 1057
 average 10–17: work 3.78–4.01 ms before, 3.19–4.20 after (client Lua
 1.18–1.23 → 1.00–1.29); no regression beyond noise. Place B Newer plays 60 s
 with an admin script loaded and no exploit / kick / tamper line, the same Output
-errors as before. Tests: `runtime::bridge_tests` (8, src/selftest/bridge.rs).
+errors as before. Tests: `runtime::bridge_tests` (8, crates/rustudio-engine/src/selftest/bridge.rs).
 
 ## Datatype parity (2026-11-08)
 
@@ -2637,7 +2637,7 @@ errors as before. Tests: `runtime::bridge_tests` (8, src/selftest/bridge.rs).
   arguments tripped `api_checknelems` → `LUAU_DEBUGBREAK` → `ud2`. Asserts
   now follow the target profile and release defines `NDEBUG`. Regression
   test: `ltypes::direct_call_tests`.
-- **Metatables (src/dtmeta.rs).** Each datatype's mlua metatable is rebuilt
+- **Metatables (crates/rustudio-engine/src/dtmeta.rs).** Each datatype's mlua metatable is rebuilt
   in place from mlua's own getter/setter/method tables (the generated
   closures' upvalues): `__index`/`__newindex`/`__namecall` are unnamed C
   closures shared by every value of the type, `__metatable` is locked.
@@ -2688,7 +2688,7 @@ The 107 left (client + server rows): RaycastResult (56) and SharedTable (47) are
   `RaycastResult{Part @ x, y, z; normal = …; material = Plastic}` (`%.9g`,
   the hit's name when cast), `==` by content (Studio: two casts are equal,
   not rawequal). Its metatable is rebuilt from a sample in `install_all`.
-- **SharedTable** (src/sharedtable.rs): userdata whose elements live in a
+- **SharedTable** (crates/rustudio-engine/src/sharedtable.rs): userdata whose elements live in a
   Rust-only Lua table; unnamed C `__index`/`__newindex` (cmeta `wrap`),
   `__iter` over a snapshot, no `__namecall` (`st:f()` is the VM's "attempt to
   call missing method 'f' of SharedTable"), no `__tostring` (Luau's default
@@ -2970,7 +2970,7 @@ Studio is `checks/humanoid-physics/RESULTS.md` (probes T1 to T19 from in a hidde
 | What | How | Source |
 |---|---|---|
 | World step | 240 Hz for every body (`mech::PHYSICS_HZ`), at most 16 a frame | Studio's world step |
-| State machine, forces | `src/humanoid.rs`: Running (hip-height spring on the floor rays, horizontal PD with the friction limit, yaw servo, balance torque P 5000 / D 100), Jumping, Freefall, Landed, Climbing, Swimming, Seated, PlatformStanding, FallingDown, GettingUp, Ragdoll, Dead | Studio and the state classes' force functions (SPEC §2) |
+| State machine, forces | `crates/rustudio-physics/src/humanoid.rs`: Running (hip-height spring on the floor rays, horizontal PD with the friction limit, yaw servo, balance torque P 5000 / D 100), Jumping, Freefall, Landed, Climbing, Swimming, Seated, PlatformStanding, FallingDown, GettingUp, Ragdoll, Dead | Studio and the state classes' force functions (SPEC §2) |
 | Timestep level | a Running character at WalkSpeed 8 to 16 is solved on every 2nd tick over 2h and is out of the solver in between; a drop of level is immediate, a rise waits 60 ticks | Studio; probes T1, T3, T10 |
 | Jump | the take-off speed 1.06 × JumpPower in one step; the push repeats while the root part's own velocity is short of it (a spinning assembly: until the floor rays lose the floor) and never starts under a ceiling (rays 1.5 × root height + Head height up from the root) | Studio; probes T4, T19; tools/fidelity movement-Place B jump_run |
 | Mass | parts weigh their physics geometry (the Head its mesh hull); the assembly's centre and inertia are those of the joints' own pose, whatever the animation does | Studio; measured (AssemblyCenterOfMass constant under animation) |

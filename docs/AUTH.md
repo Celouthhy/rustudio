@@ -159,11 +159,11 @@ recording the new place version.
 | `crates/rustudio-account/src/config.rs` | bookmarks and the signed-out flag only |
 | `crates/rustudio-account/src/store.rs` | system keyring entries used for saved account sessions |
 | `src/account_ui.rs` | Account panel (active account, saved accounts, switch, add by pasted cookie, sign out) and the Publish to Roblox window |
-| `src/avatar.rs` | the avatar from the session's own description |
+| `crates/rustudio-engine/src/avatar.rs` | the avatar from the session's own description |
 | `crates/rustudio-account/src/cloud.rs` | places on Roblox: lists, resolve, download, versions, Team Create status, cache, save with the version check |
 | `crates/rustudio-account/src/mock.rs` | a local HTTP stand-in for Roblox's hosts (tests) |
 | `src/cloud_ui.rs` | File > Open from Roblox, Save to Roblox / Publish, Experience Settings |
-| `src/assets.rs` | downloads use the session; background loads fall back to it for login-only assets |
+| `crates/rustudio-core/src/assets.rs` | downloads use the session; background loads fall back to it for login-only assets |
 
 ## Places on Roblox (round 27)
 
@@ -227,8 +227,8 @@ for saving) or give its group role "Edit group experiences".
   observe. `~/.local/share/rustudio/studio` is an offline mock that never talks
   to Roblox, so it cannot show a Team Create handshake. A real client has to
   be installed first, then the session captured.
-- rustudio already has the supporting pieces — the rbxl DOM (`src/doc.rs`)
-  and server-to-client replication (`src/replicate.rs`) — so this is
+- rustudio already has the supporting pieces — the rbxl DOM (`crates/rustudio-core/src/doc.rs`)
+  and server-to-client replication (`crates/rustudio-engine/src/replicate.rs`) — so this is
   protocol and session-lifecycle work, not a rewrite.
 
 ## Getting a cookie (not automated)

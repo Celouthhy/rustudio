@@ -1,7 +1,7 @@
 # Engine gaps (measured)
 
 What real games touch that rustudio doesn't implement, counted by the gap
-telemetry (`RUSTUDIO_GAPS=FILE`, src/telemetry.rs) while playing the
+telemetry (`RUSTUDIO_GAPS=FILE`, crates/rustudio-core/src/telemetry.rs) while playing the
 fidelity corpus: **Place A** (lobby, START GAME, 60 s of a Map 1 match with
 walking and firing), the **demo** scene and the **control** place (Play,
 walking, jumping, clicking). Every member is checked against Studio's own API
@@ -22,7 +22,7 @@ Gap kinds:
 Were silent stubs (AddVertex returned 0, Size (0, 0), ReadPixelsBuffer nil,
 `Content.fromObject` missing): Place A's WeaponModels / CamoFx / CamoLayers fell
 back inside their pcalls and every camo'd gun drew plain grey. Now
-(src/editable.rs, a runtime submodule):
+(crates/rustudio-engine/src/editable.rs, a runtime submodule):
 
 - **Content** is a datatype (typeof "Content"; `SourceType`, `Uri`,
   `Object`): `Content.none`, `fromUri`, `fromAssetId`, `fromObject(EditableImage | EditableMesh)`.
@@ -129,10 +129,10 @@ engine's sources (build.rs) now covers both.
 
 ## Round 14: every script-reachable member exists
 
-**Stubs.** `tools/gen_stubs.py` writes `src/api_stubs.rs` from the dump:
+**Stubs.** `tools/gen_stubs.py` writes `crates/rustudio-core/src/api_stubs.rs` from the dump:
 4646 members a game script may reach (Security None; properties by read
 security), each with a typed default (`false`, `0`, `""`, `{}`, the enum's
-item 0, `Vector3.new()`…, a signal). `src/stubs.rs` answers from it only
+item 0, `Vector3.new()`…, a signal). `crates/rustudio-engine/src/stubs.rs` answers from it only
 after the runtime's own lookups fail: reads give the default (or what a
 script wrote; read-only ones refuse with Studio's message), writes are kept
 per instance and fire Changed, calls return the typed empty value, events
@@ -197,7 +197,7 @@ Diagnosed with probes on both sides (round 13):
    (0 `ZHit` remotes). With no kills the player was downed at ~88 s, the
    session ended and its folder (with Round / RoundState) was deleted:
    that is the nil the probes read. **Fixed**: one shared table per Play
-   session (src/collision_groups.rs) used by both runtimes' queries and by
+   session (crates/rustudio-core/src/collision_groups.rs) used by both runtimes' queries and by
    the physics (rapier interaction groups; the character collides as its
    root part's group).
 2. **SetAttribute fired on an unchanged value** (2236 AttributeChanged for
@@ -226,7 +226,7 @@ Not API gaps but engine bugs the Place A match exposed (enemies never spawned):
 - **WorldRoot:GetPartsInPart compared bounding boxes**; Roblox tests the real
   shapes (Place A's headroom probes rely on it: a turned brush's or a terrain
   chunk's box covers far more than the part). Now exact: box vs box by
-  separating axes, box vs mesh triangles (src/query_shapes.rs).
+  separating axes, box vs mesh triangles (crates/rustudio-physics/src/query_shapes.rs).
 
 ## Coverage of Studio's API
 

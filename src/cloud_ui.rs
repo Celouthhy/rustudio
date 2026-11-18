@@ -251,6 +251,64 @@ fn live_source_text(value:&rustudio_net::replicator::PropValue)->Option<String> 
     match value {P::String(text)=>Some(text.clone()),P::SharedString(bytes)|P::CachedSharedString{bytes,..}=>String::from_utf8(bytes.clone()).ok(),_=>None}
 }
 
+/// Studio may create services locally when a plugin calls GetService.
+/// Their presence in the schema does not make them valid NewObject edits.
+/// Keep session-only services and detached plugin trees local.
+fn is_local_live_instance(
+    doc: &Document,
+    model: &rustudio_net::model::LiveModel,
+    reference: rbx_types::Ref,
+) -> bool {
+    use rbx_reflection::ClassTag;
+
+    let mut current = reference;
+    while let Some(instance) = doc.dom.get_by_ref(current) {
+        if instance.parent().is_none() {
+            return instance.class.as_str() == "Plugin";
+        }
+        if instance.parent() == doc.dom.root_ref() {
+            let class = instance.class.as_str();
+            if crate::doc::UNSAVED_SERVICES.contains(&class) {
+                return true;
+            }
+            return model.server_id(current).is_none()
+                && crate::doc::db().classes.get(class).is_some_and(|descriptor| {
+                    descriptor.tags.contains(&ClassTag::Service)
+                        && (current == reference || descriptor.tags.contains(&ClassTag::NotReplicated))
+                });
+        }
+        current = instance.parent();
+    }
+    false
+}
+
+#[cfg(test)]
+#[test]
+fn live_journal_excludes_local_services_and_keeps_place_edits() {
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use rustudio_net::model::LiveModel;
+
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    let run = dom.insert(root, InstanceBuilder::new("RunService"));
+    let widgets = dom.insert(root, InstanceBuilder::new("PluginGuiService"));
+    let widget = dom.insert(widgets, InstanceBuilder::new("Folder"));
+    let plugin = dom.insert(rbx_types::Ref::none(), InstanceBuilder::new("Plugin"));
+    let plugin_script = dom.insert(plugin, InstanceBuilder::new("Script"));
+    let workspace = dom.insert(root, InstanceBuilder::new("Workspace"));
+    let part = dom.insert(workspace, InstanceBuilder::new("Part"));
+    let doc = Document::from_play_dom(dom, "Team Create".into());
+    let mut model = LiveModel::new();
+    model.bind_local(123, workspace);
+
+    for reference in [run, widgets, widget, plugin, plugin_script] {
+        assert!(is_local_live_instance(&doc, &model, reference));
+    }
+    for reference in [workspace, part] {
+        assert!(!is_local_live_instance(&doc, &model, reference));
+    }
+}
+
 fn live_value(value: &rbx_types::Variant, model: &rustudio_net::model::LiveModel) -> Option<rustudio_net::replicator::PropValue> {
     use rbx_types::Variant as V;
     use rustudio_net::replicator::PropValue as P;
@@ -952,8 +1010,13 @@ impl Editor {
                 let mut sent = HashSet::new();
                 let mut sent_trees = HashSet::new();
                 for mark in marks {
+                    use crate::doc::Mark;
+                    let (Mark::Prop(reference, _) | Mark::Tree(reference)) = mark;
+                    if is_local_live_instance(&self.doc, &live.model, reference) {
+                        continue;
+                    }
                     match mark {
-                        crate::doc::Mark::Prop(reference, name) if sent.insert((reference, name)) => {
+                        Mark::Prop(reference, name) if sent.insert((reference, name)) => {
                             let Some(id) = live.model.server_id(reference) else { continue; };
                             let Some(inst) = self.doc.dom.get_by_ref(reference) else { continue; };
                             if name.as_str()=="Source" {
@@ -968,7 +1031,7 @@ impl Editor {
                                 if let Err(e) = live.session.send_property(id, inst.class.to_string(), name.to_string(), value) { live.sync_failed=true;self.warn(e.to_string()); }
                             } else { live.sync_failed=true;self.warn(format!("Team Create cannot synchronize {name} yet")); }
                         }
-                        crate::doc::Mark::Tree(reference) if sent_trees.insert(reference) => {
+                        Mark::Tree(reference) if sent_trees.insert(reference) => {
                             if let Err(error) = self.sync_live_tree(&mut live, reference) { live.sync_failed=true;self.warn(error); }
                         }
                         _ => {}

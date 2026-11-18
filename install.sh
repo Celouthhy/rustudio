@@ -76,13 +76,18 @@ if [ "$build" = 1 ]; then
     cargo=$(command -v cargo || true)
     [ -n "$cargo" ] || [ ! -x "$HOME/.cargo/bin/cargo" ] || cargo="$HOME/.cargo/bin/cargo"
     if [ -z "$cargo" ]; then
-        echo "cargo not found: install Rust 1.85+ (https://rustup.rs) and try again" >&2
+        echo "cargo not found: install stable Rust (https://rustup.rs) and try again" >&2
         exit 1
     fi
-    (cd "$repo" && "$cargo" build --release)
+    (cd "$repo" && "$cargo" build --release --locked --bin rustudio)
 fi
 
-bin="$repo/target/release/rustudio"
+target=${CARGO_TARGET_DIR:-target}
+case "$target" in
+    /*) ;;
+    *) target="$repo/$target" ;;
+esac
+bin="$target/release/rustudio"
 [ ! -f "$repo/rustudio" ] || bin="$repo/rustudio"
 if [ ! -x "$bin" ]; then
     echo "no build found at $bin (run without --no-build)" >&2

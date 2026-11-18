@@ -34,7 +34,7 @@ if [ "$UNIVERSAL" = 1 ]; then
     ARCH=universal
     for t in aarch64-apple-darwin x86_64-apple-darwin; do
         rustup target add "$t" >/dev/null 2>&1 || true
-        cargo build --release --locked --target "$t"
+        cargo build --workspace --release --locked --target "$t"
     done
     lipo -create \
         target/aarch64-apple-darwin/release/rustudio \
@@ -42,7 +42,7 @@ if [ "$UNIVERSAL" = 1 ]; then
         -output "$APP/Contents/MacOS/rustudio"
 else
     ARCH=$(uname -m)
-    cargo build --release --locked
+    cargo build --workspace --release --locked
     cp target/release/rustudio "$APP/Contents/MacOS/rustudio"
 fi
 

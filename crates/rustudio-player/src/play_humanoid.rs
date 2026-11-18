@@ -770,25 +770,27 @@ impl Game {
 
     /// Builds the character's body when it has none (spawn, a rebuilt world).
     fn ensure_hum_body(&mut self, model: Ref, root: Ref) {
-        let Some(s) = self.play.as_mut() else { return };
-        if s.physics.has_humanoid(model) {
-            let parts: Vec<(Ref, Xform)> = self
-                .doc
-                .dom
-                .descendants_of(model)
-                .filter(|i| doc::is_a(&i.class, "BasePart"))
-                .filter_map(|i| rustudio_render::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
-                .collect();
-            s.physics.refresh_humanoid(&self.doc, model, root, &parts);
-            return;
-        }
-        let parts: Vec<(Ref, Xform)> = self
+        let mut parts: Vec<(Ref, Xform)> = self
             .doc
             .dom
             .descendants_of(model)
             .filter(|i| doc::is_a(&i.class, "BasePart"))
             .filter_map(|i| rustudio_render::scene::xform_of(&self.doc, i.referent()).map(|x| (i.referent(), x)))
             .collect();
+        // A tool equipped since the last frame still has its parts where they were
+        // (Backpack, ReplicatedStorage…): built there, its handle would sit far off
+        // the body and drag the centre of mass (and the turn) with it.
+        let held: HashMap<Ref, Xform> = self.tool_pose(&parts).into_iter().collect();
+        for (r, x) in parts.iter_mut() {
+            if let Some(h) = held.get(r) {
+                *x = *h;
+            }
+        }
+        let Some(s) = self.play.as_mut() else { return };
+        if s.physics.has_humanoid(model) {
+            s.physics.refresh_humanoid(&self.doc, model, root, &parts);
+            return;
+        }
         s.physics.add_humanoid(&self.doc, model, root, &parts);
         if let Some(ch) = s.character.as_mut() {
             ch.last_root = rustudio_render::scene::xform_of(&self.doc, root);
@@ -799,11 +801,21 @@ impl Game {
     /// pose (no sweep, no velocity: SPEC §1.4).
     pub(super) fn hum_pose(&mut self) {
         let transforms = self.joint_transforms();
+        let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+        // The equipped tool's parts ride the hand (the RightGrip weld): their
+        // colliders follow it relative to the root like the rig's, at rest too,
+        // so the assembly's mass and centre of mass count the tool where it is
+        // held, not where its parts were before it was equipped.
+        let (local, rest) = {
+            let Some(ch) = self.play.as_ref().and_then(|s| s.character.as_ref()) else { return };
+            let mut local = ch.rig.solve(ident, &transforms);
+            let mut rest = ch.rig.solve(ident, &HashMap::new());
+            local.extend(self.tool_pose(&local));
+            rest.extend(self.tool_pose(&rest));
+            (local.into_iter().collect::<HashMap<Ref, Xform>>(), rest.into_iter().collect::<HashMap<Ref, Xform>>())
+        };
         let Some(s) = self.play.as_mut() else { return };
         let Some(ch) = s.character.as_mut() else { return };
-        let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
-        let local: HashMap<Ref, Xform> = ch.rig.solve(ident, &transforms).into_iter().collect();
-        let rest: HashMap<Ref, Xform> = ch.rig.solve(ident, &HashMap::new()).into_iter().collect();
         s.physics.set_humanoid_pose(ch.model, &local, &rest);
         ch.dynamic.transforms = transforms;
     }

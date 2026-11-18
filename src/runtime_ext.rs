@@ -3640,7 +3640,7 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
         w.abs_all = false;
         match marks {
             doc::Marks::All => all = true,
-            doc::Marks::Some(marks) => {
+            doc::Marks::Some(marks) if !all && !w.gui_listening.is_empty() => {
                 let mut roots: Vec<Ref> = Vec::new();
                 for m in marks {
                     match m {
@@ -3661,37 +3661,26 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
                         d.dom
                             .descendants_of(root)
                             .map(|i| i.referent())
-                            .filter(|r| w.listening.contains(r)),
+                            .filter(|r| w.gui_listening.contains(r)),
                     );
                 }
             }
+            doc::Marks::Some(_) => {}
         }
         let fresh = std::mem::take(&mut w.listen_new);
         if all {
-            check = w.listening.iter().copied().collect();
-        } else {
+            check = w.gui_listening.iter().copied().collect();
+        } else if !w.gui_listening.is_empty() {
             check.extend(fresh);
-            check.extend(w.input.gui_layout.keys().copied().filter(|r| w.listening.contains(r)));
+            check.extend(w.input.gui_layout.keys().copied().filter(|r| w.gui_listening.contains(r)));
             // Drawn last frame, not this one: back to its UDim2 box.
             check.extend(w.abs_laid.iter().copied().filter(|r| !w.input.gui_layout.contains_key(r)));
             let mut seen: HashSet<Ref> = HashSet::with_capacity(check.len());
             check.retain(|r| seen.insert(*r));
         }
-        let listened: Vec<Ref> = check
-            .into_iter()
-            .filter(|r| w.listening.contains(r))
-            .filter(|r| w.d().class_of(*r).is_some_and(|c| doc::is_a(&c, "GuiBase2d")))
-            .collect();
-        let laid: HashSet<Ref> = {
-            let w = &*w;
-            if all {
-                listened.iter().copied().filter(|r| w.input.gui_layout.contains_key(r)).collect()
-            } else {
-                w.input.gui_layout.keys().copied().filter(|r| w.listening.contains(r)).collect()
-            }
-        };
+        let laid = check.iter().copied().filter(|r| w.input.gui_layout.contains_key(r)).collect();
         w.abs_laid = laid;
-        for r in listened {
+        for r in check {
             // (a seeded zero box waits until the object is in a LayerCollector)
             if w.abs_seen.get(&r).is_some_and(|b| b.size == [0.0; 2] && b.pos == [0.0; 2]) && !in_layer_collector(&w, r) {
                 continue;
@@ -3714,14 +3703,7 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
         }
         // A layout's AbsoluteContentSize (Roact / Fusion bindings size their
         // frames from it): listened layouts, against what scripts last saw.
-        let layouts: Vec<Ref> = {
-            let d = w.d();
-            w.listening
-                .iter()
-                .copied()
-                .filter(|r| d.class_of(*r).is_some_and(|c| doc::is_a(&c, "UIGridStyleLayout")))
-                .collect()
-        };
+        let layouts: Vec<Ref> = w.layout_listening.iter().copied().collect();
         for r in layouts {
             let size = content_size(&w, r);
             let now = AbsBox { pos: [0.0; 2], size, rot: 0.0 };
@@ -5735,6 +5717,64 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_signals_follow_live_connections_and_waiters() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = crate::runtime::Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let lua = &rt.lua;
+        lua.load(r#"
+            screen = Instance.new("ScreenGui", workspace)
+            holder = Instance.new("Frame", screen)
+            frame = Instance.new("Frame", holder)
+            layout = Instance.new("UIListLayout", holder)
+            part = Instance.new("Part", workspace)
+            part.AncestryChanged:Connect(function() end)
+            size, pos, rotation, content, viewport = 0, 0, 0, 0, 0
+            connection = frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() size += 1 end)
+            frame:GetPropertyChangedSignal("AbsolutePosition"):Once(function() pos += 1 end)
+            task.spawn(function()
+                frame:GetPropertyChangedSignal("AbsoluteRotation"):Wait()
+                rotation += 1
+            end)
+            layoutConnection = layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() content += 1 end)
+            workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function() viewport += 1 end)
+        "#).exec().unwrap();
+        let frame = opt_inst(&lua.globals().get::<Value>("frame").unwrap()).unwrap();
+        for step in [1.0, 2.0, 2.0] {
+            let mut w = world(lua).unwrap();
+            assert_eq!(w.gui_listening.len(), 1);
+            assert_eq!(w.layout_listening.len(), 1);
+            w.input.view_size = [800.0 * step, 600.0];
+            w.input.gui_layout.insert(frame, crate::gui::GuiBox {
+                pos: [10.0 * step, 0.0],
+                size: [100.0 * step, 50.0],
+                rot: 15.0 * step,
+                ..Default::default()
+            });
+            drop(w);
+            fire_layout_changes(lua).unwrap();
+            rt.dispatch();
+        }
+        lua.load(r#"
+            assert(size == 2 and pos == 1 and rotation == 1 and content == 2 and viewport == 1,
+                string.format("%d %d %d %d %d", size, pos, rotation, content, viewport))
+            connection:Disconnect()
+            layoutConnection:Disconnect()
+        "#).exec().unwrap();
+        assert!(world(lua).unwrap().gui_listening.is_empty());
+        assert!(world(lua).unwrap().layout_listening.is_empty());
+        lua.load(r#"
+            frame.Changed:Connect(function() end)
+            layout.Changed:Connect(function() end)
+            screen:Destroy()
+        "#).exec().unwrap();
+        assert!(world(lua).unwrap().gui_listening.is_empty());
+        assert!(world(lua).unwrap().layout_listening.is_empty());
+    }
 
     /// Terrain's chunk triangle index answers rays and swept boxes exactly
     /// as a scan of every triangle in order does (nearest hit, the first

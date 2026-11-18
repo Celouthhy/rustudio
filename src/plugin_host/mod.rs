@@ -143,6 +143,7 @@ pub struct PluginHost {
     specs: Vec<Spec>,
     next: u32,
     edit: Option<EditVm>,
+    repaint_context: Option<egui::Context>,
     sync: edit_sync::EditSync,
     cmds: Vec<Cmd>,
     log: Vec<(Level, String)>,
@@ -162,6 +163,7 @@ impl Default for PluginHost {
             specs: Vec::new(),
             next: 1,
             edit: None,
+            repaint_context: None,
             sync: Default::default(),
             cmds: Vec::new(),
             log: Vec::new(),
@@ -180,6 +182,14 @@ pub fn disabled_by_env() -> bool {
 impl PluginHost {
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn set_repaint_context(&mut self, ctx: egui::Context) {
+        self.repaint_context = Some(ctx);
+    }
+
+    pub fn needs_idle_tick(&self) -> bool {
+        !self.cmds.is_empty() || self.specs.iter().any(|s| s.running)
     }
 
     /// Nothing loaded and nothing queued: the editor skips the tick.
@@ -388,6 +398,9 @@ impl PluginHost {
             }
             match new_vm(RunMode::Edit) {
                 Ok((rt, world)) => {
+                    if let Some(ctx) = &self.repaint_context {
+                        rt.lua.set_app_data(ctx.clone());
+                    }
                     self.edit = Some(EditVm { rt, world: Some(world), doc_id: doc.id, bound: false, gc_t: 0.0 })
                 }
                 Err(e) => {

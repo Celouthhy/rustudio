@@ -133,6 +133,7 @@ impl Cancel {
 
 struct Entry {
     events: VecDeque<Event>,
+    repaint: Option<egui::Context>,
     tx: Sender<Cmd>,
     cancel: Arc<Cancel>,
     /// Closed by the script (SSE / RawStream, or a WebSocket still
@@ -206,10 +207,14 @@ fn ws_send<S: std::io::Read + std::io::Write>(
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 fn push(id: u64, ev: Event) {
-    if let Some(e) = table().lock().unwrap().get_mut(&id) {
-        if !e.done {
-            e.events.push_back(ev);
-        }
+    let repaint = {
+        let mut entries = table().lock().unwrap();
+        let Some(e) = entries.get_mut(&id).filter(|e| !e.done) else { return };
+        e.events.push_back(ev);
+        e.repaint.clone()
+    };
+    if let Some(ctx) = repaint {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -218,11 +223,11 @@ fn gone(id: u64) -> bool {
 }
 
 /// Opens the connection on its own thread; events arrive through [`poll`].
-pub fn start(req: Request) -> u64 {
+pub fn start(req: Request, repaint: Option<egui::Context>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(Cancel::default());
-    table().lock().unwrap().insert(id, Entry { events: VecDeque::new(), tx, cancel: cancel.clone(), done: false, closing: false });
+    table().lock().unwrap().insert(id, Entry { events: VecDeque::new(), repaint, tx, cancel: cancel.clone(), done: false, closing: false });
     workers().lock().unwrap().insert(id, req.url.clone());
     let spawned = std::thread::Builder::new().name("rustudio-webstream".into()).spawn(move || {
         let _guard = WorkerGuard(id);
@@ -271,6 +276,11 @@ pub fn close(id: u64, kind: Kind) {
         e.events.retain(|ev| !matches!(ev, Event::Message(_)));
         e.events.push_back(Event::Closed);
         e.done = true;
+        let repaint = e.repaint.clone();
+        drop(t);
+        if let Some(ctx) = repaint {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
     }
 }
 
@@ -680,6 +690,10 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
 
+    fn start(req: Request) -> u64 {
+        super::start(req, None)
+    }
+
     #[test]
     fn sse_parsing() {
         let mut s = Sse::default();
@@ -699,6 +713,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         all
+    }
+
+    #[test]
+    fn websocket_message_wakes_idle_viewport() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (send_message, ready) = mpsc::channel();
+        let (finish, done) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(socket).unwrap();
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            ws.send(tungstenite::Message::text("wake")).unwrap();
+            let _ = done.recv_timeout(Duration::from_secs(5));
+        });
+
+        let ctx = egui::Context::default();
+        let (wake, repaint) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = wake.send((info.viewport_id, info.delay));
+        });
+        let id = super::start(req(Kind::WebSocket, format!("ws://127.0.0.1:{port}/")), Some(ctx.clone()));
+        let timeout = Duration::from_secs(5);
+        assert_eq!(repaint.recv_timeout(timeout).unwrap(), (egui::ViewportId::ROOT, Duration::ZERO));
+        assert!(matches!(poll(id).as_slice(), [Event::Opened(101, _)]));
+
+        // Consume both passes from the initial repaint, then let the worker
+        // receive a message while no UI pass is running.
+        for _ in 0..2 {
+            let _ = ctx.run_logic(&egui::RawInput::default(), |_| {});
+        }
+        while repaint.try_recv().is_ok() {}
+        send_message.send(()).unwrap();
+        assert_eq!(repaint.recv_timeout(timeout).unwrap(), (egui::ViewportId::ROOT, Duration::ZERO));
+        assert_eq!(poll(id), vec![Event::Message(b"wake".to_vec())]);
+        forget(id);
+        finish.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]

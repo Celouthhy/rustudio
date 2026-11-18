@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.2.4"
+version = "0.2.5"
 
 [package]
 name = "rustudio"
@@ -25,6 +25,7 @@ rustudio-account = { path = "crates/rustudio-account" }
 rustudio-net = { path = "crates/rustudio-net" }
 libc = "0.2"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }
+winit = { version = "0.30", default-features = false }
 egui = "0.36"
 egui-wgpu = "0.36"
 egui_dock = { version = "0.21", features = ["serde"] }
@@ -84,8 +85,6 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundatio
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSString", "NSError", "NSAppleEventDescriptor", "NSAppleEventManager", "NSNotification", "NSObject"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSMenu", "NSMenuItem", "NSEvent"] }
-# (only for EventLoopBuilderExtMacOS, on eframe's own winit)
-winit = { version = "0.30", default-features = false }
 
 [dev-dependencies]
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "encoder"] }

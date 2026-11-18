@@ -8,6 +8,7 @@ mod plugin_store;
 mod toolbox;
 mod ui_pointer;
 mod offscreen;
+mod native_loop;
 mod sim_clock;
 mod bytecode_cache;
 mod heap;
@@ -1187,10 +1188,10 @@ fn main() -> eframe::Result<()> {
     // Files opened from Finder arrive as Apple Events, not argv.
     #[cfg(target_os = "macos")]
     macos::install_open_handler();
-    let r = eframe::run_native(
+    let r = native_loop::run(
         "rustudio",
         options,
-        Box::new(move |cc| {
+        Box::new(move |cc: &eframe::CreationContext<'_>| {
             #[cfg(target_os = "macos")]
             {
                 macos::install_menu();

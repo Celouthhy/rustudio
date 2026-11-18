@@ -214,8 +214,8 @@ struct State {
     receivers: HashMap<Ref, Vec<Ref>>,
     http_hint_shown: bool,
     sim_hooked: bool,
-    /// The DataModel's services, for ServiceAdded / ServiceRemoving.
-    services: Option<HashSet<Ref>>,
+    /// The DataModel's services at the last observed tree revision.
+    services: Option<((Ref, u64), HashSet<Ref>)>,
     last_step: Option<Instant>,
     frame_time: f64,
     step_started: Option<Instant>,
@@ -979,7 +979,7 @@ fn create_stream(lua: &Lua, hs: Ref, args: &MultiValue) -> mlua::Result<MultiVal
     let mut o = StreamObj { kind, id: None, state: 0, owner, waiting: None };
     match (decision, plugin) {
         (Some(Decision::Pending), Some(p)) => o.waiting = Some((p, req)),
-        _ => o.id = Some(stream::start(req)),
+        _ => o.id = Some(stream::start(req, lua.app_data_ref::<egui::Context>().as_deref().cloned())),
     }
     state(lua)?.streams.0.insert(r, o);
     ok(inst_value(lua, r)?)
@@ -1019,7 +1019,7 @@ fn pump_streams(lua: &Lua) -> mlua::Result<()> {
                 }
                 Some(_) => {
                     if let Some((_, req)) = o.waiting.take() {
-                        o.id = Some(stream::start(req));
+                        o.id = Some(stream::start(req, lua.app_data_ref::<egui::Context>().as_deref().cloned()));
                     }
                 }
             }
@@ -1754,10 +1754,8 @@ fn tag_and_service_events(lua: &Lua) -> mlua::Result<()> {
         let w = world(lua)?;
         let Some(d) = w.doc.as_ref() else { return Ok(()) };
         let root = d.dom.root_ref();
-        let cs = d.find_child(root, "CollectionService");
         let mut added = Vec::new();
         let mut removed = Vec::new();
-        let _ = cs;
         TAG_FIRES.with(|q| {
             let mut q = q.borrow_mut();
             let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *q).into_iter().partition(|e| e.0 == root);
@@ -1767,7 +1765,9 @@ fn tag_and_service_events(lua: &Lua) -> mlua::Result<()> {
             }
         });
         let (mut svc_new, mut svc_gone) = (Vec::new(), Vec::new());
-        if w.listening.contains(&root) {
+        let mut st = state(lua)?;
+        let version = (root, d.tree_revision);
+        if w.listening.contains(&root) && st.services.as_ref().is_none_or(|(prev, _)| *prev != version) {
             let api = crate::api::get();
             let now: HashSet<Ref> = d
                 .dom
@@ -1779,13 +1779,11 @@ fn tag_and_service_events(lua: &Lua) -> mlua::Result<()> {
                     d.dom.get_by_ref(*c).is_some_and(|i| api.and_then(|a| a.classes.get(i.class.as_str())).is_some_and(|c| c.service))
                 })
                 .collect();
-            drop(w);
-            let mut st = state(lua)?;
-            if let Some(prev) = &st.services {
+            if let Some((_, prev)) = &st.services {
                 svc_new = now.difference(prev).copied().collect();
                 svc_gone = prev.difference(&now).copied().collect();
             }
-            st.services = Some(now);
+            st.services = Some((version, now));
         }
         (added, removed, svc_new, svc_gone, root)
     };

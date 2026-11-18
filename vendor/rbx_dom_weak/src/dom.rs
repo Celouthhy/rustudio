@@ -318,8 +318,15 @@ impl WeakDom {
     /// where removing them one by one with `transfer_within` scans the
     /// parent's child list for each (quadratic for a 20k-part model).
     pub fn detach_children(&mut self, referent: Ref) -> Vec<Ref> {
+        self.detach_children_prefix(referent, usize::MAX)
+    }
+
+    /// rustudio: detaches up to `count` leading children, preserving the
+    /// order of the remaining children.
+    pub fn detach_children_prefix(&mut self, referent: Ref, count: usize) -> Vec<Ref> {
         let children = match self.instances.get_mut(&referent) {
-            Some(instance) => std::mem::take(&mut instance.children),
+            Some(instance) if count >= instance.children.len() => std::mem::take(&mut instance.children),
+            Some(instance) => instance.children.drain(..count).collect(),
             None => return Vec::new(),
         };
         for child in &children {

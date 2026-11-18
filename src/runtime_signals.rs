@@ -161,7 +161,7 @@ fn deliver_immediate(lua: &Lua, r: Ref, name: String, args: Vec<Value>, seq: u64
         *d += 1;
         *d
     };
-    if depth > MAX_REENTRANCY && has_handlers(lua, &key) {
+    if depth > MAX_REENTRANCY && has_handlers(lua, &key, seq) {
         let (func, line, src) = signals(lua)
             .ok()
             .and_then(|s| s.conns.get(&key).and_then(|v| v.first().map(|c| c.func.info())))
@@ -203,7 +203,7 @@ fn deliver_immediate(lua: &Lua, r: Ref, name: String, args: Vec<Value>, seq: u64
 pub fn deliver_deferred(lua: &Lua, r: Ref, name: String, args: Vec<Value>, seq: u64, depth: u32) {
     let key = (r, name);
     if depth >= MAX_REENTRANCY {
-        if !has_handlers(lua, &key) {
+        if !has_handlers(lua, &key, seq) {
             return;
         }
         let msg = format!(
@@ -224,32 +224,51 @@ pub fn deliver_deferred(lua: &Lua, r: Ref, name: String, args: Vec<Value>, seq: 
 }
 
 /// Whether anything is connected to (or waiting on) the event.
-fn has_handlers(lua: &Lua, key: &(Ref, String)) -> bool {
+fn has_handlers(lua: &Lua, key: &(Ref, String), seq: u64) -> bool {
     signals(lua).is_ok_and(|s| {
-        s.conns.get(key).is_some_and(|v| !v.is_empty()) || s.waiters.get(key).is_some_and(|v| !v.is_empty())
+        s.conns.get(key).is_some_and(|v| !v.is_empty())
+            || s.waiters.get(key).is_some_and(|v| !v.is_empty())
+            || key.1 == "AncestryChanged" && s.destroyed_ancestry.get(&key.0)
+                .is_some_and(|(cutoff, v)| seq <= *cutoff && !v.is_empty())
     })
 }
 
 /// Resumes the handlers connected (and waiters waiting) when the event fired.
 fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
-    let (funcs, waiters) = {
+    let (funcs, waiters, removed) = {
         let Ok(mut s) = signals(lua) else { return };
-        let funcs: Vec<(Function, u8)> = s
+        let mut removed = false;
+        let mut funcs: Vec<(Function, u8)> = s
             .conns
             .get(key)
             .map(|v| v.iter().filter(|c| c.id <= seq).map(|c| (c.func.clone(), c.ident)).collect())
             .unwrap_or_default();
         if let Some(v) = s.conns.get_mut(key) {
+            let before = v.len();
             v.retain(|c| !(c.once && c.id <= seq));
+            removed = before != v.len() && v.is_empty();
+        }
+        if key.1 == "AncestryChanged" {
+            if let Some((cutoff, v)) = s.destroyed_ancestry.get_mut(&key.0) {
+                if seq <= *cutoff {
+                    funcs.extend(v.iter().filter(|c| c.id <= seq).map(|c| (c.func.clone(), c.ident)));
+                    v.retain(|c| !(c.once && c.id <= seq));
+                }
+            }
         }
         let all = s.waiters.remove(key).unwrap_or_default();
         let (now, later): (Vec<(u64, Thread)>, Vec<(u64, Thread)>) =
             all.into_iter().partition(|(id, _)| *id <= seq);
         if !later.is_empty() {
             s.waiters.insert(key.clone(), later);
+        } else {
+            removed |= !now.is_empty();
         }
-        (funcs, now.into_iter().map(|(_, t)| t).collect::<Vec<Thread>>())
+        (funcs, now.into_iter().map(|(_, t)| t).collect::<Vec<Thread>>(), removed)
     };
+    if removed {
+        super::prune_layout_listener(lua, key.0);
+    }
     // The edit DataModel (plugins) runs the most recently connected handler
     // first, as Studio's (measured in Studio, checks/plugins/ui/README.md U14:
     // two Click handlers of one PluginToolbarButton).
@@ -382,6 +401,74 @@ mod tests {
         assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
         assert_eq!(line(&out, "SYNC"), "changed5,prop,a,b,bind1,bind2,inner,c");
         assert_eq!(line(&out, "LATER"), "changed5,prop,a,b,bind1,bind2,inner,c,childP,descP");
+    }
+
+    #[test]
+    fn ancestry_changed_reports_the_moved_instance_through_destroy() {
+        let src = r#"
+            local function subtree()
+                local f = Instance.new("Folder", workspace)
+                local m = Instance.new("Model", f)
+                local p = Instance.new("Part", m)
+                return f, m, p
+            end
+            local log = {}
+            local function watch(label, inst)
+                return inst.AncestryChanged:Connect(function(child, parent)
+                    table.insert(log, label .. ":" .. child.Name .. "->" .. tostring(parent))
+                end)
+            end
+            local f, m, p = subtree()
+            local conn = watch("model", m)
+            watch("part", p)
+            local parents = {}
+            p.AncestryChanged:Connect(function()
+                table.insert(parents, tostring(p.Parent))
+            end)
+            m.AncestryChanged:Once(function(child)
+                print("ONCE", child == f)
+            end)
+            f:Destroy()
+            assert(not conn.Connected)
+            print("SYNC", #log)
+            task.wait()
+            print("TREE", table.concat(log, " | "))
+            print("PARENTS", table.concat(parents, ","))
+
+            table.clear(log)
+            f, m = subtree()
+            local target = Instance.new("Folder", workspace)
+            target.Name = "Target"
+            watch("model", m)
+            f.Parent = target
+            f.Parent = nil
+            task.wait()
+            print("MOVE", table.concat(log, " | "))
+
+            table.clear(log)
+            m = Instance.new("Model", workspace)
+            watch("self", m)
+            local cancelled = watch("cancelled", m)
+            m:Destroy()
+            cancelled:Disconnect()
+            task.wait()
+            print("SELF", table.concat(log, " | "))
+        "#;
+        for mode in [1, 2, 3] {
+            let out = run(Some(mode), src);
+            assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+            assert_eq!(line(&out, "SYNC"), if mode == 1 { "5" } else { "0" });
+            assert_eq!(
+                line(&out, "TREE"),
+                "part:Folder->nil | model:Folder->nil | part:Model->nil | model:Model->nil | part:Part->nil"
+            );
+            assert_eq!(line(&out, "PARENTS"), if mode == 1 { "Model,Model,nil" } else { "nil,nil,nil" });
+            assert_eq!(line(&out, "MOVE"), "model:Folder->Target | model:Folder->nil");
+            let expected_self = if mode == 1 { "self:Model->nil | cancelled:Model->nil" } else { "self:Model->nil" };
+            assert_eq!(line(&out, "SELF"), expected_self);
+            assert_eq!(line(&out, "ONCE"), "true");
+            assert_eq!(out.iter().filter(|(_, s)| s.starts_with("ONCE ")).count(), 1);
+        }
     }
 
     const RECURSE: &str = r#"

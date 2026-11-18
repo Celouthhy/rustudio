@@ -230,9 +230,11 @@ pub struct World {
     /// with.
     pub abs_seen: HashMap<Ref, ext::AbsBox>,
     pub viewport_seen: Option<[f32; 2]>,
-    /// Instances that joined `listening` since `ext::fire_layout_changes`
-    /// last ran, and the listened GUI objects that were drawn then.
-    pub listen_new: Vec<Ref>,
+    /// GUI instances with live connections or waiters.
+    pub gui_listening: rustc_hash::FxHashSet<Ref>,
+    pub layout_listening: rustc_hash::FxHashSet<Ref>,
+    /// Newly listened GUI objects and the listened objects drawn last pass.
+    pub listen_new: rustc_hash::FxHashSet<Ref>,
     pub abs_laid: HashSet<Ref>,
     /// What scripts changed since the drawn layout was handed over (Studio
     /// lays a GUI object out when it is read, so a box read right after a
@@ -387,10 +389,51 @@ struct Signals {
     conns: rustc_hash::FxHashMap<(Ref, String), Vec<Conn>>,
     waiters: rustc_hash::FxHashMap<(Ref, String), Vec<(u64, Thread)>>,
     next_id: u64,
-    /// The signal names each instance has (or had) connections under in
-    /// `conns`, so Destroy drops an instance's connections without a walk
-    /// of every connection there is.
+    /// Destroy disconnects these handlers from future fires. A queued
+    /// AncestryChanged can still deliver through the last pre-Destroy sequence.
+    destroyed_ancestry: rustc_hash::FxHashMap<Ref, (u64, Vec<Conn>)>,
+    /// Signal names indexed by instance so Destroy and GUI listener cleanup
+    /// can look up handlers without walking the other instances' signals.
     conn_names: rustc_hash::FxHashMap<Ref, Vec<String>>,
+}
+
+impl Signals {
+    fn note_name(&mut self, r: Ref, name: &str) {
+        let names = self.conn_names.entry(r).or_default();
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+
+    fn has_listener(&self, r: Ref) -> bool {
+        self.conn_names.get(&r).is_some_and(|names| {
+            names.iter().any(|name| {
+                let key = (r, name.clone());
+                self.conns.get(&key).is_some_and(|v| !v.is_empty())
+                    || self.waiters.get(&key).is_some_and(|v| !v.is_empty())
+            })
+        })
+    }
+}
+
+fn prune_layout_listener(lua: &Lua, r: Ref) {
+    if let Ok(mut w) = world(lua) {
+        if (w.gui_listening.contains(&r) || w.layout_listening.contains(&r))
+            && signals(lua).is_ok_and(|s| !s.has_listener(r))
+        {
+            w.forget_layout_listener(r);
+        }
+    }
+}
+
+fn prune_layout_listeners(lua: &Lua) {
+    if let (Ok(mut w), Ok(s)) = (world(lua), signals(lua)) {
+        let inactive: Vec<_> = w.gui_listening.iter().chain(&w.layout_listening).copied()
+            .filter(|r| !s.has_listener(*r)).collect();
+        for r in inactive {
+            w.forget_layout_listener(r);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -574,7 +617,9 @@ impl World {
             class_watches: Vec::new(),
             abs_seen: HashMap::new(),
             viewport_seen: None,
-            listen_new: Vec::new(),
+            gui_listening: Default::default(),
+            layout_listening: Default::default(),
+            listen_new: Default::default(),
             abs_laid: HashSet::new(),
             abs_scan: 0,
             abs_dirty: HashSet::new(),
@@ -616,6 +661,32 @@ impl World {
         if TOUCH_EVENTS.contains(&name) && self.touch_refs.insert(r) {
             self.touch_rev += 1;
         }
+    }
+
+    fn note_listener(&mut self, r: Ref, seed_box: bool) {
+        let first = self.listening.insert(r);
+        if self.destroyed.contains(&r) || self.gui_listening.contains(&r) || self.layout_listening.contains(&r) {
+            return;
+        }
+        let Some(class) = self.d().class_of(r) else { return };
+        if doc::is_a(&class, "GuiBase2d") {
+            self.gui_listening.insert(r);
+            if first && seed_box {
+                ext::seed_unlaid(self, r);
+            }
+            if self.side == Side::Client {
+                self.listen_new.insert(r);
+            }
+        } else if doc::is_a(&class, "UIGridStyleLayout") {
+            self.layout_listening.insert(r);
+        }
+    }
+
+    fn forget_layout_listener(&mut self, r: Ref) {
+        self.gui_listening.remove(&r);
+        self.layout_listening.remove(&r);
+        self.listen_new.remove(&r);
+        self.abs_laid.remove(&r);
     }
 
     pub fn fire(&mut self, r: Ref, name: &str, args: Vec<Value>) {
@@ -836,9 +907,18 @@ impl UserData for LConn {
                         "Disconnect" | "disconnect" => {
                             let check = lua.create_function(|lua, this: AnyUserData| {
                                 let this = this.borrow::<LConn>()?.clone();
-                                if let Some(v) = signals(lua)?.conns.get_mut(&this.key) {
-                                    v.retain(|c| c.id != this.id);
+                                {
+                                    let mut s = signals(lua)?;
+                                    if let Some(v) = s.conns.get_mut(&this.key) {
+                                        v.retain(|c| c.id != this.id);
+                                    }
+                                    if this.key.1 == "AncestryChanged" {
+                                        if let Some((_, v)) = s.destroyed_ancestry.get_mut(&this.key.0) {
+                                            v.retain(|c| c.id != this.id);
+                                        }
+                                    }
                                 }
+                                prune_layout_listener(lua, this.key.0);
                                 Ok(true)
                             })?;
                             Ok(Value::Function(crate::cmeta::method(
@@ -2180,6 +2260,10 @@ fn prop_get_plain(
 }
 
 fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
+    set_parent_opts(lua, r, new_parent, true)
+}
+
+fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool) -> mlua::Result<()> {
     let (old, descendants, lost, snaps) = {
         let mut w = world(lua)?;
         let old = w
@@ -2237,7 +2321,9 @@ fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
                 w.dm().note_script_change(c);
             }
         }
-        w.record(RepOp::Parent(r));
+        if replicate {
+            w.record(RepOp::Parent(r));
+        }
         w.dm().mark_tree(r);
         // An Explosion going into the Workspace goes off.
         if w.d().class_of(r).is_some_and(|c| c == "Explosion")
@@ -2560,6 +2646,31 @@ pub(crate) fn fire_parent_signals_opts(
             }
         }
     }
+    // AncestryChanged runs children first, with siblings in tree order.
+    // Skip the traversal entirely when the subtree has no listeners.
+    let ancestry = {
+        let w = world(lua)?;
+        if descendants.iter().any(|d| w.listening.contains(d) && hears(lua, *d, "AncestryChanged")) {
+            let mut targets = Vec::new();
+            let mut stack = vec![(r, false)];
+            while let Some((d, visited)) = stack.pop() {
+                if visited {
+                    if w.listening.contains(&d) && hears(lua, d, "AncestryChanged") {
+                        targets.push(d);
+                    }
+                } else {
+                    stack.push((d, true));
+                    if let Some(i) = w.d().dom.get_by_ref(d) {
+                        stack.extend(i.children().iter().rev().map(|&c| (c, false)));
+                    }
+                }
+            }
+            targets
+        } else {
+            Vec::new()
+        }
+    };
+    let parent = if ancestry.is_empty() { Value::Nil } else { inst_value(lua, new_parent)? };
     let mut w = world(lua)?;
     if old.is_some() {
         w.fire(old, "ChildRemoved", vec![me.clone()]);
@@ -2584,8 +2695,8 @@ pub(crate) fn fire_parent_signals_opts(
     }
     w.fire(r, "Changed", vec![pname]);
     w.fire(r, "Changed:Parent", vec![]);
-    for d in descendants {
-        w.fire(d, "AncestryChanged", vec![]);
+    for d in ancestry {
+        w.fire(d, "AncestryChanged", vec![me.clone(), parent.clone()]);
     }
     Ok(())
 }
@@ -3119,6 +3230,7 @@ fn stop_script(lua: &Lua, r: Ref) {
         s.conns = conns;
         s.waiters = waiters;
     }
+    prune_layout_listeners(lua);
     let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
         Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
         None => return,
@@ -3182,6 +3294,7 @@ fn stop_code_of(lua: &Lua, set: &HashSet<Ref>) {
         s.conns = conns;
         s.waiters = waiters;
     }
+    prune_layout_listeners(lua);
     let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
         Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
         None => return,
@@ -3579,12 +3692,9 @@ fn pivot_to(lua: &Lua, r: Ref, target: Xform) -> mlua::Result<()> {
 
 /// Instance:Destroy(), as Studio's `Instance::destroy`: the
 /// instance's Parent goes nil (and locks), then each descendant's in turn,
-/// a parent before its children, then the connections go. Studio walks the
-/// tree one `setParent(nil)` at a time; once the root is out of the
-/// DataModel each of those only notifies the (destroyed) parent, so here
-/// the subtree is cut loose in one pass and the per-descendant events are
-/// made only for instances something listens to (round 2, bulk: a 20k-part
-/// model took 111-117 ms, Studio 23).
+/// a parent before its children, then the connections go. An immediate
+/// ancestry handler can inspect the intermediate tree. Otherwise the
+/// descendants are detached in bulk, with fires made only for listeners.
 fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
     if r == world(lua)?.d().dom.root_ref() {
         return Err(rt_err("game cannot be destroyed"));
@@ -3606,30 +3716,68 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         w.record(RepOp::Destroy(r));
     }
     set_parent(lua, r, Ref::none())?;
-    {
+    let immediate = {
         let mut w = world(lua)?;
         if w.mode == RunMode::Edit {
             w.dm().note_script_destroyed(r);
         }
+        w.signal_mode == signal_timing::SignalMode::Immediate
+            && w.d().dom.descendants_of(r).any(|i| {
+                let d = i.referent();
+                w.listening.contains(&d) && hears(lua, d, "AncestryChanged")
+            })
+    };
+    if immediate {
+        // Let handlers inspect the root's Parent change while its children
+        // are still attached, even if the root is the only listener.
+        world(lua)?.destroyed.insert(r);
+        signal_timing::flush_immediate(lua);
     }
-    // Destroy goes on to every descendant (Roblox: "calls Destroy on all
-    // children"), so each fires its own Destroying too: a tool's cleanup
-    // bound to it (LaserTag's bindToInstanceDestroyed) runs when the
-    // character holding it is destroyed. Only where someone listens.
-    {
-        let mut w = world(lua)?;
-        let heard: Vec<Ref> = w
-            .d()
-            .dom
-            .descendants_of(r)
-            .map(|i| i.referent())
-            .filter(|d| *d != r && w.listening.contains(d))
-            .collect();
-        for d in heard {
+    let observable_descendants = immediate && {
+        let w = world(lua)?;
+        w.d().dom.descendants_of(r).skip(1).any(|i| {
+            let d = i.referent();
+            w.listening.contains(&d) && hears(lua, d, "AncestryChanged")
+        })
+    };
+    let order = if observable_descendants {
+        let mut order = Vec::new();
+        let mut stack: Vec<_> = children_of(lua, r)?.into_iter().rev().map(|d| (d, r)).collect();
+        while let Some((d, p)) = stack.pop() {
+            let mut w = world(lua)?;
+            if !w.d().dom.get_by_ref(d).is_some_and(|i| i.parent() == p) {
+                continue;
+            }
+            if let Some(quiet) = detach_quiet_leaf_prefix(lua, &mut w, p, d) {
+                order.extend(quiet.into_iter().map(|child| (child, p)));
+                continue;
+            }
             w.fire(d, "Destroying", vec![]);
+            drop(w);
+            set_parent_opts(lua, d, Ref::none(), false)?;
+            world(lua)?.destroyed.insert(d);
+            signal_timing::flush_immediate(lua);
+            order.push((d, p));
+            stack.extend(children_of(lua, d)?.into_iter().rev().map(|c| (c, d)));
         }
-    }
-    let order = detach_descendants(lua, r)?;
+        order
+    } else {
+        // Descendant Destroying is queued before replaying the detach signals.
+        {
+            let mut w = world(lua)?;
+            let heard: Vec<Ref> = w
+                .d()
+                .dom
+                .descendants_of(r)
+                .map(|i| i.referent())
+                .filter(|d| *d != r && w.listening.contains(d) && hears(lua, *d, "Destroying"))
+                .collect();
+            for d in heard {
+                w.fire(d, "Destroying", vec![]);
+            }
+        }
+        detach_descendants(lua, r)?
+    };
     // A destroyed MeshPart made from an EditableMesh leaves the link table.
     editable::forget_parts(std::iter::once(r).chain(order.iter().map(|x| x.0)));
     // Connections go only when something in the subtree has any (a walk of
@@ -3640,29 +3788,80 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         let mut w = world(lua)?;
         w.destroyed.insert(r);
         w.destroyed.extend(order.iter().map(|x| x.0));
-        std::iter::once(r)
+        let listened: Vec<_> = std::iter::once(r)
             .chain(order.iter().map(|x| x.0))
             .filter(|x| w.listening.contains(x))
-            .collect()
+            .collect();
+        for &x in &listened {
+            w.forget_layout_listener(x);
+            w.abs_seen.remove(&x);
+        }
+        listened
     };
     if !listened.is_empty() {
         let mut s = signals(lua)?;
-        let Signals { conns, conn_names, .. } = &mut *s;
+        let cutoff = s.next_id;
+        let mut retired_ancestry = false;
+        let Signals { conns, conn_names, destroyed_ancestry, .. } = &mut *s;
         for x in &listened {
             let Some(names) = conn_names.get_mut(x) else { continue };
             for name in names.drain(..).collect::<Vec<_>>() {
                 if name == "Destroying" {
                     names.push(name);
                 } else {
-                    conns.remove(&(*x, name));
+                    let ancestry = name == "AncestryChanged";
+                    if let Some(v) = conns.remove(&(*x, name)) {
+                        if ancestry && !v.is_empty() {
+                            destroyed_ancestry.insert(*x, (cutoff, v));
+                            retired_ancestry = true;
+                        }
+                    }
                 }
             }
             if names.is_empty() {
                 conn_names.remove(x);
             }
         }
+        if retired_ancestry {
+            s.next_id += 1;
+            world(lua)?.conn_seq = s.next_id;
+        }
     }
     Ok(())
+}
+
+/// Batches silent siblings between immediate callbacks. Removing each leaf
+/// from the front of a large child list would repeatedly shift the list.
+fn detach_quiet_leaf_prefix(lua: &Lua, w: &mut World, parent: Ref, first: Ref) -> Option<Vec<Ref>> {
+    if w.item_changed
+        || w.listening.contains(&first)
+        || w.listening.contains(&parent)
+            && (hears(lua, parent, "ChildRemoved") || hears(lua, parent, "DescendantRemoving"))
+    {
+        return None;
+    }
+    let d = w.d();
+    let children = d.dom.get_by_ref(parent)?.children();
+    if children.first() != Some(&first) {
+        return None;
+    }
+    let primary = d.prop(parent, "PrimaryPart");
+    let count = children.iter().take_while(|&&child| {
+        !w.listening.contains(&child)
+            && !matches!(&primary, Some(Variant::Ref(r)) if *r == child)
+            && d.dom.get_by_ref(child).is_some_and(|i| i.children().is_empty())
+    }).count();
+    if count == 0 {
+        return None;
+    }
+    let quiet = w.dm().dom.detach_children_prefix(parent, count);
+    for &child in &quiet {
+        w.orphans.insert(child);
+        w.destroyed.insert(child);
+        w.dm().mark_tree(child);
+    }
+    w.structure_changed = true;
+    Some(quiet)
 }
 
 /// Cuts every descendant of the (already unparented) `r` loose, as
@@ -3711,11 +3910,14 @@ fn detach_descendants(lua: &Lua, r: Ref) -> mlua::Result<Vec<(Ref, Ref)>> {
             stack.push(i);
         }
     }
-    // Listened instances before index i, to skip quiet subtrees fast.
-    let mut heard = vec![0usize; n + 1];
-    for i in 0..n {
-        heard[i + 1] = heard[i] + usize::from(world(lua)?.listening.contains(&order[i].0));
-    }
+    // Index the ancestry listeners in pre-order so a subtree can select
+    // its listeners without scanning quiet descendants for every detach.
+    let ancestry: Vec<usize> = {
+        let w = world(lua)?;
+        (0..n)
+            .filter(|&i| w.listening.contains(&order[i].0) && hears(lua, order[i].0, "AncestryChanged"))
+            .collect()
+    };
     let pname = Value::String(lua.create_string("Parent")?);
     let mut values: HashMap<Ref, Value> = HashMap::new();
     let mut value_of = |d: Ref| -> mlua::Result<Value> {
@@ -3728,18 +3930,26 @@ fn detach_descendants(lua: &Lua, r: Ref) -> mlua::Result<Vec<(Ref, Ref)>> {
     };
     for i in 0..n {
         let (d, p) = order[i];
-        if !listens[i] && !item_changed && heard[end[i]] == heard[i] {
+        let start = ancestry.partition_point(|&j| j < i);
+        let stop = ancestry.partition_point(|&j| j < end[i]);
+        let mut targets = ancestry[start..stop].to_vec();
+        if !listens[i] && !item_changed && targets.is_empty() {
             continue;
         }
+        // A parent and its last child share an end index.
+        targets.sort_unstable_by_key(|&j| (end[j], std::cmp::Reverse(j)));
+        let child = if targets.is_empty() { Value::Nil } else { value_of(d)? };
         let (p_hears, d_hears) = {
             let w = world(lua)?;
             (w.listening.contains(&p), w.listening.contains(&d))
         };
-        if p_hears {
+        if p_hears && hears(lua, p, "ChildRemoved") {
             let me = value_of(d)?;
+            world(lua)?.fire(p, "ChildRemoved", vec![me]);
+        }
+        if p_hears && hears(lua, p, "DescendantRemoving") {
             let subtree: Vec<Value> = (i..end[i]).map(|j| value_of(order[j].0)).collect::<mlua::Result<_>>()?;
             let mut w = world(lua)?;
-            w.fire(p, "ChildRemoved", vec![me]);
             for v in subtree {
                 w.fire(p, "DescendantRemoving", vec![v]);
             }
@@ -3749,13 +3959,8 @@ fn detach_descendants(lua: &Lua, r: Ref) -> mlua::Result<Vec<(Ref, Ref)>> {
             w.fire(d, "Changed", vec![pname.clone()]);
             w.fire(d, "Changed:Parent", vec![]);
         }
-        if heard[end[i]] > heard[i] {
-            for j in i..end[i] {
-                let e = order[j].0;
-                if w.listening.contains(&e) {
-                    w.fire(e, "AncestryChanged", vec![]);
-                }
-            }
+        for j in targets {
+            w.fire(order[j].0, "AncestryChanged", vec![child.clone(), Value::Nil]);
         }
     }
     Ok(order)
@@ -4643,9 +4848,14 @@ impl Runtime {
         let weak = lua.create_table().map_err(|e| e.to_string())?;
         let mt = lua.create_table().map_err(|e| e.to_string())?;
         mt.raw_set("__mode", "v").map_err(|e| e.to_string())?;
-        weak.set_metatable(Some(mt.clone())).map_err(|e| e.to_string())?;
+        weak.set_metatable(Some(mt)).map_err(|e| e.to_string())?;
         let sigs = lua.create_table().map_err(|e| e.to_string())?;
-        sigs.set_metatable(Some(mt)).map_err(|e| e.to_string())?;
+        let sig_mt = lua.create_table().map_err(|e| e.to_string())?;
+        // Luau's 's' mode shrinks sparse weak tables after collection. A
+        // burst of Connect calls leaves few live signal wrappers, so later
+        // GC cycles should only scan the signal states still held by Lua.
+        sig_mt.raw_set("__mode", "vs").map_err(|e| e.to_string())?;
+        sigs.set_metatable(Some(sig_mt)).map_err(|e| e.to_string())?;
         lua.set_app_data(Cache { weak: Some(weak), sigs: Some(sigs), ..Default::default() });
         lua.set_app_data(Budget { start: None });
         lua.set_app_data(ChildIndex::default());
@@ -4879,6 +5089,7 @@ impl Runtime {
                     let id = s.next_id;
                     let item_changed = name == "ItemChanged";
                     let touch = crate::runtime::TOUCH_EVENTS.contains(&name.as_str());
+                    s.note_name(inst.0, &name);
                     s.waiters.entry((inst.0, name)).or_default().push((id, th));
                     (id, item_changed, touch)
                 };
@@ -4889,9 +5100,7 @@ impl Runtime {
                 if touch {
                     w.note_touch_interest(inst.0, "Touched");
                 }
-                if w.listening.insert(inst.0) && w.side == Side::Client {
-                    w.listen_new.push(inst.0);
-                }
+                w.note_listener(inst.0, false);
                 Ok(())
             })?;
         let rs_output = lua.create_function(
@@ -4922,10 +5131,7 @@ impl Runtime {
                     let first = list.is_empty();
                     list.push(Conn { id, func: f, once, ident: security::current(lua) });
                     if first {
-                        let names = s.conn_names.entry(inst.0).or_default();
-                        if !names.contains(&name) {
-                            names.push(name.clone());
-                        }
+                        s.note_name(inst.0, &name);
                     }
                     id
                 };
@@ -4933,12 +5139,7 @@ impl Runtime {
                     w.conn_seq = id;
                     w.item_changed |= name == "ItemChanged";
                     w.note_touch_interest(inst.0, &name);
-                    if w.listening.insert(inst.0) {
-                        ext::seed_unlaid(&mut w, inst.0);
-                        if w.side == Side::Client {
-                            w.listen_new.push(inst.0);
-                        }
-                    }
+                    w.note_listener(inst.0, true);
                 }
                 Ok(LConn {
                     key: (inst.0, name),
@@ -5737,6 +5938,8 @@ impl Runtime {
                 w.states_disabled.remove(x);
                 w.avatar_descs.remove(x);
                 w.listening.remove(x);
+                w.forget_layout_listener(*x);
+                w.abs_seen.remove(x);
                 w.started.remove(x);
                 w.orphans.remove(x);
                 w.input.sound_pos.remove(x);
@@ -5878,6 +6081,9 @@ impl Runtime {
                 .map(|mut w| std::mem::take(&mut w.events))
                 .unwrap_or_default();
             if deferred.is_empty() && events.is_empty() {
+                if let Ok(mut s) = signals(lua) {
+                    s.destroyed_ancestry.clear();
+                }
                 return;
             }
             drop(_sc);

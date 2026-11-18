@@ -454,6 +454,8 @@ pub enum PendingAction {
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
     updater: crate::update::Updater,
+    last_plugin_tick: Instant,
+    plugins_ticked_between_frames: bool,
     pub dock: DockState<Tab>,
     pub ed: Editor,
     /// Keeps the dock, window and view settings (src/layout_store.rs).
@@ -484,7 +486,9 @@ impl RustudioApp {
         // (whether the cursor can truly lock: mouse_lock::platform_locks)
         use eframe::egui_wgpu::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
         let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
-        Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo)
+        let mut app = Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo);
+        app.ed.plugins.set_repaint_context(cc.egui_ctx.clone());
+        app
     }
 
     /// The app on an egui context and (optional) wgpu device of its own:
@@ -738,6 +742,8 @@ impl RustudioApp {
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(egui_ctx.clone()),
             updater: crate::update::Updater::start(),
+            last_plugin_tick: Instant::now(),
+            plugins_ticked_between_frames: false,
             dock,
             ed,
             layout,
@@ -2242,12 +2248,50 @@ impl eframe::App for RustudioApp {
         self.ed.phys.ingest(raw);
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe can run logic without a UI pass when the root is hidden.
+        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, Instant::now());
+            Self::schedule_plugin_repaint(&self.ed, ctx);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame(ui);
     }
 }
 
+const PLUGIN_IDLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl RustudioApp {
+    pub fn tick_plugins_between_frames(&mut self, now: Instant) -> Option<Instant> {
+        if self.ed.place_loading() || !self.ed.plugins.needs_idle_tick() {
+            return None;
+        }
+        if now >= self.last_plugin_tick + PLUGIN_IDLE_INTERVAL {
+            Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
+            self.plugins_ticked_between_frames = true;
+        }
+        (!self.ed.place_loading() && self.ed.plugins.needs_idle_tick())
+            .then(|| self.last_plugin_tick + PLUGIN_IDLE_INTERVAL)
+    }
+
+    fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) {
+        let _p = crate::bench::scope("plugin_tick");
+        let dt = now.saturating_duration_since(std::mem::replace(last_tick, now)).as_secs_f32();
+        let step = ed.fixed_dt.map_or_else(|| frame_grid(dt) as f64, f64::from);
+        ed.plugin_tick(step);
+    }
+
+    fn schedule_plugin_repaint(ed: &Editor, ctx: &egui::Context) {
+        if !ed.place_loading() && ed.plugins.needs_idle_tick() {
+            // Frame-driven work (RunService, timers, and yielding services
+            // such as HTTP) still needs a tick. Cap the idle gap at 100 ms
+            // without keeping the renderer at its normal refresh rate.
+            ctx.request_repaint_after(PLUGIN_IDLE_INTERVAL);
+        }
+    }
+
     /// One frame, in eframe's window or offscreen (src/offscreen.rs).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
         // (the whole frame, for --bench: the editor's and --no-ui's alike)
@@ -2330,10 +2374,11 @@ impl RustudioApp {
             ed.play_tick(&ctx, step);
         }
         self.watchdog.stage("Play tick", "plugins");
-        {
-            let _p = crate::bench::scope("plugin_tick");
-            let step = ed.fixed_dt.map(|f| f as f64).unwrap_or_else(|| frame_grid(dt) as f64);
-            ed.plugin_tick(step);
+        if ctx.input(|i| i.viewport().visible() != Some(false)) {
+            if !std::mem::take(&mut self.plugins_ticked_between_frames) {
+                Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
+            }
+            Self::schedule_plugin_repaint(ed, &ctx);
         }
         self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();

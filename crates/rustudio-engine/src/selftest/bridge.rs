@@ -572,7 +572,6 @@ for _, l in out do print(l) end
             r#"keys 2"#,
             r#"ops 2, 4, 6, 1, 0, 0, 0, 1, 0, 0, 0, 1 2, 2, 3 2, 3, 4, 1, 0, 0, 0, 1, 0, 0, 0, 1 0, 1, 2, 1, 0, 0, 0, 1, 0, 0, 0, 1 -1, -2, -3, 1, 0, 0, 0, 1, 0, 0, 0, 1"#,
             r#"members 1, 2, 3 1 -0, -0, -1 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 1 2 3 1 0 0 0 1 0 0 0 1"#,
-            r#"lerp 0.5, 1, 1.5, 0.87758255, 0, 0.47942555, 0, 1, 0, -0.47942555, 0, 0.87758255 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 2, 3, 4"#,
             r#"err invalid argument #2 to 'Lerp' (CFrame expected, got number) Argument 1 missing or nil invalid argument #2 (Vector3 expected, got string) Nope is not a valid member of CFrame X member of CFrame is read-only and cannot be assigned to"#,
             r#"err2 missing argument #3 to 'Lerp' (number expected) invalid argument #1 to 'new' (Vector3 expected, got string) invalid argument #2 to 'ToWorldSpace' (CFrame expected, got number)"#,
             r#"attr CFrame true"#,
@@ -581,6 +580,14 @@ for _, l in out do print(l) end
             r#"orient 0.0980001837015152 0.2009774148464203 0.319930762052536"#,
             r#"axis 0.3378807008266449, 0.4807199537754059, 0.8091631531715393 0.381564736366272"#,
         ],
+    );
+    // Studio's value (x86). An aarch64 build fuses the slerp's multiply-adds,
+    // which leaves sin(0.5) one f32 step higher (0.479425579).
+    let lerp = r#"lerp 0.5, 1, 1.5, 0.87758255, 0, 0.47942555, 0, 1, 0, -0.47942555, 0, 0.87758255 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 2, 3, 4"#;
+    let fused = lerp.replace("0.47942555", "0.479425579");
+    assert!(
+        text.iter().any(|t| t == lerp || (cfg!(target_arch = "aarch64") && *t == fused)),
+        "{lerp:?} not in {text:#?}"
     );
 }
 

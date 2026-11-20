@@ -483,6 +483,11 @@ impl Scene {
             }
         }
         for vf in added {
+            // GUI roots come from the previous frame. A frame may already
+            // have been deleted or moved out of this document.
+            if !doc.exists(vf) {
+                continue;
+            }
             let refs: Vec<Ref> = doc.dom.descendants_of(vf).map(|i| i.referent()).collect();
             for r in refs {
                 self.add(doc, r);
@@ -1521,4 +1526,31 @@ fn studio_avatar_mesh(rel: &str) -> Option<String> {
             Some(id)
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbx_dom_weak::InstanceBuilder;
+
+    #[test]
+    fn viewport_scene_handles_a_frame_removed_since_gui_draw() {
+        let mut doc = Document::new_place();
+        let root = doc.default_parent();
+        let removed = doc.insert(root, InstanceBuilder::new("ViewportFrame"));
+        let live = doc.insert(root, InstanceBuilder::new("ViewportFrame"));
+        let part = doc.insert(live, InstanceBuilder::new("Part"));
+
+        let mut scene = Scene::viewport_frames();
+        scene.set_viewport_frames(&doc, &HashSet::from([live]));
+        scene.sync(&mut doc);
+        let last_drawn = HashSet::from([removed, live]);
+        assert_eq!(doc.remove(&[removed]), 1);
+        scene.set_viewport_frames(&doc, &last_drawn);
+        scene.sync(&mut doc);
+
+        assert_eq!(scene.parts.len(), 1);
+        assert_eq!(scene.parts[0].r, part);
+        assert_eq!(scene.parts[0].layer, Some(live));
+    }
 }

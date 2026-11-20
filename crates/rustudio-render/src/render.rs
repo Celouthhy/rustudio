@@ -441,6 +441,18 @@ pub mod gpu_check {
         globals.view_proj = (proj * view).to_cols_array_2d();
         let sun = Vec3::new(0.3, 0.8, 0.2).normalize();
         let cascades = crate::sun_shadow::cascades(cam, -cam.normalize(), [0.5, 0.9], sun, 0.2);
+        // A projected decal can have no triangles on its chosen face.
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let mut scene = crate::scene::Scene::default();
+        scene.sync(&mut doc);
+        let empty_mesh = r.add_mesh(&device, &[], &[], &[]);
+        let empty_draw = PartDraw {
+            xf: Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY },
+            size: Vec3::splat(4.0),
+            custom_mesh: Some(empty_mesh),
+            ..scene.parts[0].draw
+        };
+        r.set_item(Ref::new(), vec![empty_draw]);
         for quality in [None, Some(crate::quality::Profile::at(1)), Some(crate::quality::Profile::at(17))] {
             let frame = Frame {
                 globals,
@@ -1230,6 +1242,9 @@ pub(crate) struct Mesh {
 impl Mesh {
     /// Binds the mesh (slot 0, and its indices) and draws `instances`.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>) {
+        if self.count == 0 {
+            return;
+        }
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         match &self.ibuf {
             Some(ib) => {
@@ -1470,6 +1485,18 @@ struct ViewportPipelines {
     overlay: wgpu::RenderPipeline,
     see_pipes: SeePipes,
     see: SeeThrough,
+}
+
+// Some OpenGL drivers lack the color-buffer-float extension that wgpu
+// requires for 32-bit float render targets. These passes only read the
+// channels they write, so the half-float equivalents need no shader changes.
+fn post_float_formats(device: &wgpu::Device) -> (wgpu::TextureFormat, wgpu::TextureFormat) {
+    use wgpu::TextureFormat::*;
+    if device.adapter_info().backend == wgpu::Backend::Gl {
+        (R16Float, Rg16Float)
+    } else {
+        (R32Float, Rg32Float)
+    }
 }
 
 impl ViewportPipelines {
@@ -1871,11 +1898,12 @@ impl ViewportPipelines {
                 cache: None,
             })
         };
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
+        let (depth_format, ao_format) = post_float_formats(device);
+        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", depth_format, None);
+        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", depth_format, None);
+        let ssao_main = ssao_pipe("ssao", "fs_ssao", ao_format, None);
+        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", ao_format, None);
+        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", ao_format, None);
         // SSAOApply: the scene × the occlusion.
         let ssao_apply = ssao_pipe(
             "ssao apply",
@@ -3836,7 +3864,8 @@ impl Renderer {
         let water_depth = tex("water surface depth", DEPTH_FORMAT, samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let water_bg = viewport.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
-        let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
+        let (depth_format, ao_format) = post_float_formats(device);
+        let glass_depth = tex("glass depth snapshot", depth_format, 1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("glass scene snapshot"), layout: &self.glass_layout,
@@ -3941,10 +3970,10 @@ impl Renderer {
                 })
                 .create_view(&Default::default())
         };
-        let ssao_depth_view = half_float("ssao depth", wgpu::TextureFormat::R32Float);
+        let ssao_depth_view = half_float("ssao depth", depth_format);
         let ssao_views = [
-            half_float("ssao a", wgpu::TextureFormat::Rg32Float),
-            half_float("ssao b", wgpu::TextureFormat::Rg32Float),
+            half_float("ssao a", ao_format),
+            half_float("ssao b", ao_format),
         ];
         let ssao_bg = |label: &str, input: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {

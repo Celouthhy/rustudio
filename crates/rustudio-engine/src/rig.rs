@@ -1032,6 +1032,31 @@ fn apply_r15_scales(dom: &mut rbx_dom_weak::WeakDom, m: Ref, s: &Scales) {
 /// Re-seats each R15 Motor6D on its two RigAttachments and sets the
 /// Humanoid's HipHeight from the legs (after body parts change size).
 pub fn reseat_r15_joints(dom: &mut rbx_dom_weak::WeakDom, m: Ref) {
+    // The HumanoidRootPart's RootRigAttachment follows the legs' parts
+    // (Studio 0.747, CreateHumanoidModelFromDescription: default body
+    // -1.0, a 1.05 height -1.05, a package body -0.9541): at (0, y, 0) with
+    // y = LowerTorso's RootRigAttachment − its LeftHipRigAttachment − half
+    // the root's height, so the soles meet the floor when the root stands
+    // HipHeight + half its height above it. A package's parts keep the
+    // body file's stale -0.35 otherwise (the avatar stood 0.6 low).
+    let y_of = |dom: &rbx_dom_weak::WeakDom, r: Ref, k: &str| match dom.get_by_ref(r)?.properties.get(&ustr(k)) {
+        Some(Variant::CFrame(c)) => Some(c.position.y),
+        Some(Variant::Vector3(v)) => Some(v.y),
+        _ => None,
+    };
+    let root_att = (|| {
+        let root = dom_child(dom, m, "HumanoidRootPart")?;
+        let lt = dom_child(dom, m, "LowerTorso")?;
+        let att = dom_child(dom, root, "RootRigAttachment")?;
+        let y = y_of(dom, dom_child(dom, lt, "RootRigAttachment")?, "CFrame")?
+            - y_of(dom, dom_child(dom, lt, "LeftHipRigAttachment")?, "CFrame")?
+            - y_of(dom, root, "Size")? * 0.5;
+        let Some(Variant::CFrame(cf)) = dom.get_by_ref(att)?.properties.get(&ustr("CFrame")).cloned() else { return None };
+        Some((att, rbx_dom_weak::types::CFrame::new(rbx_dom_weak::types::Vector3::new(0.0, y, 0.0), cf.orientation)))
+    })();
+    if let Some((att, cf)) = root_att {
+        set(dom, att, "CFrame", cf);
+    }
     let parts: Vec<Ref> = dom
         .get_by_ref(m)
         .map(|i| i.children().to_vec())
@@ -1060,9 +1085,8 @@ pub fn reseat_r15_joints(dom: &mut rbx_dom_weak::WeakDom, m: Ref) {
             }
         }
     }
-    // HipHeight from the legs, as Roblox's automatic scaling sets it: from
-    // the bottom of the HumanoidRootPart to the bottom of the feet in the
-    // rest pose (Root → LeftHip → LeftKnee → LeftAnkle).
+    // HipHeight from the legs, as Roblox's automatic scaling sets it: the
+    // left leg's length from its hip attachment down to the sole.
     if let Some(hip) = r15_hip_height(dom, m) {
         if let Some(h) = dom_class_child(dom, m, "Humanoid") {
             set(dom, h, "HipHeight", hip);
@@ -1070,27 +1094,23 @@ pub fn reseat_r15_joints(dom: &mut rbx_dom_weak::WeakDom, m: Ref) {
     }
 }
 
-/// Rest-pose hip height of an R15 model (None when a joint is missing).
+/// An R15 model's HipHeight: the left leg's length, hip attachment → knee
+/// → ankle → sole (Studio 0.747 CreateHumanoidModelFromDescription: 2.1924
+/// default body, 1.9670 a package body, 2.1 at HeightScale 1.05, each the
+/// left leg exactly). None when a part or attachment is missing.
 fn r15_hip_height(dom: &rbx_dom_weak::WeakDom, m: Ref) -> Option<f32> {
     let y_of = |r: Ref, k: &str| match dom.get_by_ref(r)?.properties.get(&ustr(k)) {
         Some(Variant::CFrame(c)) => Some(c.position.y),
         Some(Variant::Vector3(v)) => Some(v.y),
         _ => None,
     };
-    let root = dom_child(dom, m, "HumanoidRootPart")?;
+    let att = |part: &str, name: &str| y_of(dom_child(dom, dom_child(dom, m, part)?, name)?, "CFrame");
     let foot = dom_child(dom, m, "LeftFoot")?;
-    let mut y = 0.0;
-    for (part, name) in [
-        ("LowerTorso", "Root"),
-        ("LeftUpperLeg", "LeftHip"),
-        ("LeftLowerLeg", "LeftKnee"),
-        ("LeftFoot", "LeftAnkle"),
-    ] {
-        let j = dom_child(dom, dom_child(dom, m, part)?, name)?;
-        y += y_of(j, "C0")? - y_of(j, "C1")?;
-    }
-    let bottom = y - y_of(foot, "Size")? * 0.5;
-    Some(-bottom - y_of(root, "Size")? * 0.5)
+    Some(
+        att("LeftUpperLeg", "LeftHipRigAttachment")? - att("LeftUpperLeg", "LeftKneeRigAttachment")?
+            + att("LeftLowerLeg", "LeftKneeRigAttachment")? - att("LeftLowerLeg", "LeftAnkleRigAttachment")?
+            + att("LeftFoot", "LeftAnkleRigAttachment")? + y_of(foot, "Size")? * 0.5,
+    )
 }
 
 /// Distance from the HumanoidRootPart centre down to the floor.
@@ -1200,7 +1220,7 @@ impl Rig {
             joints: ordered,
             attached: Vec::new(),
         };
-        rig.attach_accessories(doc, model);
+        rig.refresh_attached(doc, model);
         rig
     }
 
@@ -1212,10 +1232,15 @@ impl Rig {
     }
 
     /// Accessories, then every other part in the model a game welded to the
-    /// body (WeldConstraint, Weld, …: Roblox moves them as one assembly
-    /// with it), carried at the offset they have now. Returns those parts,
-    /// which the simulation must leave alone (round 19: Place C welds its
-    /// ship to the HumanoidRootPart; it fell away and was destroyed).
+    /// body (WeldConstraint, Snap, Glue, RigidConstraint …: Roblox moves them
+    /// as one assembly with it), carried from the body part they hang from
+    /// at the offset their welds hold (a WeldConstraint's CFrame0, C0 · C1⁻¹,
+    /// Attachment0 · Attachment1⁻¹; where they are now only for a weld with
+    /// no offset yet). Returns those parts, which the simulation must leave
+    /// alone (round 19: Place C welds its ship to the HumanoidRootPart; it
+    /// fell away and was destroyed). A game's hunters weld their gowns, masks
+    /// and syringes to the limbs: an NPC posed only its Motor6D parts, so
+    /// those stayed where the rig was spawned, below the standing body.
     pub fn refresh_attached(&mut self, doc: &Document, model: Ref) -> Vec<Ref> {
         self.refresh_accessories(doc, model);
         let mut placed: std::collections::HashSet<Ref> = self
@@ -1227,17 +1252,30 @@ impl Rig {
             .collect();
         let motors: std::collections::HashSet<Ref> =
             self.joints.iter().map(|j| j.motor).collect();
-        let mut edges: Vec<(Ref, Ref)> = Vec::new();
+        // (Part0, Part1, Part0⁻¹ · Part1 as the joint holds it, if it says)
+        let mut edges: Vec<(Ref, Ref, Option<Xform>)> = Vec::new();
         for i in doc.dom.descendants_of(model) {
             // (AnimationConstraint is the rig's own; the rest hold parts
             // rigidly. Parts are read alias-aware: a live Team Create place
             // keeps a WeldConstraint's as Part0Internal / Part1Internal.)
+            let j = i.referent();
             let rigid = i.class != "AnimationConstraint" && rustudio_core::body::is_rigid_joint(&i.class);
-            if !rigid || motors.contains(&i.referent()) || !rustudio_core::body::joint_enabled(doc, i.referent()) {
+            if !rigid || motors.contains(&j) || !rustudio_core::body::joint_enabled(doc, j) {
                 continue;
             }
-            if let Some((a, b)) = rustudio_core::body::joint_parts(doc, i.referent()) {
-                edges.push((a, b));
+            if let Some((a, b)) = rustudio_core::body::joint_parts(doc, j) {
+                let held = match i.class.as_str() {
+                    "WeldConstraint" => crate::runtime::weld_offset(doc, j),
+                    "RigidConstraint" => {
+                        let att = |k: &str| match doc.prop(j, k) {
+                            Some(Variant::Ref(x)) if x.is_some() => Some(cf_prop(doc, x, "CFrame")),
+                            _ => None,
+                        };
+                        att("Attachment0").zip(att("Attachment1")).map(|(a0, a1)| cf_mul(&a0, &cf_inv(&a1)))
+                    }
+                    _ => joint_frames(doc, j).map(|(_, _, c0, c1)| cf_mul(&c0, &cf_inv(&c1))),
+                };
+                edges.push((a, b, held));
             }
         }
         // An equipped Tool's parts follow its grip (play_game::tool_pose).
@@ -1256,25 +1294,30 @@ impl Rig {
                 && doc.class_of(r).is_some_and(|k| doc::is_a(&k, "BasePart"))
                 && !in_tool(r)
         };
-        // Which body part each carried part hangs from (through welds).
-        let mut from: HashMap<Ref, Ref> = HashMap::new();
+        // Which body part each carried part hangs from (through welds), and at what offset.
+        let mut from: HashMap<Ref, (Ref, Xform)> = HashMap::new();
         let mut added = Vec::new();
+        let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
         loop {
             let mut grew = false;
-            for (a, b) in &edges {
-                for (held, free) in [(*a, *b), (*b, *a)] {
+            for (a, b, rel) in &edges {
+                // (rel is Part0⁻¹ · Part1: from Part1's side it is inverted)
+                for (held, free, step) in [(*a, *b, rel.map(|x| x)), (*b, *a, rel.map(|x| cf_inv(&x)))] {
                     if placed.contains(&held) && !placed.contains(&free) && in_model(free) {
-                        let body = from.get(&held).copied().unwrap_or(held);
-                        let offset = cf_mul(
-                            &cf_inv(&cf_prop(doc, body, "CFrame")),
-                            &cf_prop(doc, free, "CFrame"),
-                        );
+                        let (body, to_held) = from.get(&held).copied().unwrap_or((held, ident));
+                        let offset = match step {
+                            Some(step) => cf_mul(&to_held, &step),
+                            None => cf_mul(
+                                &cf_inv(&cf_prop(doc, body, "CFrame")),
+                                &cf_prop(doc, free, "CFrame"),
+                            ),
+                        };
                         self.attached.push(Attached {
                             handle: free,
                             part: body,
                             offset,
                         });
-                        from.insert(free, body);
+                        from.insert(free, (body, offset));
                         placed.insert(free);
                         added.push(free);
                         grew = true;
@@ -1378,9 +1421,10 @@ impl Rig {
     /// World CFrames of every part for a root placement and each joint's
     /// Motor6D.Transform, keyed by the motor (Part1 = Part0 · C0 · Transform · C1⁻¹).
     pub fn solve(&self, root: Xform, transforms: &HashMap<Ref, Xform>) -> Vec<(Ref, Xform)> {
-        let mut world: HashMap<Ref, Xform> = HashMap::new();
+        let mut world = rustc_hash::FxHashMap::with_capacity_and_hasher(self.joints.len() + 1, Default::default());
         world.insert(self.root, root);
-        let mut out = vec![(self.root, root)];
+        let mut out = Vec::with_capacity(self.joints.len() + self.attached.len() + 1);
+        out.push((self.root, root));
         for j in &self.joints {
             let Some(p0) = world.get(&j.part0).copied() else {
                 continue;
@@ -1402,8 +1446,29 @@ impl Rig {
     }
 }
 
+/// Shared by native keyframe evaluation, NPC pose solving and its queries.
+/// Small groups stay on the caller to avoid waking workers for one avatar.
+pub fn character_pool(rigs: usize) -> Option<&'static rapier3d::rayon::ThreadPool> {
+    if rigs < 32 {
+        return None;
+    }
+    static POOL: std::sync::OnceLock<Option<rapier3d::rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+        if threads == 1 {
+            return None;
+        }
+        rapier3d::rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("rustudio-character-{i}"))
+            .build()
+            .ok()
+    }).as_ref()
+}
+
 /// Writes solved part CFrames into a document.
 pub fn write_pose(doc: &mut Document, pose: &[(Ref, Xform)], map: Option<&HashMap<Ref, Ref>>) {
+    let key = ustr("CFrame");
     for (r, xf) in pose {
         let target = match map {
             Some(m) => match m.get(r) {
@@ -1413,9 +1478,11 @@ pub fn write_pose(doc: &mut Document, pose: &[(Ref, Xform)], map: Option<&HashMa
             None => *r,
         };
         if let Some(inst) = doc.dom.get_by_ref_mut(target) {
-            inst.properties
-                .insert(ustr("CFrame"), Variant::CFrame(xf.to_cframe()));
-            doc.mark_prop(target, ustr("CFrame"));
+            let value = Variant::CFrame(xf.to_cframe());
+            if inst.properties.get(&key) != Some(&value) {
+                inst.properties.insert(key, value);
+                doc.mark_prop(target, key);
+            }
         }
     }
 }
@@ -1541,6 +1608,50 @@ mod tests {
         );
         assert!((root_height(&d, m) - 3.0).abs() < 1e-4);
     }
+
+    /// Parts a game welds to a limb (a game's character: gown stains on
+    /// the Torso by WeldConstraint, a syringe on the Right Arm) go with the
+    /// limb at the weld's own offset, wherever the parts were left: an NPC
+    /// posed only its Motor6D parts, and the stains stayed where it spawned.
+    #[test]
+    fn welded_parts_follow_their_limb_at_the_weld_offset() {
+        let (mut d, m) = spawn(RigType::R6);
+        let torso = d.find_named(m, "Torso").unwrap();
+        let arm = d.find_named(m, "Right Arm").unwrap();
+        let at = |x: f32, y: f32, z: f32| Variant::CFrame(CFrame::new(Vector3::new(x, y, z), rbx_dom_weak::types::Matrix3::identity()));
+        // Left 2 studs below where the welds hold them.
+        let stain = d.dom.insert(m, InstanceBuilder::new("Part").with_name("Stain1").with_property("CFrame", at(-0.45, -2.0, -0.6)));
+        let barrel = d.dom.insert(m, InstanceBuilder::new("Part").with_name("Barrel").with_property("CFrame", at(1.5, -3.0, -1.3)));
+        let tip = d.dom.insert(m, InstanceBuilder::new("Part").with_name("Needle").with_property("CFrame", at(9.0, 9.0, 9.0)));
+        // Torso → Stain1 by a WeldConstraint that has been active (State 3, CFrame0 kept).
+        d.dom.insert(stain, InstanceBuilder::new("WeldConstraint")
+            .with_property("Part0", Variant::Ref(torso))
+            .with_property("Part1", Variant::Ref(stain))
+            .with_property("State", 3i32)
+            .with_property("CFrame0", at(-0.45, 0.2, -0.6)));
+        // Barrel → Right Arm (written the other way round), then Barrel → Needle.
+        d.dom.insert(barrel, InstanceBuilder::new("WeldConstraint")
+            .with_property("Part0", Variant::Ref(barrel))
+            .with_property("Part1", Variant::Ref(arm))
+            .with_property("State", 3i32)
+            .with_property("CFrame0", at(0.0, 1.15, 1.3)));
+        d.dom.insert(tip, InstanceBuilder::new("WeldConstraint")
+            .with_property("Part0", Variant::Ref(barrel))
+            .with_property("Part1", Variant::Ref(tip))
+            .with_property("State", 3i32)
+            .with_property("CFrame0", at(0.0, -0.9, 0.0)));
+        let rig = Rig::read(&d, m);
+        let root = Xform { pos: Vec3::new(10.0, 20.0, 30.0), rot: Mat3::from_rotation_y(0.7) };
+        let shoulder = rig.joints.iter().find(|j| j.name == "Right Shoulder").unwrap().motor;
+        let swing = HashMap::from([(shoulder, Xform { pos: Vec3::ZERO, rot: Mat3::from_rotation_x(0.6) })]);
+        let pose: HashMap<Ref, Xform> = rig.solve(root, &swing).into_iter().collect();
+        let near = |a: Vec3, b: Vec3| (a - b).length() < 1e-4;
+        let local = |part: Ref, p: Ref| cf_inv(&pose[&part]).apply(pose[&p].pos);
+        assert!(near(local(torso, stain), Vec3::new(-0.45, 0.2, -0.6)), "stain on the torso: {:?}", local(torso, stain));
+        // Part1 = Part0 · CFrame0: the arm is 1.15 up and 1.3 back from the barrel.
+        assert!(near(local(arm, barrel), Vec3::new(0.0, -1.15, -1.3)), "barrel in the swung hand: {:?}", local(arm, barrel));
+        assert!(near(local(arm, tip), Vec3::new(0.0, -2.05, -1.3)), "needle through the barrel: {:?}", local(arm, tip));
+    }
 }
 
 #[cfg(test)]
@@ -1604,6 +1715,63 @@ mod hip_tests {
             (scaled - mech::R15_PLAY_HIP_HEIGHT).abs() < 0.005,
             "scaled hip {scaled}"
         );
+    }
+
+    /// A package body (Studio 0.747, the same avatar: HipHeight 1.9670, root
+    /// attachment y -0.9541, root 2.9668 over the floor, soles at 0) came out
+    /// 1.363 with the root attachment left at the body file's -0.35: the
+    /// character stood 0.6 low. Re-seating sets both from the legs.
+    fn vec3_of_dom(f: &rbx_dom_weak::WeakDom, r: Ref, k: &str) -> Vec3 {
+        match f.get_by_ref(r).unwrap().properties.get(&ustr(k)) {
+            Some(Variant::Vector3(v)) => Vec3::new(v.x, v.y, v.z),
+            _ => panic!("{k}"),
+        }
+    }
+
+    #[test]
+    fn package_legs_reseat_root_attachment_and_hip_height() {
+        let Some(path) = studio_character_file(RigType::R15) else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let mut file = Document::decode(&bytes).unwrap();
+        let m = dom_class_child(&file, file.root_ref(), "Model").unwrap();
+        apply_r15_scales(&mut file, m, &Scales::default());
+        let att = |f: &rbx_dom_weak::WeakDom, part: &str, name: &str| {
+            let a = dom_child(f, dom_child(f, m, part).unwrap(), name).unwrap();
+            match f.get_by_ref(a).unwrap().properties.get(&ustr("CFrame")) {
+                Some(Variant::CFrame(c)) => (a, c.clone()),
+                _ => panic!("{part}.{name}"),
+            }
+        };
+        // Studio's default body: -1.0.
+        let (_, root_cf) = att(&file, "HumanoidRootPart", "RootRigAttachment");
+        assert!((root_cf.position.y + 1.0).abs() < 1e-3, "default root attachment {}", root_cf.position.y);
+        // A package: shorter upper legs, the root attachment stale.
+        let (ra, rc) = att(&file, "HumanoidRootPart", "RootRigAttachment");
+        set(&mut file, ra, "CFrame", rbx_dom_weak::types::CFrame::new(rbx_dom_weak::types::Vector3::new(0.0, -0.35, 0.0), rc.orientation));
+        for side in ["Left", "Right"] {
+            let (k, kc) = att(&file, &format!("{side}UpperLeg"), &format!("{side}KneeRigAttachment"));
+            let mut p = kc.position;
+            p.y += 0.2;
+            set(&mut file, k, "CFrame", rbx_dom_weak::types::CFrame::new(p, kc.orientation));
+        }
+        reseat_r15_joints(&mut file, m);
+        let y = |part: &str, name: &str| att(&file, part, name).1.position.y;
+        let leg = y("LeftUpperLeg", "LeftHipRigAttachment") - y("LeftUpperLeg", "LeftKneeRigAttachment")
+            + y("LeftLowerLeg", "LeftKneeRigAttachment") - y("LeftLowerLeg", "LeftAnkleRigAttachment")
+            + y("LeftFoot", "LeftAnkleRigAttachment")
+            + vec3_of_dom(&file, dom_child(&file, m, "LeftFoot").unwrap(), "Size").y * 0.5;
+        let hip = r15_hip_height(&file, m).unwrap();
+        assert!((hip - leg).abs() < 1e-5 && (hip - (mech::R15_PLAY_HIP_HEIGHT - 0.2)).abs() < 0.01, "hip {hip} leg {leg}");
+        let half = vec3_of_dom(&file, dom_child(&file, m, "HumanoidRootPart").unwrap(), "Size").y * 0.5;
+        let root_y = y("HumanoidRootPart", "RootRigAttachment");
+        assert!((root_y - (y("LowerTorso", "RootRigAttachment") - y("LowerTorso", "LeftHipRigAttachment") - half)).abs() < 1e-5);
+        // Standing (root at HipHeight + half its height), the soles touch y 0.
+        let sole = (hip + half) + root_y - y("LowerTorso", "RootRigAttachment") + y("LowerTorso", "LeftHipRigAttachment") - leg;
+        assert!(sole.abs() < 1e-4, "soles at {sole}");
+        let h = dom_class_child(&file, m, "Humanoid").unwrap();
+        assert!(matches!(file.get_by_ref(h).unwrap().properties.get(&ustr("HipHeight")), Some(Variant::Float32(v)) if (v - hip).abs() < 1e-6));
     }
 }
 

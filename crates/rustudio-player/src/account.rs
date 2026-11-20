@@ -121,6 +121,18 @@ impl Account {
         self.jobs > 0
     }
 
+    pub(crate) fn play_copy(&self) -> Self {
+        let mut copy = Self::new();
+        copy.profile = self.profile.clone();
+        copy.client = self.client.clone();
+        copy.state = self.state.clone();
+        copy.restored = self.restored;
+        copy.avatar = self.avatar.clone();
+        copy.avatar_requested = self.avatar_requested;
+        copy.user = self.user;
+        copy
+    }
+
     /// The loaded avatar, if any.
     pub fn avatar(&self) -> Option<&rustudio_engine::avatar::AvatarLook> {
         self.avatar.as_ref()

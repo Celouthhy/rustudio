@@ -252,6 +252,24 @@ pub struct ViewportState {
     pub(crate) last_sent_window_theme: Option<crate::SystemTheme>,
 }
 
+/// The start of a group of widgets within an existing UI layer.
+pub struct UiSnapshotStart {
+    layer: LayerId,
+    shapes: usize,
+    widgets: usize,
+    repaint_requests: usize,
+}
+
+/// Paint and hit-test data for a group of inactive widgets.
+///
+/// The group must be rebuilt before handling its input or when its data,
+/// placement, styling, or fonts change.
+pub struct UiSnapshot {
+    layer: LayerId,
+    shapes: Vec<ClippedShape>,
+    widgets: Vec<WidgetRect>,
+}
+
 /// What called [`Context::request_repaint`] or [`Context::request_discard`]?
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RepaintCause {
@@ -374,6 +392,7 @@ impl ViewportRepaintInfo {
 struct ContextImpl {
     fonts: Option<Fonts>,
     font_definitions: FontDefinitions,
+    font_texture_update: (u64, Option<[u32; 4]>),
 
     memory: Memory,
     animation_manager: AnimationManager,
@@ -755,6 +774,12 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Revision and dirty texel rectangle (exclusive right and bottom)
+    /// of the last emitted font atlas upload. A full upload has no rectangle.
+    pub fn font_texture_update(&self) -> (u64, Option<[u32; 4]>) {
+        self.read(|ctx| ctx.font_texture_update)
+    }
+
     /// Do read-only (shared access) transaction on Context
     fn read<R>(&self, reader: impl FnOnce(&ContextImpl) -> R) -> R {
         reader(&self.0.read())
@@ -1044,6 +1069,62 @@ impl Context {
     #[inline]
     pub fn graphics<R>(&self, reader: impl FnOnce(&GraphicLayers) -> R) -> R {
         self.write(move |ctx| reader(&ctx.viewport().graphics))
+    }
+
+    /// Mark the start of an inactive group of widgets to snapshot.
+    pub fn begin_ui_snapshot(&self, layer: LayerId) -> UiSnapshotStart {
+        self.write(|ctx| {
+            let vp = ctx.viewport();
+            UiSnapshotStart {
+                layer,
+                shapes: vp.graphics.get(layer).map_or(0, |list| list.next_idx().0),
+                widgets: vp.this_pass.widgets.get_layer(layer).count(),
+                repaint_requests: vp.repaint.causes.len(),
+            }
+        })
+    }
+
+    /// Capture the widgets in this group if they did not request a repaint.
+    /// The group's paint and hit targets must all be on the indicated layer.
+    pub fn end_ui_snapshot(&self, start: UiSnapshotStart) -> Option<UiSnapshot> {
+        let mut snapshot = self.write(|ctx| {
+            let vp = ctx.viewport();
+            if vp.repaint.causes.len() != start.repaint_requests {
+                return None;
+            }
+            Some(UiSnapshot {
+                layer: start.layer,
+                shapes: vp.graphics.get(start.layer)?.all_entries().skip(start.shapes).cloned().collect(),
+                widgets: vp.this_pass.widgets.get_layer(start.layer).skip(start.widgets).copied().collect(),
+            })
+        })?;
+        let shapes = std::mem::take(&mut snapshot.shapes);
+        snapshot.shapes = self.tessellate(shapes, self.pixels_per_point()).into_iter().map(|primitive| {
+            let shape = match primitive.primitive {
+                epaint::Primitive::Mesh(mesh) => epaint::Shape::mesh(mesh),
+                epaint::Primitive::Callback(callback) => epaint::Shape::Callback(callback),
+            };
+            ClippedShape { clip_rect: primitive.clip_rect, shape }
+        }).collect();
+        Some(snapshot)
+    }
+
+    /// Reuse an inactive group's paint and keep its hit targets registered.
+    /// Call the normal widgets when they need to process input or emit output.
+    pub fn replay_ui_snapshot(&self, snapshot: &UiSnapshot) {
+        self.write(|ctx| {
+            let vp = ctx.viewport();
+            let list = vp.graphics.entry(snapshot.layer);
+            for shape in &snapshot.shapes {
+                list.add(shape.clip_rect, shape.shape.clone());
+            }
+            for &w in &snapshot.widgets {
+                vp.this_pass.widgets.insert(w.layer_id, w, crate::InteractOptions::default());
+                if w.sense.interactive() || w.sense.is_focusable() {
+                    vp.this_pass.used_ids.insert(w.id, w.rect);
+                }
+            }
+        });
     }
 
     /// Read-only access to [`PlatformOutput`].
@@ -2676,7 +2757,12 @@ impl ContextImpl {
             let tex_mngr = &mut self.tex_manager.0.write();
             if let Some(font_image_delta) = fonts.font_image_delta() {
                 // A partial font atlas update, e.g. a new glyph has been entered.
+                let dirty = font_image_delta.pos.map(|[x, y]| {
+                    let [w, h] = font_image_delta.image.size();
+                    [x as u32, y as u32, (x + w) as u32, (y + h) as u32]
+                });
                 tex_mngr.set(TextureId::default(), font_image_delta);
+                self.font_texture_update = (self.font_texture_update.0.wrapping_add(1), dirty);
             }
         }
 

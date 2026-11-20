@@ -250,7 +250,11 @@ fn bridge_enums() {
         &text,
         &[
             "str Enums Material Enum.Material.Plastic",
-            "get true [C] -1 GetEnums 0 true false",
+            // (`Enum.GetEnums` written out twice is one import, resolved when
+            // the script loads: the same function, as in Studio 0.748 in a
+            // ModuleScript. A fresh closure per read shows through a local:
+            // `bridge_imports`.)
+            "get true [C] -1 GetEnums 0 true true",
             "from Enum.Material.Plastic Enum.Material.Plastic nil nil",
             "eq true true false",
             "cmp LOC: attempt to compare EnumItem < EnumItem",
@@ -413,6 +417,224 @@ fn bridge_settings_globals_are_instances() {
             "ugs2 1 MouseSensitivity true Flag Bogus does not exist",
             "stats Instance Stats true",
             "dm false The current thread cannot call 'DebuggerManager' (lacking capability Plugin)",
+        ],
+    );
+}
+
+/// Global chains (`Enum.GetEnums`, `CFrame.new`) resolve once when a script
+/// loads, through its environment (vendor lvmload.cpp resolveImportSafe);
+/// reads through a local still call `__index` each time; chains through
+/// the globals scripts change (`_G`, `shared`, `script`, `workspace`) stay
+/// run-time reads. Studio 0.748, a ModuleScript required from the command
+/// bar: `imp true | imp3 true | dyn false | fn true`, and `2 2 M2 W2` for
+/// values changed after the module loaded.
+#[test]
+fn bridge_imports() {
+    let mut d = Document::new_place();
+    let sp = d.find_child(d.dom.root_ref(), "StarterPlayer").unwrap();
+    let sps = d.find_child(sp, "StarterPlayerScripts").unwrap();
+    let src = r#"
+        _G.zzq = 1 shared.zzq = 1
+        local m = script.M
+        local g = require(m)
+        _G.zzq = 2 shared.zzq = 2 m.Name = "M2" workspace.Name = "W2"
+        print("mut", g())
+        local o = Enum
+        local function f() return Enum.GetEnums end
+        print("imp", Enum.GetEnums == Enum.GetEnums, Enum.Material.FromName == Enum.Material.FromName,
+            o.GetEnums == o.GetEnums, f() == f(), CFrame.new == CFrame.new)
+    "#;
+    let s = d.dom.insert(sps, InstanceBuilder::new("LocalScript").with_name("T").with_property("Source", src.to_string()));
+    d.dom.insert(
+        s,
+        InstanceBuilder::new("ModuleScript").with_name("M").with_property(
+            "Source",
+            "return function() return _G.zzq, shared.zzq, script.Name, workspace.Name end".to_string(),
+        ),
+    );
+    let rt = Runtime::new().unwrap();
+    let mut w = World::new(d, RunMode::Run);
+    w.side = Side::Client;
+    rt.enter(w);
+    rt.bind_globals().unwrap();
+    rt.run_script(s);
+    rt.step(1.0 / 60.0);
+    let text: Vec<String> =
+        rt.leave().output.iter().map(|(_, t)| t.split("  —").next().unwrap_or("").to_string()).collect();
+    expect(&text, &["mut 2 2 M2 W2", "imp true true false true true"]);
+}
+
+/// Property writes answered from the typed fast path (runtime.rs
+/// `typed_write`: numbers, booleans, Vector3, CFrame, Color3, UDim2…)
+/// convert, clamp, orthonormalize and fire exactly as the general path;
+/// the expected lines are the general path's (the build before it).
+#[test]
+fn bridge_typed_writes() {
+    let text = run(
+        r#"
+local out = {}
+local function o(...) local t = table.pack(...) for i = 1, t.n do t[i] = tostring(t[i]) end table.insert(out, table.concat(t, " ")) end
+local p = Instance.new("Part") p.Anchored = true p.Parent = workspace
+p.CFrame = CFrame.new(1, 2, 3) * CFrame.Angles(0, 0.5, 0)
+p.Position = Vector3.new(4, 5, 6)
+o("pos", p.Position, p.CFrame)
+local n, names = 0, {}
+p.Changed:Connect(function(k) n += 1 table.insert(names, k) end)
+local pc = 0
+p:GetPropertyChangedSignal("CFrame"):Connect(function() pc += 1 end)
+p.Transparency = 0.5 p.Transparency = 0.5
+p.Color = Color3.new(1, 0, 0) p.Color = Color3.new(1, 0, 0)
+p.Position = Vector3.new(7, 8, 9)
+p.CFrame = CFrame.new(7, 8, 9) * CFrame.Angles(0, 0.5, 0)
+p.CFrame = CFrame.new(1, 1, 1)
+p.Anchored = false p.Anchored = true
+p.Size = Vector3.new(2, 2, 2)
+task.wait()
+o("changed", n, pc, table.concat(names, ","))
+o("color", p.Color, p.BrickColor, p.Transparency)
+local l = Instance.new("ImageLabel")
+l.ImageColor3 = Color3.new(0.5, 0.25, 1)
+l.Size = UDim2.new(0.5, 10, 0, 20)
+l.Position = UDim2.fromOffset(3, 4)
+l.Visible = false
+l.ImageTransparency = 0.25
+o("gui", l.ImageColor3, l.Size, l.Position, l.Visible, l.ImageTransparency)
+local b = Instance.new("Bone") b.Parent = p
+b.CFrame = CFrame.new(1, 2, 3, 2, 0, 0, 0, 1, 0, 0, 0, 1)
+o("ortho", b.CFrame)
+b.Transform = CFrame.Angles(0.1, 0, 0)
+o("transform", b.Transform)
+local m6 = Instance.new("Motor6D") m6.Parent = p
+m6.C0 = CFrame.new(0, 1, 0) m6.Transform = CFrame.Angles(0, 0, 0.2)
+o("motor", m6.C0, m6.Transform)
+local nv = Instance.new("NumberValue") nv.Value = 3 local iv = Instance.new("IntValue") iv.Value = 7.9
+local vv = Instance.new("Vector3Value") vv.Value = Vector3.new(1, 2, 3)
+o("values", nv.Value, iv.Value, vv.Value)
+local ok, e = pcall(function() p.Size = CFrame.new() end)
+o("err", ok, e)
+ok, e = pcall(function() l.Size = 5 end)
+o("err2", ok, e)
+for _, l in out do print(l) end
+
+        "#,
+        3,
+    );
+    expect(
+        &text,
+        &[
+            r#"pos 4, 5, 6 4, 5, 6, 0.87758255, 0, 0.47942555, 0, 1, -0, -0.47942555, 0, 0.87758255"#,
+            r#"changed 10 2 Transparency,Color,CFrame,Position,CFrame,Anchored,Anchored,Size,AssemblyMass,Mass"#,
+            r#"color 1, 0, 0 Really red 0.5"#,
+            r#"gui 0.5, 0.25, 1 {0.5, 10}, {0, 20} {0, 3}, {0, 4} false 0.25"#,
+            r#"ortho 1, 2, 3, 1, 0, 0, 0, 1, 0, 0, 0, 1"#,
+            r#"transform 0, 0, 0, 1, -0, 0, 0, 0.995004177, -0.0998334214, 0, 0.0998334214, 0.995004177"#,
+            r#"motor 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 0, 0, 0, 0.980066597, -0.198669329, 0, 0.198669329, 0.980066597, -0, 0, 0, 1"#,
+            r#"values 3 7 1, 2, 3"#,
+            r#"err false Unable to assign property Size. Vector3 expected, got CFrame"#,
+            r#"err2 false Unable to assign property Size. UDim2 expected, got number"#,
+        ],
+    );
+}
+
+/// CFrames are tagged Luau userdata (ltypes.rs `CFRAME_TAG`), not mlua
+/// userdata: the same typeof, equality, identity as a table key, members,
+/// operators, argument errors, attributes and values as before.
+#[test]
+fn bridge_native_cframe() {
+    let text = run(
+        r#"
+local out = {}
+local function o(...) local t = table.pack(...) for i = 1, t.n do t[i] = tostring(t[i]) end table.insert(out, table.concat(t, " ")) end
+local a, b = CFrame.new(1, 2, 3), CFrame.new(1, 2, 3)
+o("type", typeof(a), type(a), a == b, rawequal(a, b), a ~= CFrame.new(), getmetatable(a))
+local t = {} t[a] = 1 t[b] = 2 local n = 0 for _ in t do n += 1 end o("keys", n)
+o("ops", a * b, a * Vector3.new(1, 0, 0), a + Vector3.new(1, 1, 1), a - Vector3.new(1, 1, 1), a:Inverse())
+o("members", a.Position, a.X, a.LookVector, a.Rotation, a:GetComponents())
+o("lerp", a:Lerp(CFrame.Angles(0, 1, 0), 0.5), a:ToObjectSpace(b), a:PointToWorldSpace(Vector3.one))
+local function e(f) local ok, m = pcall(f) return (tostring(m):gsub("^[^:]*:%d+: ", "")) end
+o("err", e(function() return a:Lerp(1, 0.5) end), e(function() return a.Lerp(nil, a, 0.5) end), e(function() return a * "x" end), e(function() return a.Nope end), e(function() a.X = 1 end))
+o("err2", e(function() return a:Lerp(a) end), e(function() return CFrame.new("a") end), e(function() return a:ToWorldSpace(5) end))
+local p = Instance.new("Part")
+p:SetAttribute("C", a)
+o("attr", typeof(p:GetAttribute("C")), p:GetAttribute("C") == a)
+local v = Instance.new("CFrameValue") v.Value = a * CFrame.Angles(0.1, 0.2, 0.3)
+o("value", v.Value)
+o("euler", a:ToEulerAnglesXYZ()) o("orient", CFrame.Angles(0.1, 0.2, 0.3):ToOrientation()) o("axis", CFrame.Angles(0.1, 0.2, 0.3):ToAxisAngle())
+for _, l in out do print(l) end
+
+        "#,
+        1,
+    );
+    expect(
+        &text,
+        &[
+            r#"type CFrame userdata true false true The metatable is locked"#,
+            r#"keys 2"#,
+            r#"ops 2, 4, 6, 1, 0, 0, 0, 1, 0, 0, 0, 1 2, 2, 3 2, 3, 4, 1, 0, 0, 0, 1, 0, 0, 0, 1 0, 1, 2, 1, 0, 0, 0, 1, 0, 0, 0, 1 -1, -2, -3, 1, 0, 0, 0, 1, 0, 0, 0, 1"#,
+            r#"members 1, 2, 3 1 -0, -0, -1 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 1 2 3 1 0 0 0 1 0 0 0 1"#,
+            r#"lerp 0.5, 1, 1.5, 0.87758255, 0, 0.47942555, 0, 1, 0, -0.47942555, 0, 0.87758255 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 2, 3, 4"#,
+            r#"err invalid argument #2 to 'Lerp' (CFrame expected, got number) Argument 1 missing or nil invalid argument #2 (Vector3 expected, got string) Nope is not a valid member of CFrame X member of CFrame is read-only and cannot be assigned to"#,
+            r#"err2 missing argument #3 to 'Lerp' (number expected) invalid argument #1 to 'new' (Vector3 expected, got string) invalid argument #2 to 'ToWorldSpace' (CFrame expected, got number)"#,
+            r#"attr CFrame true"#,
+            r#"value 1, 2, 3, 0.936293423, -0.289629489, 0.198669359, 0.312991828, 0.944702566, -0.0978433937, -0.15934509, 0.153791994, 0.975170493"#,
+            r#"euler -0 0 -0"#,
+            r#"orient 0.0980001837015152 0.2009774148464203 0.319930762052536"#,
+            r#"axis 0.3378807008266449, 0.4807199537754059, 0.8091631531715393 0.381564736366272"#,
+        ],
+    );
+}
+
+/// A --!native script runs as native code (vendor mlua: native modules
+/// only, as Roblox) with the interpreter's results, errors and positions.
+#[test]
+fn bridge_native_module() {
+    let text = run(
+        r#"--!native
+        local function f(n)
+            local s, v = 0, Vector3.new(1, 2, 3)
+            for i = 1, n do s += math.sin(i * 0.01) * (i % 7) v = v * 0.5 + Vector3.yAxis end
+            return s, v
+        end
+        local s, v = f(1000)
+        print("native", string.format("%.6f", s), v, CFrame.new(1, 2, 3) * CFrame.Angles(0, 0.5, 0))
+        print("err", select(2, pcall(function() local t = nil return t.x end)))
+        print("err2", select(2, pcall(function() return 1 + {} end)))
+        "#,
+        1,
+    );
+    expect(
+        &text,
+        &[
+            // (The interpreter's output too: RUSTUDIO_NO_NATIVE=1.)
+            "native 548.727801 0, 2, 0 1, 2, 3, 0.87758255, 0, 0.47942555, 0, 1, 0, -0.47942555, 0, 0.87758255",
+            "err StarterPlayer.StarterPlayerScripts.T:9: attempt to index nil with 'x'",
+            "err2 StarterPlayer.StarterPlayerScripts.T:10: attempt to perform arithmetic (add) on number and table",
+        ],
+    );
+}
+
+/// Color3.fromRGB, UDim2.new / fromScale / fromOffset and Vector2.new on
+/// plain numbers (dtmeta `small_ctor_fast`) and Color3 / Vector2 component
+/// reads give what the implementations give (UDim2.new(1, 2) takes two
+/// UDims: zeros; fromOffset truncates toward zero).
+#[test]
+fn bridge_small_constructors() {
+    let text = run(
+        r#"
+        print("vals", UDim2.new(0.5, 10.7, 1, -3), UDim2.new(1, 2), UDim2.fromOffset(2.9, -1.5), UDim2.fromScale(0.25),
+            Color3.fromRGB(255, 128, 0), Vector2.new(1), Color3.new(0.1, 0.2, 0.3).G, Vector2.new(3, 4).Y, UDim2.new(), Vector2.new())
+        print("types", typeof(UDim2.new(0, 1, 0, 1)), typeof(Color3.fromRGB(1, 2, 3)), typeof(Vector2.new(1, 2)), UDim2.new("1", 2, 3, 4))
+        local a, b = Vector2.new(1/3, 2/3), Vector2.new(3, 5)
+        print("v2", a + b, a - b, a * b, a * 2.5, 2.5 * a, a / 7, a / b, -a, a // 0.1)
+        "#,
+        1,
+    );
+    expect(
+        &text,
+        &[
+            "vals {0.5, 10}, {1, -3} {0, 0}, {0, 0} {0, 2}, {0, -1} {0.25, 0}, {0, 0} 1, 0.501961, 0 1, 0 0.20000000298023224 4 {0, 0}, {0, 0} 0, 0",
+            "types UDim2 Color3 Vector2 {1, 2}, {3, 4}",
+            "v2 3.33333325, 5.66666651 -2.66666675, -4.33333349 1, 3.33333349 0.833333373, 1.66666675 0.833333373, 1.66666675 0.0476190522, 0.0952381045 0.111111112, 0.13333334 -0.333333343, -0.666666687 3, 6",
         ],
     );
 }

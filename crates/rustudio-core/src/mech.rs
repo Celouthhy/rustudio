@@ -197,7 +197,7 @@ pub const LIGHTGRID_NORMAL_OFFSET: f32 = 6.0; // studs out along the normal the 
 pub const LIGHTGRID_BORDER: f32 = 0.4921875; // the shaders take the grid only within this share of its size from its centre, per axis, and open sky beyond (CB0 LightConfig3, read from memory: 0.5 − 1/128)
 pub const LIGHTGRID_MOVES_REFRESH_S: f32 = 1.5; // ...and after parts only moved (characters, enemies) at most this often
 pub const LIGHTGRID_REFRESH_S: f32 = 0.25; // rebuild after a part or terrain edit at most this often (Studio updates the touched chunks over a few frames)
-pub const LIGHTGRID_LOCAL_PATCH_MAX: usize = 400_000; // voxels the lights that changed in a frame may reach for an in-frame re-light of just their boxes (a Range-12 muzzle flash reaches ~1.3k; past this the whole local channel is re-lit on a worker)
+pub const LIGHTGRID_LOCAL_PATCH_MAX: usize = 16_384; // bound synchronous light accumulation plus filter voxels; larger updates run on a worker
 // Local lights blocked by parts (round 26, lightocc.rs; corpus lightwall-soft
 // / lightwall-real, docs/MECHANICS.md "Round 26"). Studio: Shadows on blocks them
 // (Future: shadow maps, hard; Soft: its 4-stud lighting voxels, which a
@@ -366,6 +366,7 @@ pub const TERRAIN_COLLIDER_CELL: f32 = 64.0; // studs per side of one terrain tr
 pub const TERRAIN_FRICTION: f32 = 0.4; // terrain collider friction, one value for all materials (estimated)
 pub const TERRAIN_ELASTICITY: f32 = 0.1; // terrain collider elasticity, one value for all materials (estimated)
 pub const CLICK_DISTANCE: f32 = 32.0; // ClickDetector.MaxActivationDistance default (Roblox docs)
+pub const CLICK_SEE_THROUGH: f32 = 0.95; // a ClickDetector click passes parts above this Transparency that have no detector (Studio probe: 0.95 blocks, 0.96 passes)
 pub const MOVE_TO_REACHED: f32 = 1.0; // Humanoid:MoveTo counts as reached within this many studs (estimated)
 pub const MOVE_TO_TIMEOUT_S: f32 = 8.0; // Humanoid:MoveTo gives up after 8 s (Roblox docs)
 pub const EXPLOSION_PUSH: f32 = 0.0004; // speed change per (BlastPressure / mass) for unanchored parts hit (estimated)

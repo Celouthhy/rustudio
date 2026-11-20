@@ -8,10 +8,10 @@
 //! finished frame's total (the sum of its spans: the timed encoders only, not
 //! egui's own pass or the present). Results lag the frame they measure by a
 //! frame or two. Needs the adapter's TIMESTAMP_QUERY and
-//! TIMESTAMP_QUERY_INSIDE_ENCODERS (requested only with the switch on);
-//! without them, or with the switch off, every call is a no-op.
+//! TIMESTAMP_QUERY_INSIDE_ENCODERS. Automatic quality uses the scene's
+//! encoder start and end timestamps in both timing modes.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use egui_wgpu::wgpu;
@@ -22,18 +22,31 @@ const FREE: u8 = 0;
 const MAPPING: u8 = 1;
 const MAPPED: u8 = 2;
 
-pub fn on() -> bool {
+fn benchmark_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RUSTUDIO_GPU_TIMING").is_some())
 }
 
-/// The device features the switch needs, from what the adapter offers.
+static AUTOMATIC: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_automatic(enabled: bool) {
+    AUTOMATIC.store(enabled, Ordering::Relaxed);
+}
+
+fn on() -> bool {
+    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed)
+}
+
+/// Keep timestamp queries available if Automatic is selected after startup.
 pub fn features(adapter: wgpu::Features) -> wgpu::Features {
-    if on() {
-        adapter & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-    } else {
-        wgpu::Features::empty()
+    adapter & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+}
+
+pub fn last_scene_ms() -> Option<f32> {
+    if !on() {
+        return None;
     }
+    STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.last_scene_ms.take()
 }
 
 struct Slot {
@@ -41,6 +54,7 @@ struct Slot {
     resolve: wgpu::Buffer,
     read: wgpu::Buffer,
     spans: Vec<(u32, u32, &'static str)>,
+    scene_span: Option<(u32, u32)>,
     used: u32,
     state: Arc<AtomicU8>,
 }
@@ -49,9 +63,11 @@ struct State {
     slots: Vec<Slot>,
     cur: Option<usize>,
     last: Option<u32>,
+    encoder_start: Option<u32>,
     period_ns: f64,
     results: Vec<(&'static str, f64)>,
     totals: Vec<f64>,
+    last_scene_ms: Option<f32>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -86,6 +102,7 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
                 mapped_at_creation: false,
             }),
             spans: Vec::new(),
+            scene_span: None,
             used: 0,
             state: Arc::new(AtomicU8::new(FREE)),
         })
@@ -94,9 +111,11 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
         slots,
         cur: Some(0),
         last: None,
+        encoder_start: None,
         period_ns: queue.get_timestamp_period() as f64,
         results: Vec::new(),
         totals: Vec::new(),
+        last_scene_ms: None,
     })
 }
 
@@ -123,11 +142,12 @@ pub fn begin(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::Com
     }
     let Some(st) = g.as_mut() else { return };
     st.last = write(st, encoder);
+    st.encoder_start = st.last;
 }
 
 /// Books the GPU time since the last `begin` / `mark` in this encoder to `label`.
 pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
-    if !on() {
+    if !on() || (!benchmark_enabled() && label != "gpu: post") {
         return;
     }
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -135,7 +155,11 @@ pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
     let Some(prev) = st.last else { return };
     let Some(i) = write(st, encoder) else { return };
     let cur = st.cur.unwrap_or(0);
-    st.slots[cur].spans.push((prev, i, label));
+    let slot = &mut st.slots[cur];
+    slot.spans.push((prev, i, label));
+    if label == "gpu: post" {
+        slot.scene_span = st.encoder_start.map(|start| (start, i));
+    }
     st.last = Some(i);
 }
 
@@ -162,9 +186,11 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
         } else {
             slot.used = 0;
             slot.spans.clear();
+            slot.scene_span = None;
         }
     }
     st.last = None;
+    st.encoder_start = None;
     let _ = device.poll(wgpu::PollType::Poll);
     let period = st.period_ns;
     for slot in st.slots.iter_mut() {
@@ -181,16 +207,29 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
                     continue;
                 }
                 total += ms;
-                match st.results.iter_mut().find(|e| e.0 == *label) {
-                    Some(e) => e.1 += ms,
-                    None => st.results.push((label, ms)),
+                if benchmark_enabled() {
+                    match st.results.iter_mut().find(|e| e.0 == *label) {
+                        Some(e) => e.1 += ms,
+                        None => st.results.push((label, ms)),
+                    }
                 }
             }
-            st.totals.push(total);
+            // Detailed profiling also times effects, UI and extra submits.
+            // Feed the controller the same viewport span in both modes.
+            if let Some((a, b)) = slot.scene_span {
+                let scene = ts[b as usize].wrapping_sub(ts[a as usize]) as f64 * period / 1e6;
+                if scene > 0.0 && scene < 1000.0 {
+                    st.last_scene_ms = Some(scene as f32);
+                }
+            }
+            if benchmark_enabled() {
+                st.totals.push(total);
+            }
         }
         slot.read.unmap();
         slot.used = 0;
         slot.spans.clear();
+        slot.scene_span = None;
         slot.state.store(FREE, Ordering::Release);
     }
     // The next free slot records the next frame; none free: that frame isn't timed.
@@ -219,17 +258,18 @@ pub fn submit(
     label: &'static str,
     bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
 ) {
-    if !on() || UNSUPPORTED.get().is_some() {
+    if !benchmark_enabled() || UNSUPPORTED.get().is_some() {
         queue.submit(bufs);
         return;
     }
-    let saved = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.last);
+    let saved = STATE.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref().map(|s| (s.last, s.encoder_start));
     let mut a = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gpu timing") });
     begin(device, queue, &mut a);
     let mut b = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gpu timing") });
     mark(&mut b, label);
     if let Some(st) = STATE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        st.last = saved;
+        (st.last, st.encoder_start) = saved.unwrap_or_default();
     }
     queue.submit(std::iter::once(a.finish()).chain(bufs).chain(std::iter::once(b.finish())));
 }

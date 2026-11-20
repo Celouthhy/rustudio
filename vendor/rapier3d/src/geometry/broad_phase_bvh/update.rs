@@ -52,8 +52,13 @@ impl BroadPhaseBvh {
 
         // Removals must be handled first, in case another collider in
         // `modified_colliders` shares the same index.
+        let mut removed_leaves = 0;
         for handle in removed_colliders {
-            self.tree.remove(handle.into_raw_parts().0);
+            let leaf = handle.into_raw_parts().0;
+            if self.tree.leaf_node(leaf).is_some() {
+                self.tree.remove(leaf);
+                removed_leaves += 1;
+            }
         }
 
         let first_pass = self.tree.is_empty();
@@ -75,7 +80,6 @@ impl BroadPhaseBvh {
         // collision groups) get their leaf removed and re-inserted as brand-new, so the
         // traversal re-reports every pair the filter suppressed before. Skipped for leaves
         // not in the tree yet.
-        let mut forced_reinsertion = false;
         for handle in modified_colliders {
             if let Some(co) = colliders.get(*handle) {
                 let leaf_index = handle.into_raw_parts().0;
@@ -90,7 +94,6 @@ impl BroadPhaseBvh {
                     && self.tree.leaf_node(leaf_index).is_some()
                 {
                     self.tree.remove(leaf_index);
-                    forced_reinsertion = true;
                 }
             }
         }
@@ -263,7 +266,7 @@ impl BroadPhaseBvh {
         self.reinsert_leaf_updates = num_updated * 16 < self.tree.leaf_count() as usize;
         self.changes_since_optimize = self
             .changes_since_optimize
-            .saturating_add(removed_colliders.len() as u32);
+            .saturating_add(removed_leaves);
         let run_optimizer = self.changes_since_optimize > 0
             && (num_updated * 16 >= leaf_count
                 || (self.frame_index % 8 == 0
@@ -272,8 +275,10 @@ impl BroadPhaseBvh {
 
         // The optimizer is quality-only: defer it (plus its flag-preserving refit) to overlap the narrow
         // phase and solver; inline only when a full refit is needed anyway. Insertions need
-        // NO full refit (`Bvh` maintains ancestor AABBs/counts; `refit_partial` resolves their flags — vital for huge mostly-static scenes); removals do (flag raw-merge into ancestors + orphaned wide nodes).
-        let must_full_refit = first_pass || !removed_colliders.is_empty() || forced_reinsertion;
+        // NO full refit. Insertions and removals both maintain ancestor AABBs
+        // and removals recycle their orphaned nodes. The partial refit resolves
+        // the changed leaves and their ancestor flags without scanning the map.
+        let must_full_refit = first_pass;
         let defer_optimize = run_optimizer && !must_full_refit;
 
         if run_optimizer {
@@ -317,9 +322,11 @@ impl BroadPhaseBvh {
         // the serialized broad-phase state: keeping it would make the two builds' snapshots
         // differ even on an identical simulation.
         #[cfg(feature = "parallel")]
-        let candidates = self
-            .tree
-            .traverse_bvtt_single_tree_parallel::<{ Self::CHANGE_DETECTION_ENABLED }>();
+        let candidates = if num_updated == 0 {
+            Vec::new()
+        } else {
+            self.tree.traverse_bvtt_single_tree_parallel::<{ Self::CHANGE_DETECTION_ENABLED }>()
+        };
 
         #[cfg(not(feature = "parallel"))]
         let candidates = {
@@ -328,11 +335,13 @@ impl BroadPhaseBvh {
             // beyond the (amortized) buffer.
             let mut candidates = core::mem::take(&mut self.candidates_workspace);
             candidates.clear();
-            self.tree
-                .traverse_bvtt_single_tree::<{ Self::CHANGE_DETECTION_ENABLED }>(
-                    &mut self.workspace,
-                    &mut |co1, co2| candidates.push((co1, co2)),
-                );
+            if num_updated != 0 {
+                self.tree
+                    .traverse_bvtt_single_tree::<{ Self::CHANGE_DETECTION_ENABLED }>(
+                        &mut self.workspace,
+                        &mut |co1, co2| candidates.push((co1, co2)),
+                    );
+            }
             candidates
         };
 

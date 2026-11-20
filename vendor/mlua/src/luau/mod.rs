@@ -21,6 +21,14 @@ pub use require::{FsRequirer, NavigateError, Require};
 
 #[cfg(feature = "luau-jit")]
 pub(crate) fn init_jit_flags() {
+    // rustudio: scripts compile and run exactly as without the code
+    // generator (Roblox's flags, runtime::luau_flags): these experimental
+    // call-feedback / inliner flags would change every script's bytecode.
+    // Native code is generated for --!native modules only (state/raw.rs).
+    #[allow(unreachable_code)]
+    if true {
+        return;
+    }
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         // These process-global flags must be set before any VM or compiler uses them.

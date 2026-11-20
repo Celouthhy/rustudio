@@ -15,10 +15,13 @@
 //! One `DualBatch` per solver, cleared per island, never dropped: no allocation
 //! per tick once warm.
 
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Vec3, Vec4};
 
 use super::body::NONE;
 use super::rows::DualRow;
+
+/// Position-lane mass exponent (DUAL §0.5, cfg).
+pub(super) const POSITION_MASS_EXPONENT: f32 = 0.3;
 
 /// The per-batch config (cfg = batch; ctor Studio, rescaled for the
 /// batch's level by Studio). Fields used by the legacy path, with source.
@@ -50,8 +53,7 @@ pub struct LevelCfg {
     /// contact block's compliance (DebugSimAdaptiveIncreaseCollisionStiffness live false).
     pub c_v: f32,
     pub c_p: f32,
-    /// cfg p-lane mass exponent 0.3, cfg p-lane angular factor 0.05 (DUAL §0.5).
-    pub mass_exp: f32,
+    /// cfg p-lane angular factor 0.05 (DUAL §0.5).
     pub ang_factor: f32,
     /// cfg warm start (ctor 1), cfg store λ (ctor 1).
     pub warm: bool,
@@ -92,7 +94,6 @@ impl LevelCfg {
             mu_kinetic: 1.0,
             c_v: f32::from_bits(0x3f7fbe77),
             c_p: f32::from_bits(0x3f733333),
-            mass_exp: 0.3,
             ang_factor: 0.05,
             warm: true,
             store: true,
@@ -297,38 +298,37 @@ fn rcp(a: f32) -> f32 {
 /// Ĵ·u of one side, four-wide (lin v, lin p, ang v, ang p) over x, y, z (DUAL §6.3:
 /// two f32 lanes per row; the order of the 24-term sum is not specified).
 #[inline(always)]
-fn dot_side(j: &[f32], u: &[f32; 12], acc: &mut [f32; 4]) {
-    for a in 0..3 {
-        for k in 0..4 {
-            acc[k] += j[4 * a + k] * u[4 * a + k];
-        }
+fn dot_side(j: &[f32], u: &[f32; 12], mut acc: Vec4) -> Vec4 {
+    for (j, u) in j.as_chunks::<4>().0.iter().zip(u.as_chunks::<4>().0) {
+        acc += Vec4::from_array(*j) * Vec4::from_array(*u);
     }
+    acc
 }
 
 #[inline(always)]
 fn dot_lane(jh: &[f32; 24], u: &[[f32; 12]], pair: [u32; 2]) -> [f32; 2] {
-    let mut s = [0.0f32; 4];
+    let mut s = Vec4::ZERO;
     if pair[0] != NONE {
-        dot_side(&jh[..12], &u[pair[0] as usize], &mut s);
+        s = dot_side(&jh[..12], &u[pair[0] as usize], s);
     }
     if pair[1] != NONE {
-        dot_side(&jh[12..], &u[pair[1] as usize], &mut s);
+        s = dot_side(&jh[12..], &u[pair[1] as usize], s);
     }
-    [s[0] + s[2], s[1] + s[3]]
+    [s.x + s.z, s.y + s.w]
 }
 
 #[inline(always)]
 fn add_lane(u: &mut [[f32; 12]], pair: [u32; 2], d: [f32; 2], w: &[f32; 24]) {
-    let d4 = [d[0], d[1], d[0], d[1]];
+    let d = Vec4::new(d[0], d[1], d[0], d[1]);
     for side in 0..2 {
         if pair[side] == NONE {
             continue;
         }
         let us = &mut u[pair[side] as usize];
+        let (out, _) = us.as_chunks_mut::<4>();
+        let w = w.as_chunks::<4>().0;
         for a in 0..3 {
-            for k in 0..4 {
-                us[4 * a + k] += d4[k] * w[12 * side + 4 * a + k];
-            }
+            out[a] = (Vec4::from_array(out[a]) + d * Vec4::from_array(w[3 * side + a])).to_array();
         }
     }
 }
@@ -336,19 +336,21 @@ fn add_lane(u: &mut [[f32; 12]], pair: [u32; 2], d: [f32; 2], w: &[f32; 24]) {
 /// The contact block's update (DUAL §3.3 step 5): u += Δn·W_0 + Δ1·W_1 + Δ2·W_2.
 #[inline(always)]
 fn add_block(u: &mut [[f32; 12]], pair: [u32; 2], d: &[[f32; 2]; 3], w: &[[f32; 24]]) {
-    let d4 = |r: usize| [d[r][0], d[r][1], d[r][0], d[r][1]];
+    let d4 = |r: usize| Vec4::new(d[r][0], d[r][1], d[r][0], d[r][1]);
     let (d0, d1, d2) = (d4(0), d4(1), d4(2));
+    let (w0, w1, w2) = (w[0].as_chunks::<4>().0, w[1].as_chunks::<4>().0, w[2].as_chunks::<4>().0);
     for side in 0..2 {
         if pair[side] == NONE {
             continue;
         }
-        let o = 12 * side;
         let us = &mut u[pair[side] as usize];
+        let (out, _) = us.as_chunks_mut::<4>();
         for a in 0..3 {
-            for k in 0..4 {
-                let i = o + 4 * a + k;
-                us[4 * a + k] += d0[k] * w[0][i] + d1[k] * w[1][i] + d2[k] * w[2][i];
-            }
+            let i = 3 * side + a;
+            let delta = d0 * Vec4::from_array(w0[i])
+                + d1 * Vec4::from_array(w1[i])
+                + d2 * Vec4::from_array(w2[i]);
+            out[a] = (Vec4::from_array(out[a]) + delta).to_array();
         }
     }
 }

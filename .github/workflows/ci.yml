@@ -143,4 +143,11 @@ jobs:
             exit 1
           fi
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          # A pre-release (vX.Y.Z-alpha.N, drafted with --prerelease by
+          # rustudio-release) stays one and never becomes "latest", which
+          # the in-app updater reads; a stable release becomes latest.
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isPrerelease -q .isPrerelease)" = true ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          fi

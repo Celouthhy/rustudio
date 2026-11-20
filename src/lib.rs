@@ -46,6 +46,7 @@ pub mod engine_tables;
 pub mod icons;
 pub mod live_drafts;
 pub mod layout_store;
+mod panel_cache;
 pub mod panels;
 pub mod part_drag;
 pub mod output_panel;
@@ -144,6 +145,7 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --plugins-dir DIR    load every plugin file in DIR, in Studio's order (.lua, .luau,
                        .rbxm, .rbxmx, each by name)
   --no-plugins         no plugin loads at all (also RUSTUDIO_NO_PLUGINS=1)
+  --bench-vsync        keep the interactive presentation mode with --bench
   --installed-plugin ID:FILE  load FILE as the installed plugin ID (cloud_<ID>)
   --action plugin-button:TOOLBAR/BUTTON@S, --action plugin-action:ACTIONID@S,
   --action plugin-menu:CHOICE@S (answers an open PluginMenu:ShowAsync: N, N.M,
@@ -434,6 +436,14 @@ pub fn run() -> eframe::Result<()> {
         }
     }
     restore_parent_fds();
+    rustudio_core::diagnostics::init();
+    log::info!(
+        "RusTudio {} ({}) on {}/{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("RUSTUDIO_GIT").unwrap_or("unknown commit"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     rustudio_core::load_trace::init();
     // First: a panic or fatal signal from here on leaves a report.
     rustudio_core::crash::install();
@@ -626,6 +636,7 @@ pub fn run() -> eframe::Result<()> {
     let mut shot_after: Option<f32> = None;
     let mut shots: Vec<f32> = Vec::new();
     let mut from_play = false;
+    let mut bench_vsync = false;
     let mut log_out: Option<PathBuf> = None;
     let mut actions: Vec<(f32, app::HarnessAction)> = Vec::new();
     let mut open_roblox: Option<u64> = None;
@@ -669,6 +680,7 @@ pub fn run() -> eframe::Result<()> {
                     .unwrap_or_default()
             }
             "--from-play" => from_play = true,
+            "--bench-vsync" => bench_vsync = true,
             "--log" => log_out = args.next().map(PathBuf::from),
             "--click" | "--key" => {
                 let v = args.next().unwrap_or_default();
@@ -1060,7 +1072,7 @@ pub fn run() -> eframe::Result<()> {
     if std::env::var_os("RUSTUDIO_CONTROL").is_some() {
         viewport = viewport.with_active(false).with_window_level(egui::WindowLevel::AlwaysOnBottom);
     }
-    let wgpu_options = offscreen::wgpu_options(bench_mode);
+    let wgpu_options = offscreen::wgpu_options(bench_mode && !(bench_vsync && harness.run.bench.is_some()));
     // --headless / --no-render: no window at all (src/offscreen.rs).
     if headless {
         let px = [size[0].round() as u32, size[1].round() as u32];

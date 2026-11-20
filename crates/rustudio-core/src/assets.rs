@@ -250,7 +250,7 @@ pub fn asset_ref(content: &str) -> Option<AssetRef> {
     let lower = s.to_ascii_lowercase();
     if let Some(i) = lower.find("?id=").or_else(|| lower.find("&id=")) {
         if lower.contains("roblox.com") {
-            return num(&s[i + 4..]).map(|id| AssetRef {
+            return num(s[i + 4..].trim_ascii_start()).map(|id| AssetRef {
                 id,
                 version: version(s),
             });
@@ -1182,15 +1182,19 @@ impl AssetStore {
 pub struct LoadedMesh {
     pub index: u32,
     pub extent: Vec3,
+    /// The centre of the mesh's own bounds (what the unit box was centred on).
+    pub center: Vec3,
 }
 
 /// Parses mesh bytes and normalises them into the unit box.
 pub fn load_mesh(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec3, Vec<glam::Vec4>), String> {
-    let (p,n,u,e,c,_) = load_mesh_projected(bytes)?;
+    let (p,n,u,e,c,_,_) = load_mesh_projected(bytes)?;
     Ok((p,n,u,e,c))
 }
 
-fn load_mesh_projected(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec3, Vec<glam::Vec4>, Vec<glam::Vec4>), String> {
+/// `load_mesh` plus each corner's projection plane and the centre of the
+/// mesh's own bounds (what the unit box is centred on).
+fn load_mesh_projected(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>, Vec3, Vec<glam::Vec4>, Vec<glam::Vec4>, Vec3), String> {
     let m = mesh::parse(bytes)?;
     if m.positions.is_empty() {
         return Err("the mesh has no triangles".into());
@@ -1205,7 +1209,7 @@ fn load_mesh_projected(bytes: &[u8]) -> Result<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>,
     let normals = m.normals.iter().map(|n| *n * extent).collect();
     let planes = (0..m.positions.len()).map(|i| extent.extend(m.projection_tags.get(i).copied().unwrap_or(0) as f32)).collect();
     let colors = m.gpu_colors();
-    Ok((positions, normals, m.uvs, extent, colors, planes))
+    Ok((positions, normals, m.uvs, extent, colors, planes, center))
 }
 
 /// Uploads positions, normals, UVs and (possibly empty) per-corner colours.
@@ -1299,7 +1303,7 @@ impl MeshCache {
                 f32::from_bits(u32::from_str_radix(fields[2], 16).ok()?),
             );
             let (p, n, uv) = crate::truss::generate(size, fields[3].parse().ok()?);
-            let mesh = LoadedMesh { index: upload(&p, &n, &uv, &[], &[]), extent: size };
+            let mesh = LoadedMesh { index: upload(&p, &n, &uv, &[], &[]), extent: size, center: Vec3::ZERO };
             self.entries.insert(id.to_owned(), Some(mesh));
             return Some(mesh);
         }
@@ -1321,7 +1325,7 @@ impl MeshCache {
                 None
             }
             Fetch::Ready(bytes) => match load_mesh_projected(&bytes) {
-                Ok((pos, nrm, uv, extent, mut colors, planes)) => {
+                Ok((pos, nrm, uv, extent, mut colors, planes, center)) => {
                     // A union with UsePartColor: its own Color, not its children's.
                     if id.ends_with("#partcolor") {
                         colors.clear();
@@ -1332,6 +1336,7 @@ impl MeshCache {
                     Some(LoadedMesh {
                         index: upload(&pos, &nrm, &uv, &colors, &planes),
                         extent,
+                        center,
                     })
                 }
                 Err(e) => {
@@ -1360,7 +1365,7 @@ impl MeshCache {
         if verts.is_empty() {
             return None;
         }
-        let m = LoadedMesh { index: upload(&verts), extent };
+        let m = LoadedMesh { index: upload(&verts), extent, center: Vec3::ZERO };
         self.entries.insert(id.to_string(), Some(m));
         Some(m)
     }
@@ -1999,7 +2004,7 @@ pub fn body_template_uvs(part: &str, positions: &[Vec3]) -> Option<Vec<Vec2>> {
 
 /// A mesh's positions / normals / UVs as uploaded (normalized to its unit box).
 pub fn mesh_for_upload(bytes: &[u8]) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec2>)> {
-    let (p, n, uv, _, _, _) = load_mesh_projected(bytes).ok()?;
+    let (p, n, uv, _, _, _, _) = load_mesh_projected(bytes).ok()?;
     Some((p, n, uv))
 }
 
@@ -2284,6 +2289,17 @@ pub fn composite_over(under: Option<&Rgba>, over: Option<&Rgba>) -> Option<Rgba>
 mod tests {
     use super::*;
 
+    /// The unit box is centred on the mesh's bounds; their centre comes
+    /// back so a CharacterMesh can sit by the mesh's own origin.
+    #[test]
+    fn loaded_mesh_keeps_its_bounds_centre() {
+        let v1 = b"version 1.01\n1\n[0,1,0][0,0,1][0,0,0][2,1,0][0,0,1][1,0,0][0,3,1][0,0,1][0,1,0]";
+        let (pos, _, _, extent, _, _, center) = load_mesh_projected(v1).unwrap();
+        assert!((center - Vec3::new(1.0, 2.0, 0.5)).length() < 1e-5, "{center:?}");
+        assert!((extent - Vec3::new(2.0, 2.0, 1.0)).length() < 1e-5, "{extent:?}");
+        assert!((pos[0] - Vec3::new(-0.5, -0.5, -0.5)).length() < 1e-5, "{:?}", pos[0]);
+    }
+
     fn transient(status: u16, retry_after: Option<&str>) -> AssetDownloadError {
         AssetDownloadError::Transient {
             status,
@@ -2549,6 +2565,10 @@ mod tests {
             })
         );
         assert_eq!(asset_ref("rbxasset://fonts/x.mesh"), None);
+        assert_eq!(
+            asset_ref("http://www.roblox.com/asset/?id= 276090533"),
+            Some(AssetRef { id: 276090533, version: None })
+        );
     }
 
     #[test]

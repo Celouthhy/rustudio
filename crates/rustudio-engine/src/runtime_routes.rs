@@ -19,7 +19,7 @@
 
 use super::*;
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::LazyLock;
 
 // ------------------------------------------------------------- atoms
@@ -35,12 +35,14 @@ static ATOMS: LazyLock<Atoms> = LazyLock::new(|| {
     let mut names: Vec<String> = Vec::new();
     let db = doc::db();
     for c in db.classes.values() {
+        names.push(c.name.to_string());
         for p in c.properties.keys() {
             names.push(p.to_string());
         }
     }
     if let Some(api) = rustudio_core::api::get() {
-        for c in api.classes.values() {
+        for (name, c) in &api.classes {
+            names.push(name.clone());
             names.extend(c.members.keys().cloned());
         }
     }
@@ -288,9 +290,72 @@ pub(super) fn method_route(class: rbx_dom_weak::Ustr, name: &str) -> MethodRoute
     MethodRoute { core, extended, domains, shadowed }
 }
 
+const ROUTE_SLOTS: usize = 64;
+
 thread_local! {
+    static RECENT: [Cell<Option<(usize, i32, Route)>>; ROUTE_SLOTS] = const { [const { Cell::new(None) }; ROUTE_SLOTS] };
     static BY_ATOM: RefCell<FxHashMap<(usize, i32), Route>> = RefCell::new(FxHashMap::default());
     static BY_NAME: RefCell<FxHashMap<usize, FxHashMap<Box<str>, Route>>> = RefCell::new(FxHashMap::default());
+    static ISA: RefCell<FxHashMap<(usize, i32), bool>> = RefCell::new(FxHashMap::default());
+    static LAST_ISA: Cell<Option<(rbx_dom_weak::Ustr, i32, bool)>> = const { Cell::new(None) };
+    static TRAVERSAL_ROUTES: RefCell<FxHashMap<rbx_dom_weak::Ustr, TraversalRoutes>> =
+        RefCell::new(FxHashMap::default());
+    static LAST_TRAVERSAL: Cell<Option<(rbx_dom_weak::Ustr, TraversalRoutes)>> = const { Cell::new(None) };
+}
+
+/// Class arguments use the same VM atoms as members. Keep the result by
+/// interned class and atom so a scan doesn't hash both class names per node.
+pub(super) fn is_a(class: rbx_dom_weak::Ustr, base: &str, base_atom: i32) -> bool {
+    if base_atom < 0 {
+        return doc::is_a(class.as_str(), base);
+    }
+    LAST_ISA.with(|last| {
+        if let Some((known_class, known_atom, result)) = last.get() {
+            if class == known_class && base_atom == known_atom {
+                return result;
+            }
+        }
+        let key = (class.as_str().as_ptr() as usize, base_atom);
+        let result = ISA.with(|cache| {
+            *cache.borrow_mut().entry(key).or_insert_with(|| doc::is_a(class.as_str(), base))
+        });
+        last.set(Some((class, base_atom, result)));
+        result
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TraversalRoutes {
+    is_a: bool,
+    get_children: bool,
+}
+
+/// Cache the two core route decisions together. Recursive walks ask both
+/// questions about each node and usually visit many nodes of the same class.
+fn traversal_routes(class: rbx_dom_weak::Ustr) -> TraversalRoutes {
+    LAST_TRAVERSAL.with(|last| {
+        if let Some((known, flags)) = last.get() {
+            if class == known {
+                return flags;
+            }
+        }
+        let flags = TRAVERSAL_ROUTES.with(|cache| {
+            *cache.borrow_mut().entry(class).or_insert_with(|| {
+                let core = |name: &str| {
+                    let atom = ATOMS.by_name.get(name.as_bytes()).copied().unwrap_or(-1);
+                    let rt = route(class, name, i32::from(atom));
+                    matches!(rt.disp, Disp::Method(method, _) if method == name)
+                        && rt.method.core
+                        && rt.method.domains == 0
+                        && !rt.restricted
+                        && !rt.overridable
+                };
+                TraversalRoutes { is_a: core("IsA"), get_children: core("GetChildren") }
+            })
+        });
+        last.set(Some((class, flags)));
+        flags
+    })
 }
 
 /// The route for `class.key`; `atom` is the key's Luau atom (or negative:
@@ -298,11 +363,26 @@ thread_local! {
 pub(super) fn route(class: rbx_dom_weak::Ustr, key: &str, atom: i32) -> Route {
     let cid = class.as_str().as_ptr() as usize;
     if atom >= 0 {
-        if let Some(r) = BY_ATOM.with(|m| m.borrow().get(&(cid, atom)).copied()) {
+        // A direct-mapped cache in front of the map: a script's loop reads
+        // and writes a few members of a few classes (bone posing: CFrame /
+        // Transform of Bone and Motor6D), each lookup otherwise a RefCell
+        // borrow and a hash probe.
+        let slot = ((cid >> 4) ^ (atom as usize).wrapping_mul(0x9E37)) & (ROUTE_SLOTS - 1);
+        if let Some(r) = RECENT.with(|c| match c[slot].get() {
+            Some((k, a, r)) if k == cid && a == atom => Some(r),
+            _ => None,
+        }) {
             return r;
         }
-        let r = compute(class, key);
-        BY_ATOM.with(|m| m.borrow_mut().insert((cid, atom), r));
+        let r = match BY_ATOM.with(|m| m.borrow().get(&(cid, atom)).copied()) {
+            Some(r) => r,
+            None => {
+                let r = compute(class, key);
+                BY_ATOM.with(|m| m.borrow_mut().insert((cid, atom), r));
+                r
+            }
+        };
+        RECENT.with(|c| c[slot].set(Some((cid, atom, r))));
         return r;
     }
     if let Some(r) = BY_NAME.with(|m| m.borrow().get(&cid).and_then(|t| t.get(key).copied())) {
@@ -463,21 +543,18 @@ unsafe fn push_fv(
             }
             Fv::CFrame(x) => {
                 ffi::luaL_checkstack(l, 3, std::ptr::null());
-                if lua.push_userdata_unref(l, crate::ltypes::LCFrame(x))? {
+                if crate::ltypes::cframe_ready(l) {
+                    crate::ltypes::cframe_push(l, x);
                     return Ok(true);
                 }
-                let v = Value::UserData(lua.create_userdata(crate::ltypes::LCFrame(x))?);
+                let v = crate::ltypes::LCFrame(x).into_lua(lua)?;
                 Ok(push_value(lua, l, key, v))
             }
-            Fv::Insts(refs) => {
-                ffi::lua_createtable(l, refs.len() as _, 0);
-                ffi::luaL_checkstack(l, 2, std::ptr::null());
-                for (i, r) in refs.into_iter().enumerate() {
-                    if !push_fv(lua, l, key, weak, Fv::Inst(r))? {
-                        return Ok(false);
-                    }
-                    ffi::lua_rawseti(l, -2, (i + 1) as _);
-                }
+            Fv::Insts(refs) => push_instances(lua, l, key, weak, &refs),
+            Fv::OneChild(r) => push_instances(lua, l, key, weak, &[r]),
+            Fv::NoChildren => {
+                // The caller can mutate the result, even when it is empty.
+                ffi::lua_createtable(l, 0, 0);
                 Ok(true)
             }
             Fv::Inst(r) if r.is_none() => {
@@ -497,6 +574,54 @@ unsafe fn push_fv(
                 Ok(push_value(lua, l, key, v))
             }
         }
+    }
+}
+
+unsafe fn push_instances(
+    lua: &Lua,
+    l: *mut mlua::ffi::lua_State,
+    key: *mut mlua::RegistryKey,
+    weak: std::ffi::c_int,
+    refs: &[Ref],
+) -> mlua::Result<bool> {
+    use mlua::ffi;
+    unsafe {
+        ffi::lua_createtable(l, refs.len() as _, 0);
+        ffi::luaL_checkstack(l, 4, std::ptr::null());
+        let weak_table = ffi::lua_upvalueindex(weak);
+        // A restricted child needs the normal access error from inst_value.
+        // For the usual unrestricted array, check the whole list together.
+        let has_cache = ffi::lua_type(l, weak_table) == ffi::LUA_TTABLE
+            && !domains::assets_cloud::scene::any_access_blocked(lua, refs);
+        for (i, &r) in refs.iter().enumerate() {
+            if has_cache {
+                let id = cache(lua)?.instance_slot(r) as _;
+                if ffi::lua_rawgeti(l, weak_table, id) == ffi::LUA_TUSERDATA {
+                    ffi::lua_rawseti(l, -2, (i + 1) as _);
+                    continue;
+                }
+                ffi::lua_pop(l, 1);
+                // Create the same userdata as inst_value on the caller's
+                // stack and update the weak table and orphan collector.
+                let pushed = if instance_is_object(lua, r) {
+                    lua.push_userdata_unref(l, LObj(r))?
+                } else {
+                    lua.push_userdata_unref(l, LInst(r))?
+                };
+                if pushed {
+                    cache(lua)?.fresh.push(r);
+                    ffi::lua_pushvalue(l, -1);
+                    ffi::lua_rawseti(l, weak_table, id);
+                    ffi::lua_rawseti(l, -2, (i + 1) as _);
+                    continue;
+                }
+            }
+            if !push_value(lua, l, key, inst_value(lua, r)?) {
+                return Ok(false);
+            }
+            ffi::lua_rawseti(l, -2, (i + 1) as _);
+        }
+        Ok(true)
     }
 }
 
@@ -658,18 +783,69 @@ unsafe fn fast_newindex(l: *mut mlua::ffi::lua_State, atom: std::ffi::c_int) -> 
         let lua = Lua::get_or_init_from_ptr(l);
         // (mlua's current thread: the caller, as in its own callbacks)
         lua.with_current_state(l, || {
-            // `x.Parent = p` (Place E's Emitter2D: 372 a frame, nearly all to the
-            // parent it has): the Ref straight off the stack, a no-op answered
-            // in one borrow.
-            if key == "Parent" && !domains::route_check_on() {
-                let p = match ffi::lua_type(l, 3) {
-                    ffi::LUA_TNIL => Some(Ref::none()),
-                    ffi::LUA_TUSERDATA => arg_ref(l, 3, 7),
+            if matches!(key, "Parent" | "Brightness") && !domains::route_check_on() {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let ty = ffi::lua_type(l, 3);
+                    rustudio_core::bench::api_timed("newindex", key, || match (key, ty) {
+                        ("Parent", ffi::LUA_TNIL) => parent_write(lua, r, key, atom, Ref::none()),
+                        ("Parent", ffi::LUA_TUSERDATA) => parent_write(lua, r, key, atom, arg_ref(l, 3, 7)?),
+                        ("Brightness", ffi::LUA_TNUMBER) => brightness_write(lua, r, atom, ffi::lua_tonumber(l, 3) as f32),
+                        _ => None,
+                    })
+                }));
+                match res {
+                    Ok(None) => {}
+                    Ok(Some(Ok(quiet))) => {
+                        if !quiet {
+                            signal_timing::flush_immediate(lua);
+                        }
+                        return 0;
+                    }
+                    Ok(Some(Err(e))) => {
+                        signal_timing::flush_immediate(lua);
+                        let m = raw_error_message(&e);
+                        ffi::lua_pushlstring(l, m.as_ptr() as *const _, m.len());
+                        return -2;
+                    }
+                    Err(_) => {
+                        ffi::lua_pushstring(l, c"internal error".as_ptr());
+                        return -2;
+                    }
+                }
+            }
+            // A plain stored property given a value of its own type
+            // (`typed_write`): read off the stack, no mlua Value.
+            if !domains::route_check_on() {
+                let val = match ffi::lua_type(l, 3) {
+                    ffi::LUA_TNUMBER => Some(FastVal::Num(ffi::lua_tonumber(l, 3))),
+                    ffi::LUA_TBOOLEAN => Some(FastVal::Bool(ffi::lua_toboolean(l, 3) != 0)),
+                    ffi::LUA_TVECTOR => {
+                        let v = ffi::lua_tovector(l, 3);
+                        Some(FastVal::Vec3(glam::Vec3::new(*v, *v.add(1), *v.add(2))))
+                    }
+                    ffi::LUA_TUSERDATA => match crate::ltypes::cframe_at(l, 3) {
+                        Some(x) => Some(FastVal::CFrame(x)),
+                        None => {
+                            use crate::ltypes::{LColor3, LUDim, LUDim2, LVector2};
+                            use std::any::TypeId;
+                            match lua.userdata_type_at(l, 3) {
+                                Some(t) if t == TypeId::of::<LColor3>() => {
+                                    lua.userdata_copy_of::<LColor3>(l, 3).map(|c| FastVal::Color3(c.0))
+                                }
+                                Some(t) if t == TypeId::of::<LUDim2>() => lua.userdata_copy_of::<LUDim2>(l, 3).map(FastVal::UDim2),
+                                Some(t) if t == TypeId::of::<LUDim>() => lua.userdata_copy_of::<LUDim>(l, 3).map(FastVal::UDim),
+                                Some(t) if t == TypeId::of::<LVector2>() => {
+                                    lua.userdata_copy_of::<LVector2>(l, 3).map(|v| FastVal::Vec2(v.0))
+                                }
+                                _ => None,
+                            }
+                        }
+                    },
                     _ => None,
                 };
-                if let Some(p) = p {
+                if let Some(val) = val {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rustudio_core::bench::api_timed("newindex", key, || parent_write(lua, r, key, atom, p))
+                        rustudio_core::bench::api_timed("newindex", key, || typed_write(lua, r, key, atom, val))
                     }));
                     match res {
                         Ok(None) => {}
@@ -722,9 +898,10 @@ pub(super) fn fast_newindex_fn(lua: &Lua) -> Option<(crate::cmeta::Fast, [Value;
 
 /// The Instance `__namecall`: the method by the name's atom,
 /// dispatched (`namecall`) straight from the C function, its arguments
-/// converted without an mlua call; the answer is pushed after them in the
-/// dispatcher's form ((true, results…), (false, message) or a Lua
-/// method's function). Data in upvalues 4 to 6.
+/// converted without an mlua call. Typed methods return the result count,
+/// and general calls push the dispatcher's response after the arguments
+/// ((true, results…), (false, message) or a Lua method's function).
+/// Data starts at upvalue 4.
 unsafe fn fast_namecall(
     l: *mut mlua::ffi::lua_State,
     _name: *const std::ffi::c_char,
@@ -733,15 +910,68 @@ unsafe fn fast_namecall(
 ) -> std::ffi::c_int {
     use mlua::ffi;
     unsafe {
-        if n < 1 || self_ref(l, 4).is_none() {
+        if n < 1 {
             return -1;
         }
+        let Some(r) = self_ref(l, 4) else { return -1 };
         if rustudio_core::bench::call_probes_on() {
             return -1;
         }
         let Some(&name) = ATOMS.names.get(atom as usize) else { return -1 };
-        let slot = slot_key(l, 6);
         let lua = Lua::get_or_init_from_ptr(l);
+        let check_routes = domains::route_check_on();
+        // These methods read native data first. An IsA boolean and an
+        // empty array can be pushed without switching mlua's current
+        // state to the caller. A populated array may need new userdata.
+        let mut children = None;
+        if !check_routes {
+            if name == "IsA" && n == 2 {
+                let mut base_atom = -1;
+                ffi::lua_tostringatom(l, 2, &mut base_atom);
+                if let Some(&base) = ATOMS.names.get(base_atom as usize) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rustudio_core::bench::api_timed("call", name, || {
+                            let w = lua.app_data_ref::<World>()?;
+                            let class = w.d().class_of(r)?;
+                            if !traversal_routes(class).is_a {
+                                return None;
+                            }
+                            rustudio_core::telemetry::touch(class.as_str(), name);
+                            Some(is_a(class, base, base_atom))
+                        })
+                    }));
+                    match result {
+                        Ok(Some(value)) => {
+                            ffi::lua_pushboolean(l, value as _);
+                            return 1;
+                        }
+                        Err(_) => return -1,
+                        _ => {}
+                    }
+                }
+            } else if name == "GetChildren" && n == 1 {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rustudio_core::bench::api_timed("call", name, || {
+                        let w = lua.app_data_ref::<World>()?;
+                        let instance = w.d().dom.get_by_ref(r)?;
+                        if !traversal_routes(instance.class).get_children {
+                            return None;
+                        }
+                        rustudio_core::telemetry::touch(instance.class.as_str(), name);
+                        Some(child_result(instance.children()))
+                    })
+                }));
+                match result {
+                    Ok(Some(Fv::NoChildren)) => {
+                        ffi::lua_createtable(l, 0, 0);
+                        return 1;
+                    }
+                    Ok(result) => children = result,
+                    Err(_) => return -1,
+                }
+            }
+        }
+        let slot = slot_key(l, 6);
         // (mlua's current thread: the caller, as in its own callbacks)
         lua.with_current_state(l, || {
             // EditableMesh:SetColor(id, Color3): thousands a frame from a
@@ -750,9 +980,9 @@ unsafe fn fast_namecall(
             if n == 3
                 && atom == *SET_COLOR
                 && ffi::lua_type(l, 2) == ffi::LUA_TNUMBER
-                && !domains::route_check_on()
+                && !check_routes
             {
-                if let (Some(r), Some(c)) = (self_ref(l, 4), lua.peek_userdata_copy::<crate::ltypes::LColor3>(l, 3)) {
+                if let Some(c) = lua.peek_userdata_copy::<crate::ltypes::LColor3>(l, 3) {
                     if editable::set_color_fast(r, ffi::lua_tonumber(l, 2), c.0) {
                         ffi::lua_pushboolean(l, 1);
                         return 0;
@@ -760,18 +990,26 @@ unsafe fn fast_namecall(
                 }
             }
             // A native method (`native_call`): plain arguments off the stack.
-            if n <= 4 && !domains::route_check_on() {
+            if n <= 4 && !check_routes {
                 let mut nargs: [NArg; 3] = [NArg::Other, NArg::Other, NArg::Other];
                 for i in 2..=n {
                     nargs[(i - 2) as usize] = match ffi::lua_type(l, i) {
                         ffi::LUA_TNIL => NArg::Nil,
                         ffi::LUA_TBOOLEAN => NArg::Bool(ffi::lua_toboolean(l, i) != 0),
                         ffi::LUA_TSTRING => {
-                            let mut len = 0usize;
-                            let p = ffi::lua_tolstring(l, i, &mut len);
-                            match std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len)) {
-                                Ok(s) => NArg::Str(s),
-                                Err(_) => NArg::Other,
+                            let mut arg_atom = -1;
+                            if name == "IsA" && i == 2 {
+                                ffi::lua_tostringatom(l, i, &mut arg_atom);
+                            }
+                            if let Some(&s) = ATOMS.names.get(arg_atom as usize) {
+                                NArg::Str(s, arg_atom)
+                            } else {
+                                let mut len = 0usize;
+                                let p = ffi::lua_tolstring(l, i, &mut len);
+                                match std::str::from_utf8(std::slice::from_raw_parts(p as *const u8, len)) {
+                                    Ok(s) => NArg::Str(s, -1),
+                                    Err(_) => NArg::Other,
+                                }
                             }
                         }
                         ffi::LUA_TUSERDATA => match arg_ref(l, i, 4) {
@@ -781,19 +1019,20 @@ unsafe fn fast_namecall(
                         _ => NArg::Other,
                     };
                 }
-                let r = self_ref(l, 4).unwrap_or_else(Ref::none);
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustudio_core::bench::api_timed("call", name, || native_call(lua, r, name, atom, &nargs[..(n - 1) as usize]))
-                }));
+                let res = match children {
+                    Some(value) => Ok(Some(Ok((value, true)))),
+                    None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rustudio_core::bench::api_timed("call", name, || native_call(lua, r, name, atom, &nargs[..(n - 1) as usize]))
+                    })),
+                };
                 match res {
                     Ok(None) => {}
                     Ok(Some(Ok((v, quiet)))) => {
                         if !quiet {
                             signal_timing::flush_immediate(lua);
                         }
-                        ffi::lua_pushboolean(l, 1);
                         match push_fv(lua, l, slot, 7, v) {
-                            Ok(true) => return 0,
+                            Ok(true) => return 1,
                             Ok(false) => {}
                             Err(e) => {
                                 let m = raw_error_message(&e);

@@ -36,7 +36,7 @@ fn mono_px() -> f32 {
     crate::studio_settings::font_px("Studio", "Output Font")
 }
 
-fn line_h() -> f32 {
+pub(crate) fn line_h() -> f32 {
     (LINE_H * mono_px() / 13.0).round()
 }
 
@@ -220,11 +220,34 @@ pub struct OutputState {
     pub show_context: bool,
     pub show_source: bool,
     pub sel: OutputSelection,
+    rows: OutputRows,
+    pub(crate) log_generation: u64,
+}
+
+#[derive(Default)]
+struct OutputRows {
+    filter: Option<(MessageFilter, ContextFilter, String)>,
+    indexed: usize,
+    shown: Vec<usize>,
+    tops: Vec<f32>,
+    height: f32,
+    row_height: f32,
+}
+
+impl OutputRows {
+    fn clear(&mut self) {
+        self.indexed = 0;
+        self.shown.clear();
+        self.tops.clear();
+        self.height = 0.0;
+    }
 }
 
 impl OutputState {
     /// The log dropped its first `n` lines: keep the selection on its text.
     pub fn log_drained(&mut self, n: usize) {
+        self.rows.clear();
+        self.log_generation = self.log_generation.wrapping_add(1);
         let s = &mut self.sel;
         let shift = |p: &mut TextPos| *p = if p.0 >= n { (p.0 - n, p.1) } else { (0, 0) };
         shift(&mut s.anchor);
@@ -232,6 +255,8 @@ impl OutputState {
         s.drag = None;
     }
     pub fn log_cleared(&mut self) {
+        self.rows.clear();
+        self.log_generation = self.log_generation.wrapping_add(1);
         let s = &mut self.sel;
         s.anchor = (0, 0);
         s.head = (0, 0);
@@ -249,11 +274,13 @@ impl Default for OutputState {
             show_context: false,
             show_source: true,
             sel: OutputSelection::default(),
+            rows: OutputRows::default(),
+            log_generation: 0,
         }
     }
 }
 
-fn wanted(st: &OutputState, s: &Shown, l: &LogLine) -> bool {
+fn wanted(st: &OutputState, filter: &str, s: &Shown, l: &LogLine) -> bool {
     let kind_ok = match st.messages {
         MessageFilter::All => true,
         MessageFilter::Output => s.kind == Kind::Print,
@@ -266,7 +293,7 @@ fn wanted(st: &OutputState, s: &Shown, l: &LogLine) -> bool {
         ContextFilter::Server => s.context == Context::Server,
         ContextFilter::Client => s.context == Context::Client,
     };
-    let text_ok = st.filter.is_empty() || l.text.to_lowercase().contains(&st.filter.to_lowercase());
+    let text_ok = filter.is_empty() || l.text.to_lowercase().contains(filter);
     kind_ok && ctx_ok && text_ok
 }
 
@@ -299,6 +326,7 @@ pub fn line_job(st: &OutputState, l: &LogLine, s: &Shown) -> egui::text::LayoutJ
 
 impl Editor {
     pub fn output_ui(&mut self, ui: &mut egui::Ui) {
+        let _p = rustudio_core::bench::scope("output_build");
         self.ui_rects.insert("output.panel", ui.max_rect());
         self.flush_output_changes();
         let st = &mut self.output_view;
@@ -341,6 +369,11 @@ impl Editor {
                     ui.checkbox(&mut st.show_timestamp, "Show Timestamp");
                     ui.checkbox(&mut st.show_context, "Show Context");
                     ui.checkbox(&mut st.show_source, "Show Source");
+                    if let Some(path) = rustudio_core::diagnostics::path() {
+                        if ui.button("Copy Diagnostic Log Path").clicked() {
+                            ui.ctx().copy_text(path.display().to_string());
+                        }
+                    }
                 });
                 let (r, clear) = ui.allocate_exact_size(Vec2::new(24.0, 20.0), Sense::click());
                 rustudio_engine::ti::paint(ui.painter(), r.shrink(2.0), "clear-all", theme::TEXT);
@@ -358,27 +391,34 @@ impl Editor {
 
 /// The lines, drawn and selectable as one text; returns how many were drawn.
 pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usize {
-    // Unfiltered (the usual case) needs no per-line parse every frame.
-    let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && st.filter.is_empty();
-    let shown: Vec<usize> = (0..log.len())
-        .filter(|i| {
-            if unfiltered {
-                return true;
-            }
-            let l = &log[*i];
-            wanted(st, &parse(l), l)
-        })
-        .collect();
-    let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
-    // A message can span lines (stack traces, banners): each takes
-    // line_h() per line; `tops` are the running offsets.
-    let mut tops = Vec::with_capacity(shown.len() + 1);
-    let mut y = 0.0;
-    for &i in &shown {
-        tops.push(y);
-        y += line_h() * (log[i].text.matches('\n').count() + 1) as f32;
+    let row_height = line_h();
+    let mut index = std::mem::take(&mut st.rows);
+    let same_filter = index.filter.as_ref().is_some_and(|(messages, contexts, text)| {
+        *messages == st.messages && *contexts == st.contexts && *text == st.filter
+    });
+    if !same_filter || index.indexed > log.len() || index.row_height != row_height {
+        index.clear();
+        index.filter = Some((st.messages, st.contexts, st.filter.clone()));
     }
-    tops.push(y);
+    index.row_height = row_height;
+    index.tops.pop();
+    if index.indexed < log.len() {
+        // Appends only inspect new messages. Clearing or draining the log
+        // invalidates the index, as do the filters and Output Font.
+        let filter = st.filter.to_lowercase();
+        let unfiltered = st.messages == MessageFilter::All && st.contexts == ContextFilter::All && filter.is_empty();
+        for (i, line) in log.iter().enumerate().skip(index.indexed) {
+            if unfiltered || wanted(st, &filter, &parse(line), line) {
+                index.shown.push(i);
+                index.tops.push(index.height);
+                index.height += row_height * (line.text.matches('\n').count() + 1) as f32;
+            }
+        }
+        index.indexed = log.len();
+    }
+    index.tops.push(index.height);
+    let (shown, tops) = (&index.shown, &index.tops);
+    let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
     let id = egui::Id::new("output_text");
     let mut drawn = 0;
     egui::ScrollArea::vertical()
@@ -404,7 +444,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 let galley = ui.fonts_mut(|f| f.layout_job(line_job(st, l, &s)));
                 let top = content.min.y + tops[k];
                 // One monospace space wide, then one more space.
-                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, line_h()));
+                let bar = egui::Rect::from_min_size(egui::pos2(content.min.x, top), Vec2::new(space, row_height));
                 let bar_color = match s.context {
                     Context::Server => Some(SERVER_BAR),
                     Context::Client => Some(CLIENT_BAR),
@@ -487,7 +527,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                     0.0
                 };
                 if dy != 0.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-line_h() * 2.0, line_h() * 2.0)));
+                    ui.scroll_with_delta(Vec2::new(0.0, dy.clamp(-row_height * 2.0, row_height * 2.0)));
                     ui.ctx().request_repaint();
                 }
             }
@@ -520,9 +560,9 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                         let (sa, sb) = (a.max(start), b.min(start + len));
                         let runs_on = b > start + len && (start + len < n || *i < hi.0);
                         if sa <= sb && (sa < sb || runs_on) {
-                            let y = top + line_h() * k as f32;
+                            let y = top + row_height * k as f32;
                             let end = x(sb) + if runs_on { *space } else { 0.0 };
-                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + line_h()));
+                            let r = egui::Rect::from_min_max(egui::pos2(x(sa), y), egui::pos2(end, y + row_height));
                             shapes.push(egui::Shape::rect_filled(r, 0.0, fill));
                         }
                         start += len + 1;
@@ -566,6 +606,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             }
         }
     }
+    st.rows = index;
     drawn
 }
 
@@ -738,9 +779,30 @@ mod tests {
     }
 
     #[test]
+    fn filtered_output_indexes_appends_and_rebuilds_after_drain() {
+        let mut v = View::new();
+        v.st.contexts = ContextFilter::Server;
+        v.frame(vec![]);
+        assert_eq!(v.st.rows.shown, [0, 2]);
+
+        v.log.push(line(Level::Warn, "[Client] hidden warning"));
+        v.log.push(line(Level::Info, "[Server] extra line\ncontinued"));
+        v.frame(vec![]);
+        assert_eq!(v.st.rows.shown, [0, 2, 4]);
+        assert_eq!(v.st.rows.height, 4.0 * v.st.rows.row_height);
+
+        v.log.drain(..2);
+        v.st.log_drained(2);
+        v.frame(vec![]);
+        assert_eq!(v.st.rows.shown, [0, 2]);
+        assert_eq!(v.st.rows.height, 3.0 * v.st.rows.row_height);
+    }
+
+    #[test]
     fn multi_line_messages_take_their_height() {
         let mut v = View::new();
         v.log.insert(1, line(Level::Info, "[Server] banner top\nbanner mid\nbanner end  —  ServerScriptService.D:4"));
+        v.st.log_cleared();
         v.frame(vec![]);
         // Visual rows: 0 hello, 1-3 banner, 4 second line.
         let p = v.at(4, 1);

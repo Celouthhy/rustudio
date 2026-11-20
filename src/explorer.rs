@@ -52,7 +52,7 @@ pub struct ExplorerState {
 }
 
 /// Order-independent fingerprint of the expanded set.
-fn expanded_key(st: &ExplorerState) -> u64 {
+pub(crate) fn expanded_key(st: &ExplorerState) -> u64 {
     use std::hash::{Hash, Hasher};
     st.expanded.iter().fold(st.expanded.len() as u64, |acc, r| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -192,6 +192,7 @@ fn flatten(doc: &Document, st: &ExplorerState) -> (Vec<(Ref, usize)>, HashSet<Re
 
 impl Editor {
     pub fn explorer_ui(&mut self, ui: &mut egui::Ui) {
+        let _p = rustudio_core::bench::scope("explorer_build");
         // The keyboard belongs to the Explorer after a click in it.
         let panel = ui.max_rect();
         if let Some(p) = ui.input(|i| if i.pointer.any_pressed() { i.pointer.press_origin() } else { None }) {
@@ -267,6 +268,7 @@ impl Editor {
         let rows = match &self.explorer.rows_cache {
             Some((k, rows)) if *k == key => rows.clone(),
             _ => {
+                let _p = rustudio_core::bench::scope("explorer_rebuild");
                 let (rows, forced) = flatten(&self.game.doc, &self.explorer);
                 let rows = std::rc::Rc::new(rows);
                 self.explorer.forced_open = forced;

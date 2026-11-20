@@ -369,6 +369,18 @@ pub struct NarrowPhase {
     /// (re)built at. A mismatch means the awake set / solver-body indices shifted
     /// (sleep, wake, body add/remove), so the graph is fully rebuilt.
     solver_graph_epoch: u32,
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    contact_epoch: u64,
+    /// (rustudio) Keep the manifolds of a pair whose two collider poses are bit-identical
+    /// to its last full update instead of recomputing them (an external solver that
+    /// steps some bodies only every few ticks). Off: upstream's behaviour.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub skip_unmoved_pairs: bool,
+    /// (rustudio) Before computing the manifold of a contact-free cylinder pair, test a
+    /// few conservative separating axes and keep the empty manifold when one separates
+    /// them by more than the prediction distance.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub cylinder_separation_test: bool,
     /// The [`MultibodyJointSet::topology_epoch`] the solver contact graph was last built at.
     /// A mismatch means bodies may have joined/left a multibody (manifolds can switch
     /// between color buckets and the generic list), forcing a full rebuild.
@@ -443,6 +455,9 @@ impl NarrowPhase {
             solver_contact_graph: SolverContactGraph::new(),
             solver_graph_valid: false,
             solver_graph_epoch: 0,
+            contact_epoch: 0,
+            skip_unmoved_pairs: false,
+            cylinder_separation_test: false,
             solver_graph_mb_epoch: 0,
             solver_graph_dirty: Vec::new(),
             force_event_pairs: Vec::new(),

@@ -6,7 +6,6 @@ use super::{
     PAIR_HINT_COUNT_MASK, PAIR_HINT_DYN_BIT, clear_filtered_pair, pair_qualified_manifold_count,
     single_manifold_bucket_drift,
 };
-#[cfg(not(feature = "parallel"))]
 use crate::alloc_prelude::*;
 use crate::dynamics::{
     CoefficientCombineRule, ImpulseJointSet, MultibodyJointSet, RigidBodyDominance, RigidBodySet,
@@ -64,12 +63,66 @@ pub(super) const OUTCOME_FULL_COMPOSITE: u8 = 5;
 // incremental reconcile needs, so the graph must be rebuilt from scratch (rare).
 pub(super) const OUTCOME_CLEARED_IN_GRAPH: u8 = 6;
 
+/// Conservative separation tests for cylinder pairs. The two cap normals
+/// use the exact projection of the other cylinder. Transverse directions
+/// use the bounding capsules of long cylinders.
+#[cfg(feature = "dim3")]
+fn separated_cylinder_axes(
+    a: &dyn parry::shape::Shape,
+    b: &dyn parry::shape::Shape,
+    pos12: &crate::math::Pose,
+    prediction: Real,
+) -> bool {
+    use crate::math::Vector;
+
+    let cylinder = |shape: &dyn parry::shape::Shape| {
+        if let Some(c) = shape.as_cylinder() {
+            Some((c.half_height, c.radius, 0.0))
+        } else {
+            shape.as_round_cylinder().map(|c| {
+                (c.inner_shape.half_height, c.inner_shape.radius, c.border_radius)
+            })
+        }
+    };
+    let (Some((ha, ra, ma)), Some((hb, rb, mb))) = (cylinder(a), cylinder(b)) else {
+        return false;
+    };
+    let t = pos12.translation;
+    let axis_b = pos12.rotation * Vector::Y;
+    let padding = 1.0e-5 * (1.0 + ha + hb + t.abs().max_element());
+    let margin = ma + mb + prediction.max(0.0) + padding;
+    let cos = axis_b.y.abs();
+    let cross = Vector::Y.cross(axis_b);
+    let sin = cross.length();
+    if t.y.abs() > ha + hb * cos + rb * sin + margin
+        || t.dot(axis_b).abs() > hb + ha * cos + ra * sin + margin
+    {
+        return true;
+    }
+    if ha < 2.0 * ra || hb < 2.0 * rb {
+        return false;
+    }
+    let radius = ra + rb + margin;
+    let projects_apart = |n: Vector| {
+        let length_sq = n.length_squared();
+        if length_sq <= 1.0e-8 {
+            return false;
+        }
+        let gap = t.dot(n).abs() - hb * axis_b.dot(n).abs();
+        gap > 0.0 && gap * gap > radius * radius * length_sq
+    };
+    projects_apart(cross) || projects_apart(Vector::new(t.x, 0.0, t.z))
+}
+
 /// The per-pair contact update shared by `NarrowPhase::compute_contacts`'
 /// single-threaded and parallel dispatch paths; returns an `OUTCOME_*` tag.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_pair(
     edge: &mut crate::data::graph::Edge<ContactPair>,
     edge_id: u32,
+    contact_epoch: u64,
+    skip_unmoved: bool,
+    cylinder_test: bool,
     prediction_distance: Real,
     dt: Real,
     contact_clustering: bool,
@@ -84,8 +137,7 @@ pub(super) fn process_pair(
     awake_body_mask: &[bool],
     hints_ptr: &HintsPtr,
     soft: Option<&super::soft_contacts::SoftDetectionCtx>,
-    #[cfg(not(feature = "parallel"))] transitions: &mut Vec<PairTransition>,
-    #[cfg(feature = "parallel")] snd: &std::sync::mpsc::Sender<PairTransition>,
+    transitions: &mut Vec<PairTransition>,
 ) -> u8 {
     let pair = &mut edge.weight;
     let co1 = &colliders[pair.collider1];
@@ -108,6 +160,22 @@ pub(super) fn process_pair(
         // simulation (its parent body is asleep or fixed).
         return OUTCOME_SKIPPED;
     }
+
+    // (rustudio) Neither pose changed since the last full update: its manifolds are
+    // what a recomputation from the same poses would refresh, so keep them (the
+    // epoch too, which tells the external solver its rows are still current).
+    if skip_unmoved
+        && pair.full_poses == Some([co1.pos.0, co2.pos.0])
+        && ((co1.changes | co2.changes)
+            & !(ColliderChanges::IN_MODIFIED_SET | ColliderChanges::POSITION))
+            .is_empty()
+        && (co1.flags.active_hooks | co2.flags.active_hooks).is_empty()
+        && co1.deformable_mesh_ref.is_none()
+        && co2.deformable_mesh_ref.is_none()
+    {
+        return OUTCOME_SKIPPED;
+    }
+    pair.full_poses = None;
 
     // Contact recycling: if the relative pose barely moved since the
     // last full update, skip contact determination entirely. Must run before the
@@ -174,11 +242,13 @@ pub(super) fn process_pair(
         }
     }
 
+    pair.contact_epoch = contact_epoch;
     let had_any_active_contact = pair.has_any_active_contact();
     let rb_handle1 = co1.parent.map(|p| p.handle);
     let rb_handle2 = co2.parent.map(|p| p.handle);
     let mut outcome = OUTCOME_SKIPPED;
 
+    let mut refreshed = false;
     'emit_events: {
         if rb_handle1 == rb_handle2 && co1.parent.is_some() {
             // Same parents. Ignore collisions.
@@ -457,6 +527,18 @@ pub(super) fn process_pair(
         }
         rigid.external = None;
 
+        #[cfg(feature = "dim3")]
+        if cylinder_test
+            && !soft_surface_pair
+            && rigid.manifolds.iter().all(|m| m.points.is_empty() && m.data.solver_contacts.is_empty())
+            && separated_cylinder_axes(&*co1.shape, &*co2.shape, &pos12, effective_prediction_distance)
+        {
+            // An empty manifold has no local anchors to refresh. The
+            // separating plane rules out any new contact here.
+            pair.full_poses = Some([co1.pos.0, co2.pos.0]);
+            break 'emit_events;
+        }
+
         // Rigid-vs-rigid and soft-vs-rigid collisions.
         let _ = query_dispatcher.contact_manifolds(
             &pos12,
@@ -466,6 +548,38 @@ pub(super) fn process_pair(
             &mut rigid.manifolds,
             &mut rigid.workspace,
         );
+
+        // `rigid` borrows `pair`: the poses are noted after this block.
+        refreshed = true;
+
+        #[cfg(feature = "dim3")]
+        if rigid.manifolds.iter().any(|m| m.points.len() > 4)
+            && (co1.shape.as_round_cylinder().is_some() || co2.shape.as_round_cylinder().is_some())
+        {
+            // The dispatcher refreshes the cached local anchors. Keep the
+            // actual manifold at four points, so the next refresh and an
+            // external solver both see the same retained anchors.
+            for manifold in &mut rigid.manifolds {
+                if manifold.points.len() <= 4 {
+                    continue;
+                }
+                let mut selected = [0; 4];
+                let mut count = selected.len();
+                crate::geometry::manifold_reduction::reduce_manifold_naive(
+                    manifold,
+                    &mut selected,
+                    &mut count,
+                    effective_prediction_distance,
+                );
+                let kept = &selected[..count];
+                let mut index = 0;
+                manifold.points.retain(|_| {
+                    let keep = kept.contains(&index);
+                    index += 1;
+                    keep
+                });
+            }
+        }
 
         if let Some(soft) =
             soft.filter(|_| co1.deformable_mesh_ref.is_some() || co2.deformable_mesh_ref.is_some())
@@ -765,14 +879,14 @@ pub(super) fn process_pair(
      * coloring and island updates all mutate shared state, and deferring keeps
      * the result independent of the update schedule).
      */
+    if refreshed {
+        pair.full_poses = Some([co1.pos.0, co2.pos.0]);
+    }
     let has_any_active_contact = pair.has_any_active_contact();
 
     if has_any_active_contact != had_any_active_contact {
         let transition = (edge_id, rb_handle1, rb_handle2, has_any_active_contact);
-        #[cfg(not(feature = "parallel"))]
         transitions.push(transition);
-        #[cfg(feature = "parallel")]
-        let _ = snd.send(transition);
     }
 
     // Update the pair's solver-qualification hint from its final state

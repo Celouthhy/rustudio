@@ -129,6 +129,11 @@ pub fn lua_prof_on() -> bool {
     LUA_ON.with(|c| c.get())
 }
 
+/// A Play worker follows the display thread's benchmark window.
+pub fn set_lua_profiling(on: bool) {
+    LUA_ON.with(|c| c.set(on));
+}
+
 /// Times one resume of Lua code under `key`, labelled by `label` the first
 /// time the key is seen. Nested resumes count in the outermost only.
 pub fn lua_timed<R>(key: usize, label: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
@@ -310,7 +315,7 @@ fn take_api() -> Vec<(String, f64, u64)> {
 }
 
 /// Lua totals by label, slowest first: (label, ms, calls).
-fn take_lua() -> Vec<(String, f64, u64)> {
+pub fn take_lua() -> Vec<(String, f64, u64)> {
     let m = LUA.with(|m| std::mem::take(&mut *m.borrow_mut()));
     let mut by: std::collections::HashMap<String, (f64, u64)> = std::collections::HashMap::new();
     for (_, (l, ms, n)) in m {
@@ -375,7 +380,8 @@ pub fn section_total(name: &str) -> (f64, u64) {
     })
 }
 
-fn take_sections() -> Vec<(&'static str, f64, u64)> {
+/// Drain the current thread's section totals for merging into a frame report.
+pub fn take_sections() -> Vec<(&'static str, f64, u64)> {
     SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
@@ -523,6 +529,20 @@ impl Bench {
             return false;
         }
         let mut frame_sections = take_sections();
+        // The renderer's last frame counts (perf::draw): draw calls and
+        // thousands of triangles per pass, averaged like the sections.
+        let pf = perf::frame();
+        for (i, name) in [
+            "count: scene draws", "count: scene ktris", "count: shadow draws", "count: shadow ktris",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = pf.n[i] as f64 / if i % 2 == 1 { 1000.0 } else { 1.0 };
+            if v > 0.0 {
+                frame_sections.push((name, v, 1));
+            }
+        }
         // GPU spans that finished since the last frame (a frame or two late),
         // in GPU milliseconds whatever the bench's unit.
         let (gpu, gpu_totals) = gpu_take();

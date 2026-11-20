@@ -208,7 +208,7 @@ impl Census {
     }
 
     pub fn observe(&mut self, world: &rapier3d::prelude::PhysicsWorld, studio: Option<&body::BodySet>) {
-        self.bodies.gather(&world.bodies);
+        self.bodies.gather(&world.bodies, None);
         self.contacts.update(&self.bodies, &world.bodies, &world.colliders, &world.narrow_phase, &Default::default());
         self.joints.gather(&world.impulse_joints, &self.bodies, &self.no_names);
         self.islands.build(&mut self.bodies, &self.contacts.list, &self.joints);

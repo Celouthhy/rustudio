@@ -120,7 +120,11 @@ impl PlayerApp {
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, game.viewport_rect);
         if self.run.start_play && game.viewport_rect.is_positive() && game.frame_no >= 2 {
             self.run.start_play = false;
-            game.start_play(RunMode::Play, &mut self.host, false, None);
+            if game.use_gameplay_worker() {
+                game.start_play_threaded(RunMode::Play, &mut self.host, false, None);
+            } else {
+                game.start_play(RunMode::Play, &mut self.host, false, None);
+            }
             self.run.play_started = Some(rustudio_core::sim_clock::now());
         }
         let reason = self.run.tick_before_shot(game, self.last_work_ms)
@@ -394,6 +398,12 @@ pub fn run() -> eframe::Result<()> {
             PlayerApp::frame,
         );
         std::process::exit(code.max(EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)));
+    }
+    // The standalone player has no redraw pacing of its own (the editor's
+    // native_loop.rs paces mailbox frames): it keeps vsync.
+    let mut wgpu_options = wgpu_options;
+    if !bench_mode {
+        wgpu_options.surface.present_mode = eframe::egui_wgpu::wgpu::PresentMode::AutoVsync;
     }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,

@@ -20,3 +20,11 @@ void luau_codegen_compile(lua_State* L, int idx)
     Luau::CodeGen::CompilationOptions options;
     Luau::CodeGen::compile(L, idx, options);
 }
+
+// rustudio: see luacodegen.h
+void luau_codegen_compile_native(lua_State* L, int idx)
+{
+    Luau::CodeGen::CompilationOptions options;
+    options.flags = Luau::CodeGen::CodeGen_OnlyNativeModules;
+    Luau::CodeGen::compile(L, idx, options);
+}

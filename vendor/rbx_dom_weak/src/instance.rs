@@ -215,7 +215,7 @@ impl InstanceBuilder {
 ///
 /// Operations that could affect other instances contained in the
 /// [`WeakDom`][crate::WeakDom] cannot be performed on an `Instance` correctly.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Instance {
     pub(crate) referent: Ref,
     pub(crate) children: Vec<Ref>,

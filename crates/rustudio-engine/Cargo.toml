@@ -13,7 +13,9 @@ rustudio-render = { path = "../rustudio-render" }
 # data_messaging) and the account session go through it. No cycle: account is
 # a leaf.
 rustudio-account = { path = "../rustudio-account" }
-mlua = { version = "0.12", features = ["luau"] }
+# luau-jit: Luau's code generator for --!native scripts (vendor mlua: only
+# those, as Roblox; RUSTUDIO_NO_NATIVE=1 turns it off).
+mlua = { version = "0.12", features = ["luau", "luau-jit"] }
 # theme.rs's dock_style and gui.rs's paint callback take egui's (and the dock's)
 # types; gui.rs hands the renderer egui_wgpu's RenderState.
 egui = "0.36"

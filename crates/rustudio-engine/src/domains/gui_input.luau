@@ -4,14 +4,14 @@
 -- (checks/parity/gui_input.md). Loaded once per runtime after the library.
 local G = ...
 local fire, log = G.fire, G.log
--- The current DataModel (refreshed every step; see G.game).
+-- The current DataModel. The native helper sends changed roots since the
+-- last refresh, including when the editor replaces the whole document.
 local game = game
 local workspace = workspace
 local function refresh_game()
-    local ok, g = pcall(G.game)
-    if ok and g then
-        game = g
-        local w = g:FindFirstChildOfClass("Workspace")
+    local ok, g, w = pcall(G.world_roots)
+    if ok then
+        if g then game = g end
         if w then workspace = w end
     end
 end

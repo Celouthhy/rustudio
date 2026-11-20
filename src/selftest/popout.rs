@@ -32,7 +32,9 @@ impl SelfTest {
                 let open = ed.ui.panels_open.contains("Output");
                 let lines = ed.hud.output_lines;
                 let native = ed.ui.popped_class == Some(egui::ViewportClass::Immediate);
-                let last = ed.game.log.last().is_some_and(|l| l.text.starts_with("popout:"));
+                // Output sticks to the bottom. Asset polling can append a
+                // warning after the marker and before this check.
+                let last = ed.game.log.iter().rev().take(lines).any(|l| l.text.starts_with("popout:"));
                 p.ok &= popped && open && lines > 0 && last && native;
                 p.notes.push(format!(
                     "Output popped into window rustudio-panel-output: {popped} (windows {:?}, shown as {}), still checked in the Window menu: {open}, {lines} lines drawn there, newest line shown: {last}",

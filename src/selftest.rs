@@ -2074,11 +2074,12 @@ impl SelfTest {
                                 origin: Vec3::new(6.0, 10.0, 0.0),
                                 dir: -Vec3::Y,
                                 hit: Some((b, Vec3::new(6.0, 2.0, 0.0))),
+                                click: Some((b, Vec3::new(6.0, 2.0, 0.0))),
                                 xy: [0.0, 0.0],
                                 view: [800.0, 600.0],
                                 side,
                             });
-                            s.game.input.clicks.push((b, 1));
+                            s.game.input.clicks.push((b, Vec3::new(6.0, 2.0, 0.0), 1));
                         }
                         24 => s.game.input.chat.push("hello rustudio".into()),
                         28 => s.game.input.slots.push(0),

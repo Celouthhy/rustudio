@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 
 [package]
 name = "rustudio"
@@ -16,6 +16,7 @@ license.workspace = true
 default-run = "rustudio"
 
 [dependencies]
+log = "0.4"
 rustudio-account = { path = "crates/rustudio-account" }
 rustudio-core = { path = "crates/rustudio-core" }
 rustudio-physics = { path = "crates/rustudio-physics" }
@@ -98,7 +99,9 @@ rustls = { path = "vendor/rustls" }
 # locals' registers, without which Place A' Weapons client (3k lines)
 # runs out of the 200 local registers. mlua-sys 0.13.0 is vendored only to
 # accept it (dep 0.22 -> 0.23, bytecode version max 11 -> 14). See
-# runtime::luau_flags.
+# runtime::luau_flags. Also patched (lvmload.cpp resolveImportSafe, marked
+# rustudio): a script's global chains (CFrame.new, math.sin) resolve at load
+# through the environment the chunk is loaded with, as Roblox's do.
 luau0-src = { path = "vendor/luau0-src" }
 mlua-sys = { path = "vendor/mlua-sys" }
 # parry3d 0.31.1 with one change (shape/convex_polyhedron.rs,
@@ -108,11 +111,25 @@ parry3d = { path = "vendor/parry3d" }
 # mlua 0.12.2 + Lua::with_current_state (src/state.rs, marked rustudio):
 # the direct Instance bridge (runtime_routes.rs) calls Rust from raw C
 # functions and must make the calling Lua thread mlua's current one, as
-# mlua's own callbacks do.
+# mlua's own callbacks do. RawLua::rs_lua / rs_stack_value (state/raw.rs):
+# natively stored datatypes' (ltypes.rs CFrame) FromLua::from_stack and
+# IntoLua::push_into_stack overrides. Lua::userdata_type_at /
+# userdata_copy_of: typed property writes (runtime_routes.rs). AppData keeps
+# its 8 most recent entries in front of the map (types/app_data.rs).
 mlua = { path = "vendor/mlua" }
 # egui 0.36.2 patched (text_selection/, scroll_area.rs): double/
 # triple click select on the press, not the release, like Studio.
 egui = { path = "vendor/egui" }
+# egui-wgpu 0.36.2 + a Mailbox request that falls back to Fifo when the
+# surface lists no mailbox (src/winit.rs, marked rustudio): the editor's
+# interactive present mode (offscreen.rs wgpu_options).
+egui-wgpu = { path = "vendor/egui-wgpu" }
+# epaint 0.36.2 + Fonts::set_measure_only (marked rustudio): TextScaled's
+# trial sizes are laid out without rasterizing their glyphs. Rasterizing was
+# ~94% of each trial on a game's ~1,000 TextScaled signs, so the per-frame text
+# budget ran a handful of trials and the signs stayed unfitted for the whole
+# session, their GUIs walked again every frame (round 3).
+epaint = { path = "vendor/epaint" }
 # egui_dock 0.21.1 + a pop-out button next to each tab's close × (TabViewer::
 # show_pop_out_button / on_pop_out, marked rustudio): src/panels.rs.
 egui_dock = { path = "vendor/egui_dock" }

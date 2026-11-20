@@ -1,12 +1,288 @@
 //! Laying out and drawing one GUI's objects into canvas-space shapes.
 
 use egui::epaint::TextShape;
-use egui::text::{LayoutJob, TextFormat};
+use egui::text::{Fonts, LayoutJob, TextFormat};
 use egui::{FontId, Shape, Stroke};
+use std::time::{Duration, Instant};
 
 use super::*;
 use rustudio_core::mech;
 
+
+/// Measures TextScaled against a canvas without laying out the same
+/// single-line text again at every projected BillboardGui width.
+#[derive(Default)]
+pub(super) struct TextFitCache {
+    sizes: TextMemo<(LayoutJob, FitSearch), 4096>,
+    wrapped: TextMemo<(LayoutJob, egui::Vec2), 4096>,
+    unwrapped: rustc_hash::FxHashMap<u64, UnwrappedProbes>,
+    probe_fonts: Option<Fonts>,
+    probe_frame: Option<u64>,
+    galleys: TextMemo<Arc<egui::Galley>, 1024>,
+    frame: Option<u64>,
+    // Reserve time for HUD text even when world signs fill their budget.
+    spent: [Duration; 2],
+    screen: bool,
+    budgeted: bool,
+    deferred: u64,
+}
+
+#[derive(Clone, Copy)]
+enum FitSearch {
+    Pending { lo: f32, hi: f32, step: u8 },
+    Ready(f32),
+}
+
+struct UnwrappedProbes {
+    style: LayoutJob,
+    sizes: rustc_hash::FxHashMap<u32, (egui::Vec2, f32)>,
+}
+
+// Replace a single entry on collision to bound cache memory and avoid
+// recurring full-cache clears during a camera sweep through new canvas sizes.
+struct TextMemo<T, const N: usize>(Vec<Option<(u64, T)>>);
+
+impl<T, const N: usize> Default for TextMemo<T, N> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T, const N: usize> TextMemo<T, N> {
+    fn get(&self, key: u64) -> Option<&T> {
+        let (stored, value) = self.0.get(key as usize % N)?.as_ref()?;
+        (*stored == key).then_some(value)
+    }
+
+    fn insert(&mut self, key: u64, value: T) {
+        if self.0.is_empty() {
+            self.0.resize_with(N, || None);
+        }
+        self.0[key as usize % N] = Some((key, value));
+    }
+}
+
+fn text_job_hash(job: &LayoutJob, extra: impl std::hash::Hash) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    job.hash(&mut h);
+    extra.hash(&mut h);
+    h.finish()
+}
+
+fn single_line_ascii(text: &str) -> bool {
+    text.bytes().all(|byte| byte == b' ' || byte.is_ascii_graphic())
+}
+
+/// Trial text sizes do not use the displayed atlas. Reuse the identical
+/// Roblox fallback faces so an atlas reset only parses each file once.
+fn probe_font_definitions(mut definitions: egui::FontDefinitions) -> egui::FontDefinitions {
+    for names in definitions.families.values_mut() {
+        for name in names {
+            if !name.starts_with("rbx:") {
+                continue;
+            }
+            let Some((_, index)) = name.rsplit_once("+fallback") else { continue };
+            let shared = format!("rbx:probe-fallback-{index}");
+            if let Some(data) = definitions.font_data.remove(name) {
+                definitions.font_data.entry(shared.clone()).or_insert(data);
+            }
+            *name = shared;
+        }
+    }
+    definitions
+}
+
+impl TextFitCache {
+    pub(super) fn begin_frame(&mut self, ctx: &egui::Context, budgeted: bool) {
+        let frame = ctx.cumulative_frame_nr();
+        if self.frame == Some(frame) {
+            return;
+        }
+        if let Some(fonts) = &self.probe_fonts {
+            let options = ctx.fonts(|fonts| fonts.options().clone());
+            if fonts.options() != &options {
+                *self = Self::default();
+            }
+        }
+        self.frame = Some(frame);
+        self.spent = [Duration::ZERO; 2];
+        self.budgeted = budgeted;
+    }
+
+    pub(super) fn set_screen(&mut self, screen: bool) {
+        self.screen = screen;
+    }
+
+    pub(super) fn take_deferred(&mut self) -> u64 {
+        std::mem::take(&mut self.deferred)
+    }
+
+    fn can_start_work(&mut self) -> bool {
+        let limit = Duration::from_millis(if self.screen { 2 } else { 4 });
+        if self.budgeted && self.spent[usize::from(self.screen)] >= limit {
+            self.deferred += 1;
+            return false;
+        }
+        true
+    }
+
+    fn finish_work(&mut self, start: Instant) {
+        self.spent[usize::from(self.screen)] += start.elapsed();
+    }
+
+    fn probe(&mut self, ctx: &egui::Context, job: LayoutJob) -> Option<Arc<egui::Galley>> {
+        let start = self.can_start_work().then(Instant::now)?;
+        // TextScaled tries fractional sizes that never get painted. Keep
+        // their glyphs away from the uploaded atlas and its world-GUI mips.
+        let fonts = self.probe_fonts.get_or_insert_with(|| {
+            let _p = rustudio_core::bench::scope("gui_text_probe_init");
+            let mut probe = ctx.fonts(|fonts| {
+                Fonts::new(fonts.options().clone(), probe_font_definitions(fonts.definitions().clone()))
+            });
+            // Only their sizes are read: no glyphs are rasterized.
+            probe.set_measure_only(true);
+            probe
+        });
+        if self.probe_frame != self.frame || fonts.font_atlas_fill_ratio() > 0.8 {
+            let _p = rustudio_core::bench::scope("gui_text_probe_pass");
+            fonts.begin_pass(fonts.options().clone());
+            self.probe_frame = self.frame;
+        }
+        let galley = fonts.with_pixels_per_point(ctx.pixels_per_point()).layout_job(job);
+        self.finish_work(start);
+        Some(galley)
+    }
+
+    fn layout(&mut self, ctx: &egui::Context, mut job: LayoutJob) -> Option<Arc<egui::Galley>> {
+        // epaint normalizes the wrapping width before it stores the layout.
+        job.wrap.max_width = job.wrap.max_width.round();
+        let key = text_job_hash(&job, ());
+        if let Some(galley) = self.galleys.get(key).filter(|g| *g.job == job) {
+            return Some(galley.clone());
+        }
+        let start = self.can_start_work().then(Instant::now)?;
+        let cache = job.text.len() <= 256;
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        self.finish_work(start);
+        if cache {
+            self.galleys.insert(key, galley.clone());
+        }
+        Some(galley)
+    }
+
+    /// A layout that is never deferred: AutomaticSize and other
+    /// script-visible geometry (AbsoluteSize, TextBounds) can't wait for a
+    /// later frame, or a ProximityPrompt's AutomaticSize X labels stay 0 wide.
+    fn layout_now(&mut self, ctx: &egui::Context, job: LayoutJob) -> Arc<egui::Galley> {
+        let budgeted = std::mem::replace(&mut self.budgeted, false);
+        let galley = self.layout(ctx, job);
+        self.budgeted = budgeted;
+        galley.expect("an unbudgeted layout always runs")
+    }
+
+    pub(super) fn clear_galleys(&mut self) {
+        self.galleys = Default::default();
+    }
+
+    fn size(
+        &mut self,
+        ctx: &egui::Context,
+        bounds: egui::Vec2,
+        max: f32,
+        simple: bool,
+        build: impl Fn(f32, bool) -> LayoutJob,
+    ) -> Option<f32> {
+        let _p = rustudio_core::bench::scope("gui_text_fit");
+        let style = build(1.0, !simple);
+        let key = text_job_hash(&style, (bounds.x.to_bits(), bounds.y.to_bits(), max.to_bits()));
+        let (mut lo, mut hi, mut step) = match self.sizes.get(key).filter(|(job, _)| *job == style) {
+            Some((_, FitSearch::Ready(size))) => return Some(*size),
+            Some((_, FitSearch::Pending { lo, hi, step })) => (*lo, *hi, *step),
+            None => (1.0, max.max(1.0), 0),
+        };
+        if !self.can_start_work() {
+            return None;
+        }
+
+        let style_key = text_job_hash(&style, ());
+        let mut probes = if simple {
+            self.unwrapped.remove(&style_key).filter(|entry| entry.style == style)
+                .map(|entry| entry.sizes).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        // Plain text has a uniform explicit line height. Reject sizes
+        // that cannot fit even one row, allowing for physical-pixel rounding.
+        let line_height = if simple && !style.text.is_empty() {
+            style.sections.first().and_then(|s| s.format.line_height)
+                .filter(|height| height.is_finite() && *height > 0.0)
+        } else {
+            None
+        };
+        let height_limit = bounds.y + 0.5 + ctx.pixels_per_point().recip();
+        // Resume this search at the first unmeasured size next frame.
+        // A probe is the smallest unit of atlas work.
+        let mut search = || {
+            while step < 10 && lo.floor() != hi.floor() {
+                let mid = (lo + hi) * 0.5;
+                if line_height.is_some_and(|height| mid * height > height_limit) {
+                    hi = mid;
+                    step += 1;
+                    continue;
+                }
+                let measured = if simple {
+                    let (single, advance) = match probes.entry(mid.to_bits()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let probe = self.probe(ctx, build(mid, false))?;
+                            *entry.insert((probe.size(), probe.intrinsic_size().x))
+                        }
+                    };
+                    // epaint skips the wrapping loop when the paragraph advance
+                    // fits the rounded wrap width. No wrap fits a shorter height
+                    // than the single row for this uniform text.
+                    (advance <= bounds.x.max(1.0).round() || single.y > bounds.y + 0.5).then_some(single)
+                } else {
+                    None
+                };
+                let measured = if let Some(measured) = measured {
+                    measured
+                } else {
+                    let mut job = build(mid, true);
+                    job.wrap.max_width = job.wrap.max_width.round();
+                    let key = text_job_hash(&job, ());
+                    if let Some((_, measure)) = self.wrapped.get(key).filter(|(cached, _)| *cached == job) {
+                        *measure
+                    } else {
+                        let _p = rustudio_core::bench::scope("gui_text_fit_wrapped");
+                        let galley = self.probe(ctx, job)?;
+                        let measure = galley.size();
+                        self.wrapped.insert(key, ((*galley.job).clone(), measure));
+                        measure
+                    }
+                };
+                if measured.x <= bounds.x + 0.5 && measured.y <= bounds.y + 0.5 {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+                step += 1;
+            }
+            Some(lo.floor().max(1.0))
+        };
+        let size = search();
+        if simple {
+            if self.unwrapped.len() >= 256 || probes.len() >= 1024 {
+                self.unwrapped.clear();
+            } else {
+                self.unwrapped.insert(style_key, UnwrappedProbes { style: style.clone(), sizes: probes });
+            }
+        }
+        self.sizes.insert(key, (style, size.map_or(FitSearch::Pending { lo, hi, step }, FitSearch::Ready)));
+        size
+    }
+}
 
 /// `rect` inside the UIPadding of `r` (a GuiObject or a LayerCollector:
 /// Studio pads a ScreenGui's children too, e.g. Laser Tag's 20 px HUD margin).
@@ -87,7 +363,7 @@ pub(super) struct Item {
     /// Its canvas bounds and triangles (turned, clipped) once tessellated;
     /// shared with the memo it is replayed from, so a kept item is
     /// tessellated once (None: draws nothing).
-    pub tess: Arc<std::sync::OnceLock<Option<(Rect, Mesh)>>>,
+    pub tess: Arc<std::sync::OnceLock<Option<(Rect, Arc<Mesh>)>>>,
 }
 
 /// A clickable / hoverable object found while drawing (canvas space).
@@ -427,13 +703,49 @@ impl Walk<'_, '_> {
         job.append(&text, 0.0, f);
         job.wrap.max_width = wrap.max(1.0);
         job.round_output_to_gui = false;
-        let g = self.ctx.fonts_mut(|fo| fo.layout_job(job));
+        let g = self.gui.text_fit.layout_now(self.ctx, job);
         egui::vec2(g.rect.width(), g.rect.height().max(size))
     }
 
+    fn content_size(&mut self, r: Ref, size: egui::Vec2, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
+        let d = self.input.doc;
+        Sizer { d, m: self }.content_size(r, size, scale, auto, depth)
+    }
+
+    fn own_size(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+        let d = self.input.doc;
+        Sizer { d, m: self }.own_size(r, parent, scale, depth)
+    }
+
+    fn own_size_signed(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+        let d = self.input.doc;
+        Sizer { d, m: self }.own_size_signed(r, parent, scale, depth)
+    }
+}
+
+/// Measures a text object's text for AutomaticSize (`Walk::measure_text`
+/// in the GUI walk, `FaceText` for a script's read between walks).
+pub(super) trait AutoText {
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2;
+}
+
+impl AutoText for &mut Walk<'_, '_> {
+    fn measure_text(&mut self, _: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+        Walk::measure_text(self, r, wrap, scale)
+    }
+}
+
+/// The AutomaticSize / Size rules, shared by the GUI walk and by
+/// AbsoluteSize reads of objects not laid out yet (`gui::auto_grow_now`).
+pub(super) struct Sizer<'d, M> {
+    pub d: &'d Document,
+    pub m: M,
+}
+
+impl<M: AutoText> Sizer<'_, M> {
     /// What an AutomaticSize object must hold: its text, or its children
     /// (laid out by a UIListLayout, or by their own positions), plus padding.
-    fn content_size(
+    pub(super) fn content_size(
         &mut self,
         r: Ref,
         size: egui::Vec2,
@@ -446,7 +758,7 @@ impl Walk<'_, '_> {
 
     /// `content_size`, a TextWrapped text growing on X wrapping at `room`
     /// (the width its parent leaves it).
-    fn content_size_in(
+    pub(super) fn content_size_in(
         &mut self,
         r: Ref,
         size: egui::Vec2,
@@ -455,7 +767,7 @@ impl Walk<'_, '_> {
         depth: usize,
         room: f32,
     ) -> egui::Vec2 {
-        let d = self.input.doc;
+        let d = self.d;
         let pad = |name: &str, along: f32| {
             let u = child_of_class(d, r, "UIPadding")
                 .map(|p| udim(d, p, name))
@@ -488,7 +800,7 @@ impl Walk<'_, '_> {
             } else {
                 inner.width()
             };
-            ext = self.measure_text(r, wrap, scale);
+            ext = self.m.measure_text(d, r, wrap, scale);
         }
         let kids: Vec<Ref> = children(d, r)
             .into_iter()
@@ -583,12 +895,12 @@ impl Walk<'_, '_> {
     /// Archimedes' window (an AutomaticSize Y button whose content sits in a
     /// `UDim2.new(1, 0, 1, -20)` frame: Studio shows the whole panel,
     /// checks/plugins/ref/corpus/screens/archimedes-click-main.jpg).
-    fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
+    pub(super) fn auto_child_size(&mut self, k: Ref, inner: Rect, scale: f32, auto: u32, depth: usize) -> egui::Vec2 {
         let mut s = self.own_size(k, inner, scale, depth);
         if depth >= 8 {
             return s;
         }
-        let sz = udim2(self.input.doc, k, "Size");
+        let sz = udim2(self.d, k, "Size");
         let grows = |axis: u32, sc: f32| auto & axis != 0 && sc != 0.0;
         let (gx, gy) = (grows(1, sz[0]), grows(2, sz[2]));
         if gx || gy {
@@ -605,15 +917,15 @@ impl Walk<'_, '_> {
     }
 
     /// A GuiObject's size from Size, AutomaticSize and its constraints (and UIScale).
-    fn own_size(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+    pub(super) fn own_size(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
         self.own_size_signed(r, parent, scale, depth).max(egui::Vec2::ZERO)
     }
 
     /// `own_size` before negative sizes are clamped: Studio reports those
     /// (AbsoluteSize -1, -1 for a Size of -1 px offset, the box placed with
     /// it; Emitter2D's jitter fix makes them for particles near their end).
-    fn own_size_signed(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
-        let d = self.input.doc;
+    pub(super) fn own_size_signed(&mut self, r: Ref, parent: Rect, scale: f32, depth: usize) -> egui::Vec2 {
+        let d = self.d;
         let s = udim2(d, r, "Size");
         // SizeConstraint (RelativeXY 0, RelativeXX 1, RelativeYY 2): the
         // Size's scales both take the parent's width, or both its height
@@ -663,7 +975,9 @@ impl Walk<'_, '_> {
         }
         size
     }
+}
 
+impl Walk<'_, '_> {
     /// What a memo depends on besides the document: where and how the walk
     /// reaches the object.
     fn memo_key(&self, parent: Rect, laid: Option<Rect>, dn: &Down) -> [u32; 28] {
@@ -1374,6 +1688,7 @@ impl Walk<'_, '_> {
         box_rect: Rect,
     ) -> Option<[f32; 2]> {
         let d = self.input.doc;
+        let _text = rustudio_core::bench::scope("gui_text");
         let mut text = text_prop(d, r, "Text");
         let mut col = color(d, r, "TextColor3", [0.0, 0.0, 0.0]);
         let tt = num(d, r, "TextTransparency", 0.0);
@@ -1411,23 +1726,23 @@ impl Walk<'_, '_> {
         } else {
             None
         };
+        let runs = if rich {
+            rich_runs(&text)
+        } else {
+            vec![Run {
+                text: text.clone(),
+                bold: false,
+                italic: font.2,
+                underline: false,
+                strike: false,
+                color: None,
+                size: None,
+                transparency: None,
+            }]
+        };
         let build = |size: f32, wrap: bool| -> LayoutJob {
             let mut job = LayoutJob::default();
-            let runs = if rich {
-                rich_runs(&text)
-            } else {
-                vec![Run {
-                    text: text.clone(),
-                    bold: false,
-                    italic: font.2,
-                    underline: false,
-                    strike: false,
-                    color: None,
-                    size: None,
-                    transparency: None,
-                }]
-            };
-            for run in runs {
+            for run in &runs {
                 let rs = run.size.map(|s| s * ui_scale).unwrap_or(size);
                 let c = run.color.unwrap_or(col);
                 let color = rgba(
@@ -1476,42 +1791,22 @@ impl Walk<'_, '_> {
             job
         };
         let ctx = self.ctx;
-        let layout = |job: LayoutJob| ctx.fonts_mut(|f| f.layout_job(job));
+        if text.is_empty() && !focused {
+            return Some([0.0, 0.0]);
+        }
         let mut size = num(d, r, "TextSize", 14.0) * me.scale * legacy_text_scale(&font);
+        let simple = !rich && !truncate && single_line_ascii(&text);
         if scaled {
-            let key = (
-                text.clone(),
-                format!("{family:?}"),
-                rect.width() as i32,
-                rect.height() as i32,
-                wrapped,
-            );
-            size = match self.gui.scaled.get(&key) {
-                Some(s) => *s,
-                None => {
-                    let max = tsc
-                        .map(|c| num(d, c, "MaxTextSize", 100.0))
-                        .unwrap_or(100.0)
-                        .min(100.0)
-                        * me.scale.max(1.0);
-                    let (mut lo, mut hi) = (1.0f32, max.max(1.0));
-                    for _ in 0..10 {
-                        let mid = (lo + hi) * 0.5;
-                        let g = layout(build(mid, true));
-                        if g.size().x <= rect.width() + 0.5 && g.size().y <= rect.height() + 0.5 {
-                            lo = mid;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    if self.gui.scaled.len() > 4096 {
-                        self.gui.scaled.clear();
-                    }
-                    let s = lo.floor().max(1.0);
-                    self.gui.scaled.insert(key, s);
-                    s
-                }
+            let max = tsc
+                .map(|c| num(d, c, "MaxTextSize", 100.0))
+                .unwrap_or(100.0)
+                .min(100.0)
+                * me.scale.max(1.0);
+            let Some(fitted) = self.gui.text_fit.size(ctx, rect.size(), max, simple, &build) else {
+                self.gui.no_cache = Some("text deferred");
+                return None;
             };
+            size = fitted;
             if let Some(c) = tsc {
                 size = size.max(num(d, c, "MinTextSize", 1.0) * me.scale);
             }
@@ -1521,10 +1816,24 @@ impl Walk<'_, '_> {
                 num(d, c, "MaxTextSize", 100.0) * me.scale,
             );
         }
-        if text.is_empty() && !focused {
-            return Some([0.0, 0.0]);
-        }
-        let galley = layout(build(size, wrapped || scaled));
+        let galley = {
+            let _p = rustudio_core::bench::scope("gui_text_layout");
+            if scaled && simple {
+                self.gui.text_fit.layout(ctx, build(size, false)).and_then(|single| {
+                    if single.size().x + 1.0 <= rect.width().max(1.0) {
+                        Some(single)
+                    } else {
+                        self.gui.text_fit.layout(ctx, build(size, true))
+                    }
+                })
+            } else {
+                self.gui.text_fit.layout(ctx, build(size, wrapped || scaled))
+            }
+        };
+        let Some(galley) = galley else {
+            self.gui.no_cache = Some("text deferred");
+            return None;
+        };
         let gs = galley.size();
         // The galley's rows are aligned around x by its halign.
         let x = match xa {
@@ -1668,6 +1977,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_fit_matches_wrapped_probes() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            let mut cache = TextFitCache::default();
+            for text in ["Temple Guardian", "longwordwithoutbreaks", "é W", "title\nsecond line", "Lv. 100", "jjjj W"] {
+                for width in [6.0, 39.4, 70.3, 70.8, 198.0] {
+                    for height in [3.5, 11.3, 31.7, 49.0] {
+                        for max in [20.0, 100.0] {
+                            let build = |size: f32, wrap: bool| {
+                                let mut job = LayoutJob::simple(
+                                    text.into(), FontId::proportional(size), egui::Color32::WHITE,
+                                    if wrap { width } else { f32::INFINITY },
+                                );
+                                job.sections[0].format.line_height = Some(size);
+                                job.round_output_to_gui = false;
+                                job
+                            };
+                            let mut lo = 1.0f32;
+                            let mut hi = max;
+                            for _ in 0..10 {
+                                let mid = (lo + hi) * 0.5;
+                                let actual = ctx.fonts_mut(|fonts| fonts.layout_job(build(mid, true))).size();
+                                if actual.x <= width + 0.5 && actual.y <= height + 0.5 {
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            let fitted = cache.size(&ctx, egui::vec2(width, height), max, single_line_ascii(text), build);
+                            assert_eq!(fitted, Some(lo.floor()), "{text:?} {width}×{height} max {max}");
+                        }
+                    }
+                }
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn measure_only_probes_lay_out_like_painted_text() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let new = |measure: bool| {
+            let mut f = ctx.fonts(|f| Fonts::new(f.options().clone(), probe_font_definitions(f.definitions().clone())));
+            f.set_measure_only(measure);
+            f
+        };
+        let (mut painted, mut measured) = (new(false), new(true));
+        // (fallback faces: two CJK ideographs and an emoji, made at run time)
+        let fallback: String = [0x6f22, 0x5b57, 0x20, 0x1f642].into_iter().filter_map(char::from_u32).collect();
+        let mixed = format!("é W {fallback}");
+        for text in ["CAUTION\nWET FLOOR", "U", "Temple Guardian", mixed.as_str(), "longwordwithoutbreaks", "jjjj W", "Lv. 100"] {
+            for size in [1.0, 7.3, 13.77, 31.5, 64.01, 99.9] {
+                for (wrap, rows, ppp) in [(f32::INFINITY, usize::MAX, 1.0), (57.0, usize::MAX, 1.25), (57.0, 1, 1.0), (140.0, 2, 2.0)] {
+                    for italics in [false, true] {
+                        let mut job = LayoutJob::simple(text.into(), FontId::proportional(size), Color32::WHITE, wrap);
+                        job.sections[0].format.line_height = Some(size * 1.1);
+                        job.sections[0].format.italics = italics;
+                        job.sections[0].format.extra_letter_spacing = size * 0.04;
+                        job.wrap.max_rows = rows;
+                        job.wrap.overflow_character = (rows != usize::MAX).then_some('…');
+                        job.round_output_to_gui = false;
+                        let a = painted.with_pixels_per_point(ppp).layout_job(job.clone());
+                        let b = measured.with_pixels_per_point(ppp).layout_job(job);
+                        let what = format!("{text:?} {size} {wrap} {rows} {ppp}");
+                        assert_eq!(a.size(), b.size(), "{what}");
+                        assert_eq!(a.intrinsic_size(), b.intrinsic_size(), "{what}");
+                        assert_eq!(a.rows.len(), b.rows.len(), "{what}");
+                        for (ra, rb) in a.rows.iter().zip(&b.rows) {
+                            assert_eq!(ra.pos, rb.pos, "{what}");
+                            assert_eq!(ra.size, rb.size, "{what}");
+                            let pa: Vec<_> = ra.glyphs.iter().map(|g| (g.chr, g.pos, g.advance_width)).collect();
+                            let pb: Vec<_> = rb.glyphs.iter().map(|g| (g.chr, g.pos, g.advance_width)).collect();
+                            assert_eq!(pa, pb, "{what}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(measured.font_atlas_fill_ratio() < painted.font_atlas_fill_ratio());
+    }
+
+    #[test]
+    fn text_budget_defers_misses_and_resumes_next_frame() {
+        let ctx = egui::Context::default();
+        let mut cache = TextFitCache::default();
+        let job = |text: &str| {
+            LayoutJob::simple(text.into(), FontId::proportional(20.0), Color32::WHITE, 100.0)
+        };
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            cache.begin_frame(&ctx, true);
+            assert!(cache.layout(&ctx, job("cached")).is_some());
+            cache.spent[0] = Duration::from_millis(4);
+            assert!(cache.layout(&ctx, job("cached")).is_some());
+            assert!(cache.layout(&ctx, job("world")).is_none());
+            cache.begin_frame(&ctx, true);
+            assert!(cache.layout(&ctx, job("world")).is_none());
+            cache.set_screen(true);
+            assert!(cache.layout(&ctx, job("HUD")).is_some());
+            assert_eq!(cache.take_deferred(), 2);
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            cache.begin_frame(&ctx, true);
+            cache.set_screen(false);
+            assert!(cache.layout(&ctx, job("world")).is_some());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn rotate_about_centre() {
         let a = Aff::rotate_about(Pos2::new(10.0, 10.0), 90.0);
         let p = a.apply(Pos2::new(20.0, 10.0));
@@ -1706,7 +2126,7 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::new(20.0, 0.0), egui::vec2(309.7, 30.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let mut walk = Walk { gui: &mut gui, ctx: ui.ctx(), input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
             walk.children(parent, rect, Down { aff: Aff::ID, clip: rect, alpha: 1.0, tint: [1.0; 3], scale: 1.0, z: 0, turn: 0.0 });
@@ -1741,7 +2161,7 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 40.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
@@ -1784,7 +2204,7 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(250.0, 30.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
@@ -1820,7 +2240,7 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 30.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };
@@ -1861,7 +2281,7 @@ mod layout_tests {
         let cam = Camera::default();
         let mut store = AssetStore::default();
         let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 300.0));
-        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, roots: Default::default() };
+        let mut input = DrawIn { render_state: None, doc: &doc, cam: &cam, rect, store: &mut store, doc_dir: None, playing: false, fixed_step: true, roots: Default::default() };
         let mut out = ctx.run_ui(Default::default(), |ui| {
             let ctx = ui.ctx();
             let mut walk = Walk { gui: &mut gui, ctx, input: &mut input, items: Vec::new(), hits: Vec::new(), seq: 0, boxes: Vec::new(), global_z: false, abs_offset: [0.0; 2], screen: None, cur: Ref::none(), rec: Vec::new(), replaying: 0 };

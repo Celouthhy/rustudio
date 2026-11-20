@@ -1327,6 +1327,10 @@ impl LocalLights {
         }
     }
 
+    pub fn matches_lights(&self, lights: &[crate::render::LightRaw]) -> bool {
+        bytemuck::cast_slice::<_, u8>(&self.lights) == bytemuck::cast_slice::<_, u8>(lights)
+    }
+
     /// Brings the kept lights to `lights` by taking away the ones gone and
     /// adding the new ones (the same ones, byte for byte, stay). Returns the
     /// re-filtered part of the channel to upload, None when nothing changed;
@@ -1341,8 +1345,11 @@ impl LocalLights {
         if occ.origin != self.origin {
             return Err(());
         }
-        let key = |l: &crate::render::LightRaw| bytemuck::bytes_of(l).to_vec();
-        let mut kept: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        if self.matches_lights(lights) {
+            return Ok(None);
+        }
+        let key = |l: &crate::render::LightRaw| *bytemuck::cast_ref::<_, [u32; 24]>(l);
+        let mut kept: std::collections::HashMap<[u32; 24], usize> = Default::default();
         for l in &self.lights {
             *kept.entry(key(l)).or_default() += 1;
         }
@@ -1377,19 +1384,30 @@ impl LocalLights {
             .chain(added.iter().map(|l| (*l, false)))
             .filter_map(|(l, rm)| light_box(self.origin, &l, self.dims).map(|b| (l, rm, b)))
             .collect();
-        if boxes.iter().map(|(_, _, b)| box_volume(*b)).sum::<usize>() > max_voxels {
+        rustudio_core::bench::add("local_light_changes", 0.0, (added.len() + removed.len()) as u64);
+        rustudio_core::bench::add("local_light_voxel_regions", 0.0, boxes.len() as u64);
+        let dirty = boxes.iter().fold(None, |region, (_, _, bounds)| Some(union(region, *bounds)));
+        let Some((lo, hi)) = dirty else {
+            self.lights = lights.to_vec();
+            return Ok(None);
+        };
+        // Two small lights at opposite ends of the grid can make the filter
+        // visit far more voxels than either light reaches.
+        let patch = grow(lo, hi, self.dims);
+        let light_voxels = boxes.iter().map(|(_, _, bounds)| box_volume(*bounds)).sum::<usize>();
+        let filter_voxels = box_volume(grow(patch.0, patch.1, self.dims));
+        if light_voxels.saturating_add(filter_voxels) > max_voxels {
+            rustudio_core::bench::add("local_light_deferred", 0.0, 1);
             return Err(());
         }
+        rustudio_core::bench::add("local_light_sync_voxels", 0.0, filter_voxels as u64);
         self.lights = lights.to_vec();
-        let mut dirty = None;
         for (l, rm, b) in &boxes {
             if self.raw.is_empty() {
                 self.raw = vec![Vec3::ZERO; self.dims.iter().product()];
             }
             light_into(occ, l, self.dims, *b, &mut self.raw, *rm);
-            dirty = Some(union(dirty, *b));
         }
-        let Some((lo, hi)) = dirty else { return Ok(None) };
         if self.lights.iter().all(|l| light_box(self.origin, l, self.dims).is_none()) {
             // (no light left: no float residue either, in the boxes the
             // ones taken away reached)
@@ -1401,7 +1419,7 @@ impl LocalLights {
                 }
             }
         }
-        let (lo, hi) = grow(lo, hi, self.dims);
+        let (lo, hi) = patch;
         let data = filter_region(&self.raw, self.dims, lo, hi);
         Ok(Some(LocalPatch { lo, hi, data }))
     }
@@ -1538,6 +1556,18 @@ mod local_tests {
         assert!(ll.update(&occ, &[b], 10).is_err());
         assert_eq!(bytemuck::bytes_of(&ll.lights[0]), bytemuck::bytes_of(&a), "kept as it was");
     }
+    #[test]
+    fn distant_changes_are_bounded_by_the_filter_box() {
+        let occ = wall_occ();
+        let mut a = light(4.0);
+        a.pos_range = [4.0, 4.0, 4.0, 4.0];
+        let mut b = a;
+        b.pos_range = [52.0, 52.0, 52.0, 4.0];
+        let (mut locals, _) = LocalLights::build_dims(&occ, &[], [16; 3]);
+        assert!(locals.update(&occ, &[a, b], 1_000).is_err());
+        assert!(locals.matches_lights(&[]));
+    }
+
     #[test]
     fn spot_cone_and_surface_rectangle() {
         let occ = Occupancy {

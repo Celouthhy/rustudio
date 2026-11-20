@@ -29,6 +29,15 @@ pub struct StudioSolver {
     /// Which Studio solver: `Studio` = the legacy one (dual LDL + PGS, what 0.747
     /// runs at NextGenerationPhysicsSolver = Default), `StudioNextGen` = primal.
     pub path: SolverKind,
+    /// This tick belongs to a throttled 60 Hz frame (Workspace.PhysicsEnvironmentalThrottle,
+    /// throttle.rs): only the bodies in `throttle_exempt` (Humanoid assemblies) step.
+    pub throttled: bool,
+    pub throttle_exempt: rustc_hash::FxHashSet<rp::RigidBodyHandle>,
+    /// An environment catch-up tick at this phase (physics.rs `catch_up_environment`): the
+    /// reverse of a throttled tick. The bodies in `throttle_exempt` (Humanoid assemblies,
+    /// the client's stand-ins) are held still and everything else steps the tick a
+    /// hurried frame left it; `ticks` (the Humanoids' phase) does not advance.
+    pub env_phase: Option<u8>,
     pub cfg: Config,
     pub bodies: BodySet,
     pub contacts: ContactStore,
@@ -43,6 +52,8 @@ pub struct StudioSolver {
     due: Vec<u32>,
     cuts: Vec<usize>,
     pub stats: StepStats,
+    /// `stats` of the last tick that was not throttled (the pool decision's input).
+    pub full_stats: StepStats,
     /// Which Roblox constraint each rapier joint was made for (physics_joints.rs).
     pub joint_instances: FxHashMap<rp::ImpulseJointHandle, Ref>,
     /// Velocities scripts gave anchored parts, by collider: (linear, angular, part
@@ -72,6 +83,9 @@ impl StudioSolver {
     pub fn new(path: SolverKind) -> Self {
         StudioSolver {
             path,
+            throttled: false,
+            throttle_exempt: Default::default(),
+            env_phase: None,
             cfg: Default::default(),
             bodies: Default::default(),
             contacts: Default::default(),
@@ -84,6 +98,7 @@ impl StudioSolver {
             due: Vec::new(),
             cuts: Vec::new(),
             stats: Default::default(),
+            full_stats: Default::default(),
             joint_instances: Default::default(),
             anchored_vel: Default::default(),
             ticks: 0,
@@ -278,8 +293,14 @@ impl StudioSolver {
             self.ticks += harness().phase;
         }
         // Phase p = world tick count mod maxLevel (world, STEP §1.1 step 5).
-        let phase = (self.ticks % self.cfg.max_level as u64) as u8;
-        self.ticks += 1;
+        let phase = match self.env_phase {
+            Some(p) => p % self.cfg.max_level,
+            None => {
+                let phase = (self.ticks % self.cfg.max_level as u64) as u8;
+                self.ticks += 1;
+                phase
+            }
+        };
         // rapier's island manager holds nothing here (Physics::prime runs only
         // collision detection under this solver): its narrow phase would treat
         // an active body's pairs as moved every step. A pair is recomputed only
@@ -290,19 +311,45 @@ impl StudioSolver {
         // stops there): `ExternalHooks`.
         let hooks = ExternalHooks { inner: hooks, class: &self.shape_class };
         input_hash(self, world);
+        static COLLISION_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let collision_stats = *COLLISION_STATS.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_COLLISION_STATS").is_some());
+        world.collision_pipeline.measure_stages = collision_stats;
+        // A body between its solve ticks (level 2 / 4) is not moved (STEP §1.5), and a
+        // pair of two unmoved colliders refreshes to the manifold it already holds:
+        // keep it, and ContactStore reuses its rows. RUSTUDIO_SOLVER_REFRESH_ALL=1
+        // recomputes every pair every tick.
+        static REFRESH_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        world.narrow_phase.skip_unmoved_pairs = !*REFRESH_ALL.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_REFRESH_ALL").is_some());
+        // RUSTUDIO_SOLVER_NO_CYLINDER_AXES=1: every contact-free cylinder pair goes to
+        // Parry's manifold query, without the separating-axis test first.
+        static CYLINDER_AXES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        world.narrow_phase.cylinder_separation_test = !*CYLINDER_AXES.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_NO_CYLINDER_AXES").is_some());
         let ((), c0) = rustudio_core::bench::measure(|| world.detect_collisions(&hooks, events));
+        if collision_stats {
+            for (name, ms) in ["sv_broad_wall", "sv_narrow_wall", "sv_sensor_wall"].into_iter().zip(world.collision_pipeline.stage_times_ms()) {
+                rustudio_core::bench::add(name, ms, 1);
+            }
+        }
         let ((), c1) = rustudio_core::bench::measure(|| {
-            self.bodies.gather(&world.bodies);
+            let _gather = rustudio_core::bench::scope("sv_body_gather");
+            self.bodies.gather(&world.bodies, Some(world.collision_pipeline.processed_bodies()));
+            self.freeze_throttled();
+            drop(_gather);
             // SLEEP §1 step 2: preContactStepSleepStage (wakes, state 2 → 3).
+            let _pre = rustudio_core::bench::scope("sv_sleep_pre");
             self.sleep.pre_contact(&mut self.bodies, &super::sleep::World { contacts: &self.contacts, joints: &self.joints, rb: &world.bodies, colliders: &world.colliders, np: &world.narrow_phase }, phase);
+            drop(_pre);
             enter_levels(&mut self.bodies, phase, &self.cfg);
             // SLEEP §1 step 4: with nothing due and nobody asleep, postContact is skipped.
             let decide = !super::sleep::nothing_due(&self.bodies, &self.sleep, phase);
+            let _contacts = rustudio_core::bench::scope("sv_contact_gather");
             self.contacts.update(&self.bodies, &world.bodies, &world.colliders, &world.narrow_phase, &self.prim_id);
+            drop(_contacts);
             self.touch_events(world, events);
             // (JOINTS: the constraint Instances' connectors, physics_joints.rs studio_constraints)
             self.joints.gather_studio(&self.bodies);
             // SLEEP §2: postContactStepSleepStage (contact wakes, decisions, transitions).
+            let _post = rustudio_core::bench::scope("sv_sleep_post");
             if decide {
                 self.sleep.post_contact(&mut self.bodies, &super::sleep::World { contacts: &self.contacts, joints: &self.joints, rb: &world.bodies, colliders: &world.colliders, np: &world.narrow_phase }, phase, self.cfg.max_level);
                 if !self.sleep.changed.is_empty() {
@@ -310,6 +357,7 @@ impl StudioSolver {
                     self.touch_events(world, events);
                 }
             }
+            drop(_post);
         });
         let ((), c2) = rustudio_core::bench::measure(|| {
             self.islands.build(&mut self.bodies, &self.contacts.list, &self.joints);
@@ -319,7 +367,9 @@ impl StudioSolver {
             self.joints.apply_forces(&mut self.bodies, &self.islands);
             self.joints.winch_callbacks(&self.bodies, &self.islands, h);
             self.joints.apply_level_requests(&mut self.bodies);
-            boxes(&mut self.bodies, &self.islands, &world.bodies, &world.colliders);
+            if self.cfg.max_level > 1 {
+                boxes(&mut self.bodies, &self.islands, &world.bodies, &world.colliders);
+            }
         });
         let ((), c3) = rustudio_core::bench::measure(|| {
             let nrows = self.solve_islands(h, gravity, phase);
@@ -342,6 +392,27 @@ impl StudioSolver {
 
     /// Touched / TouchEnded of the pairs narrow.rs makes alone, through rapier's event
     /// handler (physics.rs's collector), as rapier's own pairs report them.
+    /// A throttled 60 Hz frame (Studio steps solver set S only, Studio): every
+    /// awake body outside `throttle_exempt` is held still for the tick. Its pairs with
+    /// stepping bodies treat it as a moving non-sim side (`side`). An environment
+    /// catch-up tick (`env_phase`) holds the exempt bodies still instead.
+    fn freeze_throttled(&mut self) {
+        let b = &mut self.bodies;
+        for s in 0..b.len() {
+            b.flags[s] &= !flag::FROZEN;
+        }
+        let env_only = self.env_phase.is_some();
+        if !self.throttled && !env_only {
+            return;
+        }
+        for s in 0..b.len() {
+            let f = b.flags[s];
+            if f & (flag::DYNAMIC | flag::AWAKE) == (flag::DYNAMIC | flag::AWAKE) && self.throttle_exempt.contains(&b.handle[s]) == env_only {
+                b.flags[s] = (f & !flag::AWAKE) | flag::FROZEN;
+            }
+        }
+    }
+
     fn touch_events(&mut self, world: &rp::PhysicsWorld, events: &dyn rp::EventHandler) {
         static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dbg = *DBG.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_TOUCH_DEBUG").is_some());
@@ -411,6 +482,9 @@ impl StudioSolver {
     /// (`(p & (L − 1)) == 0`, JOINT §3, STEP §1.3 step 3). The Humanoid's forces enter
     /// only on such ticks. A body the solver has not seen yet: level 1.
     pub fn next_solve(&self, body: rp::RigidBodyHandle) -> (u8, bool) {
+        if self.cfg.max_level == 1 {
+            return (1, true);
+        }
         let mut t = self.ticks;
         if self.calls == 0 {
             t += harness().phase;
@@ -473,6 +547,7 @@ impl StudioSolver {
 
     /// A body's Studio mass record (one-part bodies, STEP §5 [L2]); None: rapier's sum.
     pub fn note_mass(&mut self, b: rp::RigidBodyHandle, m: Option<super::mass::PartMass>) {
+        self.bodies.mark_for_refresh(b);
         match m {
             Some(m) => {
                 self.bodies.studio_mass.insert(b, m);
@@ -551,19 +626,43 @@ impl StudioSolver {
         if self.due.is_empty() {
             return 0;
         }
+        static RATE_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *RATE_STATS.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_RATE_STATS").is_some()) {
+            let mut solved = [0; 4];
+            for &i in &self.due {
+                let i = i as usize;
+                let bucket = self.islands.level[i].trailing_zeros() as usize;
+                solved[bucket.min(3)] += self.islands.bodies(i).len() as u64;
+            }
+            for (name, count) in ["sv_bodies_240hz", "sv_bodies_120hz", "sv_bodies_60hz", "sv_bodies_30hz"].into_iter().zip(solved) {
+                rustudio_core::bench::add(name, 0.0, count);
+            }
+        }
         use rapier3d::rayon::prelude::*;
-        // Contiguous chunks of about equal body counts, one per worker (at most one
-        // per 32 islands: small worlds stay on one).
-        let threads = rapier3d::rayon::current_num_threads().max(1).min(self.due.len().div_ceil(32)).max(1);
+        // A resting island with rows costs more than a loose body. Balance
+        // contiguous ranges by the bodies and constraints they will solve.
+        // Keep the result merge in original island order.
+        let weight = |i: u32| {
+            let i = i as usize;
+            self.islands.bodies(i).len()
+                + self.islands.manifolds(i).iter()
+                    .map(|&m| 2 * self.contacts.list.count[m as usize] as usize)
+                    .sum::<usize>()
+                + 6 * self.islands.joint_ids(i).len()
+        };
+        let total: usize = self.due.iter().copied().map(weight).sum();
+        let threads = rapier3d::rayon::current_num_threads()
+            .min(total.div_ceil(64))
+            .min(self.due.len())
+            .max(1);
         if self.workers.len() < threads {
             self.workers.resize_with(threads, Default::default);
         }
-        let total: usize = self.due.iter().map(|&i| (self.islands.start[i as usize + 1] - self.islands.start[i as usize]) as usize).sum();
         self.cuts.clear();
         self.cuts.push(0);
         let mut acc = 0;
         for (k, &i) in self.due.iter().enumerate() {
-            acc += (self.islands.start[i as usize + 1] - self.islands.start[i as usize]) as usize;
+            acc += weight(i);
             if acc * threads >= total * self.cuts.len() && self.cuts.len() < threads {
                 self.cuts.push(k + 1);
             }
@@ -583,6 +682,7 @@ impl StudioSolver {
             work((&mut self.workers[0], 0));
         } else {
             self.workers[..threads].par_iter_mut().zip(0..threads).for_each(work);
+            rustudio_core::bench::add("sv_parallel_island_batches", 0.0, threads as u64);
         }
         // Results back (serial): bodies, kept impulses, queued level changes.
         let mut rows = 0;
@@ -692,6 +792,9 @@ impl StudioSolver {
         st.joints = self.joints.len() as u32;
         st.islands = self.islands.len() as u32;
         st.largest_island = (0..self.islands.len()).map(|i| self.islands.start[i + 1] - self.islands.start[i]).max().unwrap_or(0);
+        if !self.throttled && self.env_phase.is_none() {
+            self.full_stats = st;
+        }
         self.stats = st;
     }
 }
@@ -810,10 +913,11 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
     let mut cfg = LevelCfg::new(level, h, -gravity.y);
     diag_cfg(&mut cfg, h, gravity);
     w.batch.clear();
+    let damping = (-(cfg.ang_damp) * cfg.dt).exp();
     // Studio (STEP §4.1a): sim bodies' records in list order.
     for k in start..end {
         let s = isl.order[k] as usize;
-        let (rec, mass) = free_velocity(sh.bodies, s, &cfg, gravity);
+        let (rec, mass) = free_velocity(sh.bodies, s, &cfg, gravity, damping);
         let l = w.batch.add_body(rec, mass, true);
         w.local.local[s] = l;
     }
@@ -919,8 +1023,12 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
             p.pending = true;
             w.queue.push(LevelChange { idx: idx.0, gen: idx.1, ty: 1, level });
         }
-        let slot0 = box_level(sh.bodies, s, o.v, o.w, sh.cfg);
-        let l2 = arbiter(&mut p, slot0, phase, sh.cfg);
+        let l2 = if sh.cfg.max_level > 1 {
+            let slot0 = box_level(sh.bodies, s, o.v, o.w, sh.cfg);
+            arbiter(&mut p, slot0, phase, sh.cfg)
+        } else {
+            None
+        };
         if arb_debug() {
             eprintln!("ARB body {} island L{} level {} list {} node {} req {:?} prev {:?} pcf {:.3} cfl {:.2e} debounce {} -> {:?} com {:.3},{:.3},{:.3} ph {}", idx.0, level, p.level, p.list_level, p.node_level, p.requests, p.prev_requests, p.pcf, p.cfl, p.debounce, l2, o.com.x, o.com.y, o.com.z, phase);
         }
@@ -982,12 +1090,13 @@ fn side(w: &mut Worker, sh: &Shared, m: usize, first: bool) -> u32 {
 /// level-4 pose) show none.
 fn enter_levels(bodies: &mut BodySet, phase: u8, cfg: &Config) {
     for s in 0..bodies.len() {
-        if bodies.flags[s] & flag::DYNAMIC == 0 {
+        if bodies.flags[s] & flag::DYNAMIC == 0 || bodies.flags[s] & flag::FROZEN != 0 {
             continue;
         }
         let idx = bodies.handle[s].into_raw_parts().0 as usize;
         let p = &mut bodies.persist[idx];
-        let l = p.list_level.max(1);
+        let l = p.list_level.clamp(1, cfg.max_level);
+        p.node_level = p.node_level.min(cfg.max_level);
         if phase & (l - 1) != 0 {
             continue;
         }
@@ -1037,11 +1146,11 @@ fn gs_inertia(b: &BodySet, s: usize, gs: Vec3, p: f32) -> (Mat3, Option<Mat3>) {
 }
 
 /// Studio (STEP §4.1a, DUAL §5.1): a sim body's record and inverse-mass record.
-fn free_velocity(b: &BodySet, s: usize, cfg: &LevelCfg, gravity: Vec3) -> (BodyRec, MassRec) {
+fn free_velocity(b: &BodySet, s: usize, cfg: &LevelCfg, gravity: Vec3, damp: f32) -> (BodyRec, MassRec) {
     let dt = cfg.dt;
     let im = b.inv_mass[s];
     // 4: q = powf(im, cfg); k = (im > 0 ? q/im : 0)·cfg; Iw⁻¹.
-    let q = im.powf(cfg.mass_exp);
+    let q = b.inv_mass_position[s];
     let k = if im > 0.0 { q / im } else { 0.0 } * cfg.ang_factor;
     // Studio(b, out, cfg = 0.4) [J2]: the world inertia with the joints'
     // geometric stiffness (body, last solve's row collection) on its diagonal.
@@ -1064,7 +1173,6 @@ fn free_velocity(b: &BodySet, s: usize, cfg: &LevelCfg, gravity: Vec3) -> (BodyR
     let vf = v0 + f * im;
     // damp = expf(−cfg·dt); ωf = Iw⁻¹·τ + Rdamp·ω0. Rdamp = R·damp·Rᵀ with a
     // scalar damp is damp·I (DUAL Open 5 / STEP §4.1a: the exact matrix unconfirmed).
-    let damp = (-(cfg.ang_damp) * dt).exp();
     // ωf = Iw'⁻¹·τ + (damp·Iw'⁻¹)·Iw·ω0 (Studio = s·A, Studio = A·B; DUAL Open 5
     // [J2]); Iw'⁻¹·Iw = I when no GS term applies (then damp·ω0, as before).
     let wf = match w_scale {
@@ -1489,6 +1597,88 @@ mod collision_change_tests {
         let before = w.colliders.inserted_count();
         w.insert_collider(rp::ColliderBuilder::ball(0.1), None);
         assert_eq!(w.colliders.inserted_count(), before + 1);
+    }
+
+    #[test]
+    fn rounded_cylinder_retains_four_or_fewer_contact_anchors() {
+        let (mut world, ground) = world();
+        let body = world.insert_body(rp::RigidBodyBuilder::dynamic()
+            .translation(rp::Vector::new(0.0, 1.28, 0.0)));
+        let cylinder = world.insert_collider(rp::ColliderBuilder::round_cylinder(0.75, 0.45, 0.05), Some(body));
+        let anchors = |world: &rp::PhysicsWorld| {
+            let pair = world.narrow_phase.contact_pair(cylinder, ground).unwrap();
+            assert!(pair.has_any_active_contact());
+            let points = &pair.manifolds()[0].points;
+            assert!((1..=4).contains(&points.len()));
+            points.iter().map(|p| (p.local_p1, p.local_p2)).collect::<Vec<_>>()
+        };
+        detect(&mut world);
+        let saved = anchors(&world);
+        world.bodies.get_mut(body).unwrap().set_translation(rp::Vector::new(0.0, 1.2801, 0.0), false);
+        detect(&mut world);
+        assert_eq!(saved, anchors(&world));
+    }
+
+    #[test]
+    fn incremental_gather_tracks_disabled_and_replaced_bodies() {
+        let mut world = rp::PhysicsWorld::new();
+        let mut bodies = super::BodySet::default();
+        let a = world.insert_body(rp::RigidBodyBuilder::dynamic());
+        let b = world.insert_body(rp::RigidBodyBuilder::dynamic());
+        let gather = |world: &mut rp::PhysicsWorld, bodies: &mut super::BodySet| {
+            detect(world);
+            bodies.gather(&world.bodies, Some(world.collision_pipeline.processed_bodies()));
+        };
+        gather(&mut world, &mut bodies);
+        assert_eq!(bodies.handle, [a, b]);
+
+        world.bodies.get_mut(a).unwrap().set_enabled(false);
+        gather(&mut world, &mut bodies);
+        assert_eq!(bodies.handle, [b]);
+
+        world.bodies.get_mut(a).unwrap().set_enabled(true);
+        gather(&mut world, &mut bodies);
+        assert_eq!(bodies.handle, [a, b]);
+
+        world.remove_body(a);
+        let fixed = world.insert_body(rp::RigidBodyBuilder::fixed());
+        gather(&mut world, &mut bodies);
+        assert_eq!(bodies.handle, [b]);
+        assert_eq!(bodies.slot(a), super::NONE);
+        assert_eq!(bodies.slot(fixed), super::NONE);
+    }
+
+    #[test]
+    fn sparse_broad_phase_tracks_a_moved_anchor() {
+        let (mut world, ground) = world();
+        for i in 0..64 {
+            let pos = rp::Vector::new(100.0 + 3.0 * i as f32, 0.0, 0.0);
+            world.insert_collider(rp::ColliderBuilder::ball(1.0).translation(pos), None);
+        }
+        let pos = rp::Vector::new(0.0, 4.0, 0.0);
+        let body = world.insert_body(rp::RigidBodyBuilder::dynamic().translation(pos).build());
+        let ball = world.insert_collider(rp::ColliderBuilder::ball(0.5), Some(body));
+        detect(&mut world);
+        assert!(world.narrow_phase.contact_pair(ball, ground).is_none());
+
+        world.colliders.get_mut(ground).unwrap()
+            .set_translation(rp::Vector::new(0.0, 3.5, 0.0));
+        detect(&mut world);
+        assert!(world.narrow_phase.contact_pair(ball, ground)
+            .is_some_and(|pair| pair.has_any_active_contact()));
+
+        world.colliders.get_mut(ground).unwrap().set_translation(rp::Vector::ZERO);
+        detect(&mut world);
+        assert!(world.narrow_phase.contact_pair(ball, ground).is_none());
+
+        let irrelevant = world.insert_collider(rp::ColliderBuilder::ball(0.1), None);
+        detect(&mut world);
+        world.remove_collider(irrelevant);
+        world.colliders.get_mut(ground).unwrap()
+            .set_translation(rp::Vector::new(0.0, 3.5, 0.0));
+        detect(&mut world);
+        assert!(world.narrow_phase.contact_pair(ball, ground)
+            .is_some_and(|pair| pair.has_any_active_contact()));
     }
 
     /// Moving a collider within its body (set_position_wrt_parent) moves it in the

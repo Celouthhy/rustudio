@@ -38,6 +38,7 @@ const CLASSES: [&str; 7] = ["ParticleEmitter", "Sparkles", "Beam", "Trail", "Rop
 
 // ------------------------------------------------------------ script calls
 
+#[derive(Clone, Copy)]
 enum Req {
     Emit(u32),
     Clear,
@@ -48,6 +49,37 @@ enum Req {
 /// `ParticleEmitter:Emit` / `:Clear` from scripts, by document id, until
 /// the viewport next draws that document.
 static REQUESTS: Mutex<Vec<(u64, Ref, Req)>> = Mutex::new(Vec::new());
+
+pub(crate) struct SnapshotRequests(Vec<(Ref, Req)>);
+
+impl SnapshotRequests {
+    pub(crate) fn capture(doc_id: u64, server: Option<(u64, &dyn Fn(Ref) -> Option<Ref>)>) -> Self {
+        let mut out = Vec::new();
+        if let Ok(mut queue) = REQUESTS.lock() {
+            queue.retain(|&(id, r, req)| {
+                if id == doc_id {
+                    out.push((r, req));
+                } else if let Some((_, map)) = server.filter(|(server_id, _)| id == *server_id) {
+                    if let Some(client_ref) = map(r) {
+                        out.push((client_ref, req));
+                    }
+                } else {
+                    return true;
+                }
+                false
+            });
+        }
+        Self(out)
+    }
+
+    pub(crate) fn publish(self, doc_id: u64) {
+        if !self.0.is_empty() {
+            if let Ok(mut queue) = REQUESTS.lock() {
+                queue.extend(self.0.into_iter().map(|(r, req)| (doc_id, r, req)));
+            }
+        }
+    }
+}
 
 /// `emitter:Emit(n)`: n particles at once, whether or not it's Enabled.
 pub fn emit(doc_id: u64, emitter: Ref, n: u32) {
@@ -1761,6 +1793,7 @@ fn light_check() -> bool {
 
 /// What a frame needs from the viewport.
 pub struct FrameIn<'a> {
+    pub quality: Option<crate::quality::Profile>,
     pub doc: &'a mut Document,
     pub cam: &'a Camera,
     pub rect: Rect,
@@ -1783,17 +1816,15 @@ impl Effects {
     /// opaque) of the scene in front of the camera, the nearest
     /// FX_GLASS_MAX within FX_GLASS_MAX_DIST, nearest first, for
     /// `FrameIn::glass`. Which parts are see-through is kept until the
-    /// document's revision moves; where they are is read each frame.
-    pub fn glass(&mut self, scene: &crate::scene::Scene, revision: u64, cam: &Camera) -> Vec<Glass> {
+    /// scene membership changes; where they are is read each frame.
+    pub fn glass(&mut self, scene: &crate::scene::Scene, cam: &Camera) -> Vec<Glass> {
         let _p = rustudio_core::bench::scope("fx_glass");
-        let key = (scene.doc_id, revision, scene.parts.len());
+        let key = (scene.doc_id, scene.glass_generation, scene.parts.len());
         if self.glass_key != Some(key) {
+            rustudio_core::bench::add("fx_glass_rescan", 0.0, 1);
             self.glass_key = Some(key);
             self.glass_parts = (0..scene.parts.len())
-                .filter(|&i| {
-                    let a = scene.parts[i].draw.alpha;
-                    a > mech::FX_GLASS_MIN_ALPHA && a < 0.999
-                })
+                .filter(|&i| crate::scene::glass_alpha(scene.parts[i].draw.alpha))
                 .collect();
         }
         let fwd = cam.forward();
@@ -2198,7 +2229,8 @@ impl Effects {
         rustudio_core::bench::add("fx_beams_kept", 0.0, n_kept);
         let _pd = rustudio_core::bench::scope("fx_pdraw");
         emitters.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut budget = mech::FX_PARTICLES_MAX;
+        let particle_budget = f.quality.map_or(mech::FX_PARTICLES_MAX, |profile| profile.particle_budget());
+        let mut budget = particle_budget;
         for (_, r, xf, _) in emitters {
             let (Some(Cfg::Emitter(c)), Some(st)) = (self.cfg.get(&r), self.emitters.get(&r)) else {
                 continue;
@@ -2216,7 +2248,7 @@ impl Effects {
         }
         rustudio_core::bench::add("fx_particles", 0.0, n_particles as u64);
         if std::env::var_os("RUSTUDIO_FX_TRACE").is_some() && (now / 5.0).floor() != ((now - dt as f64) / 5.0).floor() {
-            eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim={:.3}", mech::FX_PARTICLES_MAX - budget, t_sim);
+            eprintln!("[fx] sim_seconds={now:.2} live={n_particles} submitted={} sim={:.3}", particle_budget - budget, t_sim);
         }
 
         drop(_pd);
@@ -2259,6 +2291,26 @@ impl Effects {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_effect_requests_keep_order_and_remap_server_refs() {
+        let client = Document::empty().id;
+        let server = Document::empty().id;
+        let mirror = Document::empty().id;
+        let target = Ref::new();
+        let server_emitter = Ref::new();
+        emit(server, server_emitter, 7);
+        clear(client, target);
+        emit(server, Ref::new(), 12);
+        set_texture_offset(client, target, 0.5);
+        let map = |r| (r == server_emitter).then_some(target);
+
+        SnapshotRequests::capture(client, Some((server, &map))).publish(mirror);
+        let got = SnapshotRequests::capture(mirror, None).0;
+        assert!(matches!(got.as_slice(), [(a, Req::Emit(7)), (b, Req::Clear), (c, Req::Offset(0.5))]
+            if [*a, *b, *c] == [target; 3]));
+        assert!(SnapshotRequests::capture(client, Some((server, &map))).0.is_empty());
+    }
 
     #[test]
     fn straight_beam_endpoint_tangent_limit_follows_chord() {

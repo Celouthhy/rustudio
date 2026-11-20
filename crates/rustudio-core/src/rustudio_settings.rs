@@ -76,6 +76,16 @@ pub struct Opt {
 pub const SOLVERS: &[(&str, &str)] = &[("studio", "Studio solver (default)"), ("rapier", "Legacy (rapier)")];
 
 pub const OPTS: &[Opt] = &[
+    Opt { key: "quality", cat: "Performance", label: "Graphics quality", desc: "Automatic adjusts the viewport quality level using recent frame times. Manual uses the settings below.", env: "RUSTUDIO_PERF_QUALITY", kind: OptKind::Choice(&[("manual", "Manual"), ("automatic", "Automatic")]) },
+    Opt { key: "resolution", cat: "Performance", label: "3D resolution", desc: "Scales the 3D scene while keeping editor text sharp. The biggest saving on a weak graphics chip: 50% draws a quarter of the pixels.", env: "RUSTUDIO_PERF_RESOLUTION", kind: OptKind::Choice(&[("100", "100%"), ("75", "75%"), ("50", "50%"), ("33", "33%"), ("25", "25%")]) },
+    Opt { key: "detail", cat: "Performance", label: "Shading detail", desc: "Medium drops sky reflections and extra lighting work; Low also drops material maps, the light grid, local lights and multisample anti-aliasing (as Studio's lower quality levels do), keeping sun, shadow and ambient. The biggest saving on a weak graphics chip.", env: "RUSTUDIO_PERF_DETAIL", kind: OptKind::Choice(&[("high", "High"), ("medium", "Medium"), ("low", "Low")]) },
+    Opt { key: "ssao", cat: "Performance", label: "Ambient occlusion", desc: "Darkens creases and corners. Off skips the screen-space pass, which costs several milliseconds a frame on a weak graphics chip.", env: "RUSTUDIO_PERF_SSAO", kind: OptKind::Choice(&[("on", "On"), ("off", "Off")]) },
+    Opt { key: "shadows", cat: "Performance", label: "Shadow quality", desc: "Reduced draws smaller sun shadow tiles. Off also disables local light shadows.", env: "RUSTUDIO_PERF_SHADOWS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
+    Opt { key: "grass", cat: "Performance", label: "Grass detail", desc: "Reduced grows fewer blades over a shorter distance.", env: "RUSTUDIO_PERF_GRASS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
+    Opt { key: "bloom", cat: "Performance", label: "Glow effects", desc: "Controls the bloom glow around bright surfaces.", env: "RUSTUDIO_PERF_BLOOM", kind: OptKind::Choice(&[("on", "On"), ("off", "Off")]) },
+    Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(&[("unlimited", "Unlimited"), ("60", "60 FPS"), ("30", "30 FPS")]) },
+    Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit (the screen's refresh rate when Unlimited). Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
+    Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
     Opt {
         key: "solver",
         cat: "Physics",
@@ -429,8 +439,24 @@ pub enum Shown {
     Path(String),
 }
 
+pub fn performance_choice(key: &str) -> usize {
+    let o = opt(key);
+    let OptKind::Choice(items) = o.kind else { return 0 };
+    let value = env(o.env).or_else(|| saved(key)?.as_str().map(str::to_owned));
+    items.iter().position(|(id, _)| Some(*id) == value.as_deref()).unwrap_or(0)
+}
+
+/// The selected choice's saved id for a Performance row ("50", "low", "off"),
+/// so code reads the value it means rather than an index into the list.
+pub fn performance_value(key: &str) -> &'static str {
+    let o = opt(key);
+    let OptKind::Choice(items) = o.kind else { return "" };
+    items.get(performance_choice(key)).map_or("", |(id, _)| *id)
+}
+
 pub fn shown(o: &Opt) -> Shown {
     match o.key {
+        key if o.cat == "Performance" => Shown::Choice(performance_choice(key)),
         "solver" => Shown::Choice(if solver_now() == SolverKind::Rapier { 1 } else { 0 }),
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),

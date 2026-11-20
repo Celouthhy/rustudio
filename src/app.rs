@@ -154,16 +154,19 @@ pub struct Editor {
     pub clean_view: bool,
     pub clipboard: Option<Vec<u8>>,
     pub hover: Option<Ref>,
+    pub(crate) hover_pick: crate::viewport::HoverPick,
     pub drag: Option<GizmoDrag>,
     pub marquee: Option<egui::Pos2>,
     /// The selection when the box started (Shift / Ctrl add to it).
     pub marquee_base: Vec<Ref>,
+    pub(crate) marquee_centres: crate::viewport::MarqueeCentres,
     /// The Output panel's toolbar choices (src/output_panel.rs).
     pub output_view: crate::output_panel::OutputState,
     /// Dragging parts with the Select / Move tool (src/part_drag.rs).
     pub part_drag: Option<crate::part_drag::PartDrag>,
     pub explorer: ExplorerState,
     pub props: PropertiesState,
+    pub(crate) panel_cache: crate::panel_cache::Panels,
     /// The character builder window (Home / Avatar → Character).
     pub chars: crate::char_builder::CharBuilder,
     /// Places stored on Roblox: File > Open from Roblox, Save to Roblox.
@@ -209,7 +212,7 @@ pub struct Editor {
     pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
-    pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64)>, Vec<rbx_dom_weak::types::Ref>),
+    pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64, u64)>, Vec<rbx_dom_weak::types::Ref>),
     pub harness: Harness,
     pub last_frame: Instant,
     pub fps: f32,
@@ -258,6 +261,7 @@ pub enum PendingAction {
 pub struct RustudioApp {
     watchdog: crate::frame_watchdog::Watchdog,
     updater: crate::update::Updater,
+    pub(crate) last_ui_frame: Option<Instant>,
     last_plugin_tick: Instant,
     plugins_ticked_between_frames: bool,
     pub dock: DockState<Tab>,
@@ -324,13 +328,16 @@ impl RustudioApp {
             clean_view: false,
             clipboard: None,
             hover: None,
+            hover_pick: Default::default(),
             drag: None,
             marquee: None,
             marquee_base: Vec::new(),
+            marquee_centres: Default::default(),
             output_view: Default::default(),
             part_drag: None,
             explorer: ExplorerState::default(),
             props: PropertiesState::default(),
+            panel_cache: Default::default(),
             chars: Default::default(),
             cloud: crate::cloud_ui::CloudUi::new(),
             account_destination: None,
@@ -489,6 +496,7 @@ impl RustudioApp {
         RustudioApp {
             watchdog: crate::frame_watchdog::Watchdog::new(egui_ctx.clone()),
             updater: crate::update::Updater::start(),
+            last_ui_frame: None,
             last_plugin_tick: Instant::now(),
             plugins_ticked_between_frames: false,
             dock,
@@ -503,6 +511,12 @@ impl RustudioApp {
 
 impl Editor {
     pub fn push_log(&mut self, level: Level, text: impl Into<String>) {
+        let text = text.into();
+        match level {
+            Level::Info => log::info!(target: "rustudio::editor", "{text}"),
+            Level::Warn => log::warn!(target: "rustudio::editor", "{text}"),
+            Level::Error => log::error!(target: "rustudio::editor", "{text}"),
+        }
         self.game.push_log(level, text);
         self.flush_output_changes();
     }
@@ -923,17 +937,11 @@ impl Editor {
         if std::env::var_os("RUSTUDIO_PICK_TRACE").is_some() {
             eprintln!("[pick selection] {:?}", self.game.doc.selection.iter().map(|r| self.game.doc.dom.get_by_ref(*r).map(|i| (&i.name, &i.class))).collect::<Vec<_>>());
         }
-        let added: Vec<Ref> = self.game
-            .doc
-            .selection
-            .iter()
-            .copied()
-            .filter(|r| !self.last_selection.contains(r))
-            .collect();
+        let last_added = self.game.doc.selection.iter().rev().find(|r| !self.last_selection.contains(r));
         for &r in &self.game.doc.selection {
             self.explorer.expand_ancestors(&self.game.doc, r);
         }
-        if let Some(&r) = added.last().or(self.game.doc.selection.last()) {
+        if let Some(&r) = last_added.or(self.game.doc.selection.last()) {
             self.explorer.scroll_to = Some(r);
         }
         self.last_selection = self.game.doc.selection.clone();
@@ -1143,6 +1151,13 @@ impl Editor {
         }
         let r = self.game.doc.insert(parent, b);
         self.select(vec![r]);
+    }
+
+    pub(crate) fn has_selected_parts(&self) -> bool {
+        self.game.doc.selection.iter().any(|&r| {
+            self.game.scene.get(r).is_some()
+                || self.game.doc.dom.descendants_of(r).any(|d| self.game.scene.get(d.referent()).is_some())
+        })
     }
 
     pub fn selected_parts(&self) -> Vec<Ref> {
@@ -1580,12 +1595,16 @@ impl TabViewer for Viewer<'_> {
             Tab::Explorer => "explorer",
             Tab::Properties => "properties",
             Tab::Output => "output",
+            Tab::Script(_) => "script_editor",
             _ => "other_tab",
         });
         match tab {
             Tab::Viewport => self.ed.viewport_ui(ui),
+            Tab::Explorer if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::explorer_ui),
             Tab::Explorer => self.ed.explorer_ui(ui),
+            Tab::Properties if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::properties_ui),
             Tab::Properties => self.ed.properties_ui(ui),
+            Tab::Output if self.window.is_none() => self.ed.docked_panel(ui, *tab, Editor::output_ui),
             Tab::Output => self.ed.output_ui(ui),
             Tab::AvatarSettings => self.ed.avatar_settings_ui(ui),
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
@@ -1844,6 +1863,7 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.last_ui_frame = Some(Instant::now());
         self.frame(ui);
     }
 }
@@ -2013,34 +2033,46 @@ impl RustudioApp {
         self.watchdog.stage("scene synchronization", "dock UI and GPU viewport preparation");
         ed.shortcuts(&ctx);
 
-        egui::Panel::top("menu")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::MENU_BAR)
-                    .inner_margin(egui::Margin::symmetric(6, 2)),
-            )
-            .show(ui, |ui| ed.studio_menu_bar(ui));
-        egui::Panel::top("testbar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(8, 4)),
-            )
-            .show(ui, |ui| ed.studio_top_row(ui));
-        egui::Panel::top("toolbar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(6, 4)),
-            )
-            .show(ui, |ui| ed.studio_ribbon(ui));
-        egui::Panel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL_DARK)
-                    .inner_margin(egui::Margin::symmetric(8, 3)),
-            )
-            .show(ui, |ui| ed.status_bar(ui));
+        {
+            let _p = rustudio_core::bench::scope("editor_chrome");
+            egui::Panel::top("menu")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::MENU_BAR)
+                        .inner_margin(egui::Margin::symmetric(6, 2)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("menu_bar");
+                    ed.studio_menu_bar(ui);
+                });
+            egui::Panel::top("testbar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("test_toolbar");
+                    ed.studio_top_row(ui);
+                });
+            egui::Panel::top("toolbar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(egui::Margin::symmetric(6, 4)),
+                )
+                .show(ui, |ui| {
+                    let _p = rustudio_core::bench::scope("ribbon");
+                    ed.studio_ribbon(ui);
+                });
+            egui::Panel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::PANEL_DARK)
+                        .inner_margin(egui::Margin::symmetric(8, 3)),
+                )
+                .show(ui, |ui| ed.status_bar(ui));
+        }
 
         // Editor::start_run requests this when a playtest begins.
         if std::mem::take(&mut self.ed.switch_to_viewport) {

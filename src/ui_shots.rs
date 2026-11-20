@@ -342,8 +342,12 @@ impl Editor {
                 self.output_view.show_timestamp = true;
                 self.start_run(crate::studio_ui::RunType::Run);
                 self.game.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}'));
+                self.output_view.log_cleared();
             }
-            (5, Show::OutputRun) => self.game.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}')),
+            (5, Show::OutputRun) => {
+                self.game.log.retain(|l| l.text.contains("RefScript") || l.text.contains('\u{2063}'));
+                self.output_view.log_cleared();
+            }
             (0, Show::Tab(t)) => self.ui.tab = *t,
             (0, Show::PluginsTab | Show::PluginPopup) => self.ui.tab = RibbonTab::Plugins,
             (0, Show::Shortcuts) => self.plugin_bar.shortcuts.open = true,

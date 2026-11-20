@@ -173,10 +173,19 @@ static TString* readString(TempBuffer<TString*>& strings, const char* data, size
     return id == 0 ? NULL : strings[id - 1];
 }
 
+// rustudio: imports resolve against the chunk's own environment `env` (the
+// one luau_load was given) and only when that environment is safe. Upstream
+// uses the loading thread's globals, which is the same table when the host
+// loads each script on a thread whose globals are its environment (Roblox);
+// mlua loads every chunk on the main thread with an explicit environment,
+// so upstream resolved nothing for scripts (the host globals aren't flagged
+// safe) and every `CFrame.new` / `math.sin` was looked up through the
+// environment's __index chain at run time (~350 instructions each).
 static void resolveImportSafe(lua_State* L, LuaTable* env, TValue* k, uint32_t id)
 {
     struct ResolveImport
     {
+        LuaTable* env;
         TValue* k;
         uint32_t id;
 
@@ -192,12 +201,12 @@ static void resolveImportSafe(lua_State* L, LuaTable* env, TValue* k, uint32_t i
             setnilvalue(L->top);
             L->top++;
 
-            luaV_getimport(L, L->gt, self->k, L->top - 1, self->id, /* propagatenil= */ true);
+            luaV_getimport(L, self->env, self->k, L->top - 1, self->id, /* propagatenil= */ true);
         }
     };
 
-    ResolveImport ri = {k, id};
-    if (L->gt->safeenv)
+    ResolveImport ri = {env, k, id};
+    if (env->safeenv)
     {
         // luaD_pcall will make sure that if any C/Lua calls during import resolution fail, the thread state is restored back
         int oldTop = lua_gettop(L);

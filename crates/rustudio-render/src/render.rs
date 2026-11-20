@@ -190,6 +190,15 @@ pub struct Globals {
     /// Screen-space AO: x, y half the projection diagonal, z near plane, w on.
     pub ssao: [f32; 4],
     pub dof: [f32; 4],
+    /// Render tuning: x shading detail (2 high, 1 medium, 0 low), y 1 =
+    /// RUSTUDIO_PROBE_FLAT (a flat colour from every part, measuring the
+    /// raster's cost without the shading), z the terrain probe, w Automatic.
+    pub perf: [f32; 4],
+    /// Studio's low-quality ambient terms with the environment cubes
+    /// averaged into indoor and skylight contributions. Ambient .w is
+    /// the low vertex shader's gloss byte, from our flat-material roughness.
+    pub low_ambient: [f32; 4],
+    pub low_outdoor: [f32; 4],
 }
 
 /// One local light as the shader reads it (see `Light` in shader.wgsl).
@@ -334,6 +343,7 @@ impl PartDraw {
 
 pub struct Frame<'a> {
     pub globals: Globals,
+    pub quality: Option<crate::quality::Profile>,
     /// Ordinary (not reverse-Z) view-projection, for culling.
     pub cull_view_proj: Mat4,
     pub fov_y: f32,
@@ -563,6 +573,38 @@ mod see_bounds_tests {
 }
 
 #[cfg(test)]
+mod caster_tests {
+    use super::*;
+
+    #[test]
+    fn recolouring_keeps_the_casters_and_moving_or_hiding_does_not() {
+        let mut a = HIDDEN;
+        a.r0 = [1.0, 0.0, 0.0, 5.0];
+        a.r1 = [0.0, 1.0, 0.0, 2.0];
+        a.r2 = [0.0, 0.0, 1.0, -3.0];
+        a.size = [4.0, 1.0, 2.0, 0.001];
+        let mut b = a;
+        b.color = [1.0, 0.2, 0.1, 1.0];
+        b.emissive = [3.0; 4];
+        b.tint = [0.5; 4];
+        b.uvt = [0.25; 4];
+        b.size[3] = 0.002;
+        b.extra = [0.0, 16.0, 0.0, 2.0];
+        assert!(casts_same(&a, &b));
+        let mut moved = a;
+        moved.r0[3] = 5.5;
+        assert!(!casts_same(&a, &moved));
+        let mut grown = a;
+        grown.size[1] = 1.5;
+        assert!(!casts_same(&a, &grown));
+        let mut off = a;
+        off.extra[1] = NO_SHADOW_BIT as f32;
+        assert!(!casts_same(&a, &off));
+        assert!(!casts_same(&a, &HIDDEN));
+    }
+}
+
+#[cfg(test)]
 mod transparent_order_tests {
     use super::transparent_order;
     use std::cmp::Ordering;
@@ -643,6 +685,42 @@ struct StaticLayout {
     hidden: usize,
     /// Slots changed in place, uploaded next frame.
     writes: Vec<u32>,
+    /// One of `writes` changed what the depth-only shadow passes read
+    /// (`casts_same`), not just how the part looks.
+    caster_writes: bool,
+    /// Bounding spheres (before and after) of in-place caster changes since
+    /// the last frame: SunCache drops only the cascades they reach.
+    caster_dirty: Vec<(Vec3, f32)>,
+}
+
+/// Whether the shadow passes (vs_shadow: depth only) draw two instances
+/// the same: their transform, size and CastShadow bit. A script recolouring
+/// a static part every frame (a game's lamps) leaves its shadow alone.
+fn casts_same(a: &InstanceRaw, b: &InstanceRaw) -> bool {
+    a.r0 == b.r0
+        && a.r1 == b.r1
+        && a.r2 == b.r2
+        && a.size[..3] == b.size[..3]
+        && (a.extra[1] as u32 & NO_SHADOW_BIT) == (b.extra[1] as u32 & NO_SHADOW_BIT)
+}
+
+/// A stable sort of `v` by `cmp` that moves only indices while comparing,
+/// then gathers once: the order `v.sort_by(cmp)` gives.
+fn sort_stable_by<T: Copy>(v: &mut Vec<T>, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    if v.len() < 2 {
+        return;
+    }
+    let mut order: Vec<u32> = (0..v.len() as u32).collect();
+    order.sort_by(|a, b| cmp(&v[*a as usize], &v[*b as usize]));
+    if order.iter().enumerate().all(|(i, o)| *o as usize == i) {
+        return;
+    }
+    *v = order.iter().map(|i| v[*i as usize]).collect();
+}
+
+/// An instance's bounding sphere (centre from its transform).
+fn raw_sphere(raw: &InstanceRaw, radius: f32) -> (Vec3, f32) {
+    (Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]), radius.max(Vec3::from_slice(&raw.size[..3]).length() * 0.5))
 }
 
 /// Counters for the last frame (shown in the bench report).
@@ -1026,9 +1104,19 @@ impl MaterialArrays {
     }
 }
 
-struct Mesh {
+pub(crate) struct Mesh {
     vbuf: wgpu::Buffer,
+    /// Corners drawn: the index count when indexed, else the vertex count.
     count: u32,
+    /// Indexed meshes (`indexed`): identical corners share one vertex, so
+    /// the vertex shader runs once per distinct corner instead of three
+    /// times a triangle. Same triangles, same vertex values.
+    ibuf: Option<wgpu::Buffer>,
+    /// Corner -> vertex, for in-place rewrites of an indexed mesh.
+    remap: Option<std::sync::Arc<[u32]>>,
+    /// The vertices' box in the unit box (loaded meshes): terrain water is
+    /// split into pieces sharing one box, each culled by its own.
+    bounds: Option<(Vec3, Vec3)>,
     /// Back faces culled (Some(true)), as Studio draws a MeshPart with
     /// DoubleSided off (an inverted-hull outline shell then shows only as its
     /// rim); Some(false) two-sided by choice (DoubleSided); None two-sided
@@ -1036,6 +1124,93 @@ struct Mesh {
     cull: Option<bool>,
     /// Made for the skinning pass (STORAGE usage).
     storage: bool,
+}
+
+impl Mesh {
+    /// Binds the mesh (slot 0, and its indices) and draws `instances`.
+    pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>) {
+        pass.set_vertex_buffer(0, self.vbuf.slice(..));
+        match &self.ibuf {
+            Some(ib) => {
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.count, 0, instances);
+            }
+            None => pass.draw(0..self.count, instances),
+        }
+    }
+
+    /// A triangle list as shared vertices and indices, when sharing saves
+    /// at least a quarter of the vertices (None: draw it as a list).
+    fn indexed(verts: &[Vertex]) -> Option<(Vec<Vertex>, Vec<u32>)> {
+        if verts.len() < 48 {
+            return None;
+        }
+        let mut seen: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::with_capacity(verts.len());
+        let mut unique: Vec<Vertex> = Vec::new();
+        let mut index = Vec::with_capacity(verts.len());
+        for v in verts {
+            let key: &[u8] = bytemuck::bytes_of(v);
+            let at = *seen.entry(key).or_insert_with(|| {
+                unique.push(*v);
+                unique.len() as u32 - 1
+            });
+            index.push(at);
+        }
+        (unique.len() * 4 <= verts.len() * 3).then_some((unique, index))
+    }
+
+    /// Uploads `verts` (a triangle list), indexed when that saves work.
+    fn upload(device: &wgpu::Device, label: &str, verts: &[Vertex], usage: wgpu::BufferUsages, cull: Option<bool>) -> Mesh {
+        let (vdata, ibuf, remap, count) = match Self::indexed(verts) {
+            Some((unique, index)) => {
+                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(&index),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let count = index.len() as u32;
+                (std::borrow::Cow::Owned(unique), Some(ibuf), Some(std::sync::Arc::from(index)), count)
+            }
+            None => (std::borrow::Cow::Borrowed(verts), None, None, verts.len() as u32),
+        };
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(&vdata),
+            usage,
+        });
+        let bounds = verts.iter().fold(None, |b: Option<(Vec3, Vec3)>, v| {
+            let p = Vec3::from(v.pos);
+            Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))))
+        });
+        Mesh { vbuf, count, ibuf, remap, bounds, cull, storage: false }
+    }
+
+    /// `corners` (one vertex per corner, as uploaded) as this mesh's
+    /// vertex buffer contents: as is for a list, through the corner map
+    /// when indexed. None when corners that share a vertex now differ.
+    fn contents<'a>(&self, corners: &'a [Vertex]) -> Option<std::borrow::Cow<'a, [Vertex]>> {
+        let Some(remap) = &self.remap else {
+            return Some(std::borrow::Cow::Borrowed(corners));
+        };
+        if remap.len() != corners.len() {
+            return None;
+        }
+        let n = remap.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let mut out: Vec<Option<Vertex>> = vec![None; n];
+        for (c, &at) in corners.iter().zip(remap.iter()) {
+            match &out[at as usize] {
+                Some(v) if bytemuck::bytes_of(v) != bytemuck::bytes_of(c) => return None,
+                Some(_) => {}
+                None => out[at as usize] = Some(*c),
+            }
+        }
+        Some(std::borrow::Cow::Owned(out.into_iter().map(|v| v.unwrap_or_else(|| corners[0])).collect()))
+    }
+
+    /// Corners the mesh was built from (its triangle list length).
+    fn corners(&self) -> u32 {
+        self.remap.as_ref().map_or(self.count, |r| r.len() as u32)
+    }
 }
 
 /// The pipelines that draw decals and see-through parts (linear, or into
@@ -1073,7 +1248,7 @@ impl SeeThrough {
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: true,
+                    multisampled: ms.count > 1,
                 },
                 count: None,
             }],
@@ -1126,6 +1301,7 @@ impl SeeThrough {
 }
 
 struct Target {
+    samples: u32,
     size: [u32; 2],
     msaa: wgpu::TextureView,
     /// The MSAA scene in the see-through encoding (SeeThrough), and the bind
@@ -1167,19 +1343,536 @@ struct Target {
     display_view: wgpu::TextureView,
 }
 
+struct ViewportPipelines {
+    water: crate::water::WaterPass,
+    glass_resolve: wgpu::RenderPipeline,
+    sky: wgpu::RenderPipeline,
+    opaque: wgpu::RenderPipeline,
+    opaque_two_sided: wgpu::RenderPipeline,
+    opaque_low: Option<[[wgpu::RenderPipeline; 2]; 2]>,
+    transparent_culled: wgpu::RenderPipeline,
+    glass: wgpu::RenderPipeline,
+    glass_culled: wgpu::RenderPipeline,
+    transparent: wgpu::RenderPipeline,
+    decal_depth: wgpu::RenderPipeline,
+    lines: wgpu::RenderPipeline,
+    post: wgpu::RenderPipeline,
+    ssao_layout: wgpu::BindGroupLayout,
+    ssao_down: wgpu::RenderPipeline,
+    ssao_main: wgpu::RenderPipeline,
+    dof_h: wgpu::RenderPipeline,
+    near_pipelines: Vec<wgpu::RenderPipeline>,
+    ssao_blur_x: wgpu::RenderPipeline,
+    ssao_blur_y: wgpu::RenderPipeline,
+    ssao_apply: wgpu::RenderPipeline,
+    terrain: wgpu::RenderPipeline,
+    overlay: wgpu::RenderPipeline,
+    see_pipes: SeePipes,
+    see: SeeThrough,
+}
+
+impl ViewportPipelines {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bgl: &wgpu::BindGroupLayout,
+        tex_layout: &wgpu::BindGroupLayout,
+        glass_layout: &wgpu::BindGroupLayout,
+        terrain_bgl: &wgpu::BindGroupLayout,
+        samples: u32,
+    ) -> Self {
+        let source = shader_source().replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("viewport color and depth"),
+            source: wgpu::ShaderSource::Wgsl(if samples == 1 { single_sample_shader(source) } else { source }.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("viewport"),
+            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
+            immediate_size: 0,
+        });
+
+        let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("parts with glass scene"),
+            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
+            immediate_size: 0,
+        });
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 8 => Float32x2, 12 => Float32x4, 11 => Float32x4],
+        };
+        let instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4],
+        };
+        let line_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+        };
+
+        let ms = wgpu::MultisampleState {
+            count: samples,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        };
+        let make = |label: &str,
+                    vs: &str,
+                    fs: &str,
+                    buffers: &[Option<wgpu::VertexBufferLayout>],
+                    topology: wgpu::PrimitiveTopology,
+                    cull: Option<wgpu::Face>,
+                    depth_write: bool,
+                    depth_compare: wgpu::CompareFunction,
+                    blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(if fs.starts_with("fs_part") || fs == "fs_decal_depth" { &part_layout } else { &layout }),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(depth_compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: ms,
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend,
+                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        use wgpu::CompareFunction as C;
+        use wgpu::PrimitiveTopology as T;
+        let sky = make(
+            "sky",
+            "vs_sky",
+            "fs_sky",
+            &[],
+            T::TriangleList,
+            None,
+            false,
+            C::Always,
+            None,
+        );
+        let opaque = make(
+            "parts",
+            "vs_part",
+            "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList,
+            Some(wgpu::Face::Back),
+            true,
+            C::Greater,
+            None,
+        );
+        let opaque_two_sided = make(
+            "parts-two-sided",
+            "vs_part",
+            "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList,
+            None,
+            true,
+            C::Greater,
+            None,
+        );
+        let opaque_low = (samples == 1).then(|| {
+            ["fs_part_opaque_low", "fs_part_opaque_shadowed"].map(|entry| {
+                [Some(wgpu::Face::Back), None].map(|cull| make(
+                    entry, "vs_part_opaque_low", entry,
+                    &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+                    T::TriangleList, cull, true, C::Greater, None,
+                ))
+            })
+        });
+        // fs_part writes premultiplied colour (round 26): see-through Neon
+        // adds its glow with cover 0, everything else blends as before.
+        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList, None, true, C::Greater, None);
+        let transparent = make(
+            "parts-transparent",
+            "vs_part",
+            "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList,
+            None,
+            false,
+            C::GreaterEqual,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
+        // See-through built-in shapes show their front faces only, as in
+        // Studio (round 19: from inside a translucent part it draws nothing).
+        let transparent_culled = make(
+            "parts-transparent-culled",
+            "vs_part",
+            "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList,
+            Some(wgpu::Face::Back),
+            false,
+            C::GreaterEqual,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
+        // GlassTransparentFS already composites the opaque scene. Replace RGB
+        // and preserve its energy-derived alpha; ordinary transparents remain
+        // premultiplied One / OneMinusSrcAlpha.
+        let glass = make("glass-composite", "vs_part", "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList, None, false, C::Greater, None);
+        let glass_culled = make("glass-composite-culled", "vs_part", "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None);
+        // The same five, drawing into the see-through encoding (shader.wgsl
+        // see_out; SeeThrough below).
+        let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
+        let see_pipes = SeePipes {
+            transparent: make("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+            transparent_culled: make("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
+            glass: make("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
+            glass_culled: make("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
+            overlay: make("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
+        };
+        let see = SeeThrough::new(device, &shader, &bgl, ms);
+        let water = crate::water::WaterPass::new(
+            device,
+            queue,
+            &shader,
+            &bgl,
+            &tex_layout,
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            HDR_FORMAT,
+            samples,
+        );
+        // Hover highlight: the same geometry again, on top of itself.
+        let overlay = make(
+            "parts-overlay",
+            "vs_part",
+            "fs_part",
+            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
+            T::TriangleList,
+            None,
+            false,
+            C::GreaterEqual,
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
+        let terrain_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<rustudio_core::terrain::TerrainVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
+        };
+        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain"),
+            bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
+            immediate_size: 0,
+        });
+        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain"),
+            layout: Some(&terrain_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_terrain"),
+                compilation_options: Default::default(),
+                buffers: &[Some(terrain_vertex_layout.clone())],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: T::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(C::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_terrain"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: samples > 1,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
+                },
+            ],
+        });
+        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("post with depth"),
+            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&ssao_layout)],
+            immediate_size: 0,
+        });
+        let post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post"),
+            layout: Some(&post_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_post"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: DISPLAY_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
+            let t = Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&post_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_post"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &vec![t; targets],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
+        let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("dof prepare"),
+            layout: Some(&post_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_dof_h"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssao"),
+            bind_group_layouts: &[Some(&bgl), Some(&ssao_layout)],
+            immediate_size: 0,
+        });
+        let ssao_pipe = |label: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&ssao_pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_post"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
+        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
+        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
+        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
+        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
+        // SSAOApply: the scene × the occlusion.
+        let ssao_apply = ssao_pipe(
+            "ssao apply",
+            "fs_ssao_apply",
+            HDR_FORMAT,
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::Src,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            }),
+        );
+        let lines = make(
+            "lines",
+            "vs_line",
+            "fs_line",
+            &[Some(line_layout)],
+            T::LineList,
+            None,
+            false,
+            C::GreaterEqual,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+
+
+        Self {
+            water,
+            glass_resolve,
+            sky,
+            opaque,
+            opaque_two_sided,
+            opaque_low,
+            transparent_culled,
+            glass,
+            glass_culled,
+            transparent,
+            decal_depth,
+            lines,
+            post,
+            ssao_layout,
+            ssao_down,
+            ssao_main,
+            dof_h,
+            near_pipelines,
+            ssao_blur_x,
+            ssao_blur_y,
+            ssao_apply,
+            terrain,
+            overlay,
+            see_pipes,
+            see,
+        }
+    }
+}
+
+fn sample_slot(samples: u32) -> usize {
+    if samples == SAMPLES { 2 } else { samples as usize - 1 }
+}
+
+fn supports_two_samples(rs: &egui_wgpu::RenderState) -> bool {
+    use wgpu::TextureFormatFeatureFlags as Flags;
+    if !rs.device.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES) {
+        return false;
+    }
+    [HDR_FORMAT, DEPTH_FORMAT, crate::highlight::MASK_FORMAT].into_iter().all(|format| {
+        let flags = rs.adapter.get_texture_format_features(format).flags;
+        flags.sample_count_supported(2)
+            && (format == DEPTH_FORMAT || flags.contains(Flags::MULTISAMPLE_RESOLVE))
+    })
+}
+
+/// Single-sample textures take a mip level in place of the sample index.
+/// Depth readers that already use index zero need only the type change.
+fn single_sample_shader(source: String) -> String {
+    source
+        .replace("texture_depth_multisampled_2d", "texture_depth_2d")
+        .replace("texture_multisampled_2d<f32>", "texture_2d<f32>")
+        .replace(", @builtin(sample_index) s: u32", "")
+        .replace("vec2<i32>(p.xy), i32(s)", "vec2<i32>(p.xy), 0")
+        .replace("textureLoad(ssao_depth_ms, pixel, i)", "textureLoad(ssao_depth_ms, pixel, 0)")
+        .replace("textureLoad(ssao_depth_ms, p, sample)", "textureLoad(ssao_depth_ms, p, 0)")
+}
+
 pub struct Renderer {
+    viewport: ViewportPipelines,
+    lower_samples: [Option<ViewportPipelines>; 2],
+    terrain_layout: wgpu::BindGroupLayout,
     /// Skinned parts deformed on the GPU (skin_gpu.rs).
     skin: crate::skin_gpu::SkinGpu,
     /// Highlight instances over the finished image (highlight.rs).
-    highlight: Option<crate::highlight::HighlightPass>,
+    highlight: [Option<crate::highlight::HighlightPass>; 3],
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
-    world_gui: Option<crate::world_gui::WorldGuiPass>,
+    world_gui: [Option<crate::world_gui::WorldGuiPass>; 3],
     /// Terrain water (round 24, water.rs).
-    water: crate::water::WaterPass,
     glass_layout: wgpu::BindGroupLayout,
-    glass_resolve: wgpu::RenderPipeline,
     material_epoch: Instant,
     /// Fog for the world GUI pass (gui_fog).
     gui_fog: ([f32; 4], [f32; 3]),
@@ -1189,43 +1882,35 @@ pub struct Renderer {
     gui_sun_params: [f32; 4],
     /// Local lights in lights_buf this frame (the effects read them).
     gui_n_lights: u32,
-    sky: wgpu::RenderPipeline,
-    opaque: wgpu::RenderPipeline,
-    transparent: wgpu::RenderPipeline,
-    decal_depth: wgpu::RenderPipeline,
-    transparent_culled: wgpu::RenderPipeline,
-    glass: wgpu::RenderPipeline,
-    glass_culled: wgpu::RenderPipeline,
-    opaque_two_sided: wgpu::RenderPipeline,
-    lines: wgpu::RenderPipeline,
-    post: wgpu::RenderPipeline,
     post_dof: bool,
     post_dof_near: bool,
-    dof_h: wgpu::RenderPipeline,
     dof_v: wgpu::RenderPipeline,
-    near_pipelines: Vec<wgpu::RenderPipeline>,
     /// Studio's SSAO passes (shader.wgsl "SSAO"): depth down, occlusion,
     /// blur across, blur down, and the multiply into the HDR scene.
-    ssao_layout: wgpu::BindGroupLayout,
-    ssao_down: wgpu::RenderPipeline,
-    ssao_main: wgpu::RenderPipeline,
-    ssao_blur_x: wgpu::RenderPipeline,
-    ssao_blur_y: wgpu::RenderPipeline,
-    ssao_apply: wgpu::RenderPipeline,
     /// Bloom: bright pass, blur across (two targets), blur down.
     bloom_bright: wgpu::RenderPipeline,
     bloom_down: wgpu::RenderPipeline,
     bloom_up: wgpu::RenderPipeline,
     post_bloom_size: f32,
     shadow: wgpu::RenderPipeline,
+    /// Each sun cascade's static casters, kept between redraws (SunCache).
+    sun_cache: SunCache,
     /// Local light shadow maps (Studio's Future path) and their pass.
     lshadow: LightShadows,
     lshadow_pipe: wgpu::RenderPipeline,
-    /// Bumped whenever the static instances change (light shadow cache key).
+    /// Bumped whenever the static instances change.
     static_gen: u64,
+    /// Bumped when the static scene changes in a way the shadow casters
+    /// can see (`casts_same`): the sun cascades' and light shadow maps'
+    /// cache key.
+    caster_gen: u64,
+    /// Bumped when a mesh's vertices are rewritten in place (SunCache key).
+    mesh_gen: u64,
+    /// caster_gen bumps that came from in-place static writes (their
+    /// spheres are in StaticLayout::caster_dirty).
+    caster_flushes: u64,
     /// Smooth terrain (round 21): per-chunk triangle buffers, drawn with
     /// Studio's terrain shading, and their per-palette parameters.
-    terrain: wgpu::RenderPipeline,
     terrain_shadow: wgpu::RenderPipeline,
     terrain_shadow_back: wgpu::RenderPipeline,
     terrain_params_buf: wgpu::Buffer,
@@ -1244,7 +1929,7 @@ pub struct Renderer {
     /// The sun's shadow cascades: the atlas the shaders read (sun_shadow.rs).
     sun: crate::sun_shadow::SunShadows,
     /// Terrain.Clouds' passes (clouds.rs), made on first use.
-    clouds: Option<crate::clouds::CloudsGpu>,
+    clouds: [Option<crate::clouds::CloudsGpu>; 3],
     sky_view: wgpu::TextureView,
     /// Studio's indoor environment (textures/sky/indoor512); white 1×1 until
     /// loaded. The scene probe's slots start as it (env_probe_gpu).
@@ -1267,6 +1952,7 @@ pub struct Renderer {
     /// Studio's legacy surface atlas (studs.dds); grey (no change) until loaded.
     studs_view: wgpu::TextureView,
     studs_sampler: wgpu::Sampler,
+    low_material_sampler: wgpu::Sampler,
     /// Material texture packs (matpack.rs): one array layer per pack,
     /// colour + height and normal + roughness + metalness.
     materials: MaterialArrays,
@@ -1281,10 +1967,7 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
     textures: Vec<wgpu::BindGroup>,
-    overlay: wgpu::RenderPipeline,
     /// See-through draws in Studio's encoded blend (SeeThrough).
-    see_pipes: SeePipes,
-    see: SeeThrough,
     /// Per-frame instances: moving and see-through parts, overlay.
     instance_buf: wgpu::Buffer,
     instance_cap: usize,
@@ -1376,6 +2059,7 @@ impl Renderer {
                     8,
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 ),
+                frag(22, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                 frag(
                     9,
                     wgpu::BindingType::Texture {
@@ -1593,6 +2277,16 @@ impl Renderer {
             anisotropy_clamp: rustudio_core::mech::TEXTURE_ANISOTROPY,
             ..Default::default()
         });
+        let low_material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("low-quality materials"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 2,
+            ..Default::default()
+        });
         let lshadow = LightShadows::new(device);
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
@@ -1611,6 +2305,7 @@ impl Renderer {
             &localgrid_view,
             &studs_view,
             &studs_sampler,
+            &low_material_sampler,
             &materials,
             &probe.slot_views[0],
             &probe.slot_views[1],
@@ -1630,6 +2325,7 @@ impl Renderer {
             &localgrid_view,
             &studs_view,
             &studs_sampler,
+            &low_material_sampler,
             &materials,
             &probe.slot_views[0],
             &probe.slot_views[1],
@@ -1723,17 +2419,6 @@ impl Renderer {
                 frag(1, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("viewport"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
-            immediate_size: 0,
-        });
-
-        let part_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("parts with glass scene"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&glass_layout)],
-            immediate_size: 0,
-        });
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -1744,169 +2429,8 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 13 => Float32x4],
         };
-        let line_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-        };
-
-        let ms = wgpu::MultisampleState {
-            count: SAMPLES,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        };
-        let make = |label: &str,
-                    vs: &str,
-                    fs: &str,
-                    buffers: &[Option<wgpu::VertexBufferLayout>],
-                    topology: wgpu::PrimitiveTopology,
-                    cull: Option<wgpu::Face>,
-                    depth_write: bool,
-                    depth_compare: wgpu::CompareFunction,
-                    blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(if fs == "fs_part" || fs == "fs_part_enc" || fs == "fs_decal_depth" { &part_layout } else { &layout }),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: cull,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(depth_compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: ms,
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend,
-                        write_mask: if fs == "fs_decal_depth" { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
         use wgpu::CompareFunction as C;
         use wgpu::PrimitiveTopology as T;
-        let sky = make(
-            "sky",
-            "vs_sky",
-            "fs_sky",
-            &[],
-            T::TriangleList,
-            None,
-            false,
-            C::Always,
-            None,
-        );
-        let opaque = make(
-            "parts",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            true,
-            C::Greater,
-            None,
-        );
-        let opaque_two_sided = make(
-            "parts-two-sided",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            true,
-            C::Greater,
-            None,
-        );
-        // fs_part writes premultiplied colour (round 26): see-through Neon
-        // adds its glow with cover 0, everything else blends as before.
-        let decal_depth = make("decal opaque texel depth", "vs_part", "fs_decal_depth",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, true, C::Greater, None);
-        let transparent = make(
-            "parts-transparent",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // See-through built-in shapes show their front faces only, as in
-        // Studio (round 19: from inside a translucent part it draws nothing).
-        let transparent_culled = make(
-            "parts-transparent-culled",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            Some(wgpu::Face::Back),
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
-        // GlassTransparentFS already composites the opaque scene. Replace RGB
-        // and preserve its energy-derived alpha; ordinary transparents remain
-        // premultiplied One / OneMinusSrcAlpha.
-        let glass = make("glass-composite", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, None, false, C::Greater, None);
-        let glass_culled = make("glass-composite-culled", "vs_part", "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None);
-        // The same five, drawing into the see-through encoding (shader.wgsl
-        // see_out; SeeThrough below).
-        let pm = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
-        let parts = [Some(vertex_layout.clone()), Some(instance_layout.clone())];
-        let see_pipes = SeePipes {
-            transparent: make("parts-transparent-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-            transparent_culled: make("parts-transparent-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::GreaterEqual, pm),
-            glass: make("glass-composite-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::Greater, None),
-            glass_culled: make("glass-composite-culled-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, Some(wgpu::Face::Back), false, C::Greater, None),
-            overlay: make("parts-overlay-enc", "vs_part", "fs_part_enc", &parts, T::TriangleList, None, false, C::GreaterEqual, pm),
-        };
-        let see = SeeThrough::new(device, &shader, &bgl, ms);
-        let water = crate::water::WaterPass::new(
-            device,
-            queue,
-            &shader,
-            &bgl,
-            &tex_layout,
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            HDR_FORMAT,
-            SAMPLES,
-        );
-        // Hover highlight: the same geometry again, on top of itself.
-        let overlay = make(
-            "parts-overlay",
-            "vs_part",
-            "fs_part",
-            &[Some(vertex_layout.clone()), Some(instance_layout.clone())],
-            T::TriangleList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-        );
         // Local light shadow faces: EVSM moments + depth, both sides.
         let lshadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("light shadow"),
@@ -1981,6 +2505,7 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let sun_cache = SunCache::new(device);
         // Smooth terrain (round 21): its own vertices (terrain.rs
         // TerrainVertex) and per-palette parameters in group 1.
         let terrain_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2015,46 +2540,6 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Uint8x4, 3 => Uint8x4, 4 => Uint8x4, 5 => Float32x4],
         };
-        let terrain_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("terrain"),
-            bind_group_layouts: &[Some(&bgl), Some(&terrain_bgl)],
-            immediate_size: 0,
-        });
-        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&terrain_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_terrain"),
-                compilation_options: Default::default(),
-                buffers: &[Some(terrain_vertex_layout.clone())],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: T::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(C::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: ms,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_terrain"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
         let terrain_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain shadow"),
             layout: Some(&shadow_layout),
@@ -2107,6 +2592,11 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("viewport post effects"),
+            bind_group_layouts: &[Some(&bgl), Some(&tex_layout)],
+            immediate_size: 0,
+        });
         // Exposure, tone mapping, bloom and colour correction into the display texture.
         let fullscreen = |label: &str, fs: &str, targets: usize| {
             let t = Some(wgpu::ColorTargetState {
@@ -2137,7 +2627,6 @@ impl Renderer {
             })
         };
 
-
         let dof_v = fullscreen("dof down", "fs_dof_v", 1);
         let bloom_bright = fullscreen("bloom bright", "fs_bloom_bright", 1);
         let bloom_down = fullscreen("bloom pyramid down", "fs_bloom_down", 1);
@@ -2148,239 +2637,39 @@ impl Renderer {
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         };
         let bloom_up = device.create_render_pipeline(&bloom_up_desc);
-        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ssao"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
-                },
-            ],
-        });
-        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post with depth"),
-            bind_group_layouts: &[Some(&bgl), Some(&tex_layout), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_post"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: DISPLAY_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let near_fullscreen = |label: &str, fs: &str, targets: usize| {
-            let t = Some(wgpu::ColorTargetState {
-                format: HDR_FORMAT,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&post_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &vec![t; targets],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let near_pipelines = ["fs_near_h", "fs_near_v", "fs_near_mask0", "fs_near_mask1", "fs_near_mask2", "fs_near_mask3", "fs_near_mask4", "fs_near_mask5", "fs_near_edge", "fs_near_bokeh", "fs_near_tent"].iter().map(|fs| near_fullscreen("dof near", fs, 1)).collect();
-        let dof_h = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("dof prepare"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_post"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_dof_h"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let ssao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ssao"),
-            bind_group_layouts: &[Some(&bgl), Some(&ssao_layout)],
-            immediate_size: 0,
-        });
-        let ssao_pipe = |label: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&ssao_pl),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_post"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let glass_resolve = ssao_pipe("glass depth", "fs_glass_depth", wgpu::TextureFormat::R32Float, None);
-        let ssao_down = ssao_pipe("ssao depth", "fs_ssao_down", wgpu::TextureFormat::R32Float, None);
-        let ssao_main = ssao_pipe("ssao", "fs_ssao", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_x = ssao_pipe("ssao blur across", "fs_ssao_blur_x", wgpu::TextureFormat::Rg32Float, None);
-        let ssao_blur_y = ssao_pipe("ssao blur down", "fs_ssao_blur_y", wgpu::TextureFormat::Rg32Float, None);
-        // SSAOApply: the scene × the occlusion.
-        let ssao_apply = ssao_pipe(
-            "ssao apply",
-            "fs_ssao_apply",
-            HDR_FORMAT,
-            Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::Src,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent::OVER,
-            }),
-        );
-        let lines = make(
-            "lines",
-            "vs_line",
-            "fs_line",
-            &[Some(line_layout)],
-            T::LineList,
-            None,
-            false,
-            C::GreaterEqual,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
+        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES);
 
         let meshes = build_meshes()
             .into_iter()
-            .map(|verts| Mesh {
-                cull: Some(true),
-                storage: false,
-                count: verts.len() as u32,
-                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("mesh"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-            })
+            .map(|verts| Mesh::upload(device, "mesh", &verts, wgpu::BufferUsages::VERTEX, Some(true)))
             .collect();
 
         let instance_cap = 1024;
         let line_cap = 4096;
         let mut r = Renderer {
+            viewport,
+            lower_samples: [None, None],
+            terrain_layout: terrain_bgl,
             skin: crate::skin_gpu::SkinGpu::new(device),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
             gui_sun: Default::default(),
             gui_lightgrid: [0.0; 4],
             gui_sun_params: [0.0, 580.0, 0.05, 0.0],
             gui_n_lights: 0,
-            world_gui: None,
-            highlight: None,
+            world_gui: [None, None, None],
+            highlight: [None, None, None],
             last_view_proj: Mat4::IDENTITY,
-            water,
             glass_layout,
-            glass_resolve,
             material_epoch: Instant::now(),
-            sky,
-            opaque,
-            opaque_two_sided,
-            transparent_culled,
-            glass,
-            glass_culled,
-            transparent,
-            decal_depth,
-            lines,
-            post,
             post_dof: false,
             post_dof_near: false,
-            ssao_layout,
-            ssao_down,
-            ssao_main,
-            dof_h,
             dof_v,
-            near_pipelines,
-            ssao_blur_x,
-            ssao_blur_y,
-            ssao_apply,
             bloom_bright,
             bloom_down,
             bloom_up,
             post_bloom_size: 24.0,
             shadow,
-            terrain,
+            sun_cache,
             terrain_shadow,
             terrain_shadow_back,
             terrain_params_buf,
@@ -2393,11 +2682,14 @@ impl Renderer {
             lshadow,
             lshadow_pipe,
             static_gen: 0,
+            caster_gen: 0,
+            mesh_gen: 0,
+            caster_flushes: 0,
             globals_layout: bgl,
             lights_buf,
             shadow_view,
             sun,
-            clouds: None,
+            clouds: [None, None, None],
             sky_view,
             indoor_view,
             probe,
@@ -2412,6 +2704,7 @@ impl Renderer {
             lightocc_view,
             studs_view,
             studs_sampler,
+            low_material_sampler,
             materials,
             sky_size: 0,
             meshes,
@@ -2420,9 +2713,6 @@ impl Renderer {
             sampler,
             textures: Vec::new(),
             black_view,
-            overlay,
-            see_pipes,
-            see,
             instance_buf: Self::make_buf(
                 device,
                 "instances",
@@ -2746,6 +3036,7 @@ impl Renderer {
         localgrid: &wgpu::TextureView,
         studs: &wgpu::TextureView,
         studs_sampler: &wgpu::Sampler,
+        low_material_sampler: &wgpu::Sampler,
         materials: &MaterialArrays,
         indoor: &wgpu::TextureView,
         indoor_next: &wgpu::TextureView,
@@ -2784,6 +3075,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: B::Sampler(studs_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: B::Sampler(low_material_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
@@ -2947,6 +3242,7 @@ impl Renderer {
             &self.localgrid_view,
             &self.studs_view,
             &self.studs_sampler,
+            &self.low_material_sampler,
             &self.materials,
             &self.probe.slot_views[self.probe.cur],
             &self.probe.slot_views[self.probe.next()],
@@ -2966,6 +3262,7 @@ impl Renderer {
             &self.localgrid_view,
             &self.studs_view,
             &self.studs_sampler,
+            &self.low_material_sampler,
             &self.materials,
             &self.probe.slot_views[self.probe.cur],
             &self.probe.slot_views[self.probe.next()],
@@ -3029,6 +3326,7 @@ impl Renderer {
     ) {
         // (the sun's cascades and the lights' shadow maps hold the terrain)
         self.static_gen += 1;
+        self.caster_gen += 1;
         if verts.is_empty() {
             self.terrain_chunks.remove(&key);
             return;
@@ -3061,6 +3359,7 @@ impl Renderer {
         self.terrain_chunks.clear();
         self.terrain_grass.clear();
         self.static_gen += 1;
+        self.caster_gen += 1;
     }
 
     /// Replaces one chunk's decoration grass (none = drop it).
@@ -3284,11 +3583,27 @@ impl Renderer {
         })
     }
 
-    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) {
-        if self.target.as_ref().is_some_and(|t| t.size == size) {
+    fn pipelines(&self, samples: u32) -> &ViewportPipelines {
+        if samples == SAMPLES {
+            &self.viewport
+        } else {
+            self.lower_samples[sample_slot(samples)].as_ref().expect("viewport pipelines")
+        }
+    }
+
+    fn ensure_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], samples: u32) {
+        if self.target.as_ref().is_some_and(|t| t.size == size && t.samples == samples) {
             return;
         }
         let device = &rs.device;
+        let viewport = if samples == SAMPLES {
+            &self.viewport
+        } else {
+            self.lower_samples[sample_slot(samples)].get_or_insert_with(|| ViewportPipelines::new(
+                device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
+                &self.terrain_layout, samples,
+            ))
+        };
         let tex =
             |label: &str, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
                 device.create_texture(&wgpu::TextureDescriptor {
@@ -3306,24 +3621,6 @@ impl Renderer {
                     view_formats: &[],
                 })
             };
-        let msaa = tex(
-            "viewport-msaa",
-            HDR_FORMAT,
-            SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
-        let msaa_view = msaa.create_view(&Default::default());
-        let see_view = tex("viewport-see-through", HDR_FORMAT, SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
-        let see_encode_bg = self.see.bind(device, &msaa_view);
-        let see_decode_bg = self.see.bind(device, &see_view);
-        let depth = tex(
-            "viewport-depth",
-            DEPTH_FORMAT,
-            SAMPLES,
-            // (read by the world GUI pass)
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        );
         let hdr = tex(
             "viewport-hdr",
             HDR_FORMAT,
@@ -3333,6 +3630,24 @@ impl Renderer {
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let hdr_view = hdr.create_view(&Default::default());
+        let msaa_view = if samples == 1 {
+            hdr_view.clone()
+        } else {
+            tex("viewport-msaa", HDR_FORMAT, samples,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
+                .create_view(&Default::default())
+        };
+        let see_view = tex("viewport-see-through", HDR_FORMAT, samples,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
+        let see_encode_bg = viewport.see.bind(device, &msaa_view);
+        let see_decode_bg = viewport.see.bind(device, &see_view);
+        let depth = tex(
+            "viewport-depth",
+            DEPTH_FORMAT,
+            samples,
+            // (read by the world GUI pass)
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
         let scene_copy = tex(
             "viewport-scene-copy",
             HDR_FORMAT,
@@ -3340,9 +3655,9 @@ impl Renderer {
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
         let depth_view = depth.create_view(&Default::default());
-        let water_depth = tex("water surface depth", DEPTH_FORMAT, SAMPLES,
+        let water_depth = tex("water surface depth", DEPTH_FORMAT, samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
-        let water_bg = self.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
+        let water_bg = viewport.water.bind(device, &scene_copy.create_view(&Default::default()), &depth_view);
         let glass_depth = tex("glass depth snapshot", wgpu::TextureFormat::R32Float, 1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
         let glass_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3456,7 +3771,7 @@ impl Renderer {
         let ssao_bg = |label: &str, input: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &self.ssao_layout,
+                layout: &viewport.ssao_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
@@ -3499,6 +3814,7 @@ impl Renderer {
             }
         }
         self.target = Some(Target {
+            samples,
             size,
             msaa: msaa_view,
             see: see_view,
@@ -3539,14 +3855,15 @@ impl Renderer {
     pub fn draw_world_gui(
         &mut self,
         rs: &egui_wgpu::RenderState,
+        font_texture_update: (u64, Option<[u32; 4]>),
         batches: &[crate::world_gui::GuiBatch],
         fx: Option<&crate::world_gui::FxFrame>,
         tone_curve: Option<[f32; 5]>,
     ) {
         let Some(t) = self.target.as_ref() else { return };
-        let pass = self
-            .world_gui
-            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT));
+        let pass = self.world_gui[sample_slot(t.samples)]
+            .get_or_insert_with(|| crate::world_gui::WorldGuiPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
+        pass.font_texture_update = Some(font_texture_update);
         pass.sun_atlas = self.sun.atlas_view.clone();
         pass.sun_grid = self.lightgrid_view.clone();
         pass.lightgrid = self.gui_lightgrid;
@@ -3567,8 +3884,8 @@ impl Renderer {
             return;
         }
         let Some(t) = self.target.as_ref() else { return };
-        let pass = self.highlight.get_or_insert_with(|| {
-            crate::highlight::HighlightPass::new(&rs.device, DISPLAY_FORMAT, DEPTH_FORMAT, SAMPLES, std::mem::size_of::<Vertex>() as u64)
+        let pass = self.highlight[sample_slot(t.samples)].get_or_insert_with(|| {
+            crate::highlight::HighlightPass::new(&rs.device, DISPLAY_FORMAT, DEPTH_FORMAT, t.samples, std::mem::size_of::<Vertex>() as u64)
         });
         let mut work = Vec::new();
         for h in list.iter().take(crate::highlight::MAX) {
@@ -3583,20 +3900,21 @@ impl Renderer {
                     let Some(m) = self.meshes.get(mesh_slot(d)) else { continue };
                     let raw = to_raw(d, 0.0);
                     let bias = item.bias;
-                    meshes.push((&m.vbuf, m.count, crate::highlight::Inst { r0: raw.r0, r1: raw.r1, r2: raw.r2, size: [raw.size[0], raw.size[1], raw.size[2], bias] }));
+                    meshes.push((m, crate::highlight::Inst { r0: raw.r0, r1: raw.r1, r2: raw.r2, size: [raw.size[0], raw.size[1], raw.size[2], bias] }));
                 }
             }
             if !meshes.is_empty() {
                 work.push((h, meshes));
             }
         }
-        pass.draw(&rs.device, &rs.queue, t.size, SAMPLES, &t.depth, &t.display_view, self.last_view_proj, &work);
+        pass.draw(&rs.device, &rs.queue, t.size, t.samples, &t.depth, &t.display_view, self.last_view_proj, &work);
     }
 
     /// The bloom and the final image again, from the HDR image as it is now
     /// (effects drawn into it after `render`; the frame's globals still
     /// bound).
     fn encode_bloom(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
+        if size < 0.0 { return; }
         let scale = ((target.size[0] as f32 * target.size[1] as f32) / 2073600.0).sqrt();
         let levels = (3.0 + (scale.log2() + (size / 7.0).log2().max(0.0)).max(-1.0)).min(5.999) as usize;
         for i in 0..levels {
@@ -3623,23 +3941,24 @@ impl Renderer {
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
         let _b = rustudio_core::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
+        let viewport = self.pipelines(target.samples);
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
         let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
-            ("dof across", &self.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
+            ("dof across", &viewport.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
             ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
-            ("dof near", &self.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
-            ("dof near", &self.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
-            ("dof near", &self.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
-            ("dof near", &self.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
-            ("dof near", &self.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
-            ("dof near", &self.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
-            ("dof near", &self.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
-            ("dof near", &self.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
-            ("dof near", &self.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
-            ("dof near", &self.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
-            ("dof near", &self.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
-            ("post", &self.post, &target.hdr_bg, vec![&target.display_view]),
+            ("dof near", &viewport.near_pipelines[0], &target.near_bgs[0], vec![&target.near_views[0]]),
+            ("dof near", &viewport.near_pipelines[1], &target.near_bgs[1], vec![&target.near_views[1]]),
+            ("dof near", &viewport.near_pipelines[2], &target.near_bgs[2], vec![&target.near_views[2]]),
+            ("dof near", &viewport.near_pipelines[3], &target.near_bgs[3], vec![&target.near_views[3]]),
+            ("dof near", &viewport.near_pipelines[4], &target.near_bgs[4], vec![&target.near_views[4]]),
+            ("dof near", &viewport.near_pipelines[5], &target.near_bgs[5], vec![&target.near_views[5]]),
+            ("dof near", &viewport.near_pipelines[6], &target.near_bgs[6], vec![&target.near_views[6]]),
+            ("dof near", &viewport.near_pipelines[7], &target.near_bgs[7], vec![&target.near_views[7]]),
+            ("dof near", &viewport.near_pipelines[8], &target.near_bgs[8], vec![&target.near_views[8]]),
+            ("dof near", &viewport.near_pipelines[9], &target.near_bgs[9], vec![&target.near_views[9]]),
+            ("dof near", &viewport.near_pipelines[10], &target.near_bgs[10], vec![&target.near_views[10]]),
+            ("post", &viewport.post, &target.hdr_bg, vec![&target.display_view]),
         ];
         for (label, pipeline, bg, views) in steps {
             if label.starts_with("dof ") && !self.post_dof { continue; }
@@ -3698,7 +4017,18 @@ impl Renderer {
     ) -> Option<egui::TextureId> {
         let svc_t0 = Instant::now();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
-        self.ensure_target(rs, size);
+        crate::gpu_timing::set_automatic(frame.quality.is_some());
+        // Shading detail Low draws one sample a pixel, as Studio does at
+        // every quality level up to 16 (quality.rs samples(); a weak GPU's
+        // levels): 4x MSAA multiplied the raster, the see-through encode
+        // and decode (both per sample) and the resolve.
+        let low_detail = rustudio_core::rustudio_settings::performance_value("detail") == "low";
+        let manual = if low_detail { 1 } else { SAMPLES };
+        let mut samples = frame.quality.map_or(manual, |profile| profile.samples());
+        if samples == 2 && !supports_two_samples(rs) {
+            samples = 1;
+        }
+        self.ensure_target(rs, size, samples);
         let device = &rs.device;
         let queue = &rs.queue;
         // cam_pos.w is unused by the camera math. Keep material animation
@@ -3770,6 +4100,8 @@ impl Renderer {
             stats.rebuilds += 1;
         }
         self.flush_static_writes(queue);
+        let dirty = std::mem::take(&mut self.st.caster_dirty);
+        self.sun_cache.invalidate(&dirty);
 
         let cam = Vec3::new(
             frame.globals.cam_pos[0],
@@ -3779,17 +4111,29 @@ impl Renderer {
         let planes = frustum(frame.cull_view_proj);
         // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
         let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
-        let lod_k = rustudio_core::mech::LOD_MIN_PX / focal;
+        let lod_px = frame.quality.map_or(rustudio_core::mech::LOD_MIN_PX, |p| p.lod_radius_pixels(size[1]));
+        let lod_k = lod_px / focal;
+        let draw_distance = frame.quality.map_or(f32::INFINITY, |p| p.distance());
 
+        let r_scope = rustudio_core::bench::scope("r_static_cull");
         // Static batches: frustum test per cell, then trim the smallest parts.
         let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
+        let mut push_range = |pass, key, start, end| match static_ranges.last_mut() {
+            Some(last) if last.0 == pass && last.1 == key && last.3 == start => last.3 = end,
+            _ => static_ranges.push((pass, key, start, end)),
+        };
         let mut see_bounds = SeeBounds::new(Mat4::from_cols_array_2d(&frame.globals.view_proj), size);
         for b in &self.st.batches {
             if !box_visible(&planes, b.lo, b.hi) {
                 stats.culled_batches += 1;
                 continue;
             }
-            let r_min = lod_k * box_distance(cam, b.lo, b.hi);
+            let distance = box_distance(cam, b.lo, b.hi);
+            if distance > draw_distance {
+                stats.culled_batches += 1;
+                continue;
+            }
+            let r_min = lod_k * distance;
             let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
             let n = radii.partition_point(|r| *r >= r_min) as u32;
             stats.lod_skipped += (b.count - n) as usize;
@@ -3799,14 +4143,29 @@ impl Renderer {
             if b.pass == Pass::Decal {
                 see_bounds.add_box(b.lo, b.hi);
             }
-            match static_ranges.last_mut() {
-                Some(last) if last.0 == b.pass && last.1 == b.key && last.3 == b.start => {
-                    last.3 = b.start + n
+            if frame.quality.is_some() {
+                let far = (cam - b.lo).abs().max((cam - b.hi).abs());
+                if far.length_squared() > draw_distance * draw_distance {
+                    // A static cell can straddle the Automatic view distance.
+                    // Use the same sphere-range test as the moving draws.
+                    for slot in b.start..b.start + n {
+                        let raw = &self.st.raw[slot as usize];
+                        let centre = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+                        let limit = draw_distance + self.st.radii[slot as usize];
+                        if (centre - cam).length_squared() <= limit * limit {
+                            push_range(b.pass, b.key, slot, slot + 1);
+                        } else {
+                            stats.lod_skipped += 1;
+                        }
+                    }
+                    continue;
                 }
-                _ => static_ranges.push((b.pass, b.key, b.start, b.start + n)),
             }
+            push_range(b.pass, b.key, b.start, b.start + n);
         }
 
+        drop(r_scope);
+        let r_scope = rustudio_core::bench::scope("r_per_frame_cull");
         // Per-frame items: moving, new and see-through parts.
         let mut dyn_opaque: Vec<((usize, usize), InstanceRaw)> = Vec::new();
         let mut dyn_decal: Vec<((usize, usize), InstanceRaw)> = Vec::new();
@@ -3818,6 +4177,9 @@ impl Renderer {
         // through it. Decals on see-through hosts stay sorted with them.
         let mut surface_decals: Vec<(f32, (usize, usize), InstanceRaw)> = Vec::new();
         let mut water: Vec<((usize, usize), InstanceRaw)> = Vec::new();
+        // Terrain water's whole box is in view (its pieces may all be culled):
+        // the frame still takes the water path, as with the water drawn whole.
+        let mut water_seen = false;
         for r in &self.per_frame {
             let Some(item) = self.items.get(r) else {
                 continue;
@@ -3831,8 +4193,16 @@ impl Renderer {
                 if !shows(d) || !sphere_visible(&planes, d.xf.pos, rad) {
                     continue;
                 }
+                // A piece of terrain water: frustum-culled by its own box
+                // (every piece has the whole water's box; game_view.rs).
+                let piece_hidden = d.material == 5.0
+                    && d.custom_mesh.is_some()
+                    && self.meshes.get(mesh_slot(d)).and_then(|m| m.bounds).is_some_and(|(lo, hi)| {
+                        let c = d.xf.pos + d.xf.rot * ((lo + hi) * 0.5 * d.size);
+                        !sphere_visible(&planes, c, ((hi - lo) * d.size).length() * 0.5)
+                    });
                 let dist = (d.xf.pos - cam).length();
-                if rad < lod_k * (dist - rad).max(0.0) {
+                if dist - rad > draw_distance || rad < lod_k * (dist - rad).max(0.0) {
                     stats.lod_skipped += 1;
                     continue;
                 }
@@ -3861,7 +4231,12 @@ impl Renderer {
                     // decals: their boxes span the map / the host.)
                     None if d.custom_mesh.is_some() && !self.culling_known(mesh_slot(d)) && d.material != 5.0 && d.tex_mode != TexMode::Decal && camera_inside(d, cam) => {}
                     // Terrain water: its own pass (water.rs).
-                    None if d.custom_mesh.is_some() && d.material == 5.0 => water.push((draw_key(d), raw)),
+                    None if d.custom_mesh.is_some() && d.material == 5.0 => {
+                        water_seen = true;
+                        if !piece_hidden {
+                            water.push((draw_key(d), raw));
+                        }
+                    }
                     None if solid_host && d.tex_mode == TexMode::Decal && d.texture.is_some() => {
                         see_bound(&mut see_bounds);
                         surface_decals.push((dist, draw_key(d), raw))
@@ -3873,13 +4248,17 @@ impl Renderer {
                 }
             }
         }
-        dyn_opaque.sort_by_key(|e| e.0);
-        dyn_decal.sort_by_key(|e| e.0);
+        drop(r_scope);
+        let r_scope = rustudio_core::bench::scope("r_sort_upload");
+        // (stable sorts of indices: the same order as sorting the 144-byte
+        // instances in place, without moving them around)
+        sort_stable_by(&mut dyn_opaque, |a, b| a.0.cmp(&b.0));
+        sort_stable_by(&mut dyn_decal, |a, b| a.0.cmp(&b.0));
         // Glass samples the opaque scene and must precede other transparents.
         // Preserve the existing back-to-front distance order within each group.
-        blended.sort_by(|a, b| transparent_order(a.2.extra[0], a.0, b.2.extra[0], b.0));
+        sort_stable_by(&mut blended, |a, b| transparent_order(a.2.extra[0], a.0, b.2.extra[0], b.0));
         // Back to front; equal distances keep source order (stable sort).
-        surface_decals.sort_by(|a, b| b.0.total_cmp(&a.0));
+        sort_stable_by(&mut surface_decals, |a, b| b.0.total_cmp(&a.0));
         for d in frame.overlay.iter().filter(|d| shows(d)) {
             if self.meshes.get(mesh_slot(d)).is_some_and(|m| m.storage) {
                 see_bounds.set_full();
@@ -3963,6 +4342,7 @@ impl Renderer {
             queue.write_buffer(&self.line_buf, 0, bytemuck::cast_slice(frame.lines));
         }
 
+        drop(r_scope);
         let n_lights = frame.lights.len().min(rustudio_core::mech::MAX_LIGHTS);
         self.gui_n_lights = n_lights as u32;
         if n_lights > 0 {
@@ -3975,7 +4355,7 @@ impl Renderer {
 
         // The sun's shadow cascades (sun_shadow.rs): which to redraw.
         let diagnostic_back = std::env::var_os("RUSTUDIO_CULL_BACK").is_some() || std::env::var_os("RUSTUDIO_CULL_SWITCH").is_some_and(|p| std::path::Path::new(&p).exists());
-        let scene_gen = self.static_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
+        let scene_gen = self.caster_gen.wrapping_add(if diagnostic_back { 1u64 << 63 } else { 0 });
         static GRASS_SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let grass_shadows = *GRASS_SHADOWS.get_or_init(|| std::env::var_os("RUSTUDIO_NO_GRASS_SHADOW").is_none());
         let sun_due = if frame.shadows {
@@ -3987,6 +4367,8 @@ impl Renderer {
         };
 
         let target = self.target.as_ref()?;
+        let viewport = if samples == SAMPLES { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
+        let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
         });
@@ -3996,18 +4378,19 @@ impl Renderer {
         crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
         match frame.clouds.as_ref().filter(|_| frame.sky) {
             Some(look) => {
-                let clouds = self.clouds.get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT)
+                let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
+                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT, samples)
                 });
                 clouds.encode(device, queue, &mut encoder, &self.globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
             None => {
-                if let Some(c) = self.clouds.as_mut() {
+                if let Some(c) = self.clouds[cloud_slot].as_mut() {
                     c.idle();
                 }
             }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: clouds");
+        let r_scope = rustudio_core::bench::scope("r_sun_encode");
         for (ci, cascade) in frame.sun_cascades.iter().enumerate() {
             if !sun_due[ci] {
                 continue;
@@ -4016,11 +4399,17 @@ impl Renderer {
             // (trimmed like the view), plus this frame's moving opaque parts.
             let sp = frustum(cascade.caster_view_proj());
             let mut shadow_ranges: Vec<((usize, usize), u32, u32)> = Vec::new();
+            // Small casters are trimmed by their distance from the camera. At
+            // Shading detail Low, cascades 1..3 measure it from their own
+            // (snapped) centre instead, so their static casters stay the same
+            // while the camera moves inside a snap step and SunCache keeps
+            // them; at High and Medium the camera, as before.
+            let trim_from = if ci > 0 && low_detail { cascade.centre } else { cam };
             for b in self.st.batches.iter().filter(|b| b.pass == Pass::Opaque) {
                 if !box_visible(&sp, b.lo, b.hi) {
                     continue;
                 }
-                let r_min = lod_k * box_distance(cam, b.lo, b.hi) * rustudio_core::mech::SHADOW_LOD_SCALE;
+                let r_min = lod_k * box_distance(trim_from, b.lo, b.hi) * rustudio_core::mech::SHADOW_LOD_SCALE;
                 let radii = &self.st.radii[b.start as usize..(b.start + b.count) as usize];
                 let n = radii.partition_point(|r| *r >= r_min) as u32;
                 if n == 0 {
@@ -4031,80 +4420,141 @@ impl Renderer {
                     _ => shadow_ranges.push((b.key, b.start, b.start + n)),
                 }
             }
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sun shadow cascade"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.shadow_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
+            let side = cascade.tile.min(SHADOW_SIZE);
+            let depth_pass = |encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &str| {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(label),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                let side = cascade.tile.min(SHADOW_SIZE);
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    })
+                    .forget_lifetime();
                 pass.set_viewport(0.0, 0.0, side as f32, side as f32, 0.0, 1.0);
                 pass.set_scissor_rect(0, 0, side, side);
+                pass
+            };
+            let cast = |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
+                if let Some(mesh) = self.meshes.get(key.0) {
+                    rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
+                    draw_top::add(1 + ci as u8, key.0, (mesh.count / 3) as u64, (range.end - range.start) as u64);
+                    mesh.draw(pass, range);
+                }
+            };
+            let terrain = |pass: &mut wgpu::RenderPass, solid: bool| {
+                let chunks: Box<dyn Iterator<Item = &TerrainChunk>> = if solid {
+                    Box::new(self.terrain_chunks.values())
+                } else {
+                    Box::new(self.terrain_grass.values().filter(|_| grass_shadows))
+                };
+                for c in chunks {
+                    pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
+                    if box_visible(&sp, c.lo, c.hi) {
+                        rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (c.count / 3) as u64);
+                        draw_top::add(1 + ci as u8, usize::MAX, (c.count / 3) as u64, 1);
+                        pass.set_vertex_buffer(0, c.vbuf.slice(..));
+                        if c.grass_ranges.is_empty() {
+                            pass.draw(0..c.count, 0..1);
+                        } else {
+                            for range in &c.grass_ranges {
+                                let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
+                                pass.draw(range.start..range.start + range.count(camera), 0..1);
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let vp = cascade.view_proj();
+                let mut clip = Vec::<[f32;4]>::new();
+                let mut chunks = Vec::new();
+                for (key,c) in &self.terrain_chunks {
+                    if box_visible(&sp,c.lo,c.hi) {
+                        chunks.push((*key,c.count));
+                        clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
+                    }
+                }
+                std::fs::write(dir.join(format!("cascade{ci}-clip.bin")),bytemuck::cast_slice(&clip)).unwrap();
+                std::fs::write(dir.join(format!("cascade{ci}.json")),serde_json::to_vec_pretty(&serde_json::json!({"vp":vp.to_cols_array(),"tile":cascade.tile,"chunks":chunks,"vertices":clip.len()})).unwrap()).unwrap();
+            }
+            // The static casters: cells and solid terrain.
+            // (skinned meshes are rewritten by the compute pass in place:
+            // they cast with the moving parts)
+            let skinned = |key: (usize, usize)| self.meshes.get(key.0).is_some_and(|m| m.storage);
+            let draw_static = |pass: &mut wgpu::RenderPass, all: bool| {
                 pass.set_pipeline(&self.shadow);
                 pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
-                self.sun.bind(&mut pass, ci);
-                let cast =
-                    |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
-                        if let Some(mesh) = self.meshes.get(key.0) {
-                            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-                            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                            pass.draw(0..mesh.count, range);
-                        }
-                    };
+                self.sun.bind(pass, ci);
                 pass.set_vertex_buffer(1, self.static_buf.slice(..));
-                for r in &shadow_ranges {
-                    cast(&mut pass, r.0, r.1..r.2);
+                for r in shadow_ranges.iter().filter(|r| all || !skinned(r.0)) {
+                    cast(pass, r.0, r.1..r.2);
+                }
+                terrain(pass, true);
+            };
+            // This frame's moving parts and the grass (its blades depend on
+            // the camera's distance).
+            let draw_moving = |pass: &mut wgpu::RenderPass| {
+                pass.set_pipeline(&self.shadow);
+                pass.set_bind_group(0, &self.shadow_globals_bg, &[]);
+                self.sun.bind(pass, ci);
+                if ci > 0 && SunCache::on() {
+                    pass.set_vertex_buffer(1, self.static_buf.slice(..));
+                    for r in shadow_ranges.iter().filter(|r| skinned(r.0)) {
+                        cast(pass, r.0, r.1..r.2);
+                    }
                 }
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &opaque_runs {
-                    cast(&mut pass, r.0, r.1..r.2);
+                    cast(pass, r.0, r.1..r.2);
                 }
-                if !self.terrain_chunks.is_empty() || !self.terrain_grass.is_empty() {
-                    // Grass remains two-sided, including in the opt-in solid
-                    // terrain BACK-culling attribution capture.
-                    pass.set_pipeline(&self.terrain_shadow);
-                    if let Some(dir) = std::env::var_os("RUSTUDIO_CULL_EXPORT") {
-                        let dir = std::path::PathBuf::from(dir);
-                        std::fs::create_dir_all(&dir).unwrap();
-                        let vp = cascade.view_proj();
-                        let mut clip = Vec::<[f32;4]>::new();
-                        let mut chunks = Vec::new();
-                        for (key,c) in &self.terrain_chunks {
-                            if box_visible(&sp,c.lo,c.hi) {
-                                chunks.push((*key,c.count));
-                                clip.extend(c.diagnostic_positions.iter().map(|p| (vp * Vec3::from(*p).extend(1.0)).to_array()));
-                            }
-                        }
-                        std::fs::write(dir.join(format!("cascade{ci}-clip.bin")),bytemuck::cast_slice(&clip)).unwrap();
-                        std::fs::write(dir.join(format!("cascade{ci}.json")),serde_json::to_vec_pretty(&serde_json::json!({"vp":vp.to_cols_array(),"tile":cascade.tile,"chunks":chunks,"vertices":clip.len()})).unwrap()).unwrap();
-                    }
-                    for (solid,c) in self.terrain_chunks.values().map(|c|(true,c)).chain(self.terrain_grass.values().filter(|_| grass_shadows).map(|c|(false,c))) {
-                        pass.set_pipeline(if solid && diagnostic_back { &self.terrain_shadow_back } else { &self.terrain_shadow });
-                        if box_visible(&sp, c.lo, c.hi) {
-                            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (c.count / 3) as u64);
-                            pass.set_vertex_buffer(0, c.vbuf.slice(..));
-                            if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
-                        else { for range in &c.grass_ranges {
-                            let camera = Vec3::new(frame.globals.cam_pos[0], frame.globals.cam_pos[1], frame.globals.cam_pos[2]);
-                            pass.draw(range.start..range.start + range.count(camera), 0..1);
-                        }}
-                        }
-                    }
+                terrain(pass, false);
+            };
+            // Cascade 0 follows the camera (redrawn every frame anyway, and
+            // small); 1..3 snap and hold still.
+            if ci > 0 && SunCache::on() {
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    // (in-place caster writes are handled by their spheres)
+                    let global = scene_gen.wrapping_sub(self.caster_flushes);
+                    (global, side, &shadow_ranges, self.mesh_gen).hash(&mut h);
+                    cascade.view_proj().to_cols_array().map(f32::to_bits).hash(&mut h);
+                    cascade.caster_view_proj().to_cols_array().map(f32::to_bits).hash(&mut h);
+                    cascade.centre.to_array().map(f32::to_bits).hash(&mut h);
+                    h.finish()
+                };
+                let slot = self.sun_cache.slot(device, ci, side);
+                if slot.key != Some(key) {
+                    slot.key = Some(key);
+                    slot.planes = [sp[0], sp[1], sp[2], sp[3]];
+                    rustudio_core::bench::add("sun_cache_redraw", 0.0, 1);
+                    let mut pass = depth_pass(&mut encoder, &slot.view, "sun cascade static casters");
+                    draw_static(&mut pass, false);
                 }
+                let slot = self.sun_cache.slots[ci].as_ref().expect("sun cache slot");
+                let mut pass = depth_pass(&mut encoder, &self.shadow_view, "sun shadow cascade");
+                pass.set_pipeline(&self.sun_cache.pipe);
+                pass.set_bind_group(0, &slot.bg, &[]);
+                pass.draw(0..3, 0..1);
+                draw_moving(&mut pass);
+            } else {
+                let mut pass = depth_pass(&mut encoder, &self.shadow_view, "sun shadow cascade");
+                draw_static(&mut pass, true);
+                draw_moving(&mut pass);
             }
             self.sun.blur(&mut encoder, cascade, ci);
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: sun shadows");
+        drop(r_scope);
+        let r_scope = rustudio_core::bench::scope("r_scene_encode");
         // Local light shadow maps (Studio's Future path): the lights the
         // light list gave a slot (LightRaw.extra.w), each a cube of EVSM
         // moments; redrawn only when those lights or the static scene change.
@@ -4118,7 +4568,7 @@ impl Renderer {
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                self.static_gen.hash(&mut h);
+                self.caster_gen.hash(&mut h);
                 for (i, p, r) in &slots {
                     i.hash(&mut h);
                     p.to_array().map(f32::to_bits).hash(&mut h);
@@ -4194,8 +4644,7 @@ impl Renderer {
                         for b in &near {
                             if let Some(mesh) = self.meshes.get(b.key.0) {
                                 rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SHADOW, 1, (mesh.count / 3) as u64 * b.count as u64);
-                                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                                pass.draw(0..mesh.count, b.start..b.start + b.count);
+                                mesh.draw(&mut pass, b.start..b.start + b.count);
                             }
                         }
                     }
@@ -4210,7 +4659,7 @@ impl Renderer {
         // See-through Neon blends against the opaque snapshot too
         // (shader.wgsl neon_over_scene).
         let has_neon = blended.iter().any(|e| (e.2.extra[0] as u32 & 7) == 1);
-        let split = !water_runs.is_empty() || has_glass || has_neon;
+        let split = water_seen || !water_runs.is_empty() || has_glass || has_neon;
         let mut calls = 0usize;
         // One instanced draw per run of (mesh, texture).
         let draw = |pass: &mut wgpu::RenderPass,
@@ -4221,9 +4670,9 @@ impl Renderer {
                 return;
             };
             pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
-            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
             rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-            pass.draw(0..mesh.count, range);
+            draw_top::add(0, key.0, (mesh.count / 3) as u64, (range.end - range.start) as u64);
+            mesh.draw(pass, range);
             *calls += 1;
         };
         // Scene environment probe work (env_probe.rs): Studio draws one cube
@@ -4272,16 +4721,16 @@ impl Renderer {
                             if !box_visible(&face_planes, b.lo, b.hi) {
                                 continue;
                             }
-                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.opaque } else { &self.opaque_two_sided });
+                            pass.set_pipeline(if self.culls_back(b.key.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
                             draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
                         }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
-                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.opaque } else { &self.opaque_two_sided });
+                            pass.set_pipeline(if self.culls_back(r.0.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
                             draw(&mut pass, r.0, r.1..r.2, &mut calls);
                         }
                         if !self.terrain_chunks.is_empty() {
-                            pass.set_pipeline(&self.terrain);
+                            pass.set_pipeline(&self.viewport.terrain);
                             pass.set_bind_group(1, &self.terrain_bg, &[]);
                             for c in self.terrain_chunks.values() {
                                 if box_visible(&face_planes, c.lo, c.hi) {
@@ -4300,20 +4749,20 @@ impl Renderer {
         crate::gpu_timing::mark(&mut encoder, "gpu: env probe");
         // Decals, then see-through parts back to front, then the hover overlay.
         let linear_pipes = SeePipes {
-            transparent: self.transparent.clone(),
-            transparent_culled: self.transparent_culled.clone(),
-            glass: self.glass.clone(),
-            glass_culled: self.glass_culled.clone(),
-            overlay: self.overlay.clone(),
+            transparent: viewport.transparent.clone(),
+            transparent_culled: viewport.transparent_culled.clone(),
+            glass: viewport.glass.clone(),
+            glass_culled: viewport.glass_culled.clone(),
+            overlay: viewport.overlay.clone(),
         };
         // Studio's encoded blend (SeeThrough), when anything blends this frame.
-        let encoded = !self.see.linear
+        let encoded = !viewport.see.linear
             && (!surface_decal_runs.is_empty()
                 || !decal_runs.is_empty()
                 || !blend_runs.is_empty()
                 || !overlay_runs.is_empty()
                 || static_ranges.iter().any(|r| r.0 == Pass::Decal));
-        let pipes = if encoded { &self.see_pipes } else { &linear_pipes };
+        let pipes = if encoded { &viewport.see_pipes } else { &linear_pipes };
         let surface_decals = |pass: &mut wgpu::RenderPass, calls: &mut usize| {
             if !surface_decal_runs.is_empty() {
                 pass.set_pipeline(&pipes.transparent);
@@ -4358,10 +4807,10 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.msaa,
                     depth_slice: None,
-                    resolve_target: Some(&target.hdr_view),
+                    resolve_target: (samples > 1).then_some(&target.hdr_view),
                     ops: wgpu::Operations {
                         load: if first { wgpu::LoadOp::Clear(wgpu::Color::BLACK) } else { wgpu::LoadOp::Load },
-                        store: if last { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+                        store: if last && samples > 1 { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -4398,7 +4847,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.see.encode);
+                pass.set_pipeline(&viewport.see.encode);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(1, &target.see_encode_bg, &[]);
                 for &[x, y, w, h] in &see_rects {
@@ -4434,7 +4883,7 @@ impl Renderer {
         // the pass stays open for the editor's lines.
         let see_end = |encoder: &mut wgpu::CommandEncoder, last: bool| {
             let mut pass = scene_pass(encoder, "see-through decode", false, last);
-            pass.set_pipeline(&self.see.decode);
+            pass.set_pipeline(&viewport.see.decode);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &target.see_decode_bg, &[]);
             for &[x, y, w, h] in &see_rects {
@@ -4449,7 +4898,7 @@ impl Renderer {
             if !frame.lines.is_empty() {
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(1, &self.textures[0], &[]);
-                pass.set_pipeline(&self.lines);
+                pass.set_pipeline(&viewport.lines);
                 pass.set_vertex_buffer(0, self.line_buf.slice(..));
                 pass.draw(0..frame.lines.len() as u32, 0..1);
             }
@@ -4460,45 +4909,66 @@ impl Renderer {
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.textures[0], &[]);
             if frame.sky {
-                pass.set_pipeline(&self.sky);
+                pass.set_pipeline(&viewport.sky);
                 pass.draw(0..3, 0..1);
             }
 
             // Loaded meshes are two-sided unless mesh_cull_slot culls them
             // (file meshes, unless a MeshPart is DoubleSided: as Studio).
-            let opaque_pipe = |key: (usize, usize)| {
-                if self.culls_back(key.0) {
-                    &self.opaque
+            let low_opaque = frame.quality.filter(|profile| profile.detail() < 2.0)
+                .zip(viewport.opaque_low.as_ref());
+            let opaque_pipe = |key: (usize, usize), instances: &[InstanceRaw]| {
+                let culls_back = self.culls_back(key.0);
+                if let Some((profile, pipes)) = low_opaque.filter(|_| {
+                    instances.iter().all(|part| (part.extra[0] as u32 & 7) < 3)
+                }) {
+                    let shadowed = usize::from(profile.shadow_tile_divisor() != 0);
+                    return &pipes[shadowed][usize::from(!culls_back)];
+                }
+                if culls_back {
+                    &viewport.opaque
                 } else {
-                    &self.opaque_two_sided
+                    &viewport.opaque_two_sided
                 }
             };
 
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
-                pass.set_pipeline(opaque_pipe(r.1));
+                pass.set_pipeline(opaque_pipe(r.1, &self.st.raw[r.2 as usize..r.3 as usize]));
                 draw(&mut pass, r.1, r.2..r.3, &mut calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &opaque_runs {
-                pass.set_pipeline(opaque_pipe(r.0));
+                pass.set_pipeline(opaque_pipe(r.0, &raw[r.1 as usize..r.2 as usize]));
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
             }
             // Only opaque authored decal texels contribute scene depth. The
             // shader rejects other blended materials and fractional coverage;
             // the invisible host never enters this pass. Keep the ordinary
             // sorted color pass for layer order and semitransparent edges.
-            pass.set_pipeline(&self.decal_depth);
-            for r in surface_decal_runs.iter().chain(&blend_runs) {
+            pass.set_pipeline(&viewport.decal_depth);
+            for r in &surface_decal_runs {
                 draw(&mut pass, r.0, r.1..r.2, &mut calls);
+            }
+            for r in &blend_runs {
+                // fs_decal_depth discards every mode except Decal.
+                if raw[r.1 as usize..r.2 as usize]
+                    .iter()
+                    .any(|part| part.extra[3] == DECAL_TEX_MODE)
+                {
+                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                }
             }
             // Terrain chunks in view.
             if !self.terrain_chunks.is_empty() {
-                pass.set_pipeline(&self.terrain);
+                pass.set_pipeline(&viewport.terrain);
                 pass.set_bind_group(1, &self.terrain_bg, &[]);
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
-                    if box_visible(&planes, c.lo, c.hi) {
+                    if box_visible(&planes, c.lo, c.hi)
+                        && (frame.quality.is_none() || box_distance(cam, c.lo, c.hi) <= draw_distance)
+                    {
                         rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (c.count / 3) as u64);
+                        draw_top::add(0, usize::MAX, (c.count / 3) as u64, 1);
                         pass.set_vertex_buffer(0, c.vbuf.slice(..));
                         if c.grass_ranges.is_empty() { pass.draw(0..c.count, 0..1); }
                         else { for range in &c.grass_ranges {
@@ -4518,6 +4988,7 @@ impl Renderer {
             }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: scene (opaque, terrain, unencoded blends)");
+        drop(r_scope);
         // Decals on solid hosts belong to the surface: before terrain water
         // and glass read the scene.
         if encoded && split && !surface_decal_runs.is_empty() {
@@ -4529,8 +5000,8 @@ impl Renderer {
             crate::gpu_timing::mark(&mut encoder, "gpu: see-through decode (bounded)");
         }
         if split {
-            let u = self.water.uniforms(&frame.water, target.size);
-            queue.write_buffer(&self.water.buf, 0, bytemuck::bytes_of(&u));
+            let u = viewport.water.uniforms(&frame.water, target.size);
+            queue.write_buffer(&viewport.water.buf, 0, bytemuck::bytes_of(&u));
             encoder.copy_texture_to_texture(
                 target.hdr.as_image_copy(),
                 target.scene_copy.as_image_copy(),
@@ -4540,13 +5011,13 @@ impl Renderer {
                     depth_or_array_layers: 1,
                 },
             );
-            if !water_runs.is_empty() {
+            if water_seen || !water_runs.is_empty() {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("water"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &target.msaa,
                         depth_slice: None,
-                        resolve_target: Some(&target.hdr_view),
+                        resolve_target: (samples > 1).then_some(&target.hdr_view),
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -4564,7 +5035,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&self.water.pipeline);
+                pass.set_pipeline(&viewport.water.pipeline);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(2, &target.water_bg, &[]);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
@@ -4581,7 +5052,7 @@ impl Renderer {
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
                 });
-                pass.set_pipeline(&self.glass_resolve);
+                pass.set_pipeline(&viewport.glass_resolve);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_bind_group(1, &target.ssao_bgs[0], &[]);
                 pass.draw(0..3, 0..1);
@@ -4617,13 +5088,18 @@ impl Renderer {
         crate::gpu_timing::mark(&mut encoder, "gpu: scene copy");
         // Bloom: bright pass, blur across, blur down (half resolution).
         // SSAO, then its multiply into the scene.
-        {
+        // Performance > Ambient occlusion Off skips both (a full-resolution
+        // pass on a weak chip).
+        if frame.quality.map_or_else(
+            || rustudio_core::rustudio_settings::performance_value("ssao") != "off",
+            |profile| profile.ssao(),
+        ) {
             let steps: [(&str, &wgpu::RenderPipeline, usize, &wgpu::TextureView, bool); 5] = [
-                ("ssao depth", &self.ssao_down, 0, &target.ssao_depth_view, true),
-                ("ssao", &self.ssao_main, 1, &target.ssao_views[0], true),
-                ("ssao blur across", &self.ssao_blur_x, 2, &target.ssao_views[1], true),
-                ("ssao blur down", &self.ssao_blur_y, 3, &target.ssao_views[0], true),
-                ("ssao apply", &self.ssao_apply, 2, &target.hdr_view, false),
+                ("ssao depth", &viewport.ssao_down, 0, &target.ssao_depth_view, true),
+                ("ssao", &viewport.ssao_main, 1, &target.ssao_views[0], true),
+                ("ssao blur across", &viewport.ssao_blur_x, 2, &target.ssao_views[1], true),
+                ("ssao blur down", &viewport.ssao_blur_y, 3, &target.ssao_views[0], true),
+                ("ssao apply", &viewport.ssao_apply, 2, &target.hdr_view, false),
             ];
             for (label, pipeline, bg, view, clear) in steps {
                 if label == "ssao apply" && (std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_NO_AO").is_some() || std::env::var_os("RUSTUDIO_TERRAIN_CAPTURE_ID").is_some()) { continue; }
@@ -4651,7 +5127,7 @@ impl Renderer {
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: ssao");
         // Terrain.Clouds over the sky (Studio composes them after SSAO).
-        if let Some(c) = self.clouds.as_mut() {
+        if let Some(c) = self.clouds[cloud_slot].as_mut().filter(|_| frame.clouds.is_some() && frame.sky) {
             encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
                 wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
             c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
@@ -4692,9 +5168,9 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         };
         if globals.dof[2] > 0.0 || globals.dof[3] > 0.0 {
-            fullscreen("dof across", &self.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
+            fullscreen("dof across", &viewport.dof_h, &target.dof_bgs[0], &[&target.dof_views[0]]);
             fullscreen("dof down", &self.dof_v, &target.dof_bgs[1], &[&target.dof_views[1]]);
-            if globals.dof[2] >= DOF_CHEAP_BELOW { for i in 0..11 { fullscreen("dof near", &self.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
+            if globals.dof[2] >= DOF_CHEAP_BELOW { for i in 0..11 { fullscreen("dof near", &viewport.near_pipelines[i], &target.near_bgs[i], &[&target.near_views[i]]); } }
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: dof");
         {
@@ -4714,7 +5190,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.post);
+            pass.set_pipeline(&viewport.post);
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &target.hdr_bg, &[]);
             pass.set_bind_group(2, &target.post_depth_bg, &[]);
@@ -4723,11 +5199,12 @@ impl Renderer {
         crate::gpu_timing::mark(&mut encoder, "gpu: post");
         self.probe.flush(queue);
         queue.submit([encoder.finish()]);
-        if let Some(c) = self.clouds.as_mut() {
+        if let Some(c) = self.clouds[cloud_slot].as_mut() {
             c.after_submit();
         }
         self.stats = stats;
         rustudio_core::bench::perf::end_frame(svc_t0.elapsed().as_secs_f64(), 0.0);
+        draw_top::end_frame();
         self.texture_id
     }
 }
@@ -4749,7 +5226,7 @@ impl Renderer {
         if let Some(&a) = self.cull_alias.get(&(index, cull_back)) {
             return a;
         }
-        let alias = Mesh { vbuf: m.vbuf.clone(), count: m.count, cull: Some(cull_back), storage: false };
+        let alias = Mesh { vbuf: m.vbuf.clone(), count: m.count, ibuf: m.ibuf.clone(), remap: m.remap.clone(), bounds: m.bounds, cull: Some(cull_back), storage: false };
         self.meshes.push(alias);
         let a = (self.meshes.len() - 1 - BUILTIN_MESHES) as u32;
         self.cull_alias.insert((index, cull_back), a);
@@ -4770,6 +5247,177 @@ impl Renderer {
 }
 
 /// Index into `Renderer::meshes`: built-in shapes first, then loaded meshes.
+/// The depth of each sun cascade's static casters (static cells and solid
+/// terrain), kept while they and the cascade stay the same. A due cascade
+/// copies it back (a full-tile depth write) and draws only this frame's
+/// moving parts and the grass over it. The depth map is the nearest caster
+/// per texel, whatever the order, so the result is the full redraw's. Studio
+/// keeps its cascades too (tiled depth cache); on a low-end laptop
+/// Place B redrew 1.3M static caster triangles a frame, Studio's Play drew
+/// 60-68k (stats().ShadowsTriangleCount). RUSTUDIO_SHADOW_CACHE=0: off.
+struct SunCache {
+    bgl: wgpu::BindGroupLayout,
+    pipe: wgpu::RenderPipeline,
+    slots: [Option<SunCacheSlot>; crate::sun_shadow::CASCADES],
+}
+
+struct SunCacheSlot {
+    /// The side planes of the caster box the cached depth was drawn for.
+    planes: [glam::Vec4; 4],
+    side: u32,
+    view: wgpu::TextureView,
+    bg: wgpu::BindGroup,
+    key: Option<u64>,
+}
+
+impl SunCache {
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RUSTUDIO_SHADOW_CACHE").ok().as_deref() != Some("0"))
+    }
+
+    fn new(device: &wgpu::Device) -> Self {
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sun cache"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sun cache"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@group(0) @binding(0) var cached: texture_depth_2d;
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment
+fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+    return textureLoad(cached, vec2<i32>(p.xy), 0);
+}
+"#
+                .into(),
+            ),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sun cache"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sun cache restore"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[] }),
+            multiview_mask: None,
+            cache: None,
+        });
+        SunCache { bgl, pipe, slots: std::array::from_fn(|_| None) }
+    }
+
+    /// Drops the cached cascades that one of these changed casters reaches.
+    fn invalidate(&mut self, spheres: &[(Vec3, f32)]) {
+        for slot in self.slots.iter_mut().flatten() {
+            if slot.key.is_some()
+                && spheres.iter().any(|(c, r)| slot.planes.iter().all(|p| p.truncate().dot(*c) + p.w >= -r))
+            {
+                slot.key = None;
+            }
+        }
+    }
+
+    /// Cascade `ci`'s slot, at least `side` texels square.
+    fn slot(&mut self, device: &wgpu::Device, ci: usize, side: u32) -> &mut SunCacheSlot {
+        if self.slots[ci].as_ref().is_none_or(|s| s.side < side) {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sun cascade cache"),
+                size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sun cache"),
+                layout: &self.bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+            });
+            self.slots[ci] = Some(SunCacheSlot { planes: [glam::Vec4::ZERO; 4], side, view, bg, key: None });
+        }
+        self.slots[ci].as_mut().expect("sun cache slot")
+    }
+}
+
+/// RUSTUDIO_DRAW_TOP=N: every N frames, print the meshes with the most
+/// triangles drawn per frame, per pass (a measurement switch).
+mod draw_top {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static ACC: RefCell<(u32, HashMap<(u8, usize), (u64, u64, u64)>)> = RefCell::new((0, HashMap::new()));
+    }
+    pub fn every() -> Option<u32> {
+        static N: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *N.get_or_init(|| std::env::var("RUSTUDIO_DRAW_TOP").ok().and_then(|v| v.parse().ok()))
+    }
+    /// pass 0 scene, 1 + i sun cascade i; `tris` per instance.
+    pub fn add(pass: u8, slot: usize, tris: u64, instances: u64) {
+        if every().is_none() {
+            return;
+        }
+        ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            let e = a.1.entry((pass, slot)).or_default();
+            e.0 += tris * instances;
+            e.1 += instances;
+            e.2 = tris;
+        });
+    }
+    pub fn end_frame() {
+        let Some(n) = every() else { return };
+        ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            a.0 += 1;
+            if a.0 < n {
+                return;
+            }
+            let frames = a.0 as f64;
+            for pass in [0u8, 1, 2, 3, 4] {
+                let mut v: Vec<_> = a.1.iter().filter(|e| e.0 .0 == pass).map(|(k, e)| (k.1, *e)).collect();
+                let total: u64 = v.iter().map(|e| e.1 .0).sum();
+                v.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
+                eprintln!("DRAWTOP pass={} ktris/frame={:.0} meshes={}", ["scene", "cascade0", "cascade1", "cascade2", "cascade3"][pass as usize], total as f64 / frames / 1e3, v.len());
+                for (slot, (t, i, per)) in v.iter().take(15) {
+                    eprintln!("DRAWTOP   slot {slot:6} tris/inst {per:7} inst/frame {:8.1} ktris/frame {:8.1}", *i as f64 / frames, *t as f64 / frames / 1e3);
+                }
+            }
+            a.0 = 0;
+            a.1.clear();
+        });
+    }
+}
+
 fn mesh_slot(p: &PartDraw) -> usize {
     match p.custom_mesh {
         Some(i) => BUILTIN_MESHES + i as usize,
@@ -4827,21 +5475,18 @@ impl Renderer {
                 color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
             })
             .collect();
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("loaded mesh"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: if storage {
-                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE
-            } else {
-                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
-            },
-        });
-        self.meshes.push(Mesh {
-            vbuf,
-            count: verts.len() as u32,
-            cull: None,
-            storage,
-        });
+        // (a skinning slot stays a list: the compute pass writes corners)
+        let mesh = if storage {
+            let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("loaded mesh"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            });
+            Mesh { vbuf, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage }
+        } else {
+            Mesh::upload(device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
+        };
+        self.meshes.push(mesh);
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
@@ -4853,15 +5498,18 @@ impl Renderer {
             contents: bytemuck::cast_slice(verts),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.push(Mesh { vbuf, count: verts.len() as u32, cull: None, storage: false });
+        self.meshes.push(Mesh { vbuf, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage: false });
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
     /// Overwrites vertices `first..` of loaded mesh `index` in place (no new
     /// buffer, only these bytes go up). False when they don't fit.
     pub fn write_mesh_vertices(&mut self, queue: &wgpu::Queue, index: u32, first: u32, verts: &[Vertex]) -> bool {
+        self.mesh_gen += 1;
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
-        if m.storage || first as usize + verts.len() > m.count as usize {
+        // (an indexed mesh has no corner layout to patch: the caller reloads
+        // it through the live path, which keeps a list)
+        if m.storage || m.ibuf.is_some() || first as usize + verts.len() > m.count as usize {
             return false;
         }
         if !verts.is_empty() {
@@ -4880,8 +5528,9 @@ impl Renderer {
         &mut self, queue: &wgpu::Queue, index: u32, positions: &[Vec3], normals: &[Vec3],
         uvs: &[glam::Vec2], colors: &[glam::Vec4], projection: [f32; 4],
     ) -> bool {
+        self.mesh_gen += 1;
         let Some(m) = self.meshes.get(index as usize + BUILTIN_MESHES) else { return false };
-        if m.count as usize != positions.len() || normals.len() != positions.len() {
+        if m.corners() as usize != positions.len() || normals.len() != positions.len() {
             return false;
         }
         let projection = if m.storage { [0.0; 4] } else { projection };
@@ -4897,6 +5546,7 @@ impl Renderer {
                 color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
             })
             .collect();
+        let Some(verts) = m.contents(&verts) else { return false };
         queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
         rustudio_core::bench::add("live_mesh_bytes", 0.0, (verts.len() * std::mem::size_of::<Vertex>()) as u64);
         if m.storage {
@@ -4948,9 +5598,10 @@ impl Renderer {
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, index: Option<u32>,
         positions: &[Vec3], normals: &[Vec3], uvs: &[glam::Vec2], colors: &[glam::Vec4],
     ) -> u32 {
+        self.mesh_gen += 1;
         let slot = index.map(|i| i as usize + BUILTIN_MESHES);
         match slot.and_then(|s| self.meshes.get(s)) {
-            Some(m) if m.count as usize == positions.len() => {
+            Some(m) if m.corners() as usize == positions.len() => {
                 let verts: Vec<Vertex> = positions
                     .iter()
                     .zip(normals)
@@ -4963,8 +5614,13 @@ impl Renderer {
                         color: colors.get(i).map(|c| c.to_array()).unwrap_or([0.0; 4]),
                     })
                     .collect();
-                queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
-                index.unwrap_or(0)
+                match m.contents(&verts) {
+                    Some(verts) => {
+                        queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(&verts));
+                        index.unwrap_or(0)
+                    }
+                    None => self.add_mesh_colored(device, positions, normals, uvs, colors),
+                }
             }
             _ => self.add_mesh_colored(device, positions, normals, uvs, colors),
         }
@@ -4983,11 +5639,13 @@ fn draw_key(p: &PartDraw) -> (usize, usize) {
     )
 }
 
+const DECAL_TEX_MODE: f32 = 2.0;
+
 fn tex_mode(p: &PartDraw) -> f32 {
     match (p.tex_mode, p.texture) {
         (_, None) | (TexMode::None, _) => 0.0,
         (TexMode::Over, Some(_)) => 1.0,
-        (TexMode::Decal, Some(_)) => 2.0,
+        (TexMode::Decal, Some(_)) => DECAL_TEX_MODE,
         (TexMode::Opaque, Some(_)) => 3.0,
         (TexMode::Cutout, Some(_)) => 4.0,
         (TexMode::OpaqueTinted, Some(_)) => 5.0,
@@ -5055,36 +5713,43 @@ impl Renderer {
                     && draw_key(a) == draw_key(b)
                     && shows(a) == shows(b)
             });
-        match &item.state {
-            ItemState::Static(slots) if same_place && static_ok => {
-                for (d, &s) in draws.iter().zip(slots) {
-                    if s != u32::MAX {
-                        st.raw[s as usize] = to_raw(d, item.bias);
-                        st.writes.push(s);
-                    }
-                }
-            }
-            ItemState::Static(slots) => {
-                for &s in slots {
-                    if s != u32::MAX {
-                        st.raw[s as usize] = HIDDEN;
-                        st.writes.push(s);
-                        st.hidden += 1;
-                    }
-                }
-                item.state = ItemState::Dynamic;
-                per_frame.insert(r);
-            }
-            ItemState::Pending if !same_place => {
-                item.state = ItemState::Dynamic;
-                *pending = pending.saturating_sub(1);
-            }
-            _ => {}
-        }
-        if !same_place {
-            item.moved = Instant::now();
-        }
         item.draws = draws;
+        update_item_slots(r, item, st, per_frame, pending, same_place, static_ok);
+    }
+
+    /// Apply the host transform to draws whose geometry and materials are
+    /// already resolved.
+    pub fn move_item(&mut self, r: Ref, old: Xform, new: Xform) -> bool {
+        let inv = old.rot.transpose();
+        let transform = |xf: Xform| Xform {
+            pos: new.pos + new.rot * (inv * (xf.pos - old.pos)),
+            rot: new.rot * (inv * xf.rot),
+        };
+        if self.vf.layer_of.contains_key(&r) {
+            let Some(draws) = self.item_draws(r) else {
+                return false;
+            };
+            let draws = draws
+                .iter()
+                .map(|d| PartDraw { xf: transform(d.xf), ..*d })
+                .collect();
+            self.set_item(r, draws);
+            return true;
+        }
+
+        let Some(item) = self.items.get_mut(&r) else {
+            return false;
+        };
+        let mut same_place = true;
+        for draw in &mut item.draws {
+            let xf = transform(draw.xf);
+            same_place &= near_xf(&draw.xf, &xf);
+            draw.xf = xf;
+        }
+        update_item_slots(
+            r, item, &mut self.st, &mut self.per_frame, &mut self.pending, same_place, true,
+        );
+        true
     }
 
     /// Dynamic parts that stopped changing go back to Pending, so the next
@@ -5095,6 +5760,25 @@ impl Renderer {
             return;
         }
         self.last_quiet_scan = Instant::now();
+        if std::env::var_os("RUSTUDIO_ITEMS_DIAG").is_some() {
+            let (mut dynamic, mut pending, mut recent, mut blend) = (0, 0, 0, 0);
+            for r in &self.per_frame {
+                let Some(item) = self.items.get(r) else { continue };
+                match item.state {
+                    ItemState::Dynamic => dynamic += 1,
+                    ItemState::Pending => pending += 1,
+                    _ => {}
+                }
+                if item.moved.elapsed().as_secs_f32() < rustudio_core::mech::DYNAMIC_SETTLE_S {
+                    recent += 1;
+                }
+                if !item.draws.iter().all(|d| !shows(d) || pass_of(d).is_some()) {
+                    blend += 1;
+                }
+            }
+            eprintln!("ITEMS per_frame={} dynamic={dynamic} pending={pending} moved_recently={recent} not_static_ok={blend} draws={}", self.per_frame.len(),
+                self.per_frame.iter().filter_map(|r| self.items.get(r)).map(|i| i.draws.len()).sum::<usize>());
+        }
         let mut n = 0;
         for r in &self.per_frame {
             let Some(item) = self.items.get_mut(r) else { continue };
@@ -5124,8 +5808,11 @@ impl Renderer {
             ItemState::Static(slots) => {
                 for s in slots {
                     if s != u32::MAX {
+                        let old = raw_sphere(&self.st.raw[s as usize], self.st.radii[s as usize]);
+                        self.st.caster_dirty.push(old);
                         self.st.raw[s as usize] = HIDDEN;
                         self.st.writes.push(s);
+                        self.st.caster_writes = true;
                         self.st.hidden += 1;
                     }
                 }
@@ -5142,6 +5829,7 @@ impl Renderer {
         self.per_frame.clear();
         self.st = StaticLayout::default();
         self.static_gen += 1;
+        self.caster_gen += 1;
         self.pending = 0;
         self.pending_at = None;
     }
@@ -5244,6 +5932,7 @@ impl Renderer {
         }
         self.st = st;
         self.static_gen += 1;
+        self.caster_gen += 1;
         let items = &self.items;
         self.per_frame
             .retain(|r| items.get(r).is_some_and(|i| i.state == ItemState::Dynamic));
@@ -5257,6 +5946,10 @@ impl Renderer {
             return;
         }
         self.static_gen += 1;
+        if std::mem::take(&mut self.st.caster_writes) {
+            self.caster_gen += 1;
+            self.caster_flushes += 1;
+        }
         let mut w = std::mem::take(&mut self.st.writes);
         w.sort_unstable();
         w.dedup();
@@ -5278,6 +5971,55 @@ impl Renderer {
                 );
             }
         }
+    }
+}
+
+/// Keep the static slots and the moving list in step with an item's draws.
+fn update_item_slots(
+    r: Ref,
+    item: &mut Item,
+    st: &mut StaticLayout,
+    per_frame: &mut HashSet<Ref>,
+    pending: &mut usize,
+    same_place: bool,
+    static_ok: bool,
+) {
+    match &item.state {
+        ItemState::Static(slots) if same_place && static_ok => {
+            for (d, &s) in item.draws.iter().zip(slots) {
+                if s != u32::MAX {
+                    let raw = to_raw(d, item.bias);
+                    if !casts_same(&st.raw[s as usize], &raw) {
+                        st.caster_writes = true;
+                        st.caster_dirty.push(raw_sphere(&st.raw[s as usize], st.radii[s as usize]));
+                        st.caster_dirty.push(raw_sphere(&raw, radius_of(d)));
+                    }
+                    st.raw[s as usize] = raw;
+                    st.writes.push(s);
+                }
+            }
+        }
+        ItemState::Static(slots) => {
+            for &s in slots {
+                if s != u32::MAX {
+                    st.caster_dirty.push(raw_sphere(&st.raw[s as usize], st.radii[s as usize]));
+                    st.raw[s as usize] = HIDDEN;
+                    st.writes.push(s);
+                    st.caster_writes = true;
+                    st.hidden += 1;
+                }
+            }
+            item.state = ItemState::Dynamic;
+            per_frame.insert(r);
+        }
+        ItemState::Pending if !same_place => {
+            item.state = ItemState::Dynamic;
+            *pending = pending.saturating_sub(1);
+        }
+        _ => {}
+    }
+    if !same_place {
+        item.moved = Instant::now();
     }
 }
 
@@ -5817,4 +6559,26 @@ thread_local! {
 /// when the image has none to replace).
 pub fn reuse_texture_slot(index: Option<u32>) {
     REUSE_TEXTURE_SLOT.with(|c| c.set(index));
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::sort_stable_by;
+
+    #[test]
+    fn index_sort_matches_a_stable_in_place_sort() {
+        let mut seed = 7u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 24
+        };
+        for n in [0usize, 1, 2, 7, 64, 1000] {
+            let v: Vec<(f32, u32)> = (0..n).map(|i| ((next() % 9) as f32, i as u32)).collect();
+            let mut a = v.clone();
+            a.sort_by(|x, y| y.0.total_cmp(&x.0));
+            let mut b = v.clone();
+            sort_stable_by(&mut b, |x, y| y.0.total_cmp(&x.0));
+            assert_eq!(a, b);
+        }
+    }
 }

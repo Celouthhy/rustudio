@@ -79,11 +79,7 @@ pub fn type_name(v: &Value) -> String {
         Value::Table(_) => "table".into(),
         Value::Function(_) => "function".into(),
         Value::Thread(_) => "thread".into(),
-        Value::UserData(u) => u
-            .metatable()
-            .ok()
-            .and_then(|m| m.get::<String>("__type").ok())
-            .unwrap_or_else(|| "userdata".into()),
+        Value::UserData(u) => crate::ltypes::userdata_type_name(u),
         _ => "userdata".into(),
     }
 }
@@ -341,9 +337,9 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
         let mut atom: c_int = -1;
         let name = ffi::lua_namecallatom(l, &mut atom);
         let n = ffi::lua_gettop(l);
-        // Upvalue 3: a `FastCall` answering as the dispatcher would (it
-        // checks self itself), pushing its results after the arguments, or
-        // declining (-1).
+        // Upvalue 3: a `FastCall` either returns the number of native
+        // results, answers through the dispatcher protocol (0), or
+        // declines (-1). It checks self before either answer.
         let mut handled = false;
         if !name.is_null() && atom >= 0 && ffi::lua_type(l, ffi::lua_upvalueindex(3)) == ffi::LUA_TLIGHTUSERDATA {
             ffi::luaL_checkstack(l, n + 4, std::ptr::null());
@@ -356,8 +352,12 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
             // the stack (the anim curve tests). The dispatcher path runs
             // in an mlua callback's frame, which never counts.
             lua_hostcall(l, 1);
-            handled = fast(l, name, atom, n) >= 0;
+            let results = fast(l, name, atom, n);
             lua_hostcall(l, -1);
+            if results > 0 {
+                return results;
+            }
+            handled = results == 0;
         }
         if !handled {
             check_self(l, INSTANCE.self_types);
@@ -400,10 +400,10 @@ unsafe extern "C-unwind" {
     fn lua_hostcall(l: *mut ffi::lua_State, delta: c_int);
 }
 
-/// The dispatcher run directly (no protected call) for a method name with
-/// an atom: `(l, name, atom, n)` with the `n` arguments at 1..=n; pushes
-/// the dispatcher's answer after them and returns >= 0, or returns -1
-/// having pushed nothing. It must not raise.
+/// The dispatcher run directly for a method name with an atom. Arguments
+/// are at 1..=n. A positive return is the count of native results at the
+/// top of the stack. Zero leaves the dispatcher's response after the
+/// arguments. Minus one declines without pushing anything.
 pub type FastCall = unsafe fn(*mut ffi::lua_State, *const c_char, c_int, c_int) -> c_int;
 
 /// The Instance `__namecall` over `dispatch` (see `namecall_fn`).

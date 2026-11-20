@@ -159,8 +159,6 @@ pub struct World {
     defer_depth: u32,
     /// Id of the newest connection / waiter.
     conn_seq: u64,
-    /// Parts whose physics-relevant properties changed.
-    pub dirty: HashSet<Ref>,
     /// Instances were reparented, created or destroyed.
     pub structure_changed: bool,
     pub destroyed: HashSet<Ref>,
@@ -178,7 +176,7 @@ pub struct World {
     /// Enum.CoreGuiType names turned off by StarterGui:SetCoreGuiEnabled.
     pub core_gui_off: HashSet<String>,
     /// Current Enum.HumanoidStateType name per Humanoid (Humanoid:GetState).
-    pub humanoid_states: HashMap<Ref, String>,
+    pub humanoid_states: HashMap<Ref, &'static str>,
     /// Humanoid:SetStateEnabled(state, false) per Humanoid (state names).
     pub states_disabled: HashMap<Ref, HashSet<String>>,
     /// PhysicsService collision groups: one table per Play session, shared
@@ -235,14 +233,16 @@ pub struct World {
     pub layout_listening: rustc_hash::FxHashSet<Ref>,
     /// Newly listened GUI objects and the listened objects drawn last pass.
     pub listen_new: rustc_hash::FxHashSet<Ref>,
-    pub abs_laid: HashSet<Ref>,
+    pub abs_laid: rustc_hash::FxHashSet<Ref>,
+    /// Inputs from the last content-size pass for each listened layout.
+    pub(crate) layout_content: rustc_hash::FxHashMap<Ref, ext::ContentDependencies>,
     /// What scripts changed since the drawn layout was handed over (Studio
     /// lays a GUI object out when it is read, so a box read right after a
     /// script moved or resized it is the new one): the journal position read
     /// up to, and the objects whose box (or text) may differ from the drawn
     /// one (`ext::abs_now`). `abs_all`: the journal lost track, all may.
     pub abs_scan: u64,
-    pub abs_dirty: HashSet<Ref>,
+    pub abs_dirty: rustc_hash::FxHashSet<Ref>,
     pub abs_all: bool,
     /// The collector (`Runtime::collect`): how many unparented instances
     /// were left watched after its last pass, and whether that pass saw new
@@ -367,12 +367,35 @@ struct Timer {
     wall: Instant,
     thread: Thread,
     args: Option<Vec<Value>>,
+    legacy: bool,
+    scheduled_step: u64,
 }
 
 #[derive(Default)]
 struct Sched {
     timers: Vec<Timer>,
+    ready: VecDeque<Timer>,
     deferred: VecDeque<(Thread, Vec<Value>)>,
+    step: u64,
+}
+
+// Public Windows Studio uses 0.1 / 60 seconds by default.
+// Studio turns that interval into a deadline for the legacy queue.
+const LEGACY_TIMER_BUDGET: Duration = Duration::from_nanos(1_666_667);
+
+impl Sched {
+    fn schedule(&mut self, now: f64, delay: f64, thread: Thread, args: Option<Vec<Value>>, legacy: bool) {
+        let minimum = if legacy { mech::WAIT_MIN_S } else { 0.0 };
+        self.timers.push(Timer {
+            at: now + delay.max(minimum),
+            started: now,
+            wall: rustudio_core::sim_clock::now(),
+            thread,
+            args,
+            legacy,
+            scheduled_step: self.step,
+        });
+    }
 }
 
 struct Conn {
@@ -595,7 +618,6 @@ impl World {
             now: Vec::new(),
             defer_depth: 0,
             conn_seq: 0,
-            dirty: HashSet::new(),
             structure_changed: false,
             destroyed: HashSet::new(),
             output: Vec::new(),
@@ -620,9 +642,10 @@ impl World {
             gui_listening: Default::default(),
             layout_listening: Default::default(),
             listen_new: Default::default(),
-            abs_laid: HashSet::new(),
+            abs_laid: Default::default(),
+            layout_content: Default::default(),
             abs_scan: 0,
-            abs_dirty: HashSet::new(),
+            abs_dirty: Default::default(),
             abs_all: true,
             orphans_seen: 0,
             gc_busy: true,
@@ -685,6 +708,7 @@ impl World {
     fn forget_layout_listener(&mut self, r: Ref) {
         self.gui_listening.remove(&r);
         self.layout_listening.remove(&r);
+        self.layout_content.remove(&r);
         self.listen_new.remove(&r);
         self.abs_laid.remove(&r);
     }
@@ -753,15 +777,7 @@ pub fn inst_value(lua: &Lua, r: Ref) -> mlua::Result<Value> {
         return Err(rt_err("The current thread cannot access 'RealtimeMedia' (lacking capability InternalTest)"));
     }
     let mut c = cache(lua)?;
-    let slot = match c.slots.get(&r) {
-        Some(s) => *s,
-        None => {
-            c.next_slot += 1;
-            let s = c.next_slot;
-            c.slots.insert(r, s);
-            s
-        }
-    };
+    let slot = c.instance_slot(r);
     let Some(weak) = c.weak.as_ref() else {
         return new_inst_ud(lua, r).map(Value::UserData);
     };
@@ -780,31 +796,43 @@ pub fn inst_value(lua: &Lua, r: Ref) -> mlua::Result<Value> {
 /// Instances (Logger, EditableImage, EditableMesh…: Studio's typeof says
 /// "Object" for them).
 fn new_inst_ud(lua: &Lua, r: Ref) -> mlua::Result<AnyUserData> {
-    let object = lua
-        .app_data_ref::<World>()
-        .and_then(|w| w.doc.as_ref().and_then(|d| d.class_of(r)))
-        .is_some_and(|class| !is_instance_class(&class));
-    if object {
+    if instance_is_object(lua, r) {
         lua.create_userdata(LObj(r))
     } else {
         lua.create_userdata(LInst(r))
     }
 }
 
+fn instance_is_object(lua: &Lua, r: Ref) -> bool {
+    lua
+        .app_data_ref::<World>()
+        .and_then(|w| w.doc.as_ref().and_then(|d| d.class_of(r)))
+        .is_some_and(|class| !is_instance_class(class))
+}
+
+impl Cache {
+    fn instance_slot(&mut self, r: Ref) -> i64 {
+        *self.slots.entry(r).or_insert_with(|| {
+            self.next_slot += 1;
+            self.next_slot
+        })
+    }
+}
+
 /// Whether Studio's API has `class` under Instance (unknown classes are).
-fn is_instance_class(class: &str) -> bool {
+fn is_instance_class(class: rbx_dom_weak::Ustr) -> bool {
     thread_local! {
-        static CACHE: std::cell::RefCell<HashMap<String, bool>> = Default::default();
+        static CACHE: std::cell::RefCell<rustc_hash::FxHashMap<rbx_dom_weak::Ustr, bool>> = Default::default();
     }
-    if let Some(v) = CACHE.with(|c| c.borrow().get(class).copied()) {
-        return v;
-    }
-    let v = match rustudio_core::api::get() {
-        Some(api) if api.classes.contains_key(class) => api.is_a(class, "Instance"),
-        _ => true,
-    };
-    CACHE.with(|c| c.borrow_mut().insert(class.to_string(), v));
-    v
+    CACHE.with(|c| {
+        *c.borrow_mut().entry(class).or_insert_with(|| {
+            let name = class.as_str();
+            match rustudio_core::api::get() {
+                Some(api) if api.classes.contains_key(name) => api.is_a(name, "Instance"),
+                _ => true,
+            }
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1062,13 +1090,6 @@ fn prop_desc(class: &str, name: &str) -> Option<(&'static str, DataType<'static>
     None
 }
 
-fn physics_prop(name: &str) -> bool {
-    matches!(
-        name,
-        "CFrame" | "Size" | "Anchored" | "CanCollide" | "Shape" | "Massless" | "CanTouch"
-    )
-}
-
 // ------------------------------------------------------- value conversion
 
 pub fn variant_to_lua(lua: &Lua, v: &Variant, enum_name: Option<&str>) -> mlua::Result<Value> {
@@ -1087,7 +1108,7 @@ pub fn variant_to_lua(lua: &Lua, v: &Variant, enum_name: Option<&str>) -> mlua::
         Variant::Content(c) => editable::content_value(lua, c)?,
         Variant::Vector3(v) => LVector3(Vec3::new(v.x, v.y, v.z)).into_value(),
         Variant::Vector2(v) => u(lua.create_userdata(LVector2(glam::Vec2::new(v.x, v.y)))?)?,
-        Variant::CFrame(cf) => u(lua.create_userdata(LCFrame(Xform::from_cframe(cf)))?)?,
+        Variant::CFrame(cf) => LCFrame(Xform::from_cframe(cf)).into_lua(lua)?,
         Variant::Color3(c) => u(lua.create_userdata(LColor3([c.r, c.g, c.b]))?)?,
         Variant::Color3uint8(c) => u(lua.create_userdata(LColor3([
             c.r as f32 / 255.0,
@@ -1676,6 +1697,8 @@ pub(crate) enum Fv {
     Inst(Ref),
     /// A new array of these instances (GetChildren).
     Insts(Vec<Ref>),
+    OneChild(Ref),
+    NoChildren,
     /// A string, pushed as is.
     Str(String),
     Static(&'static str),
@@ -1688,6 +1711,7 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
         Name,
         Class,
         Parent(Ref),
+        Position(Vec3),
         Stored(Variant, Option<&'static str>),
         Default(Variant, Option<&'static str>, rbx_dom_weak::Ustr),
         Full(Ref),
@@ -1716,6 +1740,14 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
                     None => Got::Full(i.parent()),
                 }
             }
+        } else if key == "Position" && rt.core_special && rt.domains == 0 && !rt.ext
+            && !rt.restricted && doc::is_a(class_u.as_str(), "BasePart")
+        {
+            let pos = match w.d().prop(r, "CFrame") {
+                Some(Variant::CFrame(cf)) => Vec3::new(cf.position.x, cf.position.y, cf.position.z),
+                _ => Vec3::ZERO,
+            };
+            Got::Position(pos)
         } else if !rt.plain {
             Got::Full(i.parent())
         } else {
@@ -1769,6 +1801,10 @@ fn index_entry_fast(lua: &Lua, r: Ref, key: &str, atom: i32) -> (mlua::Result<Fv
             rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Static(class_u.as_str())), quiet);
         }
+        Got::Position(pos) => {
+            rustudio_core::telemetry::touch(class_u.as_str(), key);
+            return (Ok(Fv::V(LVector3(pos).into_value())), true);
+        }
         Got::Stored(Variant::String(s), _) => {
             rustudio_core::telemetry::touch(class_u.as_str(), key);
             return (Ok(Fv::Str(s)), quiet);
@@ -1807,10 +1843,18 @@ pub(crate) fn cached_inst_slot(lua: &Lua, r: Ref) -> Option<i64> {
 pub(crate) enum NArg<'a> {
     Nil,
     Bool(bool),
-    Str(&'a str),
+    Str(&'a str, i32),
     Inst(Ref),
     /// Anything else (the general dispatcher converts it).
     Other,
+}
+
+fn child_result(children: &[Ref]) -> Fv {
+    match children {
+        [] => Fv::NoChildren,
+        [child] => Fv::OneChild(*child),
+        children => Fv::Insts(children.to_vec()),
+    }
 }
 
 /// Studio-style typed thunks for the hottest core methods, called from the
@@ -1821,24 +1865,90 @@ pub(crate) enum NArg<'a> {
 /// dispatcher runs. Answers as `call_method` would, and whether it was
 /// quiet (nothing fired).
 pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg]) -> Option<mlua::Result<(Fv, bool)>> {
-    let class_u = {
-        let w = world(lua).ok()?;
-        w.d().dom.get_by_ref(r)?.class
-    };
+    let w = world(lua).ok()?;
+    let instance = w.d().dom.get_by_ref(r)?;
+    let class_u = instance.class;
     let rt = routes::route(class_u, name, atom);
     let Disp::Method(m, _) = rt.disp else { return None };
-    if rt.restricted || rt.overridable || !rt.method.core || rt.method.domains != 0 {
+    if rt.restricted || rt.overridable || rt.method.domains != 0 {
         return None;
     }
     let class = class_u.as_str();
     let str1 = || match args.first() {
-        Some(NArg::Str(s)) => Some(*s),
+        Some(NArg::Str(s, _)) => Some(*s),
         _ => None,
     };
+    if m == "GetChildren" && rt.method.core && (args.is_empty() || matches!(args, [NArg::Nil])) {
+        let value = child_result(instance.children());
+        rustudio_core::telemetry::touch(class, name);
+        return Some(Ok((value, true)));
+    }
+    if rt.method.core && class_u == "Players" {
+        let d = w.d();
+        match (m, args) {
+            ("GetPlayers", []) => {
+                let mut players = instance.children().iter().copied()
+                    .filter(|r| d.class_of(*r).is_some_and(|class| class == "Player"));
+                let value = match (players.next(), players.next()) {
+                    (Some(first), Some(second)) => Fv::Insts([first, second].into_iter().chain(players).collect()),
+                    (Some(player), None) => Fv::OneChild(player),
+                    _ => Fv::NoChildren,
+                };
+                rustudio_core::telemetry::touch(class, name);
+                return Some(Ok((value, true)));
+            }
+            ("GetPlayerFromCharacter", [NArg::Inst(character)]) => {
+                let player = instance.children().iter().copied().find(|r| {
+                    matches!(d.prop(*r, "Character"), Some(Variant::Ref(model)) if model == *character)
+                });
+                rustudio_core::telemetry::touch(class, name);
+                return Some(Ok((Fv::Inst(player.unwrap_or_else(Ref::none)), true)));
+            }
+            _ => {}
+        }
+    }
+    if m == "FindFirstChild" && rt.method.core && instance.children().len() < CHILD_INDEX_MIN {
+        let child_name = str1()?;
+        if matches!(args.get(1), None | Some(NArg::Nil | NArg::Bool(false))) {
+            let child = instance.children().iter().copied().find(|r| {
+                w.d().dom.get_by_ref(*r).is_some_and(|i| i.name == child_name)
+            });
+            rustudio_core::telemetry::touch(class, name);
+            return Some(Ok((Fv::Inst(child.unwrap_or_else(Ref::none)), true)));
+        }
+    }
+    if m == "GetAttribute" && rt.method.core {
+        let name = str1()?;
+        static ATTRS: std::sync::LazyLock<rbx_dom_weak::Ustr> = std::sync::LazyLock::new(|| ustr("Attributes"));
+        let value = match instance.properties.get(&*ATTRS) {
+            Some(Variant::Attributes(attributes)) => attributes.get(name),
+            _ => None,
+        };
+        rustudio_core::telemetry::touch(class, m);
+        return Some(match value {
+            None => Ok((Fv::V(Value::Nil), true)),
+            Some(Variant::Float64(value)) => Ok((Fv::V(Value::Number(*value)), true)),
+            Some(Variant::Bool(value)) => Ok((Fv::V(Value::Boolean(*value)), true)),
+            Some(value) => {
+                let value = value.clone();
+                drop(w);
+                variant_to_lua(lua, &value, None).map(|value| (Fv::V(value), true))
+            }
+        });
+    }
+    drop(w);
+    if !rt.method.core {
+        if m == "GetTagged" && rt.method.extended {
+            let tag = str1()?;
+            rustudio_core::telemetry::touch(class, name);
+            return Some(ext::tagged(lua, tag).map(|refs| (Fv::Insts(refs), true)));
+        }
+        return None;
+    }
     let out = match m {
         "IsA" => {
-            let c = str1()?;
-            Ok((Fv::V(Value::Boolean(doc::is_a(class, c))), true))
+            let Some(NArg::Str(base, atom)) = args.first() else { return None };
+            Ok((Fv::V(Value::Boolean(routes::is_a(class_u, base, *atom))), true))
         }
         "FindFirstChild" => {
             let n = str1()?;
@@ -1858,23 +1968,9 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
             let c = str1()?;
             find_child(lua, r, |i| i.class == c, false).map(|f| (Fv::Inst(f.unwrap_or_else(Ref::none)), true))
         }
-        "GetAttribute" => {
-            let n = str1()?;
-            static ATTRS: std::sync::LazyLock<rbx_dom_weak::Ustr> = std::sync::LazyLock::new(|| ustr("Attributes"));
-            let v = {
-                let w = world(lua).ok()?;
-                match w.d().dom.get_by_ref(r).and_then(|i| i.properties.get(&*ATTRS)) {
-                    Some(Variant::Attributes(a)) => a.get(n).cloned(),
-                    _ => None,
-                }
-            };
-            match v {
-                Some(v) => variant_to_lua(lua, &v, None).map(|v| (Fv::V(v), true)),
-                None => Ok((Fv::V(Value::Nil), true)),
-            }
-        }
-        "GetChildren" if args.is_empty() || matches!(args, [NArg::Nil]) => {
-            children_of(lua, r).map(|k| (Fv::Insts(k), true))
+        "FindFirstAncestorOfClass" => {
+            let c = str1()?;
+            find_ancestor(lua, r, |i| i.class == c).map(|f| (Fv::Inst(f.unwrap_or_else(Ref::none)), true))
         }
         "IsDescendantOf" => {
             let other = match args.first() {
@@ -1890,7 +1986,16 @@ pub(crate) fn native_call(lua: &Lua, r: Ref, name: &str, atom: i32, args: &[NArg
             if security::service_hidden(lua, c) {
                 Ok((Fv::V(Value::Nil), true))
             } else {
-                get_service(lua, c, m == "GetService").map(|f| (Fv::Inst(f.unwrap_or_else(Ref::none)), false))
+                // (A service that exists is found without side effects:
+                // nothing to flush after it.)
+                let existing = world(lua).ok().and_then(|w| {
+                    let d = w.d();
+                    d.find_child(d.dom.root_ref(), c)
+                });
+                match existing {
+                    Some(f) if !service_studio_only(lua, c) => Ok((Fv::Inst(f), true)),
+                    _ => get_service(lua, c, m == "GetService").map(|f| (Fv::Inst(f.unwrap_or_else(Ref::none)), false)),
+                }
             }
         }
         _ => return None,
@@ -1930,6 +2035,173 @@ fn parent_write(lua: &Lua, r: Ref, key: &str, atom: i32, p: Ref) -> Option<mlua:
         return Some(Ok(true));
     }
     Some(set_parent(lua, r, p).map(|_| false))
+}
+
+/// Numeric Light.Brightness assignments use the usual property store and
+/// change delivery, with no Lua value conversion or second World borrow.
+fn brightness_write(lua: &Lua, r: Ref, atom: i32, value: f32) -> Option<mlua::Result<bool>> {
+    let w = world(lua).ok()?;
+    let instance = w.d().dom.get_by_ref(r)?;
+    let class = instance.class.as_str();
+    if !matches!(class, "PointLight" | "SpotLight" | "SurfaceLight") {
+        return None;
+    }
+    let route = routes::route(instance.class, "Brightness", atom);
+    let info = route.set?;
+    if route.restricted
+        || route.ni_domains != 0
+        || route.ni_ext
+        || info.read_only
+        || info.acts
+        || !matches!(info.ty, Some((VariantType::Float32, _)))
+    {
+        return None;
+    }
+    rustudio_core::telemetry::touch(class, "Brightness");
+    let key = info.canon.as_str();
+    crate::lua_bridge::plain_write(lua, class, key);
+    let value = Variant::Float32(mech::setter_clamp(class, key, value).unwrap_or(value));
+    let no_dispatch = w.now.is_empty();
+    if instance.properties.get(&info.canon) == Some(&value) {
+        return Some(Ok(no_dispatch));
+    }
+    let quiet = no_dispatch && !w.listening.contains(&r) && !w.item_changed && !rustudio_core::telemetry::on();
+    Some(store_prop_in_world(lua, w, r, info.canon, value).map(|_| quiet))
+}
+
+/// A written value read straight off the Lua stack (`typed_write`).
+#[derive(Clone, Copy)]
+pub(crate) enum FastVal {
+    Num(f64),
+    Bool(bool),
+    Vec3(Vec3),
+    CFrame(Xform),
+    Vec2(glam::Vec2),
+    Color3([f32; 3]),
+    UDim(LUDim),
+    UDim2(LUDim2),
+}
+
+/// `inst.key = value` for a reflected property stored as given: no domain,
+/// runtime_ext or capability rule takes the member, it isn't one of
+/// newindex_routed's own (Name, Parent, Attachment / BasePart frames, a
+/// script's Enabled / Disabled, Humanoid.Health, FontSize), and `value`
+/// is already the property's type. The value is converted, clamped and
+/// stored as `newindex_routed` does, without making an mlua `Value` or
+/// looking the World up again; an unchanged value is not stored again
+/// (it fires nothing either way). Some(quiet): done (quiet: nothing can
+/// have been fired); None: take the full path.
+pub(crate) fn typed_write(lua: &Lua, r: Ref, key: &str, atom: i32, val: FastVal) -> Option<mlua::Result<bool>> {
+    if domains::route_check_on() {
+        return None;
+    }
+    let w = world(lua).ok()?;
+    let instance = w.d().dom.get_by_ref(r)?;
+    let class_u = instance.class;
+    let route = routes::route(class_u, key, atom);
+    let info = route.set?;
+    if route.restricted
+        || route.ni_domains != 0
+        || route.ni_ext
+        || route.special != routes::Special::None
+        || route.set_attachment
+        || info.read_only
+    {
+        return None;
+    }
+    let class = class_u.as_str();
+    if route.set_part {
+        // BasePart.Position (newindex_routed's set_part): the part moves,
+        // keeping its turn; stored as its CFrame. Only when nothing hears
+        // Changed (that path fires Position after CFrame).
+        let FastVal::Vec3(v) = val else { return None };
+        if key != "Position" || w.listening.contains(&r) || w.item_changed || rustudio_core::telemetry::on() {
+            return None;
+        }
+        static CFRAME: std::sync::LazyLock<rbx_dom_weak::Ustr> = std::sync::LazyLock::new(|| ustr("CFrame"));
+        let rot = match w.d().prop_key(r, *CFRAME) {
+            Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf).rot,
+            _ => glam::Mat3::IDENTITY,
+        };
+        let value = Variant::CFrame(Xform { pos: v, rot }.to_cframe());
+        rustudio_core::telemetry::touch(class, key);
+        let no_dispatch = w.now.is_empty();
+        if instance.properties.get(&*CFRAME) == Some(&value) {
+            return Some(Ok(no_dispatch));
+        }
+        return Some(store_prop_in_world(lua, w, r, *CFRAME, value).map(|_| no_dispatch));
+    }
+    let canon = info.canon.as_str();
+    if key == "FontSize" || canon == "Disabled" || (canon == "Health" && class == "Humanoid") {
+        return None;
+    }
+    let (ty, _) = info.ty?;
+    let value = match (ty, val) {
+        (VariantType::Float32, FastVal::Num(n)) => {
+            let f = n as f32;
+            Variant::Float32(mech::setter_clamp(class, canon, f).unwrap_or(f))
+        }
+        (VariantType::Float64, FastVal::Num(n)) => Variant::Float64(n),
+        (VariantType::Int32, FastVal::Num(n)) => Variant::Int32(n as i32),
+        (VariantType::Int64, FastVal::Num(n)) => Variant::Int64(n as i64),
+        (VariantType::Bool, FastVal::Bool(b)) => Variant::Bool(b),
+        (VariantType::Vector3, FastVal::Vec3(v)) => Variant::Vector3(Vector3::new(v.x, v.y, v.z)),
+        (VariantType::CFrame, FastVal::CFrame(x)) => Variant::CFrame(x.orthonormalized().to_cframe()),
+        (VariantType::Vector2, FastVal::Vec2(v)) => Variant::Vector2(Vector2::new(v.x, v.y)),
+        (VariantType::Color3 | VariantType::Color3uint8, FastVal::Color3(c)) => {
+            // (As lua_to_variant: a property stored as Color3uint8 stays
+            // one.)
+            let c3 = Color3::new(c[0], c[1], c[2]);
+            let uint8 = ty == VariantType::Color3uint8
+                || match instance.properties.get(&info.canon) {
+                    Some(v) => matches!(v, Variant::Color3uint8(_)),
+                    None => matches!(w.d().prop_key(r, info.canon), Some(Variant::Color3uint8(_))),
+                };
+            if uint8 {
+                Variant::Color3uint8(Color3uint8::from(c3))
+            } else {
+                Variant::Color3(c3)
+            }
+        }
+        (VariantType::UDim, FastVal::UDim(x)) => Variant::UDim(UDim::new(x.scale, x.offset)),
+        (VariantType::UDim2, FastVal::UDim2(x)) => {
+            Variant::UDim2(UDim2::new(UDim::new(x.x.scale, x.x.offset), UDim::new(x.y.scale, x.y.offset)))
+        }
+        _ => return None,
+    };
+    rustudio_core::telemetry::touch(class, key);
+    if !info.acts {
+        crate::lua_bridge::plain_write(lua, class, canon);
+    }
+    let no_dispatch = w.now.is_empty();
+    if instance.properties.get(&info.canon) == Some(&value) {
+        return Some(Ok(no_dispatch));
+    }
+    let quiet = no_dispatch && !w.listening.contains(&r) && !w.item_changed && !rustudio_core::telemetry::on();
+    // Nothing to fire or record for the change history: the value goes
+    // into its slot in place (store_prop_in_world's changed path with no
+    // listener, outside Edit; ScreenGui's twinned inset properties excepted).
+    let mut w = w;
+    if quiet && w.mode != RunMode::Edit && class_u != "ScreenGui" && store_in_place(&mut w, r, info.canon, &value) {
+        return Some(Ok(true));
+    }
+    Some(store_prop_in_world(lua, w, r, info.canon, value).map(|_| quiet))
+}
+
+/// Replaces a property's stored (or class-shared) value with `value`,
+/// known to differ, and marks it as `store_prop_in_world` would; false
+/// (nothing done) when the instance has no value for it at all.
+fn store_in_place(w: &mut World, r: Ref, key: rbx_dom_weak::Ustr, value: &Variant) -> bool {
+    let d = w.dm();
+    let Some(slot) = d.dom.get_by_ref_mut(r).and_then(|i| i.properties.get_mut(&key)) else {
+        return false;
+    };
+    *slot = value.clone();
+    d.mark_prop(r, key);
+    if w.side == Side::Server && w.has_peer {
+        w.record(RepOp::Prop(r, key.as_str().to_string()));
+    }
+    true
 }
 
 /// `inst.key = value` from a script (the Instance `__newindex`): the
@@ -2128,7 +2400,7 @@ fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<O
         let d = world(lua)?;
         let xf = if key == "TransformedCFrame" { rustudio_core::attachment::local(d.d(), r, true) }
             else { rustudio_core::attachment::world(d.d(), r, true).unwrap_or(rustudio_core::attachment::local(d.d(), r, true)) };
-        return Ok(Some(Value::UserData(lua.create_userdata(LCFrame(xf))?)));
+        return Ok(Some(LCFrame(xf).into_lua(lua)?));
     }
     if doc::is_a(class, "Attachment")
         && matches!(
@@ -2141,9 +2413,7 @@ fn prop_get_special(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<O
         let worldf = compose(&part, &local);
         let v = match key {
             "WorldCFrame" => {
-                return Ok(Some(Value::UserData(
-                    lua.create_userdata(crate::ltypes::LCFrame(worldf))?,
-                )))
+                return Ok(Some(crate::ltypes::LCFrame(worldf).into_lua(lua)?))
             }
             "WorldPosition" => worldf.pos,
             "WorldOrientation" => worldf.orientation_deg(),
@@ -2278,11 +2548,11 @@ fn prop_get_plain(
 }
 
 pub fn set_parent(lua: &Lua, r: Ref, new_parent: Ref) -> mlua::Result<()> {
-    set_parent_opts(lua, r, new_parent, true)
+    set_parent_opts(lua, r, new_parent, true, true)
 }
 
-fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool) -> mlua::Result<()> {
-    let (old, descendants, lost, snaps) = {
+fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool, stop_scripts: bool) -> mlua::Result<()> {
+    let (old, descendants, lost, snaps, stopped) = {
         let mut w = world(lua)?;
         let old = w
             .d()
@@ -2355,11 +2625,25 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool) -> mlua:
             w.queue_scripts(r);
         }
         let descendants: Vec<Ref> = w.d().dom.descendants_of(r).map(|i| i.referent()).collect();
-        for d in &descendants {
-            w.dirty.insert(*d);
-        }
-        let snaps = if enters_ws { weld_snaps(w.d(), r) } else { Vec::new() };
-        (old, descendants, lost, snaps)
+        let snaps = if enters_ws {
+            let (snaps, activated) = weld_snaps(w.d(), r);
+            for (weld, rel) in activated {
+                set_weld_offset(w.dm(), weld, Some(rel));
+            }
+            snaps
+        } else {
+            Vec::new()
+        };
+        // A legacy Script moved from Workspace into ReplicatedStorage
+        // stops. LocalScripts also stop on leaving a runnable container.
+        let stopped = if stop_scripts && w.mode != RunMode::Edit {
+            descendants.iter().copied().filter(|d| {
+                w.started.contains(d) && !w.runs_here(*d)
+            }).collect()
+        } else {
+            HashSet::new()
+        };
+        (old, descendants, lost, snaps, stopped)
     };
     for (model, pivot) in lost {
         store_prop(lua, model, "PrimaryPart", Variant::Ref(Ref::none()))?;
@@ -2368,19 +2652,32 @@ fn set_parent_opts(lua: &Lua, r: Ref, new_parent: Ref, replicate: bool) -> mlua:
     for (part, xf) in snaps {
         store_prop(lua, part, "CFrame", Variant::CFrame(xf.to_cframe()))?;
     }
-    fire_parent_signals(lua, r, old, new_parent, descendants)
+    fire_parent_signals(lua, r, old, new_parent, descendants)?;
+    if !stopped.is_empty() {
+        signal_timing::flush_immediate(lua);
+        stop_code_of(lua, &stopped);
+    }
+    Ok(())
 }
 
 /// Parts of `r`'s tree that its saved WeldConstraints place as it enters the
-/// Workspace. A WeldConstraint keeps its offset (the hidden CFrame0 =
-/// Part0⁻¹ · Part1, saved and cloned with it) and the assembly is built from
-/// it: a part a script moved while the tree was out of the Workspace goes
-/// back where its weld holds it. A game's hand lantern clones
-/// its LanternAssets, sets every part's CFrame to the tool's Handle and only
+/// Workspace, and the welds of the tree that take their offset now. A
+/// WeldConstraint keeps its offset (the hidden CFrame0 = Part0⁻¹ · Part1,
+/// saved and cloned with it) and the assembly is built from it: a part a
+/// script moved while the tree was out of the Workspace goes back where its
+/// weld holds it. A game's lantern clones its
+/// LanternAssets, sets every part's CFrame to the tool's Handle and only
 /// then parents it; in Roblox the lantern still comes out whole. Parts
 /// outside the tree stay put and the tree's parts are placed outward from
 /// them (else from the first weld's Part0).
-fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
+///
+/// The offset is only there once the weld has been active (`weld_offset`):
+/// a weld made outside the Workspace (a game's hunter rigs, built in
+/// ReplicatedStorage) is saved with State 1 and an identity CFrame0, and
+/// takes its parts' offset as it enters the Workspace (Studio 0.747,
+/// measured in Studio). Snapping those to identity pulled every welded
+/// trim of a cloned rig into its limb.
+fn weld_snaps(d: &Document, r: Ref) -> (Vec<(Ref, Xform)>, Vec<(Ref, Xform)>) {
     let inside: HashSet<Ref> = std::iter::once(r).chain(d.dom.descendants_of(r).map(|i| i.referent())).collect();
     let cf = |x: Ref| match d.prop(x, "CFrame") {
         Some(Variant::CFrame(c)) => Some(Xform::from_cframe(&c)),
@@ -2390,25 +2687,34 @@ fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
         Some(Variant::Ref(p)) if p.is_some() && d.class_of(p).is_some_and(|c| doc::is_a(&c, "BasePart")) => Some(p),
         _ => None,
     };
-    // (Part0, Part1, Part0⁻¹ · Part1) for each saved, enabled weld.
+    // (Part0, Part1, Part0⁻¹ · Part1) for each enabled weld between live parts.
     let mut welds: Vec<(Ref, Ref, Xform)> = Vec::new();
+    let mut activated: Vec<(Ref, Xform)> = Vec::new();
     for x in &inside {
         let Some(i) = d.dom.get_by_ref(*x) else { continue };
         if i.class != "WeldConstraint" || !rustudio_core::body::joint_enabled(d, *x) {
             continue;
         }
-        let Some(Variant::CFrame(c0)) = d.prop(*x, "CFrame0") else { continue };
         if let Some((p0, p1)) = rustudio_core::body::joint_parts(d, *x) {
             // (a weld to a part outside the Workspace holds nothing: a clone's weld to
             // its template's part, still in ReplicatedStorage)
             let live = |p: Ref| part(Some(Variant::Ref(p))).is_some() && d.workspace().is_some_and(|ws| d.is_ancestor(ws, p));
-            if p0 != p1 && live(p0) && live(p1) {
-                welds.push((p0, p1, Xform::from_cframe(&c0)));
+            if p0 == p1 || !live(p0) || !live(p1) {
+                continue;
+            }
+            match weld_offset(d, *x) {
+                Some(off) => welds.push((p0, p1, off)),
+                None => {
+                    let (Some(a), Some(b)) = (cf(p0), cf(p1)) else { continue };
+                    let rel = compose(&a.inverse(), &b);
+                    activated.push((*x, rel));
+                    welds.push((p0, p1, rel));
+                }
             }
         }
     }
     if welds.is_empty() {
-        return Vec::new();
+        return (Vec::new(), activated);
     }
     welds.sort_by_key(|(a, b, _)| (format!("{a:?}"), format!("{b:?}")));
     let mut at: HashMap<Ref, Xform> = HashMap::new();
@@ -2455,7 +2761,68 @@ fn weld_snaps(d: &Document, r: Ref) -> Vec<(Ref, Xform)> {
         at.insert(start, x);
         queue.push_back(start);
     }
-    out
+    (out, activated)
+}
+
+/// A WeldConstraint's offset (Part0⁻¹ · Part1) if it has one: once a weld
+/// has been active Studio keeps the offset in CFrame0 and sets State bit 2
+/// (saved: 3 enabled, 0 disabled; a weld that was never in the Workspace
+/// saves State 1 and an identity CFrame0, which holds nothing). A stored
+/// CFrame0 that isn't identity counts too (the live wire carries State 1).
+pub(crate) fn weld_offset(d: &Document, j: Ref) -> Option<Xform> {
+    let i = d.dom.get_by_ref(j)?;
+    let stored = match i.properties.get(&ustr("CFrame0")) {
+        Some(Variant::CFrame(c)) => Some(Xform::from_cframe(c)),
+        _ => None,
+    };
+    let active = matches!(i.properties.get(&ustr("State")), Some(Variant::Int32(s)) if s & 2 != 0);
+    let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
+    match stored {
+        Some(x) if active => Some(x),
+        None if active => Some(ident),
+        Some(x) if !(x.pos.length() < 1e-6 && x.rot.abs_diff_eq(ident.rot, 1e-6)) => Some(x),
+        _ => None,
+    }
+}
+
+/// Records a WeldConstraint's offset (`Some`: CFrame0 and State bit 2, as
+/// Studio does when the weld becomes active) or forgets it (`None`: the
+/// weld takes a new one when it next becomes active).
+fn set_weld_offset(d: &mut Document, j: Ref, rel: Option<Xform>) {
+    let enabled = rustudio_core::body::joint_enabled(d, j);
+    let Some(i) = d.dom.get_by_ref_mut(j) else { return };
+    let bit0 = i32::from(enabled);
+    match rel {
+        Some(x) => {
+            i.properties.insert(ustr("CFrame0"), Variant::CFrame(x.to_cframe()));
+            i.properties.insert(ustr("State"), Variant::Int32(bit0 | 2));
+        }
+        None => {
+            i.properties.insert(ustr("State"), Variant::Int32(bit0));
+            i.properties.remove(&ustr("CFrame0"));
+        }
+    }
+}
+
+/// A script set a WeldConstraint's Part0, Part1 or Enabled: Studio takes the
+/// offset again from where its parts are if the weld is active now, and
+/// otherwise when it next enters the Workspace (a weld re-enabled while out
+/// of the Workspace took the parts' new offset there).
+fn weld_rejoined(w: &mut World, j: Ref) {
+    let d = w.d();
+    let live = |p: Ref| d.workspace().is_some_and(|ws| d.is_ancestor(ws, p));
+    let cf = |x: Ref| match d.prop(x, "CFrame") {
+        Some(Variant::CFrame(c)) => Some(Xform::from_cframe(&c)),
+        _ => None,
+    };
+    let rel = if w.mode != RunMode::Edit && live(j) && rustudio_core::body::joint_enabled(d, j) {
+        rustudio_core::body::joint_parts(d, j)
+            .filter(|(a, b)| a != b && live(*a) && live(*b))
+            .and_then(|(a, b)| Some(compose(&cf(a)?.inverse(), &cf(b)?)))
+    } else {
+        None
+    };
+    set_weld_offset(w.dm(), j, rel);
 }
 
 /// The Models (among `old` and its ancestors) whose PrimaryPart leaves them
@@ -2725,8 +3092,17 @@ fn store_prop(lua: &Lua, r: Ref, name: &str, v: Variant) -> mlua::Result<()> {
 
 /// `store_prop` by an interned name.
 fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlua::Result<()> {
+    store_prop_in_world(lua, world(lua)?, r, key, v)
+}
+
+fn store_prop_in_world(
+    lua: &Lua,
+    mut w: mlua::AppDataRefMut<'_, World>,
+    r: Ref,
+    key: rbx_dom_weak::Ustr,
+    v: Variant,
+) -> mlua::Result<()> {
     let name = key.as_str();
-    let mut w = world(lua)?;
     // A plugin's change of the edit DataModel goes into ChangeHistoryService
     // (doc_history.rs; Source is the script editor's own undo, as Studio's).
     let before = (w.mode == RunMode::Edit && name != "Source" && w.d().records_change(r))
@@ -2781,14 +3157,19 @@ fn store_prop_key(lua: &Lua, r: Ref, key: rbx_dom_weak::Ustr, v: Variant) -> mlu
     }
     if changed {
         w.dm().mark_prop(r, key);
-        w.record(RepOp::Prop(r, name.to_string()));
-        let class = w.d().class_of(r);
-        if physics_prop(name) && class.is_some_and(|c| doc::is_a(&c, "BasePart")) {
-            w.dirty.insert(r);
+        // (The record only when a peer takes it: no name copied per write
+        // on a client or in Edit.)
+        if w.side == Side::Server && w.has_peer {
+            w.record(RepOp::Prop(r, name.to_string()));
         }
+        if matches!(name, "Part0" | "Part1" | "Enabled") && w.d().class_of(r).is_some_and(|c| c == "WeldConstraint") {
+            weld_rejoined(&mut w, r);
+        }
+        // (Physics sees the change through the document's marks.)
         // A part's Size changes its mass: Studio fires Changed for Size,
         // then AssemblyMass, then Mass (checks/plugins/services/captures/
         // misc2.txt `part.size.changed`).
+        let class = if name == "Size" || name == "Value" { w.d().class_of(r) } else { None };
         let mass_changed = name == "Size" && class.is_some_and(|c| doc::is_a(&c, "BasePart"));
         // Nobody listening to this instance or to game.ItemChanged
         // (services' on_fire), telemetry off: both fires below would do nothing.
@@ -3212,7 +3593,27 @@ fn script_of_thread(lua: &Lua, th: &Thread) -> Option<Ref> {
             Err(_) => break,
         }
     }
-    None
+    unstarted_script(lua, th)
+}
+
+/// A task's entry function precedes its first Lua stack frame. debug.info
+/// on a task.delay or task.defer thread therefore sees no script until it runs.
+fn unstarted_script(lua: &Lua, th: &Thread) -> Option<Ref> {
+    if th.status() != ThreadStatus::Resumable {
+        return None;
+    }
+    // SAFETY: the live Thread belongs to this Lua VM. A new Luau coroutine
+    // has status OK and keeps its entry function in the first stack slot.
+    let function = unsafe {
+        let thread = th.state();
+        if mlua::ffi::lua_status(thread) != mlua::ffi::LUA_OK
+            || mlua::ffi::lua_type(thread, 1) != mlua::ffi::LUA_TFUNCTION
+        {
+            return None;
+        }
+        lua.exec_raw::<Function>((), |state| mlua::ffi::lua_xpush(thread, state, 1)).ok()?
+    };
+    script_of_function(&function)
 }
 
 /// A running Script / LocalScript is disabled: it ends, as in Roblox. Its
@@ -3249,18 +3650,7 @@ fn stop_script(lua: &Lua, r: Ref) {
         s.waiters = waiters;
     }
     prune_layout_listeners(lua);
-    let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
-        Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
-        None => return,
-    };
-    timers.retain(|t| script_of_thread(lua, &t.thread) != Some(r));
-    deferred.retain(|(th, _)| script_of_thread(lua, th) != Some(r));
-    if let Some(mut s) = lua.app_data_mut::<Sched>() {
-        timers.append(&mut s.timers);
-        deferred.append(&mut s.deferred);
-        s.timers = timers;
-        s.deferred = deferred;
-    }
+    retain_scheduled(lua, |th| script_of_thread(lua, th) != Some(r));
 }
 
 /// Whether any Lua frame of a suspended thread runs code of one of `set`'s
@@ -3279,7 +3669,7 @@ fn thread_runs_any(lua: &Lua, th: &Thread, set: &HashSet<Ref>) -> bool {
             Err(_) => break,
         }
     }
-    false
+    unstarted_script(lua, th).is_some_and(|r| set.contains(&r))
 }
 
 /// Ends every thread and connection running code of `set`'s scripts,
@@ -3292,11 +3682,18 @@ fn stop_code_of(lua: &Lua, set: &HashSet<Ref>) {
     if let Ok(mut w) = world(lua) {
         w.started.retain(|r| !set.contains(r));
     }
-    let (mut conns, mut waiters) = match lua.app_data_mut::<Signals>() {
-        Some(mut s) => (std::mem::take(&mut s.conns), std::mem::take(&mut s.waiters)),
+    let (mut conns, mut waiters, mut ancestry) = match lua.app_data_mut::<Signals>() {
+        Some(mut s) => (
+            std::mem::take(&mut s.conns),
+            std::mem::take(&mut s.waiters),
+            std::mem::take(&mut s.destroyed_ancestry),
+        ),
         None => return,
     };
     for list in conns.values_mut() {
+        list.retain(|c| !script_of_function(&c.func).is_some_and(|r| set.contains(&r)));
+    }
+    for (_, list) in ancestry.values_mut() {
         list.retain(|c| !script_of_function(&c.func).is_some_and(|r| set.contains(&r)));
     }
     for list in waiters.values_mut() {
@@ -3311,18 +3708,30 @@ fn stop_code_of(lua: &Lua, set: &HashSet<Ref>) {
         }
         s.conns = conns;
         s.waiters = waiters;
+        s.destroyed_ancestry.extend(ancestry);
     }
     prune_layout_listeners(lua);
-    let (mut timers, mut deferred) = match lua.app_data_mut::<Sched>() {
-        Some(mut s) => (std::mem::take(&mut s.timers), std::mem::take(&mut s.deferred)),
+    retain_scheduled(lua, |th| !thread_runs_any(lua, th, set));
+}
+
+fn retain_scheduled(lua: &Lua, mut keep: impl FnMut(&Thread) -> bool) {
+    let (mut timers, mut ready, mut deferred) = match lua.app_data_mut::<Sched>() {
+        Some(mut s) => (
+            std::mem::take(&mut s.timers),
+            std::mem::take(&mut s.ready),
+            std::mem::take(&mut s.deferred),
+        ),
         None => return,
     };
-    timers.retain(|t| !thread_runs_any(lua, &t.thread, set));
-    deferred.retain(|(th, _)| !thread_runs_any(lua, th, set));
+    timers.retain(|t| keep(&t.thread));
+    ready.retain(|t| keep(&t.thread));
+    deferred.retain(|(th, _)| keep(th));
     if let Some(mut s) = lua.app_data_mut::<Sched>() {
         timers.append(&mut s.timers);
+        ready.append(&mut s.ready);
         deferred.append(&mut s.deferred);
         s.timers = timers;
+        s.ready = ready;
         s.deferred = deferred;
     }
 }
@@ -3526,21 +3935,23 @@ fn opt_ref_value(lua: &Lua, r: Option<Ref>) -> mlua::Result<Value> {
     }
 }
 
-fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>> {
+/// The services `get_service` answers nil for whether or not they exist.
+fn service_studio_only(lua: &Lua, class: &str) -> bool {
     // Studio-only services: GetService / FindService give game scripts nil
     // (measured in Studio, checks/parity/testing.md).
     // (Plugins see them: measured, StudioService's Parent is the edit
     // DataModel.)
-    if matches!(
+    (matches!(
         class,
         "DebuggerManager" | "StudioService" | "DraggerService" | "LiveSyncService" | "TestCoordinatorService"
-    ) && security::current(lua) == security::GAME
-    {
-        return Ok(None);
-    }
+    ) && security::current(lua) == security::GAME)
     // Studio's edit DataModel has no StudioPublishService: a plugin's
     // GetService gets nil (checks/plugins/services/captures/history2.txt).
-    if class == "StudioPublishService" {
+        || class == "StudioPublishService"
+}
+
+fn get_service(lua: &Lua, class: &str, create: bool) -> mlua::Result<Option<Ref>> {
+    if service_studio_only(lua, class) {
         return Ok(None);
     }
     let mut w = world(lua)?;
@@ -3733,7 +4144,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
         // the client still has the pair when it gets here.
         w.record(RepOp::Destroy(r));
     }
-    set_parent(lua, r, Ref::none())?;
+    set_parent_opts(lua, r, Ref::none(), true, false)?;
     let immediate = {
         let mut w = world(lua)?;
         if w.mode == RunMode::Edit {
@@ -3772,7 +4183,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
             }
             w.fire(d, "Destroying", vec![]);
             drop(w);
-            set_parent_opts(lua, d, Ref::none(), false)?;
+            set_parent_opts(lua, d, Ref::none(), false, false)?;
             world(lua)?.destroyed.insert(d);
             signal_timing::flush_immediate(lua);
             order.push((d, p));
@@ -3802,10 +4213,14 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
     // every connection in the DataModel otherwise: 125 us per Destroy in
     // Place E, 1.6 ms in a live Place A match, whose effect parts and
     // tracers have none).
-    let listened: Vec<Ref> = {
+    let (listened, stopped_scripts) = {
         let mut w = world(lua)?;
         w.destroyed.insert(r);
         w.destroyed.extend(order.iter().map(|x| x.0));
+        let stopped_scripts = std::iter::once(r)
+            .chain(order.iter().map(|x| x.0))
+            .filter(|x| w.started.contains(x))
+            .collect();
         let listened: Vec<_> = std::iter::once(r)
             .chain(order.iter().map(|x| x.0))
             .filter(|x| w.listening.contains(x))
@@ -3814,7 +4229,7 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
             w.forget_layout_listener(x);
             w.abs_seen.remove(&x);
         }
-        listened
+        (listened, stopped_scripts)
     };
     if !listened.is_empty() {
         let mut s = signals(lua)?;
@@ -3845,6 +4260,10 @@ fn destroy_inst(lua: &Lua, r: Ref) -> mlua::Result<()> {
             world(lua)?.conn_seq = s.next_id;
         }
     }
+    // A running Script destroyed with its model also loses its connections
+    // on surviving objects, such as RunService, and its scheduled threads.
+    // A ModuleScript may be shared by other live scripts.
+    stop_code_of(lua, &stopped_scripts);
     Ok(())
 }
 
@@ -4324,7 +4743,7 @@ fn call_method_routed(
             } else {
                 model_pivot(&*world(lua)?, this)
             };
-            one(Value::UserData(lua.create_userdata(LCFrame(xf))?))
+            one(LCFrame(xf).into_lua(lua)?)
         }
         "PivotTo" | "SetPrimaryPartCFrame" => {
             let cf = opt_ud::<LCFrame>(&arg(&args, 1)).ok_or_else(|| rt_err("CFrame expected"))?;
@@ -4362,9 +4781,9 @@ fn call_method_routed(
             let name = world(lua)?
                 .humanoid_states
                 .get(&this)
-                .cloned()
-                .unwrap_or_else(|| "Running".to_string());
-            match LEnumItem::from_name("HumanoidStateType", &name) {
+                .copied()
+                .unwrap_or("Running");
+            match LEnumItem::from_name("HumanoidStateType", name) {
                 Some(item) => one(crate::ltypes::enum_value(lua, item)?),
                 None => one(Value::Nil),
             }
@@ -4486,7 +4905,7 @@ fn call_method_routed(
 
 /// Lua side of the runtime: everything that yields, plus the signal type.
 const PRELUDE: &str = r##"
-local rs_wait, rs_wait_signal, rs_output, rs_connect, rs_load_module, rs_index, rs_newindex, WAIT_MIN = ...
+local rs_wait, rs_wait_signal, rs_output, rs_connect, rs_load_module, rs_index, rs_newindex = ...
 local yield, running = coroutine.yield, coroutine.running
 
 -- Engine calls return (ok, ...) and errors are rethrown here without a
@@ -4554,12 +4973,11 @@ function __rs_new_signal(inst, name)
 end
 
 function task.wait(t)
-    rs_wait(running(), tonumber(t) or 0)
+    rs_wait(running(), tonumber(t) or 0, false)
     return yield()
 end
 function wait(t)
-    t = math.max(tonumber(t) or 0, WAIT_MIN)
-    rs_wait(running(), t)
+    rs_wait(running(), tonumber(t) or 0, true)
     local elapsed = yield()
     return elapsed, time()
 end
@@ -4839,6 +5257,12 @@ impl Runtime {
         domains::plugin_api::freeze();
         luau_flags();
         let lua = Lua::new();
+        // Scripts marked --!native (and @native functions) run as native
+        // code, as in Roblox (vendor mlua state/raw.rs: other chunks are
+        // interpreted). RUSTUDIO_NO_NATIVE=1: everything interpreted.
+        if std::env::var_os("RUSTUDIO_NO_NATIVE").is_some_and(|v| v != "0") {
+            lua.enable_jit(false);
+        }
         rustudio_core::load_trace::mark("runtime: Lua made");
         // RUSTUDIO_DETERMINISTIC (test runs): Luau seeds math.random from the time and the
         // state's address; the default Animate script rolls its weighted variants with it,
@@ -5024,13 +5448,7 @@ impl Runtime {
                 let t = it.next().and_then(|v| num(&v)).unwrap_or(0.0);
                 let th = thread_arg(lua, it.next(), "task.delay")?;
                 let now = world(lua)?.time;
-                sched(lua)?.timers.push(Timer {
-                    at: now + t,
-                    started: now,
-                    wall: rustudio_core::sim_clock::now(),
-                    thread: th.clone(),
-                    args: Some(it.collect()),
-                });
+                sched(lua)?.schedule(now, t, th.clone(), Some(it.collect()), false);
                 Ok(th)
             })?,
         )?;
@@ -5039,6 +5457,7 @@ impl Runtime {
             lua.create_function(|lua, th: Thread| {
                 let mut s = sched(lua)?;
                 s.timers.retain(|t| t.thread != th);
+                s.ready.retain(|t| t.thread != th);
                 s.deferred.retain(|(t, _)| *t != th);
                 Ok(())
             })?,
@@ -5047,8 +5466,9 @@ impl Runtime {
         g.set(
             "spawn",
             lua.create_function(|lua, f: Function| {
-                let th = domains::assets_cloud::scene::create_thread(lua,f)?;
-                sched(lua)?.deferred.push_back((th, vec![]));
+                let th = domains::assets_cloud::scene::create_thread(lua, f)?;
+                let now = world(lua)?.time;
+                sched(lua)?.schedule(now, 0.0, th, Some(Vec::new()), true);
                 Ok(())
             })?,
         )?;
@@ -5057,13 +5477,7 @@ impl Runtime {
             lua.create_function(|lua, (t, f): (f64, Function)| {
                 let th = domains::assets_cloud::scene::create_thread(lua,f)?;
                 let now = world(lua)?.time;
-                sched(lua)?.timers.push(Timer {
-                    at: now + t,
-                    started: now,
-                    wall: rustudio_core::sim_clock::now(),
-                    thread: th,
-                    args: Some(vec![]),
-                });
+                sched(lua)?.schedule(now, t, th, Some(Vec::new()), true);
                 Ok(())
             })?,
         )?;
@@ -5092,16 +5506,9 @@ impl Runtime {
         )?;
         g.set("shared", lua.create_table()?)?;
 
-        let rs_wait = lua.create_function(|lua, (th, t): (Thread, f64)| {
+        let rs_wait = lua.create_function(|lua, (th, t, legacy): (Thread, f64, bool)| {
             let now = world(lua)?.time;
-            // A zero wait still resumes on the next step.
-            sched(lua)?.timers.push(Timer {
-                at: now + t.max(0.0),
-                started: now,
-                wall: rustudio_core::sim_clock::now(),
-                thread: th,
-                args: None,
-            });
+            sched(lua)?.schedule(now, t, th, None, legacy);
             Ok(())
         })?;
         let rs_wait_signal =
@@ -5205,7 +5612,6 @@ impl Runtime {
                 rs_load_module,
                 rs_index,
                 rs_newindex,
-                mech::WAIT_MIN_S,
             ))?;
         // Roblox's are C functions, and Adonis checks (crates/rustudio-engine/src/cmeta.rs); the
         // prelude's Lua shims stay for anything that calls them directly.
@@ -5805,6 +6211,9 @@ impl Runtime {
         };
         // RUSTUDIO_FIXED_DT Play (test runs): no wall clock in what resumes when.
         let fixed_step = !realtime && fixed_dt_env();
+        if let Ok(mut s) = sched(lua) {
+            s.step += 1;
+        }
         {
             let _s = rustudio_core::bench::scope("rt_domains_step");
             let _ = domains::step(lua, dt);
@@ -5817,22 +6226,36 @@ impl Runtime {
             self.dispatch();
         }
         let _st = rustudio_core::bench::scope("rt_timers");
-        let mut due: Vec<Timer> = {
+        {
             let Ok(mut s) = sched(lua) else { return };
-            let (due, keep): (Vec<Timer>, Vec<Timer>) = std::mem::take(&mut s.timers)
-                .into_iter()
-                .partition(|t| {
-                    t.at <= now + 1e-9
-                        || realtime && rustudio_core::sim_clock::since(t.wall).as_secs_f64() >= t.at - t.started
-                });
-            s.timers = keep;
-            due
-        };
-        // Oldest first; whatever doesn't fit in this frame's budget resumes next frame.
-        due.sort_by(|a, b| a.at.total_cmp(&b.at));
-        let started = std::time::Instant::now();
-        let mut due = due.into_iter();
-        for t in due.by_ref() {
+            let step = s.step;
+            let wall_now = realtime.then(rustudio_core::sim_clock::now);
+            let Sched { timers, ready, .. } = &mut *s;
+            ready.clear();
+            ready.extend(timers.extract_if(.., |t| {
+                t.scheduled_step < step
+                    && (t.at <= now + 1e-9
+                        || wall_now.is_some_and(|wall| wall.saturating_duration_since(t.wall).as_secs_f64() >= t.at - t.started))
+            }));
+            // The legacy resumption point has its own budget. Run it before
+            // the modern task queue, which still drains in this frame.
+            ready.make_contiguous().sort_by(|a, b| b.legacy.cmp(&a.legacy).then_with(|| a.at.total_cmp(&b.at)));
+        }
+        let started = Instant::now();
+        let budgeted = !fixed_step && !rustudio_core::sim_clock::on();
+        while let Some(t) = sched(lua).ok().and_then(|mut s| s.ready.pop_front()) {
+            if t.legacy && budgeted && started.elapsed() >= LEGACY_TIMER_BUDGET {
+                // Keep the rest for the next frame. Modern tasks are
+                // in the same ready list, so cancellation can still see them.
+                if let Ok(mut s) = sched(lua) {
+                    s.timers.push(t);
+                    while s.ready.front().is_some_and(|t| t.legacy) {
+                        let next = s.ready.pop_front().unwrap();
+                        s.timers.push(next);
+                    }
+                }
+                continue;
+            }
             let args = t
                 .args
                 .unwrap_or_else(|| {
@@ -5842,18 +6265,6 @@ impl Runtime {
                     vec![Value::Number((now - t.started).max(real))]
                 });
             resume_thread_timed(lua, &t.thread, args);
-            // The frame budget is wall time: fixed-step runs (RUSTUDIO_FIXED_DT or
-            // --fixed-dt) resume every due thread, so what runs in a frame doesn't
-            // depend on how fast the machine is.
-            if !fixed_step && !rustudio_core::sim_clock::on() && started.elapsed().as_secs_f64() * 1000.0 > mech::SCRIPT_FRAME_BUDGET_MS {
-                break;
-            }
-        }
-        let rest: Vec<Timer> = due.collect();
-        if !rest.is_empty() {
-            if let Ok(mut s) = sched(lua) {
-                s.timers.extend(rest);
-            }
         }
         drop(_st);
         let _s2 = rustudio_core::bench::scope("rt_dispatch2");
@@ -5955,7 +6366,6 @@ impl Runtime {
                     }
                 }
                 w.destroyed.remove(x);
-                w.dirty.remove(x);
                 w.velocities.remove(x);
                 w.humanoid_states.remove(x);
                 w.states_disabled.remove(x);
@@ -6086,11 +6496,13 @@ impl Runtime {
                 .app_data_mut::<World>()
                 .map(|mut w| std::mem::take(&mut w.to_start))
                 .unwrap_or_default();
-            let _sc = rustudio_core::bench::scope("dis_start");
-            for s in starting {
-                let still = world(lua).map(|w| w.runs_here(s)).unwrap_or(false);
-                if still {
-                    self.run_script(s);
+            {
+                let _sc = rustudio_core::bench::scope("dis_start");
+                for s in starting {
+                    let still = world(lua).map(|w| w.runs_here(s)).unwrap_or(false);
+                    if still {
+                        self.run_script(s);
+                    }
                 }
             }
             let deferred: Vec<(Thread, Vec<Value>)> = sched(lua)
@@ -6098,7 +6510,10 @@ impl Runtime {
                 .unwrap_or_default();
             // Fires made outside any script call (engine steps, input) that
             // the place runs immediately: run them first, at this point.
-            signal_timing::flush_immediate(lua);
+            {
+                let _sc = rustudio_core::bench::scope("dis_immediate");
+                signal_timing::flush_immediate(lua);
+            }
             let events: Vec<(Ref, String, Vec<Value>, u64, u32)> = lua
                 .app_data_mut::<World>()
                 .map(|mut w| std::mem::take(&mut w.events))
@@ -6109,7 +6524,6 @@ impl Runtime {
                 }
                 return;
             }
-            drop(_sc);
             let _sc = rustudio_core::bench::scope("dis_deferred");
             for (th, args) in deferred {
                 resume_thread_timed(lua, &th, args);
@@ -6139,11 +6553,20 @@ impl Runtime {
 /// error"). C frames and rustudio's own chunks are left out, as Studio's
 /// stack printer skips frames without a line.
 fn thread_frames(lua: &Lua, th: &Thread) -> Vec<(String, u32, Option<String>)> {
-    let tb = lua
-        .globals()
-        .get::<Table>("debug")
-        .and_then(|d| d.get::<Function>("traceback"))
-        .and_then(|f| f.call::<String>(th.clone()));
+    // debug.traceback(thread) uses this VM function with level zero for
+    // a stopped thread. Read it directly so reporting an error never calls
+    // a Lua global or converts the thread through a second Lua invocation.
+    let _scope = rustudio_core::bench::scope("script_traceback");
+    // SAFETY: exec_raw puts the supplied Thread on the protected call's
+    // stack. The native formatter leaves its result above that argument.
+    let tb = unsafe {
+        lua.exec_raw::<String>(th.clone(), |state| {
+            let thread = mlua::ffi::lua_tothread(state, 1);
+            let level = i32::from(state == thread);
+            mlua::ffi::luaL_traceback_(state, thread, std::ptr::null(), level);
+            mlua::ffi::lua_remove(state, 1);
+        })
+    };
     tb.map(|s| s.lines().filter_map(parse_frame).collect()).unwrap_or_default()
 }
 
@@ -6167,6 +6590,7 @@ fn report(lua: &Lua, e: &mlua::Error) {
 /// "Script '{}', Line {}" when the frame has no function name) per Luau
 /// frame, "Stack End". With no frames known, the error's own "Name:line".
 fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Option<String>)>) {
+    let _scope = rustudio_core::bench::scope("script_error_report");
     let msg = describe_error(e);
     if frames.is_empty() {
         if let Some((path, line)) = error_origin(&msg) {
@@ -6195,6 +6619,10 @@ fn report_frames(lua: &Lua, e: &mlua::Error, mut frames: Vec<(String, u32, Optio
         w.doc.as_ref().and_then(|d| {
             let root = d.dom.root_ref();
             let sc = d.find_child(root, "ScriptContext")?;
+            if !w.listening.contains(&sc) {
+                rustudio_core::telemetry::fired("Error");
+                return None;
+            }
             // An engine error has no prefix: the innermost frame's script.
             let path = match error_origin(&msg) {
                 Some((p, _)) => p,
@@ -6464,7 +6892,7 @@ pub fn import(lua: &Lua, x: &Xfer, map: &dyn Fn(Ref) -> Option<Ref>) -> mlua::Re
         },
         Xfer::V3(v) => LVector3(*v).into_value(),
         Xfer::V2(v) => ud(lua.create_userdata(LVector2(*v))?),
-        Xfer::CF(c) => ud(lua.create_userdata(LCFrame(*c))?),
+        Xfer::CF(c) => LCFrame(*c).into_lua(lua)?,
         Xfer::C3(c) => ud(lua.create_userdata(LColor3(*c))?),
         Xfer::Brick(b) => ud(lua.create_userdata(LBrickColor(*b))?),
         Xfer::UDim(u) => ud(lua.create_userdata(*u)?),
@@ -7008,6 +7436,126 @@ mod tests {
         rt.fire(rs, "RenderStepped", vec![Value::Number(1.0 / 60.0)]);
         rt.step(1.0 / 60.0);
         let out = rt.leave().output;
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
+    fn timers_keep_legacy_cadence_and_can_cancel_another_due_task() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            result = {}
+            local function mark(name)
+                table.insert(result, name)
+            end
+            local cancelled
+            task.delay(0, function()
+                task.cancel(cancelled)
+                mark("task")
+                task.wait()
+                mark("again")
+            end)
+            cancelled = task.delay(0, function() mark("cancelled") end)
+            spawn(function() mark("spawn") end)
+            task.spawn(function()
+                wait()
+                mark("wait")
+            end)
+        "#).exec().unwrap();
+        let state = || rt.lua.load("return table.concat(result, ',')").eval::<String>().unwrap();
+        rt.step(1.0 / 60.0);
+        assert_eq!(state(), "task");
+        rt.step(1.0 / 60.0);
+        assert_eq!(state(), "task,spawn,wait,again");
+    }
+
+    #[test]
+    fn playing_an_unloaded_sound_keeps_its_play_request() {
+        let out = run(r#"
+            local sound = Instance.new("Sound", workspace)
+            assert(not sound.IsLoaded and sound.TimeLength == 0)
+            local played, loaded = false, false
+            sound.Played:Connect(function()
+                played = true
+                assert(sound.Playing and not sound.IsLoaded and sound.TimeLength == 0)
+            end)
+            sound.Loaded:Connect(function() loaded = true end)
+            sound.SoundId = "rbxasset://sounds/rustudio-test-file-does-not-exist.ogg"
+            sound:Play()
+            assert(sound.Playing and not sound.IsLoaded)
+            task.wait()
+            assert(played and not loaded and not sound.IsLoaded and sound.TimeLength == 0)
+            print("sound request checked")
+        "#);
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+        assert!(out.iter().any(|(_, msg)| msg.starts_with("sound request checked")), "{out:?}");
+    }
+
+    #[test]
+    fn same_brightness_leaves_the_journal_and_signals_untouched() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        let exec = |source| rt.lua.load(source).exec().unwrap();
+        let journal_end = || world(&rt.lua).unwrap().d().journal_end();
+        exec(r#"
+            light = Instance.new("PointLight", workspace)
+            changes = 0
+            light.Changed:Connect(function(name)
+                if name == "Brightness" then changes += 1 end
+            end)
+        "#);
+        let before = journal_end();
+        exec("light.Brightness = light.Brightness");
+        rt.dispatch();
+        exec("assert(changes == 0)");
+        assert_eq!(before, journal_end());
+        exec("light.Brightness = light.Brightness + 0.25");
+        rt.dispatch();
+        exec("assert(changes == 1)");
+        assert_eq!(before + 1, journal_end());
+        exec("light.Brightness = light.Brightness");
+        rt.dispatch();
+        exec("assert(changes == 1)");
+        assert_eq!(before + 1, journal_end());
+    }
+
+    #[test]
+    fn children_arrays_are_independent_and_keep_instance_identity() {
+        let out = run(r#"
+            local folder = Instance.new("Folder")
+            local empty = folder:GetChildren()
+            empty[1] = folder
+            assert(#folder:GetChildren() == 0)
+            local child = Instance.new("Part", folder)
+            assert(folder:GetChildren()[1] == child and empty[1] == folder)
+            local singleton = folder:GetChildren()
+            singleton[1] = nil
+            assert(folder:GetChildren()[1] == child and #singleton == 0)
+            local other = Instance.new("Model", folder)
+            local children = folder:GetChildren()
+            assert(#children == 2 and children[1] == child and children[2] == other)
+            assert(child:IsA("BasePart") and not other:IsA("BasePart"))
+            assert(not child:IsA("a class that doesn't exist"))
+        "#);
+        assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
+    }
+
+    #[test]
+    fn native_attribute_reads_keep_luau_types() {
+        let out = run(r#"
+            local light = Instance.new("PointLight")
+            light:SetAttribute("BaseBrightness", 0.625)
+            light:SetAttribute("Enabled", false)
+            local seed = Vector3.new(1, 2, 3)
+            light:SetAttribute("FlickerSeed", seed)
+            assert(light:GetAttribute("BaseBrightness") == 0.625)
+            assert(light:GetAttribute("Enabled") == false)
+            assert(light:GetAttribute("FlickerSeed") == seed)
+            light:SetAttribute("BaseBrightness", nil)
+            assert(light:GetAttribute("BaseBrightness") == nil)
+        "#);
         assert!(out.iter().all(|(level, _)| *level != Level::Error), "{out:?}");
     }
 
@@ -7719,6 +8267,63 @@ mod legacy_tests {
         assert!(out.iter().any(|(_, t)| t.starts_with("reparent false")), "{out:?}");
     }
 
+    #[test]
+    fn destroying_model_retires_its_scripts_from_surviving_signals() {
+        assert_model_scripts_retire("workspace.Npc:Destroy()");
+    }
+
+    #[test]
+    fn moving_model_to_replicated_storage_retires_legacy_scripts() {
+        assert_model_scripts_retire("workspace.Npc.Parent = game:GetService('ReplicatedStorage')");
+    }
+
+    fn assert_model_scripts_retire(action: &str) {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model").with_name("Npc"));
+        d.dom.insert(model, InstanceBuilder::new("Humanoid"));
+        let worker = d.dom.insert(model, InstanceBuilder::new("Script").with_property("Source", r#"
+            local model = script.Parent
+            local run = game:GetService("RunService")
+            _G.npc_connection = run.Heartbeat:Connect(function()
+                assert(model.Humanoid)
+            end)
+            task.spawn(function()
+                task.wait(1)
+                warn("retired NPC resumed")
+            end)
+            task.delay(1, function() warn("retired NPC delay fired") end)
+        "#.to_owned()));
+        let observer_source = format!(r#"
+            local run = game:GetService("RunService")
+            local count = 0
+            local live = run.Heartbeat:Connect(function() count += 1 end)
+            task.wait(0.25)
+            assert(_G.npc_connection.Connected)
+            assert(count > 0)
+            {action}
+            assert(not _G.npc_connection.Connected)
+            local before = count
+            task.wait(1.25)
+            assert(live.Connected and count > before)
+            print("NPC script stopped")
+        "#);
+        let observer = d.dom.insert(ws, InstanceBuilder::new("Script").with_property("Source", observer_source));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(worker);
+        rt.run_script(observer);
+        for _ in 0..120 {
+            let run = world(&rt.lua).ok().and_then(|w| w.d().find_child(w.d().dom.root_ref(), "RunService")).unwrap();
+            rt.fire(run, "Heartbeat", vec![]);
+            rt.step(1.0 / 60.0);
+        }
+        let out = rt.leave().output;
+        assert!(out.iter().any(|(_, text)| text.starts_with("NPC script stopped")), "{out:?}");
+        assert!(out.iter().all(|(level, _)| *level == Level::Info), "{out:?}");
+    }
+
     /// Tagged instances entering / leaving the DataModel fire the tag's
     /// InstanceAdded / InstanceRemoved signals (Place A's box, upgrade machine and
     /// perk lights track replicated map pieces this way); AddTag outside
@@ -7818,5 +8423,104 @@ pub fn notify_prop_in(lua: &Lua, r: Ref, name: &str) {
     if let Ok(mut w) = world(lua) {
         w.fire(r, "Changed", vec![v]);
         w.fire(r, &format!("Changed:{name}"), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod weld_offset_tests {
+    use super::*;
+
+    /// Runs `src` as a server Script in Play, with `setup` adding to the place first.
+    fn run(setup: impl FnOnce(&mut Document), src: &str) -> Vec<(Level, String)> {
+        let mut d = Document::new_place();
+        setup(&mut d);
+        let root = d.dom.root_ref();
+        let sss = d.find_child(root, "ServerScriptService").unwrap();
+        let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..30 {
+            rt.step(1.0 / 60.0);
+        }
+        rt.leave().output
+    }
+
+    fn line(out: &[(Level, String)], tag: &str) -> String {
+        out.iter()
+            .find_map(|(_, s)| s.strip_prefix(tag).map(|r| r.split("  —  ").next().unwrap_or(r).trim().to_string()))
+            .unwrap_or_else(|| panic!("no {tag} in {out:?}"))
+    }
+
+    /// Studio 0.747 (a Studio server): a
+    /// WeldConstraint takes its parts' offset when it becomes active (both
+    /// parts in the Workspace) and keeps it while out of the Workspace; a
+    /// weld made outside the Workspace holds its parts where they are when
+    /// they enter it; Enabled or Part0/Part1 set again takes a new offset.
+    /// rustudio snapped every such weld to an identity offset.
+    #[test]
+    fn weld_constraint_offset_is_taken_when_active() {
+        let out = run(|_| {}, r#"
+            local RS = game:GetService("ReplicatedStorage")
+            local function mk(parent)
+                local f = Instance.new("Model")
+                local a = Instance.new("Part") a.Name = "A" a.Anchored = true a.CFrame = CFrame.new(0, 500, 0) a.Parent = f
+                local b = Instance.new("Part") b.Name = "B" b.Anchored = true b.CFrame = CFrame.new(3, 500, 0) b.Parent = f
+                f.Parent = parent
+                return f, a, b
+            end
+            local function weld(a, b) local w = Instance.new("WeldConstraint") w.Part0 = a w.Part1 = b w.Parent = b return w end
+            local function off(f) return string.format("%.2f", (f.A.CFrame:Inverse() * f.B.CFrame).Position.X) end
+            local r = {}
+            local f, a, b = mk(RS) weld(a, b) b.CFrame = CFrame.new(7, 500, 0) f.Parent = workspace
+            table.insert(r, off(f))
+            local t, ta, tb = mk(RS) weld(ta, tb) tb.CFrame = CFrame.new(9, 500, 0)
+            local c = t:Clone() c.Parent = workspace
+            table.insert(r, off(c))
+            local g, ga, gb = mk(workspace) weld(ga, gb) g.Parent = RS gb.CFrame = CFrame.new(11, 500, 0) g.Parent = workspace
+            table.insert(r, off(g))
+            local h, ha, hb = mk(workspace) weld(ha, hb) h.Parent = RS
+            local hc = h:Clone() hc.B.CFrame = CFrame.new(13, 500, 0) hc.Parent = workspace
+            table.insert(r, off(hc))
+            local k, ka, kb = mk(workspace) local kw = weld(ka, kb) k.Parent = RS kb.CFrame = CFrame.new(15, 500, 0)
+            kw.Enabled = false kw.Enabled = true k.Parent = workspace
+            table.insert(r, off(k))
+            print("OFFSETS", table.concat(r, " "))
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "OFFSETS"), "7.00 9.00 3.00 3.00 15.00", "{out:?}");
+    }
+
+    /// a game's hunter rigs were built in ReplicatedStorage: their welds are
+    /// saved with State 1 and an identity CFrame0 (what a Studio save writes
+    /// for a weld that was never active). A clone parented into the
+    /// Workspace keeps its trim where the template has it. A weld saved
+    /// active (State 3) still puts a moved part back (a game's lantern).
+    #[test]
+    fn saved_never_active_weld_keeps_the_parts_where_they_are() {
+        let cf = |x: f32, y: f32| Variant::CFrame(rbx_dom_weak::types::CFrame::new(rbx_dom_weak::types::Vector3::new(x, y, 0.0), rbx_dom_weak::types::Matrix3::identity()));
+        let at = |x: f32| cf(x, 50.0);
+        let out = run(|d| {
+            let rs = d.find_child(d.dom.root_ref(), "ReplicatedStorage").unwrap();
+            for (name, state, c0) in [("Never", 1i32, 0.0f32), ("Active", 3i32, 2.0f32)] {
+                let m = d.dom.insert(rs, InstanceBuilder::new("Model").with_name(name));
+                let a = d.dom.insert(m, InstanceBuilder::new("Part").with_name("Torso").with_property("Anchored", true).with_property("CFrame", at(0.0)));
+                let b = d.dom.insert(m, InstanceBuilder::new("Part").with_name("Stain").with_property("Anchored", true).with_property("CFrame", at(0.45)));
+                d.dom.insert(b, InstanceBuilder::new("WeldConstraint")
+                    .with_property("Part0", Variant::Ref(a))
+                    .with_property("Part1", Variant::Ref(b))
+                    .with_property("State", state)
+                    .with_property("CFrame0", cf(c0, 0.0)));
+            }
+        }, r#"
+            local RS = game:GetService("ReplicatedStorage")
+            local function off(m) return string.format("%.2f", (m.Torso.CFrame:Inverse() * m.Stain.CFrame).Position.X) end
+            local never = RS.Never:Clone() never.Parent = workspace
+            local active = RS.Active:Clone() active.Parent = workspace
+            print("SAVED", off(never), off(active))
+        "#);
+        assert!(out.iter().all(|(l, _)| *l != Level::Error), "{out:?}");
+        assert_eq!(line(&out, "SAVED"), "0.45 2.00", "{out:?}");
     }
 }

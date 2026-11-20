@@ -9,6 +9,7 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+log = "0.4"
 rustudio-account = { path = "../rustudio-account" }
 libc = "0.2"
 rbx_dom_weak = "4"

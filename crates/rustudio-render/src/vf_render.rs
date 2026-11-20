@@ -454,6 +454,7 @@ impl Renderer {
             &self.localgrid_view,
             &self.studs_view,
             &self.studs_sampler,
+            &self.low_material_sampler,
             &self.materials,
             &self.probe.slot_views[self.probe.cur],
             &self.probe.slot_views[self.probe.next()],
@@ -488,15 +489,14 @@ impl Renderer {
             let draw = |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
                 let Some(mesh) = self.meshes.get(key.0) else { return };
                 pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
-                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                pass.draw(0..mesh.count, range);
+                mesh.draw(pass, range);
             };
             for r in &opaque_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.opaque } else { &self.opaque_two_sided });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
                 draw(&mut pass, r.0, r.1..r.2);
             }
             for r in &see_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.transparent_culled } else { &self.transparent });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.transparent_culled } else { &self.viewport.transparent });
                 draw(&mut pass, r.0, r.1..r.2);
             }
         }

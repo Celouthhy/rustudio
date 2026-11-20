@@ -13,7 +13,7 @@ use crate::instance::{Instance, InstanceBuilder};
 ///
 /// When constructing instances, you'll want to create [`InstanceBuilder`]
 /// objects and insert them into the tree.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WeakDom {
     instances: AHashMap<Ref, Instance>,
     root_ref: Ref,
@@ -21,6 +21,59 @@ pub struct WeakDom {
 }
 
 impl WeakDom {
+    /// Applies records from a later revision of a clone of this DOM. Each
+    /// supplied instance carries its final ordered children. A moved or new
+    /// instance's destination parent must also be supplied. Explicitly
+    /// deleted roots remove their old descendants, except supplied survivors.
+    /// Returns the referents of the instances that were removed.
+    pub fn apply_snapshot_tree(&mut self, records: AHashMap<Ref, Instance>, deleted: &[Ref]) -> Vec<Ref> {
+        let mut removed = AHashSet::new();
+        let mut removed_refs = Vec::new();
+        let mut pending = deleted.to_vec();
+        while let Some(r) = pending.pop() {
+            if records.contains_key(&r) || !removed.insert(r) {
+                continue;
+            }
+            if let Some(i) = self.instances.get(&r) {
+                removed_refs.push(r);
+                pending.extend_from_slice(&i.children);
+            }
+        }
+
+        // A parent with a supplied record already has its final order. Other
+        // old parents only lose children. Scan each such child list once.
+        let mut departing = AHashSet::new();
+        let mut old_parents = AHashSet::new();
+        for r in removed.iter().chain(records.keys()) {
+            let Some(old) = self.instances.get(r) else { continue };
+            if old.parent.is_some()
+                && !records.contains_key(&old.parent)
+                && !removed.contains(&old.parent)
+                && records.get(r).is_none_or(|new| new.parent != old.parent)
+            {
+                departing.insert(*r);
+                old_parents.insert(old.parent);
+            }
+        }
+        for parent in old_parents {
+            if let Some(i) = self.instances.get_mut(&parent) {
+                i.children.retain(|r| !departing.contains(r));
+            }
+        }
+        for &r in removed.iter().chain(records.keys()) {
+            if self.instances.contains_key(&r) {
+                self.inner_remove(r);
+            }
+        }
+        for (r, i) in records {
+            if let Some(Variant::UniqueId(id)) = i.properties.get(&ustr("UniqueId")) {
+                self.unique_ids.insert(*id);
+            }
+            self.instances.insert(r, i);
+        }
+        removed_refs
+    }
+
     /// Construct a new `WeakDom` described by the given [`InstanceBuilder`].
     pub fn new(builder: InstanceBuilder) -> WeakDom {
         let mut dom = WeakDom {

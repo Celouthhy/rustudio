@@ -487,6 +487,14 @@ fn mesh_shape_uncached(sig: &Sig, id: &str) -> Option<(rp::SharedShape, bool)> {
     }
 }
 
+fn rounded_cylinders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::solver::kind() != crate::solver::SolverKind::Rapier
+            && std::env::var("RUSTUDIO_SOLVER_ROUND_CYLINDERS").as_deref() != Ok("0")
+    })
+}
+
 /// The collider shape for a part, the shape's own offset inside the part,
 /// and whether a better (mesh) shape is still on its way.
 fn collider(sig: &Sig) -> (rp::ColliderBuilder, rp::Pose, bool) {
@@ -534,7 +542,20 @@ fn collider(sig: &Sig) -> (rp::ColliderBuilder, rp::Pose, bool) {
                 rp::Vector::ZERO,
                 rp::Rotation::from_rotation_z(-std::f32::consts::FRAC_PI_2),
             );
-            rp::ColliderBuilder::cylinder(h.x, h.y.min(h.z))
+            if rounded_cylinders() {
+                // Studio, GEOM §4: the collision support
+                // shape shrinks the core by 0.05 and dilates it by that margin.
+                // Assembly mass still comes from the unrounded part geometry.
+                const MARGIN: f32 = 0.05;
+                let h = h.max(Vec3::splat(0.025));
+                rp::ColliderBuilder::round_cylinder(
+                    (h.x - MARGIN).max(0.0),
+                    (h.y.min(h.z) - MARGIN).max(0.0),
+                    MARGIN,
+                )
+            } else {
+                rp::ColliderBuilder::cylinder(h.x, h.y.min(h.z))
+            }
         }
         3 => rp::ColliderBuilder::convex_hull(&pts(&[
             [-1.0, -1.0, -1.0],
@@ -1127,6 +1148,90 @@ pub struct StepResult {
     pub fallen: Vec<Ref>,
 }
 
+/// The world-tick budget prepared from one frame's script and document changes.
+pub struct PhysicsFrame {
+    doc_id: u64,
+    journal_pos: u64,
+    h: f32,
+    max_steps: usize,
+    due: f32,
+    stepped: bool,
+    /// 60 Hz frames of elapsed time the frame budget dropped.
+    owed: u32,
+    /// A real-time batch: the environmental throttle adapts to its cost.
+    adaptive: bool,
+}
+
+type PhysicsJobOutput = (Box<Physics>, PhysicsFrame, Vec<(&'static str, f64, u64)>);
+
+/// One in-flight frame of the server's simulation. The job owns the world
+/// and leaves DOM and Lua access to the caller.
+pub struct PhysicsJob {
+    result: std::sync::mpsc::Receiver<std::thread::Result<PhysicsJobOutput>>,
+    hurry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The frame's own ticks done so far, of `planned`.
+    progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    planned: u32,
+    /// Wall ms of a full tick and of a hurried one (moving averages when it started).
+    full_ms: f32,
+    hurried_ms: f32,
+}
+
+impl PhysicsJob {
+    /// The next frame wants the world now (play.rs, at the publication boundary): the
+    /// job steps only the Humanoid assemblies for the rest of its ticks and leaves the
+    /// environment's share owed (`Physics::advance_world`), so it finishes within about
+    /// one tick. Studio's client steps its character apart from the server's world;
+    /// here both share one world, so the world yields to the character instead.
+    pub fn hurry(&self) {
+        self.hurry.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume a completed job at the publication boundary.
+    pub fn try_join(&self) -> Option<(Box<Physics>, PhysicsFrame)> {
+        let start = std::time::Instant::now();
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("physics worker disconnected"),
+        };
+        Some(Self::finish_join(start, result))
+    }
+
+    /// Whether hurrying the unfinished job gets the frame its world sooner: always once
+    /// its own ticks are done (it is catching up the environment); before that, when
+    /// the rest of its ticks would take more than RUSTUDIO_PHYSICS_HURRY_MIN_MS (2) longer
+    /// in full than hurried. A world whose Humanoid-only ticks cost about what its full
+    /// ones do (a test place: ~100 NPCs, little else awake) is waited for as before.
+    pub fn should_hurry(&self) -> bool {
+        let done = self.progress.load(std::sync::atomic::Ordering::Relaxed);
+        if done >= self.planned {
+            return true;
+        }
+        let saving = (self.planned - done) as f32 * (self.full_ms - self.hurried_ms);
+        saving > hurry_min_ms()
+    }
+
+    /// Wait for the world when stopping or reading a final benchmark snapshot.
+    pub fn join(self) -> (Box<Physics>, PhysicsFrame) {
+        let start = std::time::Instant::now();
+        let result = self.result.recv().expect("physics worker disconnected");
+        Self::finish_join(start, result)
+    }
+
+    fn finish_join(
+        start: std::time::Instant,
+        result: std::thread::Result<PhysicsJobOutput>,
+    ) -> (Box<Physics>, PhysicsFrame) {
+        rustudio_core::bench::add("physics_join_wall", start.elapsed().as_secs_f64() * 1000.0, 1);
+        let (world, frame, sections) = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        for (name, work, calls) in sections {
+            rustudio_core::bench::add(name, work, calls);
+        }
+        (world, frame)
+    }
+}
+
 pub struct Physics {
     world: rp::PhysicsWorld,
     parts: rustc_hash::FxHashMap<Ref, PartBody>,
@@ -1136,9 +1241,9 @@ pub struct Physics {
     /// The parts whose overlaps something hears (play.rs `sync_touch_interest`); None:
     /// every part's (no runtime tells). See `apply_touch_quiet`.
     touch_parts: Option<rustc_hash::FxHashSet<Ref>>,
-    touch_gen: u64,
-    /// (touch_gen, colliders inserted) `apply_touch_quiet` last ran for.
-    touch_applied: Option<(u64, u64)>,
+    touch_refresh: bool,
+    /// Newly registered colliders awaiting touch filtering.
+    touch_pending: Vec<rp::ColliderHandle>,
     /// Rigid joints: joint → (Part0, Part1), and part → its joints.
     joints: HashMap<Ref, (Ref, Ref)>,
     adj: HashMap<Ref, Vec<Ref>>,
@@ -1243,6 +1348,72 @@ pub struct Physics {
     /// RUSTUDIO_SOLVER_STATS=1: bodies / contacts / islands counted after
     /// every world step (either solver; checks/humanoid-physics/solver/perf.sh).
     census: Option<Box<crate::solver::Census>>,
+    /// Workspace.PhysicsEnvironmentalThrottle and its adaptive level (throttle.rs).
+    throttle: crate::throttle::Throttle,
+    /// Play steps by wall time (not --fixed-dt): the throttle may adapt.
+    realtime: bool,
+    /// Set by `PhysicsJob::hurry` while this world runs as a job.
+    hurry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The running job's own ticks done (`PhysicsJob::should_hurry`).
+    progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Wall ms of a full tick and of a hurried one (moving averages).
+    tick_full_ms: f32,
+    tick_hurried_ms: f32,
+    /// 240 Hz ticks of environment time that hurried frames still owe (`advance_world`).
+    env_owed: u32,
+    /// The current 60 Hz frame's environment sits out for a hurried frame (owed).
+    env_hurried: bool,
+    /// 60 Hz frames since the environment last stepped a tick.
+    env_starved: u32,
+}
+
+/// Environment ticks owed at most (Play's 1/15 s game-step cap); older ones are lost, as a
+/// throttled frame's are.
+const ENV_OWED_MAX: u32 = mech::MAX_PHYSICS_STEPS as u32;
+/// Frames the environment may sit out in a row before a hurried job still catches up
+/// one frame of it: Studio's highest throttle level steps it one frame in 16
+/// (throttle.rs).
+const ENV_STARVE_MAX: u32 = 15;
+
+/// The bodies of the Humanoid assemblies (the throttle's exempt set, throttle.rs): each
+/// Humanoid's body and, seated on a loose seat, the seat's body (the SeatWeld makes the
+/// vehicle part of the character's assembly in Studio; here they are two bodies joined).
+fn humanoid_assemblies<'a>(
+    hums: &'a hum_body::Hums,
+    parts: &'a rustc_hash::FxHashMap<Ref, PartBody>,
+    asms: &'a HashMap<u32, Assembly>,
+) -> impl Iterator<Item = rp::RigidBodyHandle> + 'a {
+    hums.by_model.values().flat_map(move |hb| {
+        let seat = match hb.seat {
+            Some((part, Some(_))) => parts.get(&part).and_then(|pb| pb.asm).and_then(|id| asms.get(&id)).map(|a| a.body),
+            _ => None,
+        };
+        std::iter::once(hb.body).chain(seat)
+    })
+}
+
+/// RUSTUDIO_PHYSICS_HURRY=0: a publication waits for the whole world's batch (A/B).
+pub fn hurry_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_HURRY").as_deref() != Ok("0"))
+}
+
+/// RUSTUDIO_PHYSICS_CATCHUP=0: a hurried frame's environment ticks are lost, as a
+/// throttled frame's are, instead of owed (A/B).
+fn catch_up_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_CATCHUP").as_deref() != Ok("0"))
+}
+
+/// RUSTUDIO_PHYSICS_HURRY_MIN_MS: the least saving a hurry must promise
+/// (`PhysicsJob::should_hurry`).
+fn hurry_min_ms() -> f32 {
+    static M: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_HURRY_MIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0))
+}
+
+fn ema(avg: &mut f32, ms: f32) {
+    *avg = if *avg == 0.0 { ms } else { 0.8 * *avg + 0.2 * ms };
 }
 
 /// `A/B/C`: find_named one segment at a time.
@@ -1331,8 +1502,8 @@ impl Physics {
             next_asm: 0,
             by_collider: Default::default(),
             touch_parts: None,
-            touch_gen: 0,
-            touch_applied: None,
+            touch_refresh: false,
+            touch_pending: Vec::new(),
             joints: HashMap::default(),
             adj: HashMap::default(),
             collector: Collector::default(),
@@ -1373,6 +1544,15 @@ impl Physics {
             client_owned: HashSet::default(),
             studio: (crate::solver::kind() != crate::solver::SolverKind::Rapier).then(|| Box::new(crate::solver::StudioSolver::new(crate::solver::kind()))),
             census: std::env::var_os("RUSTUDIO_SOLVER_STATS").is_some().then(Default::default),
+            throttle: Default::default(),
+            realtime: false,
+            hurry: Default::default(),
+            progress: Default::default(),
+            tick_full_ms: 0.0,
+            tick_hurried_ms: 0.0,
+            env_owed: 0,
+            env_hurried: false,
+            env_starved: 0,
         };
         p.skip = skip;
         // Start reading the journal from here.
@@ -1440,6 +1620,16 @@ impl Physics {
             }
         }
         if let Some(sv) = self.studio.as_mut() {
+            // A fat leaf stays valid while the real AABB fits inside it;
+            // animated limbs can move without rewriting the map's query tree.
+            self.world.broad_phase.adaptive_change_detection_margin = true;
+            // Workspace.PhysicsSteppingMethod is authored in Studio. Default
+            // and Adaptive keep three assembly rates, Fixed uses only 240 Hz.
+            sv.cfg.max_level = if enum_u32(doc.prop(ws, "PhysicsSteppingMethod")) == Some(1) {
+                1
+            } else {
+                crate::solver::Config::default().max_level
+            };
             // Part serials for the solver's pair order (narrow.rs `first_is_a`).
             sv.number_parts(doc.dom.descendants_of(ws).map(|i| i.referent()));
         }
@@ -1637,7 +1827,7 @@ impl Physics {
                 let c = self
                     .world
                     .insert_collider(b.position(pose(xf) * offset), None);
-                self.by_collider.insert(c, *r);
+                self.register_collider(c, *r);
                 if let (Some(sv), Some(co)) = (self.studio.as_mut(), self.world.colliders.get(c)) {
                     sv.note_collider(c, *r, co.shape());
                 }
@@ -1733,7 +1923,7 @@ impl Physics {
             let c = self
                 .world
                 .insert_collider(b.position(local * offset), Some(body));
-            self.by_collider.insert(c, *r);
+            self.register_collider(c, *r);
             if let (Some(sv), Some(co)) = (self.studio.as_mut(), self.world.colliders.get(c)) {
                 sv.note_collider(c, *r, co.shape());
             }
@@ -2230,7 +2420,7 @@ impl Physics {
                 .restitution(mech::TERRAIN_ELASTICITY)
                 .active_events(rp::ActiveEvents::COLLISION_EVENTS);
             let c = self.world.insert_collider(b, None);
-            self.by_collider.insert(c, t);
+            self.register_collider(c, t);
             self.terrain_colliders.push(c);
             self.terrain_tris += n;
         }
@@ -2668,7 +2858,7 @@ impl Physics {
     /// Puts every mover's force and torque on its body for the next step.
     /// Forces from the previous step are cleared first; bodies that get a
     /// non-zero push are woken.
-    fn apply_movers(&mut self, doc: &Document) {
+    fn apply_movers(&mut self, doc: Option<&Document>) {
         for h in self.pushed.drain() {
             if let Some(b) = self.world.bodies.get_mut(h) {
                 b.reset_forces(false);
@@ -2678,10 +2868,10 @@ impl Physics {
         for t in self.lv_track.values_mut() {
             t.live = false;
         }
-        if self.movers.is_empty() && self.hums.foreign.is_empty() {
+        let Some(doc) = doc.filter(|_| !self.movers.is_empty() || !self.hums.foreign.is_empty()) else {
             self.lv_track.clear();
             return;
-        }
+        };
         let h = self.world.integration_parameters.dt;
         let g = gv(self.world.gravity);
         let mut out: Vec<(rp::RigidBodyHandle, Vec3, Vec3)> = Vec::new();
@@ -2816,13 +3006,14 @@ impl Physics {
                 // still lands once it passes the tolerance.
                 let shape_offset = self.shape_offset(pb.collider);
                 let (ep, er) = self.follower_eps;
-                if let Some(c) = self.world.colliders.get_mut(pb.collider) {
+                if let Some(c) = self.world.colliders.get(pb.collider) {
                     let want = target * shape_offset;
                     let cur = *c.position();
-                    let same = (cur.translation - want.translation).length_squared() < ep * ep
-                        && cur.rotation.dot(want.rotation).abs() > 1.0 - er;
+                    let same = cur == want
+                        || ((cur.translation - want.translation).length_squared() < ep * ep
+                            && cur.rotation.dot(want.rotation).abs() > 1.0 - er);
                     if !same {
-                        c.set_position(want);
+                        self.world.colliders.get_mut(pb.collider).unwrap().set_position(want);
                         if let Some(sv) = self.studio.as_mut() {
                             sv.support_changed(pb.collider);
                         }
@@ -2832,12 +3023,12 @@ impl Physics {
             Some(a) => {
                 let body_pose = target * pb.local.inverse();
                 let body = a.body;
-                if let Some(b) = self.world.bodies.get_mut(body) {
+                if let Some(b) = self.world.bodies.get(body) {
                     let cur = xform(b.position());
                     let want = xform(&body_pose);
                     if (cur.pos - want.pos).length() > 1e-4 || !cur.rot.abs_diff_eq(want.rot, 1e-4)
                     {
-                        b.set_position(body_pose, true);
+                        self.world.bodies.get_mut(body).unwrap().set_position(body_pose, true);
                     }
                 }
             }
@@ -2851,7 +3042,7 @@ impl Physics {
         };
         if let Some(o) = self.union_offsets.get(&c) {
             *o
-        } else if col.shape().as_cylinder().is_some() {
+        } else if col.shape().as_cylinder().is_some() || col.shape().as_round_cylinder().is_some() {
             rp::Pose::from_parts(
                 rp::Vector::ZERO,
                 rp::Rotation::from_rotation_z(-std::f32::consts::FRAC_PI_2),
@@ -3101,6 +3292,12 @@ impl Physics {
     /// once (Place A sets 64 = the source game's 800 units/s² from Server/Main after Play has
     /// started); read only at `new`, the change never reached the solver or
     /// the Humanoid, which then fell at the place's 196.2.
+    /// Whether frames carry wall time (Play) rather than a fixed step: only then does the
+    /// environmental throttle adapt its level to the cost (throttle.rs).
+    pub fn set_realtime(&mut self, on: bool) {
+        self.realtime = on;
+    }
+
     pub fn sync_gravity(&mut self, doc: &Document) {
         let g = doc
             .workspace()
@@ -3120,8 +3317,17 @@ impl Physics {
     /// The parts something hears touches of (a Touched / TouchEnded / … connection on
     /// the part, or Humanoid.Touched on its character): the others' colliders go quiet.
     pub fn set_touch_interest(&mut self, parts: rustc_hash::FxHashSet<Ref>) {
-        self.touch_parts = Some(parts);
-        self.touch_gen += 1;
+        if self.touch_parts.as_ref() != Some(&parts) {
+            self.touch_parts = Some(parts);
+            self.touch_refresh = true;
+        }
+    }
+
+    fn register_collider(&mut self, handle: rp::ColliderHandle, part: Ref) {
+        self.by_collider.insert(handle, part);
+        if self.touch_parts.is_some() && !self.touch_refresh {
+            self.touch_pending.push(handle);
+        }
     }
 
     /// Studio tests a part's overlaps only when it has a TouchTransmitter (a script
@@ -3132,19 +3338,113 @@ impl Physics {
     /// fired events with no listener. Contact pairs are unaffected.
     fn apply_touch_quiet(&mut self) {
         let Some(set) = &self.touch_parts else { return };
-        let key = (self.touch_gen, self.world.colliders.inserted_count());
-        if self.touch_applied == Some(key) {
-            return;
-        }
-        self.touch_applied = Some(key);
-        for (c, r) in &self.by_collider {
-            if let Some(co) = self.world.colliders.get_mut(*c) {
-                co.set_touch_quiet(!set.contains(r));
+        let colliders = &mut self.world.colliders;
+        let mut update = |c, r| {
+            let quiet = !set.contains(&r);
+            if colliders.get(c).is_some_and(|co| co.touch_quiet() != quiet) {
+                colliders.get_mut(c).unwrap().set_touch_quiet(quiet);
+            }
+        };
+        if std::mem::take(&mut self.touch_refresh) {
+            for (&c, &r) in &self.by_collider {
+                update(c, r);
+            }
+            self.touch_pending.clear();
+        } else {
+            for c in self.touch_pending.drain(..) {
+                if let Some(&r) = self.by_collider.get(&c) {
+                    update(c, r);
+                }
             }
         }
     }
 
     pub fn step(&mut self, doc: &mut Document, dt: f32) -> StepResult {
+        let solve = rustudio_core::bench::scope("physics_solve");
+        let frame = self.prepare_frame(doc, dt);
+        if frame.stepped {
+            if let Some(pool) = self.step_pool() {
+                let start = std::time::Instant::now();
+                let sections = pool.install(|| self.measure_batch(Some(doc), &frame));
+                rustudio_core::bench::add("physics_join_wall", start.elapsed().as_secs_f64() * 1000.0, 1);
+                for (name, work, calls) in sections {
+                    rustudio_core::bench::add(name, work, calls);
+                }
+            } else {
+                with_inline_pool(|pool| match pool {
+                    Some(pool) => pool.install(|| self.advance_world(Some(doc), &frame)),
+                    None => self.advance_world(Some(doc), &frame),
+                });
+            }
+        }
+        drop(solve);
+        self.finish_frame(doc, frame)
+    }
+
+    /// Start a worker-owned step when all per-tick inputs are already held
+    /// by the solver. Legacy movers and tick dumps can read the live DOM.
+    pub fn start_frame(
+        mut self: Box<Self>,
+        doc: &mut Document,
+        dt: f32,
+    ) -> Result<PhysicsJob, Box<Self>> {
+        static PIPELINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *PIPELINE.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_PIPELINE").as_deref() != Ok("0"));
+        if !enabled || self.studio.is_none() || !self.hums.foreign.is_empty() || tick_dump_on() {
+            return Err(self);
+        }
+        let Some(pool) = self.step_pool() else { return Err(self) };
+        let _solve = rustudio_core::bench::scope("physics_solve");
+        let frame = self.prepare_frame(doc, dt);
+        self.hurry.store(false, std::sync::atomic::Ordering::Relaxed);
+        let hurry = self.hurry.clone();
+        self.progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        let progress = self.progress.clone();
+        let mut planned = 0;
+        if frame.stepped {
+            let mut a = self.accum;
+            while planned < frame.max_steps && a > frame.due {
+                a -= frame.h;
+                planned += 1;
+            }
+        }
+        let (full_ms, hurried_ms) = (self.tick_full_ms, self.tick_hurried_ms);
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        pool.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let sections = self.measure_batch(None, &frame);
+                (self, frame, sections)
+            }));
+            let _ = send.send(result);
+        });
+        Ok(PhysicsJob { result, hurry, progress, planned: planned as u32, full_ms, hurried_ms })
+    }
+
+    fn measure_batch(&mut self, doc: Option<&Document>, frame: &PhysicsFrame) -> Vec<(&'static str, f64, u64)> {
+        let start = std::time::Instant::now();
+        let before = self.steps;
+        {
+            let _worker = rustudio_core::bench::scope("physics_solve_worker");
+            if frame.stepped {
+                self.advance_world(doc, frame);
+            }
+        }
+        let ticks = self.steps - before;
+        if doc.is_none() {
+            rustudio_core::bench::add("physics_batch_ticks", 0.0, ticks);
+            if ticks >= frame.max_steps as u64 {
+                rustudio_core::bench::add("physics_batch_tick_cap", 0.0, 1);
+            }
+            if let Some(solver) = &self.studio {
+                rustudio_core::bench::add("physics_batch_awake", 0.0, u64::from(solver.stats.awake));
+                rustudio_core::bench::add("physics_batch_largest_island", 0.0, u64::from(solver.stats.largest_island));
+            }
+        }
+        rustudio_core::bench::add("physics_batch_wall", start.elapsed().as_secs_f64() * 1000.0, 1);
+        rustudio_core::bench::take_sections()
+    }
+
+    fn prepare_frame(&mut self, doc: &mut Document, dt: f32) -> PhysicsFrame {
         self.apply_touch_quiet();
         self.sync_gravity(doc);
         self.take_script_impulses(doc.id);
@@ -3155,11 +3455,26 @@ impl Physics {
                 self.pending_vel.insert(r, (v, left - 1));
             }
         }
-        let mut out = StepResult::default();
         let (hz, _, max_steps) = step_rate();
         let h = 1.0 / hz;
-        self.accum = (self.accum + dt).min(h * max_steps as f32);
-        let _solve = rustudio_core::bench::scope("physics_solve");
+        // Discard elapsed time above the frame budget on a hitch. Keep the
+        // fractional remainder so ordinary frames stay on the 240 Hz grid.
+        let wanted = self.accum + dt.max(0.0);
+        self.accum = wanted.min(h * max_steps as f32);
+        let owed = ((wanted - self.accum) * 60.0) as u32;
+        self.throttle.mode = doc
+            .workspace()
+            .and_then(|w| match doc.prop(w, "PhysicsEnvironmentalThrottle") {
+                Some(Variant::Enum(e)) => Some(crate::throttle::Mode::from_value(e.to_u32())),
+                _ => None,
+            })
+            .unwrap_or_default();
+        // Harness: RUSTUDIO_PHYSICS_ENV_THROTTLE=<enum value> overrides the property
+        // (it is not scriptable; 2 = Always measures Humanoid-only ticks).
+        static FORCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(v) = *FORCE.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_ENV_THROTTLE").ok().and_then(|v| v.parse().ok())) {
+            self.throttle.mode = crate::throttle::Mode::from_value(v);
+        }
         let jsc = rustudio_core::bench::scope("ph_joints");
         {
             let _a = rustudio_core::bench::scope("pj_apply_joints");
@@ -3189,30 +3504,14 @@ impl Physics {
         let due = h * 1e-3;
         let stepped = self.accum > due;
         self.hums.frame_start = true;
-        while self.accum > due {
-            let msc = rustudio_core::bench::scope("ph_movers");
-            self.apply_movers(doc);
-            self.apply_drags(doc.id);
-            drop(msc);
-            let rsc = rustudio_core::bench::scope("ph_ropes_springs");
-            self.apply_ropes(doc, h);
-            self.apply_springs(doc, h);
-            drop(rsc);
-            self.humanoid_forces(h);
-            self.link_forces(h);
-            let wsc = rustudio_core::bench::scope("ph_world_step");
-            self.world_step();
-            drop(wsc);
-            self.track_velocity_constraints();
-            self.accum -= h;
-            self.steps += 1;
-            self.humanoid_solved();
-            if tick_dump_on() {
-                self.dump_tick(doc);
-            }
-        }
-        drop(_solve);
-        if stepped {
+        PhysicsFrame { doc_id: doc.id, journal_pos: doc.journal_end(), h, max_steps, due, stepped, owed, adaptive: self.realtime }
+    }
+
+    /// Publish the completed step on the main thread before post-simulation scripts.
+    pub fn finish_frame(&mut self, doc: &mut Document, frame: PhysicsFrame) -> StepResult {
+        debug_assert_eq!(doc.id, frame.doc_id);
+        let mut out = StepResult::default();
+        if frame.stepped {
             // Stats.ContactsCount: collider pairs touching after the frame's
             // last step (read between frames; counting after every world
             // step only overwrote it).
@@ -3229,7 +3528,17 @@ impl Physics {
             }
         }
         let cframe = ustr("CFrame");
+        // UI and plugin edits can arrive while a step is running. Keep them
+        // for the next sync and give them precedence over that step's poses.
+        let edits = doc.marks_since(frame.journal_pos).map(<[_]>::to_vec);
+        let Some(edits) = edits else { return out };
         for a in self.asms.values() {
+            if edits.iter().any(|mark| a.parts.iter().any(|r| match *mark {
+                doc::Mark::Prop(part, _) => *r == part,
+                doc::Mark::Tree(root) => *r == root || doc.is_ancestor(root, *r),
+            })) {
+                continue;
+            }
             let Some(b) = self.world.bodies.get(a.body) else {
                 continue;
             };
@@ -3265,7 +3574,7 @@ impl Physics {
             }
         }
         // Our own CFrame writes aren't news to us.
-        if !out.moved.is_empty() {
+        if edits.is_empty() && !out.moved.is_empty() {
             if let doc::Marks::Some(rest) = doc.marks_for(doc::Reader::Physics) {
                 let others: Vec<doc::Mark> = rest
                     .into_iter()
@@ -3298,25 +3607,184 @@ impl Physics {
         }
     }
 
-    /// One world step (step_rate). A world with up to
-    /// `mech::PHYSICS_SERIAL_MAX_AWAKE` awake bodies steps on the calling thread,
-    /// inside a one-worker rayon pool that is that thread itself (`with_inline_pool`):
-    /// rapier's rayon fan-out (BVH refit, pair and solver joins) made every small
-    /// step spin the calling thread for the pool, 2.6 M of its instructions per
-    /// 1/240 s step (about 25 awake bodies),
-    /// and handing each step to a thread of its own cost a wake-up per 1/240 s tick
-    /// (the NPC test place under load: 14.3 ms per frame waited on 8.6 ms of step work).
-    /// Many awake bodies use the shared pool (`par_pool`).
-    fn world_step(&mut self) {
-        let awake = match &self.studio {
-            Some(sv) => sv.stats.awake as usize,
-            None => self.world.islands.active_bodies().count(),
-        };
-        // RUSTUDIO_SOLVER_SERIAL=1 (perf runs): every step on the one thread,
-        // so the instruction counter sees all of it (solver/perf.sh).
+    fn advance_world(&mut self, doc: Option<&Document>, frame: &PhysicsFrame) {
+        let PhysicsFrame { doc_id, h, max_steps, due, .. } = *frame;
+        let studio = self.studio.is_some();
+        // A hurried job (`PhysicsJob::hurry`, real-time Play only) runs its remaining
+        // ticks as throttled ones: the Humanoid assemblies step against the environment
+        // held still. Unlike the throttle's frames the environment's ticks are owed, not
+        // lost: `catch_up_environment` steps them while no frame is waiting.
+        let can_hurry = studio && frame.adaptive && doc.is_none() && hurry_enabled();
+        let mut hurried_frames = 0u64;
+        // The environmental throttle decides per 60 Hz frame (a group of
+        // maxLevel ticks); an unthrottled frame's wall time feeds its level
+        // (its ticks may span two batches).
+        for _ in 0..max_steps {
+            if self.accum <= due {
+                break;
+            }
+            let tick_start = std::time::Instant::now();
+            if let Some(sv) = self.studio.as_mut() {
+                let hurried = can_hurry && self.hurry.load(std::sync::atomic::Ordering::Relaxed);
+                let was_throttled = sv.throttled;
+                if sv.ticks % 4 == 0 {
+                    let throttled = self.throttle.begin_frame();
+                    // The environment joins a frame only at its own phase 0 (no partial
+                    // frame owed) and sits out a hurried one.
+                    self.env_hurried = !throttled && (self.env_owed % 4 != 0 || hurried);
+                    if throttled || self.env_hurried {
+                        self.env_starved += 1;
+                    } else {
+                        self.env_starved = 0;
+                    }
+                    if self.env_hurried {
+                        self.throttle.cut();
+                        hurried_frames += 1;
+                    }
+                    sv.throttled = throttled || self.env_hurried;
+                } else if hurried && !sv.throttled {
+                    self.env_hurried = true;
+                    self.throttle.cut();
+                    sv.throttled = true;
+                    hurried_frames += 1;
+                }
+                if sv.throttled && (sv.ticks % 4 == 0 || !was_throttled) {
+                    sv.throttle_exempt.clear();
+                    sv.throttle_exempt.extend(humanoid_assemblies(&self.hums, &self.parts, &self.asms));
+                }
+                if self.env_hurried {
+                    self.env_owed += 1;
+                    if self.env_owed > ENV_OWED_MAX {
+                        self.env_owed -= 4;
+                        rustudio_core::bench::add("physics_env_lost_ticks", 0.0, 4);
+                    }
+                }
+            }
+            let msc = rustudio_core::bench::scope("ph_movers");
+            self.apply_movers(doc);
+            self.apply_drags(doc_id);
+            drop(msc);
+            let rsc = rustudio_core::bench::scope("ph_ropes_springs");
+            if let Some(doc) = doc {
+                self.apply_ropes(doc, h);
+                self.apply_springs(doc, h);
+            }
+            drop(rsc);
+            {
+                let _hum = rustudio_core::bench::scope("ph_humanoid_forces");
+                self.humanoid_forces(h);
+            }
+            self.link_forces(h);
+            let wsc = rustudio_core::bench::scope("ph_world_step");
+            self.world_step();
+            drop(wsc);
+            self.track_velocity_constraints();
+            self.accum -= h;
+            self.steps += 1;
+            if studio {
+                self.throttle.record_tick(tick_start.elapsed().as_secs_f32() * 1000.0);
+                let ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+                if self.env_hurried {
+                    rustudio_core::bench::add("physics_hurried_tick", ms, 1);
+                    ema(&mut self.tick_hurried_ms, ms as f32);
+                } else if self.studio.as_ref().is_some_and(|sv| !sv.throttled) {
+                    ema(&mut self.tick_full_ms, ms as f32);
+                }
+                self.progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !studio {
+                self.humanoid_solved();
+            }
+            if let Some(doc) = doc.filter(|_| tick_dump_on()) {
+                self.dump_tick(doc);
+            }
+        }
+        if studio {
+            // Studio publishes moved poses after the frame's world steps.
+            self.humanoid_solved();
+            if frame.adaptive {
+                self.throttle.adapt(1000.0 / 60.0, frame.owed);
+            }
+            rustudio_core::bench::add("physics_throttle_pct", self.throttle.percent(), 1);
+            if hurried_frames > 0 {
+                rustudio_core::bench::add("physics_hurried_frames", 0.0, hurried_frames);
+            }
+            self.catch_up_environment(doc, doc_id, h);
+        }
+    }
+
+    /// The environment's owed ticks (hurried frames, `advance_world`), oldest first, until
+    /// a frame wants the world (`PhysicsJob::hurry`). Each runs at the phase the
+    /// environment left off at, with the Humanoid assemblies and the client's stand-ins
+    /// held still: they are already at the newer time.
+    fn catch_up_environment(&mut self, doc: Option<&Document>, doc_id: u64, h: f32) {
+        if self.env_owed == 0 {
+            return;
+        }
+        if !catch_up_enabled() {
+            rustudio_core::bench::add("physics_env_lost_ticks", 0.0, u64::from(self.env_owed));
+            self.env_owed = 0;
+            return;
+        }
+        let Some(sv) = self.studio.as_mut() else { return };
+        let saved = std::mem::take(&mut sv.throttle_exempt);
+        let was_throttled = std::mem::replace(&mut sv.throttled, false);
+        sv.throttle_exempt.extend(humanoid_assemblies(&self.hums, &self.parts, &self.asms));
+        sv.throttle_exempt.extend(self.link.proxy_bodies());
+        let mut ticks = 0u64;
+        // The floor: after ENV_STARVE_MAX frames without a tick the environment takes one
+        // frame's worth even when hurried.
+        let floor = if self.env_starved >= ENV_STARVE_MAX { 4 } else { 0 };
+        while self.env_owed > 0 && (ticks < floor || !self.hurry.load(std::sync::atomic::Ordering::Relaxed)) {
+            let phase = ((4 - self.env_owed % 4) % 4) as u8;
+            if let Some(sv) = self.studio.as_mut() {
+                sv.env_phase = Some(phase);
+            }
+            {
+                let _m = rustudio_core::bench::scope("ph_movers");
+                self.apply_movers(doc);
+                self.apply_drags(doc_id);
+            }
+            if let Some(doc) = doc {
+                let _r = rustudio_core::bench::scope("ph_ropes_springs");
+                self.apply_ropes(doc, h);
+                self.apply_springs(doc, h);
+            }
+            let wsc = rustudio_core::bench::scope("ph_world_step");
+            self.world_step();
+            drop(wsc);
+            self.track_velocity_constraints();
+            self.env_owed -= 1;
+            ticks += 1;
+        }
+        if let Some(sv) = self.studio.as_mut() {
+            sv.env_phase = None;
+            sv.throttled = was_throttled;
+            sv.throttle_exempt = saved;
+        }
+        if ticks > 0 {
+            self.env_starved = 0;
+            rustudio_core::bench::add("physics_env_catchup_ticks", 0.0, ticks);
+        }
+    }
+
+    /// Parallelize a frame when its previous tick had enough independent
+    /// islands or contact pairs to keep more than one worker busy.
+    fn step_pool(&self) -> Option<&'static rapier3d::rayon::ThreadPool> {
         static ALL_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let all_serial = *ALL_SERIAL.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_SERIAL").is_some());
-        let serial = all_serial || awake <= mech::PHYSICS_SERIAL_MAX_AWAKE;
+        if *ALL_SERIAL.get_or_init(|| std::env::var_os("RUSTUDIO_SOLVER_SERIAL").is_some()) {
+            return None;
+        }
+        let parallel = match &self.studio {
+            Some(solver) => (solver.full_stats.awake >= 64 && solver.full_stats.islands >= 64)
+                || solver.full_stats.contact_pairs >= 256,
+            None => self.world.islands.active_bodies().count() > mech::PHYSICS_SERIAL_MAX_AWAKE,
+        };
+        parallel.then(par_pool).flatten().filter(|pool| pool.current_num_threads() > 1)
+    }
+
+    fn world_step(&mut self) {
+        let step = rustudio_core::bench::scope("ph_step_thread");
         let (world, collector) = (&mut self.world, &self.collector);
         // (Contacts across the network-ownership boundary: physics_humanoid.rs.)
         let owner_hooks = hum_body::OwnerHooks(&self.hums.roles, self.gravity, &self.hums.mid, &self.link, &self.by_collider);
@@ -3339,7 +3807,7 @@ impl Physics {
                 }
             }
             let g = gv(world.gravity);
-            let ((), work) = run_step(serial, || sv.step(world, g, hooks, collector));
+            let ((), work) = rustudio_core::bench::measure(|| sv.step(world, g, hooks, collector));
             if let Some(c) = self.census.as_ref() {
                 rustudio_core::bench::add(c.section(), work, 1);
             }
@@ -3347,11 +3815,12 @@ impl Physics {
                 rustudio_core::bench::add(name, cost, 1);
             }
         } else {
-            let ((), work) = run_step(serial, || world.step_with_events(hooks, collector));
+            let ((), work) = rustudio_core::bench::measure(|| world.step_with_events(hooks, collector));
             if let Some(c) = self.census.as_ref() {
                 rustudio_core::bench::add(c.section(), work, 1);
             }
         }
+        drop(step);
         if let Some(c) = self.census.as_mut() {
             // Under the Studio solver, awake = in that solver's last tick (sleep.rs state).
             c.observe(&self.world, self.studio.as_ref().map(|sv| &sv.bodies));
@@ -3651,7 +4120,7 @@ impl Physics {
 
     /// What scripts read off the simulation (live::Stats) for this document.
     fn publish_live(&self, doc_id: u64) {
-        let mut st = live::Stats::default();
+        let mut st = live::Stats { throttle_pct: Some(self.throttle.percent()), ..Default::default() };
         for a in self.asms.values() {
             let Some(b) = self.world.bodies.get(a.body) else { continue };
             if !b.is_dynamic() {
@@ -3696,6 +4165,8 @@ pub mod live {
     pub struct Stats {
         pub awake_assemblies: usize,
         pub awake_parts: usize,
+        /// workspace:GetPhysicsThrottling() (throttle.rs), 100 when unthrottled.
+        pub throttle_pct: Option<f64>,
         /// Part → (assembly angular velocity, assembly centre of mass).
         pub spin: HashMap<Ref, (Vec3, Vec3)>,
     }
@@ -3767,6 +4238,7 @@ pub mod live {
         let copy = Stats {
             awake_assemblies: st.awake_assemblies,
             awake_parts: st.awake_parts,
+            throttle_pct: st.throttle_pct,
             spin: st.spin.iter().filter_map(|(k, v)| s2c.get(k).map(|c| (*c, *v))).collect(),
         };
         sh.stats.insert(to, copy);
@@ -4588,6 +5060,168 @@ mod tests {
         // Origin is .02 below the root, reach is .3 * .05 = .015.
         assert!(p.find_floor(Vec3::new(60.0, 0.03, 60.0), Quat::IDENTITY, &sh, false, &std::collections::HashSet::<Ref>::new()).is_some());
         assert!(p.find_floor(Vec3::new(60.0, 0.04, 60.0), Quat::IDENTITY, &sh, false, &std::collections::HashSet::<Ref>::new()).is_none());
+    }
+
+    #[test]
+    fn prepared_studio_step_publishes_only_at_completion() {
+        let fixture = || hum_world(vec![part("Block", Vec3::Y * 100.0, false)]);
+        let (mut doc, mut physics) = fixture();
+        let (mut sync_doc, mut sync) = fixture();
+        let block = doc.find_named(doc.workspace().unwrap(), "Block").unwrap();
+        let sync_block = sync_doc.find_named(sync_doc.workspace().unwrap(), "Block").unwrap();
+        let before = doc.prop(block, "CFrame");
+        let dt = 1.0 / 60.0;
+
+        let frame = physics.prepare_frame(&mut doc, dt);
+        physics.advance_world(None, &frame);
+        assert_eq!(doc.prop(block, "CFrame"), before);
+        physics.finish_frame(&mut doc, frame);
+        sync.step(&mut sync_doc, dt);
+        assert_ne!(doc.prop(block, "CFrame"), before);
+        assert_eq!(doc.prop(block, "CFrame"), sync_doc.prop(sync_block, "CFrame"));
+    }
+
+    #[test]
+    fn completed_frame_preserves_a_later_cframe_edit() {
+        let (mut doc, mut physics) = hum_world(vec![part("Block", Vec3::Y * 100.0, false)]);
+        let block = doc.find_named(doc.workspace().unwrap(), "Block").unwrap();
+        let dt = 1.0 / 60.0;
+        let frame = physics.prepare_frame(&mut doc, dt);
+        physics.advance_world(None, &frame);
+
+        let edited = Variant::CFrame(Xform { pos: Vec3::Y * 200.0, rot: Mat3::IDENTITY }.to_cframe());
+        doc.dom.get_by_ref_mut(block).unwrap().properties.insert(ustr("CFrame"), edited.clone());
+        doc.mark_prop(block, ustr("CFrame"));
+        let result = physics.finish_frame(&mut doc, frame);
+
+        assert_eq!(doc.prop(block, "CFrame"), Some(edited));
+        assert!(!result.moved.iter().any(|(r, _)| *r == block));
+        physics.sync(&mut doc);
+        physics.step(&mut doc, dt);
+        let Some(Variant::CFrame(cf)) = doc.prop(block, "CFrame") else { panic!("missing block pose") };
+        let pos = Xform::from_cframe(&cf).pos;
+        assert!((199.0..200.0).contains(&pos.y), "next frame continued from the edit: {pos}");
+    }
+
+    /// Workspace.PhysicsEnvironmentalThrottle: a throttled 60 Hz frame holds every
+    /// assembly without a Humanoid still (Studio: plain parts gain 0.25 g per game
+    /// second at 25 %), a resting one stays at rest, and Disabled steps every frame.
+    #[test]
+    fn environmental_throttle_steps_one_frame_in_n() {
+        if crate::solver::kind() == crate::solver::SolverKind::Rapier {
+            return; // the legacy solver steps everything (no throttle)
+        }
+        let fall = |mode: u32| {
+            let (mut doc, mut physics) = hum_world(vec![
+                part("Block", Vec3::Y * 100.0, false),
+                part("Rest", Vec3::new(20.0, 1.0, 0.0), false),
+            ]);
+            let ws = doc.workspace().unwrap();
+            doc.dom.get_by_ref_mut(ws).unwrap().properties.insert(
+                ustr("PhysicsEnvironmentalThrottle"), Variant::Enum(rbx_dom_weak::types::Enum::from_u32(mode)),
+            );
+            let block = doc.find_named(ws, "Block").unwrap();
+            let rest = doc.find_named(ws, "Rest").unwrap();
+            for _ in 0..60 {
+                physics.sync(&mut doc);
+                physics.step(&mut doc, 1.0 / 60.0);
+            }
+            let y = |r| xform_of(&doc, r).unwrap().pos.y;
+            (100.0 - y(block), y(rest), physics.throttle.percent())
+        };
+        let (free, rest, pct) = fall(1);
+        assert_eq!(pct, 100.0);
+        // Skip4: frames 0, 4, 8 … step: a quarter of the second's motion.
+        let (skip4, rest4, pct4) = fall(4);
+        assert_eq!(pct4, 25.0);
+        let ratio = skip4 / free;
+        assert!((0.04..0.1).contains(&ratio), "Skip4 fell {skip4} vs {free} ({ratio})");
+        assert!((rest - 1.0).abs() < 0.05 && (rest4 - 1.0).abs() < 0.05, "resting block held: {rest} {rest4}");
+        let (always, _, _) = fall(2);
+        assert_eq!(always, 0.0, "Always: the environment never steps");
+    }
+
+    /// A hurried job (`PhysicsJob::hurry`) holds the environment still for the rest of its
+    /// frames and owes their ticks; the next unhurried job steps them after its own. Once
+    /// caught up, a falling block is where it is in a world that was never hurried.
+    #[test]
+    fn hurried_environment_is_caught_up_not_lost() {
+        if crate::solver::kind() == crate::solver::SolverKind::Rapier {
+            return;
+        }
+        let world = || {
+            let (doc, mut physics) = hum_world(vec![
+                part("Block", Vec3::Y * 100.0, false),
+                part("Rest", Vec3::new(20.0, 1.0, 0.0), false),
+            ]);
+            physics.set_realtime(true);
+            (doc, physics)
+        };
+        let batch_dt = |doc: &mut Document, physics: &mut Physics, hurry: bool, dt: f32| {
+            physics.hurry.store(hurry, std::sync::atomic::Ordering::Relaxed);
+            let frame = physics.prepare_frame(doc, dt);
+            physics.advance_world(None, &frame);
+            physics.finish_frame(doc, frame);
+        };
+        let batch = |doc: &mut Document, physics: &mut Physics, hurry: bool| batch_dt(doc, physics, hurry, 1.0 / 60.0);
+        let y = |doc: &Document, name: &str| xform_of(doc, doc.find_named(doc.workspace().unwrap(), name).unwrap()).unwrap().pos.y;
+        let (mut plain_doc, mut plain) = world();
+        let (mut doc, mut hurried) = world();
+        // Frame 1: hurried from its start, the block stays where it was.
+        batch(&mut plain_doc, &mut plain, false);
+        batch(&mut doc, &mut hurried, true);
+        assert_eq!(y(&doc, "Block"), 100.0, "a hurried frame holds the environment");
+        assert_eq!(hurried.env_owed, 4);
+        // Frame 2 unhurried: its own four ticks, then the four owed.
+        batch(&mut plain_doc, &mut plain, false);
+        batch(&mut doc, &mut hurried, false);
+        assert_eq!(hurried.env_owed, 0);
+        assert_eq!(hurried.steps, plain.steps, "the frames' own ticks");
+        let (a, b) = (y(&plain_doc, "Block"), y(&doc, "Block"));
+        assert!(a < 99.95 && a == b, "caught up: {b} vs never hurried {a}");
+        assert!((y(&doc, "Rest") - 1.0).abs() < 0.05);
+        // A hurry in the middle of a frame owes the rest of that frame.
+        let (mut doc, mut p) = world();
+        batch_dt(&mut doc, &mut p, false, 1.0 / 120.0);
+        assert_eq!(p.env_owed, 0);
+        batch_dt(&mut doc, &mut p, true, 1.0 / 120.0);
+        assert_eq!(p.env_owed, 2, "the frame's last two ticks");
+        // The next frame can't take the environment at phase 2: it sits out too, then
+        // all six are caught up.
+        batch(&mut doc, &mut p, false);
+        assert_eq!(p.env_owed, 0);
+        // Owed time is kept up to 1/15 s; older is lost.
+        let (mut doc, mut p) = world();
+        for _ in 0..10 {
+            batch(&mut doc, &mut p, true);
+        }
+        assert_eq!(p.env_owed, ENV_OWED_MAX);
+    }
+
+    #[test]
+    fn physics_hitch_keeps_no_step_debt() {
+        let (mut doc, mut physics) = hum_world(vec![]);
+        let (hz, _, max_steps) = step_rate();
+        physics.step(&mut doc, 1.0);
+        assert_eq!(physics.steps, max_steps as u64);
+        physics.step(&mut doc, 1.0 / hz);
+        assert_eq!(physics.steps, (max_steps + 1) as u64);
+    }
+
+    #[test]
+    fn fixed_workspace_keeps_awake_assemblies_at_240_hz() {
+        let (mut doc, mut physics) = hum_world(vec![part("Block", Vec3::Y * 100.0, false)]);
+        let ws = doc.workspace().unwrap();
+        doc.dom.get_by_ref_mut(ws).unwrap().properties.insert(
+            ustr("PhysicsSteppingMethod"), Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
+        );
+        physics.reconcile(&mut doc);
+        let block = doc.find_named(ws, "Block").unwrap();
+        let body = physics.body_of(block).unwrap();
+        for _ in 0..30 {
+            physics.step(&mut doc, 1.0 / 60.0);
+            assert_eq!(physics.studio.as_ref().unwrap().next_solve(body), (1, true));
+        }
     }
 
     /// A world with one big floor part (top at y = 0) and what else is given.
@@ -5490,24 +6124,6 @@ mod tests {
     }
 }
 
-/// A world step: `serial` on the calling thread as its own one-worker rayon pool
-/// (rapier's parallel passes then run inline, in their serial order), else on the
-/// shared pool. Its cost (bench::measure units, the thread that ran it) is bench
-/// section `ph_step_thread` (solver/perf.sh, solver_ticks.rs); on the pool that is
-/// the one pool thread's share.
-fn run_step(serial: bool, f: impl FnOnce() + Send) -> ((), f64) {
-    let pool = if serial { None } else { par_pool() };
-    let ((), work) = match pool {
-        Some(pool) => pool.install(|| rustudio_core::bench::measure(f)),
-        None => with_inline_pool(|pool| match pool.filter(|_| serial) {
-            Some(pool) => pool.install(|| rustudio_core::bench::measure(f)),
-            None => rustudio_core::bench::measure(f),
-        }),
-    };
-    rustudio_core::bench::add("ph_step_thread", work, 1);
-    ((), work)
-}
-
 /// The calling thread as a one-worker rayon pool (`use_current_thread`): rayon work
 /// started on this thread from now on runs on it, inline. Work meant for many
 /// threads goes through `par_pool` explicitly (big world steps, the terrain build).
@@ -5523,5 +6139,17 @@ fn with_inline_pool<R>(f: impl FnOnce(Option<&rapier3d::rayon::ThreadPool>) -> R
 /// The pool for physics work worth spreading over the machine's threads.
 fn par_pool() -> Option<&'static rapier3d::rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rapier3d::rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rapier3d::rayon::ThreadPoolBuilder::new().thread_name(|i| format!("physics-par-{i}")).build().ok()).as_ref()
+    POOL.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = std::env::var("RUSTUDIO_PHYSICS_THREADS").ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&count| count > 0)
+            .unwrap_or(4)
+            .min(available);
+        rapier3d::rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("physics-par-{i}"))
+            .build()
+            .ok()
+    }).as_ref()
 }

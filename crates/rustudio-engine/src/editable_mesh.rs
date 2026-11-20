@@ -897,7 +897,7 @@ fn v2v(lua: &Lua, v: Vec2) -> mlua::Result<Value> {
 }
 
 fn cfv(lua: &Lua, x: Xform) -> mlua::Result<Value> {
-    Ok(Value::UserData(lua.create_userdata(LCFrame(x))?))
+    Ok(LCFrame(x).into_lua(lua)?)
 }
 
 fn colv(lua: &Lua, c: [f32; 3]) -> mlua::Result<Value> {

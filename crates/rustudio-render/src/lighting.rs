@@ -387,6 +387,12 @@ pub fn globals(
     // Outdoors a point gets the larger of Ambient and OutdoorAmbient, at
     // night too (measured at 00:00: side faces 130 vs 132 predicted).
     let outdoor_extra = (outdoor - ambient).max(Vec3::ZERO);
+    // The low shaders use the mean irradiance (CB0[13]/[14]) instead
+    // of blending directional ambient cubes per pixel.
+    let mean_irradiance = |irr: &[Vec3; 6]| irr.iter().copied().sum::<Vec3>() / 6.0;
+    let indoor_diffuse = mean_irradiance(indoor_irr) * env_diffuse;
+    let outdoor_diffuse = mean_irradiance(sky_irr) * (0.5 * env_diffuse) * (c0 * c0 + c1 * c1);
+    let low_gloss = (18.0 / (std::f32::consts::PI * mech::ENV_SPEC_ROUGHNESS.powi(2))).clamp(1.0, 255.0);
 
     let cam_obj = d
         .workspace()
@@ -478,6 +484,8 @@ pub fn globals(
             .to_array(),
         ambient: ambient.extend(1.0).to_array(),
         outdoor: outdoor_extra.extend(1.0).to_array(),
+        low_ambient: (ambient + indoor_diffuse).extend(low_gloss).to_array(),
+        low_outdoor: (outdoor_extra + outdoor_diffuse - indoor_diffuse).extend(0.0).to_array(),
         sky_top: (sq(mech::SKY_GRADIENT_TOP)).extend(1.0).to_array(),
         sky_horizon: (sq(mech::SKY_GRADIENT_HORIZON)).extend(1.0).to_array(),
         params: [
@@ -578,6 +586,18 @@ pub fn globals(
         },
         lightocc: [0.0; 4],
         dof: fx.dof.unwrap_or([0.0; 4]),
+        perf: [
+            // Shading detail: 2 high, 1 medium, 0 low (the Performance page's
+            // choice list is high, medium, low).
+            match rustudio_core::rustudio_settings::performance_value("detail") {
+                "low" => 0.0,
+                "medium" => 1.0,
+                _ => 2.0,
+            },
+            if std::env::var_os("RUSTUDIO_PROBE_FLAT").is_some() || std::env::var_os("RUSTUDIO_PROBE_FLAT_PARTS").is_some() { 1.0 } else { 0.0 },
+            if std::env::var_os("RUSTUDIO_PROBE_FLAT_TERRAIN").is_some() { 1.0 } else { 0.0 },
+            0.0,
+        ],
 
     };
     if std::env::var_os("RUSTUDIO_GLOBALS_DEBUG").is_some() {
@@ -618,6 +638,22 @@ pub struct LightCache {
     /// tree change was most of the lighting time.
     lights: Vec<Ref>,
     set: std::collections::HashSet<Ref>,
+    records: rustc_hash::FxHashMap<Ref, Option<CachedLight>>,
+    dependents: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
+    soft: Option<bool>,
+}
+
+struct CachedLight {
+    raw: LightRaw,
+    unit_color: Vec3,
+    brightness: f32,
+}
+
+impl CachedLight {
+    fn set_brightness(&mut self, brightness: f32) {
+        self.brightness = brightness;
+        self.raw.color[..3].copy_from_slice(&(self.unit_color * brightness).to_array());
+    }
 }
 
 fn is_light(d: &Document, r: Ref) -> bool {
@@ -631,18 +667,48 @@ impl LightCache {
         let marks = d.marks_for(doc::Reader::Lights);
         if let doc::Marks::Some(marks) = marks {
             if self.doc_id == d.id {
-                let ws = d.workspace();
+                let mut workspace = None;
                 let mut removed = false;
-                for m in marks {
-                    let doc::Mark::Tree(t) = m else { continue };
-                    for r in d.subtree(t) {
-                        let keep = is_light(d, r) && ws.is_some_and(|w| d.in_world(w, r));
-                        if keep && self.set.insert(r) {
-                            self.lights.push(r);
-                        } else if !keep && self.set.remove(&r) {
-                            removed = true;
+                let mut topology_changed = false;
+                for mark in marks {
+                    match mark {
+                        doc::Mark::Tree(root) => {
+                            let ws = *workspace.get_or_insert_with(|| d.workspace());
+                            for r in d.subtree(root) {
+                                let keep = is_light(d, r) && ws.is_some_and(|w| d.in_world(w, r));
+                                topology_changed |= keep || self.dependents.contains_key(&r);
+                                if keep && self.set.insert(r) {
+                                    self.lights.push(r);
+                                } else if !keep && self.set.remove(&r) {
+                                    removed = true;
+                                }
+                            }
+                        }
+                        doc::Mark::Prop(r, name) => {
+                            if self.set.contains(&r) {
+                                if name == "Brightness" {
+                                    if let Some(Some(light)) = self.records.get_mut(&r) {
+                                        light.set_brightness(f32_of(d.prop_key(r, name)).unwrap_or(1.0));
+                                    }
+                                } else {
+                                    self.records.remove(&r);
+                                }
+                            } else if !appearance_only(name.as_str()) {
+                                // (an ancestor a light's position reads: a
+                                // part's CFrame or Size, an attachment's or
+                                // bone's placement under any of its names)
+                                if let Some(lights) = self.dependents.get(&r) {
+                                    for light in lights {
+                                        self.records.remove(light);
+                                    }
+                                }
+                            }
                         }
                     }
+                }
+                if removed || topology_changed {
+                    self.records.clear();
+                    self.dependents.clear();
                 }
                 if removed {
                     let set = &self.set;
@@ -651,6 +717,8 @@ impl LightCache {
                 return;
             }
         }
+        self.records.clear();
+        self.dependents.clear();
         self.doc_id = d.id;
         self.lights = match d.workspace() {
             Some(ws) => d
@@ -695,144 +763,51 @@ impl LightCache {
         d: &mut Document,
         cam: &Camera,
         planes: &dyn Fn(Vec3, f32) -> bool,
+        voxel_lights: bool,
     ) -> Vec<LightRaw> {
         self.refresh(d);
         if override_flag("nolocal") {
             return Vec::new();
         }
         let d: &Document = d;
-        let soft = soft_style(d);
-        let mut out: Vec<(f32, LightRaw)> = Vec::new();
-        for &l in &self.lights {
-            let Some(class) = d.class_of(l) else { continue };
-            if !boolp(d, l, "Enabled", true) {
-                continue;
-            }
-            let brightness = f32_of(d.prop(l, "Brightness")).unwrap_or(1.0);
-            let range = f32_of(d.prop(l, "Range"))
-                .unwrap_or(8.0)
-                .clamp(0.0, mech::LIGHT_MAX_RANGE);
-            if brightness <= 0.0 || range <= 0.0 {
-                continue;
-            }
-            let Some(host) = d.dom.get_by_ref(l).map(|i| i.parent()) else {
-                continue;
-            };
-            let Some(hclass) = d.class_of(host) else {
-                continue;
-            };
-            // Where the light sits: a part's centre, or an attachment's world position.
-            let (pos, rot, size) = if doc::is_a(&hclass, "BasePart") {
-                let Some(xf) = xform_of(d, host) else {
-                    continue;
-                };
-                (
-                    xf.pos,
-                    xf.rot,
-                    vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE),
-                )
-            } else if doc::is_a(&hclass, "Attachment") {
-                let Some(xf) = rustudio_core::attachment::world(d, host, true) else { continue };
-                (xf.pos, xf.rot, Vec3::ZERO)
-            } else {
-                continue;
-            };
-            let source_color = d.prop(l, "Color");
-            let rgb = color_of(source_color.clone()).unwrap_or([255, 255, 255]);
-            // Realistic (Future): Studio's light record holds Color^2.2 ×
-            // Brightness (read from its light buffer to 4 digits).
-            let color = if soft {
-                // round(Color * 256), saturate to a byte,
-                // then square byte/255 before accumulating voxel radiance.
-                let c = match source_color {
-                    Some(Variant::Color3(c)) => Vec3::new(c.r, c.g, c.b),
-                    _ => Vec3::from_array(rgb.map(|v| v as f32 / 255.0)),
-                };
-                let c = (c * 256.0).round().clamp(Vec3::ZERO, Vec3::splat(255.0)) / 255.0;
-                c * c * brightness
-            } else {
-                (Vec3::new(rgb[0] as f32, rgb[1] as f32, rgb[2] as f32) / 255.0).powf(2.2) * brightness
-            };
-            // Face (NormalId): Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5.
-            let face = |f: u32| match f {
-                0 => Vec3::X,
-                1 => Vec3::Y,
-                2 => Vec3::Z,
-                3 => -Vec3::X,
-                4 => -Vec3::Y,
-                _ => -Vec3::Z,
-            };
-            let cutoff = |angle: f32| {
-                if soft {
-                    // CPU voxel writer's approximation to 1-cos(Angle/2),
-                    // coefficients, full angle in degrees.
-                    let a = angle * angle;
-                    1.0 - ((3.8077018e-5 - (2.4119384e-10 - a * 5.733313e-16) * a) * a + 1e-15)
-                } else { (angle.to_radians() * 0.5).cos() }
-            };
-            let (kind, dir, cos_cut, centre, half) = match class.as_str() {
-                "SpotLight" => {
-                    let n = face(enum_u32(d.prop(l, "Face")).unwrap_or(5));
-                    let angle = f32_of(d.prop(l, "Angle"))
-                        .unwrap_or(90.0)
-                        .clamp(0.0, mech::LIGHT_MAX_ANGLE);
-                    (
-                        1.0,
-                        rot * n,
-                        cutoff(angle),
-                        pos,
-                        [0.0, 0.0],
-                    )
-                }
-                "SurfaceLight" => {
-                    let fid = enum_u32(d.prop(l, "Face")).unwrap_or(5);
-                    let n = face(fid);
-                    let angle = f32_of(d.prop(l, "Angle"))
-                        .unwrap_or(90.0)
-                        .clamp(0.0, mech::LIGHT_MAX_ANGLE);
-                    let h = size * 0.5;
-                    let along = n.abs();
-                    let centre = pos + rot * (n * (h * along).length());
-                    let rest = h * (Vec3::ONE - along);
-                    let mut ext = [rest.x, rest.y, rest.z];
-                    ext.sort_by(|a, b| b.total_cmp(a));
-                    (
-                        2.0,
-                        rot * n,
-                        cutoff(angle),
-                        centre,
-                        [ext[0], ext[1]],
-                    )
-                }
-                _ => (0.0, Vec3::Y, -1.0, pos, [0.0, 0.0]),
-            };
-            // Soft fills the camera's voxel volume, including lights behind
-            // the frustum; Realistic evaluates the visible light spheres.
-            // A SurfaceLight lights from its whole rectangle (shader.wgsl
-            // light_point), so its sphere covers the face's half diagonal.
-            let reach = range + (half[0] * half[0] + half[1] * half[1]).sqrt();
-            if !soft && !planes(centre, reach) {
-                continue;
-            }
-            let dist = (centre - cam.pos).length();
-            let fid = enum_u32(d.prop(l, "Face")).unwrap_or(5) % 3;
-            let (u, v) = match fid {
-                0 => (Vec3::Y, Vec3::Z), 1 => (Vec3::X, Vec3::Z), _ => (Vec3::X, Vec3::Y),
-            };
-            out.push((
-                dist,
-                LightRaw {
-                    surface_u: (rot * u).extend(size.dot(u) * 0.5).to_array(),
-                    surface_v: (rot * v).extend(size.dot(v) * 0.5).to_array(),
-                    pos_range: centre.extend(range).to_array(),
-                    color: color.extend(kind).to_array(),
-                    dir: dir.normalize_or_zero().extend(cos_cut).to_array(),
-                    // z: Shadows on, parts block it (round 26, lightocc.rs).
-                    // w: its shadow-map slot (set below; −1 none).
-                    extra: [half[0], half[1], if boolp(d, l, "Shadows", false) { 1.0 } else { 0.0 }, -1.0],
-                },
-            ));
+        let soft = voxel_lights || soft_style(d);
+        if self.soft.replace(soft) != Some(soft) {
+            self.records.clear();
         }
+        let mut out: Vec<(f32, LightRaw)> = Vec::with_capacity(self.lights.len());
+        let mut rebuilt = 0;
+        for &l in &self.lights {
+            let record = self.records.entry(l).or_insert_with(|| {
+                rebuilt += 1;
+                // Track the parents used by attachment world transforms.
+                // Tree marks on ancestors also invalidate the layer's records.
+                let mut parent = d.dom.get_by_ref(l).map(|i| i.parent());
+                while let Some(i) = parent.and_then(|r| d.dom.get_by_ref(r)) {
+                    if matches!(i.class.as_str(), "Workspace" | "DataModel") {
+                        break;
+                    }
+                    let users = self.dependents.entry(i.referent()).or_default();
+                    if !users.contains(&l) {
+                        users.push(l);
+                    }
+                    parent = Some(i.parent());
+                }
+                prepare_light(d, l, soft)
+            });
+            let Some(light) = record else { continue };
+            if light.brightness <= 0.0 {
+                continue;
+            }
+            let raw = light.raw;
+            let centre = Vec3::from_array(raw.pos_range[..3].try_into().unwrap());
+            let [a, b, ..] = raw.extra;
+            if !soft && !planes(centre, raw.pos_range[3] + (a * a + b * b).sqrt()) {
+                continue;
+            }
+            let dist = if soft { 0.0 } else { (centre - cam.pos).length() };
+            out.push((dist, raw));
+        }
+        rustudio_core::bench::add("lt_records_rebuilt", 0.0, rebuilt);
         if !soft {
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
             out.truncate(mech::MAX_LIGHTS);
@@ -858,6 +833,143 @@ impl LightCache {
         }
         out.into_iter().map(|(_, l)| l).collect()
     }
+}
+
+/// Properties that can't move a light's host (a part or attachment above
+/// it): a script recolouring a lamp's part every frame keeps its record.
+fn appearance_only(name: &str) -> bool {
+    matches!(
+        name,
+        "Color" | "BrickColor" | "Color3uint8" | "Material" | "MaterialVariant" | "Transparency"
+            | "LocalTransparencyModifier" | "Reflectance" | "CastShadow" | "Name" | "CanCollide"
+            | "CanTouch" | "CanQuery" | "Anchored" | "Massless" | "AssemblyLinearVelocity"
+            | "AssemblyAngularVelocity" | "Velocity" | "RotVelocity"
+    )
+}
+
+fn prepare_light(d: &Document, l: Ref, soft: bool) -> Option<CachedLight> {
+    let Some(class) = d.class_of(l) else { return None };
+    if !boolp(d, l, "Enabled", true) {
+        return None;
+    }
+    let brightness = f32_of(d.prop(l, "Brightness")).unwrap_or(1.0);
+    let range = f32_of(d.prop(l, "Range"))
+        .unwrap_or(8.0)
+        .clamp(0.0, mech::LIGHT_MAX_RANGE);
+    if range <= 0.0 {
+        return None;
+    }
+    let Some(host) = d.dom.get_by_ref(l).map(|i| i.parent()) else {
+        return None;
+    };
+    let Some(hclass) = d.class_of(host) else {
+        return None;
+    };
+    // Where the light sits: a part's centre, or an attachment's world position.
+    let (pos, rot, size) = if doc::is_a(&hclass, "BasePart") {
+        let Some(xf) = xform_of(d, host) else {
+            return None;
+        };
+        (
+            xf.pos,
+            xf.rot,
+            vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE),
+        )
+    } else if doc::is_a(&hclass, "Attachment") {
+        let Some(xf) = rustudio_core::attachment::world(d, host, true) else { return None };
+        (xf.pos, xf.rot, Vec3::ZERO)
+    } else {
+        return None;
+    };
+    let source_color = d.prop(l, "Color");
+    let rgb = color_of(source_color.clone()).unwrap_or([255, 255, 255]);
+    // Realistic (Future): Studio's light record holds Color^2.2 ×
+    // Brightness (read from its light buffer to 4 digits).
+    let unit_color = if soft {
+        // Studio: round(Color * 256), saturate to a byte,
+        // then square byte/255 before accumulating voxel radiance.
+        let c = match source_color {
+            Some(Variant::Color3(c)) => Vec3::new(c.r, c.g, c.b),
+            _ => Vec3::from_array(rgb.map(|v| v as f32 / 255.0)),
+        };
+        let c = (c * 256.0).round().clamp(Vec3::ZERO, Vec3::splat(255.0)) / 255.0;
+        c * c
+    } else {
+        (Vec3::new(rgb[0] as f32, rgb[1] as f32, rgb[2] as f32) / 255.0).powf(2.2)
+    };
+    // Face (NormalId): Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5.
+    let face = |f: u32| match f {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        2 => Vec3::Z,
+        3 => -Vec3::X,
+        4 => -Vec3::Y,
+        _ => -Vec3::Z,
+    };
+    let cutoff = |angle: f32| {
+        if soft {
+            // CPU voxel writer's approximation to 1-cos(Angle/2),
+            // coefficients at Studio, full angle in degrees.
+            let a = angle * angle;
+            1.0 - ((3.8077018e-5 - (2.4119384e-10 - a * 5.733313e-16) * a) * a + 1e-15)
+        } else { (angle.to_radians() * 0.5).cos() }
+    };
+    let (kind, dir, cos_cut, centre, half) = match class.as_str() {
+        "SpotLight" => {
+            let n = face(enum_u32(d.prop(l, "Face")).unwrap_or(5));
+            let angle = f32_of(d.prop(l, "Angle"))
+                .unwrap_or(90.0)
+                .clamp(0.0, mech::LIGHT_MAX_ANGLE);
+            (
+                1.0,
+                rot * n,
+                cutoff(angle),
+                pos,
+                [0.0, 0.0],
+            )
+        }
+        "SurfaceLight" => {
+            let fid = enum_u32(d.prop(l, "Face")).unwrap_or(5);
+            let n = face(fid);
+            let angle = f32_of(d.prop(l, "Angle"))
+                .unwrap_or(90.0)
+                .clamp(0.0, mech::LIGHT_MAX_ANGLE);
+            let h = size * 0.5;
+            let along = n.abs();
+            let centre = pos + rot * (n * (h * along).length());
+            let rest = h * (Vec3::ONE - along);
+            let mut ext = [rest.x, rest.y, rest.z];
+            ext.sort_by(|a, b| b.total_cmp(a));
+            (
+                2.0,
+                rot * n,
+                cutoff(angle),
+                centre,
+                [ext[0], ext[1]],
+            )
+        }
+        _ => (0.0, Vec3::Y, -1.0, pos, [0.0, 0.0]),
+    };
+    let fid = enum_u32(d.prop(l, "Face")).unwrap_or(5) % 3;
+    let (u, v) = match fid {
+        0 => (Vec3::Y, Vec3::Z), 1 => (Vec3::X, Vec3::Z), _ => (Vec3::X, Vec3::Y),
+    };
+    let mut light = CachedLight {
+        raw: LightRaw {
+            surface_u: (rot * u).extend(size.dot(u) * 0.5).to_array(),
+            surface_v: (rot * v).extend(size.dot(v) * 0.5).to_array(),
+            pos_range: centre.extend(range).to_array(),
+            color: [0.0, 0.0, 0.0, kind],
+            dir: dir.normalize_or_zero().extend(cos_cut).to_array(),
+            // z: Shadows on, parts block it (round 26, lightocc.rs).
+            // w: its shadow-map slot (set below; −1 none).
+            extra: [half[0], half[1], if boolp(d, l, "Shadows", false) { 1.0 } else { 0.0 }, -1.0],
+        },
+        unit_color,
+        brightness,
+    };
+    light.set_brightness(brightness);
+    Some(light)
 }
 
 // ------------------------------------------------------------- sky faces
@@ -955,6 +1067,63 @@ mod tests {
     use super::*;
     use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
+    /// The kept light records give what a fresh gather gives after
+    /// brightness, light, host and appearance writes and a reparent.
+    #[test]
+    fn kept_light_records_match_a_fresh_gather() {
+        use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+        use rbx_dom_weak::ustr;
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let ws = d.insert(root, InstanceBuilder::new("Workspace"));
+        let at = |x: f32| CFrame::new(Vector3::new(x, 2.0, 0.0), Matrix3::identity());
+        let part = d.insert(ws, InstanceBuilder::new("Part")
+            .with_property("Size", Vector3::new(4.0, 2.0, 1.0))
+            .with_property("CFrame", at(0.0)));
+        let other = d.insert(ws, InstanceBuilder::new("Part")
+            .with_property("Size", Vector3::new(2.0, 2.0, 2.0))
+            .with_property("CFrame", at(30.0)));
+        let point = d.insert(part, InstanceBuilder::new("PointLight").with_property("Range", 12.0f32));
+        let att = d.insert(part, InstanceBuilder::new("Attachment")
+            .with_property("CFrame", CFrame::new(Vector3::new(1.0, 0.5, 0.0), Matrix3::identity())));
+        d.insert(att, InstanceBuilder::new("SpotLight").with_property("Brightness", 3.0f32));
+        d.insert(part, InstanceBuilder::new("SurfaceLight").with_property("Face", rbx_dom_weak::types::Enum::from_u32(1)));
+        let cam = Camera::default();
+        let all = |_: Vec3, _: f32| true;
+        for voxel in [false, true] {
+            let mut kept = LightCache::default();
+            let mut check = |d: &mut Document, what: &str| {
+                let a = kept.gather(d, &cam, &all, voxel);
+                let b = LightCache::default().gather(d, &cam, &all, voxel);
+                assert_eq!(bytemuck::cast_slice::<_, u8>(&a), bytemuck::cast_slice::<_, u8>(&b), "{what} voxel {voxel}");
+                a.len()
+            };
+            assert_eq!(check(&mut d, "start"), 3);
+            d.set_prop_live(point, ustr("Brightness"), Variant::Float32(2.5));
+            check(&mut d, "brightness");
+            d.set_prop_live(point, ustr("Brightness"), Variant::Float32(0.0));
+            assert_eq!(check(&mut d, "dark"), 2);
+            d.set_prop_live(point, ustr("Brightness"), Variant::Float32(1.0));
+            d.set_prop_live(point, ustr("Color"), Variant::Color3(rbx_dom_weak::types::Color3::new(1.0, 0.5, 0.0)));
+            check(&mut d, "light colour");
+            d.set_prop_live(part, ustr("Color"), Variant::Color3(rbx_dom_weak::types::Color3::new(0.0, 0.5, 0.0)));
+            check(&mut d, "part colour");
+            d.set_prop_live(part, ustr("CFrame"), Variant::CFrame(at(5.0)));
+            check(&mut d, "part moved");
+            d.set_prop_live(part, ustr("Size"), Variant::Vector3(Vector3::new(6.0, 1.0, 1.0)));
+            check(&mut d, "part resized");
+            d.set_prop_live(att, ustr("Position"), Variant::Vector3(Vector3::new(0.0, 3.0, 0.0)));
+            d.set_prop_live(att, ustr("CFrame"), Variant::CFrame(CFrame::new(Vector3::new(0.0, 3.0, 0.0), Matrix3::identity())));
+            check(&mut d, "attachment moved");
+            d.reparent(&[att], other);
+            check(&mut d, "reparented");
+            d.set_prop_live(point, ustr("Enabled"), Variant::Bool(false));
+            assert_eq!(check(&mut d, "disabled"), 2);
+            d.set_prop_live(point, ustr("Enabled"), Variant::Bool(true));
+            d.reparent(&[att], part);
+        }
+    }
+
     #[test]
     fn renamed_sky_and_camera_effects() {
         let dom = WeakDom::new(InstanceBuilder::new("DataModel").with_child(
@@ -989,7 +1158,7 @@ mod tests {
         d.insert(b, InstanceBuilder::new("PointLight"));
         let mut cache = LightCache::default();
         assert!(cache.hosts(&mut d).contains(&p));
-        let lights = cache.gather(&mut d, &Camera::default(), &|_, _| true);
+        let lights = cache.gather(&mut d, &Camera::default(), &|_, _| true, false);
         assert_eq!(lights.len(), 1);
         assert_eq!(&lights[0].pos_range[..3], &[11., 1., 0.]);
     }

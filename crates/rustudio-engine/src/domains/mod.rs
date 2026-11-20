@@ -471,12 +471,10 @@ pub fn call_claims_shadow(class: &str, name: &str, _core: bool, core_base: Optio
             shown
         });
         if hidden && !listed {
+            // The generated call claims include the shadowed declaration's
+            // implementation. They must not re-add it to the route.
             shadowed |= 1 << i;
-        }
-        // Domains answer before core, as the old chain did: a domain that
-        // handles a method core also has (world_part's assembly-aware
-        // ApplyImpulse over core's single-part one) must still be asked.
-        if listed || claimed_in(claim_words, claim_pairs, class, name) {
+        } else if listed || claimed_in(claim_words, claim_pairs, class, name) {
             bits |= 1 << i;
         }
         i += 1;

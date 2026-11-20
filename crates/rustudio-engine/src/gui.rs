@@ -245,10 +245,12 @@ pub struct Gui {
     /// Font file → egui family name, once added to egui.
     fonts: HashMap<String, String>,
     fonts_failed: HashSet<String>,
+    /// The document `preload_faces` last ran for.
+    faces_preloaded: Option<u64>,
     /// egui font size per Roblox TextSize, by family.
     em_ratio: HashMap<String, f32>,
-    /// TextScaled sizes: (text, family, box w, box h, wrapped) → size.
-    scaled: HashMap<(String, String, i32, i32, bool), f32>,
+    /// TextScaled sizes and reusable measurements of their size probes.
+    text_fit: walk::TextFitCache,
     hits: Vec<Hit>,
     /// Layout of everything drawn last frame. Kept from frame to frame: a
     /// GUI walked again replaces its own entries (`layout_from`), one no
@@ -289,6 +291,15 @@ pub struct Gui {
     root_boxes: HashMap<Ref, Vec<(Ref, GuiBox)>>,
     /// ScreenGuis drawn as they were last frame (gui_input.rs `RootCache`).
     cache: HashMap<Ref, input::RootCache>,
+    /// Model billboard anchors, invalidated through the document journal.
+    billboard_model_centers: HashMap<Ref, Option<Vec3>>,
+    /// Workspace SurfaceGuis' own placement properties (gui_input.rs
+    /// `SurfaceSpec`), invalidated through the document journal.
+    surface_specs: rustc_hash::FxHashMap<Ref, input::SurfaceSpec>,
+    /// Reads from archived canvases can outlive the active walk's ownership.
+    billboard_archive_owner: rustc_hash::FxHashMap<Ref, Ref>,
+    /// Recent exact canvas layouts for each billboard.
+    billboard_canvases: HashMap<Ref, input::BillboardArchive>,
     /// What a cached ScreenGui's walk read → that ScreenGui: instances whose
     /// properties it read (`cache_owner`) and whose children it listed
     /// (`cache_kids`); per ScreenGui, both lists, to drop them again. A
@@ -337,6 +348,9 @@ pub struct DrawIn<'a> {
     pub doc_dir: Option<&'a std::path::Path>,
     /// Play (the LocalPlayer's PlayerGui) or edit (StarterGui).
     pub playing: bool,
+    /// Fixed-step replays resolve layout synchronously so measured bounds
+    /// and captured frames don't depend on the host's clock.
+    pub fixed_step: bool,
     /// Which GUIs: the view's (above), or the edit DataModel's plugin GUIs.
     pub roots: Roots,
 }
@@ -422,8 +436,7 @@ fn children(d: &Document, r: Ref) -> Vec<Ref> {
 
 /// The first enabled child of a class (UI modifiers).
 fn child_of_class(d: &Document, r: Ref, class: &str) -> Option<Ref> {
-    children(d, r)
-        .into_iter()
+    d.dom.get_by_ref(r)?.children().iter().copied()
         .find(|c| d.class_of(*c).is_some_and(|k| k == class) && boolp(d, *c, "Enabled", true))
 }
 
@@ -696,47 +709,53 @@ fn lerp_vertex(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
 }
 
 /// Clips a mesh's triangles to a rect (Sutherland–Hodgman).
-fn clip_mesh(m: &Mesh, clip: Rect) -> Mesh {
+fn clip_mesh(m: Mesh, clip: Rect) -> Mesh {
     if m.vertices.iter().all(|v| clip.contains(v.pos)) {
-        return m.clone();
+        return m;
     }
     let mut out = Mesh::with_texture(m.texture_id);
     for tri in m.indices.chunks_exact(3) {
-        let mut poly: Vec<Vertex> = tri
-            .iter()
-            .filter_map(|i| m.vertices.get(*i as usize).copied())
-            .collect();
-        if poly.len() < 3 {
-            continue;
-        }
+        let (Some(a), Some(b), Some(c)) = (
+            m.vertices.get(tri[0] as usize),
+            m.vertices.get(tri[1] as usize),
+            m.vertices.get(tri[2] as usize),
+        ) else { continue };
+        // Each of the four planes adds at most one vertex to a convex polygon.
+        let mut poly = [Vertex::default(); 7];
+        poly[..3].copy_from_slice(&[*a, *b, *c]);
+        let mut len = 3;
         for (axis, val, ge) in [
             (0, clip.left(), true),
             (0, clip.right(), false),
             (1, clip.top(), true),
             (1, clip.bottom(), false),
         ] {
-            if poly.is_empty() {
+            if len == 0 {
                 break;
             }
             let get = |v: &Vertex| if axis == 0 { v.pos.x } else { v.pos.y };
             let ins = |v: &Vertex| if ge { get(v) >= val } else { get(v) <= val };
-            let mut next = Vec::with_capacity(poly.len() + 2);
-            for k in 0..poly.len() {
+            let mut next = [Vertex::default(); 7];
+            let mut count = 0;
+            for k in 0..len {
                 let a = &poly[k];
-                let b = &poly[(k + 1) % poly.len()];
+                let b = &poly[(k + 1) % len];
                 if ins(a) {
-                    next.push(*a);
+                    next[count] = *a;
+                    count += 1;
                 }
                 if ins(a) != ins(b) {
-                    next.push(lerp_vertex(a, b, (val - get(a)) / (get(b) - get(a))));
+                    next[count] = lerp_vertex(a, b, (val - get(a)) / (get(b) - get(a)));
+                    count += 1;
                 }
             }
             poly = next;
+            len = count;
         }
-        if poly.len() >= 3 {
+        if len >= 3 {
             let base = out.vertices.len() as u32;
-            let n = poly.len() as u32;
-            out.vertices.extend(poly);
+            let n = len as u32;
+            out.vertices.extend_from_slice(&poly[..len]);
             for k in 1..n - 1 {
                 out.indices
                     .extend_from_slice(&[base, base + k, base + k + 1]);
@@ -755,18 +774,26 @@ fn clip_mesh(m: &Mesh, clip: Rect) -> Mesh {
 /// fall wholly past one edge of `view` (screen) are dropped. A mesh whose
 /// whole screen extent passes that test (no triangle in it can fail it)
 /// comes back as it is.
-fn subdivide(
-    m: Mesh,
+///
+/// The mesh is borrowed back when it needs no splitting; `projected` then
+/// holds each vertex's screen position (as `screen` gives it), else it is
+/// left empty.
+fn subdivide<'a>(
+    m: &'a Mesh,
     err: f32,
     view: Rect,
     screen: &dyn Fn(Pos2) -> Option<(Pos2, f32)>,
-) -> Mesh {
+    projected: &mut Vec<Pos2>,
+) -> std::borrow::Cow<'a, Mesh> {
+    use std::borrow::Cow;
+    projected.clear();
     {
         let (mut b, mut wlo, mut whi) = (Rect::NOTHING, f32::INFINITY, 0.0f32);
         let mut known = true;
         for v in &m.vertices {
             match screen(v.pos) {
                 Some((p, w)) => {
+                    projected.push(p);
                     b.extend_with(p);
                     wlo = wlo.min(w);
                     whi = whi.max(w);
@@ -778,8 +805,12 @@ fn subdivide(
             }
         }
         // (Behind the camera in part: the caller drops the mesh anyway.)
-        if !known || m.vertices.is_empty() || b.size().length() * (whi / wlo - 1.0) * 0.25 <= err {
-            return m;
+        if !known {
+            projected.clear();
+            return Cow::Borrowed(m);
+        }
+        if m.vertices.is_empty() || b.size().length() * (whi / wlo - 1.0) * 0.25 <= err {
+            return Cow::Borrowed(m);
         }
     }
     let flat = |a: &Vertex, b: &Vertex, c: &Vertex| {
@@ -794,8 +825,9 @@ fn subdivide(
         _ => true,
     };
     if m.indices.chunks_exact(3).all(tri_flat) {
-        return m;
+        return Cow::Borrowed(m);
     }
+    projected.clear();
     let mut out = Mesh::with_texture(m.texture_id);
     let mut stack: Vec<([Vertex; 3], u8)> = Vec::new();
     for tri in m.indices.chunks_exact(3) {
@@ -846,7 +878,7 @@ fn subdivide(
             stack.push((t, depth + 1));
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
@@ -1098,6 +1130,32 @@ impl Gui {
         found
     }
 
+    /// Adds every face the document's text objects name, once per
+    /// document, so egui rebuilds its glyph atlas once for them instead of
+    /// once per face as GUIs first show text in it (each rebuild re-walks
+    /// every kept GUI: a game added faces 3–4 times during a round).
+    pub(crate) fn preload_faces(&mut self, ctx: &egui::Context, store: &mut AssetStore, d: &Document) {
+        if self.faces_preloaded == Some(d.id) {
+            return;
+        }
+        self.faces_preloaded = Some(d.id);
+        let _p = rustudio_core::bench::scope("gui_preload_faces");
+        let mut seen = HashSet::new();
+        let texts: Vec<Ref> = d
+            .dom
+            .descendants()
+            .filter(|i| matches!(i.class.as_str(), "TextLabel" | "TextButton" | "TextBox"))
+            .map(|i| i.referent())
+            .collect();
+        for r in texts {
+            let font = font_of(d, r);
+            if seen.insert(font.clone()) {
+                self.family(ctx, store, &font);
+            }
+        }
+        self.no_cache = None;
+    }
+
     /// The egui family for a font (Studio's file for the nearest available
     /// face); egui's default font until the file has been added (next frame).
     fn family(
@@ -1163,8 +1221,8 @@ impl Gui {
         ));
         // Glyphs the face lacks ("▶" in Sarpanch) come from the fallback
         // fonts after it, as Roblox's text falls back, not a missing-glyph box.
-        // (egui adds a font name once, so each family gets its own names for
-        // the shared, never-freed bytes.)
+        // The uploaded atlas keeps a slot for each family's fallback glyphs.
+        // TextScaled's scratch atlas shares these faces across families.
         for (i, bytes) in fallback_fonts().iter().enumerate() {
             ctx.add_font(egui::epaint::text::FontInsert::new(
                 &format!("{name}+fallback{i}"),
@@ -1359,6 +1417,7 @@ impl Gui {
                 Img::Failed => None,
             };
         }
+        let _load = rustudio_core::bench::scope("gui_image_load");
         let mut bytes = match store.content(id, doc_dir) {
             Fetch::Ready(b) => b,
             Fetch::Pending => {
@@ -1708,7 +1767,7 @@ mod tests {
             &|_| Color32::WHITE,
             1,
         );
-        let c = clip_mesh(&m, Rect::from_min_max(Pos2::ZERO, Pos2::new(5.0, 5.0)));
+        let c = clip_mesh(m, Rect::from_min_max(Pos2::ZERO, Pos2::new(5.0, 5.0)));
         assert!(c.vertices.iter().all(|v| v.pos.x >= -1e-4
             && v.pos.x <= 5.0001
             && v.pos.y >= -1e-4
@@ -1877,6 +1936,81 @@ pub fn text_bounds_now(d: &Document, r: Ref, size: [f32; 2], ui_scale: f32) -> O
     }
     let g = layout(ts, wrapped || scaled);
     Some([g.rect.width(), g.rect.height()])
+}
+
+/// The face the walk last drew `font` with (else its default face), and
+/// the egui context it measures with: None before any text was drawn.
+fn text_face(font: &FaceKey) -> Option<(&'static egui::Context, FontFamily, f32)> {
+    let ctx = TEXT_CTX.get()?;
+    let m = TEXT_FACES.lock().unwrap_or_else(|e| e.into_inner());
+    let m = m.as_ref()?;
+    let (family, em) = match m.get(font) {
+        Some(f) => f.clone(),
+        None => m.iter().find(|(_, (f, _))| *f == FontFamily::Proportional).map(|(_, f)| f.clone())?,
+    };
+    Some((ctx, family, em))
+}
+
+/// `Walk::measure_text` outside the walk, with the walk's faces.
+struct FaceText;
+
+impl walk::AutoText for FaceText {
+    fn measure_text(&mut self, d: &Document, r: Ref, wrap: f32, scale: f32) -> egui::Vec2 {
+        let mut text = text_prop(d, r, "Text");
+        if text.is_empty() && d.class_of(r).is_some_and(|c| c == "TextBox") {
+            text = text_prop(d, r, "PlaceholderText");
+        }
+        if boolp(d, r, "RichText", false) {
+            text = content_text(&text);
+        }
+        if text.is_empty() {
+            return egui::Vec2::ZERO;
+        }
+        let font = font_of(d, r);
+        let Some((ctx, family, em)) = text_face(&font) else { return egui::Vec2::ZERO };
+        let size = num(d, r, "TextSize", 14.0) * scale * legacy_text_scale(&font);
+        let mut f = egui::TextFormat::simple(egui::FontId::new(size * em, family), Color32::WHITE);
+        f.line_height = Some(size * num(d, r, "LineHeight", 1.0));
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&text, 0.0, f);
+        job.wrap.max_width = wrap.max(1.0);
+        job.round_output_to_gui = false;
+        let g = ctx.fonts_mut(|fo| fo.layout_job(job));
+        egui::vec2(g.rect.width(), g.rect.height().max(size))
+    }
+}
+
+/// An AutomaticSize object's `size` (from its Size in a `parent` content
+/// box) grown to hold its content, for a script reading AbsoluteSize before
+/// the GUI walk has laid it out (Studio's ProximityPrompt reads its
+/// AutomaticSize X frame two RenderSteppeds after building it: with the Play
+/// worker the walk's boxes reach scripts a step later, and it read 0).
+/// The walk's rules (`walk::Sizer`); None before any text was drawn.
+pub fn auto_grow_now(d: &Document, r: Ref, size: [f32; 2], parent: [f32; 2], position: [f32; 2], scale: f32) -> Option<[f32; 2]> {
+    TEXT_CTX.get()?;
+    let auto = enum_u32(d.prop(r, "AutomaticSize")).unwrap_or(0);
+    if auto == 0 {
+        return Some(size);
+    }
+    let room = parent[0] - position[0];
+    let mut sizer = walk::Sizer { d, m: FaceText };
+    let c = sizer.content_size_in(r, egui::vec2(size[0], size[1]), scale, auto, 0, room);
+    Some([
+        if auto & 1 != 0 { size[0].max(c.x) } else { size[0] },
+        if auto & 2 != 0 { size[1].max(c.y) } else { size[1] },
+    ])
+}
+
+/// Tests: lets reads measure text as if the walk had drawn some with
+/// egui's default face.
+#[cfg(test)]
+pub(crate) fn prime_text_measure() {
+    let ctx = TEXT_CTX.get_or_init(egui::Context::default).clone();
+    ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+    let line = ctx.fonts_mut(|f| f.row_height(&egui::FontId::new(100.0, FontFamily::Proportional))) / 100.0;
+    let em = rustudio_core::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
+    let mut m = TEXT_FACES.lock().unwrap_or_else(|e| e.into_inner());
+    m.get_or_insert_with(HashMap::new).entry((String::new(), 0, false)).or_insert((FontFamily::Proportional, em));
 }
 
 /// What RichText leaves of a string once its tags are gone (ContentText).

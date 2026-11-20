@@ -24,6 +24,9 @@ pub mod flag {
     /// `mat` / `com` are Studio's own pose state (kept in `Persist::pose`), not a
     /// conversion of rapier's quaternion (STEP §4.2 [L2]).
     pub const STUDIO_POSE: u8 = 16;
+    /// Awake but held still this tick: the environmental throttle skips its
+    /// 60 Hz frame (throttle.rs). Not solved, no contacts of its own, no sleep step.
+    pub const FROZEN: u8 = 32;
 }
 
 /// Studio's f32 3×3 rotation, row-major as a CoordinateFrame keeps it (STEP §4.2 [L2]),
@@ -177,7 +180,7 @@ impl Default for Persist {
 
 #[derive(Default)]
 pub struct BodySet {
-    // -- per slot (dense, this tick) --
+    // -- per slot (dense, retained while membership is stable) --
     pub handle: Vec<rp::RigidBodyHandle>,
     pub flags: Vec<u8>,
     /// Body frame (rapier's body pose).
@@ -193,6 +196,7 @@ pub struct BodySet {
     pub linvel: Vec<Vec3>,
     pub angvel: Vec<Vec3>,
     pub inv_mass: Vec<f32>,
+    pub inv_mass_position: Vec<f32>,
     /// Inverse principal inertia and the principal frame (body frame).
     pub inv_inertia: Vec<Vec3>,
     pub inertia_frame: Vec<Quat>,
@@ -224,6 +228,20 @@ pub struct BodySet {
     pub size_box: std::collections::HashMap<rp::RigidBodyHandle, (Vec3, Vec3)>,
     /// body, the length r of Studio (physics.rs → note_char_len; SLEEP §2.1 [S2]).
     pub char_len: std::collections::HashMap<rp::RigidBodyHandle, f32>,
+    initialized: bool,
+    body_count: usize,
+    mass_inputs: Vec<Option<MassInput>>,
+    world_inertia_rot: Vec<Mat3>,
+    local_inertia: Vec<Mat3>,
+    refresh_slots: Vec<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct MassInput {
+    local: rp::MassProperties,
+    studio: Option<super::mass::PartMass>,
+    dynamic: bool,
+    rotation_locked: bool,
 }
 
 impl BodySet {
@@ -248,6 +266,7 @@ impl BodySet {
         self.linvel.clear();
         self.angvel.clear();
         self.inv_mass.clear();
+        self.inv_mass_position.clear();
         self.inv_inertia.clear();
         self.inertia_frame.clear();
         self.inv_inertia_world.clear();
@@ -260,6 +279,10 @@ impl BodySet {
         self.island.clear();
         self.box_c.clear();
         self.box_e.clear();
+        self.mass_inputs.clear();
+        self.world_inertia_rot.clear();
+        self.local_inertia.clear();
+        self.refresh_slots.clear();
     }
 
     /// Slot of a rapier body this tick.
@@ -268,103 +291,175 @@ impl BodySet {
         self.slot_of.get(h.into_raw_parts().0 as usize).copied().unwrap_or(NONE)
     }
 
-    /// Copies every enabled dynamic and kinematic body out of rapier.
-    pub fn gather(&mut self, bodies: &rp::RigidBodySet) {
-        // STEP §5 / §5a: mass, centre and inertia are the assembly's;
-        // rustudio's come from part_mass per part (physics.rs), summed by rapier.
-        // The composition and per-shape inertia are STEP Open 4.
-        self.clear();
-        for (h, b) in bodies.iter() {
-            if !b.is_enabled() || !b.is_dynamic_or_kinematic() {
-                continue;
-            }
-            let (idx, gen) = h.into_raw_parts();
-            let idx = idx as usize;
-            if self.slot_of.len() <= idx {
-                self.slot_of.resize(idx + 1, NONE);
-                self.persist.resize(idx + 1, Persist::default());
-            }
-            let p = &mut self.persist[idx];
-            if !p.live || p.generation != gen {
-                *p = Persist { generation: gen, live: true, ..Default::default() };
-            }
-            // Sleep is sleep.rs's (state 5 = out of the solve); rapier's sleeping flag
-            // mirrors it, and a property write that wakes the body in rapier
-            // (physics.rs wake_part / set_velocity) is SLEEP §7.2's property wake.
-            let asleep = b.is_dynamic() && p.sleep.gather(b.is_sleeping(), v(b.linvel()), v(b.angvel()), v(b.position().translation), q(b.position().rotation));
-            p.asleep = asleep;
-            let slot = self.handle.len() as u32;
-            self.slot_of[idx] = slot;
-            let mp = b.mass_properties().local_mprops;
-            let pose = b.position();
-            let rot = q(pose.rotation);
-            let frame = q(mp.principal_inertia_local_frame);
-            // Locked rotations (rustudio's upright characters): no angular response.
-            let inv_i = if b.locked_axes().contains(rp::LockedAxes::ROTATION_LOCKED) { Vec3::ZERO } else { v(mp.inv_principal_inertia) };
-            let mut f = if b.is_dynamic() { flag::DYNAMIC } else { flag::KINEMATIC };
-            // STEP §4.2 [L2]: Studio's body keeps its own R / x between solves; rapier's
-            // pose is only a copy. Kept while rapier still holds what was written.
-            let tr = v(pose.translation);
-            let studio = match p.pose {
-                Some(sp) if sp.written_pos == tr && sp.written_rot == rot => Some(sp),
-                _ => {
-                    p.pose = None;
-                    None
+    /// Refresh the dense entries without reallocating or revisiting fixed bodies
+    /// unless a body is added, removed, enabled, disabled, or changes type.
+    pub fn gather(&mut self, bodies: &rp::RigidBodySet, modified: Option<&[rp::RigidBodyHandle]>) {
+        let eligible = |b: &rp::RigidBody| b.is_enabled() && b.is_dynamic_or_kinematic();
+        let membership_changed = !self.initialized || self.body_count != bodies.len()
+            || modified.is_none_or(|handles| handles.iter().any(|&h| {
+                let slot = self.slot(h);
+                let in_solver = self.handle.get(slot as usize) == Some(&h);
+                if in_solver {
+                    self.refresh_slots[slot as usize] = true;
                 }
+                bodies.get(h).is_some_and(eligible) != in_solver
+            }));
+
+        if membership_changed {
+            self.clear();
+            self.initialized = true;
+            self.body_count = bodies.len();
+            for (h, b) in bodies.iter().filter(|(_, b)| eligible(b)) {
+                let (idx, gen) = h.into_raw_parts();
+                let idx = idx as usize;
+                if self.slot_of.len() <= idx {
+                    self.slot_of.resize(idx + 1, NONE);
+                    self.persist.resize(idx + 1, Persist::default());
+                }
+                let p = &mut self.persist[idx];
+                if !p.live || p.generation != gen {
+                    *p = Persist { generation: gen, live: true, ..Default::default() };
+                }
+                self.slot_of[idx] = self.handle.len() as u32;
+                self.handle.push(h);
+                self.flags.push(0);
+                self.pos.push(Vec3::ZERO);
+                self.rot.push(Quat::IDENTITY);
+                self.mat.push(Mat3::IDENTITY);
+                self.local_com.push(Vec3::ZERO);
+                self.com.push(Vec3::ZERO);
+                self.linvel.push(Vec3::ZERO);
+                self.angvel.push(Vec3::ZERO);
+                self.inv_mass.push(0.0);
+                self.inv_mass_position.push(0.0);
+                self.inv_inertia.push(Vec3::ZERO);
+                self.inertia_frame.push(Quat::IDENTITY);
+                self.inertia_body.push(None);
+                self.inv_inertia_world.push(Mat3::ZERO);
+                self.force.push(Vec3::ZERO);
+                self.torque.push(Vec3::ZERO);
+                self.gravity_scale.push(0.0);
+                self.next_pos.push(Vec3::ZERO);
+                self.next_rot.push(Quat::IDENTITY);
+                self.island.push(NONE);
+                self.box_c.push(Vec3::ZERO);
+                self.box_e.push(Vec3::ZERO);
+                self.mass_inputs.push(None);
+                self.world_inertia_rot.push(Mat3::IDENTITY);
+                self.local_inertia.push(Mat3::ZERO);
+                self.refresh_slots.push(false);
+                self.refresh(self.handle.len() - 1, b);
+            }
+        } else {
+            for s in 0..self.len() {
+                if let Some(b) = bodies.get(self.handle[s]) {
+                    let p = &mut self.persist[self.handle[s].into_raw_parts().0 as usize];
+                    let asleep = p.sleep.state == super::sleep::ASLEEP_OUT;
+                    if std::mem::take(&mut self.refresh_slots[s]) || (asleep && !b.is_sleeping()) {
+                        self.refresh(s, b);
+                    } else {
+                        // Rapier can wake a body through the narrow phase without an
+                        // explicit edit. The branch above passes that through Sleep::gather.
+                        p.asleep = asleep;
+                        self.flags[s] &= !(flag::DIRTY | flag::AWAKE);
+                        if !asleep {
+                            self.flags[s] |= flag::AWAKE;
+                        }
+                    }
+                } else {
+                    // A removed body can be replaced with a fixed body in the
+                    // same tick, leaving the total number of bodies unchanged.
+                    self.initialized = false;
+                    self.gather(bodies, modified);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn mark_for_refresh(&mut self, h: rp::RigidBodyHandle) {
+        let slot = self.slot(h);
+        if self.handle.get(slot as usize) == Some(&h) {
+            self.refresh_slots[slot as usize] = true;
+        }
+    }
+
+    fn refresh(&mut self, s: usize, b: &rp::RigidBody) {
+        let h = self.handle[s];
+        let idx = h.into_raw_parts().0 as usize;
+        let p = &mut self.persist[idx];
+        let pose = b.position();
+        let rot = q(pose.rotation);
+        let pos = v(pose.translation);
+        let linvel = v(b.linvel());
+        let angvel = v(b.angvel());
+        let dynamic = b.is_dynamic();
+        p.asleep = dynamic && p.sleep.gather(b.is_sleeping(), linvel, angvel, pos, rot);
+        let mut flags = if dynamic { flag::DYNAMIC } else { flag::KINEMATIC };
+        if !p.asleep {
+            flags |= flag::AWAKE;
+        }
+        let studio = p.pose.filter(|sp| sp.written_pos == pos && sp.written_rot == rot);
+        p.pose = studio;
+        if studio.is_some() {
+            flags |= flag::STUDIO_POSE;
+        }
+
+        let rotation_locked = b.locked_axes().contains(rp::LockedAxes::ROTATION_LOCKED);
+        let mp = b.mass_properties().local_mprops;
+        let studio_mass = if dynamic && !rotation_locked {
+            self.studio_mass.get(&h).copied()
+        } else {
+            None
+        };
+        let input = MassInput { local: mp, studio: studio_mass, dynamic, rotation_locked };
+        let mass_changed = self.mass_inputs[s] != Some(input);
+        if mass_changed {
+            self.mass_inputs[s] = Some(input);
+            self.local_com[s] = v(mp.local_com);
+            self.inv_mass[s] = if dynamic { mp.inv_mass } else { 0.0 };
+            self.inertia_frame[s] = q(mp.principal_inertia_local_frame);
+            self.inv_inertia[s] = if dynamic && !rotation_locked { v(mp.inv_principal_inertia) } else { Vec3::ZERO };
+            self.inertia_body[s] = studio_mass.map(|m| {
+                self.inv_mass[s] = 1.0 / m.mass;
+                let inertia = m.inertia();
+                let det = inertia.determinant();
+                self.local_inertia[s] = if det.is_finite() && det != 0.0 { inertia.inverse() } else { Mat3::ZERO };
+                inertia
+            });
+            self.inv_mass_position[s] = self.inv_mass[s].powf(super::dual::POSITION_MASS_EXPONENT);
+        }
+        let mat = match studio {
+            Some(sp) => {
+                self.com[s] = sp.x;
+                m3::to_glam(&sp.r)
+            }
+            None => {
+                self.com[s] = pos + rot * self.local_com[s];
+                Mat3::from_quat(rot)
+            }
+        };
+        if mass_changed || self.world_inertia_rot[s] != mat {
+            self.world_inertia_rot[s] = mat;
+            self.inv_inertia_world[s] = if self.inertia_body[s].is_some() {
+                mat * self.local_inertia[s] * mat.transpose()
+            } else {
+                world_inv_inertia_m(mat * Mat3::from_quat(self.inertia_frame[s]), self.inv_inertia[s])
             };
-            if studio.is_some() {
-                f |= flag::STUDIO_POSE;
-            }
-            if !asleep {
-                f |= flag::AWAKE;
-            }
-            self.handle.push(h);
-            self.flags.push(f);
-            self.pos.push(v(pose.translation));
-            self.rot.push(rot);
-            self.local_com.push(v(mp.local_com));
-            match studio {
-                Some(sp) => {
-                    self.mat.push(m3::to_glam(&sp.r));
-                    self.com.push(sp.x);
-                }
-                None => {
-                    self.mat.push(Mat3::from_quat(rot));
-                    self.com.push(v(pose.translation) + rot * v(mp.local_com));
-                }
-            }
-            self.linvel.push(v(b.linvel()));
-            self.angvel.push(v(b.angvel()));
-            self.inv_mass.push(if b.is_dynamic() { mp.inv_mass } else { 0.0 });
-            self.inv_inertia.push(if b.is_dynamic() { inv_i } else { Vec3::ZERO });
-            self.inertia_frame.push(frame);
-            let rm = *self.mat.last().unwrap();
-            // STEP §5 [L2]: a body with Studio's mass record takes its 1/m,
-            // I (body), I⁻¹ = Studio(I) (; glam's cofactor inverse, the
-            // f32 order of Studio is not transcribed) and Iw⁻¹ = R·I⁻¹·Rᵀ.
-            let sm = if b.is_dynamic() && !b.locked_axes().contains(rp::LockedAxes::ROTATION_LOCKED) { self.studio_mass.get(&h) } else { None };
-            match sm {
-                Some(sm) => {
-                    let i = sm.inertia();
-                    let inv = if i.determinant().is_finite() && i.determinant() != 0.0 { i.inverse() } else { Mat3::ZERO };
-                    *self.inv_mass.last_mut().unwrap() = 1.0 / sm.mass;
-                    self.inertia_body.push(Some(i));
-                    self.inv_inertia_world.push(rm * inv * rm.transpose());
-                }
-                None => {
-                    self.inertia_body.push(None);
-                    self.inv_inertia_world.push(world_inv_inertia_m(rm * Mat3::from_quat(frame), if b.is_dynamic() { inv_i } else { Vec3::ZERO }));
-                }
-            }
-            self.force.push(v(b.user_force()));
-            self.torque.push(v(b.user_torque()));
-            self.gravity_scale.push(b.gravity_scale());
+        }
+        self.flags[s] = flags;
+        self.pos[s] = pos;
+        self.rot[s] = rot;
+        self.mat[s] = mat;
+        self.linvel[s] = linvel;
+        self.angvel[s] = angvel;
+        self.force[s] = v(b.user_force());
+        self.torque[s] = v(b.user_torque());
+        self.gravity_scale[s] = b.gravity_scale();
+        if !dynamic {
             let np = b.next_position();
-            self.next_pos.push(v(np.translation));
-            self.next_rot.push(q(np.rotation));
-            self.island.push(NONE);
-            self.box_c.push(Vec3::ZERO);
-            self.box_e.push(Vec3::ZERO);
+            self.next_pos[s] = v(np.translation);
+            self.next_rot[s] = q(np.rotation);
         }
     }
 

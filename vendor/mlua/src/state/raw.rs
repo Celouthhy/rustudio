@@ -98,6 +98,21 @@ impl RawLua {
         unsafe { (*self.extra.get()).lua() }
     }
 
+    /// rustudio: the `Lua` handle, for a `FromLua::from_stack` /
+    /// `IntoLua::push_into_stack` override that falls back to the value
+    /// conversion (natively stored datatypes, ltypes.rs).
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn rs_lua(&self) -> &Lua {
+        self.lua()
+    }
+
+    /// rustudio: `try_stack_value` for those overrides.
+    #[doc(hidden)]
+    pub unsafe fn rs_stack_value(&self, idx: c_int) -> Result<Value> {
+        self.try_stack_value(idx, None)
+    }
+
     #[inline(always)]
     pub(crate) fn weak(&self) -> &WeakLua {
         unsafe { (*self.extra.get()).weak() }
@@ -405,9 +420,12 @@ impl RawLua {
                 _ => 0,
             },
         );
+        // rustudio: native code for --!native modules and @native functions
+        // only, as Roblox (luau_codegen_compile_native: a flag test for any
+        // other chunk).
         #[cfg(feature = "luau-jit")]
         if status == ffi::LUA_OK && (*self.extra.get()).enable_jit && ffi::luau_codegen_supported() != 0 {
-            ffi::luau_codegen_compile(state, -1);
+            ffi::luau_codegen_compile_native(state, -1);
         }
         status
     }
@@ -1387,6 +1405,17 @@ impl RawLua {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// rustudio: the type of the mlua userdata at `idx` of `state`, if it
+    /// is one this Lua made (natively answered property writes,
+    /// runtime_routes.rs).
+    #[doc(hidden)]
+    pub unsafe fn rs_userdata_type_at(&self, state: *mut ffi::lua_State, idx: c_int) -> Option<TypeId> {
+        if ffi::lua_type(state, idx) != ffi::LUA_TUSERDATA {
+            return None;
+        }
+        self.get_userdata_type_id_inner(state, idx).ok().flatten()
     }
 
     #[inline]

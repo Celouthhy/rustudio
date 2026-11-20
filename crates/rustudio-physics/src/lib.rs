@@ -16,3 +16,4 @@ pub mod physics_mesh;
 pub mod query_shapes;
 pub mod solver;
 pub mod solver_ticks;
+pub mod throttle;

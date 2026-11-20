@@ -578,13 +578,37 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(())
         })?,
     )?;
-    // The world's DataModel as it is now (the global `game` this chunk
-    // saw at install can be a DataModel since replaced).
+    // The GUI module keeps its DataModel and Workspace across frames.
+    // Refresh the Lua references only when those instances change.
+    let cached_roots = std::cell::Cell::new(None::<(u64, u64, Ref, Option<Ref>)>);
     g.set(
-        "game",
-        lua.create_function(|lua, ()| {
-            let root = world(lua)?.d().dom.root_ref();
-            inst_value(lua, root)
+        "world_roots",
+        lua.create_function(move |lua, ()| {
+            let previous = cached_roots.get();
+            let (doc_id, revision, root, workspace) = {
+                let w = world(lua)?;
+                let d = w.d();
+                if previous.is_some_and(|(id, rev, _, _)| id == d.id && rev == d.tree_revision) {
+                    return Ok((Value::Nil, Value::Nil));
+                }
+                let root = d.dom.root_ref();
+                let workspace = d.dom.get_by_ref(root).and_then(|r| {
+                    r.children().iter().copied().find(|child| d.class_of(*child).is_some_and(|class| class == "Workspace"))
+                });
+                (d.id, d.tree_revision, root, workspace)
+            };
+            let old = previous.filter(|(id, _, _, _)| *id == doc_id);
+            let game = if old.is_none_or(|(_, _, prev, _)| root != prev) {
+                inst_value(lua, root)?
+            } else {
+                Value::Nil
+            };
+            let workspace_value = match workspace {
+                Some(ws) if old.is_none_or(|(_, _, _, prev)| Some(ws) != prev) => inst_value(lua, ws)?,
+                _ => Value::Nil,
+            };
+            cached_roots.set(Some((doc_id, revision, root, workspace)));
+            Ok((game, workspace_value))
         })?,
     )?;
     // class_signals({classes}): (added, removing) signals on game for the
@@ -1056,6 +1080,12 @@ pub fn focus_now(lua: &Lua) {
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
+    let side = world(lua).map(|w| w.side).ok();
+    let _scope = rustudio_core::bench::scope(if side == Some(Side::Server) {
+        "input_step_server"
+    } else {
+        "input_step_client"
+    });
     let Ok(m) = module(lua) else { return Ok(()) };
     let f: Function = m.get("step")?;
     if let Err(e) = f.call::<()>(dt) {

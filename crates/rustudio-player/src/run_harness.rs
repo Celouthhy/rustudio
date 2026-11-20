@@ -474,44 +474,17 @@ impl RunHarness {
             let ready = !b.play || self.play_started.is_some();
             if ready && !b.done && b.frame(work_ms) {
                 let mut report = b.report();
+                if let Some(frames) = report["frames"].as_f64().filter(|frames| *frames > 0.0) {
+                    if let Some(profile) = game.worker_lua_profile(frames) {
+                        report["gameplay_lua"] = profile;
+                    }
+                }
                 if let Some(r) = game.renderer.as_ref() {
                     report["render"] = serde_json::json!(format!("{:?}", r.stats));
                 }
-                if let Some(p) = game.play.as_ref() {
-                    let (dynamic, fixed) = p.physics.counts();
-                    report["physics"] = serde_json::json!({"assemblies": dynamic, "awake": p.physics.awake(), "fixed_colliders": fixed, "steps": p.physics.steps, "stages": p.physics.stage_times()});
-                    let sample: Vec<String> = p
-                        .physics
-                        .awake_sample(25)
-                        .into_iter()
-                        .map(|(r, pos, vel, n)| {
-                            let mut path = Vec::new();
-                            let mut cur = r;
-                            while let Some(i) = game.doc.dom.get_by_ref(cur) {
-                                path.push(i.name.clone());
-                                cur = i.parent();
-                            }
-                            path.reverse();
-                            let kids: Vec<String> = game
-                                .doc
-                                .dom
-                                .get_by_ref(r)
-                                .map(|i| {
-                                    i.children()
-                                        .iter()
-                                        .filter_map(|c| game.doc.class_of(*c).map(|k| k.to_string()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let size =
-                                rustudio_render::scene::vec3_of(game.doc.prop(r, "Size")).unwrap_or_default();
-                            format!(
-                                "{} n={n} size={size:.1} pos={pos:.1} vel={vel:.1} kids={kids:?}",
-                                path.join(".")
-                            )
-                        })
-                        .collect();
-                    report["awake_sample"] = serde_json::json!(sample);
+                if let Some((physics, awake)) = game.worker_physics_report().or_else(|| game.physics_report()) {
+                    report["physics"] = physics;
+                    report["awake_sample"] = awake;
                 }
                 let text = serde_json::to_string_pretty(&report).unwrap_or_default();
                 if let Some(out) = &self.log_out {
@@ -812,6 +785,50 @@ impl HarnessInput {
                 self.pointer = Some(*p);
             }
         }
+    }
+}
+
+impl Game {
+    pub(crate) fn physics_report(&mut self) -> Option<(serde_json::Value, serde_json::Value)> {
+        if self.play.as_ref()?.presentation.is_some() {
+            return None;
+        }
+        self.wait_for_play_physics();
+        let p = self.play.as_ref()?;
+        let (dynamic, fixed) = p.physics.counts();
+        let physics = serde_json::json!({"assemblies": dynamic, "awake": p.physics.awake(), "fixed_colliders": fixed, "steps": p.physics.steps, "stages": p.physics.stage_times()});
+        let sample: Vec<String> = p
+            .physics
+            .awake_sample(25)
+            .into_iter()
+            .map(|(r, pos, vel, n)| {
+                let mut path = Vec::new();
+                let mut cur = r;
+                while let Some(i) = self.doc.dom.get_by_ref(cur) {
+                    path.push(i.name.clone());
+                    cur = i.parent();
+                }
+                path.reverse();
+                let kids: Vec<String> = self
+                    .doc
+                    .dom
+                    .get_by_ref(r)
+                    .map(|i| {
+                        i.children()
+                            .iter()
+                            .filter_map(|c| self.doc.class_of(*c).map(|k| k.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let size =
+                    rustudio_render::scene::vec3_of(self.doc.prop(r, "Size")).unwrap_or_default();
+                format!(
+                    "{} n={n} size={size:.1} pos={pos:.1} vel={vel:.1} kids={kids:?}",
+                    path.join(".")
+                )
+            })
+            .collect();
+        Some((physics, serde_json::json!(sample)))
     }
 }
 

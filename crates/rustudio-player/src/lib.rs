@@ -8,6 +8,7 @@ pub mod game_view;
 pub mod keys;
 pub mod offscreen;
 pub mod play;
+mod play_worker;
 mod gamepad;
 pub mod player_app;
 pub mod run_harness;

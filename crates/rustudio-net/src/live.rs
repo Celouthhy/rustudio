@@ -119,6 +119,7 @@ impl LiveSession {
         std::thread::Builder::new()
             .name("rustudio-team-create".into())
             .spawn(move || {
+                log::info!("Team Create join started (place={place}, universe={universe})");
                 let result = prepare_and_run(
                     universe,
                     place,
@@ -131,6 +132,7 @@ impl LiveSession {
                     if !worker_cancel.load(Ordering::Acquire) {
                         // Errors created by this module contain fixed context,
                         // never response bodies or secret-bearing packet bytes.
+                        log::error!("Team Create worker failed (place={place}): {error}");
                         let _ = tx.send(LiveEvent::Error(error.to_string()));
                     }
                 }
@@ -282,7 +284,7 @@ fn prepare_and_run(
         .build()
         .map_err(|_| NetError::Other("Could not start Team Create network runtime".into()))?;
     runtime
-        .block_on(run(target, opening, tx.clone(), cancel, commands, next_id))
+        .block_on(run(place, target, opening, tx.clone(), cancel, commands, next_id))
         .map_err(|_| NetError::Other("The Team Create network session failed".into()))
 }
 
@@ -344,6 +346,7 @@ async fn read_frame(stream: &mut quinn::RecvStream) -> Result<Vec<u8>> {
 }
 
 async fn receive_lane(
+    place: u64,
     mut stream: quinn::RecvStream,
     tx: mpsc::SyncSender<LiveEvent>,
     cancel: Arc<AtomicBool>,
@@ -426,7 +429,14 @@ async fn receive_lane(
         let errors = decoder.errors.len();
         let ops = decoder.decode_frame(frame[0], &frame[1..]);
         if decoder.errors.len() != errors {
-            eprintln!("Team Create decode error: {:?}", decoder.errors.last());
+            if let Some(error) = decoder.errors.last() {
+                eprintln!("Team Create decode error: {error}");
+                log::error!(
+                    "Team Create decode error (place={place}, channel={channel}, lane={tag:02x?}, packet={:#04x}, bytes={}): {error}",
+                    frame[0],
+                    frame.len()
+                );
+            }
             if let Ok(path) = std::env::var("RUSTUDIO_TC_BAD_FRAME") {
                 use std::io::Write;
                 let mut options = std::fs::OpenOptions::new();
@@ -497,6 +507,7 @@ async fn wait_cancelled(cancel: &AtomicBool) {
 }
 
 async fn run(
+    place: u64,
     target: QuicTarget,
     opening: Vec<Vec<u8>>,
     tx: mpsc::SyncSender<LiveEvent>,
@@ -557,7 +568,7 @@ async fn run(
             incoming = connection.accept_uni() => {
                 match incoming {
                     Ok(stream) => {
-                        tokio::spawn(receive_lane(stream, tx.clone(), cancel.clone(), seen_sync.clone(), initial.clone(), lane_ended.clone(), shared_schema.clone(), next_id.clone()));
+                        tokio::spawn(receive_lane(place, stream, tx.clone(), cancel.clone(), seen_sync.clone(), initial.clone(), lane_ended.clone(), shared_schema.clone(), next_id.clone()));
                     }
                     Err(_) => {
                         emit(&tx, &cancel, LiveEvent::Disconnected("The Team Create connection ended".into())).await;

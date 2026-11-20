@@ -32,11 +32,7 @@ fn err(msg: String) -> mlua::Error {
 
 fn type_name(v: &Value) -> String {
     match v {
-        Value::UserData(u) => u
-            .metatable()
-            .ok()
-            .and_then(|m| m.get::<String>("__type").ok())
-            .unwrap_or_else(|| "userdata".into()),
+        Value::UserData(u) => crate::ltypes::userdata_type_name(u),
         Value::Integer(_) => "number".into(),
         Value::Vector(_) => "Vector3".into(),
         other => other.type_name().into(),

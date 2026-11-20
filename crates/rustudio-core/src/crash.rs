@@ -98,6 +98,7 @@ pub fn install() {
                 .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_default();
+            crate::diagnostics::panic_at(&loc);
             let bt = Backtrace::force_capture();
             let body = format!(
                 "{}panic in thread '{name}' at {loc}:\n{msg}\n\nbacktrace:\n{bt}\n",

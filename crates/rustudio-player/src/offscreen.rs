@@ -122,6 +122,8 @@ pub fn run<A: eframe::App>(
     } else {
         None
     };
+    let atlas_device_limit = rs.as_ref().map(|rs| rs.device.limits().max_texture_dimension_2d as usize);
+    let mut font_limit = None;
     let size = [opts.size[0].max(1), opts.size[1].max(1)];
     let frame = rs.as_ref().map(|rs| target(rs, size));
     let mut app = make(&ctx, rs.clone());
@@ -137,6 +139,7 @@ pub fn run<A: eframe::App>(
             )),
             time: Some(start.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
+            max_texture_side: font_limit,
             focused: true,
             events: std::mem::take(&mut events),
             ..Default::default()
@@ -150,7 +153,21 @@ pub fn run<A: eframe::App>(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| draw(&mut app, ui));
+        let out = ctx.run_ui(raw, |ui| {
+            draw(&mut app, ui);
+            // RawInput defaults to a 2048 atlas offscreen. Keep its packing
+            // for small scenes, but grow to the device limit when epaint
+            // would otherwise discard the full atlas and start over.
+            if font_limit.is_none() {
+                if let Some(limit) = atlas_device_limit {
+                    if ctx.fonts(|fonts| {
+                        fonts.options().max_texture_side < limit && fonts.font_atlas_fill_ratio() > 0.8
+                    }) {
+                        font_limit = Some(limit);
+                    }
+                }
+            }
+        });
         let mut close = false;
         let mut shots = Vec::new();
         for (_, v) in out.viewport_output.iter() {
@@ -235,6 +252,12 @@ pub fn run<A: eframe::App>(
     }
 }
 
+/// The interactive window presents in mailbox mode (Settings > rustudio >
+/// Performance > Presentation, `RUSTUDIO_PERF_PRESENT=fifo` forces Fifo).
+pub fn interactive_mailbox() -> bool {
+    rustudio_core::rustudio_settings::performance_value("present") != "fifo"
+}
+
 pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
     egui_wgpu::WgpuConfiguration {
         wgpu_setup: {
@@ -266,6 +289,16 @@ pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
             // for a few frames after each camera move.
             present_mode: if bench_mode || std::env::var_os("RUSTUDIO_CONTROL").is_some() {
                 egui_wgpu::wgpu::PresentMode::AutoNoVsync
+            } else if interactive_mailbox() {
+                // Studio presents without waiting for the refresh (its
+                // D3D11 frames run past the display rate with a higher
+                // TaskSchedulerTargetFps) and paces them with its own
+                // frame cap; composited, so nothing tears. Mailbox is the
+                // tear-free equivalent; the vendored egui-wgpu falls back
+                // to Fifo on a surface without it, and native_loop.rs
+                // paces redraws. FIFO blocked a low-end laptop's main thread on
+                // the GPU (a test place 24.6 -> 30.5 fps with mailbox).
+                egui_wgpu::wgpu::PresentMode::Mailbox
             } else {
                 egui_wgpu::wgpu::PresentMode::AutoVsync
             },

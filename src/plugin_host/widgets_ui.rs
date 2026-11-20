@@ -638,10 +638,13 @@ impl Editor {
         // Every DataModel's widgets: the edit VM's, and the Play copies'.
         let mut sets: Vec<(Where, Vec<super::UiItem>)> = vec![(Where::Edit, items)];
         for side in self.game.play_sides() {
-            let its = self.game
-                .play_side_lua(side)
-                .and_then(|l| l.app_data_ref::<super::vm::PluginVm>().map(|v| v.ui.clone()))
-                .unwrap_or_default();
+            let its = if self.game.has_play_worker() {
+                self.plugins.play_widgets(side)
+            } else {
+                self.game.play_side_lua(side)
+                    .and_then(|l| l.app_data_ref::<super::vm::PluginVm>().map(|v| v.ui.clone()))
+                    .unwrap_or_default()
+            };
             sets.push((Where::Play(side), its));
         }
         if self.game.play.is_none() {
@@ -719,7 +722,12 @@ impl Editor {
         let mut titles: Vec<(usize, String, bool)> = Vec::new();
         for (at, _) in &sets {
             let at = *at;
-            let Some(doc) = self.plugin_context_doc(at) else { continue };
+            let Some(doc) = self.plugin_context_doc(at) else {
+                for slot in self.plugin_ui.slots.iter_mut().filter(|s| s.at == at) {
+                    slot.want = false;
+                }
+                continue;
+            };
             // SAFETY: the document stays put while this runs (the editor's
             // own, or one Play holds; nothing here moves either).
             let doc = unsafe { &mut *doc };
@@ -881,7 +889,7 @@ impl Editor {
         let doc = unsafe { &mut *doc };
         let Editor {
             plugin_ui,
-            game: Game { cam, assets, render_state, .. },
+            game: Game { cam, assets, render_state, fixed_dt, .. },
             ..
         } = self;
         let slot = &mut plugin_ui.slots[n];
@@ -896,6 +904,7 @@ impl Editor {
                 store: assets,
                 doc_dir: doc_dir.as_deref(),
                 playing: false,
+                fixed_step: fixed_dt.is_some(),
                 roots: Roots::Widget(r),
             },
         );
@@ -972,7 +981,7 @@ impl Editor {
         };
         let Editor {
             plugin_ui,
-            game: Game { doc, cam, assets, render_state, .. },
+            game: Game { doc, cam, assets, render_state, fixed_dt, .. },
             ..
         } = self;
         if std::env::var_os("RUSTUDIO_NO_GUI").is_none() {
@@ -987,6 +996,7 @@ impl Editor {
                     store: assets,
                     doc_dir: doc_dir.as_deref(),
                     playing: false,
+                    fixed_step: fixed_dt.is_some(),
                     roots: Roots::CoreGui,
                 },
             );
@@ -1372,7 +1382,7 @@ impl Editor {
                 }
                 set.extend(layout.keys().copied());
             }
-            self.game.with_play_side(side, |rt, _, _| {
+            self.game.queue_play_side(side, move |rt, _, _| {
                 let _ch = rustudio_engine::gui::share_channel(channel(at));
                 let lua = &rt.lua;
                 if changed {

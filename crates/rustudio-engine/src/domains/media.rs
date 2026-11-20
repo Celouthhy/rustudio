@@ -310,7 +310,7 @@ struct WireRec {
 }
 
 enum Load {
-    Fetch(u64),
+    Fetch(u64, bool),
     Decode(std::sync::mpsc::Receiver<Result<Arc<Pcm>, String>>),
 }
 
@@ -416,10 +416,44 @@ enum Got {
     Failed(String),
 }
 
-fn decode(id: &str, bytes: Arc<Vec<u8>>) -> Got {
-    // Small files decode at once (a cached asset is ready in the same frame,
-    // as in Studio); long ones on a thread.
-    if bytes.len() < 1 << 21 {
+struct DecodeJob {
+    id: String,
+    bytes: Arc<Vec<u8>>,
+    result: std::sync::mpsc::Sender<Result<Arc<Pcm>, String>>,
+}
+
+fn decode_jobs() -> &'static std::sync::mpsc::Sender<DecodeJob> {
+    static JOBS: std::sync::OnceLock<std::sync::mpsc::Sender<DecodeJob>> = std::sync::OnceLock::new();
+    JOBS.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<DecodeJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        // A place can load many SoundIds in one step. Bound the decoding
+        // concurrency so a burst cannot spawn a worker per Sound.
+        for _ in 0..2 {
+            let rx = rx.clone();
+            std::thread::spawn(move || loop {
+                let job = { rx.lock().unwrap().recv() };
+                let Ok(job) = job else { break };
+                let decoded = match pcm_cached(&job.id) {
+                    Some(p) => Ok(p),
+                    None => crate::audio::decode_pcm(&job.bytes).map(|p| {
+                        let p = Arc::new(p);
+                        pcm_store(&job.id, p.clone());
+                        p
+                    }),
+                };
+                let _ = job.result.send(decoded);
+            });
+        }
+        tx
+    })
+}
+
+fn decode(id: &str, bytes: Arc<Vec<u8>>, eager: bool) -> Got {
+    // AudioPlayer keeps the small-file fast path. Legacy Sound readiness
+    // is polled by the frame loop. A compressed track can take a long time
+    // to decode even when the file is small.
+    if (eager || rustudio_core::sim_clock::on()) && bytes.len() < 1 << 21 {
         return match crate::audio::decode_pcm(&bytes) {
             Ok(p) => {
                 let p = Arc::new(p);
@@ -430,15 +464,11 @@ fn decode(id: &str, bytes: Arc<Vec<u8>>) -> Got {
         };
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    let key = id.to_string();
-    std::thread::spawn(move || {
-        let r = crate::audio::decode_pcm(&bytes).map(Arc::new);
-        if let Ok(p) = &r {
-            pcm_store(&key, p.clone());
-        }
-        let _ = tx.send(r);
-    });
-    Got::Pending(Load::Decode(rx))
+    let job = DecodeJob { id: id.to_owned(), bytes, result: tx };
+    match decode_jobs().send(job) {
+        Ok(()) => Got::Pending(Load::Decode(rx)),
+        Err(_) => Got::Failed("decoder stopped".into()),
+    }
 }
 
 /// Audio is script-readable (GetWaveformAsync, AudioAnalyzer), and a
@@ -449,7 +479,7 @@ fn audio_allowed(id: &str) -> bool {
     rustudio_core::assets::place_content_allowed(id, true)
 }
 
-fn start_load(id: &str) -> Got {
+fn start_load(id: &str, eager: bool) -> Got {
     if !audio_allowed(id) {
         return Got::Failed("Invalid Asset identifier or not found".into());
     }
@@ -458,27 +488,27 @@ fn start_load(id: &str) -> Got {
     }
     if let Some(path) = rustudio_core::assets::resolve(id, None) {
         return match std::fs::read(&path) {
-            Ok(b) => decode(id, Arc::new(b)),
+            Ok(b) => decode(id, Arc::new(b), eager),
             Err(e) => Got::Failed(format!("{}: {e}", path.display())),
         };
     }
     match rustudio_core::assets::asset_ref(id) {
-        Some(a) => poll_fetch(id, a.id),
+        Some(a) => poll_fetch(id, a.id, eager),
         None => Got::Failed("Invalid Asset identifier or not found".into()),
     }
 }
 
-fn poll_fetch(id: &str, asset: u64) -> Got {
+fn poll_fetch(id: &str, asset: u64, eager: bool) -> Got {
     match rustudio_core::assets::public_prefetch(asset) {
-        rustudio_core::assets::Fetch::Ready(b) => decode(id, b),
-        rustudio_core::assets::Fetch::Pending => Got::Pending(Load::Fetch(asset)),
+        rustudio_core::assets::Fetch::Ready(b) => decode(id, b, eager),
+        rustudio_core::assets::Fetch::Pending => Got::Pending(Load::Fetch(asset, eager)),
         rustudio_core::assets::Fetch::Unavailable(e) => Got::Failed(e),
     }
 }
 
 fn poll_load(id: &str, l: Load) -> Got {
     match l {
-        Load::Fetch(a) => poll_fetch(id, a),
+        Load::Fetch(a, eager) => poll_fetch(id, a, eager),
         Load::Decode(rx) => match rx.try_recv() {
             Ok(Ok(p)) => Got::Ready(p),
             Ok(Err(e)) => Got::Failed(e),
@@ -747,13 +777,32 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             Ok(true)
         }
         ("Sound", "SoundId") => {
-            // Loaded fires once the new id's audio is in (step).
-            let id = match value {
-                Value::String(s) => s.to_str()?.to_string(),
-                _ => String::new(),
+            let Some((canon, rbx_reflection::DataType::Value(ty), _)) = prop_desc(class, key) else {
+                return Ok(false);
             };
-            media(lua)?.sound_loads.insert(r, (id, None));
-            Ok(false)
+            let old = world(lua)?.d().prop(r, canon);
+            let new = lua_to_variant(key, value, ty, None, old.as_ref())?;
+            if old.as_ref() != Some(&new) {
+                store_prop(lua, r, canon, new)?;
+                world(lua)?.input.sound_len.remove(&r);
+                media(lua)?.sound_loads.remove(&r);
+                let id = pstr(world(lua)?.d(), r, canon);
+                if !id.trim().is_empty() {
+                    // Studio loads its built-in content and resident assets
+                    // during assignment. Uncached remote audio is completed
+                    // from the regular media step.
+                    let got = if id.starts_with("rbxasset://") {
+                        start_load(&id, true)
+                    } else if let Some(pcm) = pcm_cached(&id) {
+                        Got::Ready(pcm)
+                    } else {
+                        media(lua)?.sound_loads.insert(r, (id, None));
+                        return Ok(true);
+                    };
+                    finish_sound_load(lua, r, id, got)?;
+                }
+            }
+            Ok(true)
         }
         _ => Ok(false),
     }
@@ -1169,7 +1218,7 @@ fn asset_changed(lua: &Lua, r: Ref) -> mlua::Result<()> {
     if id.trim().is_empty() || !in_dm(world(lua)?.d(), r) {
         return Ok(());
     }
-    let got = start_load(&id);
+    let got = start_load(&id, true);
     finish_load(lua, r, got)
 }
 
@@ -1679,6 +1728,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         now - media(lua)?.scanned_at >= 0.25
     };
     if due {
+        let _scope = rustudio_core::bench::scope("media_refresh");
         refresh(lua, true)?;
     }
     // Scheduled Play / Stop (atTime on the mixer clock).
@@ -1739,7 +1789,10 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         let got = poll_load(&id, l);
         finish_load(lua, r, got)?;
     }
-    sound_loads(lua)?;
+    {
+        let _scope = rustudio_core::bench::scope("media_sound_loads");
+        sound_loads(lua)?;
+    }
     misc::step(lua, dt)?;
 
     // Render the graph for this frame. The side that plays it (a client, or
@@ -1769,9 +1822,13 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Sound.IsLoaded is false while the SoundId a script set is loading.
-pub fn sound_loading(lua: &Lua, r: Ref) -> mlua::Result<bool> {
-    Ok(media(lua)?.sound_loads.contains_key(&r))
+/// Length of the current, ready SoundId. A pending, empty or failed asset
+/// has no length, including while Play is queued.
+pub fn sound_length(lua: &Lua, r: Ref) -> mlua::Result<Option<f64>> {
+    if media(lua)?.sound_loads.contains_key(&r) {
+        return Ok(None);
+    }
+    Ok(world(lua)?.input.sound_len.get(&r).copied())
 }
 
 fn sound_loads(lua: &Lua) -> mlua::Result<()> {
@@ -1780,25 +1837,31 @@ fn sound_loads(lua: &Lua) -> mlua::Result<()> {
         m.sound_loads.drain().map(|(r, (id, l))| (r, id, l)).collect()
     };
     for (r, id, l) in items {
-        if id.trim().is_empty() {
+        if pstr(world(lua)?.d(), r, "SoundId") != id {
             continue;
         }
         let got = match l {
             Some(l) => poll_load(&id, l),
-            None => start_load(&id),
+            None => start_load(&id, false),
         };
-        match got {
-            Got::Ready(_) => {
-                let still = pstr(world(lua)?.d(), r, "SoundId") == id;
-                if still {
-                    let v = Value::String(lua.create_string(&id)?);
-                    world(lua)?.fire(r, "Loaded", vec![v]);
-                }
-            }
-            Got::Pending(l) => {
-                media(lua)?.sound_loads.insert(r, (id, Some(l)));
-            }
-            Got::Failed(_) => {}
+        finish_sound_load(lua, r, id, got)?;
+    }
+    Ok(())
+}
+
+fn finish_sound_load(lua: &Lua, r: Ref, id: String, got: Got) -> mlua::Result<()> {
+    match got {
+        Got::Ready(pcm) => {
+            let v = Value::String(lua.create_string(&id)?);
+            let mut w = world(lua)?;
+            w.input.sound_len.insert(r, pcm.len_secs());
+            w.fire(r, "Loaded", vec![v]);
+        }
+        Got::Pending(load) => {
+            media(lua)?.sound_loads.insert(r, (id, Some(load)));
+        }
+        Got::Failed(_) => {
+            world(lua)?.input.sound_len.remove(&r);
         }
     }
     Ok(())
@@ -2183,14 +2246,14 @@ mod curve_tests {
         let path = path.to_string_lossy().into_owned();
         for id in [format!("file://{path}"), path.clone(), "private.wav".to_string()] {
             pcm_store(&id, Arc::new(Pcm { rate: 8000, chans: vec![vec![0.25, -0.25]] }));
-            let denied = matches!(start_load(&id), Got::Failed(_)) && pcm_cached(&id).is_none();
+            let denied = matches!(start_load(&id, true), Got::Failed(_)) && pcm_cached(&id).is_none();
             PCM.lock().unwrap().as_mut().unwrap().remove(&id);
             assert!(denied || rustudio_core::assets::local_content_opt_in(), "local audio cache bypass: {id}");
         }
         // Roblox content still plays from the cache.
         for id in ["rbxasset://sounds/x.wav", "rbxassetid://123", "rbxtemp://rustudio/tts/1"] {
             pcm_store(id, Arc::new(Pcm { rate: 8000, chans: vec![vec![0.25, -0.25]] }));
-            let ready = matches!(start_load(id), Got::Ready(_));
+            let ready = matches!(start_load(id, true), Got::Ready(_));
             PCM.lock().unwrap().as_mut().unwrap().remove(id);
             assert!(ready, "{id}");
         }

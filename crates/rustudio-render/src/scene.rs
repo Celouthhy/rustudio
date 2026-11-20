@@ -13,6 +13,12 @@ use crate::render::{LineVertex, MeshKind, PartDraw};
 
 pub use rustudio_core::doc::{content_string, enum_u32, use_2022_materials};
 
+/// A CharacterMesh's scale on a limb of `size`: the part's Size over the
+/// standard R6 limb (`standard`), per axis.
+pub fn character_mesh_scale(size: Vec3, standard: Vec3) -> Vec3 {
+    size / standard
+}
+
 // Unions are solved in core (`mesh::union_mesh`): physics collides them.
 pub use rustudio_core::mesh::{union_mesh, MeshAsset};
 
@@ -70,6 +76,10 @@ pub struct ScenePart {
     /// The ViewportFrame it is drawn in (`Scene::viewport_frames`), None
     /// in the 3D world.
     pub layer: Option<Ref>,
+}
+
+pub(crate) fn glass_alpha(alpha: f32) -> bool {
+    alpha > mech::FX_GLASS_MIN_ALPHA && alpha < 0.999
 }
 
 /// A Decal or Texture on one face of a part.
@@ -389,6 +399,7 @@ fn style_prop(name: &str) -> bool {
 pub struct Scene {
     /// Document the parts came from (0 = none yet).
     pub doc_id: u64,
+    pub(crate) glass_generation: u64,
     pub parts: Vec<ScenePart>,
     pub index: HashMap<Ref, usize>,
     /// Bounding sphere per part (centre, radius), parallel to `parts`.
@@ -554,6 +565,7 @@ impl Scene {
     fn rebuild(&mut self, doc: &Document) {
         crate::skin::rig_changed();
         self.doc_id = doc.id;
+        self.glass_generation = self.glass_generation.wrapping_add(1);
         self.parts.clear();
         self.index.clear();
         self.bounds.clear();
@@ -587,6 +599,9 @@ impl Scene {
         let b = bound_of(&p);
         match self.index.get(&p.r) {
             Some(&i) => {
+                if glass_alpha(self.parts[i].draw.alpha) != glass_alpha(p.draw.alpha) {
+                    self.glass_generation = self.glass_generation.wrapping_add(1);
+                }
                 self.parts[i] = p;
                 self.bounds[i] = b;
             }
@@ -602,6 +617,8 @@ impl Scene {
         let Some(i) = self.index.remove(&r) else {
             return false;
         };
+        // A swap changes the indices held by the effects glass list.
+        self.glass_generation = self.glass_generation.wrapping_add(1);
         self.parts.swap_remove(i);
         self.bounds.swap_remove(i);
         if let Some(moved) = self.parts.get(i) {
@@ -966,7 +983,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 fit_to_part: true,
                 scale: Vec3::ONE,
                 offset: Vec3::ZERO,
-                vertex_colors: true,
+                vertex_colors: true, origin: false,
             })
     } else if matches!(class, "UnionOperation" | "IntersectOperation" | "NegateOperation" | "PartOperation") {
         union_mesh(doc, r)
@@ -989,7 +1006,11 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
     }
     // CharacterMesh (R6 package bodies): the model's CharacterMesh for this
     // limb replaces its box (BodyPart Torso 1, LeftArm 2, RightArm 3,
-    // LeftLeg 4, RightLeg 5), at the mesh's own size.
+    // LeftLeg 4, RightLeg 5), scaled by the part's Size over the standard
+    // limb (Torso 2×2×1, arms and legs 1×2×1) and placed by the mesh's own
+    // origin. Studio 0.747: the Boy torso on Torso
+    // boxes of 2×2×1, 2.93×2.93×1.46, 4×2×1 and 2×4×1 follows the box each
+    // time; a game's 1.46× rig drew the package at 1× with floating hands.
     if class == "Part" {
         let body_part = match inst.name.as_str() {
             "Torso" => Some(1),
@@ -1013,7 +1034,9 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                     _ => content_string(doc.prop(*c, "MeshContent")),
                 };
                 if let Some(id) = id {
-                    mesh_asset = Some(MeshAsset { id, fit_to_part: false, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true });
+                    let standard = if want == 1 { Vec3::new(2.0, 2.0, 1.0) } else { Vec3::new(1.0, 2.0, 1.0) };
+                    let scale = character_mesh_scale(size, standard);
+                    mesh_asset = Some(MeshAsset { id, fit_to_part: false, scale, offset: Vec3::ZERO, vertex_colors: true, origin: true });
                     placeholder = true;
                 }
             }
@@ -1025,7 +1048,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
             fit_to_part: true,
             scale: Vec3::ONE,
             offset: Vec3::ZERO,
-            vertex_colors: true,
+            vertex_colors: true, origin: false,
         });
     }
     // Default R6 body geometry comes from Studio's shipped avatar meshes.
@@ -1055,7 +1078,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                 fit_to_part: true,
                 scale: Vec3::ONE,
                 offset: Vec3::ZERO,
-                vertex_colors: true,
+                vertex_colors: true, origin: false,
             });
             placeholder = true;
         }
@@ -1134,7 +1157,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                             fit_to_part: true,
                             scale: Vec3::ONE,
                             offset: Vec3::ZERO,
-                            vertex_colors: true,
+                            vertex_colors: true, origin: false,
                         });
                         placeholder = true;
                     } else {
@@ -1181,7 +1204,7 @@ pub fn part_draw(doc: &Document, inst: &Instance) -> Option<ScenePart> {
                             // MeshId at all (OBJ) keeps them, for a port that uses
                             // local OBJ scenery with light baked into the colours;
                             // remove it once that port has moved to MeshParts.
-                            vertex_colors: false,
+                            vertex_colors: false, origin: false,
                         });
                 }
                 // Prism, Pyramid, ramps: no shape of their own yet.
@@ -1449,6 +1472,35 @@ mod tint_tests {
         assert_eq!(p.tex_kind, crate::render::TexMode::OpaqueTinted);
         assert!((p.draw.color[0] / p.draw.color[1] - 0.25).abs() < 1e-6);
         assert!((p.draw.color[2] / p.draw.color[1] - 0.0625).abs() < 1e-6);
+    }
+
+    /// A CharacterMesh scales with its limb over the standard R6 size and
+    /// sits by its own origin (Studio 0.747: the Boy
+    /// package on a game's 1.46× rig fills the limbs; rustudio drew it at 1×).
+    #[test]
+    fn character_mesh_scales_with_its_limb() {
+        let size = |x: f32, y: f32, z: f32| rbx_dom_weak::types::Vector3::new(x, y, z);
+        let cm = |part: u32, id: i64| InstanceBuilder::new("CharacterMesh")
+            .with_property("BodyPart", rbx_dom_weak::types::Enum::from_u32(part))
+            .with_property("MeshId", id);
+        let torso = InstanceBuilder::new("Part").with_name("Torso").with_property("Size", size(2.93, 2.93, 1.46));
+        let arm = InstanceBuilder::new("Part").with_name("Left Arm").with_property("Size", size(1.46, 2.93, 1.46));
+        let (tr, ar) = (torso.referent(), arm.referent());
+        let model = InstanceBuilder::new("Model")
+            .with_child(InstanceBuilder::new("Humanoid"))
+            .with_child(torso)
+            .with_child(arm)
+            .with_child(cm(1, 376169183))
+            .with_child(cm(2, 279174949));
+        let doc = Document::from_play_dom(WeakDom::new(
+            InstanceBuilder::new("DataModel").with_child(model)), "charmesh".into());
+        for (r, id, scale) in [(tr, "rbxassetid://376169183", Vec3::new(1.465, 1.465, 1.46)), (ar, "rbxassetid://279174949", Vec3::new(1.46, 1.465, 1.46))] {
+            let p = part_draw(&doc, doc.dom.get_by_ref(r).unwrap()).unwrap();
+            let a = p.mesh_asset.expect("the CharacterMesh");
+            assert_eq!(a.id, id);
+            assert!(!a.fit_to_part && a.origin);
+            assert!((a.scale - scale).length() < 1e-5, "{:?}", a.scale);
+        }
     }
 }
 

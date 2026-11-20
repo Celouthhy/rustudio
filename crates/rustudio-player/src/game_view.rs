@@ -96,6 +96,10 @@ fn mesh_texture_uvt(tiling: Option<[f32; 4]>, w: f32, h: f32) -> [f32; 4] {
     }
 }
 
+/// Terrain water is drawn in pieces of this many consecutive triangles,
+/// each frustum-culled (sync_terrain).
+const WATER_PIECE_TRIS: usize = 4096;
+
 /// A right-drag camera look in progress: the cursor is hidden and grabbed.
 #[derive(Debug, Clone)]
 pub struct LookGrab {
@@ -250,6 +254,10 @@ impl Game {
         // ForceShow icon override): no grab, the arrow shows, no mouse-look.
         // MouseBehavior itself keeps the game's value and applies again on
         // Resume.
+        // An editor dialog (egui Modal: "Discard unsaved changes?", …) frees
+        // it the same way, so its buttons can be clicked during first person
+        // or shift lock; the game's grab comes back when the dialog closes.
+        let menu = menu || ctx.memory(|m| m.top_modal_layer()).is_some();
         let (behavior, icon) = if menu { (0, true) } else { (behavior, icon) };
         // A shown GuiButton.Modal lets go of the cursor too, unless the
         // right button is down (gui_modal.rs; asked only while the game
@@ -613,30 +621,13 @@ impl Game {
             let (Some(sp), Some(old)) = (scene.get(*r), draw_cache.xf.get(r).copied()) else {
                 continue;
             };
-            let Some(draws) = renderer.item_draws(*r) else {
-                continue;
-            };
             // A CFrame written with the value it already had.
             if sp.xf.pos.abs_diff_eq(old.pos, 1e-5) && sp.xf.rot.abs_diff_eq(old.rot, 1e-6) {
                 continue;
             }
-            let inv = old.rot.transpose();
-            let moved: Vec<PartDraw> = draws
-                .iter()
-                .map(|d| {
-                    let local_pos = inv * (d.xf.pos - old.pos);
-                    let local_rot = inv * d.xf.rot;
-                    PartDraw {
-                        xf: Xform {
-                            pos: sp.xf.pos + sp.xf.rot * local_pos,
-                            rot: sp.xf.rot * local_rot,
-                        },
-                        ..*d
-                    }
-                })
-                .collect();
-            draw_cache.xf.insert(*r, sp.xf);
-            renderer.set_item(*r, moved);
+            if renderer.move_item(*r, old, sp.xf) {
+                draw_cache.xf.insert(*r, sp.xf);
+            }
         }
         // Restyled parts (Transparency, Color, Reflectance, CastShadow):
         // their one draw is patched in place, as Studio updates a part's
@@ -795,6 +786,9 @@ impl Game {
                     if !asset.fit_to_part {
                         d.size = m.extent * asset.scale;
                         d.xf.pos += d.xf.rot * asset.offset;
+                        if asset.origin {
+                            d.xf.pos += d.xf.rot * (m.center * asset.scale);
+                        }
                     }
                     // A MeshPart with Bones: its skinned mesh, deformed by
                     // the Bones' current frames (skin.rs).
@@ -1149,6 +1143,13 @@ impl Game {
                 }
                 _ => None,
             };
+            // LocalTransparencyModifier fades a part's Decals and Textures too
+            // (Studio: the first-person camera hides the head's face this way),
+            // while the part's own Transparency leaves them showing.
+            let ltm_keep = 1.0
+                - scene::f32_of(self.doc.prop(sp.r, "LocalTransparencyModifier"))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
             for dec in &sp.decals {
                 if dec.base_surface && variant_maps.is_some() {
                     continue;
@@ -1203,7 +1204,7 @@ impl Game {
                     extra.push(PartDraw {
                         texture: Some(t.index),
                         tex_mode: TexMode::Decal, color: dec.color,
-                        alpha: (1.0 - dec.transparency).clamp(0.0, 1.0),
+                        alpha: ((1.0 - dec.transparency) * ltm_keep).clamp(0.0, 1.0),
                         material: 0.0, material_id: 256, mat_layer: -1,
                         surfaces: 0, cast_shadow: false, surface_tint: None, uvt: PartDraw::NO_UVT,
                         emissive: [0.0; 3], reflectance: 0.0,
@@ -1248,7 +1249,7 @@ impl Game {
                     extra.push(PartDraw {
                         custom_mesh: Some(index), texture: Some(t.index),
                         tex_mode: TexMode::Decal, color: dec.color,
-                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).clamp(0.0, 1.0),
+                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { ltm_keep }).clamp(0.0, 1.0),
                         material: 0.0, material_id: 256, mat_layer: -1,
                         surfaces: 0, cast_shadow: false, surface_tint: None, uvt,
                         emissive: [0.0; 3], reflectance: 0.0,
@@ -1309,7 +1310,7 @@ impl Game {
                     extra.push(PartDraw {
                         custom_mesh: Some(index), texture: Some(t.index),
                         tex_mode: TexMode::Decal, color: dec.color,
-                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { 1.0 }).clamp(0.0, 1.0),
+                        alpha: ((1.0 - dec.transparency) * if dec.base_surface { d.alpha } else { ltm_keep }).clamp(0.0, 1.0),
                         material: 0.0, material_id: 256, mat_layer: -1,
                         surfaces: 0, cast_shadow: false, surface_tint: None, uvt,
                         emissive: [0.0; 3], reflectance: 0.0,
@@ -1377,7 +1378,7 @@ impl Game {
                     },
                     size: s,
                     color: dec.color,
-                    alpha: ((1.0 - dec.transparency) * if dec.base_surface { sp.draw.alpha } else { 1.0 }).clamp(0.0, 1.0),
+                    alpha: ((1.0 - dec.transparency) * if dec.base_surface { sp.draw.alpha } else { ltm_keep }).clamp(0.0, 1.0),
                     mesh: rustudio_render::render::MeshKind::Block,
                     material: 0.0,
                     placeholder: false,
@@ -1755,7 +1756,15 @@ impl Game {
                         [base + glam::Vec2::X, base + glam::Vec2::Y, base]
                     })
                     .collect();
-                let mesh = renderer.add_mesh(&device, &pos, &nrm, &uvs);
+                // In pieces of consecutive triangles (the mesh's order, so
+                // overlapping water blends as before), each its own mesh in
+                // the whole water's box (the same vertex arithmetic), so the
+                // renderer culls the water out of view: Place B's 333k
+                // triangle sea was drawn whole every frame (a low-end laptop: ~5 ms).
+                let piece = 3 * WATER_PIECE_TRIS;
+                for at in (0..pos.len()).step_by(piece) {
+                let end = (at + piece).min(pos.len());
+                let mesh = renderer.add_mesh(&device, &pos[at..end], &nrm[at..end], &uvs[at..end]);
                 let rgb = water_rgb;
                 draws.push(rustudio_render::render::PartDraw {
                     xf: Xform {
@@ -1788,6 +1797,7 @@ impl Game {
                     surface_tint: None,
                     cast_shadow: false,
                 });
+                }
             }
             renderer.set_item(terrain, draws);
         }
@@ -1815,7 +1825,12 @@ impl Game {
             return;
         };
         let terrain = *terrain;
-        let on = matches!(self.doc.prop(terrain, "Decoration"), Some(Variant::Bool(true)));
+        let detail = self.quality_profile().map_or_else(
+            || rustudio_core::rustudio_settings::performance_choice("grass"),
+            |profile| profile.grass(),
+        );
+        let radius_scale = if detail == 1 { 0.5 } else { 1.0 };
+        let on = detail != 2 && matches!(self.doc.prop(terrain, "Decoration"), Some(Variant::Bool(true)));
         let length = match self.doc.prop(terrain, "GrassLength") {
             Some(Variant::Float32(f)) => f,
             _ => mech::GRASS_LENGTH_DEFAULT,
@@ -1831,10 +1846,12 @@ impl Game {
             return;
         };
         let device = rs.device.clone();
-        if !on || length.to_bits() != self.terrain_grass_length.to_bits() {
+        let density = density * radius_scale;
+        if !on || density != self.terrain_grass_density || length.to_bits() != self.terrain_grass_length.to_bits() {
             for k in self.terrain_grass_built.drain() {
                 renderer.set_terrain_grass(&device, k, &[]);
             }
+            self.terrain_grass_density = density;
             self.terrain_grass_length = length;
             if !on {
                 return;
@@ -1849,7 +1866,7 @@ impl Game {
         let far: Vec<[i32; 3]> = self
             .terrain_grass_built
             .iter()
-            .filter(|k| !near(k, mech::GRASS_EVICTION_RADIUS))
+            .filter(|k| !near(k, mech::GRASS_EVICTION_RADIUS * radius_scale))
             .copied()
             .collect();
         for k in far {
@@ -1859,7 +1876,7 @@ impl Game {
         let mut pending: Vec<_> = self
             .terrain_grass_chunks
             .iter()
-            .filter(|k| !self.terrain_grass_built.contains(*k) && near(k, mech::GRASS_RADIUS))
+            .filter(|k| !self.terrain_grass_built.contains(*k) && near(k, mech::GRASS_RADIUS * radius_scale))
             .copied()
             .collect();
         // Complete the visible working set before drawing this camera. Building
@@ -1981,9 +1998,14 @@ impl Game {
         self.sync_terrain_params();
         self.sync_terrain_grass();
         // Decoration sways in Edit mode too, even when input is idle.
-        if !self.terrain_grass_built.is_empty() {
+        if !self.terrain_grass_built.is_empty() && (rustudio_core::rustudio_settings::performance_choice("idle") == 0 || self.is_playing()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+    }
+
+    fn quality_profile(&self) -> Option<rustudio_render::quality::Profile> {
+        (rustudio_core::rustudio_settings::performance_value("quality") == "automatic")
+            .then(|| self.automatic_quality.profile())
     }
 
     pub fn draw_world(
@@ -1995,6 +2017,21 @@ impl Game {
         overlay: &[PartDraw],
         started: std::time::Instant,
     ) {
+        let playing = self.is_playing();
+        let quality_start = self.quality_profile().map(|_| std::time::Instant::now());
+        if let Some(now) = quality_start {
+            let gpu_ms = rustudio_render::gpu_timing::last_scene_ms();
+            if let Some((last, was_playing)) = self.quality_frame_at.replace((now, playing)) {
+                if playing == was_playing {
+                    let ms = now.duration_since(last).as_secs_f32() * 1_000.0;
+                    let render_ms = gpu_ms.map(|gpu| gpu.max(self.quality_cpu_ms));
+                    self.automatic_quality.observe(if playing { ms.min(500.0) } else { ms }, render_ms);
+                }
+            }
+        } else {
+            self.quality_frame_at = None;
+        }
+        let quality = self.quality_profile();
         // WireframeHandleAdornments (domains/world_misc.rs).
         let (wire_lines, wire_texts) = rustudio_engine::runtime::domains::world::misc::wire_geometry(&self.doc);
         lines.extend(wire_lines.into_iter().map(|(pos, color)| LineVertex { pos, color }));
@@ -2011,13 +2048,18 @@ impl Game {
             }
             None => rect,
         };
+        let scale = rustudio_core::rustudio_settings::performance_value("resolution")
+            .parse::<f32>()
+            .unwrap_or(100.0)
+            / 100.0;
+        size = size.map(|n| (n as f32 * scale).round().max(1.0) as u32);
         let (globals, lights, shadows, sun_cascades) = {
             let _l = rustudio_core::bench::scope("lighting");
             self.frame_lighting(rrect)
         };
         // Studio's scene environment probe (env_probe.rs): the PBR
         // technologies' 128 px indoor reflection cube.
-        let probe = (globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
+        let probe = (quality.is_none_or(|p| p.detail() >= 2.0) && globals.env_spec[2] > 0.5 && std::env::var_os("RUSTUDIO_NO_ENV_PROBE").is_none()).then(|| {
             let _p = rustudio_core::bench::scope("env_probe");
             let revision = self.renderer.as_ref().map_or(0, |r| r.static_gen());
             let now = rustudio_core::sim_clock::since(started).as_secs_f64();
@@ -2033,6 +2075,7 @@ impl Game {
                 size,
                 &Frame {
                     globals,
+                    quality,
                     cull_view_proj: self.cam.view_proj(rrect),
                     fov_y: self.cam.fov_deg.to_radians(),
                     lights: &lights,
@@ -2045,13 +2088,17 @@ impl Game {
                         time: std::env::var("RUSTUDIO_CAPTURE_WATER_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| rustudio_core::sim_clock::since(started).as_secs_f32()),
                         ..self.water_waves
                     },
-                    clouds: rustudio_render::clouds::look(&self.doc),
+                    clouds: quality.is_none_or(|p| p.clouds())
+                        .then(|| rustudio_render::clouds::look(&self.doc)).flatten(),
                     probe,
                 },
             ),
             _ => None,
         };
         drop(vp_render);
+        if let Some(start) = quality_start {
+            self.quality_cpu_ms = start.elapsed().as_secs_f32() * 1_000.0;
+        }
         // The 3D view behind the GUI (UIBlur samples it).
         rustudio_engine::gui::share().scene = tex.map(|id| (id, rect));
         match tex {
@@ -2114,7 +2161,7 @@ impl Game {
                 .as_ref()
                 .and_then(|p| p.parent())
                 .map(|p| p.to_path_buf());
-            let Game { doc, cam, assets, play, gui, game_grab, .. } = self;
+            let Game { doc, cam, assets, play, gui, game_grab, fixed_dt, .. } = self;
             // (RUSTUDIO_NO_GUI hides every GUI, to tell GUI from 3D in tests.)
             if std::env::var_os("RUSTUDIO_NO_GUI").is_none() && show_gui {
                 let _g = rustudio_core::bench::scope("gui_draw");
@@ -2130,6 +2177,7 @@ impl Game {
                         store: assets,
                         doc_dir: doc_dir.as_deref(),
                         playing,
+                        fixed_step: fixed_dt.is_some(),
                         roots: rustudio_engine::gui::Roots::View,
                     },
                 );
@@ -2194,11 +2242,12 @@ impl Game {
         // the GUIs (round 25).
         // (RUSTUDIO_NO_FX leaves them out, to measure their cost.)
         if self.renderer.is_some() && std::env::var_os("RUSTUDIO_NO_FX").is_none() {
+            let quality = self.quality_profile();
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let Game { doc, cam, scene, assets, play, fixed_dt, gui, effects, lighting, .. } = self;
             // (round 26: see-through parts dim the effects behind them; the
             // server's :Emit reaches the client's view)
-            let glass = if effects.is_empty() { Vec::new() } else { effects.glass(scene, doc.revision, cam) };
+            let glass = if effects.is_empty() { Vec::new() } else { effects.glass(scene, cam) };
             let server = play.as_ref().filter(|s| s.showing == rustudio_engine::runtime::Side::Client).and_then(|s| {
                 let id = s.other_doc_id()?;
                 Some((id, &s.map.s2c))
@@ -2210,6 +2259,7 @@ impl Game {
                     cam,
                     rect,
                     dt: fixed_dt.unwrap_or(dt),
+                    quality,
                     texture: &mut |id| gui.texture(&ctx, assets, doc_dir.as_deref(), id).map(|t| t.0),
                     light: &lighting.fx,
                     glass: &glass,
@@ -2226,7 +2276,7 @@ impl Game {
             let _g = rustudio_core::bench::scope("gui_world_pass");
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = rustudio_render::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
-            r.draw_world_gui(rs, &self.gui.world_batches, self.effects.drawn(), curve);
+            r.draw_world_gui(rs, ctx.font_texture_update(), &self.gui.world_batches, self.effects.drawn(), curve);
             // Highlights last, over the finished image (highlight.rs).
             r.draw_highlights(rs, &hl);
         }
@@ -2239,6 +2289,7 @@ impl Game {
             // (handed over only when it changed: the game keeps the last one)
             if self.gui.take_layout_change() {
                 s.game.gui_layout = self.gui.layout.clone();
+                s.game.gui_layout_changed = true;
             }
         } else {
             self.gui.events.clear();
@@ -2485,8 +2536,8 @@ impl Game {
     /// the parts in it and the terrain are gathered here, voxelized and lit
     /// on a worker, and uploaded when done; the GPU keeps the last one (with
     /// its own origin) meanwhile. Returns its globals entry (w 0 = none yet).
-    fn sync_lightgrid(&mut self, lights: &[rustudio_render::render::LightRaw], sun: Vec3, shadows: bool) -> [f32; 4] {
-        let lights = if rustudio_render::lighting::soft_style(&self.doc) { lights } else { &[] };
+    fn sync_lightgrid(&mut self, lights: &[rustudio_render::render::LightRaw], sun: Vec3, shadows: bool, voxel_lights: bool) -> [f32; 4] {
+        let lights = if voxel_lights || rustudio_render::lighting::soft_style(&self.doc) { lights } else { &[] };
         let st = &mut self.lighting;
         if bytemuck::cast_slice::<_, u8>(&st.lightgrid_lights) != bytemuck::cast_slice::<_, u8>(lights) {
             st.lightgrid_lights = lights.to_vec();
@@ -2506,8 +2557,8 @@ impl Game {
                         // Only if the grid it re-lit is still the one shown.
                         if st.lightgrid_shown == Some(locals.origin) {
                             renderer.set_localgrid(&rs.queue, &local);
+                            st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
                             st.lightgrid_locals = Some(locals);
-                            st.lightgrid_local_dirty = true;
                         }
                     }
                     st.lightgrid_local_job = None;
@@ -2536,10 +2587,8 @@ impl Game {
                         // (the GPU has the channel; it's kept as `locals`)
                         grid.local = Vec::new();
                         st.fx.grid = Some(std::sync::Arc::new(grid));
+                        st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
                         st.lightgrid_locals = Some(locals);
-                        // A re-light running was for the grid before.
-                        st.lightgrid_local_job = None;
-                        st.lightgrid_local_dirty = true;
                     }
                     st.lightgrid_job = None;
                 }
@@ -2565,7 +2614,7 @@ impl Game {
         let since = st.lightgrid_at.map(|t| rustudio_core::sim_clock::since(t).as_secs_f32());
         let stale = (st.lightgrid_dirty && since.is_none_or(|t| t >= mech::LIGHTGRID_REFRESH_S))
             || (st.lightgrid_moves && since.is_none_or(|t| t >= mech::LIGHTGRID_MOVES_REFRESH_S));
-        if (moved || stale) && st.lightgrid_job.is_none() {
+        if (moved || stale) && st.lightgrid_job.is_none() && st.lightgrid_local_job.is_none() {
             let _b = rustudio_core::bench::scope("lightgrid");
             // The terrain's share, read again only when the grid moved or
             // the terrain changed.
@@ -2657,9 +2706,9 @@ impl Game {
             st.lightgrid_moves = false;
         }
         // Lights changed, voxels didn't: re-light the boxes of the lights
-        // that changed now (also while a full build runs: it catches up
-        // when it lands), or the whole channel on a worker when they're big.
-        if st.lightgrid_local_dirty && st.lightgrid_local_job.is_none() {
+        // that changed now, or the whole channel on a worker when they're big.
+        // Only one job can publish a grid at a time, including a full rebuild.
+        if st.lightgrid_local_dirty && st.lightgrid_local_job.is_none() && st.lightgrid_job.is_none() {
             if let (Some(occ), Some(locals)) = (st.lightgrid_occ.clone(), st.lightgrid_locals.as_mut()) {
                 if Some(locals.origin) == st.lightgrid_shown {
                     let _b = rustudio_core::bench::scope("lightgrid_local");
@@ -2811,9 +2860,11 @@ impl Game {
         self.sync_studs();
         let planes = rustudio_render::render::frustum(self.cam.view_proj(rect));
         let lt_gather = rustudio_core::bench::scope("lt_gather");
-        let lights = self.lighting.lights.gather(&mut self.doc, &self.cam, &|c, r| {
+        let quality = self.quality_profile();
+        let voxel_lights = quality.is_some_and(|profile| profile.detail() < 2.0);
+        let mut lights = self.lighting.lights.gather(&mut self.doc, &self.cam, &|c, r| {
             rustudio_render::render::sphere_visible(&planes, c, r)
-        });
+        }, voxel_lights);
         drop(lt_gather);
         self.lighting.drawn_lights = lights.len();
         let skybox = self.renderer.as_ref().is_some_and(|r| r.sky_size > 0);
@@ -2826,8 +2877,34 @@ impl Game {
             &self.lighting.sky_irr,
             &self.lighting.indoor_irr,
         );
-        fl.globals.lightgrid = self.sync_lightgrid(&lights, fl.sun_true, fl.shadows);
-        fl.globals.lightocc = {
+        if let Some(profile) = quality {
+            fl.globals.perf[0] = profile.detail();
+            fl.globals.perf[3] = 1.0;
+            if !profile.depth_of_field() {
+                fl.globals.dof = [0.0; 4];
+            }
+        }
+        let shadow_divisor = quality.map_or_else(
+            || [1, 2, 0][rustudio_core::rustudio_settings::performance_choice("shadows")],
+            |profile| profile.shadow_tile_divisor(),
+        );
+        let grid_sun = fl.shadows && (shadow_divisor != 0 || quality.is_some());
+        if shadow_divisor == 0 {
+            fl.shadows = false;
+            fl.globals.bloom[2] = 0.0;
+        }
+        if shadow_divisor == 0 {
+            for light in &mut lights { light.extra[3] = -1.0; }
+        }
+        if quality.map_or_else(
+            || rustudio_core::rustudio_settings::performance_choice("bloom") == 1,
+            |profile| !profile.bloom(),
+        ) {
+            fl.globals.cc_tint[3] = 0.0;
+            fl.globals.bloom[1] = -1.0;
+        }
+        fl.globals.lightgrid = self.sync_lightgrid(&lights, fl.sun_true, grid_sun, voxel_lights);
+        fl.globals.lightocc = if voxel_lights { [0.0; 4] } else {
             let _s = rustudio_core::bench::scope("lt_occ");
             self.sync_lightocc(&lights)
         };
@@ -2863,19 +2940,23 @@ impl Game {
         }
         // Terrain.Clouds' sun cover (clouds.rs): it softens and dims the sun
         // (shader.wgsl reads it from outdoor.w).
-        let cover = rustudio_render::clouds::sun_cover(rustudio_render::clouds::look(&self.doc).is_some());
+        let cover = rustudio_render::clouds::sun_cover(quality.is_none_or(|p| p.clouds())
+            && rustudio_render::clouds::look(&self.doc).is_some());
         fl.globals.outdoor[3] = cover;
         fl.shadow_softness = rustudio_render::clouds::shadow_softness(fl.shadow_softness, cover);
         // The sun's shadow cascades (sun_shadow.rs), around this camera.
         let aspect = (rect.width() / rect.height().max(1.0)).max(0.01);
         let tan_y = (self.cam.fov_deg.to_radians() * 0.5).tan();
-        let cascades = rustudio_render::sun_shadow::cascades(
+        let mut cascades = rustudio_render::sun_shadow::cascades(
             self.cam.pos,
             self.cam.forward(),
             [tan_y * aspect, tan_y],
             fl.sun,
             fl.shadow_softness,
         );
+        if shadow_divisor > 1 {
+            for cascade in &mut cascades { cascade.tile /= shadow_divisor; }
+        }
         (fl.globals.sun_casc, fl.globals.sun_sphere, fl.globals.sun_rect) = rustudio_render::sun_shadow::uniforms(&cascades);
         (fl.globals, lights, fl.shadows, cascades)
     }

@@ -21,6 +21,7 @@ pub mod assets;
 pub mod bench;
 pub mod collision_groups;
 pub mod crash;
+pub mod diagnostics;
 pub mod default_scripts;
 pub mod doc;
 pub mod editable_source;

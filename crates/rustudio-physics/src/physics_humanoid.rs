@@ -61,6 +61,8 @@ pub struct HumBody {
     pub ctl: Option<HumCtl>,
     /// Seated: the seat part and, on a moving seat, the weld's joint.
     pub seat: Option<(Ref, Option<rp::ImpulseJointHandle>)>,
+    /// Held by an Anchored HumanoidRootPart (`anchor_humanoid`).
+    anchored: bool,
     /// The root's pose and velocities after the last world tick (a level-2
     /// assembly moves on every 2nd tick only: `MidSolve`), kept so that a
     /// teleport or a velocity write shows at once. None = the body as it is.
@@ -331,6 +333,7 @@ impl rp::PhysicsHooks for OwnerHooks<'_> {
 
 #[derive(Default)]
 pub struct Hums {
+    force_models: Vec<Ref>,
     pub by_model: HashMap<Ref, HumBody>,
     /// Part → its character model.
     pub of_part: HashMap<Ref, Ref>,
@@ -726,7 +729,7 @@ impl Physics {
             if let Some(sv) = self.studio.as_mut() {
                 sv.note_character_collider(c);
             }
-            self.by_collider.insert(c, *r);
+            self.register_collider(c, *r);
             self.hums.of_part.insert(*r, model);
             list.push(HumPart { part: *r, collider: c, offset, friction: props.friction, mp });
         }
@@ -747,7 +750,7 @@ impl Physics {
                 eprintln!("HUMDBG   {name} {:?} doc {:.4}", p.mp.mass(), part_mass(doc, p.part).mass);
             }
         }
-        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::default(), sig: sig_hash, solve0: None, arb: [0, 0] });
+        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, anchored: false, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::default(), sig: sig_hash, solve0: None, arb: [0, 0] });
     }
 
     /// What a character's body depends on besides its pose: each part's
@@ -950,7 +953,7 @@ impl Physics {
                 }
                 // Touching the stand-in is touching the part (Touched).
                 if let Some(part) = self.by_collider.get(&ch).copied() {
-                    self.by_collider.insert(gc, part);
+                    self.register_collider(gc, part);
                 }
                 colliders.push((ch, gc));
             }
@@ -1688,6 +1691,10 @@ impl Physics {
     pub(super) fn humanoid_part_xform(&self, part: Ref) -> Option<Xform> {
         let m = self.hums.of_part.get(&part)?;
         let h = self.hums.by_model.get(m)?;
+        self.humanoid_part_pose(h, part)
+    }
+
+    fn humanoid_part_pose(&self, h: &HumBody, part: Ref) -> Option<Xform> {
         let p = h.parts.iter().find(|p| p.part == part)?;
         let c = self.world.colliders.get(p.collider)?;
         // From the body's pose: a collider's own follows a teleport only in
@@ -1818,6 +1825,52 @@ impl Physics {
                 }
             }
             self.hums.desc_remap.clear();
+        }
+    }
+
+    /// An Anchored HumanoidRootPart holds the character where its root is
+    /// (Studio 0.747: a server PivotTo of a player's character with the root
+    /// anchored stays there, 5 studs up, in Freefall, for as long as it is
+    /// anchored); the controller's forces and gravity move nothing. None lets
+    /// it go again. A seated character is the seat's.
+    pub fn anchor_humanoid(&mut self, model: Ref, at: Option<Xform>) {
+        let Some(hb) = self.hums.by_model.get(&model) else { return };
+        if hb.seat.is_some() {
+            return;
+        }
+        let body = hb.body;
+        match at {
+            Some(root_at) => {
+                if let Some(b) = self.world.bodies.get_mut(body) {
+                    if !b.is_kinematic() {
+                        b.set_linvel(rp::Vector::ZERO, true);
+                        b.set_angvel(rp::Vector::ZERO, true);
+                        b.set_body_type(rp::RigidBodyType::KinematicPositionBased, true);
+                    }
+                    if *b.position() != pose(&root_at) {
+                        b.set_position(pose(&root_at), true);
+                    }
+                    b.set_next_kinematic_position(pose(&root_at));
+                    b.set_linvel(rp::Vector::ZERO, true);
+                    b.set_angvel(rp::Vector::ZERO, true);
+                }
+                if let Some(h) = self.hums.by_model.get_mut(&model) {
+                    h.anchored = true;
+                    h.shown = None;
+                    h.hold = None;
+                }
+            }
+            None => {
+                if !hb.anchored {
+                    return;
+                }
+                if let Some(b) = self.world.bodies.get_mut(body) {
+                    b.set_body_type(rp::RigidBodyType::Dynamic, true);
+                }
+                if let Some(h) = self.hums.by_model.get_mut(&model) {
+                    h.anchored = false;
+                }
+            }
         }
     }
 
@@ -2023,8 +2076,14 @@ impl Physics {
         }
     }
 
-    /// What Studio's force functions read off the root assembly.
+    /// Body state for the frame's timestep arbiter. This calculation only
+    /// needs mass and inertia, so no contact graph traversal is necessary.
     pub fn humanoid_body(&self, model: Ref) -> Option<Body> {
+        self.humanoid_body_input(model, false)
+    }
+
+    /// What Studio's force functions read off the root assembly.
+    fn humanoid_body_input(&self, model: Ref, force: bool) -> Option<Body> {
         let h = self.hums.by_model.get(&model)?;
         let b = self.world.bodies.get(h.body)?;
         let p = *b.position();
@@ -2040,7 +2099,7 @@ impl Physics {
         let mass = b.mass();
         let (fx, tx) = self.hums.fext.get(&h.body).copied().unwrap_or((Vec3::ZERO, Vec3::ZERO));
         let hrp = h.ctl.as_ref().map(|c| c.hrp).unwrap_or(h.root);
-        let hrp_xf = self.humanoid_part_xform(hrp).unwrap_or(xf);
+        let hrp_xf = self.humanoid_part_pose(h, hrp).unwrap_or(xf);
         Some(Body {
             mass,
             rot: xf.rot,
@@ -2053,7 +2112,11 @@ impl Physics {
             hrp_up: hrp_xf.rot.y_axis,
             hrp_y: hrp_xf.pos.y,
             gravity: self.gravity,
-            contacts: self.humanoid_contacts(model),
+            contacts: if force && h.ctl.as_ref().is_some_and(|ctl| ctl.hum.needs_force_contacts(xf.pos.y)) {
+                self.humanoid_contacts(model)
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -2062,17 +2125,12 @@ impl Physics {
     pub(super) fn humanoid_forces(&mut self, h: f32) {
         self.ghosts_follow();
         self.hums.mid.colliders.clear();
-        let models: Vec<Ref> = self
-            .hums
-            .by_model
-            .iter()
-            .filter(|(_, b)| b.ctl.is_some())
-            .map(|(m, _)| *m)
-            .collect();
-        for model in models {
-            let Some(body) = self.humanoid_body(model) else { continue };
+        let mut models = std::mem::take(&mut self.hums.force_models);
+        models.extend(self.hums.by_model.iter().filter_map(|(&model, hb)| hb.ctl.is_some().then_some(model)));
+        for &model in &models {
             let Some(hb) = self.hums.by_model.get_mut(&model) else { continue };
             let handle = hb.body;
+            let mut level = None;
             if let Some(sv) = self.studio.as_mut() {
                 // RUSTUDIO_SOLVER=studio (Studio observations): the Humanoid's level
                 // is its slot-3 request (Studio(body, req, 3), STEP
@@ -2102,6 +2160,11 @@ impl Physics {
                 if !own {
                     continue;
                 }
+                level = Some(lvl);
+            }
+            let Some(body) = self.humanoid_body_input(model, true) else { continue };
+            let Some(hb) = self.hums.by_model.get_mut(&model) else { continue };
+            if let Some(lvl) = level {
                 let Some(ctl) = hb.ctl.as_mut() else { continue };
                 let step = ctl.step;
                 if let Some(v) = ctl.swim {
@@ -2276,6 +2339,8 @@ impl Physics {
                 }
             }
         }
+        models.clear();
+        self.hums.force_models = models;
         // A floor no character has stood on for a while (its level-1 solves span
         // one tick, its level-2 two): its slot-3 request goes (`floor_levels`).
         if !self.hums.floor_levels.is_empty() {

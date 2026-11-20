@@ -2461,7 +2461,9 @@ impl Bvh {
                 let mut curr = parent.decompose().0;
                 while curr != 0 {
                     let parent = self.parents[curr];
-                    self.nodes[parent] = self.nodes[curr].merged(curr as u32);
+                    let mut merged = self.nodes[curr].merged(curr as u32);
+                    merged.data.normalize_change_flag();
+                    self.nodes[parent] = merged;
                     curr = parent.decompose().0;
                 }
             }

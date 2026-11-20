@@ -559,7 +559,8 @@ impl SleepStage {
                 continue;
             }
             let sl = st(b, s as usize);
-            if sl.state != AWAKE || !sl.eligible {
+            // stepAwakeAssemblies skips throttled assemblies on a throttled frame.
+            if sl.state != AWAKE || !sl.eligible || b.flags[s as usize] & flag::FROZEN != 0 {
                 continue;
             }
             // Stand-in (no SLEEP.md rule for it): a body a Humanoid / mover holds a slot-3
@@ -576,7 +577,7 @@ impl SleepStage {
         // Step 3, Studio (§6): state-4 retest every maxLevel ticks.
         if phase % max_level == 0 {
             for s in 0..b.len() as u32 {
-                if !dynamic(b, s) || st(b, s as usize).state != ASLEEP_IN {
+                if !dynamic(b, s) || st(b, s as usize).state != ASLEEP_IN || b.flags[s as usize] & flag::FROZEN != 0 {
                     continue;
                 }
                 let lv = b.persist[pidx(b, s as usize)].level.max(1);
@@ -628,7 +629,8 @@ impl SleepStage {
     /// write).
     pub fn end_tick(&mut self, b: &mut BodySet) {
         for s in 0..b.len() {
-            if b.flags[s] & flag::DYNAMIC == 0 {
+            // A throttled frame does not run for a frozen body: no history step.
+            if b.flags[s] & flag::DYNAMIC == 0 || b.flags[s] & flag::FROZEN != 0 {
                 continue;
             }
             let (com, rot, r) = (b.com[s], b.rot[s], r_of(b, s));

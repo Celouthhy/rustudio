@@ -76,7 +76,7 @@ pub struct ActionRow {
 }
 
 /// What the UI draws this frame, read from the plugin VM after its tick.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UiModel {
     pub at: Option<Where>,
     pub groups: Vec<RibbonGroup>,
@@ -316,6 +316,7 @@ impl Editor {
                     None => UiModel::default(),
                 }
             }
+            Where::Play(side) if self.game.has_play_worker() => self.plugins.play_ribbon(side),
             Where::Play(side) => self.game
                 .with_play_side(side, |rt, _, _| match rustudio_engine::runtime::world(&rt.lua) {
                     Ok(w) => {
@@ -388,7 +389,7 @@ impl Editor {
     pub fn plugin_fire(&mut self, r: Ref, event: &'static str) {
         match self.plugin_bar.model.at {
             Some(Where::Play(side)) => {
-                self.game.with_play_side(side, |rt, _, _| {
+                self.game.queue_play_side(side, move |rt, _, _| {
                     rt.fire(r, event, vec![]);
                     rt.dispatch();
                 });
@@ -445,7 +446,7 @@ impl Editor {
         self.plugin_bar.popup_pos.remove(&token);
         match self.plugin_bar.model.at {
             Some(Where::Play(side)) => {
-                self.game.with_play_side(side, |rt, _, _| menus::answer(&rt.lua, token, choice));
+                self.game.queue_play_side(side, move |rt, _, _| menus::answer(&rt.lua, token, choice));
             }
             _ => {
                 if let Some(lua) = self.plugins.edit_lua() {
@@ -734,7 +735,7 @@ pub fn tool_for_ribbon(name: &str) -> Option<Tool> {
 }
 
 /// The UI model of a VM whose objects live in `doc`.
-fn snapshot(lua: &mlua::Lua, doc: &rustudio_core::doc::Document) -> UiModel {
+pub(super) fn snapshot(lua: &mlua::Lua, doc: &rustudio_core::doc::Document) -> UiModel {
     let groups = toolbar::ribbon(lua, doc);
     let s = |r: Ref, k: &str| match doc.prop(r, k) {
         Some(rbx_dom_weak::types::Variant::String(s)) => s,

@@ -989,8 +989,15 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
                 .unwrap_or(0);
             one(Value::Number(n as f64))
         }
-        // Studio never throttles a local session.
-        "GetPhysicsThrottling" if class == "Workspace" => one(Value::Number(100.0)),
+        // The environmental throttle's stepped share (rustudio-physics throttle.rs).
+        "GetPhysicsThrottling" if class == "Workspace" => {
+            let pct = world(lua)
+                .ok()
+                .and_then(|w| rustudio_physics::physics::live::with_stats(w.d().id, |s| s.throttle_pct))
+                .flatten()
+                .unwrap_or(100.0);
+            one(Value::Number(pct))
+        }
         "PGSIsEnabled" if class == "Workspace" => one(Value::Boolean(true)),
         "JoinToOutsiders" if class == "Workspace" => join_outsiders(lua, args),
         "UnjoinFromOutsiders" if class == "Workspace" => unjoin_outsiders(lua, args),

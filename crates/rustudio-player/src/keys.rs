@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 /// The physical key positions held this frame.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PhysicalKeys {
     down: BTreeSet<egui::Key>,
 }

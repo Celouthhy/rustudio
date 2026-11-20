@@ -31,7 +31,7 @@ use glam::Quat;
 pub const KIND_PARRY: u8 = 0xff;
 
 /// One point of this tick's manifold, before matching.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct TempPt {
     kind: u8,
     id_a: i32,
@@ -206,6 +206,7 @@ pub struct ManifoldState {
     /// This tick's manifold index in `list` (valid when `list_tick` is the store's tick).
     pub list_m: u32,
     pub list_tick: u64,
+    cached_parry: Option<ParryStamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -298,20 +299,62 @@ struct Pending {
     reg: [u8; MAX_POINTS],
 }
 
+/// Independent narrow-phase result. Connector IDs and touch events are still
+/// committed in the original pair visit order.
+struct Geometry {
+    first_a: bool,
+    geom: narrow::PairState,
+    temps: narrow::Temps,
+}
+
+// Most convex pairs have one manifold. Project its local points on the
+// same workers as native narrow-phase geometry, before the ordered commit.
+struct ProjectedManifold {
+    frame2: rp::Pose,
+    points: [TempPt; MAX_POINTS],
+    count: usize,
+}
+
+enum PreparedGeometry {
+    Retained(u32),
+    Native(Geometry),
+    Parry(ProjectedManifold),
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParryStamp {
+    epoch: u64,
+    handles: [rp::ColliderHandle; 2],
+    poses: [rp::Pose; 2],
+}
+
+impl ParryStamp {
+    fn new(pair: &rp::ContactPair, co1: &rp::Collider, co2: &rp::Collider) -> Self {
+        Self {
+            epoch: pair.contact_epoch(),
+            handles: [pair.collider1, pair.collider2],
+            poses: [*co1.position(), *co2.position()],
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ContactStore {
     pub map: FxHashMap<ManifoldKey, u32>,
     pub slots: Vec<ManifoldState>,
     free: Vec<u32>,
     pub list: ContactList,
+    previous: ContactList,
+    reuse_rows: bool,
+    /// Manifolds this tick took unchanged from last tick's rows (bench counter).
+    retained: u64,
     tick: u64,
     /// Connector key counter (conn).
     next_id: u64,
     /// Scratch: this tick's penetrating points of one manifold.
     temp: Vec<TempPt>,
-    temps: narrow::Temps,
-    /// Scratch: this tick's pairs in visit order (born, discovery, colliders).
-    visit: Vec<(u64, u64, rp::ColliderHandle, rp::ColliderHandle)>,
+    geometry: Vec<PreparedGeometry>,
     /// Contact creation counter (`ManifoldState::born`).
     born: u64,
     /// This tick's contacts with connectors to register (slot 9 runs in `flush_keys`).
@@ -330,6 +373,10 @@ pub struct ContactStore {
 
 fn cidx(c: rp::ColliderHandle) -> u32 {
     c.into_raw_parts().0
+}
+
+fn primitive_id(prim_id: &FxHashMap<rp::ColliderHandle, u64>, c: rp::ColliderHandle) -> u64 {
+    prim_id.get(&c).copied().unwrap_or((1 << 40) + cidx(c) as u64)
 }
 
 /// A collider's friction and elasticity weights, kept in its user data by
@@ -357,7 +404,17 @@ impl ContactStore {
     pub fn update(&mut self, bodies: &BodySet, rb: &rp::RigidBodySet, colliders: &rp::ColliderSet, np: &rp::NarrowPhase, prim_id: &FxHashMap<rp::ColliderHandle, u64>) {
         self.tick += 1;
         let tick = self.tick;
+        // Each task returns a full manifold. Keep small working sets inline
+        // so their geometry costs less than dispatching and joining the jobs.
+        let parallel = self.list.pairs >= 512 && rapier3d::rayon::current_num_threads() > 1;
+        let visit_mode = visit_mode();
+        let mut visit = Vec::new();
+        self.reuse_rows = true;
+        if self.reuse_rows {
+            std::mem::swap(&mut self.list, &mut self.previous);
+        }
         self.list.clear();
+        let visit_scope = rustudio_core::bench::scope("cg_visit");
         for s in 0..bodies.len() {
             if bodies.flags[s] & body::flag::AWAKE == 0 || bodies.flags[s] & body::flag::DYNAMIC == 0 {
                 continue;
@@ -375,35 +432,51 @@ impl ContactStore {
                     if os != NONE && (os as usize) < s && bodies.flags[os as usize] & body::flag::AWAKE != 0 && bodies.flags[os as usize] & body::flag::DYNAMIC != 0 {
                         continue;
                     }
-                    if visit_mode() == 0 {
-                        self.read_pair(pair, bodies, colliders, tick, prim_id);
+                    if !parallel && visit_mode == 0 {
+                        let retained = self.retained_inline(pair, colliders);
+                        self.read_pair(pair, bodies, colliders, tick, prim_id, retained);
                     } else {
                         let key = ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: 0, sub2: 0 };
-                        let born = self.map.get(&key).map_or(u64::MAX, |&i| self.slots[i as usize].born);
-                        let seq = self.visit.len() as u64;
-                        self.visit.push((born, seq, pair.collider1, pair.collider2));
+                        let born = if visit_mode == 0 {
+                            0
+                        } else {
+                            self.map.get(&key).map_or(u64::MAX, |&i| self.slots[i as usize].born)
+                        };
+                        visit.push((born, pair));
                     }
                 }
             }
         }
+        drop(visit_scope);
+        let commit_scope = rustudio_core::bench::scope("cg_commit");
         // The order stepContacts visits the contacts (C, ORDER §1: it orders the
         // keys of connectors registered in the same tick) is open (ORDER Open 3):
         // RUSTUDIO_SOLVER_VISIT=born takes the contacts oldest first.
-        if visit_mode() != 0 {
-            let mut v = std::mem::take(&mut self.visit);
-            if visit_mode() == 1 {
-                v.sort_unstable_by_key(|x| (x.0, x.1));
-            } else {
-                v.sort_unstable_by_key(|x| (std::cmp::Reverse(x.0), x.1));
-            }
-            for &(_, _, c1, c2) in &v {
-                if let Some(pair) = np.contact_pair(c1, c2) {
-                    self.read_pair(pair, bodies, colliders, tick, prim_id);
-                }
-            }
-            v.clear();
-            self.visit = v;
+        match visit_mode {
+            1 => visit.sort_by_key(|x| x.0),
+            2 => visit.sort_by_key(|x| std::cmp::Reverse(x.0)),
+            _ => {}
         }
+        if parallel {
+            use rapier3d::rayon::prelude::*;
+            let scope = rustudio_core::bench::scope("sv_contact_geometry");
+            let mut geometry = std::mem::take(&mut self.geometry);
+            visit.par_iter().with_min_len(24).map(|&(_, pair)| {
+                self.prepare_geometry(pair, bodies, colliders, prim_id)
+            }).collect_into_vec(&mut geometry);
+            drop(scope);
+            for ((_, pair), geom) in visit.into_iter().zip(geometry.drain(..)) {
+                self.read_pair(pair, bodies, colliders, tick, prim_id, Some(geom));
+            }
+            self.geometry = geometry;
+        } else {
+            for (_, pair) in visit {
+                let retained = self.retained_inline(pair, colliders);
+                self.read_pair(pair, bodies, colliders, tick, prim_id, retained);
+            }
+        }
+        drop(commit_scope);
+        let _sweep_scope = rustudio_core::bench::scope("cg_sweep");
         // Contact slot 10 Studio: a pair the broad phase no longer pairs loses
         // all its connectors. A manifold not seen this tick is gone, unless neither
         // body was visited (both asleep / fixed): then it keeps its state.
@@ -428,9 +501,93 @@ impl ContactStore {
             }
         }
         self.flush_keys();
+        if self.retained > 0 {
+            rustudio_core::bench::add("sv_contact_retained", 0.0, std::mem::take(&mut self.retained));
+        }
     }
 
-    fn read_pair(&mut self, pair: &rp::ContactPair, bodies: &BodySet, colliders: &rp::ColliderSet, tick: u64, prim_id: &FxHashMap<rp::ColliderHandle, u64>) {
+    fn prepare_geometry(&self, pair: &rp::ContactPair, bodies: &BodySet, colliders: &rp::ColliderSet, prim_id: &FxHashMap<rp::ColliderHandle, u64>) -> PreparedGeometry {
+        let manifolds = pair.manifolds();
+        if manifolds.is_empty() {
+            return self.geometry_for(pair.collider1, pair.collider2, bodies, colliders, prim_id)
+                .map_or(PreparedGeometry::Deferred, PreparedGeometry::Native);
+        }
+        let [m] = manifolds else { return PreparedGeometry::Deferred };
+        if m.points.is_empty() || m.points.len() > MAX_POINTS
+            || !m.data.solver_flags.contains(rp::SolverFlags::COMPUTE_RIGID_IMPULSES)
+        {
+            return PreparedGeometry::Deferred;
+        }
+        let (Some(co1), Some(co2)) = (colliders.get(pair.collider1), colliders.get(pair.collider2)) else {
+            return PreparedGeometry::Deferred;
+        };
+        if let Some(slot) = self.retained_slot(pair, m, co1, co2) {
+            return PreparedGeometry::Retained(slot);
+        }
+        let (wp1, wp2) = manifold_frames(m, co1, co2);
+        let ball = co1.shape().as_ball().is_some() || co2.shape().as_ball().is_some();
+        let mut points = [TempPt::default(); MAX_POINTS];
+        let count = project_manifold(m, wp1, wp2, ball, &mut points);
+        PreparedGeometry::Parry(ProjectedManifold { frame2: wp2, points, count })
+    }
+
+    /// The slot of a single-manifold Parry pair whose manifold the narrow phase kept
+    /// (same epoch, same poses) since last tick's rows were made from it.
+    fn retained_slot(&self, pair: &rp::ContactPair, m: &rp::ContactManifold, co1: &rp::Collider, co2: &rp::Collider) -> Option<u32> {
+        if !self.reuse_rows || pair.contact_epoch() == 0 {
+            return None;
+        }
+        let key = ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: m.subshape1, sub2: m.subshape2 };
+        let slot = *self.map.get(&key)?;
+        let state = &self.slots[slot as usize];
+        (state.stamp + 1 == self.tick && state.list_tick + 1 == self.tick
+            && state.cached_parry == Some(ParryStamp::new(pair, co1, co2)))
+            .then_some(slot)
+    }
+
+    /// `retained_slot` for the inline path, with `prepare_geometry`'s conditions.
+    fn retained_inline(&self, pair: &rp::ContactPair, colliders: &rp::ColliderSet) -> Option<PreparedGeometry> {
+        let [m] = pair.manifolds() else { return None };
+        if m.points.is_empty() || m.points.len() > MAX_POINTS
+            || !m.data.solver_flags.contains(rp::SolverFlags::COMPUTE_RIGID_IMPULSES)
+        {
+            return None;
+        }
+        let (co1, co2) = (colliders.get(pair.collider1)?, colliders.get(pair.collider2)?);
+        self.retained_slot(pair, m, co1, co2).map(PreparedGeometry::Retained)
+    }
+
+    fn geometry_for(&self, c1: rp::ColliderHandle, c2: rp::ColliderHandle, bodies: &BodySet, colliders: &rp::ColliderSet, prim_id: &FxHashMap<rp::ColliderHandle, u64>) -> Option<Geometry> {
+        let (co1, co2) = (colliders.get(c1)?, colliders.get(c2)?);
+        let (i1, i2) = (cidx(c1), cidx(c2));
+        if co1.is_sensor() || co2.is_sensor() || self.no_collide.contains(&(i1.min(i2), i1.max(i2))) {
+            return None;
+        }
+        let class = |h: rp::ColliderHandle, co: &rp::Collider| {
+            let (i, g) = h.into_raw_parts();
+            match self.classes.get(i as usize) {
+                Some(&(cg, k)) if cg == g => k,
+                _ => narrow::handled_class(co.shape()),
+            }
+        };
+        if class(c1, co1) == 0 || class(c2, co2) == 0 {
+            return None;
+        }
+        let (g1, g2) = (narrow::shape_of(co1, bodies)?, narrow::shape_of(co2, bodies)?);
+        if !narrow::handles(&g1, &g2) {
+            return None;
+        }
+        let id = |c: rp::ColliderHandle| primitive_id(prim_id, c);
+        let first_a = narrow::first_is_a(&g1, &g2, id(c1), id(c2));
+        let key = ManifoldKey { c1: i1, c2: i2, sub1: 0, sub2: 0 };
+        let mut geom = self.map.get(&key).map_or_else(Default::default, |&i| self.slots[i as usize].geom);
+        let mut temps = narrow::Temps::default();
+        let (ga, gb) = if first_a { (&g1, &g2) } else { (&g2, &g1) };
+        narrow::collide(ga, gb, &mut geom, 0.0, &mut temps);
+        Some(Geometry { first_a, geom, temps })
+    }
+
+    fn read_pair(&mut self, pair: &rp::ContactPair, bodies: &BodySet, colliders: &rp::ColliderSet, tick: u64, prim_id: &FxHashMap<rp::ColliderHandle, u64>, geometry: Option<PreparedGeometry>) {
         let (Some(co1), Some(co2)) = (colliders.get(pair.collider1), colliders.get(pair.collider2)) else { return };
         if co1.is_sensor() || co2.is_sensor() {
             return;
@@ -450,51 +607,58 @@ impl ContactStore {
         };
         let (h1, h2) = (co1.parent(), co2.parent());
         let (s1, s2) = (h1.map(|h| bodies.slot(h)).unwrap_or(NONE), h2.map(|h| bodies.slot(h)).unwrap_or(NONE));
-        // Only a pair narrow.rs handles needs its shapes and frames (a mesh's class
-        // scans its hull: once per collider, `class_of`).
-        let handled = self.class_of(pair.collider1, co1) != 0 && self.class_of(pair.collider2, co2) != 0;
-        let (g1, g2) = if handled { (narrow::shape_of(co1, bodies), narrow::shape_of(co2, bodies)) } else { (None, None) };
-        if let (Some(g1), Some(g2)) = (g1, g2) {
-            if narrow::handles(&g1, &g2) {
-                // Studio's own narrow phase (narrow.rs, GEOM.md): one Contact per pair.
-                let key = ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: 0, sub2: 0 };
-                // Ids: part serials (physics.rs), else the collider index after them.
-                let id = |c: rp::ColliderHandle| prim_id.get(&c).copied().unwrap_or((1 << 40) + cidx(c) as u64);
-                let first_a = narrow::first_is_a(&g1, &g2, id(pair.collider1), id(pair.collider2));
-                if self.map.get(&key).is_some_and(|&i| self.slots[i as usize].stamp == tick) {
-                    return; // read this tick already (`read_woken`)
-                }
-                let slot = self.slot_for(key, h1, h2, tick);
-                let st = &mut self.slots[slot as usize];
-                let (ga, gb) = if first_a { (&g1, &g2) } else { (&g2, &g1) };
-                // Margin 0.0 per world step (STEP §1.2a).
-                narrow::collide(ga, gb, &mut st.geom, 0.0, &mut self.temps);
-                self.temp.clear();
-                if allow {
-                    for t in self.temps.t.iter().filter(|t| t.n != Vec3::ZERO) {
-                        // Row point p (ctor arg 1) → the p that rows.rs moves by n·sep/2.
-                        let p = if t.row_at_p { t.p - t.n * (t.sep * 0.5) } else { t.p };
-                        self.temp.push(TempPt { kind: t.kind, id_a: t.id_a, id_b: t.id_b, a1: t.a_first == first_a, p, n: t.n, sep: t.sep });
-                    }
-                }
-                self.list.pairs += 1;
-                let dynamic = |s: u32| s != NONE && bodies.flags[s as usize] & body::flag::DYNAMIC != 0;
-                let both = dynamic(s1) && dynamic(s2);
-                let was = self.slots[slot as usize].touching && self.slots[slot as usize].external;
-                let (ia, ib) = (id(pair.collider1), id(pair.collider2));
-                let pkey = if first_a { (ia, ib) } else { (ib, ia) };
-                self.place(slot, s1, s2, h1, h2, pair, co1, co2, false, both, body::q(co2.position().rotation), lower_centre(co1, co2), pkey);
-                let st = &mut self.slots[slot as usize];
-                st.external = external.is_some();
-                st.col1 = Some(pair.collider1);
-                st.col2 = Some(pair.collider2);
-                // Touched / TouchEnded from Studio's own contacts (rapier fires none for it).
-                let now = st.touching && st.external;
-                if now != was {
-                    self.events.push((pair.collider1, pair.collider2, now));
-                }
+        let (native, projected) = match geometry {
+            Some(PreparedGeometry::Retained(slot)) if self.slots[slot as usize].stamp != tick => {
+                self.retain_parry_rows(slot, s1, s2, h1, h2, pair);
                 return;
             }
+            Some(PreparedGeometry::Retained(_)) => return,
+            Some(PreparedGeometry::Native(g)) => (Some(g), None),
+            Some(PreparedGeometry::Parry(g)) => (None, Some(g)),
+            Some(PreparedGeometry::Deferred) => (None, None),
+            None => {
+                // Cache the shape class even for pairs that fall back to Parry.
+                let native = if self.class_of(pair.collider1, co1) == 0 || self.class_of(pair.collider2, co2) == 0 {
+                    None
+                } else {
+                    self.geometry_for(pair.collider1, pair.collider2, bodies, colliders, prim_id)
+                };
+                (native, None)
+            }
+        };
+        if let Some(Geometry { first_a, geom, temps }) = native {
+            let key = ManifoldKey { c1: i1, c2: i2, sub1: 0, sub2: 0 };
+            if self.map.get(&key).is_some_and(|&i| self.slots[i as usize].stamp == tick) {
+                return; // read this tick already (`read_woken`)
+            }
+            let slot = self.slot_for(key, h1, h2, tick);
+            self.slots[slot as usize].geom = geom;
+            self.temp.clear();
+            if allow {
+                for t in temps.t.iter().filter(|t| t.n != Vec3::ZERO) {
+                    // Row point p (ctor arg 1) → the p that rows.rs moves by n·sep/2.
+                    let p = if t.row_at_p { t.p - t.n * (t.sep * 0.5) } else { t.p };
+                    self.temp.push(TempPt { kind: t.kind, id_a: t.id_a, id_b: t.id_b, a1: t.a_first == first_a, p, n: t.n, sep: t.sep });
+                }
+            }
+            self.list.pairs += 1;
+            let dynamic = |s: u32| s != NONE && bodies.flags[s as usize] & body::flag::DYNAMIC != 0;
+            let both = dynamic(s1) && dynamic(s2);
+            let was = self.slots[slot as usize].touching && self.slots[slot as usize].external;
+            let pkey = || {
+                let (ia, ib) = (primitive_id(prim_id, pair.collider1), primitive_id(prim_id, pair.collider2));
+                if first_a { (ia, ib) } else { (ib, ia) }
+            };
+            self.place(slot, s1, s2, h1, h2, pair, co1, co2, false, both, body::q(co2.position().rotation), lower_centre(co1, co2), pkey);
+            let st = &mut self.slots[slot as usize];
+            st.external = external.is_some();
+            st.col1 = Some(pair.collider1);
+            st.col2 = Some(pair.collider2);
+            let now = st.touching && st.external;
+            if now != was {
+                self.events.push((pair.collider1, pair.collider2, now));
+            }
+            return;
         }
         if manifolds.is_empty() {
             return;
@@ -509,34 +673,18 @@ impl ContactStore {
             if m.points.is_empty() && !self.map.contains_key(&ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: m.subshape1, sub2: m.subshape2 }) {
                 continue;
             }
-            let wp1 = match m.subshape_pos1() {
-                Some(p) => *co1.position() * *p,
-                None => *co1.position(),
-            };
-            let wp2 = match m.subshape_pos2() {
-                Some(p) => *co2.position() * *p,
-                None => *co2.position(),
-            };
-            // Pairs narrow.rs does not make (cylinders, meshes, unions, terrain: Studio's
-            // Bullet path, GEOM §4): parry's manifold converted (CONTACT §0): n = parry's
-            // normal out of shape 1 (A into B), p = the point on shape 1, sep = dist.
-            let n = body::v(wp1.rotation * m.local_n1);
             self.temp.clear();
-            // The separation from this tick's poses (recycled manifolds keep stale
-            // distances). Ball pairs (ball–cylinder / –mesh): act at sep ≤ 0 (CORE fit).
-            let ball = co1.shape().as_ball().is_some() || co2.shape().as_ball().is_some();
-            for p in &m.points {
-                let (p1, p2) = (body::v(wp1 * p.local_p1), body::v(wp2 * p.local_p2));
-                let dist = (p2 - p1).dot(n);
-                // One connector per location (CORE fit: parry repeats coincident corners;
-                // a Bullet manifold holds ≤ 4 distinct points).
-                if self.temp.iter().any(|t| (t.p - p1).length_squared() < 1e-8) {
-                    continue;
-                }
-                if dist < 0.0 || (ball && dist <= 0.0) {
-                    self.temp.push(TempPt { kind: KIND_PARRY, id_a: p.fid1.0 as i32, id_b: p.fid2.0 as i32, a1: true, p: p1, n, sep: dist });
-                }
-            }
+            let wp2 = if let Some(projected) = &projected {
+                self.temp.extend_from_slice(&projected.points[..projected.count]);
+                projected.frame2
+            } else {
+                let (wp1, wp2) = manifold_frames(m, co1, co2);
+                let ball = co1.shape().as_ball().is_some() || co2.shape().as_ball().is_some();
+                self.temp.resize(m.points.len(), TempPt::default());
+                let count = project_manifold(m, wp1, wp2, ball, &mut self.temp);
+                self.temp.truncate(count);
+                wp2
+            };
             let key = ManifoldKey { c1: cidx(pair.collider1), c2: cidx(pair.collider2), sub1: m.subshape1, sub2: m.subshape2 };
             if !self.map.contains_key(&key) && self.temp.is_empty() {
                 continue;
@@ -545,11 +693,47 @@ impl ContactStore {
                 continue; // read this tick already (`read_woken`)
             }
             let slot = self.slot_for(key, h1, h2, tick);
-            let _ = n;
             // Sort key: the pair's collider order (Bullet contacts' primitives not read).
-            let pid = |c: rp::ColliderHandle| prim_id.get(&c).copied().unwrap_or((1 << 40) + cidx(c) as u64);
-            self.place(slot, s1, s2, h1, h2, pair, co1, co2, true, false, body::q(wp2.rotation), (body::v(wp2.translation), body::q(wp2.rotation)), (pid(pair.collider1), pid(pair.collider2)));
+            let pkey = || (primitive_id(prim_id, pair.collider1), primitive_id(prim_id, pair.collider2));
+            self.place(slot, s1, s2, h1, h2, pair, co1, co2, true, false, body::q(wp2.rotation), (body::v(wp2.translation), body::q(wp2.rotation)), pkey);
+            self.slots[slot as usize].cached_parry = (self.reuse_rows && manifolds.len() == 1)
+                .then(|| ParryStamp::new(pair, co1, co2));
         }
+    }
+
+    fn retain_parry_rows(&mut self, slot: u32, s1: u32, s2: u32, h1: Option<rp::RigidBodyHandle>, h2: Option<rp::RigidBodyHandle>, pair: &rp::ContactPair) {
+        self.retained += 1;
+        let state = &mut self.slots[slot as usize];
+        let prev = state.list_m as usize;
+        let count = self.previous.count[prev];
+        let start = self.previous.first[prev] as usize;
+        let range = start..start + count as usize;
+        let first = self.list.len() as u32;
+        let index = self.list.manifold_count() as u32;
+
+        self.list.p.extend_from_slice(&self.previous.p[range.clone()]);
+        self.list.n.extend_from_slice(&self.previous.n[range.clone()]);
+        self.list.sep.extend_from_slice(&self.previous.sep[range.clone()]);
+        self.list.mu.extend_from_slice(&self.previous.mu[range.clone()]);
+        self.list.e.extend_from_slice(&self.previous.e[range.clone()]);
+        self.list.id.extend_from_slice(&self.previous.id[range.clone()]);
+        self.list.k.extend_from_slice(&self.previous.k[range.clone()]);
+        self.list.swap.extend_from_slice(&self.previous.swap[range]);
+        self.list.manifold.resize(self.list.len(), index);
+        self.list.a.push(s1);
+        self.list.b.push(s2);
+        self.list.fixed_a.push(h1.is_none().then_some(pair.collider1));
+        self.list.fixed_b.push(h2.is_none().then_some(pair.collider2));
+        self.list.slot.push(slot);
+        self.list.first.push(first);
+        self.list.count.push(count);
+        self.list.added.push(false);
+        self.list.pairs += 1;
+        state.list_m = index;
+        state.list_tick = self.tick;
+        state.stamp = self.tick;
+        state.body1 = h1;
+        state.body2 = h2;
     }
 
     /// The pairs of bodies the sleep stage woke after this tick's narrow phase (SLEEP §7.2's
@@ -565,7 +749,7 @@ impl ContactStore {
             let Some(b) = rb.get(bodies.handle[s]) else { continue };
             for &ch in b.colliders() {
                 for pair in np.contact_pairs_with(ch) {
-                    self.read_pair(pair, bodies, colliders, tick, prim_id);
+                    self.read_pair(pair, bodies, colliders, tick, prim_id, None);
                 }
             }
         }
@@ -593,7 +777,7 @@ impl ContactStore {
             Some(&i) => i,
             None => {
                 self.born += 1;
-                let st = ManifoldState { key, stamp: tick, body1: h1, body2: h2, n: 0, conns: [Conn::default(); MAX_POINTS], geom: Default::default(), born: self.born, external: false, touching: false, col1: None, col2: None, list_m: NONE, list_tick: 0 };
+                let st = ManifoldState { key, stamp: tick, body1: h1, body2: h2, n: 0, conns: [Conn::default(); MAX_POINTS], geom: Default::default(), born: self.born, external: false, touching: false, col1: None, col2: None, list_m: NONE, list_tick: 0, cached_parry: None };
                 let i = if let Some(i) = self.free.pop() {
                     self.slots[i as usize] = st;
                     i
@@ -615,16 +799,27 @@ impl ContactStore {
     /// The connector lifetime of one contact for this tick's points `self.temp`
     /// (CONTACT §2.2 Studio steps 1, 5–10; §2.4 slot 9 Studio).
     #[allow(clippy::too_many_arguments)]
-    fn place(&mut self, slot: u32, s1: u32, s2: u32, h1: Option<rp::RigidBodyHandle>, h2: Option<rp::RigidBodyHandle>, pair: &rp::ContactPair, co1: &rp::Collider, co2: &rp::Collider, parry: bool, both_dynamic: bool, frame2: Quat, lower: (Vec3, Quat), pkey: (u64, u64)) {
-        let first = self.list.len() as u32;
-        let mi = self.list.manifold_count() as u32;
+    fn place(&mut self, slot: u32, s1: u32, s2: u32, h1: Option<rp::RigidBodyHandle>, h2: Option<rp::RigidBodyHandle>, pair: &rp::ContactPair, co1: &rp::Collider, co2: &rp::Collider, parry: bool, both_dynamic: bool, frame2: Quat, lower: (Vec3, Quat), pkey: impl FnOnce() -> (u64, u64)) {
         let st = &mut self.slots[slot as usize];
-        // 1: every connector inactive.
         let cn = st.n as usize;
+        let nt = self.temp.len().min(32);
+        if nt == 0 && cn == 0 {
+            st.touching = false;
+            return;
+        }
+        if nt == cn && st.conns[..cn].iter().zip(&self.temp).all(|(c, p)| {
+            c.id != 0 && c.active && c.kind == p.kind && c.a1 == p.a1
+                && c.fid1 == p.id_a && c.fid2 == p.id_b
+        }) {
+            // Slot order already agrees with the incoming geometry.
+            let order = [0, 1, 2, 3, 4, 5, 6, 7];
+            self.append_manifold(slot, s1, s2, h1, h2, pair, &order[..nt], false, &[], pkey);
+            return;
+        }
+        // 1: every connector inactive.
         for c in &mut st.conns[..cn] {
             c.active = false;
         }
-        let nt = self.temp.len().min(32);
         // 5–7: match Studio: an inactive connector with the same (kind, A, idA, idB);
         // edge–edge (kind 1) also from the other side, then the connector is swapped.
         let mut slot_of = [u8::MAX; 32];
@@ -642,6 +837,16 @@ impl ContactStore {
                 slot_of[t] = c as u8;
             }
         }
+        // A steady manifold already has the registered connector keys and
+        // warm-start impulses. Its contact rows need only the new world points.
+        if nt == cn
+            && slot_of[..nt].iter().all(|&c| c != u8::MAX)
+            && st.conns[..cn].iter().all(|c| c.id != 0)
+        {
+            self.append_manifold(slot, s1, s2, h1, h2, pair, &slot_of[..nt], false, &[], pkey);
+            return;
+        }
+
         // 8–10: place the rest in temp order. Parry pairs keep CORE's
         // fitted creation order (no spec for Bullet's point order).
         let mut ord = [0u8; 32];
@@ -793,13 +998,25 @@ impl ContactStore {
         for r in &mut reg[..nreg] {
             *r = remap[*r as usize];
         }
+        for c in &mut slot_of[..nt] {
+            if *c != u8::MAX {
+                *c = remap[*c as usize];
+            }
+        }
+        self.append_manifold(slot, s1, s2, h1, h2, pair, &slot_of[..nt], added, &reg[..nreg], pkey);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_manifold(&mut self, slot: u32, s1: u32, s2: u32, h1: Option<rp::RigidBodyHandle>, h2: Option<rp::RigidBodyHandle>, pair: &rp::ContactPair, points: &[u8], added: bool, reg: &[u8], pkey: impl FnOnce() -> (u64, u64)) {
+        let first = self.list.len() as u32;
+        let mi = self.list.manifold_count() as u32;
+        let st = &mut self.slots[slot as usize];
         let mut count = 0u8;
-        for t in 0..nt {
-            if slot_of[t] == u8::MAX {
+        let trace = trace() && reg.is_empty();
+        for (&k, tp) in points.iter().zip(&self.temp) {
+            if k == u8::MAX {
                 continue;
             }
-            let tp = self.temp[t];
-            let k = remap[slot_of[t] as usize];
             let c = &st.conns[k as usize];
             self.list.p.push(tp.p);
             self.list.n.push(tp.n);
@@ -809,19 +1026,16 @@ impl ContactStore {
             self.list.id.push(c.id);
             self.list.k.push(k);
             self.list.swap.push(!c.a1);
-            if trace() && nreg == 0 {
+            if trace {
                 eprintln!("t{} contact {:?} k{} kind {} ids {} {} a1 {} key {} p {:?} n {:?} sep {}", self.tick, st.key, k, c.kind, c.fid1, c.fid2, c.a1, c.id, tp.p, tp.n, tp.sep);
             }
             self.list.manifold.push(mi);
             count += 1;
         }
+        st.touching = count != 0;
         if count == 0 {
-            continue_drop(&mut self.list, first);
-            self.slots[slot as usize].touching = false;
             return;
         }
-        let st = &mut self.slots[slot as usize];
-        st.touching = true;
         st.list_m = mi;
         st.list_tick = self.tick;
         self.list.a.push(s1);
@@ -832,8 +1046,10 @@ impl ContactStore {
         self.list.first.push(first);
         self.list.count.push(count);
         self.list.added.push(added);
-        if nreg > 0 {
-            self.pending.push(Pending { key: pkey, m: mi, slot, n: nreg as u8, reg });
+        if !reg.is_empty() {
+            let mut order = [0; MAX_POINTS];
+            order[..reg.len()].copy_from_slice(reg);
+            self.pending.push(Pending { key: pkey(), m: mi, slot, n: reg.len() as u8, reg: order });
         }
     }
 
@@ -935,6 +1151,31 @@ impl ContactStore {
 /// z; the rank tables (RUSTUDIO_SOLVER_ORDER_X / _Y / _Z, the quadrants in creation
 /// order) are "1203" (collide_headon), "0312" (R1, drop_default) and "0312"
 /// (no recording yet). Ties keep parry's order.
+fn manifold_frames(m: &rp::ContactManifold, co1: &rp::Collider, co2: &rp::Collider) -> (rp::Pose, rp::Pose) {
+    (
+        m.subshape_pos1().map_or(*co1.position(), |p| *co1.position() * *p),
+        m.subshape_pos2().map_or(*co2.position(), |p| *co2.position() * *p),
+    )
+}
+
+fn project_manifold(m: &rp::ContactManifold, wp1: rp::Pose, wp2: rp::Pose, ball: bool, points: &mut [TempPt]) -> usize {
+    // Reproject retained local anchors. A recycled manifold's stored distances
+    // can predate the current poses (GEOM §4, CONTACT §0).
+    let n = body::v(wp1.rotation * m.local_n1);
+    let mut count = 0;
+    for p in &m.points {
+        let (p1, p2) = (body::v(wp1 * p.local_p1), body::v(wp2 * p.local_p2));
+        let dist = (p2 - p1).dot(n);
+        if (dist < 0.0 || (ball && dist <= 0.0))
+            && !points[..count].iter().any(|t| (t.p - p1).length_squared() < 1e-8)
+        {
+            points[count] = TempPt { kind: KIND_PARRY, id_a: p.fid1.0 as i32, id_b: p.fid2.0 as i32, a1: true, p: p1, n, sep: dist };
+            count += 1;
+        }
+    }
+    count
+}
+
 fn creation_order(temp: &[TempPt], n: Vec3, frame: glam::Quat, lower: (Vec3, Quat), both_dynamic: bool, out: &mut [u8]) {
     static RANK: std::sync::OnceLock<[[u8; 4]; 4]> = std::sync::OnceLock::new();
     let rank = RANK.get_or_init(|| {
@@ -982,20 +1223,6 @@ fn lower_centre(co1: &rp::Collider, co2: &rp::Collider) -> (Vec3, Quat) {
     let (a, b) = (co1.position(), co2.position());
     let lo = if a.translation.y <= b.translation.y { a } else { b };
     (body::v(lo.translation), body::q(lo.rotation))
-}
-
-/// Nothing was pushed for the manifold (all its points vanished): truncate.
-fn continue_drop(l: &mut ContactList, first: u32) {
-    let f = first as usize;
-    l.p.truncate(f);
-    l.n.truncate(f);
-    l.sep.truncate(f);
-    l.mu.truncate(f);
-    l.e.truncate(f);
-    l.id.truncate(f);
-    l.k.truncate(f);
-    l.swap.truncate(f);
-    l.manifold.truncate(f);
 }
 
 /// A body of the manifold no longer exists.

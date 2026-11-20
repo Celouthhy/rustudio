@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// GitHub's latest release: never a draft or a pre-release, so a stable
+/// build is only ever offered stable releases.
 const FEED: &str = "https://api.github.com/repos/rippelz/rustudio/releases/latest";
 const SNOOZE: Duration = Duration::from_secs(12 * 3600);
 
@@ -295,9 +297,45 @@ fn download(url: &str, progress: &Progress) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn version_of(tag: &str) -> Option<[u64; 3]> {
-    let mut it = tag.trim().trim_start_matches('v').split(['.', '-', '+']).map(|p| p.parse::<u64>().ok());
-    Some([it.next()??, it.next()??, it.next()??])
+/// A release version that orders like semver for the tags rustudio uses:
+/// `0.3.3-alpha.1 < 0.3.3-beta.1 < 0.3.3-rc.1 < 0.3.3`. A pre-release
+/// sorts below its own release, so someone on an alpha is offered the
+/// stable version once it is out. Build metadata (`+...`) is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    core: [u64; 3],
+    /// (stage, number): alpha 0, beta 1, rc 2, unknown tags 0; a stable
+    /// release is (3, 0), above every pre-release of the same core.
+    pre: (u8, u64),
+}
+
+fn version_of(tag: &str) -> Option<Version> {
+    let tag = tag.trim().trim_start_matches('v');
+    let tag = tag.split('+').next()?;
+    let (core, pre) = match tag.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (tag, None),
+    };
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    let core = [it.next()??, it.next()??, it.next()??];
+    if it.next().is_some() {
+        return None;
+    }
+    let pre = match pre {
+        None => (3, 0),
+        Some(pre) => {
+            let pre = pre.to_ascii_lowercase();
+            let name = pre.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+            let number = pre[name.len()..].trim_start_matches('.').split('.').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let stage = match name {
+                "beta" => 1,
+                "rc" => 2,
+                _ => 0,
+            };
+            (stage, number)
+        }
+    };
+    Some(Version { core, pre })
 }
 
 fn asset_suffix() -> Option<&'static str> {
@@ -319,7 +357,10 @@ fn check() -> Result<Option<Release>, String> {
     let (Some(latest), Some(ours)) = (version_of(tag), version_of(env!("CARGO_PKG_VERSION"))) else {
         return Err(format!("can't compare versions {tag} and {}", env!("CARGO_PKG_VERSION")));
     };
-    if latest <= ours {
+    // A feed that does list a pre-release (RUSTUDIO_UPDATE_URL) offers it
+    // only to someone already on a pre-release.
+    let stable = ours.pre == (3, 0);
+    if latest <= ours || (stable && feed["prerelease"].as_bool() == Some(true)) {
         return Ok(None);
     }
     let assets: Vec<(String, String)> = feed["assets"]
@@ -489,11 +530,37 @@ mod tests {
 
     #[test]
     fn versions_compare() {
-        assert_eq!(version_of("v0.1.0"), Some([0, 1, 0]));
-        assert_eq!(version_of("0.10.2"), Some([0, 10, 2]));
-        assert_eq!(version_of("v1.2.3-rc1"), Some([1, 2, 3]));
+        let core = |v: &str| version_of(v).map(|v| v.core);
+        assert_eq!(core("v0.1.0"), Some([0, 1, 0]));
+        assert_eq!(core("0.10.2"), Some([0, 10, 2]));
+        assert_eq!(core("v1.2.3-rc1"), Some([1, 2, 3]));
         assert!(version_of("v0.2.0") > version_of("v0.1.9"));
         assert!(version_of("v0.10.0") > version_of("v0.9.0"));
         assert_eq!(version_of("latest"), None);
+        assert_eq!(version_of("0.1"), None);
+    }
+
+    #[test]
+    fn pre_releases_compare() {
+        let v = |s: &str| version_of(s).unwrap();
+        assert_eq!(v("0.3.3-alpha.1").core, [0, 3, 3]);
+        // A pre-release sorts below its own release and above the last one.
+        assert!(v("v0.3.3-alpha.1") < v("v0.3.3"));
+        assert!(v("v0.3.3-alpha.1") > v("v0.3.2"));
+        assert!(v("v0.3.3-alpha.1") < v("v0.3.3-alpha.2"));
+        assert!(v("v0.3.3-alpha.2") < v("v0.3.3-beta.1"));
+        assert!(v("v0.3.3-beta.1") < v("v0.3.3-rc.1"));
+        assert!(v("v0.3.3-rc.1") < v("v0.3.3"));
+        assert!(v("v0.3.3-alpha.10") > v("v0.3.3-alpha.9"));
+        assert_eq!(v("v1.2.3-rc1"), v("v1.2.3-rc.1"));
+        assert_eq!(v("0.3.3+build.5"), v("0.3.3"));
+        // Someone on the alpha is offered the stable release (the feed's
+        // releases/latest never lists pre-releases); a stable user is not
+        // offered an older alpha.
+        assert!(v("v0.3.3") > v("0.3.3-alpha.1"));
+        assert!(v("v0.4.0") > v("0.3.3-alpha.1"));
+        assert!(v("v0.3.2") <= v("0.3.2"));
+        // This build's own version parses, whatever its suffix.
+        assert!(version_of(env!("CARGO_PKG_VERSION")).is_some());
     }
 }

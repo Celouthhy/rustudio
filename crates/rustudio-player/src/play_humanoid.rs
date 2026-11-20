@@ -93,6 +93,8 @@ pub(super) struct HumFrameOut {
     pub floor_changed: Option<u32>,
     /// A state change: the Humanoid sets its limbs' CanCollide false again.
     pub limbs_off: bool,
+    /// This batch advances a local movement or jump request.
+    pub active_input: bool,
 }
 
 impl Default for HumFrameOut {
@@ -107,6 +109,7 @@ impl Default for HumFrameOut {
             running_speed: None,
             floor_changed: None,
             limbs_off: false,
+            active_input: false,
         }
     }
 }
@@ -280,7 +283,10 @@ impl Game {
         };
         out.humanoid = humanoid;
         out.char_part = touch_part;
-        self.ensure_hum_body(model, root);
+        {
+            let _scope = rustudio_core::bench::scope("hum_body_refresh");
+            self.ensure_hum_body(model, root);
+        }
         // A script moved the root (PivotTo, CFrame, either side): the body
         // goes there (Roblox moves the whole assembly).
         {
@@ -297,6 +303,12 @@ impl Game {
                     ch.last_root = Some(xf);
                 }
             }
+            // An Anchored root (either side) holds the body where it is.
+            let anchored = |d: &doc::Document, r: Ref| matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)));
+            let held = anchored(&self.doc, root)
+                || s.map.s2c.get(&root).is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| anchored(cd, *c)));
+            let at = if held { ch.last_root.or_else(|| rustudio_render::scene::xform_of(&self.doc, root)) } else { None };
+            s.physics.anchor_humanoid(model, at);
         }
         // AssemblyLinearVelocity a client script gave its character (Place A's own jump).
         {
@@ -466,6 +478,7 @@ impl Game {
         // Sensors (Studio, per frame): the floor rays, the ladder.
         let state = hd.hum.state;
         let rot = glam::Quat::from_mat3(&root_xf.rot);
+        let sensors = rustudio_core::bench::scope("hum_sensors");
         let floor: Option<(Floor, Option<Ref>)> = if senses_floor(state) {
             s.physics.humanoid_floor(doc, model, root_xf.pos, rot, &shape, hd.had_floor, &own)
         } else {
@@ -498,6 +511,7 @@ impl Game {
         }
         let ladder = senses_ladder(state) && ch.ladder.is_some() && !states_off.contains("Climbing");
         let in_water = !states_off.contains("Swimming") && s.physics.water_at(root_xf.pos) > mech::SWIM_ENTER_WATER;
+        drop(sensors);
         // The full hip: ½ root.Size.Y, R6's longer leg, HipHeight.
         let full_hip = shape.root_size.y * 0.5 + legs + hip_height;
         let inp = FrameIn {
@@ -525,6 +539,8 @@ impl Game {
             root_w,
             torso_up: Some(root_xf.rot.y_axis),
         };
+        out.active_input = !anchored && health > 0.0 && (mag > 0.0 || jump_req);
+        let controller = rustudio_core::bench::scope("hum_controller");
         // A forced state (ChangeState) replaces this frame's transition.
         let forced = forced_req.filter(|n| !states_off.contains(n)).and_then(|n| State::from_name(&n));
         let change = match forced {
@@ -554,6 +570,7 @@ impl Game {
                 }
             }
         };
+        drop(controller);
         out.state_change = change;
         if change.is_some() {
             out.limbs_off = true;
@@ -898,5 +915,60 @@ impl Game {
             self.record(RepOp::Prop(humanoid, "Health".into()));
             self.kill_character();
         }
+    }
+}
+
+#[cfg(test)]
+mod anchored_root_tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio 0.747: a server PivotTo of the player's character with its
+    /// HumanoidRootPart Anchored stays where it was put (5 studs up, in
+    /// Freefall) while anchored; unanchored it falls back to the floor. The
+    /// controller used to drop it (and walk it) regardless of Anchored.
+    #[test]
+    fn anchored_root_holds_the_character() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 120);
+        let found = game.run_luau(Side::Server, r#"
+            local plr = game:GetService("Players"):GetPlayers()[1]
+            local ch = plr and plr.Character
+            assert(ch and ch:FindFirstChild("HumanoidRootPart"), "no character")
+            local root = ch.HumanoidRootPart
+            _G.anch = { root = root, y0 = root.Position.Y }
+            root.Anchored = true
+            ch:PivotTo(root.CFrame + Vector3.new(30, 5, 0))
+            _G.anch.y1 = root.Position.Y
+        "#);
+        assert_eq!(found, None);
+        tick(&mut game, 90);
+        assert_eq!(
+            game.run_luau(Side::Server, "local a = _G.anch; assert(math.abs(a.root.Position.Y - a.y1) < 1e-3, 'moved to ' .. a.root.Position.Y)"),
+            None
+        );
+        assert_eq!(game.run_luau(Side::Server, "_G.anch.root.Anchored = false"), None);
+        tick(&mut game, 120);
+        assert_eq!(
+            game.run_luau(Side::Server, "local a = _G.anch; assert(a.root.Position.Y < a.y1 - 4, 'stayed at ' .. a.root.Position.Y)"),
+            None
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! the move / scale / rotate gizmos.
 
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::ustr;
 
@@ -104,6 +104,29 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (a + ab * t - p).length()
 }
 
+/// World-space targets stay valid across mouse movements and camera changes.
+#[derive(Default)]
+pub(crate) struct MarqueeCentres {
+    key: Option<(u64, u64)>,
+    targets: Vec<(Ref, Vec3)>,
+}
+
+#[derive(Default)]
+pub(crate) struct HoverPick {
+    key: Option<HoverKey>,
+    hit: Option<Ref>,
+}
+
+#[derive(PartialEq)]
+struct HoverKey {
+    doc: u64,
+    journal: u64,
+    rect: Rect,
+    point: Pos2,
+    view_proj: Mat4,
+    raw: bool,
+}
+
 impl Editor {
     /// Fly speed multiplier over the base step, Studio's rule:
     /// the base step until 120 ticks held, then ticks / 240 studs, capped at 15
@@ -131,6 +154,7 @@ impl Editor {
     }
 
     pub fn pick(&self, rect: Rect, p: Pos2, raw: bool) -> Option<Ref> {
+        let _p = rustudio_core::bench::scope("viewport_pick");
         let ray = self.game.cam.ray(rect, p);
         let mut best: Option<(f32, Ref)> = None;
         let mut invisible_host: Option<(f32, Ref)> = None;
@@ -161,6 +185,31 @@ impl Editor {
         }
         let r = best.or(invisible_host)?.1;
         Some(if raw { r } else { self.selection_target(r) })
+    }
+
+    fn hover_pick(&mut self, rect: Rect, point: Pos2, raw: bool) -> Option<Ref> {
+        let key = HoverKey {
+            doc: self.game.doc.id,
+            journal: self.game.doc.journal_end(),
+            rect,
+            point,
+            view_proj: self.game.cam.view_proj(rect),
+            raw,
+        };
+        if self.game.is_playing() || self.hover_pick.key.as_ref() != Some(&key) {
+            self.hover_pick = HoverPick { key: Some(key), hit: self.pick(rect, point, raw) };
+        }
+        self.hover_pick.hit
+    }
+
+    fn sync_hover_refs(&mut self, hover: Ref) {
+        let key = (hover, self.game.doc.id, self.game.doc.journal_end());
+        if self.hover_outline_refs.0 != Some(key) {
+            let refs = std::iter::once(hover)
+                .chain(self.game.doc.dom.descendants_of(hover).map(|i| i.referent()))
+                .collect();
+            self.hover_outline_refs = (Some(key), refs);
+        }
     }
 
     /// Clicking a part inside a Model selects the outermost Model below Workspace.
@@ -556,7 +605,11 @@ impl Editor {
             self.game.vf_scene.sync(&mut self.game.doc);
         }
         let pointer = resp.hover_pos();
-        let handles = self.handles(rect);
+        let handles = if pointer.is_some() || resp.drag_started_by(PointerButton::Primary) {
+            self.handles(rect)
+        } else {
+            Vec::new()
+        };
         let hover_handle = if self.drag.is_none() {
             pointer.and_then(|p| self.handle_at(&handles, p))
         } else {
@@ -573,7 +626,7 @@ impl Editor {
             && !in_play
             && !self.clean_view
         {
-            pointer.and_then(|p| self.pick(rect, p, alt))
+            pointer.and_then(|p| self.hover_pick(rect, p, alt))
         } else {
             None
         };
@@ -581,11 +634,13 @@ impl Editor {
         self.game.sync_view_draws(&ctx);
         // Hover: the hovered part (or model's parts) drawn again, highlighted.
         let mut overlay = Vec::new();
-        if let (Some(h), Some(rend)) = (self.hover, self.game.renderer.as_ref()) {
-            for r in std::iter::once(h).chain(self.game.doc.dom.descendants_of(h).map(|i| i.referent()))
-            {
-                if let Some(d) = rend.item_draws(r).and_then(|d| d.first()) {
-                    overlay.push(*d);
+        if let Some(h) = self.hover {
+            self.sync_hover_refs(h);
+            if let Some(rend) = self.game.renderer.as_ref() {
+                for &r in &self.hover_outline_refs.1 {
+                    if let Some(d) = rend.item_draws(r).and_then(|d| d.first()) {
+                        overlay.push(*d);
+                    }
                 }
             }
         }
@@ -729,6 +784,7 @@ impl Editor {
 
         // ------------------------------------------------------- overlays
         self.game.scene.sync(&mut self.game.doc);
+        let _overlays = rustudio_core::bench::scope("viewport_overlays");
         // Comparison captures show the scene alone (clean_view).
         if !self.clean_view {
             self.draw_selection(&painter, rect);
@@ -739,13 +795,7 @@ impl Editor {
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
         if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
-            // (the hovered instance and its descendants, walked again only
-            // when the hover or the document changes)
-            let journal = self.game.doc.journal_end();
-            if self.hover_outline_refs.0 != Some((h, journal)) {
-                let refs = std::iter::once(h).chain(self.game.doc.dom.descendants_of(h).map(|i| i.referent())).collect();
-                self.hover_outline_refs = (Some((h, journal)), refs);
-            }
+            self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);
             self.draw_outline_union(&painter, rect, &refs,
                 Stroke::new(crate::studio_settings::hover_outline_px(), crate::studio_settings::color("Studio", "Hover Over Color", theme::HOVER_3D)));
@@ -923,7 +973,7 @@ impl Editor {
         if reuse {
             if let Some(i) = cache.entries.iter().position(|e| e.0 == key) {
                 let e = cache.entries.remove(i);
-                for edge in &e.1 { painter.line_segment(*edge, stroke); }
+                painter.extend(e.1.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
                 cache.entries.push(e);
                 return;
             }
@@ -941,7 +991,7 @@ impl Editor {
             }
         }
         let edges = mask.edges();
-        for edge in &edges { painter.line_segment(*edge, stroke); }
+        painter.extend(edges.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
         if reuse {
             // The selection's and a few hovered parts' (moving the mouse
             // across parts and back doesn't redo each one).
@@ -985,8 +1035,37 @@ impl Editor {
     /// centre, a part's position — is inside the four planes through the
     /// camera and the box's corners (the same as projecting inside the box,
     /// in front of the camera). Added to the base selection (Shift / Ctrl).
-    fn marquee_pick(&self, rect: Rect, area: Rect) -> Vec<Ref> {
-        let mut picked: Vec<Ref> = self.marquee_base.clone();
+    fn marquee_pick(&mut self, rect: Rect, area: Rect) -> Vec<Ref> {
+        let _p = rustudio_core::bench::scope("marquee_pick");
+        let key = (self.game.doc.id, self.game.doc.journal_end());
+        if self.marquee_centres.key != Some(key) || self.game.is_playing() {
+            self.marquee_centres = MarqueeCentres {
+                key: Some(key),
+                targets: self.collect_marquee_centres(),
+            };
+        }
+        let mut picked = self.marquee_base.clone();
+        let mut seen: rustc_hash::FxHashSet<_> = picked.iter().copied().collect();
+        let view_proj = self.game.cam.view_proj(rect);
+        for &(target, centre) in &self.marquee_centres.targets {
+            let clip = view_proj * centre.extend(1.0);
+            if clip.w <= 1e-4 {
+                continue;
+            }
+            let ndc = clip.truncate() / clip.w;
+            let point = egui::pos2(
+                rect.min.x + (ndc.x + 1.0) * 0.5 * rect.width(),
+                rect.min.y + (1.0 - ndc.y) * 0.5 * rect.height(),
+            );
+            if area.contains(point) && seen.insert(target) {
+                picked.push(target);
+            }
+        }
+        picked
+    }
+
+    fn collect_marquee_centres(&self) -> Vec<(Ref, Vec3)> {
+        let _p = rustudio_core::bench::scope("marquee_centres");
         // selectable -> (centre if a part, else the box of its parts)
         let mut order: Vec<Ref> = Vec::new();
         let mut centres: std::collections::HashMap<Ref, Result<Vec3, (Vec3, Vec3)>> = std::collections::HashMap::new();
@@ -1014,16 +1093,13 @@ impl Editor {
                 }
             }
         }
-        for t in order {
-            let c = match centres[&t] {
-                Ok(c) => c,
-                Err((a, b)) => (a + b) * 0.5,
+        order.into_iter().map(|target| {
+            let centre = match centres[&target] {
+                Ok(centre) => centre,
+                Err((lo, hi)) => (lo + hi) * 0.5,
             };
-            if self.game.cam.project(rect, c).is_some_and(|p| area.contains(p)) && !picked.contains(&t) {
-                picked.push(t);
-            }
-        }
-        picked
+            (target, centre)
+        }).collect()
     }
 
     fn view_selector_rect(rect: Rect) -> Rect {

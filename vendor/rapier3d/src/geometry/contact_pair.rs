@@ -215,6 +215,13 @@ pub struct ContactPair {
     /// Event bookkeeping: `CollisionEvent::Started` emission and force-event
     /// threshold status.
     pub(crate) event_status: PairEventStatus,
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) contact_epoch: u64,
+    /// (rustudio) The two collider poses of the last full contact update, kept
+    /// while that update's manifolds are still current (see
+    /// `NarrowPhase::skip_unmoved_pairs`).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub(crate) full_poses: Option<[crate::math::Pose; 2]>,
     /// The pair's contacts, in the form the two colliders call for: contact manifolds, or
     /// the contact candidates of two soft surfaces.
     pub contacts: PairContacts,
@@ -429,6 +436,8 @@ impl ContactPair {
             collider1,
             collider2,
             event_status: PairEventStatus::empty(),
+            contact_epoch: 0,
+            full_poses: None,
             contacts: PairContacts::Rigid(RigidPairContacts::new()),
         }
     }
@@ -440,6 +449,8 @@ impl ContactPair {
         self.collider1 = collider1;
         self.collider2 = collider2;
         self.event_status = PairEventStatus::empty();
+        self.contact_epoch = 0;
+        self.full_poses = None;
         match &mut self.contacts {
             PairContacts::Rigid(rigid) => {
                 rigid.clear();
@@ -493,6 +504,11 @@ impl ContactPair {
         }
     }
 
+    /// Narrow-phase publication that last replaced or refreshed the contacts.
+    pub fn contact_epoch(&self) -> u64 {
+        self.contact_epoch
+    }
+
     /// The pair's contact manifolds (empty for a pair of two soft surfaces, whose contacts
     /// are its candidates: see [`Self::soft`]).
     pub fn manifolds(&self) -> &[ContactManifold] {
@@ -540,6 +556,8 @@ impl ContactPair {
 
     /// Clears all the contacts of this contact pair.
     pub fn clear(&mut self) {
+        self.contact_epoch = 0;
+        self.full_poses = None;
         match &mut self.contacts {
             PairContacts::Rigid(rigid) => rigid.clear(),
             PairContacts::Soft {

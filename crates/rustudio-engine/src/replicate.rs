@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rbx_dom_weak::types::{Ref, Variant};
-use rbx_dom_weak::{InstanceBuilder, WeakDom};
+use rbx_dom_weak::{ustr, InstanceBuilder, Ustr, WeakDom};
 
 use rustudio_core::doc::Document;
 use crate::runtime::{RemoteMsg, RepOp, Runtime};
@@ -26,7 +26,7 @@ pub struct RepMap {
     seq: u64,
     /// Prop / CFrame ops waiting in the queue (a newer one adds nothing:
     /// the value is read from the server when the op is applied).
-    queued_props: HashSet<(Ref, String)>,
+    queued_props: rustc_hash::FxHashSet<(Ref, Ustr)>,
     /// Server → client remote calls waiting for the replication sent
     /// before them (Roblox keeps remotes and replication in one order).
     held: VecDeque<(u64, RemoteMsg)>,
@@ -80,6 +80,8 @@ const STEP_S: f64 = 1.0 / 120.0;
 /// Instances per piece when a big new subtree streams over (about what a
 /// few of Studio's packets carry); smaller subtrees arrive whole.
 const PIECE: usize = 128;
+/// Physics updates per borrow and replication deadline check.
+const MOVE_BATCH: usize = 32;
 
 impl RepMap {
     fn link(&mut self, s: Ref, c: Ref) {
@@ -126,10 +128,11 @@ impl RepMap {
 
     fn enqueue(&mut self, ops: Vec<RepOp>) {
         let now = Instant::now();
+        let cframe = ustr("CFrame");
         for op in ops {
             let key = match &op {
-                RepOp::Prop(r, n) => Some((*r, n.clone())),
-                RepOp::Moved(r) => Some((*r, "CFrame".to_string())),
+                RepOp::Prop(r, n) => Some((*r, ustr(n))),
+                RepOp::Moved(r) => Some((*r, cframe)),
                 _ => None,
             };
             if let Some(k) = key {
@@ -348,26 +351,61 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
     let used = map.frame_used;
     // At least one piece a frame, as Studio's job always takes a packet.
     let over = |map: &RepMap| budgeted && map.frame_items > 0 && used + start.elapsed() >= limit;
-    let mut seen_props: HashSet<(Ref, String)> = Default::default();
+    let mut seen_props = rustc_hash::FxHashSet::default();
+    let cframe = ustr("CFrame");
     while let Some(p) = map.queue.front() {
         if over(map) {
             break;
+        }
+        if matches!(p.kind, PendingKind::Op(RepOp::Moved(_))) {
+            let _sc = rustudio_core::bench::scope("rep_moved");
+            let mut world = client.world_mut();
+            // Consecutive physics updates have no property callbacks. Keep
+            // their place in the ordered queue and reuse one document borrow.
+            let before = map.frame_items;
+            for _ in 0..MOVE_BATCH {
+                let Some(Pending { kind: PendingKind::Op(RepOp::Moved(r)), .. }) = map.queue.front() else {
+                    break;
+                };
+                let r = *r;
+                map.queue.pop_front();
+                map.frame_items += 1;
+                map.queued_props.remove(&(r, cframe));
+                if map.buffered.contains(&r) || !seen_props.insert((r, cframe)) {
+                    continue;
+                }
+                let (Some(&target), Some(value)) = (
+                    map.s2c.get(&r),
+                    server.dom.get_by_ref(r).and_then(|i| i.properties.get(&cframe)),
+                ) else {
+                    continue;
+                };
+                crate::runtime::domains::services::perf::net(true, true, 4 + 12 + 6 + 12 + 12);
+                if let Some(w) = &mut world {
+                    let d = w.dm();
+                    if let Some(i) = d.dom.get_by_ref_mut(target) {
+                        if i.properties.get(&cframe) != Some(value) {
+                            i.properties.insert(cframe, value.clone());
+                            d.mark_prop(target, cframe);
+                        }
+                    }
+                }
+            }
+            rustudio_core::bench::add("rep_moved_parts", 0.0, u64::from(map.frame_items - before));
+            continue;
         }
         let p = map.queue.pop_front().unwrap();
         map.frame_items += 1;
         let _sc = rustudio_core::bench::scope(match &p.kind {
             PendingKind::Op(RepOp::Parent(_)) => "rep_parent",
             PendingKind::Op(RepOp::Destroy(_)) => "rep_destroy",
-            PendingKind::Op(RepOp::Moved(_)) => "rep_moved",
             PendingKind::Op(_) => "rep_prop",
             PendingKind::Attach { .. } => "rep_attach",
         });
         match p.kind {
             PendingKind::Op(op) => {
                 if let RepOp::Prop(r, n) = &op {
-                    map.queued_props.remove(&(*r, n.clone()));
-                } else if let RepOp::Moved(r) = &op {
-                    map.queued_props.remove(&(*r, "CFrame".to_string()));
+                    map.queued_props.remove(&(*r, ustr(n)));
                 }
                 apply_op(server, client, map, op, p.seq, budgeted, &mut seen_props, &mut created);
             }
@@ -491,12 +529,12 @@ fn apply_op(
     op: RepOp,
     seq: u64,
     budgeted: bool,
-    seen_props: &mut HashSet<(Ref, String)>,
+    seen_props: &mut rustc_hash::FxHashSet<(Ref, Ustr)>,
     created: &mut Vec<Ref>,
 ) {
     match op {
         RepOp::Prop(r, name) => {
-            if !seen_props.insert((r, name.clone())) {
+            if !seen_props.insert((r, ustr(&name))) {
                 return;
             }
             let Some(c) = map.s2c.get(&r).copied() else {
@@ -526,29 +564,7 @@ fn apply_op(
             let v = remap_value(server, c, &name, v, map);
             client.apply_prop(c, &name, v);
         }
-        RepOp::Moved(r) => {
-            if map.buffered.contains(&r) || !seen_props.insert((r, "CFrame".into())) {
-                return;
-            }
-            let (Some(c), Some(v)) = (
-                map.s2c.get(&r).copied(),
-                server
-                    .dom
-                    .get_by_ref(r)
-                    .and_then(|i| i.properties.get(&rbx_dom_weak::ustr("CFrame")).cloned()),
-            ) else {
-                return;
-            };
-            // A physics update: position, rotation, velocities.
-            crate::runtime::domains::services::perf::net(true, true, 4 + 12 + 6 + 12 + 12);
-            if let Some(mut w) = client.world_mut() {
-                let d = w.dm();
-                if let Some(i) = d.dom.get_by_ref_mut(c) {
-                    i.properties.insert(rbx_dom_weak::ustr("CFrame"), v);
-                }
-                d.mark_prop(c, rbx_dom_weak::ustr("CFrame"));
-            }
-        }
+        RepOp::Moved(_) => unreachable!("moves are applied in batches"),
         RepOp::Name(r) => {
             if let (Some(c), Some(i)) = (map.s2c.get(&r).copied(), server.dom.get_by_ref(r)) {
                 client.apply_name(c, &i.name);
@@ -753,6 +769,47 @@ mod tests {
             return 'ok ' .. #_G.seen").eval().unwrap();
         assert_eq!(order, "ok 2461");
         let _ = sn;
+    }
+
+    #[test]
+    fn motion_batch_respects_handover_budget_and_remote_order() {
+        use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+
+        let (s, c, mut map) = pair();
+        let mut server = s.world_mut().unwrap();
+        let d = server.dm();
+        let ws = d.workspace().unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        let value = |x| Variant::CFrame(CFrame::new(Vector3::new(x, 0.0, 0.0), Matrix3::identity()));
+        let parts: Vec<_> = (0..40).map(|_| {
+            d.dom.insert(model, InstanceBuilder::new("Part").with_property("CFrame", value(0.0)))
+        }).collect();
+        apply(d, &c, &mut map, vec![RepOp::Parent(model)]);
+        for &part in &parts {
+            d.dom.get_by_ref_mut(part).unwrap().properties.insert(ustr("CFrame"), value(10.0));
+        }
+        map.buffered.insert(parts[0]);
+        let moves = parts.iter().copied().chain([parts[35]]).map(RepOp::Moved).collect();
+        map.begin_frame(1.0 / 60.0);
+        map.frame_budget = Some(Duration::ZERO);
+        apply_budgeted(d, &c, &mut map, moves);
+        assert_eq!(map.backlog(), parts.len() - MOVE_BATCH);
+        {
+            let client = c.world_mut().unwrap();
+            let read = |i: usize| client.d().prop(map.s2c[&parts[i]], "CFrame");
+            assert_eq!(read(0), Some(value(0.0)));
+            assert_eq!(read(1), Some(value(10.0)));
+            assert_eq!(read(35), Some(value(0.0)));
+        }
+        let remote = RemoteMsg { inst: Ref::none(), kind: crate::runtime::RemoteKind::Event, args: vec![] };
+        assert!(map.gate_remotes(vec![remote]).is_empty());
+
+        d.dom.get_by_ref_mut(parts[35]).unwrap().properties.insert(ustr("CFrame"), value(20.0));
+        apply(d, &c, &mut map, vec![]);
+        assert_eq!(map.backlog(), 0);
+        assert_eq!(map.gate_remotes(vec![]).len(), 1);
+        let client = c.world_mut().unwrap();
+        assert_eq!(client.d().prop(map.s2c[&parts[35]], "CFrame"), Some(value(20.0)));
     }
 
     #[test]

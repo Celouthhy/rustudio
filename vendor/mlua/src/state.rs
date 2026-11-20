@@ -2525,6 +2525,27 @@ impl Lua {
         Ok(true)
     }
 
+    /// rustudio: the type of the userdata at `idx` of `state` when it is an
+    /// mlua userdata this Lua made.
+    ///
+    /// # Safety
+    /// `state` is a running thread of this Lua.
+    #[doc(hidden)]
+    pub unsafe fn userdata_type_at(&self, state: *mut ffi::lua_State, idx: c_int) -> Option<TypeId> {
+        self.lock().rs_userdata_type_at(state, idx)
+    }
+
+    /// rustudio: a copy of the `T` userdata at `idx`, which
+    /// `userdata_type_at` said is a `T`; None while it is mutably borrowed.
+    ///
+    /// # Safety
+    /// The value at `idx` of `state` is an mlua userdata of type `T`.
+    #[doc(hidden)]
+    pub unsafe fn userdata_copy_of<T: UserData + Copy + 'static>(&self, state: *mut ffi::lua_State, idx: c_int) -> Option<T> {
+        let ud = crate::util::get_userdata::<UserDataStorage<T>>(state, idx);
+        (*ud).try_borrow_scoped(|v| *v).ok()
+    }
+
     /// rustudio: a copy of the `T` userdata at `idx` of `state`, read in
     /// place (no reference into the registry); None when the value there
     /// is not a `T` made by this Lua, or is mutably borrowed.

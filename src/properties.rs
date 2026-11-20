@@ -258,7 +258,13 @@ impl Painter<'_> {
 }
 
 impl Editor {
+    pub(crate) fn properties_interacting(&self) -> bool {
+        self.props.editing.is_some() || self.props.slider_drag.is_some()
+            || self.props.brick_popup.is_some() || self.props.color_dialog.is_some()
+    }
+
     pub fn properties_ui(&mut self, ui: &mut egui::Ui) {
+        let _p = rustudio_core::bench::scope("properties_build");
         // Studio: the filter field always, its shortcut in the hint; the
         // selection's class and name are in the panel's title.
         ui.add(

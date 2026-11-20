@@ -10,5 +10,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() -> eframe::Result<()> {
-    rustudio::run()
+    let result = rustudio::run();
+    match &result {
+        Ok(()) => log::info!("RusTudio exited"),
+        Err(error) => log::error!("RusTudio startup or event loop failed: {error}"),
+    }
+    result
 }

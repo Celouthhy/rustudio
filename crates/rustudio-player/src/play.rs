@@ -26,7 +26,7 @@ use rustudio_core::log::Level;
 use rustudio_engine::ltypes::LEnumItem;
 use rustudio_core::math::Xform;
 use rustudio_core::mech;
-use rustudio_physics::physics::{CharBody, Physics};
+use rustudio_physics::physics::{CharBody, Physics, PhysicsFrame, PhysicsJob, StepResult};
 use rustudio_engine::replicate::{self, RepMap};
 use rustudio_core::body::State;
 use rustudio_engine::rig::{self, Rig, RigType};
@@ -45,7 +45,8 @@ mod npc;
 /// The player's character (refs are server-side).
 pub struct Character {
     pub model: Ref,
-    /// Accessories the rig's attachments were last worked out for.
+    /// Accessories the rig's attachments were last worked out for (unused:
+    /// the Npcs journal reader redoes them, play_npc.rs `npc_journal`).
     pub accessories_seen: usize,
     /// Humanoid.FloorMaterial as last written (Enum.Material value).
     pub floor_material: u32,
@@ -154,22 +155,94 @@ impl SideState {
     }
 }
 
+/// Physics is present during the simulation phases. While a worker owns it,
+/// the editor and player viewport use the last published documents instead.
+pub struct PlayPhysics(Option<Box<Physics>>);
+
+impl std::ops::Deref for PlayPhysics {
+    type Target = Physics;
+    fn deref(&self) -> &Physics {
+        self.0.as_deref().expect("physics is in flight")
+    }
+}
+
+impl std::ops::DerefMut for PlayPhysics {
+    fn deref_mut(&mut self) -> &mut Physics {
+        self.0.as_deref_mut().expect("physics is in flight")
+    }
+}
+
+impl PlaySession {
+    /// Character/tool exclusions used by the mouse query during presentation.
+    pub(super) fn physics_skip(&self) -> &rustc_hash::FxHashSet<Ref> {
+        match &self.pending_frame {
+            Some(pending) => &pending.skip,
+            None => self.presentation.as_ref().map_or_else(|| &self.physics.skip, |view| &view.skip),
+        }
+    }
+}
+
+struct PlayFrameInput {
+    mode: RunMode,
+    dt: f32,
+    realtime: bool,
+    humanoid: Option<hum_glue::HumFrameOut>,
+    local_input_edge: bool,
+}
+
+struct PlayKeys {
+    focused: bool,
+    keys: HashSet<String>,
+    began: Vec<(String, bool)>,
+    ended: Vec<(String, bool)>,
+}
+
+pub(crate) struct PlayKeyboard {
+    focused: bool,
+    blocked: bool,
+    textbox: bool,
+    modifiers: egui::Modifiers,
+    shift_tapped: bool,
+    no_ui: bool,
+    shift: bool,
+}
+
+impl PlayKeyboard {
+    pub(crate) fn read(ctx: &egui::Context, textbox: bool, no_ui: bool, shift: bool) -> Self {
+        let (focused, modifiers, shift_tapped) = ctx.input(|i| {
+            let taps = rustudio_engine::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift);
+            (i.focused, i.modifiers, taps > 0)
+        });
+        Self { focused, blocked: ctx.egui_wants_keyboard_input(), textbox, modifiers, shift_tapped, no_ui, shift }
+    }
+}
+
+struct PendingPlayFrame {
+    input: PlayFrameInput,
+    job: Option<PhysicsJob>,
+    ready: Option<PhysicsFrame>,
+    deferred_dt: f32,
+    skip: rustc_hash::FxHashSet<Ref>,
+}
+
 pub struct PlaySession {
     pub mode: RunMode,
     /// Place content loads only Roblox content while this session lives
     /// (assets::place_content_allowed).
-    _scripts_running: rustudio_core::assets::ScriptsRunning,
+    _scripts_running: Option<rustudio_core::assets::ScriptsRunning>,
     saved_doc: Option<Document>,
     saved_cam: Camera,
     saved_sel: Vec<Ref>,
-    server: SideState,
+    server: Option<SideState>,
     client: Option<SideState>,
+    pub(super) presentation: Option<crate::play_worker::PlayView>,
     /// The DataModel not shown in the editor right now.
     other_doc: Option<Document>,
     /// Which DataModel the editor shows (Explorer, Properties, viewport).
     pub showing: Side,
     pub map: RepMap,
-    pub physics: Physics,
+    pub physics: PlayPhysics,
+    pending_frame: Option<PendingPlayFrame>,
     /// (server, client) `World::touch_rev` the physics' touch interest was built from.
     touch_seen: Option<(u64, u64)>,
     pub character: Option<Character>,
@@ -231,17 +304,64 @@ pub struct PlaySession {
 }
 
 impl PlaySession {
+    pub(super) fn new(mode: RunMode, saved_doc: Document, saved_cam: Camera, saved_sel: Vec<Ref>) -> Self {
+        Self {
+            npcs: Default::default(),
+            mode,
+            _scripts_running: None,
+            saved_doc: Some(saved_doc),
+            saved_cam,
+            saved_sel,
+            server: None,
+            client: None,
+            presentation: None,
+            other_doc: None,
+            showing: Side::Server,
+            map: Default::default(),
+            physics: PlayPhysics(None),
+            pending_frame: None,
+            touch_seen: None,
+            character: None,
+            player: Ref::none(),
+            respawn_at: None,
+            handover: HashMap::default(),
+            time: 0.0,
+            keys_prev: HashSet::new(),
+            keys_processed: HashSet::new(),
+            window_focused: true,
+            gamepads: Default::default(),
+            gc_at: 0.0,
+            engine_orphans: Vec::new(),
+            memstats_at: 0.0,
+            memstats_frames: 0,
+            memstats_worst: 0.0,
+            client_joints: Default::default(),
+            client_sim: Default::default(),
+            client_touches: Vec::new(),
+            state_log: Vec::new(),
+            game: Default::default(),
+            mouse_delta: glam::Vec2::ZERO,
+            spawns: 0,
+            mouse_moved: false,
+            wheel: 0.0,
+            mouse_behavior: 0,
+            mouse_icon: true,
+            cursor_image: None,
+            camera_relative: false,
+        }
+    }
+
     /// The server side's collector counts while its runtime isn't entered:
     /// (unparented instances watched, instances freed so far, instances with
     /// a Lua slot). The self-test's `gc` step reads these.
     pub fn gc_counts(&self) -> (usize, u64, usize) {
-        let (orphans, freed) = self
-            .server
+        let Some(server) = self.server.as_ref() else { return (0, 0, 0) };
+        let (orphans, freed) = server
             .world
             .as_ref()
             .map(|w| (w.orphans.len(), w.freed))
             .unwrap_or_default();
-        (orphans, freed, self.server.runtime.lua_slots())
+        (orphans, freed, server.runtime.lua_slots())
     }
 
     /// The id of the DataModel not shown (the server's while the client is).
@@ -380,19 +500,21 @@ impl Game {
     /// keys go to the game's scripts.
     pub fn play_game_input(&self) -> bool {
         self.play.as_ref().is_some_and(|p| {
-            p.mode == RunMode::Play && p.client.is_some() && p.showing == Side::Client
+            p.mode == RunMode::Play && p.showing == Side::Client
         })
     }
 
     /// True while a Play session drives a character.
     pub fn play_has_character(&self) -> bool {
         self.play.as_ref().is_some_and(|p| {
-            p.mode == RunMode::Play && p.character.as_ref().is_some_and(|c| !c.dead)
+            p.mode == RunMode::Play && p.presentation.as_ref().map_or_else(
+                || p.character.as_ref().is_some_and(|c| !c.dead), |p| p.has_character,
+            )
         })
     }
 
     /// Puts the server DataModel in `self.doc` (the client one in `other_doc`).
-    fn server_front(&mut self) {
+    pub(super) fn server_front(&mut self) {
         if let Some(s) = self.play.as_mut() {
             if s.showing == Side::Client {
                 if let Some(other) = s.other_doc.as_mut() {
@@ -403,12 +525,16 @@ impl Game {
     }
 
     /// Undoes `server_front`.
-    fn shown_front(&mut self) {
+    pub(super) fn shown_front(&mut self) {
         self.server_front();
     }
 
     /// Switches the editor between the server's and the client's DataModel.
     pub fn show_play_side(&mut self, side: Side, host: &mut dyn GameHost) {
+        if self.play_thread.is_some() {
+            self.show_worker_side(side, host);
+            return;
+        }
         let Some(s) = self.play.as_mut() else { return };
         if s.showing == side || s.other_doc.is_none() {
             return;
@@ -433,14 +559,15 @@ impl Game {
         let s = self.play.as_mut()?;
         let (result, output) = match side {
             Side::Server => {
-                let mut w = s.server.world.take()?;
+                let server = s.server.as_mut()?;
+                let mut w = server.world.take()?;
                 w.doc = Some(std::mem::replace(&mut self.doc, Document::placeholder()));
-                s.server.runtime.enter(w);
-                let r = f(&s.server.runtime, s.other_doc.as_ref(), &mut s.map);
-                let mut w = s.server.runtime.leave();
+                server.runtime.enter(w);
+                let r = f(&server.runtime, s.other_doc.as_ref(), &mut s.map);
+                let mut w = server.runtime.leave();
                 self.doc = w.doc.take().expect("server document returned");
                 let out = std::mem::take(&mut w.output);
-                s.server.world = Some(w);
+                server.world = Some(w);
                 (r, out)
             }
             Side::Client => {
@@ -471,7 +598,7 @@ impl Game {
     }
 
     fn server_world(&mut self) -> Option<&mut World> {
-        self.play.as_mut()?.server.world.as_mut()
+        self.play.as_mut()?.server.as_mut()?.world.as_mut()
     }
 
     fn client_world(&mut self) -> Option<&mut World> {
@@ -647,46 +774,14 @@ impl Game {
         }
         physics.groups = groups;
         self.play = Some(PlaySession {
-            npcs: Default::default(),
-            mode,
-            _scripts_running: scripts_running,
-            saved_doc: Some(saved_doc),
-            saved_cam: self.cam.clone(),
-            saved_sel,
-            server,
+            _scripts_running: Some(scripts_running),
+            server: Some(server),
             client,
             other_doc: client_doc,
-            showing: Side::Server,
             map,
-            physics,
-            touch_seen: None,
-            character: None,
-            player: Ref::none(),
-            respawn_at: None,
-            handover: HashMap::default(),
-            time: 0.0,
-            keys_prev: HashSet::new(),
-            keys_processed: HashSet::new(),
-            window_focused: true,
+            physics: PlayPhysics(Some(Box::new(physics))),
             gamepads: if two { crate::gamepad::Gamepads::new() } else { Default::default() },
-            gc_at: 0.0,
-            engine_orphans: Vec::new(),
-            memstats_at: 0.0,
-            memstats_frames: 0,
-            memstats_worst: 0.0,
-            client_joints: Default::default(),
-            client_sim: Default::default(),
-            client_touches: Vec::new(),
-            state_log: Vec::new(),
-            game: Default::default(),
-            mouse_delta: glam::Vec2::ZERO,
-            spawns: 0,
-            mouse_moved: false,
-            wheel: 0.0,
-            mouse_behavior: 0,
-            mouse_icon: true,
-            cursor_image: None,
-            camera_relative: false,
+            ..PlaySession::new(mode, saved_doc, self.cam.clone(), saved_sel)
         });
         self.add_chat_stub();
         // The menu's settings from earlier playtests (volume, camera
@@ -848,10 +943,15 @@ impl Game {
     }
 
     pub fn stop_play(&mut self, host: &mut dyn GameHost) {
+        self.stop_play_worker();
         // A game's orthographic camera ends with the session.
         self.cam.ortho = None;
         self.cam.stretch = 1.0;
         if self.play.is_some() {
+            self.wait_for_play_physics();
+            if let Some(s) = self.play.as_mut() {
+                s.pending_frame = None;
+            }
             self.server_front();
             self.fire_player_removing();
             // The Play DataModels' plugin copies unload with them, the
@@ -872,10 +972,12 @@ impl Game {
         self.cam = s.saved_cam.clone();
         self.scene = rustudio_render::scene::Scene::default();
         host.document_changed(&self.doc);
-        self.info(format!(
-            "■ Stopped after {:.1} s; the edit DataModel is back as it was",
-            s.time
-        ));
+        if s.presentation.is_none() {
+            self.info(format!(
+                "■ Stopped after {:.1} s; the edit DataModel is back as it was",
+                s.time
+            ));
+        }
     }
 
     /// Server Scripts to start: under Workspace and ServerScriptService
@@ -2256,7 +2358,7 @@ impl Game {
     }
 
     /// Players.CharacterAutoLoads (default true).
-    fn character_auto_loads(&self) -> bool {
+    pub(super) fn character_auto_loads(&self) -> bool {
         let root = self.doc.dom.root_ref();
         !self.doc.find_child(root, "Players").is_some_and(|p| {
             matches!(
@@ -2266,79 +2368,28 @@ impl Game {
         })
     }
 
-    /// One frame of the play session.
-    pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32, host: &mut dyn GameHost, no_ui: bool, shift: bool) {
-        let Some(mode) = self.play.as_ref().map(|p| p.mode) else {
-            return;
-        };
-        // An avatar that arrived after Play started (it wasn't waited for:
-        // CharacterAutoLoads off) is the next LoadCharacter's.
-        if let (Some(look), Some(s)) = (self.account.avatar(), self.play.as_mut()) {
-            for w in [s.server.world.as_mut(), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
-                if w.avatar.is_none() {
-                    w.avatar = Some(look.clone());
-                }
-            }
+    /// Join the outstanding job. Bench summaries also use this to read the
+    /// completed world's counts after collecting their final display frame.
+    pub(crate) fn wait_for_play_physics(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(pending) = s.pending_frame.as_mut() else { return };
+        if let Some(job) = pending.job.take() {
+            let (physics, ready) = job.join();
+            s.physics.0 = Some(physics);
+            pending.ready = Some(ready);
         }
-        // Roblox steps the game by at most 1/15 s a frame: slower frames slow
-        // time(), physics and animations, while waits keep wall time (World::realtime).
-        let realtime = self.fixed_dt.is_none();
-        let dt = dt.clamp(0.0, rustudio_core::mech::MAX_FRAME_DT);
-        // The in-game menu's Leave stops the session; Reset Character kills
-        // the character on the server (Humanoid.Health = 0, as Roblox does).
-        if self.play.as_ref().is_some_and(|s| s.game.leave_request) {
-            self.stop_play(host);
-            return;
-        }
-        // StudioTestService:EndTest ends the session; the Studio services
-        // read the editor's settings (runtime/domains/testing*.rs).
-        {
-            use rustudio_engine::runtime::domains::testing as t;
-            if let Some(value) = t::take_end_request() {
-                self.stop_play(host);
-                host.end_test(value, &self.log);
-                return;
-            }
-            t::set_editor_state(t::EditorState {
-                snap_move: self.snap_move,
-                move_inc: self.move_inc,
-                snap_rotate: self.snap_rotate,
-                rotate_inc: self.rotate_inc,
-                local_space: self.local_space,
-                ..Default::default()
-            });
-        }
-        self.server_front();
-        if let Some(h) = self.play.as_mut().and_then(|s| {
-            std::mem::take(&mut s.game.reset_request)
-                .then(|| s.character.as_ref().map(|c| c.humanoid))
-                .flatten()
-        }) {
-            self.with_side(Side::Server, |rt, _, _| {
-                rt.set(h, "Health", Value::Number(0.0));
-            });
-        }
-        // The menu's Settings: UserGameSettings changes on the client.
-        let menu_lua = self
-            .play
-            .as_mut()
-            .map(|s| std::mem::take(&mut s.game.menu.lua))
-            .unwrap_or_default();
-        for code in menu_lua {
-            if let Some(e) = self.run_luau_as(Side::Client, &code, rustudio_engine::runtime::security::CORE) {
-                self.warn(format!("Settings: {e}"));
-            }
-        }
+    }
 
+    fn capture_play_keys(&mut self, keyboard: &PlayKeyboard) -> PlayKeys {
         // Keys: character movement and UserInputService (client side).
         // A focused TextBox has the keys: the character doesn't hear them, but
         // UserInputService still does, with gameProcessedEvent true (chat typing).
         // The key positions are physical, like Roblox's KeyCodes: WASD moves
         // from the keys labelled ZQSD on AZERTY (src/keys.rs).
-        let textbox = self.gui.focus.is_some();
+        let textbox = keyboard.textbox;
         // No-UI runs report every key Roblox has a KeyCode for (F5–F12, /).
-        let all_keys = no_ui;
-        let blocked = ctx.egui_wants_keyboard_input()
+        let all_keys = keyboard.no_ui;
+        let blocked = keyboard.blocked
             || self.play.as_ref().is_some_and(|s| s.game.menu_open);
         let typing = blocked || textbox;
         let raw_keys: HashSet<String> = if blocked {
@@ -2351,9 +2402,9 @@ impl Game {
                 .map(String::from)
                 .collect();
             // egui reports modifiers apart from keys (shift-lock is LeftShift).
-            let mods = ctx.input(|i| i.modifiers);
+            let mods = keyboard.modifiers;
             for (on, name) in [
-                (mods.shift || shift, "LeftShift"),
+                (mods.shift || keyboard.shift, "LeftShift"),
                 (mods.ctrl, "LeftControl"),
                 (mods.alt, "LeftAlt"),
             ] {
@@ -2400,10 +2451,7 @@ impl Game {
                 // quick press) would never reach shift lock without this.
                 let shift = "LeftShift".to_string();
                 if !raw_keys.contains(&shift) && !s.keys_prev.contains(&shift) {
-                    let taps = ctx.input(|i| {
-                        rustudio_engine::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift)
-                    });
-                    if taps > 0 {
+                    if keyboard.shift_tapped {
                         b.push((shift.clone(), textbox));
                         e.push(shift);
                     }
@@ -2424,12 +2472,158 @@ impl Game {
             s.keys_prev = raw_keys;
             (b, e)
         };
+        if !typing && began.iter().any(|(key, processed)| {
+            !processed && matches!(key.as_str(), "W" | "A" | "S" | "D" | "Up" | "Down" | "Space")
+        }) {
+            self.play_input_pose_due = true;
+        }
+        PlayKeys { focused: keyboard.focused, keys, began, ended }
+    }
+
+    /// One frame of the play session.
+    pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32, host: &mut dyn GameHost, no_ui: bool, shift: bool) {
+        let keyboard = PlayKeyboard::read(ctx, self.gui.focus.is_some(), no_ui, shift);
+        if self.play_thread.is_some() {
+            self.threaded_step(keyboard, dt, host);
+        } else {
+            self.step_play(dt, host, &keyboard, false);
+        }
+    }
+
+    pub(crate) fn step_play(&mut self, dt: f32, host: &mut dyn GameHost, keyboard: &PlayKeyboard, render_in_parallel: bool) -> bool {
+        let mut dt = dt;
+        if let Some(s) = self.play.as_mut() {
+            if let Some(pending) = s.pending_frame.as_mut() {
+                if let Some(job) = pending.job.as_ref() {
+                    let mut result = job.try_join();
+                    if result.is_none() && rustudio_physics::physics::hurry_enabled() && job.should_hurry() {
+                        // The world's batch is still running: it yields to this
+                        // frame (the Humanoids finish their ticks against the
+                        // environment held still; the environment's ticks are owed
+                        // and caught up between frames, physics.rs `PhysicsJob::hurry`).
+                        // Studio's client steps the local character apart from the
+                        // server's world, whose physics never holds up its frame.
+                        // (Not when hurrying would gain little: `should_hurry`.)
+                        job.hurry();
+                        let _wait = rustudio_core::bench::scope("physics_pose_wait");
+                        let _tail = rustudio_core::bench::scope("physics_hurry_tail");
+                        result = Some(pending.job.take().expect("pending physics job").join());
+                    }
+                    let result = result.or_else(|| {
+                        // During movement, continue as soon as physics is
+                        // ready. Threaded Play keeps drawing its last snapshot
+                        // while this waits, except at the first input edge.
+                        let moving = pending.input.humanoid.as_ref().is_some_and(|h| h.active_input);
+                        // (a fixed-step worker replay completes every
+                        // step, as the direct path's slower frames do)
+                        let must_publish = moving
+                            || (render_in_parallel && (pending.input.local_input_edge || self.fixed_dt.is_some()));
+                        must_publish.then(|| {
+                            let _wait = rustudio_core::bench::scope("physics_pose_wait");
+                            pending.job.take().expect("pending physics job").join()
+                        })
+                    });
+                    let Some((physics, ready)) = result else {
+                        // An unfinished step can miss presentation without
+                        // blocking it. Limit the elapsed time the next step
+                        // inherits to the same simulation hitch budget.
+                        let elapsed = pending.deferred_dt + dt;
+                        pending.deferred_dt = elapsed.min(rustudio_core::mech::MAX_FRAME_DT);
+                        if elapsed > pending.deferred_dt {
+                            rustudio_core::bench::add("physics_elapsed_clipped", f64::from(elapsed - pending.deferred_dt) * 1000.0, 1);
+                        }
+                        rustudio_core::bench::add("physics_wait_frames", 0.0, 1);
+                        return false;
+                    };
+                    pending.job = None;
+                    s.physics.0 = Some(physics);
+                    pending.ready = Some(ready);
+                }
+            }
+        }
+        let mut display_keys = None;
+        if let Some(pending) = self.play.as_mut().and_then(|s| s.pending_frame.take()) {
+            dt += pending.deferred_dt;
+            self.server_front();
+            let result = self.play.as_mut().unwrap().physics.finish_frame(
+                &mut self.doc, pending.ready.expect("joined physics frame"),
+            );
+            // Keyboard edges belong to the upcoming RenderStepped, which
+            // feeds the local controller for the batch we prepare below.
+            let keys = display_keys.insert(self.capture_play_keys(keyboard));
+            self.finish_play_tick(host, pending.input, result, keys);
+        }
+        let Some(mode) = self.play.as_ref().map(|p| p.mode) else {
+            return true;
+        };
+        // An avatar that arrived after Play started (it wasn't waited for:
+        // CharacterAutoLoads off) is the next LoadCharacter's.
+        if let (Some(look), Some(s)) = (self.account.avatar(), self.play.as_mut()) {
+            for w in [s.server.as_mut().and_then(|server| server.world.as_mut()), s.client.as_mut().and_then(|c| c.world.as_mut())].into_iter().flatten() {
+                if w.avatar.is_none() {
+                    w.avatar = Some(look.clone());
+                }
+            }
+        }
+        // Roblox steps the game by at most 1/15 s a frame: slower frames slow
+        // time(), physics and animations, while waits keep wall time (World::realtime).
+        let realtime = self.fixed_dt.is_none();
+        let elapsed = dt.clamp(0.0, rustudio_core::mech::MAX_FRAME_DT);
+        if realtime && dt > elapsed {
+            rustudio_core::bench::add("physics_elapsed_clipped", f64::from(dt - elapsed) * 1000.0, 1);
+        }
+        let dt = elapsed;
+        // The in-game menu's Leave stops the session; Reset Character kills
+        // the character on the server (Humanoid.Health = 0, as Roblox does).
+        if self.play.as_ref().is_some_and(|s| s.game.leave_request) {
+            self.stop_play(host);
+            return true;
+        }
+        // StudioTestService:EndTest ends the session; the Studio services
+        // read the editor's settings (runtime/domains/testing*.rs).
+        {
+            use rustudio_engine::runtime::domains::testing as t;
+            if let Some(value) = t::take_end_request() {
+                self.stop_play(host);
+                host.end_test(value, &self.log);
+                return true;
+            }
+            t::set_editor_state(t::EditorState {
+                snap_move: self.snap_move,
+                move_inc: self.move_inc,
+                snap_rotate: self.snap_rotate,
+                rotate_inc: self.rotate_inc,
+                local_space: self.local_space,
+                ..Default::default()
+            });
+        }
+        self.server_front();
+        if let Some(h) = self.play.as_mut().and_then(|s| {
+            std::mem::take(&mut s.game.reset_request)
+                .then(|| s.character.as_ref().map(|c| c.humanoid))
+                .flatten()
+        }) {
+            self.with_side(Side::Server, |rt, _, _| {
+                rt.set(h, "Health", Value::Number(0.0));
+            });
+        }
+        // The menu's Settings: UserGameSettings changes on the client.
+        let menu_lua = self
+            .play
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.game.menu.lua))
+            .unwrap_or_default();
+        for code in menu_lua {
+            if let Some(e) = self.run_luau_as(Side::Client, &code, rustudio_engine::runtime::security::CORE) {
+                self.warn(format!("Settings: {e}"));
+            }
+        }
 
         // 1. Server script changes from last frame reach physics.
         let sc = rustudio_core::bench::scope("p1_physics_sync");
         {
             let s = self.play.as_mut().expect("playing");
-            let w = s.server.world.as_mut().expect("server world");
+            let w = s.server.as_mut().and_then(|server| server.world.as_mut()).expect("server world");
             let vel = std::mem::take(&mut w.velocity_requests);
             s.physics.sync(&mut self.doc);
             if let Some(c) = s.other_doc.as_mut() {
@@ -2466,16 +2660,9 @@ impl Game {
         }
         // 2. Character (owned by the client: written to both DataModels).
         let sc = rustudio_core::bench::scope("p2_character");
-        let mut char_touches: Vec<Ref> = Vec::new();
-        let mut state_change: Option<(State, State)> = None;
-        let mut seat_change: Option<SeatChange> = None;
-        let mut move_event: Option<(&'static str, f32)> = None;
-        let mut running_speed: Option<f32> = None;
-        let mut floor_changed: Option<u32> = None;
-        let mut char_part = Ref::none();
-        let mut humanoid_ref = Ref::none();
         let mut hum_out: Option<hum_glue::HumFrameOut> = None;
         if mode == RunMode::Play && self.play_has_character() {
+            let _s = rustudio_core::bench::scope("p2_player_humanoid");
             hum_out = Some(self.hum_pre(dt));
         }
         {
@@ -2485,10 +2672,12 @@ impl Game {
         {
             let _s = rustudio_core::bench::scope("p2b_lua_pre");
             self.lua_pre_physics(mode, dt, 1);
-            // What the scripts did on Stepped / PreSimulation reaches this
-            // frame's world steps.
+        }
+        // Changes from Stepped / PreSimulation reach this frame's solve.
+        {
+            let _s = rustudio_core::bench::scope("p2_stepped_sync");
             if let Some(s) = self.play.as_mut() {
-                let vel = s.server.world.as_mut().map(|w| std::mem::take(&mut w.velocity_requests)).unwrap_or_default();
+                let vel = s.server.as_mut().and_then(|server| server.world.as_mut()).map(|w| std::mem::take(&mut w.velocity_requests)).unwrap_or_default();
                 s.physics.sync(&mut self.doc);
                 if let Some(c) = s.other_doc.as_mut() {
                     s.physics.follow_client(&self.doc, c, &s.map.c2s);
@@ -2497,25 +2686,71 @@ impl Game {
                     s.physics.set_velocity(r, v);
                 }
             }
-            if hum_out.is_some() {
-                self.hum_pose();
-            }
+        }
+        if hum_out.is_some() {
+            let _pose = rustudio_core::bench::scope("p2_humanoid_pose");
+            self.hum_pose();
+        }
+        {
+            let _pose = rustudio_core::bench::scope("p2_npc_pose");
             self.npc_pose();
         }
 
         drop(sc);
-        // 3. Physics (server-authoritative for everything not owned by the client).
+        // Keep the rendered document on the UI thread while the solver works
+        // on its owned world. Commit and replicate at the next frame boundary.
         let sc = rustudio_core::bench::scope("p3_physics_step");
         self.sync_touch_interest();
-        let result = {
-            let s = self.play.as_mut().expect("playing");
-            s.physics.step(&mut self.doc, dt)
+        let input = PlayFrameInput {
+            mode, dt, realtime, humanoid: hum_out, local_input_edge: self.play_input_pose_due,
         };
+        let s = self.play.as_mut().expect("playing");
+        let mut physics = s.physics.0.take().expect("physics is ready");
+        physics.set_realtime(realtime);
+        let queued = if realtime {
+            let skip = physics.skip.clone();
+            physics.start_frame(&mut self.doc, dt).map(|job| (job, skip))
+        } else {
+            Err(physics)
+        };
+        match queued {
+            Ok((job, skip)) => {
+                s.pending_frame = Some(PendingPlayFrame {
+                    input, job: Some(job), ready: None, deferred_dt: 0.0, skip,
+                });
+                self.shown_front();
+            }
+            Err(mut physics) => {
+                let result = physics.step(&mut self.doc, dt);
+                s.physics.0 = Some(physics);
+                drop(sc);
+                let keys = display_keys.get_or_insert_with(|| self.capture_play_keys(keyboard));
+                self.finish_play_tick(host, input, result, keys);
+            }
+        }
+        true
+    }
+
+    fn finish_play_tick(&mut self, host: &mut dyn GameHost, input: PlayFrameInput, result: StepResult, display_keys: &mut PlayKeys) {
+        let PlayFrameInput { mode, dt, realtime, humanoid: hum_out, .. } = input;
+        let PlayKeys { focused: focused_now, keys, began, ended } = display_keys;
+        let focused_now = *focused_now;
+        let began = std::mem::take(began);
+        let ended = std::mem::take(ended);
+        let sc = rustudio_core::bench::scope("p3_physics_publish");
+        let mut char_touches: Vec<Ref> = Vec::new();
+        let mut state_change: Option<(State, State)> = None;
+        let mut seat_change: Option<SeatChange> = None;
+        let mut move_event: Option<(&'static str, f32)> = None;
+        let mut running_speed: Option<f32> = None;
+        let mut floor_changed: Option<u32> = None;
+        let mut char_part = Ref::none();
+        let mut humanoid_ref = Ref::none();
         {
             let _s = rustudio_core::bench::scope("p3a_npc_post");
             self.npc_post();
         }
-        if let Some(mut o) = hum_out.take() {
+        if let Some(mut o) = hum_out {
             let _s = rustudio_core::bench::scope("p3a_humanoid_post");
             self.hum_post(&mut o);
             char_touches = std::mem::take(&mut o.touches);
@@ -2747,10 +2982,7 @@ impl Game {
             .with_side(Side::Server, |rt, _, _| {
                 if let Some(mut w) = rt.world_mut() {
                     w.velocities = velocities.iter().map(|(k, v)| (*k, *v)).collect();
-                    w.humanoid_states = state_names
-                        .iter()
-                        .map(|(k, v)| (*k, v.to_string()))
-                        .collect();
+                    w.humanoid_states.clone_from(&state_names);
                 }
                 fire_touches(rt, None);
                 fire_humanoid(rt, humanoid_server, seat_server, false);
@@ -2835,9 +3067,9 @@ impl Game {
                 .map(|s| std::mem::take(&mut s.client_touches))
                 .unwrap_or_default();
             let humanoid_client = humanoid_server.and_then(|h| map_s2c.get(&h).copied());
-            let client_states: HashMap<Ref, String> = state_names
+            let client_states = state_names
                 .iter()
-                .filter_map(|(k, v)| map_s2c.get(k).map(|c| (*c, v.to_string())))
+                .filter_map(|(k, v)| map_s2c.get(k).map(|c| (*c, *v)))
                 .collect();
             let (gui_events, gui_layout, mouse_events, menu_events, menu_open) =
                 match self.play.as_mut() {
@@ -2874,7 +3106,7 @@ impl Game {
                 (mouse_xy[1] - mech::GUI_TOP_INSET) as f64,
             );
             // The OS window gained or lost focus since last frame.
-            let focused_now = ctx.input(|i| i.focused);
+
             let window_focus_change = self.play.as_mut().and_then(|s| {
                 (s.window_focused != focused_now).then(|| {
                     s.window_focused = focused_now;
@@ -3329,6 +3561,9 @@ impl Game {
 
     /// `run_luau` at identity `id` (the in-game menu runs as a CoreScript).
     pub fn run_luau_as(&mut self, side: Side, code: &str, id: u8) -> Option<String> {
+        if self.play_thread.is_some() {
+            return self.threaded_luau(side, code, id);
+        }
         self.server_front();
         let r = self.with_side(side, |rt, _, _| {
             // The given identity, for this chunk and what it spawns.
@@ -3368,7 +3603,7 @@ impl Game {
     /// The Play session's sides (server, and the client in Play).
     pub fn play_sides(&self) -> Vec<Side> {
         match self.play.as_ref() {
-            Some(s) if s.client.is_some() => vec![Side::Server, Side::Client],
+            Some(s) if s.mode == RunMode::Play => vec![Side::Server, Side::Client],
             Some(_) => vec![Side::Server],
             None => Vec::new(),
         }
@@ -3379,7 +3614,7 @@ impl Game {
     pub fn play_side_lua(&self, side: Side) -> Option<&mlua::Lua> {
         let s = self.play.as_ref()?;
         match side {
-            Side::Server => Some(&s.server.runtime.lua),
+            Side::Server => s.server.as_ref().map(|server| &server.runtime.lua),
             Side::Client => s.client.as_ref().map(|c| &c.runtime.lua),
         }
     }
@@ -3401,6 +3636,9 @@ impl Game {
 
     /// Status text for the toolbar / status bar.
     pub fn play_status(&self) -> Option<String> {
+        if self.play_thread.is_some() {
+            return self.threaded_status();
+        }
         let s = self.play.as_ref()?;
         let what = if s.mode == RunMode::Play {
             "Playing"
@@ -3529,13 +3767,14 @@ impl Game {
     /// the physics when a side's set grew.
     fn sync_touch_interest(&mut self) {
         let Some(s) = self.play.as_mut() else { return };
-        let srev = s.server.with_world(|w| w.touch_rev).unwrap_or(0);
+        let Some(server) = s.server.as_ref() else { return };
+        let srev = server.with_world(|w| w.touch_rev).unwrap_or(0);
         let crev = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_rev)).unwrap_or(0);
         if s.touch_seen == Some((srev, crev)) {
             return;
         }
         s.touch_seen = Some((srev, crev));
-        let mut refs: Vec<Ref> = s.server.with_world(|w| w.touch_refs.iter().copied().collect()).unwrap_or_default();
+        let mut refs: Vec<Ref> = server.with_world(|w| w.touch_refs.iter().copied().collect()).unwrap_or_default();
         let client: Vec<Ref> = s.client.as_ref().and_then(|c| c.with_world(|w| w.touch_refs.iter().copied().collect())).unwrap_or_default();
         for r in client {
             refs.push(r);

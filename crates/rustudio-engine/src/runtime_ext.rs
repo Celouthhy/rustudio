@@ -924,7 +924,7 @@ fn vec3_value(lua: &Lua, v: Vec3) -> mlua::Result<Value> {
 }
 
 fn cframe_value(lua: &Lua, xf: Xform) -> mlua::Result<Value> {
-    Ok(Value::UserData(lua.create_userdata(LCFrame(xf))?))
+    Ok(LCFrame(xf).into_lua(lua)?)
 }
 
 // ------------------------------------------------------------- world queries
@@ -1005,7 +1005,7 @@ impl TagCache {
     }
 }
 
-fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
+pub(super) fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
     if lua.app_data_ref::<TagCache>().is_none() {
         lua.set_app_data(TagCache::default());
     }
@@ -1090,7 +1090,7 @@ struct QueryCache {
     /// Workspace.Terrain's voxels for rays (None = read them again).
     /// With its voxel bounds (studs), which every ray needs (round 20: the
     /// scan over every chunk per ray was 12% of Place B's Play frame).
-    terrain: Option<Option<(Ref, std::rc::Rc<rustudio_core::terrain::Voxels>, Option<([f32; 3], [f32; 3])>)>>,
+    terrain: Option<Option<(Ref, std::sync::Arc<rustudio_core::terrain::Voxels>, Option<([f32; 3], [f32; 3])>)>>,
     /// The material of the last ray that hit terrain (for its RaycastResult).
     terrain_material: Option<u8>,
     /// Terrain triangles per chunk for rays (dropped with `terrain`).
@@ -2053,6 +2053,49 @@ fn near_parts(lua: &Lua, lo: Vec3, hi: Vec3) -> mlua::Result<Option<Vec<QPart>>>
     ))
 }
 
+/// PathfindingService's view of the world near a box (geometry_nav.rs):
+/// the Workspace parts the grid has there, in the cache's order (stable for
+/// a given history of edits), and the terrain voxels, both kept current
+/// from the document journal instead of a walk over Workspace and a
+/// terrain decode per path request.
+pub(crate) fn nav_world(lua: &Lua, lo: Vec3, hi: Vec3) -> mlua::Result<crate::runtime::domains::geometry::nav::NavWorld> {
+    query_parts(lua)?;
+    let parts = {
+        let Some(c) = lua.app_data_ref::<QueryCache>() else {
+            return Ok(Default::default());
+        };
+        Some(match c.grid.in_box(lo, hi) {
+            Some(refs) => {
+                let mut v: Vec<(usize, Ref)> = refs.into_iter().filter_map(|r| c.index.get(&r).map(|i| (*i, r))).collect();
+                v.sort_unstable_by_key(|e| e.0);
+                v.into_iter().map(|e| e.1).collect()
+            }
+            // Too many cells for the grid: the flat list, by bounds.
+            None => c
+                .parts
+                .iter()
+                .filter(|p| {
+                    let (a, b) = part_aabb(p);
+                    !(a.cmpgt(hi).any() || b.cmplt(lo).any())
+                })
+                .map(|p| p.r)
+                .collect(),
+        })
+    };
+    let voxels = Some(terrain_state(lua)?.map(|(_, v, (blo, bhi))| {
+        let cell = |x: f32, up: bool| {
+            let c = x / rustudio_core::terrain::VOXEL;
+            (if up { c.round() as i32 - 1 } else { c.round() as i32 })
+        };
+        let b = (
+            [cell(blo.x, false), cell(blo.y, false), cell(blo.z, false)],
+            [cell(bhi.x, true), cell(bhi.y, true), cell(bhi.z, true)],
+        );
+        (v, b)
+    }));
+    Ok(crate::runtime::domains::geometry::nav::NavWorld { parts, voxels })
+}
+
 /// The query parts as last updated (no journal read).
 fn query_parts_cached(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
     Ok(lua
@@ -2127,7 +2170,7 @@ fn overlap_once(
 
 /// Workspace.Terrain with its voxels and their world bounds (studs), read
 /// once per terrain change.
-fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<rustudio_core::terrain::Voxels>, (Vec3, Vec3))>> {
+fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::sync::Arc<rustudio_core::terrain::Voxels>, (Vec3, Vec3))>> {
     let cached = {
         let c = lua.app_data_ref::<QueryCache>();
         c.and_then(|c| c.terrain.clone())
@@ -2142,7 +2185,7 @@ fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::rc::Rc<rustudio_co
                 match (r, rustudio_core::terrain::Voxels::from_dom(&d.dom)) {
                     (Some(r), Some(Ok(v))) if v.count() > 0 => {
                         let b = v.world_bounds();
-                        Some((r, std::rc::Rc::new(v), b))
+                        Some((r, std::sync::Arc::new(v), b))
                     }
                     _ => None,
                 }
@@ -3371,17 +3414,17 @@ pub(crate) fn seed_unlaid(w: &mut World, r: Ref) {
 }
 
 /// `r` is (in) a LayerCollector: a ScreenGui, a widget, a SurfaceGui ….
-fn in_layer_collector(w: &World, r: Ref) -> bool {
+fn layer_collector(w: &World, r: Ref) -> Option<Ref> {
     let d = w.d();
     let mut c = r;
     for _ in 0..64 {
-        let Some(i) = d.dom.get_by_ref(c) else { return false };
+        let i = d.dom.get_by_ref(c)?;
         if doc::is_a(&i.class, "LayerCollector") {
-            return true;
+            return Some(c);
         }
         c = i.parent();
     }
-    false
+    None
 }
 
 pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
@@ -3406,7 +3449,7 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
     } else {
         chain.iter().rposition(|x| w.abs_dirty.contains(x))
     };
-    let drawn = |x: Ref| w.input.gui_layout.get(&x).map(|b| AbsBox { pos: b.pos, size: b.size, rot: b.rot });
+    let drawn = |x: Ref| drawn_box(w, x);
     if dirty_top.is_none() {
         if let Some(b) = drawn(r) {
             return b;
@@ -3477,6 +3520,14 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
         let s = u2("Size");
         let p = u2("Position");
         let mut size = [s[0] * csize[0] + s[1] * scale, s[2] * csize[1] + s[3] * scale];
+        if auto {
+            // Not laid out yet (a drawn box `continue`d above): sized by
+            // its content now, by the walk's rules.
+            let at = [p[0] * csize[0] + p[1] * scale, p[2] * csize[1] + p[3] * scale];
+            if let Some(grown) = crate::gui::auto_grow_now(d, x, size, csize, at, scale) {
+                size = grown;
+            }
+        }
         if let Some(c) = child_of(x, "UISizeConstraint") {
             let v = |n: &str, dflt: f32| match d.prop(c, n) {
                 Some(Variant::Vector2(v)) => [v.x, v.y],
@@ -3543,7 +3594,63 @@ fn text_dirty(w: &mut World, r: Ref) -> bool {
 }
 
 /// Properties that change a GUI object's box, its children's, or its text.
-static ABS_PROPS: std::sync::OnceLock<HashSet<rbx_dom_weak::Ustr>> = std::sync::OnceLock::new();
+fn layout_props() -> &'static rustc_hash::FxHashSet<rbx_dom_weak::Ustr> {
+    static PROPS: std::sync::OnceLock<rustc_hash::FxHashSet<rbx_dom_weak::Ustr>> = std::sync::OnceLock::new();
+    PROPS.get_or_init(|| {
+        [
+            "Size", "Position", "AnchorPoint", "Rotation", "SizeConstraint", "AutomaticSize", "Scale",
+            "AspectRatio", "AspectType", "DominantAxis", "MinSize", "MaxSize", "PaddingLeft", "PaddingRight",
+            "PaddingTop", "PaddingBottom", "IgnoreGuiInset", "ScreenInsets", "CanvasSize", "CanvasPosition",
+            "Text", "TextSize", "Font", "FontFace", "TextScaled", "TextWrapped", "RichText", "LineHeight",
+            "MaxTextSize", "MinTextSize", "Padding", "FillDirection", "HorizontalAlignment", "VerticalAlignment",
+            "SortOrder", "CellSize", "CellPadding", "LayoutOrder", "Visible", "Enabled", "Name",
+            "FillDirectionMaxCells", "StartCorner", "HorizontalFlex", "VerticalFlex",
+            "ItemLineAlignment", "Wraps", "FlexMode", "GrowRatio", "ShrinkRatio", "AutomaticCanvasSize",
+        ]
+        .into_iter()
+        .map(rbx_dom_weak::ustr)
+        .collect()
+    })
+}
+
+/// Non-GUI properties with overlapping names (such as Part.Size and
+/// Attachment.Position) cannot change a screen layout.
+fn mark_layout_roots(d: &Document, marks: &[doc::Mark], roots: &mut rustc_hash::FxHashSet<Ref>) {
+    let props = layout_props();
+    for mark in marks {
+        let (r, tree) = match *mark {
+            doc::Mark::Prop(r, name) if props.contains(&name) => (r, false),
+            doc::Mark::Tree(r) => (r, true),
+            _ => continue,
+        };
+        if tree {
+            // A Folder or Model may contain a GUI, so a tree change is
+            // checked against the listener's ancestry regardless of class.
+            roots.insert(r);
+        }
+        let Some(instance) = d.dom.get_by_ref(r) else { continue };
+        if doc::is_a(&instance.class, "UIComponent") {
+            if instance.parent().is_some() {
+                roots.insert(instance.parent());
+            }
+        } else if !tree && doc::is_a(&instance.class, "GuiBase2d") {
+            roots.insert(r);
+        }
+    }
+}
+
+fn layout_ancestor_dirty(d: &Document, roots: &rustc_hash::FxHashSet<Ref>, mut r: Ref) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    while let Some(instance) = d.dom.get_by_ref(r) {
+        if roots.contains(&r) {
+            return true;
+        }
+        r = instance.parent();
+    }
+    false
+}
 
 /// Reads the journal since the last look and notes what scripts changed
 /// (see `World::abs_dirty`).
@@ -3551,45 +3658,69 @@ fn abs_scan(w: &mut World) {
     if w.abs_all {
         return;
     }
-    let props = ABS_PROPS.get_or_init(|| {
-        [
-            "Size", "Position", "AnchorPoint", "Rotation", "SizeConstraint", "AutomaticSize", "Scale",
-            "AspectRatio", "AspectType", "DominantAxis", "MinSize", "MaxSize", "PaddingLeft", "PaddingRight",
-            "PaddingTop", "PaddingBottom", "IgnoreGuiInset", "ScreenInsets", "CanvasSize", "CanvasPosition",
-            "Text", "TextSize", "Font", "FontFace", "TextScaled", "TextWrapped", "RichText", "LineHeight",
-            "MaxTextSize", "MinTextSize", "Padding", "FillDirection", "HorizontalAlignment", "VerticalAlignment",
-            "SortOrder", "CellSize", "CellPadding", "LayoutOrder", "Visible", "Enabled",
-        ]
-        .into_iter()
-        .map(rbx_dom_weak::ustr)
-        .collect()
-    });
-    let d = w.d();
-    let end = d.journal_end();
+    let end = w.d().journal_end();
     if end == w.abs_scan {
         return;
     }
-    let Some(marks) = d.marks_since(w.abs_scan) else {
-        w.abs_all = true;
+    let World { doc, abs_dirty, abs_scan, abs_all, .. } = w;
+    let d = doc.as_ref().expect("checked by World::d");
+    let Some(marks) = d.marks_since(*abs_scan) else {
+        *abs_all = true;
         return;
     };
-    let mut add: Vec<Ref> = Vec::new();
-    for m in marks {
-        let r = match m {
-            doc::Mark::Prop(r, name) if props.contains(name) => *r,
-            doc::Mark::Tree(r) => *r,
-            _ => continue,
-        };
-        add.push(r);
-        // A modifier (UIScale, UIPadding, a layout…) changes its parent's box.
-        if let Some(i) = d.dom.get_by_ref(r) {
-            if !doc::is_a(&i.class, "GuiBase2d") {
-                add.push(i.parent());
-            }
+    mark_layout_roots(d, marks, abs_dirty);
+    *abs_scan = end;
+}
+
+fn drawn_box(w: &World, r: Ref) -> Option<AbsBox> {
+    w.input.gui_layout.get(&r).map(|b| AbsBox { pos: b.pos, size: b.size, rot: b.rot })
+}
+
+/// The inputs needed by the last AbsoluteContentSize calculation. The
+/// child list detects removals as well as additions and moves. The drawn
+/// boxes can change without a document mark, for example on window resize.
+pub(crate) struct ContentDependencies {
+    parent: Ref,
+    children: Vec<Ref>,
+    drawn: Vec<(Ref, AbsBox)>,
+    widget_canvas: Option<(Ref, Option<[f32; 2]>)>,
+}
+
+impl ContentDependencies {
+    fn dirty(
+        &self,
+        w: &World,
+        parent: Ref,
+        children: &[Ref],
+        roots: &rustc_hash::FxHashSet<Ref>,
+    ) -> bool {
+        self.parent != parent
+            || self.children != children
+            || layout_ancestor_dirty(w.d(), roots, parent)
+            || (!roots.is_empty() && children.iter().any(|r| roots.contains(r)))
+            || self.widget_canvas.is_some_and(|(r, old)| old != drawn_box(w, r).map(|b| b.size))
+            || ((!w.input.gui_layout.is_empty() || !self.drawn.is_empty())
+                && !children.iter().filter_map(|&r| drawn_box(w, r).map(|b| (r, b)))
+                    .eq(self.drawn.iter().copied()))
+    }
+
+    fn capture(w: &World, parent: Ref, children: &[Ref]) -> Self {
+        // A dock widget can be resized independently of the main viewport.
+        let widget_canvas = layer_collector(w, parent)
+            .filter(|r| w.d().class_of(*r).is_some_and(|c| doc::is_a(&c, "PluginGui")))
+            .map(|r| (r, drawn_box(w, r).map(|b| b.size)));
+        Self {
+            parent,
+            children: children.to_vec(),
+            drawn: children.iter().filter_map(|&r| drawn_box(w, r).map(|b| (r, b))).collect(),
+            widget_canvas,
         }
     }
-    w.abs_scan = end;
-    w.abs_dirty.extend(add);
+}
+
+fn layout_parent_and_children(d: &Document, r: Ref) -> (Ref, &[Ref]) {
+    let parent = d.dom.get_by_ref(r).map_or_else(Ref::none, |i| i.parent());
+    (parent, d.dom.get_by_ref(parent).map_or(&[], |p| p.children()))
 }
 
 /// Fires Changed / GetPropertyChangedSignal for AbsolutePosition,
@@ -3618,97 +3749,71 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
             // Every box scaled from the screen may have moved.
             all = true;
         }
-        // Only what can have moved is looked at (Studio recomputes a GUI
-        // object's box when its layout is invalidated, not every frame): the
-        // objects drawn this frame or last (their box is the drawn one),
-        // those newly listened to, and for the rest (hidden GUIs, whose box
-        // comes from the UDim2s in `gui_rect`) the subtrees whose Size /
-        // Position / AnchorPoint / canvas or place in the tree changed, from
-        // the document's journal. Checking every listened instance each
-        // frame was 2.5 ms in Place E (6 800 listened, 2 250 of
-        // them hidden GUI objects, each a walk up to its ScreenGui).
-        let layout_props = LAYOUT_PROPS.get_or_init(|| {
-            ["Size", "Position", "AnchorPoint", "IgnoreGuiInset", "ScreenInsets", "CanvasSize"].map(rbx_dom_weak::ustr)
-        });
-        let mut check: Vec<Ref> = Vec::new();
         let marks = w.dm().marks_for(doc::Reader::Layout);
-        // The new layout holds every change so far: reads see it until
-        // scripts change something again (`abs_now`).
-        let end = w.d().journal_end();
-        w.abs_scan = end;
+        // The delivered drawing covers the journal up to this pass. Later
+        // script reads still detect any mutations that happen after it.
+        w.abs_scan = w.d().journal_end();
         w.abs_dirty.clear();
         w.abs_all = false;
+        let mut roots = rustc_hash::FxHashSet::default();
         match marks {
             doc::Marks::All => all = true,
-            doc::Marks::Some(marks) if !all && !w.gui_listening.is_empty() => {
-                let mut roots: Vec<Ref> = Vec::new();
-                for m in marks {
-                    match m {
-                        doc::Mark::Prop(r, name) if layout_props.contains(&name) => roots.push(r),
-                        doc::Mark::Tree(r) => roots.push(r),
-                        _ => {}
-                    }
-                }
-                let mut seen_root: HashSet<Ref> = HashSet::new();
-                roots.retain(|r| seen_root.insert(*r));
-                let w = &*w;
-                let d = w.d();
-                for root in roots {
-                    if d.dom.get_by_ref(root).is_none() {
-                        continue;
-                    }
-                    check.extend(
-                        d.dom
-                            .descendants_of(root)
-                            .map(|i| i.referent())
-                            .filter(|r| w.gui_listening.contains(r)),
-                    );
-                }
+            doc::Marks::Some(marks) if !all && !(w.gui_listening.is_empty() && w.layout_listening.is_empty()) => {
+                mark_layout_roots(w.d(), &marks, &mut roots);
             }
             doc::Marks::Some(_) => {}
         }
-        let fresh = std::mem::take(&mut w.listen_new);
-        if all {
-            check = w.gui_listening.iter().copied().collect();
-        } else if !w.gui_listening.is_empty() {
-            check.extend(fresh);
-            check.extend(w.input.gui_layout.keys().copied().filter(|r| w.gui_listening.contains(r)));
-            // Drawn last frame, not this one: back to its UDim2 box.
-            check.extend(w.abs_laid.iter().copied().filter(|r| !w.input.gui_layout.contains_key(r)));
-            let mut seen: HashSet<Ref> = HashSet::with_capacity(check.len());
-            check.retain(|r| seen.insert(*r));
+
+        let mut boxes = Vec::new();
+        let mut laid = std::mem::take(&mut w.abs_laid);
+        for &r in &w.gui_listening {
+            if let Some(now) = drawn_box(&w, r) {
+                laid.insert(r);
+                if w.abs_seen.get(&r) != Some(&now) {
+                    boxes.push((r, Some(now)));
+                }
+            } else {
+                let was_laid = laid.remove(&r);
+                if all || was_laid || w.listen_new.contains(&r) || layout_ancestor_dirty(w.d(), &roots, r) {
+                    boxes.push((r, None));
+                }
+            }
         }
-        let laid = check.iter().copied().filter(|r| w.input.gui_layout.contains_key(r)).collect();
+        w.listen_new.clear();
         w.abs_laid = laid;
-        for r in check {
-            // (a seeded zero box waits until the object is in a LayerCollector)
-            if w.abs_seen.get(&r).is_some_and(|b| b.size == [0.0; 2] && b.pos == [0.0; 2]) && !in_layer_collector(&w, r) {
+        for (r, drawn) in boxes {
+            // A seeded zero box waits until it is inside a LayerCollector.
+            if w.abs_seen.get(&r).is_some_and(|b| b.size == [0.0; 2] && b.pos == [0.0; 2])
+                && layer_collector(&w, r).is_none()
+            {
                 continue;
             }
-            let now = abs_now(&mut w, r);
-            match w.abs_seen.insert(r, now) {
-                Some(old) if old != now => {
-                    if old.pos != now.pos {
-                        fires.push((r, "AbsolutePosition"));
-                    }
-                    if old.size != now.size {
-                        fires.push((r, "AbsoluteSize"));
-                    }
-                    if old.rot != now.rot {
-                        fires.push((r, "AbsoluteRotation"));
-                    }
+            let now = drawn.unwrap_or_else(|| abs_now(&mut w, r));
+            if let Some(old) = w.abs_seen.insert(r, now) {
+                if old.pos != now.pos {
+                    fires.push((r, "AbsolutePosition"));
                 }
-                _ => {}
+                if old.size != now.size {
+                    fires.push((r, "AbsoluteSize"));
+                }
+                if old.rot != now.rot {
+                    fires.push((r, "AbsoluteRotation"));
+                }
             }
         }
-        // A layout's AbsoluteContentSize (Roact / Fusion bindings size their
-        // frames from it): listened layouts, against what scripts last saw.
-        let layouts: Vec<Ref> = w.layout_listening.iter().copied().collect();
+
+        let layouts: Vec<Ref> = w.layout_listening.iter().copied().filter(|r| {
+            let (parent, children) = layout_parent_and_children(w.d(), *r);
+            all || roots.contains(r) || w.layout_content.get(r)
+                .is_none_or(|deps| deps.dirty(&w, parent, children, &roots))
+        }).collect();
         for r in layouts {
+            let (parent, children) = layout_parent_and_children(w.d(), r);
+            let deps = ContentDependencies::capture(&w, parent, children);
             let size = content_size(&w, r);
+            w.layout_content.insert(r, deps);
             let now = AbsBox { pos: [0.0; 2], size, rot: 0.0 };
-            // (a layout nobody has read yet had (0, 0) before its first
-            // layout pass, so a listener hears the content arrive)
+            // The first layout arrives from a zero-size state.
             let old = w.abs_seen.insert(r, now).map_or([0.0; 2], |b| b.size);
             if old != size {
                 fires.push((r, "AbsoluteContentSize"));
@@ -3733,36 +3838,27 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
 /// last frame (before that, from their UDim2s).
 pub(crate) fn content_size(w: &World, r: Ref) -> [f32; 2] {
     let d = w.d();
-    let parent = d.dom.get_by_ref(r).map(|i| i.parent()).unwrap_or_else(Ref::none);
-    let kids: Vec<Ref> = d
-        .dom
-        .get_by_ref(parent)
-        .map(|p| p.children().to_vec())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|k| {
-            d.class_of(*k).is_some_and(|c| doc::is_a(&c, "GuiObject"))
-                && !matches!(d.prop(*k, "Visible"), Some(Variant::Bool(false)))
-        })
-        .collect();
-    if kids.is_empty() {
-        return [0.0; 2];
-    }
+    let (_, children) = layout_parent_and_children(d, r);
     let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
-    for k in &kids {
-        let (pos, size) = match w.input.gui_layout.get(k) {
+    let mut any = false;
+    for &k in children {
+        if !d.class_of(k).is_some_and(|c| doc::is_a(&c, "GuiObject"))
+            || matches!(d.prop(k, "Visible"), Some(Variant::Bool(false)))
+        {
+            continue;
+        }
+        any = true;
+        let (pos, size) = match w.input.gui_layout.get(&k) {
             Some(b) => (b.pos, b.size),
-            None => gui_rect(w, *k, 0),
+            None => gui_rect(w, k, 0),
         };
         for a in 0..2 {
             mn[a] = mn[a].min(pos[a]);
             mx[a] = mx[a].max(pos[a] + size[a]);
         }
     }
-    [mx[0] - mn[0], mx[1] - mn[1]]
+    if any { [mx[0] - mn[0], mx[1] - mn[1]] } else { [0.0; 2] }
 }
-
-static LAYOUT_PROPS: std::sync::OnceLock<[rbx_dom_weak::Ustr; 6]> = std::sync::OnceLock::new();
 
 fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
     let d = w.d();
@@ -3798,6 +3894,14 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
                 Some(Variant::Vector2(v)) => ([0.0, 0.0], [v.x, v.y]),
                 _ => ([0.0, 0.0], [800.0, 600.0]),
             },
+            // A BillboardGui not drawn yet: its canvas is its Size in pixels
+            // (the stud-scaled part needs the camera; the screen stands in).
+            "BillboardGui" => match d.prop(r, "Size") {
+                Some(Variant::UDim2(u)) if u.x.scale == 0.0 && u.y.scale == 0.0 => {
+                    ([0.0, 0.0], [u.x.offset as f32, u.y.offset as f32])
+                }
+                _ => ([0.0, 0.0], screen),
+            },
             _ => ([0.0, 0.0], screen),
         };
     }
@@ -3825,7 +3929,13 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
     };
     let s = udim2("Size");
     let p = udim2("Position");
-    let size = [s[0] * psize[0] + s[1], s[2] * psize[1] + s[3]];
+    let mut size = [s[0] * psize[0] + s[1], s[2] * psize[1] + s[3]];
+    if rustudio_render::scene::enum_u32(d.prop(r, "AutomaticSize")).unwrap_or(0) != 0 {
+        let at = [p[0] * psize[0] + p[1], p[2] * psize[1] + p[3]];
+        if let Some(grown) = crate::gui::auto_grow_now(d, r, size, psize, at, 1.0) {
+            size = grown;
+        }
+    }
     let anchor = match d.prop(r, "AnchorPoint") {
         Some(Variant::Vector2(v)) => [v.x, v.y],
         _ => [0.0, 0.0],
@@ -4335,20 +4445,19 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         let w = world(lua)?;
         return Ok(match key {
             "TimePosition" => Some(Value::Number(sound_time(&w, r))),
-            "TimeLength" => Some(Value::Number(
-                w.input.sound_len.get(&r).copied().unwrap_or(0.0),
-            )),
+            "TimeLength" => {
+                drop(w);
+                Some(Value::Number(super::domains::media::sound_length(lua, r)?.unwrap_or(0.0)))
+            }
             "IsPlaying" => Some(Value::Boolean(w.input.sound_playing.contains(&r))),
             // Studio's IsPaused getter is
             // == 0`, the same byte Playing / IsPlaying read
             // a
             // sound that never played or has ended reads IsPaused = true.
             "IsPaused" => Some(Value::Boolean(!w.input.sound_playing.contains(&r))),
-            // False while a SoundId a script set is still loading (until
-            // Loaded fires), as in Studio.
             "IsLoaded" => {
                 drop(w);
-                Some(Value::Boolean(!super::domains::media::sound_loading(lua, r)?))
+                Some(Value::Boolean(super::domains::media::sound_length(lua, r)?.is_some()))
             }
             _ => None,
         });
@@ -4431,7 +4540,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                     lua,
                     pp,
                     "PivotOffset",
-                    Value::UserData(lua.create_userdata(LCFrame(off))?),
+                    LCFrame(off).into_lua(lua)?,
                 )?;
             }
             None => store_prop(
@@ -5180,7 +5289,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             let ty = LEnumItem::from_value("ListenerType", mode)
                 .ok_or_else(|| rt_err("ListenerType unavailable"))?;
             let listener = if let Some(cf) = cf {
-                Value::UserData(lua.create_userdata(LCFrame(cf))?)
+                LCFrame(cf).into_lua(lua)?
             } else if let Some(part) = part {
                 inst_value(lua, part)?
             } else {
@@ -5744,15 +5853,15 @@ mod tests {
             workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function() viewport += 1 end)
         "#).exec().unwrap();
         let frame = opt_inst(&lua.globals().get::<Value>("frame").unwrap()).unwrap();
-        for step in [1.0, 2.0, 2.0] {
+        for (view_scale, box_scale) in [(1.0, 1.0), (2.0, 2.0), (2.0, 3.0), (2.0, 3.0)] {
             let mut w = world(lua).unwrap();
             assert_eq!(w.gui_listening.len(), 1);
             assert_eq!(w.layout_listening.len(), 1);
-            w.input.view_size = [800.0 * step, 600.0];
+            w.input.view_size = [800.0 * view_scale, 600.0];
             w.input.gui_layout.insert(frame, crate::gui::GuiBox {
-                pos: [10.0 * step, 0.0],
-                size: [100.0 * step, 50.0],
-                rot: 15.0 * step,
+                pos: [10.0 * box_scale, 0.0],
+                size: [100.0 * box_scale, 50.0],
+                rot: 15.0 * box_scale,
                 ..Default::default()
             });
             drop(w);
@@ -5760,7 +5869,7 @@ mod tests {
             rt.dispatch();
         }
         lua.load(r#"
-            assert(size == 2 and pos == 1 and rotation == 1 and content == 2 and viewport == 1,
+            assert(size == 3 and pos == 1 and rotation == 1 and content == 3 and viewport == 1,
                 string.format("%d %d %d %d %d", size, pos, rotation, content, viewport))
             connection:Disconnect()
             layoutConnection:Disconnect()
@@ -5774,6 +5883,101 @@ mod tests {
         "#).exec().unwrap();
         assert!(world(lua).unwrap().gui_listening.is_empty());
         assert!(world(lua).unwrap().layout_listening.is_empty());
+    }
+
+    /// Studio's ProximityPrompt sizes its BillboardGui from an AutomaticSize
+    /// X frame's AbsoluteSize two RenderSteppeds after building it. With the
+    /// Play worker the walk's boxes reach scripts a step later: an undrawn
+    /// AutomaticSize object is measured on the read, not left 0 wide (which
+    /// made the prompt 0 wide with a NaN SizeOffset, and invisible).
+    #[test]
+    fn undrawn_automatic_size_is_measured_on_read() {
+        crate::gui::prime_text_measure();
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = crate::runtime::Side::Client;
+        w.input.view_size = [1280.0, 800.0];
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local ui = Instance.new("BillboardGui")
+            ui.Size = UDim2.fromOffset(72, 72)
+            local frame = Instance.new("Frame", ui)
+            frame.Size = UDim2.fromScale(0, 1)
+            frame.AutomaticSize = Enum.AutomaticSize.X
+            local pad = Instance.new("UIPadding", frame)
+            pad.PaddingRight = UDim.new(0, 24)
+            local label = Instance.new("TextLabel", frame)
+            label.Size = UDim2.fromScale(0, 1)
+            label.AutomaticSize = Enum.AutomaticSize.X
+            label.TextSize = 19
+            label.Text = "Take blood bag"
+            ui.Parent = workspace
+            local text = label.TextBounds.X
+            assert(text > 40, "measured text " .. text)
+            assert(math.abs(label.AbsoluteSize.X - text) < 0.5, label.AbsoluteSize.X .. " vs " .. text)
+            assert(label.AbsoluteSize.Y == 72, "label height " .. label.AbsoluteSize.Y)
+            assert(math.abs(frame.AbsoluteSize.X - (text + 24)) < 0.5, "frame " .. frame.AbsoluteSize.X)
+            assert(frame.AbsoluteSize.Y == 72, "frame height " .. frame.AbsoluteSize.Y)
+            -- A plain Frame keeps its Size (scale 0 is 0 wide).
+            local plain = Instance.new("Frame", ui)
+            plain.Size = UDim2.fromScale(0, 1)
+            assert(plain.AbsoluteSize.X == 0)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn layout_notifications_coalesce_writes_and_follow_removed_children() {
+        let rt = crate::runtime::Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = crate::runtime::Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let lua = &rt.lua;
+        let exec = |source| lua.load(source).exec().unwrap();
+        let pass = || {
+            fire_layout_changes(lua).unwrap();
+            rt.dispatch();
+        };
+        exec(r#"
+            local screen = Instance.new("ScreenGui", workspace)
+            local holder = Instance.new("Frame", screen)
+            frame = Instance.new("Frame", holder)
+            frame.Size = UDim2.fromOffset(10, 20)
+            layout = Instance.new("UIListLayout", holder)
+            light = Instance.new("PointLight", workspace)
+            part = Instance.new("Part", workspace)
+            sizes, contents = {}, {}
+            frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                table.insert(sizes, frame.AbsoluteSize.X)
+            end)
+            layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+                table.insert(contents, layout.AbsoluteContentSize.X)
+            end)
+        "#);
+        pass();
+        exec(r#"
+            assert(table.concat(sizes, ",") == "10")
+            assert(table.concat(contents, ",") == "10")
+            for _, size in {20, 30, 40} do
+                frame.Size = UDim2.fromOffset(size, 20)
+            end
+            assert(#sizes == 1 and #contents == 1)
+        "#);
+        pass();
+        exec(r#"
+            assert(table.concat(sizes, ",") == "10,40")
+            assert(table.concat(contents, ",") == "10,40")
+            light.Brightness = 2.25
+            part.Size = Vector3.new(4, 5, 6)
+        "#);
+        pass();
+        exec(r#"
+            assert(#sizes == 2 and #contents == 2)
+            frame.Parent = nil
+        "#);
+        pass();
+        exec(r#"assert(table.concat(contents, ",") == "10,40,0")"#);
     }
 
     /// Terrain's chunk triangle index answers rays and swept boxes exactly

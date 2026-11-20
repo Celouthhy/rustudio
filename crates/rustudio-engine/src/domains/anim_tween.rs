@@ -175,6 +175,9 @@ pub fn ease(alpha: f64, style: &str, dir: &str) -> f64 {
 // ---------------------------------------------------------- interpolation
 
 fn ud<T: 'static + Clone>(v: &Value) -> Option<T> {
+    if let Some(x) = crate::ltypes::vec_any::<T>(v) {
+        return Some(x);
+    }
     match v {
         Value::UserData(u) => u.borrow::<T>().ok().map(|r| (*r).clone()),
         _ => None,

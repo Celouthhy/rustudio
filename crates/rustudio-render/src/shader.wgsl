@@ -1,3 +1,5 @@
+const VIEWPORT_SAMPLES: i32 = 4;
+
 // rustudio viewport shader: sky, parts, lines, shadows and the final image.
 //
 // Lighting follows Roblox Studio's own shaders and measurements (see
@@ -41,6 +43,9 @@ struct Globals {
     lamp1: vec4<f32>,        // Lamp1: the back light (faces turned away from the sun / moon), rgb
     ssao: vec4<f32>,         // half projection diagonal, near plane, SSAO on
     dof: vec4<f32>,
+    perf: vec4<f32>,         // x shading detail, y 1 = flat probe (see render.rs), z/w spare
+    low_ambient: vec4<f32>,
+    low_outdoor: vec4<f32>,
 };
 
 struct Light {
@@ -396,6 +401,7 @@ struct PartOut {
 
 @group(0) @binding(7) var studs_tex: texture_2d<f32>;
 @group(0) @binding(8) var studs_sampler: sampler;
+@group(0) @binding(22) var low_material_sampler: sampler;
 // Material texture packs (matpack.rs), one layer per pack: colour + height,
 // and normal X/Y + roughness + metalness.
 @group(0) @binding(9) var mat_albedo: texture_2d_array<f32>;
@@ -616,6 +622,16 @@ fn light_grid(world: vec3<f32>, n: vec3<f32>) -> f32 {
     return textureSampleLevel(lightgrid_tex, sky_sampler, t, 0.0).r;
 }
 
+// Automatic's lower shading tiers read sky ambient and coarse sun
+// visibility together from the voxel field.
+fn light_grid_channels(world: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    if (g.lightgrid.w <= 0.0) { return vec2<f32>(1.0); }
+    let p = (world + n * g.lightgrid.w) * 0.25 - g.lightgrid.xyz;
+    let t = p.xzy / vec3<f32>(textureDimensions(lightgrid_tex));
+    if (any(abs(t - vec3<f32>(0.5)) >= vec3<f32>(LIGHTGRID_BORDER))) { return vec2<f32>(1.0); }
+    return textureSampleLevel(lightgrid_tex, sky_sampler, t, 0.0).rg;
+}
+
 /// The light grid's sun channel (.y), read as the skylight; 1 outside it.
 fn light_grid_sun(world: vec3<f32>, n: vec3<f32>) -> f32 {
     if (g.lightgrid.w <= 0.0) {
@@ -757,15 +773,21 @@ fn light_occlusion(world: vec3<f32>, n: vec3<f32>, lpos: vec3<f32>) -> f32 {
     return occ_transmit(start, lpos - to / d * skip);
 }
 
+// Baked local lights reduce both light and shadow evaluation to one grid
+// lookup, as in the Studio shader pack's non-HQ variants.
+fn local_grid_light(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (g.lightgrid.w <= 0.0) { return vec3<f32>(0.0); }
+    let p = (world + n * 6.0) * 0.25 - g.lightgrid.xyz;
+    let t = p.xzy / vec3<f32>(textureDimensions(localgrid_tex));
+    if (any(abs(t - vec3<f32>(0.5)) >= vec3<f32>(LIGHTGRID_BORDER))) { return vec3<f32>(0.0); }
+    let v = textureSampleLevel(localgrid_tex, sky_sampler, t, 0.0);
+    return v.rgb * (v.a * 120.0);
+}
+
 /// Light from the local lights on a surface, the shadowed ones blocked by parts.
 fn local_lights(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     if (g.sun_color.w > 0.5) {
-        if (g.lightgrid.w <= 0.0) { return vec3<f32>(0.0); }
-        let p = (world + n * 6.0) * 0.25 - g.lightgrid.xyz;
-        let t = p.xzy / vec3<f32>(textureDimensions(localgrid_tex));
-        if (any(abs(t - vec3<f32>(0.5)) >= vec3<f32>(LIGHTGRID_BORDER))) { return vec3<f32>(0.0); }
-        let v = textureSampleLevel(localgrid_tex, sky_sampler, t, 0.0);
-        return v.rgb * (v.a * 120.0);
+        return local_grid_light(world, n);
     }
     var sum = vec3<f32>(0.0);
     let count = u32(g.params.x);
@@ -1024,7 +1046,155 @@ fn fs_see_decode(@builtin(position) p: vec4<f32>, @builtin(sample_index) s: u32)
     return vec4<f32>(see_dec(e.rgb), 1.0);
 }
 
+/// Performance > Shading detail "Low": the sun (one shadow-map tap), its
+/// ambient and the fog. No material maps, sky reflection, light grid, local
+/// lights or specular. Called from part_shade after the box faces' surfaces.
+fn part_shade_low(in: PartOut, base: vec3<f32>, alpha: f32, kind: f32) -> vec4<f32> {
+    var c: vec3<f32>;
+    if (kind > 0.5 && kind < 1.5) {
+        // Neon: its own colour, unlit (cheap and the same as the full path).
+        c = base * base * NEON_GLOW;
+    } else {
+        let n = normalize(in.normal);
+        let l = normalize(g.sun_dir.xyz);
+        let ndl = max(dot(n, l), 0.0);
+        var light = g.ambient.rgb + g.outdoor.rgb * sky_gain();
+        var coarse_shadow = 1.0;
+        if (g.perf.w > 0.5) {
+            let grid = light_grid_channels(in.world, n);
+            light = g.ambient.rgb + g.outdoor.rgb * grid.x * sky_gain() + local_grid_light(in.world, n);
+            coarse_shadow = grid.y;
+        }
+        if (ndl > 0.0) {
+            var shadow = coarse_shadow;
+            if (g.bloom.z > 0.5) {
+                let m = sun_shadow_map(in.world);
+                if (m >= 0.0) { shadow = m; }
+            }
+            light += g.sun_color.rgb * g.sun_dir.w * ndl * shadow * sun_cover();
+        }
+        c = base * light;
+    }
+    c = c + vec3<f32>(0.004, 0.008, 0.014) * step(1.5, in.extra.z);
+    let see_through_neon = kind > 0.5 && kind < 1.5 && alpha < 0.999;
+    var visibility = 1.0;
+    if (g.fog.z > 0.5) {
+        let f = fog_amount(length(in.world - g.cam_pos.xyz));
+        visibility = 1.0 - f;
+        c = mix(c, fog_rgb_at(in.world), f);
+    }
+    if (see_through_neon) {
+        let a = 1.0 - visibility * (1.0 - alpha);
+        if (ENC_OUT) { return see_out(c, a, a); }
+        return neon_over_scene(c, a, in.clip.xy);
+    }
+    return see_out(c, alpha, alpha);
+}
+
+// The low Studio material programs compute their coordinates and lamp
+// terms per vertex. Store the projected UV and lamp cosine in the
+// varying that the full fragment program uses for emissive properties.
+@vertex
+fn vs_part_opaque_low(v: PartIn) -> PartOut {
+    var o = part_out(v);
+    let projected = face_studs(o.objn, o.local, o.half, o.oblique) * o.mscale.xy + o.mscale.zw;
+    let mapped = (u32(o.extra.x + 0.5) & 8u) != 0u;
+    let nl = dot(o.normal, g.sun_dir.xyz);
+    o.emissive = vec3<f32>(select(projected, o.uv, mapped), nl);
+    // Studio's low material VS puts a Blinn lobe in VARYING5.w.
+    // The flat-material gloss is computed once with the ambient constants.
+    let gloss = g.low_ambient.w;
+    let h = normalize(g.sun_dir.xyz + normalize(g.cam_pos.xyz - o.world));
+    o.mscale.w = max(nl, 0.0) * (gloss * 0.055556) * exp2(gloss * 0.50359976 * (dot(o.normal, h) - 1.0));
+    return o;
+}
+
+// The lowest solid-part pipeline has no transparent branches, normal maps
+// or per-pixel light lists. Opaque fragments can keep early depth testing.
+fn shade_opaque_low(in: PartOut, use_shadow_map: bool) -> vec4<f32> {
+    if (g.perf.y > 0.5) { return vec4<f32>(0.02, 0.03, 0.02, 1.0); }
+    let code = u32(in.extra.x + 0.5);
+    let kind = f32(code & 7u);
+    let layer = i32(code >> 4u) - 1;
+    let mode = u32(in.extra.w + 0.5);
+    let uv_dx = dpdx(in.uv);
+    let uv_dy = dpdy(in.uv);
+    let mat_dx = dpdx(in.emissive.xy);
+    let mat_dy = dpdy(in.emissive.xy);
+    let local_dx = dpdx(in.local);
+    let local_dy = dpdy(in.local);
+    let vertex_tint = sq(in.vtint.rgb);
+    var base = in.color.rgb * vertex_tint;
+    if (mode != 0u) {
+        let sample = textureSampleGrad(tex, tex_sampler, in.uv, uv_dx, uv_dy);
+        let raw = select(1.055 * pow(sample.rgb, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+            12.92 * sample.rgb, sample.rgb <= vec3<f32>(0.0031308));
+        let squared = raw * raw;
+        if (mode == 1u && in.tint.w > 0.5) {
+            let under = sqrt(max(in.color.rgb, vec3<f32>(0.0))) * in.vtint.rgb;
+            base = sq(mix(under, raw * in.tint.rgb * sqrt(max(in.emissive_albedo, 0.0)), sample.a));
+        } else if (mode == 1u) {
+            base = mix(base, squared * in.emissive_albedo * vertex_tint, sample.a);
+        } else if (mode == 5u) {
+            base *= squared;
+        } else if (mode == 6u) {
+            base = sq(raw * mix(vec3<f32>(1.0), in.tint.rgb, sample.a)) * max(in.emissive_albedo, 0.0);
+        } else {
+            base = squared * in.emissive_albedo * vertex_tint;
+        }
+    } else if (layer >= 0 && u32(layer) < MAT_PARAM_LAYERS) {
+        let kind_params = mat_params[5u * u32(layer) + 1u];
+        let tiling = mat_params[5u * u32(layer)].w;
+        let a = textureSampleGrad(mat_albedo, low_material_sampler,
+            in.emissive.xy * tiling, layer, mat_dx * tiling, mat_dy * tiling);
+        let shader_type = u32(kind_params.z + 0.5);
+        let tint = select(1.0, a.a, kind_params.w > 0.5 && shader_type != 10u && shader_type != 11u);
+        base = sq(mix(vec3<f32>(1.0), sqrt(max(base, vec3<f32>(0.0))), vec3<f32>(tint)) * a.rgb);
+    }
+    let packed = u32(in.extra.y + 0.5);
+    let faces = (packed >> 1u) & 0x3FFFFu;
+    if (faces != 0u) {
+        base *= surface_shade(faces, in.objn, in.local, in.half, local_dx, local_dy);
+    }
+    if ((packed & 1u) != 0u) {
+        let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
+        base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+    }
+    let n = normalize(in.normal);
+    let grid = light_grid_channels(in.world, n);
+    let ndl = max(in.emissive.z, 0.0);
+    let back_light = max(-in.emissive.z, 0.0);
+    var shadow = grid.y;
+    if (use_shadow_map && (ndl > 0.0 || back_light > 0.0) && g.bloom.z > 0.5) {
+        let mapped = sun_shadow_map(in.world);
+        shadow = select(shadow, mapped, mapped >= 0.0);
+    }
+    let lamp = g.sun_color.rgb * g.sun_dir.w;
+    let direct = lamp * ndl + g.lamp1.rgb * back_light;
+    let light = g.low_ambient.rgb + g.low_outdoor.rgb * grid.x * sky_gain()
+        + local_grid_light(in.world, n) + direct * shadow * sun_cover();
+    let highlight = lamp * (0.1 * in.mscale.w * shadow * sun_cover());
+    var color = select(base * light + highlight, base * base * NEON_GLOW, kind > 0.5 && kind < 1.5);
+    if (g.fog.z > 0.5) {
+        color = mix(color, fog_rgb_at(in.world), fog_amount(length(in.world - g.cam_pos.xyz)));
+    }
+    return vec4<f32>(color, 1.0);
+}
+
+@fragment
+fn fs_part_opaque_low(in: PartOut) -> @location(0) vec4<f32> {
+    return shade_opaque_low(in, false);
+}
+
+@fragment
+fn fs_part_opaque_shadowed(in: PartOut) -> @location(0) vec4<f32> {
+    return shade_opaque_low(in, true);
+}
+
 fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
+    // RUSTUDIO_PROBE_FLAT: the raster alone (overdraw, depth, MSAA), with no
+    // shading: a measurement switch, not a quality level.
+    if (g.perf.y > 0.5) { return vec4<f32>(0.02, 0.03, 0.02, 1.0); }
     // extra.x: shading kind (0..7), + 8 mesh-UV mapping, + 16 × (layer + 1).
     let code = u32(in.extra.x + 0.5);
     let kind = f32(code & 7u);
@@ -1118,6 +1288,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         base = select(t.rgb * in.emissive_albedo * vtint, sa_raw * sa_raw, surface);
         alpha = in.color.a * in.vtint.a * t.a;
     }
+    // Performance > Shading detail: Low skips the material atlas below and
+    // takes part_shade_low after the box faces' surfaces. Glass, water and
+    // ViewportFrames keep their own paths.
+    let low_part = g.perf.x < 0.5 && kind < 2.5 && g.lamp1.w <= 1.5;
+    let cheap_material = low_part || (g.perf.w > 0.5 && g.perf.x < 1.5 && kind < 2.5 && g.lamp1.w <= 1.5);
     // extra.y: placeholder (bit 0) and the six surfaces above it.
     // Material maps (Studio's part shader): colour × part colour, squared;
     // the normal map (OpenGL convention, X right, Y up the image) bends the
@@ -1129,7 +1304,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     let sa = textureSample(surface_tex, tex_sampler, in.uv);
     let udx = dpdx(in.uv);
     let udy = dpdy(in.uv);
-    if ((mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
+    if (!(g.perf.w > 0.5 && cheap_material) && (mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
         mat_rough = sa.b;
         mat_metal = sa.a;
         let det = udx.x * udy.y - udx.y * udy.x;
@@ -1159,6 +1334,16 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             mc = mat_params[5u * u32(layer) + 3u];
             ms = mat_params[5u * u32(layer) + 4u];
         }
+        if (cheap_material) {
+            // Cheaper material tiers read the colour map only (the pattern
+            // that makes a wall read as brick or wood). No normal map, surface
+            // map, emission or detail layer: those are the extra taps and the
+            // tangent-frame maths the full path pays for.
+            let a = textureSampleGrad(mat_albedo, studs_sampler, muv * mp0.w, layer, mdx, mdy);
+            let st = u32(mp1.z + 0.5);
+            let tint = select(1.0, a.a, mp1.w > 0.5 && st != 10u && st != 11u);
+            base = sq(mix(vec3<f32>(1.0), sqrt(max(base, vec3<f32>(0.0))), vec3<f32>(tint)) * a.rgb);
+        } else {
         let shader_type = u32(mp1.z + 0.5);
         let lq = material_lq;
         let depth = 1.0 / in.clip.w;
@@ -1254,6 +1439,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             let bb = normalize(b - n * dot(n, b));
             n = normalize(tt * xy.x - bb * xy.y + n * z);
         }
+        }
     }
     let packed = u32(in.extra.y + 0.5);
     let ddx = dpdx(in.local);
@@ -1267,6 +1453,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     if ((packed & 1u) == 1u) {
         let k = fract((in.world.x + in.world.y + in.world.z) * 0.25);
         base = mix(base, base * 0.6 + vec3<f32>(0.18, 0.12, 0.3), step(0.5, k) * 0.6);
+    }
+    // Performance > Shading detail Low: the box faces' surfaces above still
+    // draw (one texel); the lighting below is what costs.
+    if (low_part) {
+        return part_shade_low(in, base, alpha, kind);
     }
     if (g.lamp1.w > 1.5) {
         // A ViewportFrame (vf_render.rs): Ambient² + LightColor² × N·L
@@ -1312,6 +1503,19 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // Neon glows at its own colour, unlit (and blooms). See-through
         // Neon blends the same radiance (neon_over_scene below).
         c = base * base * NEON_GLOW;
+    } else if (g.perf.x < 1.5) {
+        // Performance > Shading detail "Medium": the same diffuse light as
+        // High (sun shadow, sky light grid, ambient), without the
+        // environment BRDF, sky reflections, sun highlight or local lights.
+        let l = normalize(g.sun_dir.xyz);
+        let ndl = max(dot(n, l), 0.0);
+        let shadow = select(1.0, sun_shadow(in.world, normalize(in.normal)), ndl > 0.0);
+        let sv = light_grid(in.world, normalize(in.normal));
+        c = base * (g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
+            + g.sun_color.rgb * g.sun_dir.w * ndl * shadow * sun_cover());
+        if (g.perf.w > 0.5) {
+            c += base * local_grid_light(in.world, normalize(in.normal));
+        }
     } else {
         let l = normalize(g.sun_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
@@ -1846,10 +2050,11 @@ struct TerrainSample {
     glow: f32,
 };
 
-fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: bool) -> TerrainSample {
+fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: bool, cheap: bool) -> TerrainSample {
     var s: TerrainSample;
     let a = tp.p[pal * 4u];
     let layer = i32(a.w);
+    let rc = tp.p[pal * 4u + 2u];
     // Without its pack (not loaded, or packs off) a material shows its
     // average albedo (the colour table's avgAlbedo), recoloured like a texel:
     // what Studio draws before its texture arrays fill.
@@ -1867,13 +2072,21 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
         // (magnified, Studio filters its 512² level).
         let fp = max(length(dx), length(dy)) * 1024.0;
         let k = select(1.0, 2.0 / max(fp, 1e-6), fp < 2.0);
-        t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
-        su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
-        glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
+        if (cheap) {
+            t = textureSampleGrad(mat_albedo, low_material_sampler, uv, layer, dx * k, dy * k);
+            if (rc.w > 0.5) {
+                su = textureSampleGrad(mat_surface, low_material_sampler, uv, layer, dx * k, dy * k);
+            }
+        } else {
+            t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
+            su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
+        }
+        if (!cheap) {
+            glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
+        }
     }
     // MaterialColors recolour (luma scale, chroma turn): Studio bakes it
     // into the array texels, so it blends as YCoCg.
-    let rc = tp.p[pal * 4u + 2u];
     // A 2022 or MaterialService override layer takes CB4's tint form instead:
     // albedo × mix(1, MaterialColor, tint mask) (row 2 = colour, .w = 1; the
     // mask rides in the surface map's alpha).
@@ -1910,6 +2123,8 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     if (TERRAIN_CAPTURE_ID) {
         return select(vec4<f32>(1.0, 0.0, 0.0, 1.0), vec4<f32>(0.0, 1.0, 0.0, 1.0), in.palette.w > 0u);
     }
+    // RUSTUDIO_PROBE_FLAT (see part_shade).
+    if (g.perf.z > 0.5) { return vec4<f32>(0.02, 0.03, 0.02, 1.0); }
     let n0 = normalize(in.normal);
     let d0x = dpdx(in.uv01.xy);
     let d0y = dpdy(in.uv01.xy);
@@ -1917,9 +2132,31 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let d1y = dpdy(in.uv01.zw);
     let d2x = dpdx(in.uv2);
     let d2y = dpdy(in.uv2);
-    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x, in.palette.w > 0u);
-    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y, in.palette.w > 0u);
-    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z, in.palette.w > 0u);
+    let cheap = g.perf.w > 0.5 && g.perf.x < 1.5;
+    let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x, in.palette.w > 0u, cheap);
+    let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y, in.palette.w > 0u, cheap);
+    let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z, in.palette.w > 0u, cheap);
+    // The low terrain variant blends authored albedo using the triangulated
+    // weights, and lights the geometric normal with the same grids as parts.
+    if (cheap) {
+        let yc = s0.ycocg * in.bary.x + s1.ycocg * in.bary.y + s2.ycocg * in.bary.z;
+        let albedo = vec3<f32>(yc.x - yc.z + yc.y, yc.x + yc.z, yc.x - yc.z - yc.y);
+        let grid = light_grid_channels(in.world, n0);
+        let direct = max(dot(n0, normalize(g.sun_dir.xyz)), 0.0);
+        var shadow = grid.y;
+        if (g.bloom.z > 0.5 && direct > 0.0) {
+            let visibility = sun_shadow_map(in.world);
+            shadow = select(shadow, visibility, visibility >= 0.0);
+        }
+        let sun = g.sun_color.rgb * g.sun_dir.w * direct * shadow;
+        let light = g.ambient.rgb + g.outdoor.rgb * grid.x * sky_gain()
+            + local_grid_light(in.world, n0) + sun * sun_cover();
+        var c = albedo * albedo * light;
+        if (g.fog.z > 0.5) {
+            c = mix(c, fog_rgb_at(in.world), fog_amount(length(in.world - g.cam_pos.xyz)));
+        }
+        return vec4<f32>(c, 1.0);
+    }
     // Height blend (FS HQ): each corner's height remapped and weighted by its
     // barycentric; the highest wins over a softness of bary · sharpness; back
     // to plain barycentrics as the texture gets small on screen.
@@ -2803,6 +3040,6 @@ fn fs_ssao_apply(in: PostOut) -> @location(0) vec4<f32> {
 fn fs_glass_depth(in: PostOut) -> @location(0) f32 {
     let pixel = vec2<i32>(in.pos.xy);
     var z = 0.0;
-    for (var i = 0; i < 4; i++) { z = max(z, textureLoad(ssao_depth_ms, pixel, i)); }
+    for (var i = 0; i < VIEWPORT_SAMPLES; i++) { z = max(z, textureLoad(ssao_depth_ms, pixel, i)); }
     return z;
 }

@@ -409,6 +409,8 @@ mod tests {
         let script=d.dom.insert(parent,InstanceBuilder::new("Script").with_property("Source",r#"
 local ok,e=pcall(function()return workspace:FindFirstChild('AC_Realtime')end)
 assert(not ok and string.find(tostring(e),"The current thread cannot access 'RealtimeMedia' (lacking capability InternalTest)",1,true))
+local ok,e=pcall(function()return workspace:GetChildren()end)
+assert(not ok and string.find(tostring(e),"The current thread cannot access 'RealtimeMedia' (lacking capability InternalTest)",1,true))
 local ok,e=pcall(function()return Instance.new('RealtimeMedia')end)
 assert(not ok and string.find(tostring(e),"The current thread cannot create 'RealtimeMedia' (lacking capability InternalTest)",1,true))
 print('assets-cloud-realtime-ok')

@@ -16,3 +16,8 @@ LUACODEGEN_API void luau_codegen_create(lua_State* L);
 
 // build target function and all inner functions
 LUACODEGEN_API void luau_codegen_compile(lua_State* L, int idx);
+
+// rustudio: build target function and its inner functions only when its
+// module is marked --!native or the function @native, as Roblox does
+// (CodeGen_OnlyNativeModules); a no-op for any other chunk
+LUACODEGEN_API void luau_codegen_compile_native(lua_State* L, int idx);

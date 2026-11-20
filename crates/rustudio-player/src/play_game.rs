@@ -22,6 +22,10 @@ pub struct Pointer {
     pub origin: Vec3,
     pub dir: Vec3,
     pub hit: Option<(Ref, Vec3)>,
+    /// What a ClickDetector click meets along the same ray: Studio's click
+    /// ray passes through parts with Transparency above 0.95 that have no
+    /// ClickDetector (Mouse.Target still reports them).
+    pub click: Option<(Ref, Vec3)>,
     pub xy: [f32; 2],
     pub view: [f32; 2],
     pub side: Side,
@@ -31,13 +35,15 @@ pub struct Pointer {
 #[derive(Default)]
 pub struct PlayInput {
     pub pointer: Option<Pointer>,
-    /// (part clicked, mouse button 1 or 2).
-    pub clicks: Vec<(Ref, u8)>,
+    /// (part clicked, where the click ray met it, mouse button 1 or 2).
+    pub clicks: Vec<(Ref, Vec3, u8)>,
     /// (mouse button, pressed).
     pub buttons: Vec<(u8, bool)>,
     pub chat: Vec<String>,
     /// Hotbar slots toggled (0-based).
     pub slots: Vec<usize>,
+    /// Clicks whose world hit will be resolved by the gameplay worker.
+    pub(crate) ray_clicks: Vec<(Pointer, u8)>,
 }
 
 struct Equipped {
@@ -73,6 +79,7 @@ struct Track {
     detached: bool,
 }
 
+#[derive(Clone)]
 pub struct Flash {
     pub pos: Vec3,
     pub radius: f32,
@@ -133,6 +140,8 @@ pub struct GameState {
     pub gui_events: Vec<rustudio_engine::gui::GuiEvent>,
     /// Where the client's GUI objects were drawn (AbsolutePosition / AbsoluteSize).
     pub gui_layout: HashMap<Ref, rustudio_engine::gui::GuiBox>,
+    pub(crate) gui_layout_changed: bool,
+    pub(crate) input_active: bool,
     /// Mouse buttons for UserInputService: (button, down, gameProcessedEvent).
     pub uis_mouse: Vec<(u8, bool, bool)>,
     /// The in-game menu (Esc) is open: the game gets no keys.
@@ -650,22 +659,35 @@ impl Game {
 
     /// A ClickDetector on a part only the client has (a client-cloned
     /// island): the click and hover fire on the client alone, as in Roblox.
-    fn client_click_detector_for(&self, part: Ref) -> Option<Ref> {
+    fn client_click_detector_for(&self, part: Ref, at: Vec3) -> Option<Ref> {
         let s = self.play.as_ref()?;
         let cd = s.other_doc.as_ref()?;
         let det = click_detector_in(cd, part)?;
-        let max = f32_prop(cd, det, "MaxActivationDistance", mech::CLICK_DISTANCE);
-        let at = self.character_pos();
-        let xf = rustudio_render::scene::xform_of(cd, part)?;
-        at.is_none_or(|at| (xf.pos - at).length() <= max).then_some(det)
+        reach_in(cd, det, at, self.character_pos()).then_some(det)
     }
 
-    /// The ClickDetector in reach that the mouse on `part` (a `side` ref)
-    /// reaches, with whether it lives on the client alone.
-    fn detector_under(&self, side: Side, part: Ref) -> Option<(Ref, bool)> {
+    /// The ClickDetector in reach that the mouse on `part` (a `side` ref, met
+    /// at `at`) reaches, with whether it lives on the client alone.
+    fn detector_under(&self, side: Side, part: Ref, at: Vec3) -> Option<(Ref, bool)> {
+        // The client's DataModel decides what a click on the client's view
+        // reaches, as in Roblox: a ClickDetector a LocalScript put on a
+        // replicated part (a game's lobby tab, its egg targets) exists only
+        // there. A replicated detector fires on both sides.
+        if side == Side::Client {
+            if let Some(cd) = self.play.as_ref().and_then(|s| s.other_doc.as_ref()) {
+                let det = click_detector_in(cd, part)?;
+                if !reach_in(cd, det, at, self.character_pos()) {
+                    return None;
+                }
+                return Some(match self.server_of(det) {
+                    Some(sdet) if self.doc.exists(sdet) => (sdet, false),
+                    _ => (det, true),
+                });
+            }
+        }
         match self.to_server(side, part) {
-            Some(sp) => self.click_detector_for(sp).filter(|d| self.in_reach(*d, sp)).map(|d| (d, false)),
-            None if side == Side::Client => self.client_click_detector_for(part).map(|d| (d, true)),
+            Some(sp) => self.click_detector_for(sp).filter(|d| self.in_reach(*d, at)).map(|d| (d, false)),
+            None if side == Side::Client => self.client_click_detector_for(part, at).map(|d| (d, true)),
             None => None,
         }
     }
@@ -675,6 +697,22 @@ impl Game {
         let ev = event.to_string();
         self.with_side(Side::Client, |rt, _, _| rt.fire(det, &ev, vec![rt.inst(cp)]));
     }
+}
+
+/// Whether the character's root at `root` is within `detector`'s
+/// MaxActivationDistance of `hit`, where the click ray met the part (no
+/// character: always). Studio measures from the HumanoidRootPart to the
+/// mouse's hit point: neither the camera nor the part's centre counts (a
+/// 40-stud part clicked at its near end is in reach of a max of 12).
+fn reach_in(d: &Document, detector: Ref, hit: Vec3, root: Option<Vec3>) -> bool {
+    let max = f32_prop(d, detector, "MaxActivationDistance", mech::CLICK_DISTANCE);
+    root.is_none_or(|root| (hit - root).length() <= max)
+}
+
+/// Whether a ClickDetector click passes through `part`: Transparency above
+/// 0.95 and no ClickDetector of its own (in it or a Model above it).
+fn click_see_through(d: &Document, part: Ref) -> bool {
+    f32_prop(d, part, "Transparency", 0.0) > mech::CLICK_SEE_THROUGH && click_detector_in(d, part).is_none()
 }
 
 fn click_detector_in(d: &Document, part: Ref) -> Option<Ref> {
@@ -698,29 +736,18 @@ fn click_detector_in(d: &Document, part: Ref) -> Option<Ref> {
 }
 
 impl Game {
+    /// The live character's HumanoidRootPart (server DataModel), else its body.
     fn character_pos(&self) -> Option<Vec3> {
-        self.play
-            .as_ref()?
-            .character
-            .as_ref()
-            .filter(|c| !c.dead)
-            .map(|c| c.body.pos)
+        let c = self.play.as_ref()?.character.as_ref().filter(|c| !c.dead)?;
+        let root = self
+            .doc
+            .find_named(c.model, "HumanoidRootPart")
+            .and_then(|r| rustudio_render::scene::xform_of(&self.doc, r));
+        Some(root.map_or(c.body.pos, |xf| xf.pos))
     }
 
-    fn in_reach(&self, detector: Ref, part: Ref) -> bool {
-        let max = f32_prop(
-            &self.doc,
-            detector,
-            "MaxActivationDistance",
-            mech::CLICK_DISTANCE,
-        );
-        let Some(at) = self.character_pos() else {
-            return true;
-        };
-        let Some(xf) = rustudio_render::scene::xform_of(&self.doc, part) else {
-            return false;
-        };
-        (xf.pos - at).length() <= max
+    fn in_reach(&self, detector: Ref, hit: Vec3) -> bool {
+        reach_in(&self.doc, detector, hit, self.character_pos())
     }
 
     /// The input the viewport queued, before the server's scripts run.
@@ -768,7 +795,7 @@ impl Game {
 
         // Hovering a ClickDetector.
         let pointer = self.play.as_ref().and_then(|s| s.game.last_pointer);
-        let hovered = pointer.and_then(|p| p.hit.and_then(|(r, _)| self.detector_under(p.side, r)));
+        let hovered = pointer.and_then(|p| p.click.and_then(|(r, at)| self.detector_under(p.side, r, at)));
         let before = self.play.as_ref().and_then(|s| s.game.hover_detector);
         if hovered != before {
             match before {
@@ -789,9 +816,9 @@ impl Game {
 
         // Clicks on ClickDetectors (fired on both sides with the player).
         let side = pointer.map(|p| p.side).unwrap_or(Side::Server);
-        for (r, button) in input.clicks {
+        for (r, at, button) in input.clicks {
             let ev = if button == 1 { "MouseClick" } else { "RightMouseClick" };
-            match self.detector_under(side, r) {
+            match self.detector_under(side, r, at) {
                 Some((det, false)) => self.fire_with_player(det, ev),
                 Some((det, true)) => self.fire_client_with_player(det, ev),
                 None => {}
@@ -923,7 +950,7 @@ impl Game {
         let reqs = {
             let Some(s) = self.play.as_mut() else { return };
             let w = match side {
-                Side::Server => s.server.world.as_mut(),
+                Side::Server => s.server.as_mut().and_then(|server| server.world.as_mut()),
                 Side::Client => s.client.as_mut().and_then(|c| c.world.as_mut()),
             };
             match w {
@@ -1632,7 +1659,7 @@ impl Game {
         s.client
             .as_ref()
             .and_then(|c| c.world.as_ref())
-            .or(s.server.world.as_ref())
+            .or(s.server.as_ref().and_then(|server| server.world.as_ref()))
             .and_then(|w| w.input.sound_listener)
     }
     fn start_sound(&mut self, key: u64) {
@@ -1800,7 +1827,7 @@ impl Game {
         f: impl Fn(&mut rustudio_engine::runtime::ext::Inputs, Ref),
     ) {
         let Some(s) = self.play.as_mut() else { return };
-        if let (Some(r), Some(w)) = (server, s.server.world.as_mut()) {
+        if let (Some(r), Some(w)) = (server, s.server.as_mut().and_then(|server| server.world.as_mut())) {
             f(&mut w.input, r);
         }
         if let (Some(r), Some(w)) = (client, s.client.as_mut().and_then(|c| c.world.as_mut())) {
@@ -2086,7 +2113,7 @@ impl Game {
             .play
             .as_ref()
             .map(|s| {
-                let server = s.server.world.as_ref().map(|w| &w.requests.sounds);
+                let server = s.server.as_ref().and_then(|server| server.world.as_ref()).map(|w| &w.requests.sounds);
                 let client = s
                     .client
                     .as_ref()
@@ -2162,49 +2189,38 @@ impl Game {
         let ctx = ui.ctx().clone();
         // (LockCenter: the game's mouse is the middle of the view, wherever
         // the held system cursor is.)
-        let mut pointer = rustudio_engine::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
+        let threaded = self.play_thread.is_some();
+        let pointer = rustudio_engine::mouse_lock::game_pointer(self.lock_center_held(), rect, resp.hover_pos()).map(|p| {
             let ray = self.cam.ray(rect, p);
-            let hit = self.mouse_pick(side, &ray).map(|(r, t)| (r, ray.at(t)));
             Pointer {
                 origin: ray.origin,
                 dir: ray.dir,
-                hit,
+                hit: None,
+                click: None,
                 xy: [p.x - rect.min.x, p.y - rect.min.y],
                 view: [rect.width(), rect.height()],
                 side,
             }
         });
-        // Terrain under the mouse (Mouse.Hit / Mouse.Target), through the
-        // shown side's query cache: the same surface Raycast meets.
-        if let Some(p) = pointer.as_mut() {
-            let (o, d) = (p.origin, p.dir);
-            self.server_front();
-            let terrain = self
-                .with_side(side, |rt, _, _| {
-                    rustudio_engine::runtime::ext::mouse_terrain_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH)
-                })
-                .flatten();
-            self.shown_front();
-            if let Some((r, t)) = terrain {
-                if p.hit.is_none_or(|(_, at)| (at - o).length() > t) {
-                    p.hit = Some((r, o + d * t));
-                }
-            }
-        }
+        let pointer = if threaded { pointer } else { pointer.map(|p| self.resolve_play_pointer(p)) };
         let mut clicks = Vec::new();
-        // A click the GUI took doesn't reach the world (ClickDetectors, Mouse, tools).
-        if let Some((r, _)) = pointer.and_then(|p| p.hit).filter(|_| !gui_took) {
-            if resp.clicked_by(egui::PointerButton::Primary) {
-                clicks.push((r, 1));
-            }
-            if resp.clicked_by(egui::PointerButton::Secondary) {
-                clicks.push((r, 2));
+        let mut ray_clicks = Vec::new();
+        if let Some(p) = pointer.filter(|_| !gui_took) {
+            for (btn, id) in [(egui::PointerButton::Primary, 1), (egui::PointerButton::Secondary, 2)] {
+                if resp.clicked_by(btn) {
+                    if threaded {
+                        ray_clicks.push((p, id));
+                    } else if let Some((r, at)) = p.click {
+                        clicks.push((r, at, id));
+                    }
+                }
             }
         }
         // Any key, click or mouse move is activity (Player.Idled).
         if ctx.input(|i| !i.events.is_empty() || i.pointer.delta() != egui::Vec2::ZERO) {
             if let Some(s) = self.play.as_mut() {
                 s.game.last_activity = s.time;
+                s.game.input_active = true;
             }
         }
         let mut buttons = Vec::new();
@@ -2258,22 +2274,14 @@ impl Game {
         }
         // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat (Place A's
         // menu does; Studio shows no chat there).
-        let chat_on = self
-            .play
-            .as_ref()
+        let core_gui_on = |name: &str| self.play.as_ref()
             .and_then(|s| s.client.as_ref())
             .and_then(|c| c.world.as_ref())
-            .is_none_or(|w| !w.core_gui_off.contains("Chat"));
+            .is_none_or(|w| !w.core_gui_off.contains(name));
+        let presentation = self.play.as_ref().and_then(|s| s.presentation.as_ref());
+        let chat_on = presentation.map_or_else(|| core_gui_on("Chat"), |view| view.chat_on);
+        let backpack_on = presentation.map_or_else(|| core_gui_on("Backpack"), |view| view.backpack_on);
         open_chat &= chat_on;
-        // SetCoreGuiEnabled(Backpack, false) turns off Roblox's Backpack
-        // CoreScript: no hotbar is drawn and the number keys equip nothing
-        // (games with their own hotbar, e.g. the test place's CustomHotbar).
-        let backpack_on = self
-            .play
-            .as_ref()
-            .and_then(|s| s.client.as_ref())
-            .and_then(|c| c.world.as_ref())
-            .is_none_or(|w| !w.core_gui_off.contains("Backpack"));
         if !backpack_on {
             slots.clear();
         }
@@ -2282,6 +2290,7 @@ impl Game {
         let menu = self.play.as_ref().is_some_and(|s| s.game.menu_open);
         if menu {
             clicks.clear();
+            ray_clicks.clear();
             buttons.clear();
             slots.clear();
             open_chat = false;
@@ -2336,29 +2345,8 @@ impl Game {
         }
 
         // Hotbar.
-        let slot_tools: Vec<Ref> = self
-            .play
-            .as_ref()
-            .map(|s| s.game.slots.clone())
-            .unwrap_or_default();
-        let equipped = self
-            .play
-            .as_ref()
-            .and_then(|s| s.game.equipped.as_ref().map(|e| e.tool));
-        if backpack_on && !slot_tools.is_empty() {
-            // (Slots hold server refs: viewing the client, the tool is in
-            // the other DataModel.) Drawn as Roblox's Backpack CoreScript
-            // does: gui.rs `draw_hotbar`.
-            let info: Vec<(String, String, bool)> = slot_tools
-                .iter()
-                .map(|t| {
-                    let d = if self.doc.exists(*t) { Some(&self.doc) } else { self.play_other_doc() };
-                    let name = d.and_then(|d| d.dom.get_by_ref(*t)).map(|i| i.name.clone()).unwrap_or_default();
-                    let texture = rustudio_render::scene::content_string(d.and_then(|d| d.prop(*t, "TextureId")))
-                        .unwrap_or_default();
-                    (name, texture, Some(*t) == equipped)
-                })
-                .collect();
+        let info = self.play_hotbar();
+        if backpack_on && !info.is_empty() {
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
@@ -2375,19 +2363,18 @@ impl Game {
         // ExpChat bubble chat runs whatever the place's ChatVersion, and
         // SetCoreGuiEnabled(Chat, false) hides only the window and bar.
         // (with_side needs the server's DataModel in front.)
-        self.server_front();
-        let view = self
-            .with_side(Side::Client, |rt, _, _| {
-                rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua)
-            })
-            .flatten();
-        self.shown_front();
+        let live_view = (!threaded).then(|| self.with_play_side(Side::Client, |rt, _, _| {
+            rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua)
+        }).flatten()).flatten();
+        let presented_chat = self.play.as_ref().and_then(|s| s.presentation.as_ref())
+            .and_then(|view| view.chat.as_ref());
+        let view = presented_chat.or(live_view.as_ref());
         let chat_open_now = self.play.as_ref().is_some_and(|s| s.game.chat_open);
-        let input_rect = match &view {
+        let input_rect = match view {
             Some(v) if v.tcs && chat_on => draw_text_chat(&painter, rect, v, chat_open_now, &self.cam),
             _ => {
                 draw_legacy_chat(self, &painter, rect, chat_on);
-                if let Some(v) = &view {
+                if let Some(v) = view {
                     draw_chat_bubbles(&painter, rect, v, &self.cam);
                 }
                 None
@@ -2449,6 +2436,7 @@ impl Game {
                 s.game.input.pointer = pointer;
             }
             s.game.input.clicks.extend(clicks);
+            s.game.input.ray_clicks.extend(ray_clicks);
             s.game.input.buttons.extend(buttons);
             s.game.uis_mouse.extend(uis);
             s.game.input.slots.extend(slots);
@@ -2460,6 +2448,74 @@ impl Game {
             }
         }
         true
+    }
+
+    pub(crate) fn play_hotbar(&self) -> Vec<(String, String, bool)> {
+        let Some(s) = self.play.as_ref() else { return Vec::new() };
+        if let Some(view) = s.presentation.as_ref() {
+            return view.hotbar.clone();
+        }
+        let equipped = s.game.equipped.as_ref().map(|e| e.tool);
+        s.game.slots.iter().map(|&tool| {
+            // Slots hold server refs even when the client is shown.
+            let d = if self.doc.exists(tool) { Some(&self.doc) } else { self.play_other_doc() };
+            let name = d.and_then(|d| d.dom.get_by_ref(tool)).map(|i| i.name.clone()).unwrap_or_default();
+            let texture = rustudio_render::scene::content_string(d.and_then(|d| d.prop(tool, "TextureId")))
+                .unwrap_or_default();
+            (name, texture, Some(tool) == equipped)
+        }).collect()
+    }
+
+    pub(crate) fn resolve_play_pointer(&mut self, mut pointer: Pointer) -> Pointer {
+        let ray = rustudio_core::math::Ray { origin: pointer.origin, dir: pointer.dir };
+        pointer.hit = self.mouse_pick(pointer.side, &ray).map(|(r, t)| (r, ray.at(t)));
+        let terrain = self.with_play_side(pointer.side, |rt, _, _| {
+            rustudio_engine::runtime::ext::mouse_terrain_hit(
+                &rt.lua, ray.origin, ray.dir, rustudio_core::mech::MOUSE_RAY_LENGTH,
+            )
+        }).flatten();
+        let near = |hit: Option<(Ref, Vec3)>| match terrain {
+            Some((r, t)) if hit.is_none_or(|(_, at)| (at - ray.origin).length() > t) => Some((r, ray.at(t))),
+            _ => hit,
+        };
+        pointer.click = near(self.click_pick(pointer.side, &ray, pointer.hit));
+        pointer.hit = near(pointer.hit);
+        pointer
+    }
+
+    /// The part a ClickDetector click meets: the mouse's hit, past parts with
+    /// Transparency above 0.95 and no ClickDetector (Studio: a 0.95 part in
+    /// front blocks the click, a 0.96 one doesn't; a Transparency 1 part
+    /// with its own ClickDetector is still clicked).
+    fn click_pick(&mut self, side: Side, ray: &rustudio_core::math::Ray, first: Option<(Ref, Vec3)>) -> Option<(Ref, Vec3)> {
+        let mut hit = first;
+        let mut skip: Vec<Ref> = self.own_parts().into_iter().collect();
+        for _ in 0..32 {
+            let (r, _) = hit?;
+            if !self.click_passes(side, r) {
+                return hit;
+            }
+            skip.push(r);
+            let (o, d) = (ray.origin, ray.dir);
+            self.server_front();
+            let next = self.with_side(side, |rt, _, _| {
+                rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, &skip)
+            });
+            self.shown_front();
+            hit = next.flatten().map(|(r, t)| (r, ray.at(t)));
+        }
+        hit
+    }
+
+    /// Whether the click ray goes through `part` (a `side` ref).
+    fn click_passes(&self, side: Side, part: Ref) -> bool {
+        // (the shown side's DataModel is in front here)
+        let shown = self.play.as_ref().map(|s| s.showing);
+        let d = match (shown, self.play.as_ref().and_then(|s| s.other_doc.as_ref())) {
+            (Some(sh), Some(other)) if sh != side => other,
+            _ => &self.doc,
+        };
+        click_see_through(d, part)
     }
 
     /// The part under the game's mouse: the shown side's world query, as
@@ -2487,10 +2543,9 @@ impl Game {
             .play
             .as_ref()
             .map(|s| match s.showing {
-                Side::Server => s.physics.skip.iter().copied().collect(),
+                Side::Server => s.physics_skip().iter().copied().collect(),
                 Side::Client => s
-                    .physics
-                    .skip
+                    .physics_skip()
                     .iter()
                     .filter_map(|r| s.map.s2c.get(r).copied())
                     .collect(),
@@ -2763,5 +2818,65 @@ mod tool_tests {
         let handle = d.dom.insert(tool, InstanceBuilder::new("Part").with_name("Handle"));
         assert_eq!(tool_handle(&d, tool), Some(handle));
         assert_eq!(tool_handle(&d, Ref::new()), None);
+    }
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    fn part(d: &mut Document, parent: Ref, transparency: f32) -> Ref {
+        d.dom.insert(parent, InstanceBuilder::new("Part").with_property("Transparency", transparency))
+    }
+
+    fn detector(d: &mut Document, parent: Ref, max: f32) -> Ref {
+        d.dom.insert(parent, InstanceBuilder::new("ClickDetector").with_property("MaxActivationDistance", max))
+    }
+
+    #[test]
+    fn reach_is_root_to_hit_point() {
+        // Studio: a hit 10.105 from the HumanoidRootPart clicks with a max of
+        // 10.15, not 10; the part's centre and the camera don't count.
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let p = part(&mut d, ws, 0.0);
+        let near = detector(&mut d, p, 10.15);
+        let root = Some(Vec3::new(0.0, 2.97, 0.0));
+        let hit = Vec3::new(0.0, 2.97 + 1.45, -10.0);
+        assert!(reach_in(&d, near, hit, root));
+        let mut d2 = Document::new_place();
+        let ws2 = d2.workspace().unwrap();
+        let p2 = part(&mut d2, ws2, 0.0);
+        let short = detector(&mut d2, p2, 10.0);
+        assert!(!reach_in(&d2, short, hit, root));
+        // No character: always in reach.
+        assert!(reach_in(&d2, short, Vec3::splat(1000.0), None));
+    }
+
+    #[test]
+    fn see_through_needs_transparency_above_0_95_and_no_detector() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let solid = part(&mut d, ws, 0.95);
+        let clear = part(&mut d, ws, 0.96);
+        let invisible = part(&mut d, ws, 1.0);
+        let clickable = part(&mut d, ws, 1.0);
+        detector(&mut d, clickable, 32.0);
+        assert!(!click_see_through(&d, solid));
+        assert!(click_see_through(&d, clear));
+        assert!(click_see_through(&d, invisible));
+        assert!(!click_see_through(&d, clickable), "a Transparency 1 part with a ClickDetector is clicked");
+    }
+
+    #[test]
+    fn detector_in_a_model_above_the_part() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        let p = part(&mut d, model, 0.0);
+        let det = detector(&mut d, model, 32.0);
+        assert_eq!(click_detector_in(&d, p), Some(det));
+        let loose = part(&mut d, ws, 0.0);
+        assert_eq!(click_detector_in(&d, loose), None);
     }
 }

@@ -220,12 +220,12 @@ fn native(id: egui::TextureId) -> Option<(wgpu::Texture, u64)> {
     NATIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&id).cloned()
 }
 
-pub fn push(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, vertices: Vec<GuiVertex>, indices: &[u32]) {
+pub fn push(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, vertices: impl IntoIterator<Item = GuiVertex>, indices: &[u32]) {
     push_wrap(batches, texture, false, vertices, indices);
 }
 
 /// `push`, with the texture sampled repeating (`wrap`) or clamped.
-pub fn push_wrap(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, wrap: bool, vertices: Vec<GuiVertex>, indices: &[u32]) {
+pub fn push_wrap(batches: &mut Vec<GuiBatch>, texture: egui::TextureId, wrap: bool, vertices: impl IntoIterator<Item = GuiVertex>, indices: &[u32]) {
     if batches.last().is_none_or(|b| b.texture != Some(texture) || b.wrap != wrap) {
         batches.push(GuiBatch { texture: Some(texture), wrap, ..Default::default() });
     }
@@ -726,6 +726,14 @@ fn fs_out(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextureRevision {
+    Static,
+    Atlas(u64),
+    Native(u64),
+    UntrackedAtlas(u64),
+}
+
 /// The sun's shadow cascades as the beams' shader reads them
 /// (render.rs Globals sun_casc / sun_sphere / sun_rect).
 #[derive(Clone, Copy, Default)]
@@ -755,7 +763,7 @@ pub struct WorldGuiPass {
     /// average, not a sparse sample of its texels), made from egui's copy
     /// on first use. Keyed by egui's texture; the copy, its view, and the
     /// frame each was last used (and, for the font atlas, refilled).
-    mips: std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64)>,
+    mips: std::collections::HashMap<wgpu::Texture, (wgpu::Texture, wgpu::TextureView, u64, TextureRevision)>,
     mip_pipeline: wgpu::RenderPipeline,
     mip_bgl: wgpu::BindGroupLayout,
     mip_sampler: wgpu::Sampler,
@@ -779,8 +787,8 @@ pub struct WorldGuiPass {
     /// Texture bind groups by egui id and wrap: the egui texture they were
     /// made for, and the frame each was last used.
     tex_groups: std::collections::HashMap<(egui::TextureId, bool), (wgpu::Texture, wgpu::BindGroup, u64)>,
-    /// Each native texture's draw count when its copy was last refilled.
-    native_seen: std::collections::HashMap<egui::TextureId, u64>,
+    /// Atlas upload revision from the preceding completed egui pass.
+    pub(crate) font_texture_update: Option<(u64, Option<[u32; 4]>)>,
     /// Untextured effects: one white texel.
     white: wgpu::BindGroup,
     fx_bgl: wgpu::BindGroupLayout,
@@ -864,13 +872,28 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// A dirty rectangle in the source mip can affect a bilinear tap just
+/// outside its scaled bounds. Include a texel of padding on each side.
+fn mip_dirty_rect(rect: [u32; 4], source: [u32; 2], target: [u32; 2]) -> [u32; 4] {
+    let lower = |i: usize| {
+        let scaled = u64::from(rect[i]) * u64::from(target[i]) / u64::from(source[i]);
+        (scaled as u32).saturating_sub(1)
+    };
+    let upper = |i: usize| {
+        let scaled = (u64::from(rect[i + 2]) * u64::from(target[i])).div_ceil(u64::from(source[i]));
+        (scaled as u32 + 1).min(target[i])
+    };
+    [lower(0), lower(1), upper(0), upper(1)]
+}
+
 impl WorldGuiPass {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, samples: u32) -> Self {
+        let source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{SHADER}",
+                    "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\nconst EVSM_SHADOW_BIAS: f32 = {:?};\nconst EVSM_BLEED_CUT: f32 = {:?};\n{}{source}",
                     rustudio_core::mech::EVSM_POS_EXP,
                     rustudio_core::mech::EVSM_NEG_EXP,
                     rustudio_core::mech::EVSM_SHADOW_BIAS,
@@ -889,7 +912,7 @@ impl WorldGuiPass {
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: true,
+                        multisampled: samples > 1,
                     },
                     count: None,
                 },
@@ -1206,7 +1229,7 @@ impl WorldGuiPass {
             bufs: Default::default(),
             glass: Default::default(),
             tex_groups: Default::default(),
-            native_seen: Default::default(),
+            font_texture_update: None,
             fx_bgl,
             fx_in,
             fx_out,
@@ -1246,28 +1269,26 @@ impl WorldGuiPass {
         }
     }
 
-    /// A mipmapped copy of an egui texture (egui's own have one level),
-    /// made once: level 0 drawn from egui's, each next level downsampled
-    /// from the one above. Gamma-space premultiplied texels averaged, as
-    /// the effects' fragment shader mixes them.
-    ///
-    /// `live`: egui's texture changes in place (the font atlas gains glyphs
-    /// as new text sizes are laid out), so the copy is refilled once a
-    /// frame, not kept from the first frame: a SurfaceGui whose text size
-    /// was first laid out after the copy was made drew nothing (Place A's
-    /// Liquid Divinium counter).
-    fn mipped(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, live: bool) -> wgpu::TextureView {
+    /// Copy and downsample a texture when its uploaded contents change.
+    fn mipped(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, revision: TextureRevision) -> wgpu::TextureView {
         let frame = self.frame;
-        let reuse = match self.mips.get_mut(tex) {
-            Some((_, view, used)) if !live || *used == frame => {
-                *used = frame;
+        let mut dirty = None;
+        let reuse = if let Some((copy, view, used, last)) = self.mips.get_mut(tex) {
+            *used = frame;
+            if *last == revision {
                 return view.clone();
             }
-            Some((copy, view, used)) => {
-                *used = frame;
-                Some((copy.clone(), view.clone()))
+            // The Context only tracks its latest delta. After skipped
+            // revisions, refill the full copy to include every missed write.
+            if let (TextureRevision::Atlas(previous), TextureRevision::Atlas(current)) = (*last, revision) {
+                if previous.wrapping_add(1) == current {
+                    dirty = self.font_texture_update.and_then(|(_, rect)| rect);
+                }
             }
-            None => None,
+            *last = revision;
+            Some((copy.clone(), view.clone()))
+        } else {
+            None
         };
         let size = tex.size();
         let levels = 32 - size.width.max(size.height).max(1).leading_zeros();
@@ -1289,7 +1310,11 @@ impl WorldGuiPass {
             })
         };
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
+        let mut source_size = [size.width, size.height];
         for l in 0..levels {
+            let dst_size = [(size.width >> l).max(1), (size.height >> l).max(1)];
+            dirty = dirty.map(|rect| mip_dirty_rect(rect, source_size, dst_size));
+            source_size = dst_size;
             let src = if l == 0 { tex.create_view(&Default::default()) } else { level_view(l - 1) };
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("world gui mips"),
@@ -1306,13 +1331,19 @@ impl WorldGuiPass {
                     view: &dst,
                     resolve_target: None,
                     depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: if dirty.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some([left, top, right, bottom]) = dirty {
+                pass.set_scissor_rect(left, top, right - left, bottom - top);
+            }
             pass.set_pipeline(&self.mip_pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.draw(0..3, 0..1);
@@ -1322,7 +1353,7 @@ impl WorldGuiPass {
             return view;
         }
         let view = mipped.create_view(&Default::default());
-        self.mips.insert(tex.clone(), (mipped, view.clone(), frame));
+        self.mips.insert(tex.clone(), (mipped, view.clone(), frame, revision));
         view
     }
 
@@ -1394,7 +1425,7 @@ impl WorldGuiPass {
         self.frame += 1;
         // (effects' textures unused for a while are let go)
         let frame = self.frame;
-        self.mips.retain(|_, (_, _, used)| frame - *used < 600);
+        self.mips.retain(|_, (_, _, used, _)| frame - *used < 600);
         let egui = rs.renderer.read();
         self.tex_groups.retain(|_, (_, _, used)| frame - *used < 600);
         // (kept from frame to frame while egui's texture for the id is the
@@ -1409,22 +1440,25 @@ impl WorldGuiPass {
                 }
             };
             let mipped = tex.size().width.max(tex.size().height) > 1;
-            // (the font atlas changes in place: its copy is refilled once a
-            // frame; a ViewportFrame's image when it was drawn again)
-            let native_new = native_gen.is_some_and(|g| this.native_seen.insert(id, g) != Some(g));
-            let live = id == egui::TextureId::default() || native_new;
-            let kept = match this.tex_groups.get_mut(&(id, wrap)) {
-                Some((t, bg, used)) if *t == tex => Some((bg.clone(), std::mem::replace(used, frame) != frame)),
-                _ => None,
+            let revision = if let Some(generation) = native_gen {
+                TextureRevision::Native(generation)
+            } else if id == egui::TextureId::default() {
+                this.font_texture_update.map_or(TextureRevision::UntrackedAtlas(frame), |(revision, _)| TextureRevision::Atlas(revision))
+            } else {
+                TextureRevision::Static
             };
-            if let Some((bg, first)) = kept {
-                if first && live && mipped {
-                    this.mipped(device, &rs.queue, &tex, true);
+            if let Some((t, bg, used)) = this.tex_groups.get_mut(&(id, wrap)) {
+                if *t == tex {
+                    let bg = bg.clone();
+                    let first = std::mem::replace(used, frame) != frame;
+                    if first && mipped {
+                        this.mipped(device, &rs.queue, &tex, revision);
+                    }
+                    return Some(bg);
                 }
-                return Some(bg);
             }
             let (view, sampler) = if mipped {
-                (this.mipped(device, &rs.queue, &tex, live), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
+                (this.mipped(device, &rs.queue, &tex, revision), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
             } else {
                 (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler })
             };
@@ -1468,8 +1502,11 @@ impl WorldGuiPass {
         }
         let (q, v, i) = (&rs.queue, wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
         let [b0, b1, b2, b3, b4] = &mut self.bufs;
-        fill(device, q, b0, v, bytemuck::cast_slice(&vertices));
-        fill(device, q, b1, i, bytemuck::cast_slice(&indices));
+        if !indices.is_empty() {
+            let _upload = rustudio_core::bench::scope("gui_world_mesh_upload");
+            fill(device, q, b0, v, bytemuck::cast_slice(&vertices));
+            fill(device, q, b1, i, bytemuck::cast_slice(&indices));
+        }
         fill(device, q, b2, v, bytemuck::cast_slice(&f.strips));
         fill(device, q, b3, i, bytemuck::cast_slice(&f.indices));
         fill(device, q, b4, v, bytemuck::cast_slice(&f.particles));
@@ -1631,5 +1668,31 @@ impl WorldGuiPass {
         drop(step);
         crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [enc.finish()]);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mip_dirty_rect;
+
+    #[test]
+    fn partial_mips_cover_every_bilinear_tap_of_the_dirty_texel() {
+        for source in 1u32..=33 {
+            for target in [source, (source / 2).max(1)] {
+                for dirty in 0..source {
+                    let [left, _, right, _] = mip_dirty_rect(
+                        [dirty, 0, dirty + 1, 1], [source, 1], [target, 1],
+                    );
+                    for dst in 0..target {
+                        let sample = (f64::from(dst) + 0.5) * f64::from(source) / f64::from(target) - 0.5;
+                        let first = (sample.floor() as i32).clamp(0, source as i32 - 1) as u32;
+                        let second = (sample.ceil() as i32).clamp(0, source as i32 - 1) as u32;
+                        if first == dirty || second == dirty {
+                            assert!((left..right).contains(&dst), "{source} -> {target}, src {dirty}, dst {dst}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

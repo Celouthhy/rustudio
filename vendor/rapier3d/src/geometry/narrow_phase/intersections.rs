@@ -149,64 +149,69 @@ impl NarrowPhase {
             None
         };
 
+        let run_serial = |edges: &mut [crate::data::graph::Edge<IntersectionPair>]| {
+            update_candidates
+                .iter()
+                .filter_map(|id| {
+                    process_pair(&mut edges[*id as usize], hooks).map(|started| (*id, started))
+                })
+                .collect()
+        };
+
         #[cfg(not(feature = "parallel"))]
-        let deferred_events: Vec<(u32, bool)> = update_candidates
-            .iter()
-            .filter_map(|id| {
-                process_pair(
-                    &mut self.intersection_graph.graph.edges[*id as usize],
-                    hooks,
-                )
-                .map(|started| (*id, started))
-            })
-            .collect();
+        let deferred_events: Vec<(u32, bool)> =
+            run_serial(&mut self.intersection_graph.graph.edges);
 
         #[cfg(feature = "parallel")]
-        let deferred_events: Vec<(u32, bool)> = {
-            let edges_ptr = SyncPtr(self.intersection_graph.graph.edges.as_mut_ptr());
+        let deferred_events: Vec<(u32, bool)> =
+            if update_candidates.len() < 256 || rayon::current_num_threads() <= 1 {
+                run_serial(&mut self.intersection_graph.graph.edges)
+            } else {
+                let edges_ptr = SyncPtr(self.intersection_graph.graph.edges.as_mut_ptr());
 
-            #[cfg(feature = "unsync-callbacks")]
-            let is_hooked = |id: u32| {
-                // SAFETY: read-only, and no worker is running at either call site.
-                let edge = unsafe { &*edges_ptr.add(id as usize) };
-                let hooks_of = |i: usize| colliders[nodes[i].weight].flags.active_hooks;
-                (hooks_of(edge.source().index()) | hooks_of(edge.target().index()))
-                    .contains(ActiveHooks::FILTER_INTERSECTION_PAIR)
-            };
+                #[cfg(feature = "unsync-callbacks")]
+                let is_hooked = |id: u32| {
+                    // SAFETY: read-only, and no worker is running at either call site.
+                    let edge = unsafe { &*edges_ptr.add(id as usize) };
+                    let hooks_of = |i: usize| colliders[nodes[i].weight].flags.active_hooks;
+                    (hooks_of(edge.source().index()) | hooks_of(edge.target().index()))
+                        .contains(ActiveHooks::FILTER_INTERSECTION_PAIR)
+                };
 
-            // Bound concretely so the worker closure captures `&()` rather than
-            // `&dyn PhysicsHooks` under `unsync-callbacks`.
-            #[cfg(not(feature = "unsync-callbacks"))]
-            let worker_hooks = hooks;
-            #[cfg(feature = "unsync-callbacks")]
-            let worker_hooks = &();
+                // Bound concretely so the worker closure captures `&()` rather than
+                // `&dyn PhysicsHooks` under `unsync-callbacks`.
+                #[cfg(not(feature = "unsync-callbacks"))]
+                let worker_hooks = hooks;
+                #[cfg(feature = "unsync-callbacks")]
+                let worker_hooks = &();
 
-            // NOTE: rayon's collect preserves the candidates' order.
-            #[allow(unused_mut)]
-            let mut slots: Vec<Option<(u32, bool)>> = par_iter!(&update_candidates)
-                .map(|id| {
-                    #[cfg(feature = "unsync-callbacks")]
+                // NOTE: rayon's collect preserves the candidates' order.
+                #[allow(unused_mut)]
+                let mut slots: Vec<Option<(u32, bool)>> = par_iter!(&update_candidates)
+                    .with_min_len(64)
+                    .map(|id| {
+                        #[cfg(feature = "unsync-callbacks")]
+                        if is_hooked(*id) {
+                            return None;
+                        }
+                        // SAFETY: `update_candidates` is deduplicated, so each edge is accessed
+                        //         by exactly one iteration.
+                        let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
+                        process_pair(edge, worker_hooks).map(|started| (*id, started))
+                    })
+                    .collect();
+
+                #[cfg(feature = "unsync-callbacks")]
+                for (slot, id) in slots.iter_mut().zip(update_candidates.iter()) {
                     if is_hooked(*id) {
-                        return None;
+                        // SAFETY: as above; the workers have joined.
+                        let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
+                        *slot = process_pair(edge, hooks).map(|started| (*id, started));
                     }
-                    // SAFETY: `update_candidates` is deduplicated, so each edge is accessed
-                    //         by exactly one iteration.
-                    let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
-                    process_pair(edge, worker_hooks).map(|started| (*id, started))
-                })
-                .collect();
-
-            #[cfg(feature = "unsync-callbacks")]
-            for (slot, id) in slots.iter_mut().zip(update_candidates.iter()) {
-                if is_hooked(*id) {
-                    // SAFETY: as above; the workers have joined.
-                    let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
-                    *slot = process_pair(edge, hooks).map(|started| (*id, started));
                 }
-            }
 
-            slots.into_iter().flatten().collect()
-        };
+                slots.into_iter().flatten().collect()
+            };
 
         for (id, started) in deferred_events {
             let edge = &mut self.intersection_graph.graph.edges[id as usize];

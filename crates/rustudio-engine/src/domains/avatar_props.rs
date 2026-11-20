@@ -104,11 +104,7 @@ fn type_name(k: Kind) -> &'static str {
 
 fn bad(class: &str, key: &str, want: &str, v: &Value) -> mlua::Error {
     let got = match v {
-        Value::UserData(u) => u
-            .metatable()
-            .ok()
-            .and_then(|m| m.get::<String>("__type").ok())
-            .unwrap_or_else(|| "userdata".into()),
+        Value::UserData(u) => crate::ltypes::userdata_type_name(u),
         _ => v.type_name().to_string(),
     };
     let _ = class;
@@ -172,7 +168,7 @@ fn cframe_prop(lua: &Lua, r: Ref, name: &str) -> mlua::Result<rustudio_core::mat
 }
 
 fn cf_value(lua: &Lua, xf: rustudio_core::math::Xform) -> mlua::Result<Value> {
-    Ok(Value::UserData(lua.create_userdata(crate::ltypes::LCFrame(xf))?))
+    Ok(crate::ltypes::LCFrame(xf).into_lua(lua)?)
 }
 
 fn v3_value(lua: &Lua, v: glam::Vec3) -> mlua::Result<Value> {

@@ -449,7 +449,9 @@ pub fn new_env(lua: &Lua, script: Option<Value>) -> mlua::Result<Table> {
 }
 
 /// The test harness's environment: scripts' `_G` and `shared`, and every
-/// host global (internals included).
+/// host global (internals included). Flagged safe like a script's, so a
+/// harness chunk gets the same import and builtin fast paths (per-call
+/// costs measured from it are a script's).
 pub fn harness_env(lua: &Lua) -> mlua::Result<Table> {
     let env = lua.create_table()?;
     env.raw_set("_G", reg::<Table>(lua, "rs_script_G")?)?;
@@ -457,6 +459,7 @@ pub fn harness_env(lua: &Lua) -> mlua::Result<Table> {
     let mt = lua.create_table()?;
     mt.raw_set("__index", lua.globals())?;
     env.set_metatable(Some(mt))?;
+    env.set_safeenv(true);
     Ok(env)
 }
 

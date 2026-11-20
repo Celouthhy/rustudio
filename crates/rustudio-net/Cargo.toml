@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+log = "0.4"
 rustudio-account = { path = "../rustudio-account" }
 rbx_dom_weak = "4"
 rbx_types = "3"

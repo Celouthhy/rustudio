@@ -15,11 +15,25 @@ type Container = UnsafeCell<FxHashMap<TypeId, RefCell<Box<dyn Any>>>>;
 #[cfg(feature = "send")]
 type Container = UnsafeCell<FxHashMap<TypeId, RefCell<Box<dyn Any + Send>>>>;
 
+#[cfg(not(feature = "send"))]
+type Slot = RefCell<Box<dyn Any>>;
+#[cfg(feature = "send")]
+type Slot = RefCell<Box<dyn Any + Send>>;
+
+/// rustudio: entries recently looked up, in front of the map (a runtime
+/// looks the same few types up thousands of times a frame; the map probe
+/// and the `Any` downcast were ~140 instructions an access). Each holds a
+/// type and its slot in the map, valid until the map changes (`insert` /
+/// `remove` clear them; no entry moves otherwise).
+const RECENT: usize = 8;
+
 /// A container for arbitrary data associated with the Lua state.
 #[derive(Debug, Default)]
 pub struct AppData {
     container: Container,
     borrow: Cell<usize>,
+    recent: [Cell<Option<(TypeId, *const Slot)>>; RECENT],
+    next: Cell<usize>,
 }
 
 impl AppData {
@@ -35,6 +49,7 @@ impl AppData {
         if self.borrow.get() != 0 {
             return Err(data);
         }
+        self.forget_recent();
         // SAFETY: we checked that there are no other references to the container
         Ok(unsafe { &mut *self.container.get() }
             .insert(TypeId::of::<T>(), RefCell::new(Box::new(data)))
@@ -50,12 +65,38 @@ impl AppData {
         }
     }
 
+    fn forget_recent(&self) {
+        for c in &self.recent {
+            c.set(None);
+        }
+    }
+
+    /// The map's slot of `T` (`recent` first).
+    #[inline]
+    fn slot<T: 'static>(&self) -> Option<&Slot> {
+        let id = TypeId::of::<T>();
+        for c in &self.recent {
+            match c.get() {
+                // SAFETY: a recent slot is in the map, which hasn't changed
+                // since (insert / remove clear `recent`).
+                Some((t, p)) if t == id => return Some(unsafe { &*p }),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let slot = unsafe { &*self.container.get() }.get(&id)?;
+        let i = self.next.get();
+        self.recent[i % RECENT].set(Some((id, slot as *const Slot)));
+        self.next.set(i.wrapping_add(1));
+        Some(slot)
+    }
+
     pub(crate) fn try_borrow<T: 'static>(
         &self,
         guard: Option<LuaGuard>,
     ) -> Result<Option<AppDataRef<'_, T>>, BorrowError> {
-        let data = unsafe { &*self.container.get() }
-            .get(&TypeId::of::<T>())
+        let data = self
+            .slot::<T>()
             .map(|c| c.try_borrow())
             .transpose()?
             .and_then(|data| Ref::filter_map(data, |data| data.downcast_ref()).ok());
@@ -85,8 +126,8 @@ impl AppData {
         &self,
         guard: Option<LuaGuard>,
     ) -> Result<Option<AppDataRefMut<'_, T>>, BorrowMutError> {
-        let data = unsafe { &*self.container.get() }
-            .get(&TypeId::of::<T>())
+        let data = self
+            .slot::<T>()
             .map(|c| c.try_borrow_mut())
             .transpose()?
             .and_then(|data| RefMut::filter_map(data, |data| data.downcast_mut()).ok());
@@ -108,6 +149,7 @@ impl AppData {
         if self.borrow.get() != 0 {
             panic!("cannot mutably borrow app data container");
         }
+        self.forget_recent();
         // SAFETY: we checked that there are no other references to the container
         unsafe { &mut *self.container.get() }
             .remove(&TypeId::of::<T>())?

@@ -155,6 +155,13 @@ unsafe fn raise(l: *mut ffi::lua_State, msg: &str) -> ! {
 /// Raises the failure on top of the stack (from a protected call) as a
 /// string, converting mlua errors with `errtext` (an upvalue index).
 unsafe fn reraise(l: *mut ffi::lua_State, errtext: c_int) -> ! {
+    unsafe { reraise_named(l, errtext, "") }
+}
+
+/// `reraise` for a method `name`: an argument error that doesn't name its
+/// function gets `to 'name'` (`name_arg_error`), as mlua's own methods
+/// worded it (natively stored types' methods are plain functions).
+unsafe fn reraise_named(l: *mut ffi::lua_State, errtext: c_int, name: &str) -> ! {
     unsafe {
         if ffi::lua_type(l, -1) != ffi::LUA_TSTRING {
             ffi::lua_pushvalue(l, errtext);
@@ -163,6 +170,12 @@ unsafe fn reraise(l: *mut ffi::lua_State, errtext: c_int) -> ! {
                 ffi::lua_settop(l, 0);
                 ffi::lua_pushstring(l, c"invalid argument".as_ptr());
             }
+        }
+        if !name.is_empty() {
+            let msg = name_arg_error(str_at(l, -1), name);
+            ffi::lua_pop(l, 1);
+            ffi::lua_pushlstring(l, msg.as_ptr() as *const c_char, msg.len());
+            drop(msg);
         }
         let mut len = 0usize;
         let s = ffi::lua_tolstring(l, -1, &mut len);
@@ -341,67 +354,14 @@ unsafe extern "C-unwind" fn index_fn(l: *mut ffi::lua_State) -> c_int {
     }
 }
 
-/// mlua's userdata block for a CFrame: its length, first word (the storage
-/// variant) and where the `LCFrame` sits behind the pointer at +8; probed
-/// on a known value at install (`probe_cframe`), None if it didn't match.
-static CFRAME_UD: std::sync::OnceLock<Option<(usize, u64, usize)>> = std::sync::OnceLock::new();
-
-fn probe_cframe(lua: &Lua) -> Option<(usize, u64, usize)> {
-    use rustudio_core::math::Xform;
-    let known = crate::ltypes::LCFrame(Xform {
-        pos: glam::Vec3::new(1.5, -2.25, 3.125),
-        rot: glam::Mat3::from_cols_array(&[0.25, 0.5, 0.75, -1.0, 2.0, -3.0, 4.5, 5.5, 6.5]),
-    });
-    let u = lua.create_userdata(known).ok()?;
-    let want: [f32; 12] = unsafe { std::mem::transmute(known) };
-    let found = std::cell::Cell::new(None);
-    unsafe {
-        lua.exec_raw::<()>(&u, |l| {
-            let len = ffi::lua_objlen(l, -1) as usize;
-            let p = ffi::lua_touserdata(l, -1) as *const u64;
-            if len >= 16 {
-                let w0 = p.read_unaligned();
-                let rc = p.add(1).read_unaligned() as *const u8;
-                if !rc.is_null() && (rc as usize) % 8 == 0 {
-                    for at in (16..=64).step_by(4) {
-                        let got = (rc.add(at) as *const [f32; 12]).read_unaligned();
-                        if got.iter().zip(want.iter()).all(|(a, b)| a.to_bits() == b.to_bits()) {
-                            found.set(Some((len, w0, at)));
-                            break;
-                        }
-                    }
-                }
-            }
-            ffi::lua_settop(l, 0);
-        })
-        .ok()?;
-    }
-    found.get()
-}
-
 /// The CFrame at 1 (self already known to be one).
 unsafe fn cframe_at(l: *mut ffi::lua_State) -> Option<rustudio_core::math::Xform> {
-    unsafe { cframe_idx(l, 1) }
+    unsafe { crate::ltypes::cframe_at(l, 1) }
 }
 
-/// The CFrame at `i` (known to be one: its metatable checked), read from
-/// mlua's block as probed; None if the block doesn't look as probed.
+/// The CFrame at `i`, if the value there is one.
 unsafe fn cframe_idx(l: *mut ffi::lua_State, i: c_int) -> Option<rustudio_core::math::Xform> {
-    let (len, w0, at) = (*CFRAME_UD.get()?)?;
-    unsafe {
-        if ffi::lua_objlen(l, i) as usize != len {
-            return None;
-        }
-        let p = ffi::lua_touserdata(l, i) as *const u64;
-        if p.read_unaligned() != w0 {
-            return None;
-        }
-        let rc = p.add(1).read_unaligned() as *const u8;
-        if rc.is_null() {
-            return None;
-        }
-        Some((rc.add(at) as *const crate::ltypes::LCFrame).read_unaligned().0)
-    }
+    unsafe { crate::ltypes::cframe_at(l, i) }
 }
 
 /// A CFrame / Vector3 member answered natively (as the type's mlua getter
@@ -422,6 +382,21 @@ unsafe fn native_get(l: *mut ffi::lua_State, meta: &TypeMeta) -> Option<c_int> {
                 let p = ffi::lua_tovector(l, 1);
                 Some(f(glam::Vec3::new(*p, *p.add(1), *p.add(2))).push(l))
             }
+            "Color3" | "Vector2" if dt_fast() => {
+                let i = match (meta.name, key) {
+                    ("Color3", "R" | "r") | ("Vector2", "X" | "x") => 0,
+                    ("Color3", "G" | "g") | ("Vector2", "Y" | "y") => 1,
+                    ("Color3", "B" | "b") => 2,
+                    _ => return None,
+                };
+                let lua = Lua::get_or_init_from_ptr(l);
+                let v = if meta.name == "Color3" {
+                    lua.peek_userdata_copy::<crate::ltypes::LColor3>(l, 1)?.0[i]
+                } else {
+                    lua.peek_userdata_copy::<crate::ltypes::LVector2>(l, 1)?.0[i]
+                };
+                Some(Pushed::Num(v as f64).push(l))
+            }
             "CFrame" => {
                 let f: fn(&rustudio_core::math::Xform) -> Pushed = match key {
                     "Position" | "p" => |x| Pushed::Vec(x.pos),
@@ -432,8 +407,13 @@ unsafe fn native_get(l: *mut ffi::lua_State, meta: &TypeMeta) -> Option<c_int> {
                     "RightVector" | "rightVector" | "XVector" => |x| Pushed::Vec(x.rot.x_axis),
                     "UpVector" | "upVector" | "YVector" => |x| Pushed::Vec(x.rot.y_axis),
                     "ZVector" => |x| Pushed::Vec(x.rot.z_axis),
+                    "Rotation" => |x| Pushed::Cf(rustudio_core::math::Xform { pos: glam::Vec3::ZERO, rot: x.rot }),
                     _ => return None,
                 };
+                // (A CFrame's tag is its type: no metatable compare.)
+                if let Some(x) = cframe_at(l) {
+                    return Some(f(&x).push(l));
+                }
                 if !meta.self_first {
                     check_self(l, meta, 6);
                 }
@@ -448,6 +428,7 @@ unsafe fn native_get(l: *mut ffi::lua_State, meta: &TypeMeta) -> Option<c_int> {
 enum Pushed {
     Num(f64),
     Vec(glam::Vec3),
+    Cf(rustudio_core::math::Xform),
 }
 
 impl Pushed {
@@ -456,6 +437,10 @@ impl Pushed {
             match self {
                 Pushed::Num(n) => ffi::lua_pushnumber(l, n),
                 Pushed::Vec(v) => ffi::lua_pushvector(l, v.x, v.y, v.z),
+                Pushed::Cf(x) => {
+                    ffi::luaL_checkstack(l, 1, std::ptr::null());
+                    crate::ltypes::cframe_push(l, x)
+                }
             }
         }
         1
@@ -471,13 +456,14 @@ unsafe fn push_method(l: *mut ffi::lua_State, _unused: c_int, key: c_int, meta: 
         let name = ffi::lua_tolstring(l, key, std::ptr::null_mut());
         let m = meta_at(l, meta);
         let style = m.style(CStr::from_ptr(name).to_str().unwrap_or(""));
-        ffi::luaL_checkstack(l, 4, std::ptr::null());
+        ffi::luaL_checkstack(l, 5, std::ptr::null());
         // the method stays on top: upvalue 1
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(meta));
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(errtext));
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(mt));
         ffi::lua_pushboolean(l, matches!(style, SelfErr::Reflect) as c_int);
-        ffi::lua_pushcclosurek(l, method_fn, name, 5, None);
+        ffi::lua_pushvalue(l, key);
+        ffi::lua_pushcclosurek(l, method_fn, name, 6, None);
     }
 }
 
@@ -494,7 +480,8 @@ fn cast_name(t: c_int, typename: &str) -> &str {
 }
 
 /// A method. Upvalues: 1 the implementation (mlua callback), 2 `TypeMeta`,
-/// 3 errtext, 4 the type's metatable, 5 reflection-style self errors.
+/// 3 errtext, 4 the type's metatable, 5 reflection-style self errors,
+/// 6 its name.
 unsafe extern "C-unwind" fn method_fn(l: *mut ffi::lua_State) -> c_int {
     unsafe {
         if !is_self(l, 1, 4) {
@@ -517,7 +504,8 @@ unsafe extern "C-unwind" fn method_fn(l: *mut ffi::lua_State) -> c_int {
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(1));
         ffi::lua_insert(l, 1);
         if ffi::lua_pcall(l, n, ffi::LUA_MULTRET, 0) != 0 {
-            reraise(l, ffi::lua_upvalueindex(3));
+            let name = str_at(l, ffi::lua_upvalueindex(6));
+            reraise_named(l, ffi::lua_upvalueindex(3), name);
         }
         ffi::lua_gettop(l)
     }
@@ -591,6 +579,13 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
             raise(l, "attempt to call a nil value");
         }
         let n = ffi::lua_gettop(l);
+        // (The fast path first: it answers only methods the type has, on a
+        // CFrame self, without making the name a Lua string to look up.)
+        if meta.name == "CFrame" && DT_FAST.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(r) = cf_method_fast(l, CStr::from_ptr(name).to_bytes(), n) {
+                return r;
+            }
+        }
         ffi::luaL_checkstack(l, 2, std::ptr::null());
         ffi::lua_pushstring(l, name);
         let found = upv_get(l, 1, n + 1) != ffi::LUA_TNIL;
@@ -600,15 +595,12 @@ unsafe extern "C-unwind" fn namecall_fn(l: *mut ffi::lua_State) -> c_int {
             drop(msg);
             ffi::lua_error(l);
         }
-        if meta.name == "CFrame" && DT_FAST.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(r) = cf_method_fast(l, CStr::from_ptr(name).to_bytes(), n) {
-                return r;
-            }
-        }
         ffi::lua_remove(l, n + 1);
         ffi::lua_insert(l, 1);
         if ffi::lua_pcall(l, n, ffi::LUA_MULTRET, 0) != 0 {
-            reraise(l, ffi::lua_upvalueindex(3));
+            // (The atom's text lives as long as the interned string.)
+            let name = CStr::from_ptr(name).to_str().unwrap_or("");
+            reraise_named(l, ffi::lua_upvalueindex(3), name);
         }
         ffi::lua_gettop(l)
     }
@@ -648,6 +640,11 @@ fn ctor_fast_id(ty: &str, f: &str) -> i32 {
         ("CFrame", "Angles" | "fromEulerAnglesXYZ") => 2,
         ("CFrame", "fromOrientation" | "fromEulerAnglesYXZ") => 3,
         ("Color3", "new") => 4,
+        ("Color3", "fromRGB") => 5,
+        ("UDim2", "new") => 6,
+        ("UDim2", "fromScale") => 7,
+        ("UDim2", "fromOffset") => 8,
+        ("Vector2", "new") => 9,
         _ => 0,
     }
 }
@@ -673,29 +670,16 @@ unsafe fn vec_at(l: *mut ffi::lua_State, i: c_int) -> Option<glam::Vec3> {
     }
 }
 
-/// The CFrame at `i` when its metatable is the one at `mt` (a stack index).
-unsafe fn cframe_with_mt(l: *mut ffi::lua_State, i: c_int, mt: c_int) -> Option<rustudio_core::math::Xform> {
-    unsafe {
-        if ffi::lua_type(l, i) != ffi::LUA_TUSERDATA || ffi::lua_getmetatable(l, i) == 0 {
-            return None;
-        }
-        let same = ffi::lua_rawequal(l, -1, mt) != 0;
-        ffi::lua_pop(l, 1);
-        if !same {
-            return None;
-        }
-        cframe_idx(l, i)
-    }
-}
-
 /// Pushes a new CFrame; false (nothing pushed) if it can't be made here.
+/// (Reached only from the CFrame type's own functions: the metatable is
+/// installed.)
 unsafe fn push_cframe(l: *mut ffi::lua_State, x: rustudio_core::math::Xform) -> bool {
     unsafe {
-        if ffi::lua_checkstack(l, 3) == 0 {
+        if ffi::lua_checkstack(l, 2) == 0 {
             return false;
         }
-        let lua = Lua::get_or_init_from_ptr(l);
-        matches!(lua.push_userdata_unref(l, crate::ltypes::LCFrame(x)), Ok(true))
+        crate::ltypes::cframe_push(l, x);
+        true
     }
 }
 
@@ -740,11 +724,7 @@ unsafe fn cf_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -
 unsafe fn cf_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_int> {
     use rustudio_core::math::Xform;
     unsafe {
-        let mt = ffi::lua_upvalueindex(4);
-        if ffi::lua_type(l, mt) != ffi::LUA_TTABLE {
-            return None;
-        }
-        let a = cframe_with_mt(l, 1, mt)?;
+        let a = cframe_idx(l, 1)?;
         let out = match op {
             1 => {
                 if let Some(v) = vec_at(l, 2) {
@@ -752,13 +732,46 @@ unsafe fn cf_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_i
                     ffi::lua_pushvector(l, p.x, p.y, p.z);
                     return Some(1);
                 }
-                crate::ltypes::cf_mul(&a, &cframe_with_mt(l, 2, mt)?)
+                crate::ltypes::cf_mul(&a, &cframe_idx(l, 2)?)
             }
             2 => Xform { pos: a.pos + vec_at(l, 2)?, rot: a.rot },
             3 => Xform { pos: a.pos - vec_at(l, 2)?, rot: a.rot },
             _ => return None,
         };
         push_cframe(l, out).then_some(1)
+    }
+}
+
+/// Vector2 `+` / `-` / `*` / `/` (op 4..7) with the implementation's
+/// arithmetic (ltypes LVector2): Vector2 with Vector2, and a number on
+/// either side of `*` or after `/`; None for anything else.
+unsafe fn v2_op_fast(l: *mut ffi::lua_State, op: ffi::lua_Integer) -> Option<c_int> {
+    use crate::ltypes::LVector2;
+    unsafe {
+        let lua = Lua::get_or_init_from_ptr(l);
+        let v = |i: c_int| lua.peek_userdata_copy::<LVector2>(l, i).map(|v| v.0);
+        let k = |i: c_int| (ffi::lua_type(l, i) == ffi::LUA_TNUMBER).then(|| ffi::lua_tonumber(l, i));
+        let out = match op {
+            4 => v(1)? + v(2)?,
+            5 => v(1)? - v(2)?,
+            6 => match (v(1), v(2)) {
+                (Some(a), Some(b)) => a * b,
+                (Some(a), None) => a * k(2)? as f32,
+                (None, Some(b)) => b * k(1)? as f32,
+                _ => return None,
+            },
+            _ => {
+                let a = v(1)?;
+                match v(2) {
+                    Some(b) => a / b,
+                    None => a * (1.0 / k(2)?) as f32,
+                }
+            }
+        };
+        if ffi::lua_checkstack(l, 3) == 0 {
+            return None;
+        }
+        matches!(lua.push_userdata_unref(l, LVector2(out)), Ok(true)).then_some(1)
     }
 }
 
@@ -770,21 +783,42 @@ unsafe fn cf_method_fast(l: *mut ffi::lua_State, name: &[u8], n: c_int) -> Optio
     use glam::Quat;
     unsafe {
         let a = cframe_idx(l, 1)?;
-        // A CFrame argument: its metatable is self's.
-        let other = |i: c_int| -> Option<Xform> {
-            if ffi::lua_getmetatable(l, 1) == 0 {
-                return None;
-            }
-            let top = ffi::lua_gettop(l);
-            let x = cframe_with_mt(l, i, top);
-            ffi::lua_pop(l, 1);
-            x
-        };
+        // A CFrame argument (its tag says so).
+        let other = |i: c_int| -> Option<Xform> { cframe_idx(l, i) };
         let vec_out = |v: glam::Vec3| {
             ffi::lua_pushvector(l, v.x, v.y, v.z);
             Some(1)
         };
+        let nums = |v: &[f32]| {
+            ffi::luaL_checkstack(l, v.len() as c_int, std::ptr::null());
+            for x in v {
+                ffi::lua_pushnumber(l, *x as f64);
+            }
+            Some(v.len() as c_int)
+        };
         let cf_out = match (name, n) {
+            (b"GetComponents" | b"components", 1) => {
+                let r = &a.rot;
+                return nums(&[
+                    a.pos.x, a.pos.y, a.pos.z, r.x_axis.x, r.y_axis.x, r.z_axis.x, r.x_axis.y, r.y_axis.y,
+                    r.z_axis.y, r.x_axis.z, r.y_axis.z, r.z_axis.z,
+                ]);
+            }
+            (b"ToEulerAnglesXYZ" | b"toEulerAnglesXYZ", 1) => {
+                let (x, y, z) = a.rot.to_euler(glam::EulerRot::XYZ);
+                return nums(&[x, y, z]);
+            }
+            (b"ToEulerAnglesYXZ" | b"toEulerAnglesYXZ" | b"ToOrientation" | b"toOrientation", 1) => {
+                let (y, x, z) = a.rot.to_euler(glam::EulerRot::YXZ);
+                return nums(&[x, y, z]);
+            }
+            (b"ToAxisAngle" | b"toAxisAngle", 1) => {
+                let (axis, angle) = Quat::from_mat3(&a.rot).to_axis_angle();
+                ffi::luaL_checkstack(l, 2, std::ptr::null());
+                ffi::lua_pushvector(l, axis.x, axis.y, axis.z);
+                ffi::lua_pushnumber(l, angle as f64);
+                return Some(2);
+            }
             (b"Inverse" | b"inverse", 1) => cf_inv(&a),
             (b"ToWorldSpace" | b"toWorldSpace", 2) => cf_mul(&a, &other(2)?),
             (b"ToObjectSpace" | b"toObjectSpace", 2) => cf_mul(&cf_inv(&a), &other(2)?),
@@ -815,7 +849,8 @@ unsafe extern "C-unwind" fn op_fn(l: *mut ffi::lua_State) -> c_int {
         let n = ffi::lua_gettop(l);
         let fast = ffi::lua_tointegerx(l, ffi::lua_upvalueindex(3), std::ptr::null_mut());
         if fast != 0 && n == 2 {
-            if let Some(r) = cf_op_fast(l, fast) {
+            let r = if fast >= 4 { v2_op_fast(l, fast) } else { cf_op_fast(l, fast) };
+            if let Some(r) = r {
                 return r;
             }
         }
@@ -1013,10 +1048,231 @@ pub fn install(lua: &Lua, sample: &AnyUserData) -> mlua::Result<()> {
     }
     install_on(lua, &mt, meta, Value::Table(mt.clone()))?;
     mt.raw_set("__rs_dtmeta", true)?;
-    if name == "CFrame" {
-        CFRAME_UD.get_or_init(|| probe_cframe(lua));
+    Ok(())
+}
+
+// ------------------------------------------------------ native CFrame
+
+/// The CFrame type's metatable for a VM (ltypes `CFRAME_TAG`): its members
+/// (`LCFrame::add_fields` / `add_methods`, written against mlua's
+/// registration traits) collected by `NativeReg` into the getter and
+/// method tables `install_parts` builds the C `__index` / `__newindex` /
+/// `__namecall` from, then set as the tag's metatable. Once per VM; done
+/// by ltypes' install (and on the first CFrame made in a VM without it).
+pub fn install_cframe(lua: &Lua) -> mlua::Result<()> {
+    let ready = unsafe { lua.exec_raw::<bool>((), |l| ffi::lua_pushboolean(l, crate::ltypes::cframe_ready(l) as c_int))? };
+    if ready {
+        return Ok(());
+    }
+    let mut reg = NativeReg::new(lua, "LCFrame")?;
+    crate::ltypes::LCFrame::add_fields(&mut reg);
+    crate::ltypes::LCFrame::add_methods(&mut reg);
+    if let Some(e) = reg.err.take() {
+        return Err(e);
+    }
+    let mt = reg.mt.clone();
+    let meta = meta("CFrame").expect("CFrame spec");
+    let parts = Parts { getters: Value::Table(reg.getters.clone()), methods: Value::Table(reg.methods.clone()), fallback: Value::Nil };
+    install_parts(lua, &mt, meta, Value::Table(mt.clone()), parts, Value::Nil, Value::Nil)?;
+    // `==` compares the components (as LCFrame's PartialEq), in C.
+    let eq = unsafe { lua.exec_raw::<Function>((), |l| ffi::lua_pushcclosurek(l, cframe_eq, std::ptr::null(), 0, None))? };
+    mt.raw_set("__eq", eq)?;
+    mt.raw_set("__rs_dtmeta", true)?;
+    unsafe {
+        lua.exec_raw::<()>(&mt, |l| {
+            ffi::lua_setuserdatametatable(l, crate::ltypes::CFRAME_TAG);
+            crate::ltypes::cframe_push(l, rustudio_core::math::Xform { pos: glam::Vec3::ZERO, rot: glam::Mat3::IDENTITY });
+            crate::ltypes::probe_cframe_header(l);
+            ffi::lua_settop(l, 0);
+        })?;
     }
     Ok(())
+}
+
+/// CFrame `__eq` (Luau calls it for two userdata sharing it: two CFrames).
+unsafe extern "C-unwind" fn cframe_eq(l: *mut ffi::lua_State) -> c_int {
+    unsafe {
+        let same = match (cframe_idx(l, 1), cframe_idx(l, 2)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        ffi::lua_pushboolean(l, same as c_int);
+        1
+    }
+}
+
+/// Collects a natively stored type's members as mlua's userdata registry
+/// would, as plain functions taking self (converted with `FromLua`) first.
+/// Only the registration calls the native types use are supported; others
+/// fail `install_cframe`.
+struct NativeReg {
+    lua: Lua,
+    ty: &'static str,
+    mt: mlua::Table,
+    getters: mlua::Table,
+    methods: mlua::Table,
+    err: Option<mlua::Error>,
+}
+
+impl NativeReg {
+    fn new(lua: &Lua, ty: &'static str) -> mlua::Result<Self> {
+        Ok(NativeReg {
+            lua: lua.clone(),
+            ty,
+            mt: lua.create_table()?,
+            getters: lua.create_table()?,
+            methods: lua.create_table()?,
+            err: None,
+        })
+    }
+    fn keep(&mut self, r: mlua::Result<()>) {
+        if let Err(e) = r {
+            self.err.get_or_insert(e);
+        }
+    }
+    fn unsupported(&mut self, what: &str, name: String) {
+        self.err.get_or_insert(mlua::Error::runtime(format!("NativeReg: {what} not supported ({name})")));
+    }
+    /// `f(self, args…)` with mlua's argument positions (self #1, the rest
+    /// from #2).
+    fn self_fn<T, A, R>(
+        &self,
+        name: &str,
+        f: impl Fn(&Lua, &T, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+    ) -> mlua::Result<Function>
+    where
+        T: mlua::FromLua + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        // (mlua's stack conversion; the error path names the method,
+        // `reraise_named`.)
+        let _ = name;
+        self.lua.create_function(move |lua, (this, a): (T, A)| f(lua, &this, a))
+    }
+}
+
+impl<T: mlua::FromLua + 'static> mlua::UserDataFields<T> for NativeReg {
+    fn add_field<V: mlua::IntoLua + 'static>(&mut self, name: impl Into<String>, _value: V) {
+        self.unsupported("add_field", name.into());
+    }
+    fn add_field_method_get<M, R>(&mut self, name: impl Into<String>, method: M)
+    where
+        M: Fn(&Lua, &T) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        R: mlua::IntoLua,
+    {
+        let name = name.into();
+        let r = self.self_fn(&name, move |lua, this: &T, ()| method(lua, this)).and_then(|f| self.getters.raw_set(name, f));
+        self.keep(r);
+    }
+    fn add_field_method_set<M, A>(&mut self, name: impl Into<String>, _method: M)
+    where
+        M: FnMut(&Lua, &mut T, A) -> mlua::Result<()> + mlua::MaybeSend + 'static,
+        A: mlua::FromLua,
+    {
+        self.unsupported("add_field_method_set", name.into());
+    }
+    fn add_field_function_get<F, R>(&mut self, name: impl Into<String>, _function: F)
+    where
+        F: Fn(&Lua, mlua::AnyUserData) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        R: mlua::IntoLua,
+    {
+        self.unsupported("add_field_function_get", name.into());
+    }
+    fn add_field_function_set<F, A>(&mut self, name: impl Into<String>, _function: F)
+    where
+        F: FnMut(&Lua, mlua::AnyUserData, A) -> mlua::Result<()> + mlua::MaybeSend + 'static,
+        A: mlua::FromLua,
+    {
+        self.unsupported("add_field_function_set", name.into());
+    }
+    fn add_meta_field<V: mlua::IntoLua + 'static>(&mut self, name: impl Into<String>, value: V) {
+        let r = value.into_lua(&self.lua).and_then(|v| self.mt.raw_set(name.into(), v));
+        self.keep(r);
+    }
+    fn add_meta_field_with<F, R>(&mut self, name: impl Into<String>, f: F)
+    where
+        F: FnOnce(&Lua) -> mlua::Result<R> + 'static,
+        R: mlua::IntoLua,
+    {
+        let r = f(&self.lua).and_then(|v| v.into_lua(&self.lua)).and_then(|v| self.mt.raw_set(name.into(), v));
+        self.keep(r);
+    }
+}
+
+impl<T: mlua::FromLua + 'static> mlua::UserDataMethods<T> for NativeReg {
+    fn add_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
+    where
+        M: Fn(&Lua, &T, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        let name = name.into();
+        let r = self.self_fn(&name, method).and_then(|f| self.methods.raw_set(name, f));
+        self.keep(r);
+    }
+    fn add_method_mut<M, A, R>(&mut self, name: impl Into<String>, _method: M)
+    where
+        M: FnMut(&Lua, &mut T, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        self.unsupported("add_method_mut", name.into());
+    }
+    fn add_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        let name = name.into();
+        let r = self.lua.create_function(function).and_then(|f| self.methods.raw_set(name, f));
+        self.keep(r);
+    }
+    fn add_function_mut<F, A, R>(&mut self, name: impl Into<String>, _function: F)
+    where
+        F: FnMut(&Lua, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        self.unsupported("add_function_mut", name.into());
+    }
+    fn add_meta_method<M, A, R>(&mut self, name: impl Into<String>, method: M)
+    where
+        M: Fn(&Lua, &T, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        let name = name.into();
+        let r = self.self_fn(&name, method).and_then(|f| self.mt.raw_set(name, f));
+        self.keep(r);
+    }
+    fn add_meta_method_mut<M, A, R>(&mut self, name: impl Into<String>, _method: M)
+    where
+        M: FnMut(&Lua, &mut T, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        self.unsupported("add_meta_method_mut", name.into());
+    }
+    fn add_meta_function<F, A, R>(&mut self, name: impl Into<String>, function: F)
+    where
+        F: Fn(&Lua, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        let name = name.into();
+        let r = self.lua.create_function(function).and_then(|f| self.mt.raw_set(name, f));
+        self.keep(r);
+    }
+    fn add_meta_function_mut<F, A, R>(&mut self, name: impl Into<String>, _function: F)
+    where
+        F: FnMut(&Lua, A) -> mlua::Result<R> + mlua::MaybeSend + 'static,
+        A: mlua::FromLuaMulti,
+        R: mlua::IntoLuaMulti,
+    {
+        self.unsupported("add_meta_function_mut", name.into());
+    }
 }
 
 /// `self_mt`: the metatable self must have, or `true` for native vectors.
@@ -1100,6 +1356,10 @@ fn install_parts(
                 ("CFrame", "__mul") => 1,
                 ("CFrame", "__add") => 2,
                 ("CFrame", "__sub") => 3,
+                ("Vector2", "__add") => 4,
+                ("Vector2", "__sub") => 5,
+                ("Vector2", "__mul") => 6,
+                ("Vector2", "__div") => 7,
                 _ => 0,
             };
             let w = unsafe {
@@ -1539,6 +1799,10 @@ unsafe extern "C-unwind" fn ctor_fn(l: *mut ffi::lua_State) -> c_int {
                     }
                 }
             }
+        } else if (5..=9).contains(&fast) {
+            if let Some(r) = small_ctor_fast(l, fast, n) {
+                return r;
+            }
         } else if fast != 0 {
             if let Some(x) = cf_ctor_fast(l, fast, n) {
                 if push_cframe(l, x) {
@@ -1588,6 +1852,51 @@ unsafe extern "C-unwind" fn ctor_fn(l: *mut ffi::lua_State) -> c_int {
         drop(msg);
         drop(fname);
         reraise(l, ffi::lua_upvalueindex(2))
+    }
+}
+
+/// Color3.fromRGB, UDim2.new / fromScale / fromOffset and Vector2.new on
+/// plain finite numbers (each missing one 0, as the implementations take
+/// them: f32 components, offsets through f32 for new and f64 for
+/// fromOffset), pushed as the mlua userdata the implementation makes;
+/// None for anything else (UDim2.new with two arguments takes two UDims).
+unsafe fn small_ctor_fast(l: *mut ffi::lua_State, id: ffi::lua_Integer, n: c_int) -> Option<c_int> {
+    use crate::ltypes::{LColor3, LUDim, LUDim2, LVector2};
+    unsafe {
+        let max = match id {
+            5 => 3,
+            6 => 4,
+            _ => 2,
+        };
+        if n > max || (id == 6 && n == 2) || ffi::lua_checkstack(l, 3) == 0 {
+            return None;
+        }
+        let mut a = [0f32; 4];
+        let mut d = [0f64; 2];
+        for i in 0..n {
+            a[i as usize] = num_at(l, i + 1)?;
+            if i < 2 {
+                d[i as usize] = ffi::lua_tonumber(l, i + 1);
+            }
+        }
+        let lua = Lua::get_or_init_from_ptr(l);
+        let pushed = match id {
+            5 => lua.push_userdata_unref(l, LColor3([a[0] / 255.0, a[1] / 255.0, a[2] / 255.0])),
+            6 => lua.push_userdata_unref(
+                l,
+                LUDim2 { x: LUDim { scale: a[0], offset: a[1] as i32 }, y: LUDim { scale: a[2], offset: a[3] as i32 } },
+            ),
+            7 => lua.push_userdata_unref(
+                l,
+                LUDim2 { x: LUDim { scale: a[0], offset: 0 }, y: LUDim { scale: a[1], offset: 0 } },
+            ),
+            8 => lua.push_userdata_unref(
+                l,
+                LUDim2 { x: LUDim { scale: 0.0, offset: d[0] as i32 }, y: LUDim { scale: 0.0, offset: d[1] as i32 } },
+            ),
+            _ => lua.push_userdata_unref(l, LVector2(glam::Vec2::new(a[0], a[1]))),
+        };
+        matches!(pushed, Ok(true)).then_some(1)
     }
 }
 

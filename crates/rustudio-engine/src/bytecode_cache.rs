@@ -24,7 +24,11 @@ pub fn compiler() -> mlua::chunk::Compiler {
         .set_debug_level(1)
         .set_vector_ctor("Vector3.new")
         .set_vector_type("Vector3")
-        .set_mutable_globals(["Game", "Workspace", "game", "plugin", "script", "shared", "workspace"])
+        // (Roblox's list. Imports now resolve when a script loads (vendor
+        // lvmload.cpp resolveImportSafe), so chains through these, which
+        // scripts change, must stay run-time lookups: `_G.Config` set by
+        // another script after this one loaded.)
+        .set_mutable_globals(["Game", "Workspace", "_G", "game", "plugin", "script", "shared", "workspace"])
 }
 
 fn enabled() -> bool {
@@ -44,7 +48,7 @@ local function f(a, ...) local s = `{a}:{select("#", ...)}` for i, v in ipairs(t
 local v = Vector3.new(1, 2, 3) local g = game:GetService("Workspace") workspace.Name = script.Name
 return f(1, 2, 3), math.floor(v.X // 2) % 3, (if t[1] then 1 else 2) + bit32.band(7, 3), string.format("%d", 4)"##;
         let mut h = blake3::Hasher::new();
-        h.update(b"rustudio bytecode 1|O1 D1 Vector3.new Vector3 mutable globals|");
+        h.update(b"rustudio bytecode 2|O1 D1 Vector3.new Vector3 mutable globals _G|");
         h.update(&compiler().compile(PROBE).unwrap_or_default());
         h.finalize().as_bytes().to_vec()
     })

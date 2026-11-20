@@ -112,6 +112,11 @@ pub struct Link {
 }
 
 impl Link {
+    /// The stand-in bodies.
+    pub(super) fn proxy_bodies(&self) -> impl Iterator<Item = rp::RigidBodyHandle> + '_ {
+        self.proxies.values().map(|p| p.body)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty()
     }
@@ -415,7 +420,7 @@ impl Physics {
         if let Some(sv) = self.studio.as_mut() {
             sv.note_collider(gc, r, c.shape());
         }
-        self.by_collider.insert(gc, r);
+        self.register_collider(gc, r);
         self.link.proxy_colliders.insert(gc);
         self.link.friction.insert(r, (c.friction(), hum_body::weights_of(c).0));
         self.link.statics.insert(r, StaticCopy { client: ch, mirror: gc, seen: frame });
@@ -473,7 +478,7 @@ impl Physics {
             if let Some(sv) = self.studio.as_mut() {
                 sv.note_collider(gc, *r, c.shape());
             }
-            self.by_collider.insert(gc, *r);
+            self.register_collider(gc, *r);
             self.link.proxy_colliders.insert(gc);
             colliders.push(gc);
         }

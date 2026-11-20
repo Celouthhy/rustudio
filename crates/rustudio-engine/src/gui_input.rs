@@ -63,8 +63,23 @@ pub(super) struct RootCache {
     vfs: Vec<Ref>,
     /// SurfaceGuis / BillboardGuis: the canvas triangles (with their
     /// bounds for the view test) and hit boxes, mapped again each frame.
-    citems: Vec<(Rect, Mesh)>,
+    citems: Vec<(Rect, Arc<Mesh>)>,
     lhits: Vec<walk::LocalHit>,
+}
+
+/// A previously projected edit billboard. If the camera returns to this
+/// exact canvas size, update its projection without revisiting the GUI tree.
+struct BillboardCanvas {
+    output: RootCache,
+    boxes: Vec<(Ref, GuiBox)>,
+    reads: Vec<(Ref, Ref)>,
+    children: Vec<Ref>,
+}
+
+#[derive(Default)]
+pub(super) struct BillboardArchive {
+    canvases: Vec<BillboardCanvas>,
+    reads: rustc_hash::FxHashSet<Ref>,
 }
 
 /// The state outside the document that cached GUIs were drawn with.
@@ -156,6 +171,7 @@ impl Gui {
                         if changed {
                             self.adorn_pg_order = None;
                         }
+                        self.surface_specs.remove(&r);
                         let keep = layer(d, r);
                         let has = self.world_roots_set.contains(&r);
                         if keep && !has {
@@ -171,6 +187,7 @@ impl Gui {
             }
             _ => {
                 self.roots_doc = d.id;
+                self.surface_specs.clear();
                 self.world_roots = match ws {
                     Some(ws) => d
                         .dom
@@ -225,6 +242,7 @@ impl Gui {
                         } else {
                             self.adorn_roots.remove(&r);
                         }
+                        self.surface_specs.remove(&r);
                         let keep = layer(r);
                         let has = self.world_roots_set.contains(&r);
                         if keep && !has {
@@ -245,6 +263,7 @@ impl Gui {
             }
             _ => {
                 self.roots_doc = d.id;
+                self.surface_specs.clear();
                 let scan = |top: Option<Ref>| -> Vec<Ref> {
                     top.map(|t| d.dom.descendants_of(t).map(|i| i.referent()).collect()).unwrap_or_default()
                 };
@@ -268,24 +287,70 @@ impl Gui {
     /// something its walk read, or an instance added, moved or removed where
     /// that walk listed the children (or that it read itself).
     fn cache_marks(&mut self, d: &Document, marks: &doc::Marks) {
-        if self.cache_owner.is_empty() {
-            return;
+        // A SurfaceGui's own placement properties (`SurfaceSpec`): any of
+        // its properties written drops its entry; reparenting drops it in
+        // `sync_roots` / `sync_plugin` (Tree marks).
+        if !self.surface_specs.is_empty() {
+            match marks {
+                doc::Marks::Some(marks) if d.id == self.roots_doc => {
+                    for mark in marks {
+                        if let doc::Mark::Prop(r, _) = mark {
+                            self.surface_specs.remove(r);
+                        }
+                    }
+                }
+                _ => self.surface_specs.clear(),
+            }
+        }
+        if !self.billboard_model_centers.is_empty() {
+            match marks {
+                doc::Marks::Some(marks) if d.id == self.roots_doc => {
+                    for mark in marks {
+                        match *mark {
+                            doc::Mark::Tree(_) => {
+                                self.billboard_model_centers.clear();
+                                break;
+                            }
+                            doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Position" | "Orientation" | "Rotation") => {
+                                let mut part = r;
+                                while let Some(inst) = d.dom.get_by_ref(part) {
+                                    self.billboard_model_centers.remove(&part);
+                                    part = inst.parent();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => self.billboard_model_centers.clear(),
+            }
         }
         let marks = match marks {
             doc::Marks::Some(m) if d.id == self.roots_doc => m,
             _ => {
+                self.clear_billboard_canvases();
                 self.cache.clear();
                 self.memo.clear();
                 return;
             }
         };
+        if self.cache_owner.is_empty() && self.billboard_archive_owner.is_empty() {
+            return;
+        }
         let why_on = debug_env(DebugEnv::Why);
         for m in marks {
-            let (r, read, listed) = match *m {
-                doc::Mark::Prop(r, _) => (r, self.cache_owner.get(&r).map(|o| (o.0, o.1)), None),
+            let r = match *m {
+                doc::Mark::Prop(r, _) | doc::Mark::Tree(r) => r,
+            };
+            self.invalidate_billboard_archive(r);
+            let (read, listed) = match *m {
+                doc::Mark::Prop(r, _) => (self.cache_owner.get(&r).map(|o| (o.0, o.1)), None),
                 doc::Mark::Tree(r) => {
                     let parent = d.dom.get_by_ref(r).map(|i| i.parent());
-                    (r, self.cache_owner.get(&r).map(|o| (o.0, o.1)), parent.and_then(|p| self.cache_kids.get(&p).map(|g| (*g, p))))
+                    if let Some(parent) = parent {
+                        self.invalidate_billboard_archive(parent);
+                    }
+                    (self.cache_owner.get(&r).map(|o| (o.0, o.1)), parent.and_then(|p| self.cache_kids.get(&p).map(|g| (*g, p))))
                 }
             };
             // The objects whose memos it touches: itself and up, the one that
@@ -323,7 +388,7 @@ impl Gui {
         screen: bool,
         shapes: &[Shape],
         hits: &[Hit],
-        citems: &[(Rect, Mesh)],
+        citems: &[(Rect, Arc<Mesh>)],
         lhits: &[walk::LocalHit],
     ) {
         let same_mesh = |a: &Mesh, b: &Mesh| {
@@ -406,6 +471,79 @@ impl Gui {
         self.cache_owned.insert(g, (reads, kids));
     }
 
+    fn clear_billboard_canvases(&mut self) {
+        self.billboard_canvases.clear();
+        self.billboard_archive_owner.clear();
+    }
+
+    fn invalidate_billboard_archive(&mut self, touched: Ref) {
+        let Some(gui) = self.billboard_archive_owner.get(&touched).copied() else { return };
+        self.drop_billboard_archive(gui);
+    }
+
+    fn drop_billboard_archive(&mut self, gui: Ref) {
+        if let Some(archive) = self.billboard_canvases.remove(&gui) {
+            for read in archive.reads {
+                if self.billboard_archive_owner.get(&read) == Some(&gui) {
+                    self.billboard_archive_owner.remove(&read);
+                }
+            }
+        }
+    }
+
+    fn reuse_billboard_canvas(&mut self, g: Ref, key: [u32; 12]) {
+        const BILLBOARD_ROOTS: usize = 128;
+        const CANVASES_PER_ROOT: usize = 8;
+        const VERTICES_PER_CANVAS: usize = 4096;
+        if self.cache.get(&g).is_some_and(|c| c.key == key) {
+            return;
+        }
+        let previous = self.billboard_canvases.get_mut(&g).and_then(|archive| {
+            let index = archive.canvases.iter().position(|canvas| canvas.output.key == key)?;
+            Some(archive.canvases.remove(index))
+        });
+        if self.billboard_canvases.len() < BILLBOARD_ROOTS || self.billboard_canvases.contains_key(&g) {
+            let archive = self.cache.get(&g).is_some_and(|c| {
+                c.vfs.is_empty() && c.citems.iter().map(|(_, mesh)| mesh.vertices.len()).sum::<usize>() <= VERTICES_PER_CANVAS
+            });
+            if archive {
+                if let (Some(output), Some(boxes), Some((reads, children))) = (
+                    self.cache.remove(&g), self.root_boxes.get(&g), self.cache_owned.get(&g),
+                ) {
+                    let archive = self.billboard_canvases.entry(g).or_default();
+                    for r in reads.iter().map(|(r, _)| *r).chain(children.iter().copied()) {
+                        if archive.reads.insert(r) {
+                            self.billboard_archive_owner.insert(r, g);
+                        }
+                    }
+                    if archive.canvases.len() == CANVASES_PER_ROOT {
+                        archive.canvases.remove(0);
+                    }
+                    archive.canvases.push(BillboardCanvas {
+                        output, boxes: boxes.clone(), reads: reads.clone(), children: children.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(previous) = previous {
+            if self.billboard_canvases.get(&g).is_some_and(|archive| archive.canvases.is_empty()) {
+                self.drop_billboard_archive(g);
+            }
+            for r in self.layout_from.remove(&g).unwrap_or_default() {
+                if r != g { self.layout.remove(&r); }
+            }
+            self.layout.extend(previous.boxes.iter().copied());
+            self.layout_from.insert(g, previous.boxes.iter().map(|(r, _)| *r).collect());
+            self.root_boxes.insert(g, previous.boxes);
+            self.layout_changed = true;
+            self.walk_reads = previous.reads;
+            self.walk_kids = previous.children;
+            self.cache_own(g);
+            self.cache.insert(g, previous.output);
+            rustudio_core::bench::add("gui_billboard_canvas_hit", 0.0, 1);
+        }
+    }
+
     /// Drops the memos of `from` and every object above it, up to GUI `g`.
     fn memo_up(&mut self, d: &Document, from: Ref, g: Ref) {
         let mut c = from;
@@ -450,8 +588,20 @@ impl Gui {
         }
         // (egui's atlas grew, or started over: glyph UVs moved)
         if atlas != was.atlas || fill < was.fill || fonts != was.fonts || ppp != was.ppp {
+            rustudio_core::bench::add("gui_atlas_reset", 0.0, 1);
+            if std::env::var_os("RUSTUDIO_ATLAS_TRACE").is_some() {
+                eprintln!("[atlas] {:?} -> {:?} fill {} -> {} fonts {:?} -> {:?}", was.atlas, atlas, was.fill, fill, was.fonts, fonts);
+            }
+            if fonts != was.fonts || ppp != was.ppp {
+                self.text_fit = Default::default();
+            } else if atlas[0] != was.atlas[0] || fill < was.fill {
+                // Height growth changes normalized mesh UVs below, but not
+                // the pixel coordinates stored by the galleys.
+                self.text_fit.clear_galleys();
+            }
             self.memo.clear();
             self.cache.clear();
+            self.clear_billboard_canvases();
             return;
         }
         let now = &self.cache_with;
@@ -464,6 +614,7 @@ impl Gui {
             .chain([now.selected, was.selected].into_iter().flatten().filter(|_| now.selected != was.selected))
             .collect();
         for r in touched {
+            self.invalidate_billboard_archive(r);
             if let Some((g, _, _)) = self.cache_owner.get(&r).copied() {
                 self.cache.remove(&g);
                 self.memo_up(d, r, g);
@@ -477,9 +628,15 @@ impl Gui {
         self.hits.clear();
         self.world_batches.clear();
         self.cache_check(ctx, inp.doc);
+        let verify = debug_env(DebugEnv::Verify);
+        self.text_fit.begin_frame(ctx, !verify && !inp.fixed_step);
         if self.retry_missing_faces(inp.store) {
             self.memo.clear();
             self.cache.clear();
+            self.clear_billboard_canvases();
+        }
+        if inp.roots == Roots::View {
+            self.preload_faces(ctx, inp.store, inp.doc);
         }
         self.fx_frame(inp.doc);
         if (inp.playing && inp.roots == Roots::View) || inp.roots == Roots::CoreGui {
@@ -595,25 +752,62 @@ impl Gui {
                 }
             }
         }
-        layered.extend(
-            self.world_roots
-                .iter()
-                .copied()
-                .filter(|g| !matches!(inp.roots, Roots::Widget(_)) && d.exists(*g) && boolp(d, *g, "Enabled", true)),
-        );
+        // (the cached SurfaceGuis' properties need the journal `sync_roots`
+        // / `sync_plugin` read for this document)
+        let specs_ok = d.id == self.roots_doc;
+        if !specs_ok {
+            self.surface_specs.clear();
+        }
+        let first_world = layered.len();
+        layered.extend(self.world_roots.iter().copied().filter(|g| {
+            !matches!(inp.roots, Roots::Widget(_)) && d.exists(*g) && match self.surface_specs.get(g) {
+                Some(spec) => spec.enabled,
+                None => boolp(d, *g, "Enabled", true),
+            }
+        }));
         drop(pre);
         let place = rustudio_core::bench::scope("gui_place");
-        for g in layered {
-            if let Some((target, canvas, dist)) = place_3d(d, inp.cam, rect, g) {
-                let on_top = boolp(d, g, "AlwaysOnTop", false);
-                let normal = match target {
-                    Target::Surface { tl, tr, bl } => (bl - tl).cross(tr - tl).normalize_or_zero(),
-                    _ => -inp.cam.forward(),
+        let view_proj = inp.cam.view_proj(rect);
+        let mut billboard_light = None;
+        let mut light_terms = None;
+        for (i, g) in layered.into_iter().enumerate() {
+            // SurfaceGuis under Workspace: their own properties from the
+            // last frame unless the journal touched them, the part's
+            // placement read now.
+            let spec = (specs_ok && i >= first_world)
+                .then(|| {
+                    let fresh = self.surface_specs.get(&g).is_some_and(|s| s.current(d));
+                    if !fresh {
+                        let spec = SurfaceSpec::read(d, g)?;
+                        self.surface_specs.insert(g, spec);
+                    }
+                    self.surface_specs.get(&g).copied()
+                })
+                .flatten();
+            let placed = match spec {
+                Some(spec) => spec.place(d, inp.cam).map(|p| (p, spec.on_top, spec.light_props, spec.z_offset)),
+                None => place_3d(d, inp.cam, &view_proj, rect, g, &mut self.billboard_model_centers).map(|p| {
+                    let on_top = boolp(d, g, "AlwaysOnTop", false);
+                    let light_props = if on_top { [0.0; 2] } else { light_props(d, g) };
+                    (p, on_top, light_props, num(d, g, "ZOffset", 0.0) as i64)
+                }),
+            };
+            if let Some(((target, canvas, dist), on_top, light_props, z_offset)) = placed {
+                let light = if on_top {
+                    1.0
+                } else {
+                    world_gui_light(light_props, || {
+                        let terms = *light_terms.get_or_insert_with(|| SceneLight::of(d));
+                        match target {
+                            Target::Surface { tl, tr, bl } => terms.on(Some((bl - tl).cross(tr - tl).normalize_or_zero())),
+                            _ => *billboard_light.get_or_insert_with(|| terms.on(Some(-inp.cam.forward()))),
+                        }
+                    })
                 };
                 roots.push(Root {
                     on_top,
-                    light: world_gui_light(d, g, normal),
-                    order: if on_top { 500_000 } else { 0 } + num(d, g, "ZOffset", 0.0) as i64,
+                    light,
+                    order: if on_top { 500_000 } else { 0 } + z_offset,
                     dist,
                     gui: g,
                     target,
@@ -623,12 +817,14 @@ impl Gui {
             }
         }
         // Back to front: 3D GUIs (far first, AlwaysOnTop after), then ScreenGuis by DisplayOrder.
-        roots.sort_by(|a, b| a.order.cmp(&b.order).then(b.dist.total_cmp(&a.dist)));
+        {
+            let _sort = rustudio_core::bench::scope("gui_z_sort");
+            roots.sort_by(|a, b| a.order.cmp(&b.order).then(b.dist.total_cmp(&a.dist)));
+        }
         drop(place);
 
         // (No prepared discs: they only speed up small circles.)
         let atlas = ctx.fonts(|f| f.font_image_size());
-        let view_proj = inp.cam.view_proj(rect);
         // The renderer's reverse-Z projection: the depth the world GUI pass tests.
         let view_proj_rz = inp.cam.view_proj_reverse_z(rect);
         let mut tess = Tessellator::new(
@@ -638,6 +834,8 @@ impl Gui {
             Vec::new(),
         );
         let mut out: Vec<Shape> = Vec::new();
+        let mut cached_roots = 0;
+        let mut triangle_counts = [0, 0, 0];
         let mut drawn_roots: Vec<Ref> = Vec::with_capacity(roots.len());
         // (RUSTUDIO_GUI_CACHE_WHY: say why each GUI was walked)
         let why_on = debug_env(DebugEnv::Why);
@@ -677,6 +875,15 @@ impl Gui {
                     continue;
                 }
             }
+            if !inp.playing && clip != Rect::EVERYTHING {
+                if let Target::Billboard(center, _) = root.target {
+                    let projected = Rect::from_center_size(center, canvas_rect.size());
+                    if !projected.expand(1.0 / ctx.pixels_per_point()).intersects(rect) {
+                        rustudio_core::bench::add("gui_unseen", 0.0, 1);
+                        continue;
+                    }
+                }
+            }
             // A ScreenGui nothing touched since it was walked is drawn from
             // what that walk made.
             // A GUI nothing touched since it was walked is drawn from what
@@ -697,7 +904,9 @@ impl Gui {
                 .map(f32::to_bits)
             };
             // (RUSTUDIO_GUI_CACHE_VERIFY: walk it anyway and compare)
-            let verify = debug_env(DebugEnv::Verify);
+            if !verify && matches!(root.target, Target::Billboard(..)) {
+                self.reuse_billboard_canvas(g, key);
+            }
             let mut kept: Option<RootCache> = None;
             let mut reuse: Option<RootCache> = None;
             if let Some(c) = self.cache.get(&g).filter(|c| c.key == key) {
@@ -709,6 +918,13 @@ impl Gui {
                 });
                 if vfs_ok {
                     self.vf_live.extend(c.vfs.iter().copied());
+                    if let std::collections::hash_map::Entry::Vacant(entry) = self.layout_from.entry(g) {
+                        if let Some(boxes) = self.root_boxes.get(&g) {
+                            self.layout.extend(boxes.iter().copied());
+                            entry.insert(boxes.iter().map(|(r, _)| *r).collect());
+                            self.layout_changed = true;
+                        }
+                    }
                 }
                 if vfs_ok && verify {
                     kept = self.cache.remove(&g);
@@ -717,11 +933,11 @@ impl Gui {
                     out.extend(c.shapes.iter().cloned());
                     self.hits.extend(c.hits.iter().cloned());
                     crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI2D, c.ui2d.0, c.ui2d.1);
-                    rustudio_core::bench::add("gui_cached", 0.0, 1);
+                    cached_roots += 1;
                     continue;
                 } else if vfs_ok {
                     reuse = self.cache.remove(&g);
-                    rustudio_core::bench::add("gui_cached", 0.0, 1);
+                    cached_roots += 1;
                 }
             }
             let (target, canvas) = (root.target, root.canvas);
@@ -771,13 +987,14 @@ impl Gui {
                 let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
                 project_w(tl + (tr - tl) * u + (bl - tl) * v)
             };
+            let billboard_origin = match target {
+                Target::Billboard(center, _) => center - egui::vec2(canvas[0] * 0.5, canvas[1] * 0.5),
+                _ => Pos2::ZERO,
+            };
             let map = |p: Pos2| -> Option<Pos2> {
                 match target {
                     Target::Screen(o) => Some(o + p.to_vec2()),
-                    Target::Billboard(c, _) => Some(Pos2::new(
-                        c.x - canvas[0] * 0.5 + p.x,
-                        c.y - canvas[1] * 0.5 + p.y,
-                    )),
+                    Target::Billboard(..) => Some(billboard_origin + p.to_vec2()),
                     Target::Surface { tl, tr, bl } => {
                         let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
                         project(tl + (tr - tl) * u + (bl - tl) * v)
@@ -821,13 +1038,12 @@ impl Gui {
                 }
                 let s = s.intersect(rect);
                 // A pixel centre (i + 0.5) / ppp inside on both axes.
-                let holds = |lo: f32, hi: f32| (hi * ppp - 0.5).floor() >= (lo * ppp - 0.5).ceil();
-                s.is_positive() && holds(s.min.x, s.max.x) && holds(s.min.y, s.max.y)
+                s.is_positive() && contains_pixel_center(s.min.x, s.max.x, ppp)
+                    && contains_pixel_center(s.min.y, s.max.y, ppp)
             };
             let (out_from, hits_from) = (out.len(), self.hits.len());
-            let (mut t_tess, mut t_clip, mut t_split, mut t_map, mut n_in, mut n_out) =
-                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0u64, 0u64);
             // The walk and the canvas triangles (or the kept ones).
+            self.text_fit.set_screen(screen_root);
             let (citems, lhits) = match reuse.as_mut() {
                 Some(c) => (std::mem::take(&mut c.citems), std::mem::take(&mut c.lhits)),
                 None => {
@@ -968,9 +1184,9 @@ impl Gui {
                     if global_z {
                         items.sort_by_key(|i| (i.z, i.seq));
                     }
-                    let mut citems: Vec<(Rect, Mesh)> = Vec::with_capacity(items.len());
+                    let _tess = rustudio_core::bench::scope("gui_tessellate");
+                    let mut citems = Vec::with_capacity(items.len());
                     for it in &items {
-                        let t0 = std::time::Instant::now();
                         let kept = it.tess.get_or_init(|| {
                             let b = canvas_bounds(it)?;
                             let mut mesh = Mesh::default();
@@ -984,11 +1200,10 @@ impl Gui {
                                 }
                             }
                             if it.clip != Rect::EVERYTHING {
-                                mesh = clip_mesh(&mesh, it.clip);
+                                mesh = clip_mesh(mesh, it.clip);
                             }
-                            Some((b, mesh))
+                            Some((b, Arc::new(mesh)))
                         });
-                        t_tess += t0.elapsed().as_secs_f64();
                         let Some((b, mesh)) = kept else { continue };
                         // (a ScreenGui's view test needs no camera: done now)
                         if screen_root && !on_screen(*b) {
@@ -999,73 +1214,113 @@ impl Gui {
                     (citems, hits)
                 }
             };
+            let project_scope = (!citems.is_empty()).then(|| rustudio_core::bench::scope("gui_project_mesh"));
             let mut ui2d = (0u64, 0u64);
-            let mut ui2d_tex: Option<egui::TextureId> = None;
-            for (b, mesh) in &citems {
-                if !screen_root && !on_screen(*b) {
+            let mut last_texture = None;
+            let mut n_in = 0;
+            let mut n_out = 0;
+            let billboard_depth = match target {
+                Target::Billboard(..) if world => Some(depth_of(Pos2::ZERO)),
+                _ => None,
+            };
+            let mut projected: Vec<Pos2> = Vec::new();
+            for (bounds, retained) in &citems {
+                if !screen_root && !on_screen(*bounds) {
                     continue;
                 }
-                let t2 = std::time::Instant::now();
-                let mut mesh = mesh.clone();
-                n_in += mesh.indices.len() as u64 / 3;
-                if perspective {
-                    mesh = subdivide(mesh, mech::GUI_SURFACE_AFFINE_ERR_PX, rect, &surface);
-                }
+                n_in += retained.indices.len() as u64 / 3;
+                let subdivided;
+                // (the vertices' screen positions when subdivide already
+                // projected them for its test)
+                projected.clear();
+                let mesh = if perspective {
+                    subdivided = subdivide(retained, mech::GUI_SURFACE_AFFINE_ERR_PX, rect, &surface, &mut projected);
+                    subdivided.as_ref()
+                } else {
+                    retained.as_ref()
+                };
+                let projected = (projected.len() == mesh.vertices.len()).then_some(projected.as_slice());
                 n_out += mesh.indices.len() as u64 / 3;
-                let t3 = std::time::Instant::now();
-                t_split += (t3 - t2).as_secs_f64();
-                let mut ok = !mesh.is_empty();
-                let mut depths = Vec::new();
-                for v in &mut mesh.vertices {
-                    if world {
-                        depths.push(depth_of(v.pos));
-                    }
-                    match map(v.pos) {
-                        Some(p) => v.pos = p,
-                        None => {
-                            ok = false;
-                            break;
+                if mesh.is_empty() {
+                    continue;
+                }
+                if world {
+                    let width = rect.width().max(1.0);
+                    let height = rect.height().max(1.0);
+                    let vertex = |v: &Vertex, p: Pos2, (depth, dist)| rustudio_render::world_gui::GuiVertex {
+                        ndc: [
+                            (p.x - rect.min.x) / width * 2.0 - 1.0,
+                            1.0 - (p.y - rect.min.y) / height * 2.0,
+                        ],
+                        depth,
+                        uv: [v.uv.x, v.uv.y],
+                        color: v.color.to_array(),
+                        light: [light; 3],
+                        dist,
+                        alpha_mul: 1.0,
+                        ..Default::default()
+                    };
+                    if let Some(depth) = billboard_depth {
+                        // All triangles share the billboard's translation and depth.
+                        let verts = mesh.vertices.iter().map(|v| {
+                            vertex(v, billboard_origin + v.pos.to_vec2(), depth)
+                        });
+                        rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
+                    } else {
+                        let verts: Option<Vec<_>> = mesh.vertices.iter().enumerate().map(|(i, v)| {
+                            let p = match projected {
+                                Some(p) => p[i],
+                                None => map(v.pos)?,
+                            };
+                            Some(vertex(v, p, depth_of(v.pos)))
+                        }).collect();
+                        if let Some(verts) = verts {
+                            rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
                         }
                     }
-                }
-                t_map += t3.elapsed().as_secs_f64();
-                if ok && world {
-                    // Into the renderer's pass (NDC over the view), in order.
-                    let verts: Vec<rustudio_render::world_gui::GuiVertex> = mesh
-                        .vertices
-                        .iter()
-                        .zip(&depths)
-                        .map(|(v, d)| rustudio_render::world_gui::GuiVertex {
-                            ndc: [
-                                (v.pos.x - rect.min.x) / rect.width().max(1.0) * 2.0 - 1.0,
-                                1.0 - (v.pos.y - rect.min.y) / rect.height().max(1.0) * 2.0,
-                            ],
-                            depth: d.0,
-                            uv: [v.uv.x, v.uv.y],
-                            color: v.color.to_array(),
-                            light: [light; 3],
-                            dist: d.1,
-                            clip_w: 0.0,
-                            alpha_mul: 1.0,
-                            ..Default::default()
-                        })
-                        .collect();
-                    rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
-                } else if ok {
-                    // Stats.UI2D*: a draw call per texture change (egui batches the rest).
-                    let new_tex = ui2d_tex.replace(mesh.texture_id) != Some(mesh.texture_id);
-                    crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI2D, new_tex as u64, (mesh.indices.len() / 3) as u64);
-                    ui2d.0 += new_tex as u64;
+                } else {
+                    // Screen roots are already clipped to the canvas. Retain one
+                    // mesh per consecutive texture run, preserving alpha order.
+                    if let Target::Screen(origin) = target {
+                        if out.len() > out_from {
+                            if let Some(Shape::Mesh(last)) = out.last_mut() {
+                                if last.texture_id == mesh.texture_id {
+                                    let last = Arc::make_mut(last);
+                                    let offset = last.vertices.len() as u32;
+                                    last.indices.extend(mesh.indices.iter().map(|i| offset + i));
+                                    last.vertices.extend(mesh.vertices.iter().map(|vertex| Vertex {
+                                        pos: origin + vertex.pos.to_vec2(),
+                                        ..*vertex
+                                    }));
+                                    ui2d.1 += (mesh.indices.len() / 3) as u64;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    let mut mesh = mesh.clone();
+                    if !mesh.vertices.iter_mut().all(|v| {
+                        if let Some(p) = map(v.pos) {
+                            v.pos = p;
+                            true
+                        } else {
+                            false
+                        }
+                    }) {
+                        continue;
+                    }
                     ui2d.1 += (mesh.indices.len() / 3) as u64;
+                    ui2d.0 += (last_texture.replace(mesh.texture_id) != Some(mesh.texture_id)) as u64;
                     out.push(Shape::Mesh(mesh.into()));
                 }
             }
-            rustudio_core::bench::add("gui_m_tess", t_tess * 1e3, 1);
-            rustudio_core::bench::add("gui_m_clip", t_clip * 1e3, 1);
-            rustudio_core::bench::add("gui_m_split", t_split * 1e3, 1);
-            rustudio_core::bench::add("gui_m_map", t_map * 1e3, 1);
-            rustudio_core::bench::add(if perspective { "gui_tris_surface_in" } else { "gui_tris_flat" }, 0.0, n_in);
-            rustudio_core::bench::add("gui_tris_out", 0.0, n_out);
+            if ui2d.0 > 0 {
+                crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI2D, ui2d.0, ui2d.1);
+            }
+            triangle_counts[perspective as usize] += n_in;
+            triangle_counts[2] += n_out;
+            drop(project_scope);
+            let hit_scope = (!lhits.is_empty()).then(|| rustudio_core::bench::scope("gui_project_hits"));
             for h in &lhits {
                 let corners = [
                     h.rect.left_top(),
@@ -1074,23 +1329,14 @@ impl Gui {
                     h.rect.left_bottom(),
                 ]
                 .map(|p| h.aff.apply(p));
-                let q: Option<Vec<Pos2>> = corners.iter().map(|p| map(*p)).collect();
-                let Some(q) = q else { continue };
+                let project_quad = |[a, b, c, d]: [Pos2; 4]| Some([map(a)?, map(b)?, map(c)?, map(d)?]);
+                let Some(quad) = project_quad(corners) else { continue };
                 let clip = h.clip.and_then(|c| {
-                    let cq: Option<Vec<Pos2>> = [
-                        c.left_top(),
-                        c.right_top(),
-                        c.right_bottom(),
-                        c.left_bottom(),
-                    ]
-                    .iter()
-                    .map(|p| map(*p))
-                    .collect();
-                    cq.map(|v| [v[0], v[1], v[2], v[3]])
+                    project_quad([c.left_top(), c.right_top(), c.right_bottom(), c.left_bottom()])
                 });
                 self.hits.push(Hit {
                     r: h.r,
-                    quad: [q[0], q[1], q[2], q[3]],
+                    quad,
                     clip,
                     button: h.button,
                     textbox: h.textbox,
@@ -1100,6 +1346,7 @@ impl Gui {
                     painted: h.painted,
                 });
             }
+            drop(hit_scope);
             if let Some(mut c) = reuse {
                 // (drawn from what was kept: keep it)
                 c.citems = citems;
@@ -1144,6 +1391,15 @@ impl Gui {
                 );
             }
         }
+        let deferred = self.text_fit.take_deferred();
+        if deferred > 0 {
+            rustudio_core::bench::add("gui_text_deferred", 0.0, deferred);
+            ctx.request_repaint();
+        }
+        rustudio_core::bench::add("gui_cached", 0.0, cached_roots);
+        for (name, count) in ["gui_tris_flat", "gui_tris_surface_in", "gui_tris_out"].into_iter().zip(triangle_counts) {
+            rustudio_core::bench::add(name, 0.0, count);
+        }
         // GUIs drawn last frame and not now: their entries go.
         let was: HashSet<Ref> = std::mem::take(&mut self.layout_roots).into_iter().collect();
         let now: HashSet<Ref> = drawn_roots.iter().copied().collect();
@@ -1184,9 +1440,7 @@ impl Gui {
         if debug_env(DebugEnv::BlackBg) {
             clipped.rect_filled(rect, 0.0, Color32::BLACK);
         }
-        for s in out {
-            clipped.add(s);
-        }
+        clipped.extend(out);
     }
 
     /// Pointer over the viewport: hover, clicks and the wheel. Queues events;
@@ -1690,11 +1944,24 @@ fn surface_in_view(view_proj: &glam::Mat4, rect: Rect, ppp: f32, tl: Vec3, tr: V
     }
     // (+ a pixel for the tessellator's feathering)
     let s = s.expand(1.0 / ppp).intersect(rect);
-    let holds = |lo: f32, hi: f32| (hi * ppp - 0.5).floor() >= (lo * ppp - 0.5).ceil();
-    s.is_positive() && holds(s.min.x, s.max.x) && holds(s.min.y, s.max.y)
+    s.is_positive() && contains_pixel_center(s.min.x, s.max.x, ppp)
+        && contains_pixel_center(s.min.y, s.max.y, ppp)
 }
 
-fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [f32; 2], f32)> {
+fn contains_pixel_center(lo: f32, hi: f32, ppp: f32) -> bool {
+    let lo = lo * ppp - 0.5;
+    let hi = hi * ppp - 0.5;
+    hi - lo > 1.0 || hi.floor() >= lo.ceil()
+}
+
+fn place_3d(
+    d: &Document,
+    cam: &Camera,
+    view_proj: &glam::Mat4,
+    rect: Rect,
+    g: Ref,
+    model_centers: &mut HashMap<Ref, Option<Vec3>>,
+) -> Option<(Target, [f32; 2], f32)> {
     let class = d.class_of(g)?;
     let adornee = match d.prop(g, "Adornee") {
         Some(Variant::Ref(a)) if d.exists(a) => Some(a),
@@ -1706,44 +1973,16 @@ fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [
         if !doc::is_a(&host_class, "BasePart") {
             return None;
         }
-        let xf = xform_of(d, host)?;
-        let h = vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE) * 0.5;
-        // Face (NormalId): Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5 → (normal, canvas right, canvas up).
-        let (n, right, up) = match enum_u32(d.prop(g, "Face")).unwrap_or(5) {
-            0 => (Vec3::X, -Vec3::Z, Vec3::Y),
-            1 => (Vec3::Y, Vec3::X, -Vec3::Z),
-            2 => (Vec3::Z, Vec3::X, Vec3::Y),
-            3 => (-Vec3::X, Vec3::Z, Vec3::Y),
-            4 => (-Vec3::Y, Vec3::X, Vec3::Z),
-            _ => (-Vec3::Z, -Vec3::X, Vec3::Y),
-        };
-        let (wr, hu) = ((right * h).length(), (up * h).length());
-        let centre = n * (n * h).length() + n * mech::GUI_SURFACE_LIFT;
-        let mid = xf.apply(centre);
-        // Only seen from in front of the face.
-        if (xf.rot * n).dot(cam.pos - mid) <= 0.0 {
-            return None;
-        }
-        let max = num(d, g, "MaxDistance", 0.0);
-        let dist = (mid - cam.pos).length();
-        if max > 0.0 && dist > max {
-            return None;
-        }
-        // SizingMode: FixedSize 0 (CanvasSize), PixelsPerStud 1.
-        let canvas = if enum_u32(d.prop(g, "SizingMode")).unwrap_or(0) == 1 {
-            let pps = num(d, g, "PixelsPerStud", 50.0);
-            [wr * 2.0 * pps, hu * 2.0 * pps]
-        } else {
-            vec2(d, g, "CanvasSize", [800.0, 600.0])
-        };
-        let tl = xf.apply(centre - right * wr + up * hu);
-        let tr = xf.apply(centre + right * wr + up * hu);
-        let bl = xf.apply(centre - right * wr - up * hu);
-        return Some((Target::Surface { tl, tr, bl }, canvas, dist));
+        let spec = SurfaceSpec::read(d, g)?;
+        return spec.place(d, cam);
     }
     // BillboardGui: over a part, attachment or model.
+    let part_position = |r| match d.prop(r, "CFrame") {
+        Some(Variant::CFrame(cf)) => Some(Vec3::new(cf.position.x, cf.position.y, cf.position.z)),
+        _ => None,
+    };
     let base = if doc::is_a(&host_class, "BasePart") {
-        xform_of(d, host)?.pos
+        part_position(host)?
     } else if host_class == "Attachment" {
         let pxf = xform_of(d, d.dom.get_by_ref(host)?.parent())?;
         let cf = match d.prop(host, "CFrame") {
@@ -1755,16 +1994,13 @@ fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [
         };
         pxf.apply(cf.pos)
     } else if doc::is_a(&host_class, "Model") {
-        let ps: Vec<Vec3> = d
-            .dom
-            .descendants_of(host)
-            .filter(|i| doc::is_a(&i.class, "BasePart"))
-            .filter_map(|i| xform_of(d, i.referent()).map(|x| x.pos))
-            .collect();
-        if ps.is_empty() {
-            return None;
-        }
-        ps.iter().fold(Vec3::ZERO, |a, p| a + *p) / ps.len() as f32
+        (*model_centers.entry(host).or_insert_with(|| {
+            let (sum, count) = d.dom.descendants_of(host)
+                .filter(|i| doc::is_a(&i.class, "BasePart"))
+                .filter_map(|i| part_position(i.referent()))
+                .fold((Vec3::ZERO, 0u32), |(sum, count), pos| (sum + pos, count + 1));
+            (count > 0).then(|| sum / count as f32)
+        }))?
     } else {
         return None;
     };
@@ -1777,7 +2013,15 @@ fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [
     if max > 0.0 && max.is_finite() && dist > max {
         return None;
     }
-    let c = cam.project(rect, p)?;
+    let clip = *view_proj * p.extend(1.0);
+    if clip.w <= 1e-4 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    let c = Pos2::new(
+        rect.min.x + (ndc.x + 1.0) * 0.5 * rect.width(),
+        rect.min.y + (1.0 - ndc.y) * 0.5 * rect.height(),
+    );
     let s = udim2(d, g, "Size");
     // Size: scale in studs, offset in pixels.
     // (by view-space depth, not distance: Studio's 230 px at 10 studs
@@ -1804,46 +2048,308 @@ fn place_3d(d: &Document, cam: &Camera, rect: Rect, g: Ref) -> Option<(Target, [
 /// (an estimate). The world GUI pass then tone-maps it with the scene.
 /// (tools/fidelity gui-depth: Studio shows LightInfluence 0 colours through
 /// its tone curve: red 255 → 224, Brightness 2 grey 0.4 → 148.)
-fn world_gui_light(d: &Document, g: Ref, normal: Vec3) -> f32 {
-    let li = num(d, g, "LightInfluence", 1.0).clamp(0.0, 1.0);
-    let bright = num(d, g, "Brightness", 1.0).max(0.0);
+fn world_gui_light([li, bright]: [f32; 2], scene_light: impl FnOnce() -> f32) -> f32 {
     if li <= 0.0 {
         return bright;
     }
-    bright * (1.0 - li) + scene_light(d, Some(normal)) * li
+    bright * (1.0 - li) + scene_light() * li
+}
+
+/// A world GUI's LightInfluence (0..1) and Brightness (≥ 0).
+fn light_props(d: &Document, g: Ref) -> [f32; 2] {
+    [num(d, g, "LightInfluence", 1.0).clamp(0.0, 1.0), num(d, g, "Brightness", 1.0).max(0.0)]
+}
+
+/// What a SurfaceGui's placement reads from itself and which part it is on
+/// (`place_3d`). Kept from frame to frame (Gui::surface_specs, dropped by
+/// the journal): a game's ~970 world SurfaceGuis read ~15 properties each a
+/// frame for this. The part's CFrame and Size are read each frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SurfaceSpec {
+    enabled: bool,
+    host: Ref,
+    /// The Adornee as set, and whether it existed (else the parent hosts).
+    adornee: Option<(Ref, bool)>,
+    face: u32,
+    max_distance: f32,
+    /// SizingMode PixelsPerStud: the PixelsPerStud; FixedSize: None.
+    pixels_per_stud: Option<f32>,
+    canvas_size: [f32; 2],
+    on_top: bool,
+    light_props: [f32; 2],
+    z_offset: i64,
+}
+
+impl SurfaceSpec {
+    /// None: not a SurfaceGui on a part (it draws nowhere).
+    fn read(d: &Document, g: Ref) -> Option<SurfaceSpec> {
+        if d.class_of(g)? != "SurfaceGui" {
+            return None;
+        }
+        let adornee = match d.prop(g, "Adornee") {
+            Some(Variant::Ref(a)) if !a.is_none() => Some((a, d.exists(a))),
+            _ => None,
+        };
+        let host = match adornee {
+            Some((a, true)) => a,
+            _ => d.dom.get_by_ref(g)?.parent(),
+        };
+        if !doc::is_a(&d.class_of(host)?, "BasePart") {
+            return None;
+        }
+        let on_top = boolp(d, g, "AlwaysOnTop", false);
+        Some(SurfaceSpec {
+            enabled: boolp(d, g, "Enabled", true),
+            host,
+            adornee,
+            face: enum_u32(d.prop(g, "Face")).unwrap_or(5),
+            max_distance: num(d, g, "MaxDistance", 0.0),
+            pixels_per_stud: (enum_u32(d.prop(g, "SizingMode")).unwrap_or(0) == 1)
+                .then(|| num(d, g, "PixelsPerStud", 50.0)),
+            canvas_size: vec2(d, g, "CanvasSize", [800.0, 600.0]),
+            on_top,
+            light_props: if on_top { [0.0; 2] } else { light_props(d, g) },
+            z_offset: num(d, g, "ZOffset", 0.0) as i64,
+        })
+    }
+
+    /// Still what `read` would give: the journal drops it on any write to
+    /// the GUI or a reparent; an Adornee appearing or going is checked here.
+    fn current(&self, d: &Document) -> bool {
+        self.adornee.is_none_or(|(a, existed)| d.exists(a) == existed) && d.exists(self.host)
+    }
+
+    /// Where it is drawn this frame: its canvas corners on the part's face,
+    /// canvas size and distance; None when the face looks away or it is
+    /// beyond MaxDistance.
+    fn place(&self, d: &Document, cam: &Camera) -> Option<(Target, [f32; 2], f32)> {
+        let host = self.host;
+        let xf = xform_of(d, host)?;
+        let h = vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE) * 0.5;
+        // Face (NormalId): Right 0, Top 1, Back 2, Left 3, Bottom 4, Front 5 → (normal, canvas right, canvas up).
+        let (n, right, up) = match self.face {
+            0 => (Vec3::X, -Vec3::Z, Vec3::Y),
+            1 => (Vec3::Y, Vec3::X, -Vec3::Z),
+            2 => (Vec3::Z, Vec3::X, Vec3::Y),
+            3 => (-Vec3::X, Vec3::Z, Vec3::Y),
+            4 => (-Vec3::Y, Vec3::X, Vec3::Z),
+            _ => (-Vec3::Z, -Vec3::X, Vec3::Y),
+        };
+        let (wr, hu) = ((right * h).length(), (up * h).length());
+        let centre = n * (n * h).length() + n * mech::GUI_SURFACE_LIFT;
+        let mid = xf.apply(centre);
+        // Only seen from in front of the face.
+        if (xf.rot * n).dot(cam.pos - mid) <= 0.0 {
+            return None;
+        }
+        let max = self.max_distance;
+        let dist = (mid - cam.pos).length();
+        if max > 0.0 && dist > max {
+            return None;
+        }
+        // SizingMode: FixedSize 0 (CanvasSize), PixelsPerStud 1.
+        let canvas = match self.pixels_per_stud {
+            Some(pps) => [wr * 2.0 * pps, hu * 2.0 * pps],
+            None => self.canvas_size,
+        };
+        let tl = xf.apply(centre - right * wr + up * hu);
+        let tr = xf.apply(centre + right * wr + up * hu);
+        let bl = xf.apply(centre - right * wr - up * hu);
+        Some((Target::Surface { tl, tr, bl }, canvas, dist))
+    }
 }
 
 /// The light `world_gui_light` mixes in: Ambient, OutdoorAmbient and the sun
 /// on a face with this normal, or, with no normal, the whole sun (Studio's
-/// particle and trail shaders light without N·L, round 25).
-pub(crate) fn scene_light(d: &Document, normal: Option<Vec3>) -> f32 {
-    let root = d.dom.root_ref();
-    let lighting = d.find_child(root, "Lighting");
-    let get = |k: &str| lighting.and_then(|l| d.prop(l, k));
-    let rgb = |k: &str, dflt: [u8; 3]| -> [u8; 3] {
-        match get(k) {
-            Some(Variant::Color3(c)) => [c.r, c.g, c.b].map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8),
-            Some(Variant::Color3uint8(c)) => [c.r, c.g, c.b],
-            _ => dflt,
-        }
-    };
-    let luma = |v: Vec3| v.x * 0.299 + v.y * 0.587 + v.z * 0.114;
-    let amb = rustudio_render::lighting::sq(rgb("Ambient", mech::AMBIENT));
-    let out = rustudio_render::lighting::sq(rgb("OutdoorAmbient", mech::OUTDOOR_AMBIENT));
-    let ambient = luma(amb) + (luma(out) - luma(amb)).max(0.0);
-    let clock = f32_of(get("ClockTime")).unwrap_or(mech::CLOCK_TIME);
-    let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
-    let sun = rustudio_render::lighting::sun_direction(clock, lat);
-    let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);
-    let sun_light = if sun.y > 0.0 {
-        mech::SUN_IRRADIANCE_PER_BRIGHTNESS * brightness * normal.map_or(1.0, |n| n.dot(sun).max(0.0))
-    } else {
-        0.0
-    };
-    (ambient + sun_light).max(0.0)
+/// particle and trail shaders light without N·L, round 25). The Lighting
+/// terms are read once for a frame's world GUIs.
+#[derive(Clone, Copy)]
+struct SceneLight {
+    ambient: f32,
+    /// The sun's irradiance (0 below the horizon) and its direction.
+    sun: Option<(f32, Vec3)>,
 }
+
+impl SceneLight {
+    fn of(d: &Document) -> SceneLight {
+        let root = d.dom.root_ref();
+        let lighting = d.find_child(root, "Lighting");
+        let get = |k: &str| lighting.and_then(|l| d.prop(l, k));
+        let rgb = |k: &str, dflt: [u8; 3]| -> [u8; 3] {
+            match get(k) {
+                Some(Variant::Color3(c)) => [c.r, c.g, c.b].map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8),
+                Some(Variant::Color3uint8(c)) => [c.r, c.g, c.b],
+                _ => dflt,
+            }
+        };
+        let luma = |v: Vec3| v.x * 0.299 + v.y * 0.587 + v.z * 0.114;
+        let amb = rustudio_render::lighting::sq(rgb("Ambient", mech::AMBIENT));
+        let out = rustudio_render::lighting::sq(rgb("OutdoorAmbient", mech::OUTDOOR_AMBIENT));
+        let ambient = luma(amb) + (luma(out) - luma(amb)).max(0.0);
+        let clock = f32_of(get("ClockTime")).unwrap_or(mech::CLOCK_TIME);
+        let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
+        let sun = rustudio_render::lighting::sun_direction(clock, lat);
+        let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);
+        SceneLight {
+            ambient,
+            sun: (sun.y > 0.0).then(|| (mech::SUN_IRRADIANCE_PER_BRIGHTNESS * brightness, sun)),
+        }
+    }
+
+    fn on(&self, normal: Option<Vec3>) -> f32 {
+        let sun_light = match self.sun {
+            Some((irradiance, sun)) => irradiance * normal.map_or(1.0, |n| n.dot(sun).max(0.0)),
+            None => 0.0,
+        };
+        (self.ambient + sun_light).max(0.0)
+    }
+}
+
 
 /// The Scale of a UIScale directly under a LayerCollector (1 without one).
 fn root_ui_scale(d: &Document, g: Ref) -> f32 {
     child_of_class(d, g, "UIScale").map_or(1.0, |s| num(d, s, "Scale", 1.0))
+}
+
+
+#[cfg(test)]
+mod surface_spec_tests {
+    use super::*;
+    use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
+    use rbx_dom_weak::{ustr, InstanceBuilder};
+
+    #[test]
+    fn surface_specs_follow_the_journal_and_place_like_before() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let ws = d.insert(root, InstanceBuilder::new("Workspace"));
+        let at = |x: f32| CFrame::new(Vector3::new(x, 0.0, 0.0), Matrix3::identity());
+        let part = d.insert(ws, InstanceBuilder::new("Part")
+            .with_property("Size", Vector3::new(4.0, 2.0, 1.0))
+            .with_property("CFrame", at(0.0)));
+        let other = d.insert(ws, InstanceBuilder::new("Part")
+            .with_property("Size", Vector3::new(8.0, 2.0, 1.0))
+            .with_property("CFrame", at(20.0)));
+        let sg = d.insert(part, InstanceBuilder::new("SurfaceGui"));
+        let mut gui = Gui::default();
+        gui.sync_roots(&mut d);
+        assert!(gui.world_roots.contains(&sg));
+        let mut cam = Camera::default();
+        // In front of the Front face (−Z).
+        cam.pos = Vec3::new(0.0, 0.0, -10.0);
+        let spec = SurfaceSpec::read(&d, sg).unwrap();
+        let Some((Target::Surface { tl, tr, bl }, canvas, dist)) = spec.place(&d, &cam) else { panic!() };
+        assert_eq!(canvas, [800.0, 600.0]);
+        assert!((dist - (10.0 - 0.5 - mech::GUI_SURFACE_LIFT)).abs() < 1e-4);
+        assert!((tl - Vec3::new(2.0, 1.0, -0.5 - mech::GUI_SURFACE_LIFT)).length() < 1e-4, "{tl}");
+        assert!((tr - Vec3::new(-2.0, 1.0, -0.5 - mech::GUI_SURFACE_LIFT)).length() < 1e-4, "{tr}");
+        assert!((bl - Vec3::new(2.0, -1.0, -0.5 - mech::GUI_SURFACE_LIFT)).length() < 1e-4, "{bl}");
+        // From behind the face it is not drawn.
+        cam.pos = Vec3::new(0.0, 0.0, 10.0);
+        assert!(spec.place(&d, &cam).is_none());
+        cam.pos = Vec3::new(0.0, 0.0, -10.0);
+
+        // A property write drops it; so does moving it to another part.
+        gui.surface_specs.insert(sg, spec);
+        d.set_prop_live(sg, ustr("PixelsPerStud"), Variant::Float32(10.0));
+        gui.sync_roots(&mut d);
+        assert!(!gui.surface_specs.contains_key(&sg));
+        gui.surface_specs.insert(sg, spec);
+        // The part's own CFrame and Size are read each frame.
+        d.set_prop_live(part, ustr("CFrame"), Variant::CFrame(at(1.0)));
+        gui.sync_roots(&mut d);
+        assert_eq!(gui.surface_specs.get(&sg), Some(&spec));
+        let moved = spec.place(&d, &cam).unwrap();
+        assert!(matches!(moved.0, Target::Surface { tl, .. } if (tl.x - 3.0).abs() < 1e-4));
+        d.reparent(&[sg], other);
+        gui.sync_roots(&mut d);
+        assert!(!gui.surface_specs.contains_key(&sg));
+        let spec = SurfaceSpec::read(&d, sg).unwrap();
+        assert_eq!(spec.host, other);
+        // An Adornee that goes away hands the GUI back to its parent.
+        gui.surface_specs.insert(sg, spec);
+        d.set_prop_live(sg, ustr("Adornee"), Variant::Ref(part));
+        gui.sync_roots(&mut d);
+        let spec = SurfaceSpec::read(&d, sg).unwrap();
+        assert_eq!(spec.host, part);
+        assert!(spec.current(&d));
+        d.dom.destroy(part);
+        assert!(!spec.current(&d));
+        assert_eq!(SurfaceSpec::read(&d, sg).map(|s| s.host), Some(other));
+    }
+}
+
+#[cfg(test)]
+mod billboard_canvas_tests {
+    use super::*;
+
+    #[test]
+    fn archived_canvas_only_drops_for_a_relevant_property_mark() {
+        let d = Document::empty();
+        let root = Ref::new();
+        let other_root = Ref::new();
+        let label = Ref::new();
+        let mut gui = Gui {
+            roots_doc: d.id,
+            ..Gui::default()
+        };
+        let output = || RootCache {
+            key: [24; 12],
+            shapes: Vec::new(),
+            hits: Vec::new(),
+            ui2d: (0, 0),
+            vfs: Vec::new(),
+            citems: Vec::new(),
+            lhits: Vec::new(),
+        };
+        gui.cache.insert(root, output());
+        gui.root_boxes.insert(root, Vec::new());
+        gui.cache_owned.insert(root, (vec![(label, label)], vec![root]));
+        gui.reuse_billboard_canvas(root, [36; 12]);
+        gui.cache.insert(other_root, output());
+        gui.root_boxes.insert(other_root, Vec::new());
+        gui.cache_owned.insert(other_root, (vec![(other_root, other_root)], vec![other_root]));
+        gui.reuse_billboard_canvas(other_root, [36; 12]);
+
+        gui.cache_marks(&d, &doc::Marks::Some(vec![
+            doc::Mark::Prop(Ref::new(), rbx_dom_weak::ustr("CFrame")),
+        ]));
+        assert!(gui.billboard_canvases.contains_key(&root));
+
+        gui.cache_marks(&d, &doc::Marks::Some(vec![
+            doc::Mark::Prop(label, rbx_dom_weak::ustr("Text")),
+        ]));
+        assert!(!gui.billboard_canvases.contains_key(&root));
+        assert!(!gui.billboard_archive_owner.contains_key(&label));
+        assert!(gui.billboard_canvases.contains_key(&other_root));
+    }
+
+    #[test]
+    fn returning_to_a_canvas_restores_the_layout_and_dependencies() {
+        let root = Ref::new();
+        let child = Ref::new();
+        let make_output = |key| RootCache {
+            key, shapes: Vec::new(), hits: Vec::new(), ui2d: (0, 0),
+            vfs: Vec::new(), citems: Vec::new(), lhits: Vec::new(),
+        };
+        let mut gui = Gui::default();
+        let small_key = [24; 12];
+        let large_key = [36; 12];
+        let small = GuiBox { size: [24.0, 24.0], ..GuiBox::default() };
+        let large = GuiBox { size: [36.0, 36.0], ..GuiBox::default() };
+        gui.cache.insert(root, make_output(small_key));
+        gui.root_boxes.insert(root, vec![(child, small)]);
+        gui.cache_owned.insert(root, (vec![(child, child)], vec![root]));
+        gui.reuse_billboard_canvas(root, large_key);
+
+        gui.cache.insert(root, make_output(large_key));
+        gui.layout.insert(child, large);
+        gui.layout_from.insert(root, vec![child]);
+        gui.root_boxes.insert(root, vec![(child, large)]);
+        gui.reuse_billboard_canvas(root, small_key);
+
+        assert_eq!(gui.cache[&root].key, small_key);
+        assert_eq!(gui.layout[&child], small);
+        assert_eq!(gui.cache_owner[&child].0, root);
+    }
 }

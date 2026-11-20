@@ -29,6 +29,24 @@ fn joint_class(class: &str) -> bool {
     JOINTS.contains(&class) || RIGID.contains(&class)
 }
 
+/// Edges are linked from each endpoint, in the rig's joint order, so a
+/// traversal visits only the edges incident to the part it is posing.
+struct RigEdge {
+    parts: [Ref; 2],
+    frames: [Xform; 2],
+    next: [usize; 2],
+}
+
+#[derive(Default)]
+struct RigPoseScratch {
+    joints: Vec<Ref>,
+    edges: Vec<RigEdge>,
+    heads: rustc_hash::FxHashMap<Ref, usize>,
+    placed: rustc_hash::FxHashSet<Ref>,
+    queue: VecDeque<(Ref, Xform)>,
+    writes: Vec<(Ref, Xform)>,
+}
+
 #[derive(Default)]
 pub struct ClientJoints {
     doc_id: u64,
@@ -49,6 +67,7 @@ pub struct ClientJoints {
     /// instructions on the NPC test place.)
     rig_joints: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
     joint_rig: rustc_hash::FxHashMap<Ref, Ref>,
+    pose_scratch: RigPoseScratch,
 }
 
 fn is_joint(cd: &Document, r: Ref) -> bool {
@@ -296,8 +315,8 @@ impl ClientJoints {
         }
         self.frame += 1;
         let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
-        let mut writes: Vec<(Ref, Xform)> = Vec::new();
-        let rigs = self.rigs.clone();
+        let mut scratch = std::mem::take(&mut self.pose_scratch);
+        let rigs = std::mem::take(&mut self.rigs);
         for &root in &rigs {
             if !c2s.contains_key(&root) {
                 continue;
@@ -311,53 +330,66 @@ impl ClientJoints {
                 continue;
             }
             let Some(at) = cframe(cd, root, "CFrame") else { continue };
-            let mut edges: Vec<(Ref, Ref, Xform, Xform)> = Vec::new();
-            let found: Vec<Ref> = match self.rig_joints.get(&model) {
-                Some(list) => list.clone(),
-                None => {
-                    let list: Vec<Ref> = cd
-                        .dom
-                        .descendants_of(model)
-                        .filter(|i| joint_class(i.class.as_str()))
-                        .map(|i| i.referent())
-                        .collect();
-                    for j in &list {
-                        self.joint_rig.insert(*j, model);
-                    }
-                    self.rig_joints.insert(model, list.clone());
-                    list
+            scratch.joints.clear();
+            if let Some(list) = self.rig_joints.get(&model) {
+                scratch.joints.extend_from_slice(list);
+            } else {
+                let list: Vec<Ref> = cd
+                    .dom
+                    .descendants_of(model)
+                    .filter(|i| joint_class(i.class.as_str()))
+                    .map(|i| i.referent())
+                    .collect();
+                for &j in &list {
+                    self.joint_rig.insert(j, model);
                 }
-            };
-            for j in found {
+                scratch.joints.extend_from_slice(&list);
+                self.rig_joints.insert(model, list);
+            }
+            scratch.edges.clear();
+            for &j in &scratch.joints {
                 let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                     continue;
                 };
                 let t = cframe(cd, j, "Transform").unwrap_or(ident);
-                edges.push((p0, p1, compose(&c0, &t), c1));
+                scratch.edges.push(RigEdge {
+                    parts: [p0, p1],
+                    frames: [compose(&c0, &t), c1],
+                    next: [usize::MAX; 2],
+                });
             }
-            let mut placed: rustc_hash::FxHashMap<Ref, Xform> = Default::default();
-            placed.insert(root, at);
-            let mut queue = VecDeque::from([root]);
-            while let Some(p) = queue.pop_front() {
-                let at = placed[&p];
-                for &(p0, p1, c0t, c1) in &edges {
-                    let (other, xf) = if p == p0 {
-                        (p1, compose(&compose(&at, &c0t), &c1.inverse()))
-                    } else if p == p1 {
-                        (p0, compose(&compose(&at, &c1), &c0t.inverse()))
-                    } else {
-                        continue;
-                    };
-                    if placed.contains_key(&other) || anchored(cd, other) {
+            scratch.heads.clear();
+            for (edge_index, edge) in scratch.edges.iter_mut().enumerate().rev() {
+                // Encoding the side in the link also handles joints authored
+                // in reverse order. Keep one link for a self-joint.
+                for side in 0..=usize::from(edge.parts[0] != edge.parts[1]) {
+                    edge.next[side] = scratch.heads
+                        .insert(edge.parts[side], edge_index * 2 + side)
+                        .unwrap_or(usize::MAX);
+                }
+            }
+            scratch.placed.clear();
+            scratch.placed.insert(root);
+            scratch.queue.push_back((root, at));
+            while let Some((p, at)) = scratch.queue.pop_front() {
+                let mut link = *scratch.heads.get(&p).unwrap_or(&usize::MAX);
+                while link != usize::MAX {
+                    let edge = &scratch.edges[link / 2];
+                    let side = link % 2;
+                    link = edge.next[side];
+                    let other_side = 1 - side;
+                    let other = edge.parts[other_side];
+                    if scratch.placed.contains(&other) || anchored(cd, other) {
                         continue;
                     }
-                    placed.insert(other, xf);
-                    queue.push_back(other);
-                    writes.push((other, xf));
+                    let xf = compose(&compose(&at, &edge.frames[side]), &edge.frames[other_side].inverse());
+                    scratch.placed.insert(other);
+                    scratch.queue.push_back((other, xf));
+                    scratch.writes.push((other, xf));
                 }
             }
         }
-        for (p, xf) in writes {
+        for (p, xf) in scratch.writes.drain(..) {
             let same = cframe(cd, p, "CFrame").is_some_and(|o| {
                 (o.pos - xf.pos).length() < 1e-4 && o.rot.abs_diff_eq(xf.rot, 1e-5)
             });
@@ -369,6 +401,8 @@ impl ClientJoints {
             }
             cd.mark_prop(p, ustr("CFrame"));
         }
+        self.pose_scratch = scratch;
+        self.rigs = rigs;
     }
 }
 
@@ -454,6 +488,38 @@ mod tests {
         // Body's local +Y is world +Z after the quarter turn.
         assert!((pos(trim) - Vec3::new(0.0, 10.0, 0.0)).length() < 1e-4, "{:?}", pos(trim));
         assert!((pos(sight) - Vec3::new(0.0, 10.0, 1.0)).length() < 1e-4, "{:?}", pos(sight));
+    }
+
+    #[test]
+    fn replicated_rig_follows_joint_transform_changes() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let model = d.dom.insert(ws, InstanceBuilder::new("Model"));
+        d.dom.insert(model, InstanceBuilder::new("Humanoid"));
+        let root = d.dom.insert(
+            model,
+            InstanceBuilder::new("Part")
+                .with_name("HumanoidRootPart")
+                .with_property("CFrame", at(0.0, 5.0, 0.0)),
+        );
+        let limb = d.dom.insert(model, InstanceBuilder::new("Part").with_property("CFrame", at(0.0, 0.0, 0.0)));
+        let joint = d.dom.insert(
+            limb,
+            InstanceBuilder::new("Motor6D")
+                .with_property("Part0", limb)
+                .with_property("Part1", root)
+                .with_property("Transform", at(-1.0, 0.0, 0.0)),
+        );
+        let replicated = [root, limb, joint].into_iter().map(|r| (r, r)).collect();
+        d.mark_all();
+        let mut joints = ClientJoints::default();
+        joints.solve(&mut d, &replicated);
+        assert_eq!(cframe(&d, limb, "CFrame").unwrap().pos, Vec3::new(1.0, 5.0, 0.0));
+
+        d.dom.get_by_ref_mut(joint).unwrap().properties.insert(ustr("Transform"), Variant::CFrame(at(-2.0, 0.0, 0.0)));
+        d.mark_prop(joint, ustr("Transform"));
+        joints.solve(&mut d, &replicated);
+        assert_eq!(cframe(&d, limb, "CFrame").unwrap().pos, Vec3::new(2.0, 5.0, 0.0));
     }
 
     /// An anchored root moved by script carries a client-made limb with it.

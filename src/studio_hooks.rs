@@ -48,6 +48,10 @@ struct StudioGameHost<'a> {
 }
 
 impl GameHost for StudioGameHost<'_> {
+    fn play_worker_host(&self) -> Box<dyn GameHost + Send> {
+        Box::new(self.plugins.play_worker_plugins())
+    }
+
     fn document_changed(&mut self, doc: &Document) {
         self.explorer.expand_defaults(doc);
         *self.drag = None;
@@ -101,7 +105,15 @@ impl Editor {
             && rustudio_core::rustudio_settings::studio_flag("Studio", "Clear Output On Start", true);
         let live_ids = self.live_team_create_ids();
         self.game.keep_game_settings = self.harness.keeps_game_settings();
-        self.with_game_host(|game, host| game.start_play(mode, host, clear_output, live_ids));
+        // Deterministic editor self-tests inspect intermediate VM state.
+        let threaded = self.game.use_gameplay_worker() && self.harness.selftest.is_none();
+        self.with_game_host(|game, host| {
+            if threaded {
+                game.start_play_threaded(mode, host, clear_output, live_ids);
+            } else {
+                game.start_play(mode, host, clear_output, live_ids);
+            }
+        });
     }
 
     pub fn stop_play(&mut self) {

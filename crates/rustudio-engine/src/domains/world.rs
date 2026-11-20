@@ -260,7 +260,7 @@ pub(crate) mod util {
         Ok(LVector3(v).into_value())
     }
     pub fn cframe(lua: &Lua, x: Xform) -> mlua::Result<Value> {
-        Ok(Value::UserData(lua.create_userdata(LCFrame(x))?))
+        Ok(LCFrame(x).into_lua(lua)?)
     }
     pub fn num_arg(args: &MultiValue, i: usize) -> Option<f64> {
         crate::ltypes::num(&arg(args, i))

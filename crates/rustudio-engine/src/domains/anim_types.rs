@@ -128,11 +128,7 @@ pub fn cast_name(v: &Value) -> String {
         Value::String(_) => "string".into(),
         Value::Table(_) => "table".into(),
         Value::Function(_) => "function".into(),
-        Value::UserData(u) => u
-            .metatable()
-            .ok()
-            .and_then(|m| m.get::<String>("__type").ok())
-            .unwrap_or_else(|| "userdata".into()),
+        Value::UserData(u) => crate::ltypes::userdata_type_name(u),
         other => other.type_name().into(),
     }
 }
@@ -149,7 +145,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 ref v => return Err(rt_err(format!("Unable to cast {} to float", cast_name(v)))),
             };
             let rot = match &cf {
-                Value::UserData(u) => u.borrow::<LCFrame>().map(|c| c.0.rot).ok(),
+                Value::UserData(u) => crate::ltypes::cframe_of(u).map(|c| c.rot),
                 _ => None,
             }
             .ok_or_else(|| rt_err(format!("Unable to cast {} to CoordinateFrame", cast_name(&cf))))?;

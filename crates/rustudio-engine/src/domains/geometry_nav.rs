@@ -413,11 +413,59 @@ fn column_interval(o: &Obstacle, x: f32, z: f32) -> Option<(f32, f32)> {
     (lo <= hi).then_some((lo, hi))
 }
 
-fn obstacles(doc: &Document, labels: &mut Vec<String>, lo: Vec2, hi: Vec2) -> (Vec<Obstacle>, Vec<(Xform, Vec3, u16)>) {
+/// What a field reads besides the document's own tree, kept current by the
+/// world-query cache (runtime_ext.rs `nav_world`): the Workspace parts near
+/// the field's box, and Workspace.Terrain's voxels. Without them (`None`)
+/// the field walks every instance under Workspace and decodes the terrain,
+/// which in a 56k-instance place took ~35 ms per path request and per
+/// Blocked re-check (a game: a stutter every half second while a bot walks).
+#[derive(Default)]
+pub struct NavWorld {
+    /// The parts whose bounds meet the box (with a margin), in a stable
+    /// order; None: scan Workspace.
+    pub parts: Option<Vec<Ref>>,
+    /// The terrain voxels with their voxel bounds (inclusive), Some(None):
+    /// no terrain; None: decode them.
+    pub voxels: Option<Option<(std::sync::Arc<rustudio_core::terrain::Voxels>, ([i32; 3], [i32; 3]))>>,
+}
+
+/// What a field reads from the place, owned (Send): the obstacles in its
+/// box, the modifier volumes and labels they named, the terrain.
+struct FieldInput {
+    obs: Vec<Obstacle>,
+    modifiers: Vec<(Xform, Vec3, u16)>,
+    labels: Vec<String>,
+    voxels: Option<(std::sync::Arc<rustudio_core::terrain::Voxels>, ([i32; 3], [i32; 3]))>,
+}
+
+impl FieldInput {
+    fn gather(doc: &Document, world: &NavWorld, lo: Vec2, hi: Vec2) -> FieldInput {
+        let mut labels = Vec::new();
+        let (obs, modifiers) = obstacles(doc, &mut labels, lo, hi, world.parts.as_deref());
+        let voxels = match &world.voxels {
+            Some(v) => v.clone(),
+            None => rustudio_core::terrain::Voxels::from_dom(&doc.dom)
+                .and_then(Result::ok)
+                .filter(|v| v.count() > 0)
+                .and_then(|v| v.bounds().map(|b| (std::sync::Arc::new(v), b))),
+        };
+        FieldInput { obs, modifiers, labels, voxels }
+    }
+}
+
+/// Margin around a field's box for the grid's candidates: the grid boxes
+/// an off-centre union where its geometry is, the field where its CFrame is.
+pub const NAV_NEAR_PAD: f32 = 16.0;
+
+fn obstacles(doc: &Document, labels: &mut Vec<String>, lo: Vec2, hi: Vec2, near: Option<&[Ref]>) -> (Vec<Obstacle>, Vec<(Xform, Vec3, u16)>) {
     let mut out = Vec::new();
     let mut mods = Vec::new();
     let Some(ws) = doc.workspace() else { return (out, mods) };
-    for r in doc.subtree(ws) {
+    let all = match near {
+        Some(list) => list.to_vec(),
+        None => doc.subtree(ws),
+    };
+    for r in all {
         let Some(class) = doc.class_of(r) else { continue };
         if !doc::is_a(&class, "BasePart") || class == "Terrain" {
             continue;
@@ -481,12 +529,24 @@ impl Field {
 
     /// Builds the heightfield for [lo, hi] (horizontal x, z) with cell `cs`.
     pub fn build(doc: &Document, lo: Vec2, hi: Vec2, cs: f32, ylo: f32, yhi: f32, agent: &Agent) -> Field {
+        Self::build_in(doc, &NavWorld::default(), lo, hi, cs, ylo, yhi, agent)
+    }
+
+    /// `build` with the parts near the box and the terrain from `world`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_in(doc: &Document, world: &NavWorld, lo: Vec2, hi: Vec2, cs: f32, ylo: f32, yhi: f32, agent: &Agent) -> Field {
+        let g = FieldInput::gather(doc, world, lo, hi);
+        Self::rasterise(&g, lo, hi, cs, ylo, yhi, agent)
+    }
+
+    /// The field from gathered inputs (no document: a worker can run it).
+    fn rasterise(g: &FieldInput, lo: Vec2, hi: Vec2, cs: f32, ylo: f32, yhi: f32, agent: &Agent) -> Field {
         let nx = (((hi.x - lo.x) / cs).ceil() as usize).max(1);
         let nz = (((hi.y - lo.y) / cs).ceil() as usize).max(1);
-        let mut labels = Vec::new();
-        let (obs, modifiers) = obstacles(doc, &mut labels, lo, hi);
+        let mut labels = g.labels.clone();
+        let (obs, modifiers) = (&g.obs, g.modifiers.clone());
         let mut spans: Vec<Vec<Span>> = vec![Vec::new(); nx * nz];
-        for o in &obs {
+        for o in obs {
             let ext = o.xf.rot.x_axis.abs() * o.half.x + o.xf.rot.y_axis.abs() * o.half.y + o.xf.rot.z_axis.abs() * o.half.z;
             if o.xf.pos.y + ext.y < ylo || o.xf.pos.y - ext.y > yhi {
                 continue;
@@ -509,15 +569,20 @@ impl Field {
             }
         }
         // Terrain: solid voxels (and water, walkable, labelled Water).
-        if let Some(Ok(v)) = rustudio_core::terrain::Voxels::from_dom(&doc.dom) {
+        // (Only the columns and heights inside the terrain's voxel bounds:
+        // outside them every voxel is empty.)
+        if let Some((v, (blo, bhi))) = g.voxels.as_ref().map(|(v, b)| (&**v, *b)) {
             if v.count() > 0 {
-                let vy0 = (ylo / rustudio_core::terrain::VOXEL).floor() as i32;
-                let vy1 = (yhi / rustudio_core::terrain::VOXEL).ceil() as i32;
+                let vy0 = ((ylo / rustudio_core::terrain::VOXEL).floor() as i32).max(blo[1]);
+                let vy1 = ((yhi / rustudio_core::terrain::VOXEL).ceil() as i32).min(bhi[1]);
                 for iz in 0..nz {
                     for ix in 0..nx {
                         let c = lo + Vec2::new((ix as f32 + 0.5) * cs, (iz as f32 + 0.5) * cs);
                         let vx = (c.x / rustudio_core::terrain::VOXEL).floor() as i32;
                         let vz = (c.y / rustudio_core::terrain::VOXEL).floor() as i32;
+                        if vx < blo[0] || vx > bhi[0] || vz < blo[2] || vz > bhi[2] || vy0 > vy1 {
+                            continue;
+                        }
                         let mut run: Option<(f32, f32, u8)> = None;
                         let col = &mut spans[iz * nx + ix];
                         for vy in vy0..=vy1 {
@@ -724,10 +789,11 @@ struct Link {
 fn links(doc: &Document) -> Vec<(Link, bool)> {
     let mut out = Vec::new();
     let Some(ws) = doc.workspace() else { return out };
-    for r in doc.subtree(ws) {
-        if doc.class_of(r).is_none_or(|c| c != "PathfindingLink") {
-            continue;
-        }
+    // (The interned class straight off each instance: a walk of a 56k
+    // instance Workspace per path request.)
+    let class = rbx_dom_weak::ustr("PathfindingLink");
+    let found: Vec<Ref> = doc.dom.descendants_of(ws).filter(|i| i.class == class).map(|i| i.referent()).collect();
+    for r in found {
         let att = |k: &str| match doc.prop(r, k) {
             Some(Variant::Ref(a)) if !a.is_none() => rustudio_core::attachment::world(doc, a, true).map(|x| x.pos),
             _ => None,
@@ -746,10 +812,9 @@ fn links(doc: &Document) -> Vec<(Link, bool)> {
 fn trusses(doc: &Document, lo: Vec2, hi: Vec2) -> Vec<(Xform, Vec3)> {
     let mut out = Vec::new();
     let Some(ws) = doc.workspace() else { return out };
-    for r in doc.subtree(ws) {
-        if doc.class_of(r).is_none_or(|c| c != "TrussPart") {
-            continue;
-        }
+    let class = rbx_dom_weak::ustr("TrussPart");
+    let found: Vec<Ref> = doc.dom.descendants_of(ws).filter(|i| i.class == class).map(|i| i.referent()).collect();
+    for r in found {
         let (Some(xf), Some(size)) = (rustudio_render::scene::xform_of(doc, r), rustudio_render::scene::vec3_of(doc.prop(r, "Size"))) else { continue };
         if xf.pos.x < lo.x || xf.pos.x > hi.x || xf.pos.z < lo.y || xf.pos.z > hi.y {
             continue;
@@ -808,8 +873,8 @@ fn ground(f: &Field, p: Vec2, h: f32) -> Option<f32> {
     f.cells[i].iter().map(|n| n.h).min_by(|a, b| (a - h).abs().total_cmp(&(b - h).abs()))
 }
 
-pub fn solve(doc: &Document, agent: &Agent, start: Vec3, finish: Vec3) -> Solved {
-    let fail = Solved { status: S_NO_PATH, waypoints: Vec::new() };
+/// A path request's field: horizontal box, cell size and height range.
+fn request_field(start: Vec3, finish: Vec3) -> (Vec2, Vec2, f32, f32, f32) {
     let d = Vec2::new(finish.x - start.x, finish.z - start.z).length();
     let margin = 48.0 + d * 0.25;
     let lo = Vec2::new(start.x.min(finish.x), start.z.min(finish.z)) - Vec2::splat(margin);
@@ -818,12 +883,63 @@ pub fn solve(doc: &Document, agent: &Agent, start: Vec3, finish: Vec3) -> Solved
     let cs = (span / 512.0).max(1.0);
     let ylo = start.y.min(finish.y) - SNAP_BELOW - 64.0;
     let yhi = start.y.max(finish.y) + 96.0;
-    let f = Field::build(doc, lo, hi, cs, ylo, yhi, agent);
+    (lo, hi, cs, ylo, yhi)
+}
+
+/// The world box (studs) `world` must cover for a field.
+fn near_box(lo: Vec2, hi: Vec2, ylo: f32, yhi: f32) -> (Vec3, Vec3) {
+    (Vec3::new(lo.x, ylo, lo.y) - Vec3::splat(NAV_NEAR_PAD), Vec3::new(hi.x, yhi, hi.y) + Vec3::splat(NAV_NEAR_PAD))
+}
+
+pub fn solve(doc: &Document, agent: &Agent, start: Vec3, finish: Vec3) -> Solved {
+    solve_in(doc, &NavWorld::default(), agent, start, finish)
+}
+
+pub fn solve_in(doc: &Document, world: &NavWorld, agent: &Agent, start: Vec3, finish: Vec3) -> Solved {
+    NavInput::gather(doc, world, agent, start, finish).solve()
+}
+
+/// A path request with everything it reads from the place, taken on the
+/// main thread; `solve` needs no document, so the search runs on a worker
+/// while the calling script yields (Studio's ComputeAsync).
+pub struct NavInput {
+    agent: Agent,
+    start: Vec3,
+    finish: Vec3,
+    field: FieldInput,
+    links: Vec<(Link, bool)>,
+    trusses: Vec<(Xform, Vec3)>,
+}
+
+impl NavInput {
+    pub fn gather(doc: &Document, world: &NavWorld, agent: &Agent, start: Vec3, finish: Vec3) -> NavInput {
+        let (lo, hi, ..) = request_field(start, finish);
+        let climb = agent.can_climb && agent.costs.get("Climb").copied().unwrap_or(1.0).is_finite();
+        NavInput {
+            agent: agent.clone(),
+            start,
+            finish,
+            field: FieldInput::gather(doc, world, lo, hi),
+            links: links(doc),
+            trusses: if climb { trusses(doc, lo, hi) } else { Vec::new() },
+        }
+    }
+
+    pub fn solve(self) -> Solved {
+        solve_gathered(&self)
+    }
+}
+
+fn solve_gathered(input: &NavInput) -> Solved {
+    let (agent, start, finish) = (&input.agent, input.start, input.finish);
+    let fail = Solved { status: S_NO_PATH, waypoints: Vec::new() };
+    let (lo, hi, cs, ylo, yhi) = request_field(start, finish);
+    let f = Field::rasterise(&input.field, lo, hi, cs, ylo, yhi, agent);
     let Some(s) = snap(&f, agent, start) else { return fail };
     let Some(g) = snap(&f, agent, finish) else { return fail };
 
     // Links snapped onto the field.
-    let all_links = links(doc);
+    let all_links = &input.links;
     let mut link_edges: HashMap<(usize, usize), Vec<((usize, usize), usize)>> = HashMap::new();
     for (li, (l, bi)) in all_links.iter().enumerate() {
         if let (Some(a), Some(b)) = (snap(&f, agent, l.a), snap(&f, agent, l.b)) {
@@ -841,7 +957,7 @@ pub fn solve(doc: &Document, agent: &Agent, start: Vec3, finish: Vec3) -> Solved
     let mut climb_edges: HashMap<(usize, usize), Vec<((usize, usize), usize)>> = HashMap::new();
     let mut climb_points: Vec<Vec3> = Vec::new();
     if agent.can_climb && climb_cost.is_finite() {
-        for (xf, half) in trusses(doc, lo, hi) {
+        for &(xf, half) in &input.trusses {
             let ext = xf.rot.x_axis.abs() * half.x + xf.rot.y_axis.abs() * half.y + xf.rot.z_axis.abs() * half.z;
             let (bottom, top) = (xf.pos.y - ext.y, xf.pos.y + ext.y);
             let foot = Vec2::new(ext.x, ext.z).max_element();
@@ -1151,11 +1267,9 @@ fn string_pull(f: &Field, agent: &Agent, pts: &[Vec3], relax_first: f32) -> Vec<
 
 /// CheckOcclusionAsync: the first waypoint after `start` (1-based) that is
 /// now obstructed, or -1.
-fn occlusion(doc: &Document, data: &PathData, start: usize) -> i64 {
+/// A computed path's re-check field: horizontal box, cell size and height range.
+fn occlusion_field(data: &PathData) -> (Vec2, Vec2, f32, f32, f32) {
     let w = &data.waypoints;
-    if w.is_empty() {
-        return -1;
-    }
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     let (mut ylo, mut yhi) = (f32::MAX, f32::MIN);
@@ -1169,7 +1283,26 @@ fn occlusion(doc: &Document, data: &PathData, start: usize) -> i64 {
     let lo = lo - Vec2::splat(pad);
     let hi = hi + Vec2::splat(pad);
     let cs = ((hi - lo).max_element() / 512.0).max(1.0);
-    let f = Field::build(doc, lo, hi, cs, ylo - 8.0, yhi + data.agent.height + 8.0, &data.agent);
+    (lo, hi, cs, ylo - 8.0, yhi + data.agent.height + 8.0)
+}
+
+/// The world near a computed path's re-check field (runtime_ext.rs).
+fn occlusion_world(lua: &Lua, data: &PathData) -> mlua::Result<NavWorld> {
+    if data.waypoints.is_empty() {
+        return Ok(NavWorld::default());
+    }
+    let (lo, hi, _, ylo, yhi) = occlusion_field(data);
+    let (a, b) = near_box(lo, hi, ylo, yhi);
+    crate::runtime::ext::nav_world(lua, a, b)
+}
+
+fn occlusion(doc: &Document, world: &NavWorld, data: &PathData, start: usize) -> i64 {
+    let w = &data.waypoints;
+    if w.is_empty() {
+        return -1;
+    }
+    let (lo, hi, cs, ylo, yhi) = occlusion_field(data);
+    let f = Field::build_in(doc, world, lo, hi, cs, ylo, yhi, &data.agent);
     for (i, p) in w.iter().enumerate().skip(start) {
         if f.obstructed(p.pos, &data.agent) {
             return i as i64 + 1;
@@ -1277,7 +1410,8 @@ fn v3(v: &Value) -> Option<Vec3> {
     ud_of::<LVector3>(v).map(|v| v.0)
 }
 
-fn compute(lua: &Lua, r: Ref, start: Vec3, finish: Vec3) -> mlua::Result<()> {
+/// Starts a path request (`finish_job` lands it): the request's id.
+fn compute(lua: &Lua, r: Ref, start: Vec3, finish: Vec3) -> mlua::Result<u64> {
     let agent = paths(lua, |p| p.get(&r).map(|d| d.agent.clone())).unwrap_or_default();
     if start.distance(finish) > MAX_REQUEST {
         paths(lua, |p| {
@@ -1288,20 +1422,137 @@ fn compute(lua: &Lua, r: Ref, start: Vec3, finish: Vec3) -> mlua::Result<()> {
         });
         return Err(rt_err("PathfindingService: path request is too long."));
     }
-    let (solved, rev) = {
+    let near = {
+        let (lo, hi, _, ylo, yhi) = request_field(start, finish);
+        let (a, b) = near_box(lo, hi, ylo, yhi);
+        crate::runtime::ext::nav_world(lua, a, b)?
+    };
+    // The place is read here, on the main thread; the field and the
+    // search run on a worker while the calling script yields.
+    let (input, rev) = {
         let w = world(lua)?;
         let d = w.d();
-        (solve(d, &agent, start, finish), d.revision)
+        (NavInput::gather(d, &near, &agent, start, finish), d.revision)
     };
-    paths(lua, |p| {
-        if let Some(d) = p.get_mut(&r) {
-            d.status = solved.status;
-            d.waypoints = solved.waypoints;
-            d.blocked = None;
-            d.checked_rev = rev;
-        }
+    let (tx, rx) = std::sync::mpsc::channel();
+    path_pool(Box::new(move || {
+        #[cfg(test)]
+        SOLVED_OFF_MAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = tx.send(input.solve());
+    }));
+    let id = jobs(lua, |j| {
+        j.next += 1;
+        let id = j.next;
+        j.live.insert(id, Job { path: r, rev, rx });
+        j.latest.insert(r, id);
+        id
     });
-    Ok(())
+    Ok(id)
+}
+
+type PathTask = Box<dyn FnOnce() + Send>;
+
+/// The path search workers: `PATH_WORKERS` threads taking requests in the
+/// order they were made (a bot's ring of probes doesn't start nine threads
+/// against the physics workers). A request is run here if none can start.
+fn path_pool(task: PathTask) {
+    const PATH_WORKERS: usize = 2;
+    static POOL: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<PathTask>>>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathTask>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let mut started = 0;
+        for i in 0..PATH_WORKERS {
+            let rx = rx.clone();
+            let ok = std::thread::Builder::new()
+                .name(format!("rustudio-path-{i}"))
+                .spawn(move || loop {
+                    let next = rx.lock().ok().and_then(|r| r.recv().ok());
+                    match next {
+                        Some(t) => t(),
+                        None => break,
+                    }
+                })
+                .is_ok();
+            started += ok as usize;
+        }
+        (started > 0).then(|| std::sync::Mutex::new(tx))
+    });
+    let mut task = task;
+    if let Some(Ok(tx)) = pool.as_ref().map(|p| p.lock()) {
+        match tx.send(task) {
+            Ok(()) => return,
+            Err(e) => task = e.0,
+        }
+    }
+    task();
+}
+
+/// Requests solved on a worker thread (tests).
+#[cfg(test)]
+pub(crate) static SOLVED_OFF_MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A path request on a worker (`compute`).
+struct Job {
+    path: Ref,
+    /// The document revision the inputs were read at.
+    rev: u64,
+    rx: std::sync::mpsc::Receiver<Solved>,
+}
+
+#[derive(Default)]
+struct Jobs {
+    next: u64,
+    live: HashMap<u64, Job>,
+    /// Each path's newest request: an older one finishing later is dropped.
+    latest: HashMap<Ref, u64>,
+}
+
+fn jobs<R>(lua: &Lua, f: impl FnOnce(&mut Jobs) -> R) -> R {
+    if lua.app_data_ref::<Jobs>().is_none() {
+        lua.set_app_data(Jobs::default());
+    }
+    let mut g = lua.app_data_mut::<Jobs>().expect("path jobs");
+    f(&mut g)
+}
+
+/// Whether request `id` is done, its result now on its path (a worker's
+/// result is taken as it is there; under --fixed-dt it is waited for, so a
+/// replay resumes the script on the same frame however busy the machine).
+fn finish_job(lua: &Lua, id: u64) -> bool {
+    let Some(job) = jobs(lua, |j| j.live.remove(&id)) else { return true };
+    // (The engine's own tests step back to back: they wait too.)
+    let got = if cfg!(test) {
+        job.rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected)
+    } else {
+        rustudio_core::sim_clock::job_recv(&job.rx)
+    };
+    let solved = match got {
+        Ok(s) => s,
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            jobs(lua, |j| j.live.insert(id, job));
+            return false;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Solved { status: S_NO_PATH, waypoints: Vec::new() },
+    };
+    let newest = jobs(lua, |j| {
+        let newest = j.latest.get(&job.path) == Some(&id);
+        if newest {
+            j.latest.remove(&job.path);
+        }
+        newest
+    });
+    if newest {
+        paths(lua, |p| {
+            if let Some(d) = p.get_mut(&job.path) {
+                d.status = solved.status;
+                d.waypoints = solved.waypoints;
+                d.blocked = None;
+                d.checked_rev = job.rev;
+            }
+        });
+    }
+    true
 }
 
 fn one(v: Value) -> mlua::Result<MultiValue> {
@@ -1361,14 +1612,14 @@ fn nav_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result
                 }
             }
             let r = new_path(lua, Agent::default())?;
-            compute(lua, r, s, e)?;
-            one(inst_value(lua, r)?)
+            let id = compute(lua, r, s, e)?;
+            Ok(MultiValue::from_iter([Value::Number(id as f64), inst_value(lua, r)?]))
         }
         "ComputeAsync" => {
             let s = v3(&arg(args, 0)).ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
             let e = v3(&arg(args, 1)).ok_or_else(|| rt_err("Argument 2 missing or nil"))?;
-            compute(lua, this, s, e)?;
-            Ok(MultiValue::new())
+            let id = compute(lua, this, s, e)?;
+            Ok(MultiValue::from_iter([Value::Number(id as f64)]))
         }
         "CheckOcclusionAsync" => {
             let start = cast_float(&arg(args, 0))?.ok_or_else(|| rt_err("Argument 1 missing or nil"))?;
@@ -1376,9 +1627,10 @@ fn nav_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result
             if start < 1.0 || start as usize > data.waypoints.len() {
                 return Err(rt_err("Start point value is invalid"));
             }
+            let near = occlusion_world(lua, &data)?;
             let w = world(lua)?;
-            let v = occlusion(w.d(), &data, start as usize);
-            one(Value::Number(v as f64))
+            let v = occlusion(w.d(), &near, &data, start as usize);
+            Ok(MultiValue::from_iter([Value::Boolean(false), Value::Number(v as f64)]))
         }
         _ => Ok(MultiValue::new()),
     }
@@ -1410,6 +1662,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     g.set("PathWaypoint", pw)?;
+    g.set("__geo_nav_done", lua.create_function(|lua, id: f64| Ok(finish_job(lua, id as u64)))?)?;
     g.set(
         "__geo_nav",
         lua.create_function(|lua, (name, this, rest): (String, Value, MultiValue)| {
@@ -1429,12 +1682,19 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         r#"
 local M = __rs_lua_methods
 local nav = __geo_nav
+local done = __geo_nav_done
+-- (true, request id or false, results…): only the calling script waits
+-- for a request's search on its worker.
 for _, name in {"FindPathAsync", "ComputeRawPathAsync", "ComputeSmoothPathAsync", "ComputeAsync", "CheckOcclusionAsync"} do
     M[name] = function(self, ...)
         local r = table.pack(nav(name, self, ...))
         task.wait()
         if not r[1] then error(r[2], 0) end
-        return table.unpack(r, 2, r.n)
+        local job = r[2]
+        if job then
+            while not done(job) do task.wait() end
+        end
+        return table.unpack(r, 3, r.n)
     end
 end
 "#,
@@ -1448,6 +1708,11 @@ end
 /// when the world changed) and fire on a change of their first obstructed
 /// waypoint.
 pub fn step(lua: &Lua, _dt: f64) -> mlua::Result<()> {
+    // Requests whose script is gone (or not yet back) land here too.
+    let live: Vec<u64> = jobs(lua, |j| j.live.keys().copied().collect());
+    for id in live {
+        finish_job(lua, id);
+    }
     let (rev, clock) = {
         let w = world(lua)?;
         (w.d().revision, w.time)
@@ -1465,9 +1730,10 @@ pub fn step(lua: &Lua, _dt: f64) -> mlua::Result<()> {
             paths(lua, |p| p.remove(&r));
             continue;
         }
+        let near = occlusion_world(lua, &d)?;
         let occ = {
             let w = world(lua)?;
-            occlusion(w.d(), &d, 0)
+            occlusion(w.d(), &near, &d, 0)
         };
         let now_blocked = (occ > 0).then_some(occ as usize);
         paths(lua, |p| {

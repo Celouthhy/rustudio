@@ -948,6 +948,13 @@ impl Humanoid {
         Force { force, torque, floor: floor_force, dv: Vec3::ZERO }
     }
 
+    /// Only Freefall's unstick force inspects the contact points.
+    pub(crate) fn needs_force_contacts(&self, body_y: f32) -> bool {
+        self.state == State::Freefall
+            && self.unstick_y - body_y <= UNSTICK_MIN_FALL
+            && (self.timer - self.unstick_t).abs() > UNSTICK_MAX_TIME
+    }
+
     /// Unstick: a body that hasn't fallen MinimumFreefall
     /// MoveDistanceInTenths (5) / 10 studs for MaximumFreefallMoveTimeInTenths
     /// (1) / 10 s is pushed away from its contact points at Gs × g, Gs
@@ -960,8 +967,7 @@ impl Humanoid {
         let y = b.pos.y;
         if self.unstick_y - y <= UNSTICK_MIN_FALL {
             self.unstick_gs = (self.unstick_gs + UNSTICK_GROWTH).min(UNSTICK_MAX_GS);
-            let elapsed = (self.timer - self.unstick_t).abs();
-            if elapsed > UNSTICK_MAX_TIME {
+            if self.needs_force_contacts(y) {
                 let mut sum = Vec3::ZERO;
                 let mut nsum = Vec3::ZERO;
                 let mut n = 0;

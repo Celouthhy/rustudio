@@ -1168,8 +1168,6 @@ dependencies = [
 [[package]]
 name = "egui-wgpu"
 version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cef1f6d1bba40b09a4d0d62cb822b81030922cfbf65c5373398c3a3caafc5bd"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1311,8 +1309,6 @@ dependencies = [
 [[package]]
 name = "epaint"
 version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0ec0308dc23130fc1a7d4623a8534c2ed069c6dc84e258ee4f3de99615aa1a3"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -4119,7 +4115,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "blake2",
  "blake3",
@@ -4136,6 +4132,7 @@ dependencies = [
  "glob",
  "image",
  "libc",
+ "log",
  "md-5",
  "mlua",
  "notify",
@@ -4178,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-account"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -4195,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-core"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4205,6 +4202,7 @@ dependencies = [
  "glam 0.30.10",
  "image",
  "libc",
+ "log",
  "objc2-foundation 0.3.2",
  "rbx_binary",
  "rbx_dom_weak",
@@ -4222,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-engine"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "blake2",
  "blake3",
@@ -4258,10 +4256,11 @@ dependencies = [
 
 [[package]]
 name = "rustudio-net"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "base64 0.23.1",
  "blake2",
+ "log",
  "md-5",
  "quinn",
  "rbx_binary",
@@ -4278,7 +4277,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-physics"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "flate2",
  "glam 0.30.10",
@@ -4292,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-player"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4319,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "rustudio-render"
-version = "0.3.2"
+version = "0.3.3-alpha.1"
 dependencies = [
  "blake3",
  "bytemuck",

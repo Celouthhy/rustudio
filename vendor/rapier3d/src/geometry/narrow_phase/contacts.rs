@@ -1,6 +1,5 @@
 //! `NarrowPhase::compute_contacts`: the per-step contact-update drivers
-//! (single-threaded loop and broadcast parallel-for over the update
-//! candidates), plus the deferred solver-graph coloring pass.
+//! (single-threaded loop and parallel blocks of update candidates), plus the deferred solver-graph coloring pass.
 
 use super::pair_update::{
     self, HintsPtr, OUTCOME_CLEARED_IN_GRAPH, OUTCOME_FULL, OUTCOME_FULL_COMPOSITE,
@@ -21,6 +20,16 @@ use crate::math::Real;
 #[cfg(all(feature = "parallel", feature = "unsync-callbacks"))]
 use crate::pipeline::ActiveHooks;
 use crate::pipeline::{ActiveEvents, EventHandler, PhysicsHooks};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+#[cfg(feature = "parallel")]
+#[derive(Default)]
+struct ContactUpdates {
+    dirty: Vec<u32>,
+    transitions: Vec<PairTransition>,
+    rebuild: bool,
+}
 
 impl NarrowPhase {
     pub(crate) fn compute_contacts(
@@ -43,6 +52,10 @@ impl NarrowPhase {
         // meshes (`None`: no soft contact detection, as in the collision pipeline).
         soft_bodies: Option<(&SoftBodySet, &IntegrationParameters)>,
     ) {
+        self.contact_epoch = self.contact_epoch.wrapping_add(1).max(1);
+        let contact_epoch = self.contact_epoch;
+        let skip_unmoved = self.skip_unmoved_pairs;
+        let cylinder_test = self.cylinder_separation_test;
         self.update_awake_body_mask(islands);
         let awake_body_mask = core::mem::take(&mut self.awake_body_mask);
         let soft_ctx = soft_bodies.map(|(soft_bodies, params)| SoftDetectionCtx {
@@ -63,8 +76,6 @@ impl NarrowPhase {
         let hints_ptr = &hints_ptr;
 
         let query_dispatcher = &*self.query_dispatcher;
-        #[cfg(feature = "parallel")]
-        let (snd, rcv) = std::sync::mpsc::channel();
 
         // Edges fully updated this step (bucket membership may have changed) for the
         // incremental maintenance of `solver_contact_graph`; the parallel path
@@ -103,6 +114,9 @@ impl NarrowPhase {
             pair_update::process_pair(
                 edge,
                 edge_id,
+                contact_epoch,
+                skip_unmoved,
+                cylinder_test,
                 prediction_distance,
                 dt,
                 contact_clustering,
@@ -126,10 +140,14 @@ impl NarrowPhase {
         #[cfg(feature = "parallel")]
         let process_pair = |edge: &mut crate::data::graph::Edge<ContactPair>,
                             edge_id: u32,
-                            hooks: &dyn PhysicsHooks| {
+                            hooks: &dyn PhysicsHooks,
+                            transitions: &mut Vec<PairTransition>| {
             pair_update::process_pair(
                 edge,
                 edge_id,
+                contact_epoch,
+                skip_unmoved,
+                cylinder_test,
                 prediction_distance,
                 dt,
                 contact_clustering,
@@ -143,7 +161,7 @@ impl NarrowPhase {
                 &awake_body_mask,
                 hints_ptr,
                 soft_ctx,
-                &snd,
+                transitions,
             )
         };
 
@@ -185,11 +203,8 @@ impl NarrowPhase {
         #[cfg(feature = "parallel")]
         {
             let edges_ptr = &crate::utils::SyncPtr(self.contact_graph.graph.edges.as_mut_ptr());
-            // Stats: (dirty edges, force-full-rebuild — see `OUTCOME_FULL_COMPOSITE`).
-            // Broadcast parallel-for: one broadcast wakes all pool threads at once, then they race
-            // a shared cursor for fixed blocks (rayon's split-and-steal ramp-up costs more than the update).
             let process_block =
-                |stats: &mut (Vec<u32>, bool), chunk: &[u32], hooks: &dyn PhysicsHooks| {
+                |updates: &mut ContactUpdates, chunk: &[u32], hooks: &dyn PhysicsHooks| {
                     for (i, id) in chunk.iter().enumerate() {
                         if let Some(next_id) = chunk.get(i + PREFETCH_AHEAD) {
                             crate::utils::prefetch_read::<2, _>(
@@ -199,13 +214,13 @@ impl NarrowPhase {
                         // SAFETY: `update_candidates` is deduplicated, so each edge is
                         //         accessed by exactly one iteration.
                         let edge = unsafe { &mut *edges_ptr.add(*id as usize) };
-                        match process_pair(edge, *id, hooks) {
+                        match process_pair(edge, *id, hooks, &mut updates.transitions) {
                             OUTCOME_RECYCLED_REQUALIFIED | OUTCOME_FULL => {
-                                stats.0.push(*id);
+                                updates.dirty.push(*id);
                             }
                             OUTCOME_FULL_COMPOSITE | OUTCOME_CLEARED_IN_GRAPH => {
-                                stats.0.push(*id);
-                                stats.1 = true;
+                                updates.dirty.push(*id);
+                                updates.rebuild = true;
                             }
                             _ => {}
                         }
@@ -238,62 +253,52 @@ impl NarrowPhase {
             #[cfg(feature = "unsync-callbacks")]
             let worker_hooks = &();
 
-            const BLOCK: usize = 64;
-            #[allow(unused_mut)]
-            let (mut dirty, mut force_full_rebuild) = if update_candidates.len() > BLOCK {
-                let cursor = core::sync::atomic::AtomicUsize::new(0);
-                let candidates = &update_candidates[..];
-                let per_thread = rayon::broadcast(|_| {
-                    let mut stats = (Vec::new(), false);
-                    loop {
-                        let start = cursor.fetch_add(BLOCK, core::sync::atomic::Ordering::Relaxed);
-                        if start >= candidates.len() {
-                            break;
-                        }
-                        let end = (start + BLOCK).min(candidates.len());
-                        process_block(&mut stats, &candidates[start..end], worker_hooks);
-                    }
-                    stats
-                });
-                per_thread
-                    .into_iter()
-                    .fold((Vec::new(), false), |mut a, mut b| {
-                        a.0.append(&mut b.0);
-                        a.1 |= b.1;
-                        a
-                    })
-            } else {
-                let mut stats = (Vec::new(), false);
-                process_block(&mut stats, &update_candidates, worker_hooks);
-                stats
+            // Small ticks run on the caller. Larger ticks expose whole chunks to
+            // work stealing without requiring every worker to rendezvous each tick.
+            const BLOCK: usize = 128;
+            let mut updates = ContactUpdates {
+                dirty: core::mem::take(&mut self.solver_graph_dirty),
+                ..ContactUpdates::default()
             };
+            updates.dirty.clear();
+            if update_candidates.len() >= 2 * BLOCK && rayon::current_num_threads() > 1 {
+                let blocks: Vec<_> = update_candidates
+                    .par_chunks(BLOCK)
+                    .map(|chunk| {
+                        let mut block = ContactUpdates::default();
+                        process_block(&mut block, chunk, worker_hooks);
+                        block
+                    })
+                    .collect();
+                for mut block in blocks {
+                    updates.dirty.append(&mut block.dirty);
+                    updates.transitions.append(&mut block.transitions);
+                    updates.rebuild |= block.rebuild;
+                }
+            } else {
+                process_block(&mut updates, &update_candidates, worker_hooks);
+            }
             // The pairs held back above, on this thread: the only place a user hook runs.
             #[cfg(feature = "unsync-callbacks")]
             {
-                let mut stats = (dirty, force_full_rebuild);
-                process_block(&mut stats, &hooked, hooks);
-                (dirty, force_full_rebuild) = stats;
+                process_block(&mut updates, &hooked, hooks);
                 update_candidates.extend_from_slice(&hooked);
             }
-            // The reduce order is scheduler-dependent: sort so the fully-updated
-            // edge list is deterministic.
-            dirty.sort_unstable();
-            self.solver_graph_dirty = dirty;
-            if force_full_rebuild {
+            // Canonical edge order keeps the solver independent of the dispatch path.
+            updates.dirty.sort_unstable();
+            self.solver_graph_dirty = updates.dirty;
+            self.apply_pair_transitions(
+                &mut updates.transitions,
+                islands,
+                bodies,
+                colliders,
+                events,
+            );
+            if updates.rebuild {
                 // A composite pair rebuilt its manifolds: invalidate the graph so
                 // the next maintenance pass rebuilds it from scratch.
                 self.solver_graph_valid = false;
             }
-        }
-
-        #[cfg(feature = "parallel")]
-        {
-            drop(snd);
-            // The channel yields transitions in worker-completion order: collect
-            // them so the apply pass can sort (it mutates persistent island and
-            // coloring state whose layout must not depend on the schedule).
-            let mut transitions: Vec<PairTransition> = rcv.iter().collect();
-            self.apply_pair_transitions(&mut transitions, islands, bodies, colliders, events);
         }
 
         // The self contacts, once the transitions woke the bodies a new pair touches (the context

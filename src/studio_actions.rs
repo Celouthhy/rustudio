@@ -70,7 +70,6 @@ impl Editor {
     /// (enabled, checked) of a menu / ribbon action.
     pub fn action_state(&self, a: &str) -> (bool, Option<bool>) {
         let sel = !self.game.doc.selection.is_empty();
-        let parts = !self.selected_parts().is_empty();
         let playing = self.game.play.is_some();
         let edit = !playing;
         let open = |n: &str| Some(self.ui.panels_open.contains(n));
@@ -90,7 +89,7 @@ impl Editor {
             a if a.starts_with("toolbox:") => (true, None),
             "character" => (edit, Some(self.chars.open)),
             a if a.starts_with("character:") => (edit, None),
-            "about" | "exit" | "studio_settings" => (true, None),
+            "about" | "exit" | "studio_settings" | "logs_folder" => (true, None),
             "customize_shortcuts" => (true, Some(self.plugin_bar.shortcuts.open)),
             a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") => (true, None),
             "undo" => (edit && self.game.doc.can_undo().is_some(), None),
@@ -107,8 +106,11 @@ impl Editor {
                     .any(|r| matches!(self.game.doc.class_of(*r).as_deref(), Some("Model" | "Folder"))),
                 None,
             ),
-            "lock" => (edit && parts, Some(parts && self.all_parts("Locked"))),
-            "anchor" => (edit && parts, Some(parts && self.all_parts("Anchored"))),
+            "lock" | "anchor" => {
+                let parts = self.selected_parts();
+                let prop = if a == "lock" { "Locked" } else { "Anchored" };
+                (edit && !parts.is_empty(), Some(!parts.is_empty() && self.parts_have(&parts, prop)))
+            }
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
             "full_screen" => (true, Some(self.game.fullscreen)),
@@ -144,8 +146,7 @@ impl Editor {
             "transform" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => (true, None),
             "part" | "part_block" | "part_sphere" | "part_wedge" | "part_corner" | "part_cylinder" => (edit, None),
             "gui" | "script" => (edit, None),
-            "effect" | "attachment" => (edit && parts, None),
-            "material" | "color" => (edit && parts, None),
+            "effect" | "attachment" | "material" | "color" => (edit && self.has_selected_parts(), None),
             "weld" => (edit && self.selected_parts().len() >= 2, None),
             "ui_frame" | "ui_label" | "ui_input" | "ui_appearance" | "ui_layout" | "ui_constraint" => {
                 (edit && self.gui_target().is_some(), None)
@@ -155,8 +156,11 @@ impl Editor {
     }
 
     pub fn all_parts(&self, prop: &str) -> bool {
-        self.selected_parts()
-            .iter()
+        self.parts_have(&self.selected_parts(), prop)
+    }
+
+    fn parts_have(&self, parts: &[Ref], prop: &str) -> bool {
+        parts.iter()
             .all(|r| matches!(self.game.doc.prop(*r, prop), Some(Variant::Bool(true))))
     }
 
@@ -244,6 +248,11 @@ impl Editor {
             "toolbox" => self.ui.panel_requests.push((Tab::Toolbox, None)),
             a if a.starts_with("toolbox:") => self.toolbox_action(a),
             "about" => self.ui.about = true,
+            "logs_folder" => {
+                if let Err(error) = rustudio_core::diagnostics::open_folder() {
+                    self.error(format!("Could not open the logs folder: {error}"));
+                }
+            }
             "studio_settings" => self.ui.studio_settings.open = true,
             "customize_shortcuts" => self.plugin_bar.shortcuts.open = true,
             // Harness: open on a page ("studio_settings:Physics"), or filling

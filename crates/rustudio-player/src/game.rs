@@ -24,6 +24,8 @@ pub struct Game {
     pub account: crate::account::Account,
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
+    pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
+    pub(crate) play_input_pose_due: bool,
     /// Fixed frame time for deterministic self-tests.
     pub fixed_dt: Option<f32>,
     /// The rig picker: Some(R15 / R6) is an explicit choice that wins over
@@ -54,6 +56,9 @@ pub struct Game {
     pub grab_use_confined: bool,
     pub render_state: Option<egui_wgpu::RenderState>,
     pub renderer: Option<Renderer>,
+    pub(crate) automatic_quality: rustudio_render::quality::Automatic,
+    pub(crate) quality_frame_at: Option<(std::time::Instant, bool)>,
+    pub(crate) quality_cpu_ms: f32,
     /// The document's Highlights, kept from its change journal (viewport.rs).
     pub highlight_index: Option<rustudio_core::doc::ClassIndex>,
     /// ParticleEmitters, Beams and Trails (round 25).
@@ -96,6 +101,7 @@ pub struct Game {
     /// are built.
     pub terrain_grass_chunks: std::collections::HashSet<[i32; 3]>,
     pub terrain_grass_built: std::collections::HashSet<[i32; 3]>,
+    pub terrain_grass_density: f32,
     pub terrain_grass_length: f32,
     /// The water look last drawn (WaterColor, WaterTransparency, WaterReflectance).
     pub terrain_water_look: Option<([u8; 3], f32, f32)>,
@@ -131,6 +137,8 @@ impl Game {
             log: Vec::new(),
             account: crate::account::Account::new(),
             play: None,
+            play_thread: None,
+            play_input_pose_due: false,
             fixed_dt: None,
             play_rig: None,
             play_shows_client: true,
@@ -150,6 +158,9 @@ impl Game {
             grab_use_confined: !rustudio_engine::mouse_lock::platform_locks(),
             render_state,
             renderer,
+            automatic_quality: Default::default(),
+            quality_frame_at: None,
+            quality_cpu_ms: 0.0,
             highlight_index: None,
             effects: Default::default(),
             meshes: Default::default(),
@@ -173,6 +184,7 @@ impl Game {
             terrain_present: [false; 23],
             terrain_grass_chunks: Default::default(),
             terrain_grass_built: Default::default(),
+            terrain_grass_density: -1.0,
             terrain_grass_length: -1.0,
             terrain_water_look: None,
             water_waves: Default::default(),
@@ -210,6 +222,17 @@ impl Game {
             level,
             text,
         });
+        self.trim_output();
+    }
+
+    pub(crate) fn append_play_output(&mut self, lines: Vec<LogLine>) {
+        if !lines.is_empty() {
+            self.log.extend(lines);
+            self.trim_output();
+        }
+    }
+
+    fn trim_output(&mut self) {
         // Studio Settings > Output > Maximum Output Lines (5000: past it the
         // oldest fifth goes).
         let max = max_output_lines().clamp(10.0, 1e7) as usize;
@@ -323,6 +346,14 @@ fn max_output_lines() -> f64 {
 /// The Studio services a play session can call. A standalone session uses
 /// the defaults, with no plug-ins or editor chrome.
 pub trait GameHost {
+    /// Session services that can run on a gameplay worker. The editor
+    /// supplies detached plugin load specifications and a UI publication sink.
+    fn play_worker_host(&self) -> Box<dyn GameHost + Send> {
+        Box::new(())
+    }
+    fn capture_play_ui(&mut self, _game: &mut Game) -> Option<Box<dyn FnOnce() + Send>> {
+        None
+    }
     fn document_changed(&mut self, _doc: &Document) {}
     fn load_plugins(&mut self, _runtime: &rustudio_engine::runtime::Runtime) {}
     fn unload_plugins(&mut self, _runtime: &rustudio_engine::runtime::Runtime) {}

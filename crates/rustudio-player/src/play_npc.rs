@@ -18,6 +18,7 @@
 use super::*;
 use rustudio_physics::humanoid::{FrameIn, Humanoid, StepIn};
 use rustudio_physics::physics::hum_body::HumCtl;
+use rapier3d::rayon::prelude::*;
 
 /// Frames between looks for new / gone Humanoids under Workspace.
 const SCAN_EVERY: u32 = 30;
@@ -71,6 +72,9 @@ struct NpcView {
     verified: Option<u64>,
     /// The journal says something it was read from changed.
     stale: bool,
+    /// Collider settings already applied to this body.
+    applied_collide: Option<rapier3d::prelude::RigidBodyHandle>,
+    applied_freefall: Option<(rapier3d::prelude::RigidBodyHandle, bool)>,
 }
 
 pub(super) enum NpcEvent {
@@ -249,24 +253,22 @@ impl Game {
             let client = s.character.as_ref().filter(|c| !c.dead).map(|c| c.model);
             s.physics.set_ownership_split(client, &server);
         }
-        for model in models {
+        let workspace = self.doc.workspace();
+        // Build bodies and apply script teleports before taking the frame's
+        // floor snapshot. Every sensor reads the same collision world.
+        for &model in &models {
             let Some((humanoid, root)) = self.play.as_ref().and_then(|s| s.npcs.by_model.get(&model)).map(|n| (n.humanoid, n.root)) else {
                 continue;
             };
-            if !self.doc.exists(humanoid) || !self.doc.exists(root) || !self.doc.workspace().is_some_and(|ws| self.doc.is_ancestor(ws, model)) {
+            if !self.doc.exists(humanoid) || !self.doc.exists(root) || !workspace.is_some_and(|ws| self.doc.is_ancestor(ws, model)) {
                 self.npc_remove(model);
                 continue;
             }
-            let f = |name: &str, d: f32| match self.doc.prop(humanoid, name) {
+            let health = match self.doc.prop(humanoid, "Health") {
                 Some(Variant::Float32(v)) => v,
                 Some(Variant::Float64(v)) => v as f32,
-                _ => d,
+                _ => 100.0,
             };
-            let b = |name: &str, d: bool| match self.doc.prop(humanoid, name) {
-                Some(Variant::Bool(v)) => v,
-                _ => d,
-            };
-            let health = f("Health", 100.0);
             if health <= 0.0 || matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true))) {
                 self.npc_remove(model);
                 continue;
@@ -274,6 +276,13 @@ impl Game {
             if self.play.as_ref().and_then(|s| s.npcs.by_model.get(&model)).is_some_and(|n| n.view.as_ref().is_none_or(|v| v.stale)) {
                 if let Some(s) = self.play.as_mut() {
                     npc_view(&self.doc, &mut s.npcs, model);
+                    // Parts welded on (or taken off) since: the rig carries
+                    // them from their limbs (Rig::refresh_attached).
+                    if let Some(n) = s.npcs.by_model.get_mut(&model) {
+                        n.rig.refresh_attached(&self.doc, model);
+                        n.rest = None;
+                        n.posed_on = None;
+                    }
                 }
             }
             let doc_root = rustudio_render::scene::xform_of(&self.doc, root);
@@ -309,7 +318,54 @@ impl Game {
                         }
                     }
                 }
+                if let Some(ctl) = s.physics.humanoid_ctl(model) {
+                    n.hum = ctl.hum.clone();
+                }
+                if let Some(body) = s.physics.humanoid_body_handle(model) {
+                    if view.applied_collide != Some(body) {
+                        s.physics.sync_humanoid_collide(model, &view.collide);
+                        view.applied_collide = Some(body);
+                    }
+                }
             }
+        }
+        let sensed = {
+            let _scope = rustudio_core::bench::scope("npc_floor");
+            let s = self.play.as_ref().expect("playing");
+            let physics = &*s.physics;
+            let npcs = &s.npcs.by_model;
+            let doc = &self.doc;
+            let sense = |model: Ref| {
+                let npc = npcs.get(&model)?;
+                let view = npc.view.as_ref()?;
+                let (root, v, w) = physics.humanoid_root(model)?;
+                let floor = if senses_floor(npc.hum.state) {
+                    physics.humanoid_floor(
+                        doc, model, root.pos, glam::Quat::from_mat3(&root.rot),
+                        &npc.shape, npc.had_floor, &view.own,
+                    )
+                } else {
+                    None
+                };
+                Some((model, npc.humanoid, npc.root, root, v, w, floor))
+            };
+            match rig::character_pool(npcs.len()) {
+                Some(pool) => pool.install(|| models.into_par_iter().map(sense).collect::<Vec<_>>()),
+                None => models.into_iter().map(sense).collect::<Vec<_>>(),
+            }
+        };
+        // Humanoids whose Jump latch the state machine used up this frame.
+        let mut jump_spent: Vec<Ref> = Vec::new();
+        for (model, humanoid, root, root_xf, root_v, root_w, floor) in sensed.into_iter().flatten() {
+            let f = |name: &str, d: f32| match self.doc.prop(humanoid, name) {
+                Some(Variant::Float32(v)) => v,
+                Some(Variant::Float64(v)) => v as f32,
+                _ => d,
+            };
+            let b = |name: &str, d: bool| match self.doc.prop(humanoid, name) {
+                Some(Variant::Bool(v)) => v,
+                _ => d,
+            };
             // The Humanoid's values (the server's).
             let speed = f("WalkSpeed", mech::WALK_SPEED);
             let jump_velocity = if b("UseJumpPower", true) {
@@ -329,15 +385,8 @@ impl Game {
             };
             let move_dir = if move_dir.is_finite() { move_dir.clamp_length_max(1.0) } else { Vec3::ZERO };
             let s = self.play.as_mut().expect("playing");
-            let doc = &self.doc;
             let Some(n) = s.npcs.by_model.get_mut(&model) else { continue };
-            // (Out while the rest of the frame borrows the maps; back at the end.)
-            let Some(view) = n.view.take() else { continue };
-            let (own, collide, head, legs) = (&view.own, &view.collide, view.head, view.legs);
-            let Some((root_xf, root_v, root_w)) = s.physics.humanoid_root(model) else { continue };
-            if let Some(c) = s.physics.humanoid_ctl(model) {
-                n.hum = c.hum.clone();
-            }
+            let Some(view) = n.view.as_ref() else { continue };
             // Humanoid:MoveTo's walk (play_game.rs keeps the target).
             let mut dir = move_dir;
             let mut mag = move_dir.length().min(1.0);
@@ -351,16 +400,9 @@ impl Game {
                     }
                 }
             }
-            let state = n.hum.state;
-            let rot = glam::Quat::from_mat3(&root_xf.rot);
-            let floor = if senses_floor(state) {
-                s.physics.humanoid_floor(doc, model, root_xf.pos, rot, &n.shape, n.had_floor, own)
-            } else {
-                None
-            };
             n.had_floor = floor.is_some();
             n.floor_part = floor.and_then(|f| f.1);
-            let full_hip = n.shape.root_size.y * 0.5 + legs + hip_height;
+            let full_hip = n.shape.root_size.y * 0.5 + view.legs + hip_height;
             let jump = std::mem::take(&mut n.jump) || jump_prop;
             let inp = FrameIn {
                 dt,
@@ -388,6 +430,13 @@ impl Game {
                 torso_up: Some(root_xf.rot.y_axis),
             };
             let change = n.hum.frame(&inp).changed;
+            // Humanoid.Jump is a latch, not a held input: Studio sets it back
+            // to false as the jump starts (Jumping), and a Jump set in the air
+            // is dropped on landing (Landed) without a second jump. Left true
+            // it would jump again on every landing.
+            if jump_prop && matches!(change, Some((_, State::Jumping | State::Landed))) {
+                jump_spent.push(humanoid);
+            }
             // (the arbiter answers for the new state and targets: see hum_pre)
             let level = match s.physics.humanoid_body(model) {
                 Some(body) => n.hum.level(&body, s.physics.floor_static(n.floor_part), s.physics.humanoid_touching_moving(model), false),
@@ -424,12 +473,23 @@ impl Game {
             let freefall = n.hum.state == State::Freefall;
             s.npcs.events.extend(ev);
             s.physics.set_humanoid_ctl(model, Some(ctl));
-            let air_parts: Vec<Ref> = [head, Some(root)].into_iter().flatten().collect();
-            s.physics.humanoid_air_friction(model, &air_parts, freefall);
-            s.physics.sync_humanoid_collide(model, collide);
-            if let Some(n) = s.npcs.by_model.get_mut(&model) {
-                n.view = Some(view);
+            if let (Some(body), Some(view)) = (
+                s.physics.humanoid_body_handle(model),
+                n.view.as_mut(),
+            ) {
+                if view.applied_freefall != Some((body, freefall)) {
+                    let parts = [root, view.head.unwrap_or(root)];
+                    s.physics.humanoid_air_friction(model, &parts, freefall);
+                    view.applied_freefall = Some((body, freefall));
+                }
             }
+        }
+        for humanoid in jump_spent {
+            if let Some(inst) = self.doc.dom.get_by_ref_mut(humanoid) {
+                inst.properties.insert(ustr("Jump"), Variant::Bool(false));
+            }
+            self.doc.mark_prop(humanoid, ustr("Jump"));
+            self.record(RepOp::Prop(humanoid, "Jump".into()));
         }
     }
 
@@ -443,6 +503,10 @@ impl Game {
         let Some(s) = self.play.as_mut() else { return };
         let npcs = &mut s.npcs;
         let mut dirty: Vec<Ref> = Vec::new();
+        // The player's character: something put in it (a part welded on, an
+        // accessory) gets carried by its rig too (Rig::refresh_attached).
+        let mine = s.character.as_ref().map(|c| c.model);
+        let mut mine_dirty = matches!(marks, doc::Marks::All);
         match marks {
             doc::Marks::All => dirty.extend(npcs.by_model.keys().copied()),
             doc::Marks::Some(list) => {
@@ -477,12 +541,20 @@ impl Game {
                                     if npcs.by_model.contains_key(&cur) {
                                         dirty.push(cur);
                                     }
+                                    if Some(cur) == mine {
+                                        mine_dirty = true;
+                                    }
                                     cur = i.parent();
                                 }
                             }
                         }
                     }
                 });
+            }
+        }
+        if mine_dirty {
+            if let Some(ch) = s.character.as_mut().filter(|c| self.doc.exists(c.model)) {
+                ch.rig.refresh_attached(&self.doc, ch.model);
             }
         }
         for m in dirty {
@@ -524,15 +596,29 @@ impl Game {
     /// After the world steps: each character's pose in both DataModels and
     /// its FloorMaterial.
     pub(super) fn npc_post(&mut self) {
-        let models: Vec<Ref> = self.play.as_ref().map(|s| s.npcs.by_model.keys().copied().collect()).unwrap_or_default();
-        for model in models {
+        let Some(s) = self.play.as_ref() else { return };
+        let poses = {
+            let _scope = rustudio_core::bench::scope("npc_solve_pose");
+            let inputs: Vec<_> = s.npcs.by_model.iter().filter_map(|(&model, npc)| {
+                let (root, _, _) = s.physics.humanoid_root(model)?;
+                Some((model, root, &npc.rig, &npc.transforms))
+            }).collect();
+            let solve = |(model, root, rig, transforms): (Ref, Xform, &rig::Rig, &HashMap<Ref, Xform>)| {
+                (model, root, rig.solve(root, transforms))
+            };
+            // A rig solve is pure. Batch large crowds across a bounded pool
+            // and keep document publication in the original traversal order.
+            match rig::character_pool(inputs.len()) {
+                Some(pool) => pool.install(|| inputs.into_par_iter().map(solve).collect::<Vec<_>>()),
+                None => inputs.into_iter().map(solve).collect::<Vec<_>>(),
+            }
+        };
+        for (model, root_xf, pose) in poses {
             let Some(s) = self.play.as_mut() else { return };
             let Some(n) = s.npcs.by_model.get_mut(&model) else { continue };
             if let Some(c) = s.physics.humanoid_ctl(model) {
                 n.hum = c.hum.clone();
             }
-            let Some((root_xf, _, _)) = s.physics.humanoid_root(model) else { continue };
-            let pose = n.rig.solve(root_xf, &n.transforms);
             n.last_root = Some(root_xf);
             let state = n.hum.state;
             let humanoid = n.humanoid;
@@ -600,5 +686,79 @@ fn npc_view(doc: &Document, npcs: &mut Npcs, model: Ref) {
     let own: std::collections::HashSet<Ref, rustc_hash::FxBuildHasher> = parts.iter().copied().collect();
     let collide: HashMap<Ref, bool> = parts.iter().map(|r| (*r, !matches!(doc.prop(*r, "CanCollide"), Some(Variant::Bool(false))))).collect();
     let head = doc.find_named(model, "Head");
-    n.view = Some(NpcView { parts, own, collide, legs, head, members, verified: None, stale: false });
+    n.view = Some(NpcView { parts, own, collide, legs, head, members, verified: None, stale: false, applied_collide: None, applied_freefall: None });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Humanoid.Jump on a server NPC is a latch (Studio 0.747, server NPC on
+    /// a Baseplate): set once it jumps once and reads false from the jump on;
+    /// set in the air it stays true until the landing, which clears it
+    /// without a second jump. Left set, a game's bots hopped without end.
+    #[test]
+    fn humanoid_jump_is_a_latch_spent_by_the_jump() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Run, &mut (), false, None);
+        assert!(game.is_playing());
+        let setup = r#"
+            local floor = Instance.new("Part")
+            floor.Anchored = true
+            floor.Size = Vector3.new(100, 1, 100)
+            floor.CFrame = CFrame.new(5000, 500, 5000)
+            floor.Parent = workspace
+            local m = Instance.new("Model")
+            m.Name = "JumpLatchNpc"
+            local root = Instance.new("Part")
+            root.Name = "HumanoidRootPart"
+            root.Size = Vector3.new(2, 2, 1)
+            root.CFrame = CFrame.new(5000, 503.5, 5000)
+            root.Parent = m
+            local h = Instance.new("Humanoid")
+            h.HipHeight = 2.5
+            h.Parent = m
+            m.PrimaryPart = root
+            m.Parent = workspace
+            _G.latch = { h = h, jumps = 0, landed = 0 }
+            h.StateChanged:Connect(function(_, new)
+                if new == Enum.HumanoidStateType.Jumping then _G.latch.jumps += 1 end
+                if new == Enum.HumanoidStateType.Landed then _G.latch.landed += 1 end
+            end)
+        "#;
+        assert_eq!(game.run_luau(Side::Server, setup), None);
+        let ctx = egui::Context::default();
+        let mut tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        // Settle on the floor, then one Jump.
+        tick(&mut game, 120);
+        assert_eq!(game.run_luau(Side::Server, "assert(_G.latch.jumps == 0, _G.latch.jumps); _G.latch.h.Jump = true"), None);
+        tick(&mut game, 240);
+        assert_eq!(
+            game.run_luau(Side::Server, "local l = _G.latch; assert(l.jumps == 1, 'jumps ' .. l.jumps); assert(l.h.Jump == false, 'Jump still set')"),
+            None
+        );
+        // Jump set while in the air: no second jump on landing, and cleared.
+        assert_eq!(game.run_luau(Side::Server, "_G.latch.h.Jump = true"), None);
+        let mut airborne = false;
+        for _ in 0..30 {
+            tick(&mut game, 1);
+            if game.run_luau(Side::Server, "assert(_G.latch.h:GetState() == Enum.HumanoidStateType.Freefall)").is_none() {
+                airborne = true;
+                break;
+            }
+        }
+        assert!(airborne, "the second jump never left the ground");
+        assert_eq!(game.run_luau(Side::Server, "_G.latch.jumps = 0; _G.latch.landed = 0; _G.latch.h.Jump = true"), None);
+        tick(&mut game, 240);
+        assert_eq!(
+            game.run_luau(Side::Server, "local l = _G.latch; assert(l.landed >= 1, 'never landed'); assert(l.jumps == 0, 'jumped again on landing: ' .. l.jumps); assert(l.h.Jump == false, 'Jump still set')"),
+            None
+        );
+    }
 }

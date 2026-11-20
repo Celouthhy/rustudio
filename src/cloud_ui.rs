@@ -1079,6 +1079,7 @@ impl Editor {
             };
             match event {
                 LiveEvent::Stage(stage) => {
+                    log::info!("Team Create join stage (place={}): {stage:?}", live.place);
                     if live.document_id.is_none() {
                         if let Some(j) = self.cloud.join.as_mut() { j.stage(stage); }
                     }

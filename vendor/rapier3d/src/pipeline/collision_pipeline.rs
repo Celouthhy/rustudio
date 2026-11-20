@@ -35,6 +35,10 @@ use crate::{dynamics::RigidBodySet, geometry::ColliderSet};
 // NOTE: this contains only workspace data, so there is no point in making this serializable.
 pub struct CollisionPipeline {
     broad_phase_events: Vec<BroadPhasePairEvent>,
+    processed_bodies: ModifiedRigidBodies,
+    /// Collect collision-stage wall times for the last step.
+    pub measure_stages: bool,
+    stage_timers: [crate::counters::Timer; 3],
     /// rustudio: contact recycling for this pipeline too (0 = off, upstream's
     /// behaviour): a pair whose relative pose drifted less than this since its
     /// last full update keeps its manifolds (see IntegrationParameters).
@@ -58,8 +62,16 @@ impl CollisionPipeline {
     pub fn new() -> CollisionPipeline {
         CollisionPipeline {
             broad_phase_events: Vec::new(),
+            processed_bodies: ModifiedRigidBodies::default(),
+            measure_stages: false,
+            stage_timers: Default::default(),
             contact_recycle_distance: 0.0,
         }
+    }
+
+    /// Last broad-phase, rigid contact, and sensor wall times in milliseconds.
+    pub fn stage_times_ms(&self) -> [f64; 3] {
+        self.stage_timers.map(|timer| timer.time_ms())
     }
 
     fn detect_collisions(
@@ -85,6 +97,9 @@ impl CollisionPipeline {
             ..Default::default()
         };
 
+        if self.measure_stages {
+            self.stage_timers[0].start();
+        }
         broad_phase.update(
             &params,
             colliders,
@@ -94,6 +109,10 @@ impl CollisionPipeline {
             &mut self.broad_phase_events,
         );
 
+        if self.measure_stages {
+            self.stage_timers[0].pause();
+            self.stage_timers[1].start();
+        }
         // Update narrow-phase.
         if handle_user_changes {
             narrow_phase.handle_user_changes(
@@ -122,6 +141,10 @@ impl CollisionPipeline {
             events,
             None,
         );
+        if self.measure_stages {
+            self.stage_timers[1].pause();
+            self.stage_timers[2].start();
+        }
         narrow_phase.compute_intersections(
             islands,
             bodies,
@@ -130,6 +153,9 @@ impl CollisionPipeline {
             hooks,
             events,
         );
+        if self.measure_stages {
+            self.stage_timers[2].pause();
+        }
     }
 
     fn clear_modified_colliders(
@@ -149,7 +175,7 @@ impl CollisionPipeline {
     fn clear_modified_bodies(
         &mut self,
         bodies: &mut RigidBodySet,
-        modified_bodies: &mut ModifiedRigidBodies,
+        modified_bodies: &ModifiedRigidBodies,
     ) {
         // Without this, a body modified by the user keeps its MODIFIED flag forever, so
         // `RigidBodySet::get_mut` never re-inserts it into the modified set and later user
@@ -159,8 +185,11 @@ impl CollisionPipeline {
                 rb.changes = RigidBodyChanges::empty();
             }
         }
+    }
 
-        modified_bodies.clear();
+    /// Body handles whose edits were consumed by the last collision step.
+    pub fn processed_bodies(&self) -> &[crate::dynamics::RigidBodyHandle] {
+        &self.processed_bodies
     }
 
     /// Executes one step of the collision detection.
@@ -175,7 +204,13 @@ impl CollisionPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
-        let mut modified_bodies = bodies.take_modified();
+        // Give the body set the previous step's emptied buffer as scratch.
+        // Collider edits below can enqueue more body changes for the next step.
+        self.processed_bodies.clear();
+        let modified_bodies = core::mem::replace(
+            &mut bodies.modified_bodies,
+            core::mem::take(&mut self.processed_bodies),
+        );
         let mut modified_colliders = colliders.take_modified();
         let mut removed_colliders = colliders.take_removed();
 
@@ -217,8 +252,15 @@ impl CollisionPipeline {
         );
 
         self.clear_modified_colliders(colliders, &mut modified_colliders);
-        self.clear_modified_bodies(bodies, &mut modified_bodies);
-        removed_colliders.clear();
+        self.clear_modified_bodies(bodies, &modified_bodies);
+        self.processed_bodies = modified_bodies;
+        if colliders.modified_colliders.is_empty() {
+            colliders.set_modified(modified_colliders);
+        }
+        if colliders.removed_colliders.is_empty() {
+            removed_colliders.clear();
+            colliders.removed_colliders = removed_colliders;
+        }
     }
 }
 

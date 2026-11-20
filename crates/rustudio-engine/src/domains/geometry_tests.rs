@@ -606,3 +606,88 @@ false CalculateConstraintsToPreserve: cannot have nil as a destination"#;
     assert!(!out.contains("none 4"), "{out}");
     assert!(!out.contains("all 8"), "{out}");
 }
+
+/// Path requests and Blocked re-checks read the parts near them from the
+/// world-query cache and its cached terrain, not a walk over Workspace and a
+/// terrain decode each (a game: ~35 ms per request and per half-second
+/// re-check). The waypoints must be the full scan's: after a wall moves
+/// under a warm cache, with terrain in the box, and for a request too big
+/// for the grid (the flat list instead).
+#[test]
+fn pathfinding_near_world_matches_full_scan() {
+    let src = format!("{PATH_SETUP}{}", r#"
+part(Vector3.new(600,1,60),Vector3.new(250,-0.5,0))
+workspace.Terrain:FillBlock(CFrame.new(0,0,25), Vector3.new(16,8,16), Enum.Material.Grass)
+-- far away clutter the grid leaves out
+for i=1,200 do part(Vector3.new(2,2,2),Vector3.new(2000+i*3,1,2000)) end
+local w=part(Vector3.new(2,10,30),Vector3.new(0,5,0))
+workspace:Raycast(Vector3.new(0,50,0),Vector3.new(0,-100,0)) -- warm the cache
+local function dump(tag,p) local s={} for _,x in p:GetWaypoints() do table.insert(s,string.format("%.4f,%.4f,%.4f,%d",x.Position.X,x.Position.Y,x.Position.Z,x.Action.Value)) end print(tag,p.Status.Name,table.concat(s,";")) end
+local p=PS:CreatePath() p:ComputeAsync(Vector3.new(-20,3,0),Vector3.new(20,3,0)) dump("first",p)
+w.CFrame=CFrame.new(0,5,-12) -- moved: the path goes the other way round
+local q=PS:CreatePath() q:ComputeAsync(Vector3.new(-20,3,0),Vector3.new(20,3,0)) dump("moved",q)
+local r=PS:CreatePath() r:ComputeAsync(Vector3.new(-20,3,0),Vector3.new(500,3,0)) dump("long",r)
+"#);
+    let (out, doc) = run_doc(&src, 30);
+    let agent = super::nav::Agent::default();
+    let want = |start: glam::Vec3, finish: glam::Vec3| {
+        let s = super::nav::solve(&doc, &agent, start, finish);
+        let w: Vec<String> = s.waypoints.iter().map(|w| format!("{:.4},{:.4},{:.4},{}", w.pos.x, w.pos.y, w.pos.z, w.action)).collect();
+        (s.status, w.join(";"))
+    };
+    let line = |tag: &str| {
+        let l = out.lines().find(|l| l.starts_with(tag)).unwrap_or_else(|| panic!("no {tag} in\n{out}"));
+        l.split("  —").next().unwrap_or(l).to_string()
+    };
+    let (st, moved) = want(glam::Vec3::new(-20.0, 3.0, 0.0), glam::Vec3::new(20.0, 3.0, 0.0));
+    assert_eq!(st, 0, "{out}");
+    assert_eq!(line("moved"), format!("moved Success {moved}"));
+    assert_ne!(line("first").split_once(' ').unwrap().1, line("moved").split_once(' ').unwrap().1, "the wall's move was not seen");
+    let (st, long) = want(glam::Vec3::new(-20.0, 3.0, 0.0), glam::Vec3::new(500.0, 3.0, 0.0));
+    assert_eq!(st, 0, "{out}");
+    assert_eq!(line("long"), format!("long Success {long}"));
+}
+
+/// ComputeAsync searches on a worker: only the calling script yields (a
+/// second script runs while it waits and sees the path not yet computed),
+/// and it resumes with the waypoints the synchronous search gives.
+#[test]
+fn compute_async_yields_only_the_caller_and_resumes_with_the_same_path() {
+    let before = super::nav::SOLVED_OFF_MAIN.load(std::sync::atomic::Ordering::Relaxed);
+    let caller = format!("{PATH_SETUP}{}", r#"
+part(Vector3.new(2,10,30),Vector3.new(0,5,0))
+local p=PS:CreatePath()
+_G.p=p
+print("calling")
+p:ComputeAsync(Vector3.new(-20,3,0),Vector3.new(20,3,0))
+local s={} for _,x in p:GetWaypoints() do table.insert(s,string.format("%.4f,%.4f,%.4f,%d",x.Position.X,x.Position.Y,x.Position.Z,x.Action.Value)) end
+print("async",p.Status.Name,table.concat(s,";"))
+local q=PS:FindPathAsync(Vector3.new(-20,3,0),Vector3.new(20,3,0))
+print("find",q.Status.Name,#q:GetWaypoints()==#p:GetWaypoints())
+"#);
+    let other = r#"print("other", _G.p.Status.Name)"#;
+    let mut d = Document::new_place();
+    let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+    let s1 = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("A").with_property("Source", caller));
+    let s2 = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("B").with_property("Source", other.to_string()));
+    let rt = Runtime::new().unwrap();
+    rt.enter(World::new(d, RunMode::Run));
+    rt.bind_globals().unwrap();
+    rt.run_script(s1);
+    rt.run_script(s2);
+    for _ in 0..30 {
+        rt.step(1.0 / 60.0);
+    }
+    let mut w = rt.leave();
+    let out = w.output.iter().map(|(_, t)| t.split("  —").next().unwrap_or(t).to_string()).collect::<Vec<_>>();
+    let doc = std::mem::replace(w.dm(), Document::empty());
+    let at = |p: &str| out.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("no {p} in {out:#?}"));
+    // The second script ran while the first was waiting on its search.
+    assert!(at("calling") < at("other") && at("other") < at("async"), "{out:#?}");
+    assert_eq!(out[at("other")], "other NoPath");
+    let s = super::nav::solve(&doc, &super::nav::Agent::default(), glam::Vec3::new(-20.0, 3.0, 0.0), glam::Vec3::new(20.0, 3.0, 0.0));
+    let want: Vec<String> = s.waypoints.iter().map(|w| format!("{:.4},{:.4},{:.4},{}", w.pos.x, w.pos.y, w.pos.z, w.action)).collect();
+    assert_eq!(out[at("async")], format!("async Success {}", want.join(";")));
+    assert_eq!(out[at("find")], "find Success true");
+    assert!(super::nav::SOLVED_OFF_MAIN.load(std::sync::atomic::Ordering::Relaxed) >= before + 2);
+}

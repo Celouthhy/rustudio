@@ -2391,7 +2391,7 @@ pub fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
         if matches!(doc.prop(r, "UsePartColor"), Some(Variant::Bool(true))) {
             id.push_str("#partcolor");
         }
-        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true });
+        return Some(MeshAsset { id, fit_to_part: true, scale: Vec3::ONE, offset: Vec3::ZERO, vertex_colors: true, origin: false });
     };
     if std::env::var_os("RUSTUDIO_UNION_DENSITY_TRACE").is_some() {
         static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
@@ -2420,7 +2420,7 @@ pub fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
         fit_to_part: true,
         scale: Vec3::ONE,
         offset: Vec3::ZERO,
-        vertex_colors: true,
+        vertex_colors: true, origin: false,
     })
 }
 
@@ -2439,4 +2439,8 @@ pub struct MeshAsset {
     /// studio/specialmesh). Applied by the mesh cache (MeshCache::get_colored)
     /// only to meshes in a Roblox format; see the exception there.
     pub vertex_colors: bool,
+    /// Placed by the mesh's own origin, not its bounds' centre (a
+    /// CharacterMesh: Studio 0.747 hangs the Boy torso's crotch below the
+    /// Torso box, its top flush with the box top).
+    pub origin: bool,
 }

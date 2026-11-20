@@ -125,13 +125,22 @@ pub fn v3_opt(v: &Value) -> Option<LVector3> {
 
 /// `v3_opt` for the generic `ud::<T>`-style helpers (T = LVector3), which
 /// otherwise only see userdata.
+/// `v` as a natively stored datatype `T` (LVector3, a Luau vector; LCFrame,
+/// a tagged userdata), None for any other `T`: generic userdata readers
+/// (`ud`, `opt_ud`) ask this before mlua's `borrow`, which only knows mlua
+/// userdata.
 pub fn vec_any<T: 'static>(v: &Value) -> Option<T> {
-    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<LVector3>() {
-        return None;
+    let t = std::any::TypeId::of::<T>();
+    if t == std::any::TypeId::of::<LVector3>() {
+        // (T is LVector3: no boxing per call.)
+        let x = v3_opt(v)?;
+        return (&mut Some(x) as &mut dyn std::any::Any).downcast_mut::<Option<T>>()?.take();
     }
-    // (T is LVector3: no boxing per call.)
-    let x = v3_opt(v)?;
-    (&mut Some(x) as &mut dyn std::any::Any).downcast_mut::<Option<T>>()?.take()
+    if t == std::any::TypeId::of::<LCFrame>() {
+        let x = LCFrame(cframe_value(v)?);
+        return (&mut Some(x) as &mut dyn std::any::Any).downcast_mut::<Option<T>>()?.take();
+    }
+    None
 }
 
 /// The vector type's metatable: Vector3's members (dtmeta builds the C
@@ -256,9 +265,181 @@ impl UserData for LVector2 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LCFrame(pub Xform);
 
+// A CFrame is a plain Luau userdata of tag `CFRAME_TAG` holding its
+// `Xform` inline (48 bytes, no destructor, the tag's metatable set by the
+// VM on creation), as Studio's CFrame is a fixed-size userdata
+// (RE-DATATYPES item 2). Before, it was an mlua userdata: a Luau block
+// plus a reference-counted Rust heap cell, a destructor, mlua's lock and
+// type lookup on every make and read (~1,400 instructions a CFrame.new).
+// The metatable is dtmeta's (`install_cframe`), built from the getters and
+// methods below; `typeof` reads its `__type`.
+
+/// The Luau userdata tag of CFrames (mlua uses tag 1 for destructed
+/// userdata; Luau's own are past LUA_UTAG_LIMIT).
+pub const CFRAME_TAG: std::ffi::c_int = 70;
+const CFRAME_LEN: usize = std::mem::size_of::<Xform>();
+const _: () = assert!(CFRAME_LEN == 48);
+
+/// Pushes a new CFrame on `l`. The VM's CFrame metatable must be
+/// installed (`cframe_ready`); the caller has a free stack slot.
+///
+/// # Safety
+/// `l` is a running thread of a VM with the CFrame metatable installed.
+#[inline]
+pub unsafe fn cframe_push(l: *mut mlua::ffi::lua_State, x: Xform) {
+    unsafe {
+        let p = mlua::ffi::lua_newuserdatataggedwithmetatable(l, CFRAME_LEN, CFRAME_TAG) as *mut Xform;
+        p.write_unaligned(x);
+    }
+}
+
+/// The CFrame at `idx` of `l`, if the value there is one.
+///
+/// # Safety
+/// `idx` is a valid index of `l`.
+#[inline]
+pub unsafe fn cframe_at(l: *mut mlua::ffi::lua_State, idx: std::ffi::c_int) -> Option<Xform> {
+    unsafe {
+        let p = mlua::ffi::lua_touserdatatagged(l, idx, CFRAME_TAG) as *const Xform;
+        (!p.is_null()).then(|| p.read_unaligned())
+    }
+}
+
+/// Whether `l`'s VM has the CFrame metatable (pushes nothing).
+///
+/// # Safety
+/// `l` is a running thread with a free stack slot.
+pub unsafe fn cframe_ready(l: *mut mlua::ffi::lua_State) -> bool {
+    unsafe {
+        mlua::ffi::lua_getuserdatametatable(l, CFRAME_TAG);
+        let ok = mlua::ffi::lua_type(l, -1) == mlua::ffi::LUA_TTABLE;
+        mlua::ffi::lua_pop(l, 1);
+        ok
+    }
+}
+
+/// Luau's userdata header puts the tag 13 bytes and the length 12 bytes
+/// before the data (`Udata`: tt, marked, memcat, tag, int len, metatable,
+/// data); checked on a real CFrame when the metatable is installed
+/// (`probe_cframe_header`). 0 unchecked, 1 holds, 2 doesn't (read through
+/// the stack instead).
+static CF_HEADER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Checks the header layout on the CFrame at the top of `l`.
+pub(crate) unsafe fn probe_cframe_header(l: *mut mlua::ffi::lua_State) {
+    use std::sync::atomic::Ordering;
+    unsafe {
+        let p = mlua::ffi::lua_touserdata(l, -1) as *const u8;
+        let ok = !p.is_null()
+            && *p.sub(13) == CFRAME_TAG as u8
+            && (p.sub(12) as *const i32).read_unaligned() == CFRAME_LEN as i32
+            && mlua::ffi::lua_userdatatag(l, -1) == CFRAME_TAG
+            && mlua::ffi::lua_objlen(l, -1) as usize == CFRAME_LEN;
+        let _ = CF_HEADER.compare_exchange(0, if ok { 1 } else { 2 }, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// The CFrame in an mlua userdata value, if it is one.
+pub fn cframe_of(u: &mlua::AnyUserData) -> Option<Xform> {
+    use std::sync::atomic::Ordering;
+    if CF_HEADER.load(Ordering::Relaxed) == 1 {
+        let p = u.to_pointer() as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: every full userdata has the probed header before its data.
+        unsafe {
+            if *p.sub(13) != CFRAME_TAG as u8 || (p.sub(12) as *const i32).read_unaligned() != CFRAME_LEN as i32 {
+                return None;
+            }
+            return Some((p as *const Xform).read_unaligned());
+        }
+    }
+    let found = std::cell::Cell::new(None);
+    // SAFETY: the value is pushed and read on the same stack.
+    unsafe {
+        let _ = u.weak_lua().upgrade().exec_raw::<()>(u, |l| {
+            found.set(cframe_at(l, -1));
+            mlua::ffi::lua_settop(l, 0);
+        });
+    }
+    found.get()
+}
+
+/// A userdata's `__type` for error messages (natively stored CFrames
+/// included; mlua's `metatable()` knows only its own userdata), else
+/// "userdata".
+pub fn userdata_type_name(u: &mlua::AnyUserData) -> String {
+    if cframe_of(u).is_some() {
+        return "CFrame".into();
+    }
+    u.metatable().ok().and_then(|m| m.get::<String>("__type").ok()).unwrap_or_else(|| "userdata".into())
+}
+
+/// `v` as a CFrame, if it is one.
+pub fn cframe_value(v: &Value) -> Option<Xform> {
+    match v {
+        Value::UserData(u) => cframe_of(u),
+        _ => None,
+    }
+}
+
 impl FromLua for LCFrame {
     fn from_lua(v: Value, _: &Lua) -> LResult<Self> {
-        ud::<LCFrame>(&v).ok_or_else(|| rt_err(format!("CFrame expected, got {}", v.type_name())))
+        cframe_value(&v)
+            .map(LCFrame)
+            .ok_or_else(|| rt_err(format!("CFrame expected, got {}", v.type_name())))
+    }
+
+    unsafe fn from_stack(idx: std::ffi::c_int, lua: &mlua::state::RawLua) -> LResult<Self> {
+        unsafe {
+            if let Some(x) = cframe_at(lua.state(), idx) {
+                return Ok(LCFrame(x));
+            }
+            Self::from_lua(lua.rs_stack_value(idx)?, lua.rs_lua())
+        }
+    }
+}
+
+impl IntoLua for LCFrame {
+    fn into_lua(self, lua: &Lua) -> LResult<Value> {
+        // (Unprotected, as mlua's create_userdata when memory errors are
+        // unlikely: exec_raw's protected call costs more than the rest.)
+        // SAFETY: the value is pushed, taken as a reference and popped.
+        let push = || unsafe {
+            lua.exec_raw_lua(|raw| {
+                let l = raw.state();
+                if mlua::ffi::lua_checkstack(l, 2) == 0 {
+                    return Err(rt_err("stack overflow"));
+                }
+                if !cframe_ready(l) {
+                    return Ok(None);
+                }
+                cframe_push(l, self.0);
+                let v = raw.rs_stack_value(-1);
+                mlua::ffi::lua_pop(l, 1);
+                v.map(Some)
+            })
+        };
+        match push()? {
+            Some(v) => Ok(v),
+            None => {
+                crate::dtmeta::install_cframe(lua)?;
+                push()?.ok_or_else(|| rt_err("CFrame type missing"))
+            }
+        }
+    }
+
+    unsafe fn push_into_stack(self, lua: &mlua::state::RawLua) -> LResult<()> {
+        unsafe {
+            let l = lua.state();
+            if mlua::ffi::lua_checkstack(l, 2) == 0 || !cframe_ready(l) {
+                let v = self.into_lua(lua.rs_lua())?;
+                return lua.push_value(&v);
+            }
+            cframe_push(l, self.0);
+            Ok(())
+        }
     }
 }
 
@@ -293,8 +474,16 @@ fn look_at_eps(pos: Vec3, target: Vec3, up: Vec3, eps: f32) -> Xform {
     }
 }
 
-impl UserData for LCFrame {
-    fn add_fields<F: UserDataFields<Self>>(f: &mut F) {
+/// The CFrame type's members, registered by dtmeta's `install_cframe`
+/// (`NativeReg`) as an mlua userdata's would be.
+impl LCFrame {
+    /// The CFrame as a Lua value (`IntoLua`, callable without the trait).
+    #[allow(clippy::should_implement_trait)]
+    pub fn into_lua(self, lua: &Lua) -> LResult<Value> {
+        IntoLua::into_lua(self, lua)
+    }
+
+    pub(crate) fn add_fields<F: UserDataFields<Self>>(f: &mut F) {
         f.add_meta_field("__type", "CFrame");
         f.add_field_method_get("Position", |_, this| Ok(LVector3(this.0.pos)));
         f.add_field_method_get("p", |_, this| Ok(LVector3(this.0.pos)));
@@ -318,7 +507,7 @@ impl UserData for LCFrame {
         });
     }
 
-    fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
+    pub(crate) fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
         m.add_method("Inverse", |_, this, ()| Ok(LCFrame(cf_inv(&this.0))));
         m.add_method("inverse", |_, this, ()| Ok(LCFrame(cf_inv(&this.0))));
         m.add_method("Lerp", |_, this, (o, a): (LCFrame, f32)| {
@@ -501,6 +690,12 @@ trait IntoLuaValue {
 impl<T: UserData + 'static> IntoLuaValue for T {
     fn into_lua_value(self, lua: &Lua) -> LResult<Value> {
         Ok(Value::UserData(lua.create_userdata(self)?))
+    }
+}
+
+impl IntoLuaValue for LCFrame {
+    fn into_lua_value(self, lua: &Lua) -> LResult<Value> {
+        self.into_lua(lua)
     }
 }
 
@@ -1074,6 +1269,7 @@ fn f(v: &Value) -> f32 {
 /// Installs Vector3, Vector2, CFrame, Color3, BrickColor, UDim, UDim2 and
 /// Enum into `globals`.
 pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
+    crate::dtmeta::install_cframe(lua)?;
     install_font(lua, g)?;
     crate::sharedtable::install(lua, g)?;
     install_vector3(lua)?;

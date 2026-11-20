@@ -120,7 +120,11 @@ pub enum Reader {
     Highlights = 19,
     /// The Humanoids Play drives besides the player's (src/play_npc.rs).
     Npcs = 20,
+    /// The Play worker's presentation document (rustudio-render/src/snapshot.rs).
+    RenderSnapshot = 21,
 }
+
+const JOURNAL_READERS: usize = Reader::RenderSnapshot as usize + 1;
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
 pub enum Marks {
@@ -134,7 +138,7 @@ struct Journal {
     base: u64,
     marks: Vec<Mark>,
     /// Next sequence number each reader wants; None = hasn't read yet.
-    read: [Option<u64>; 21],
+    read: [Option<u64>; JOURNAL_READERS],
     /// The joint graph's position (crates/rustudio-engine/src/domains/world_part.rs), read through
     /// `&self`: 0 = not reading, else the next sequence number + 1.
     graph_pos: std::sync::atomic::AtomicU64,
@@ -522,7 +526,7 @@ impl Document {
             journal: Journal {
                 base: 0,
                 marks: Vec::new(),
-                read: [None; 21],
+                read: [None; JOURNAL_READERS],
                 graph_pos: std::sync::atomic::AtomicU64::new(0),
             },
             history: Default::default(),

@@ -33,6 +33,7 @@ enum Tok {
     OrOr,
     EqEq,
     Bang,
+    Dot,
     Other,
 }
 
@@ -65,7 +66,13 @@ fn lex(src: &str) -> Vec<Tok> {
             } else if b.get(i + 2) == Some(&b'\'') {
                 i += 3;
             } else {
+                // A lifetime: skipped with its name (`&'static str` read as
+                // a `static` item named `str`, whose body was the rest of
+                // the function, and linked anything naming `str` to it).
                 i += 1;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
             }
         } else if (c == b'r' || c == b'b')
             && (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#') || (c == b'b' && b.get(i + 1) == Some(&b'r')))
@@ -134,6 +141,7 @@ fn lex(src: &str) -> Vec<Tok> {
                     Tok::EqEq
                 }
                 b'!' if b.get(i + 1) != Some(&b'=') => Tok::Bang,
+                b'.' => Tok::Dot,
                 _ => Tok::Other,
             });
             i += 1;
@@ -338,13 +346,21 @@ fn call_args(toks: &[Tok]) -> BTreeSet<usize> {
                     continue;
                 }
                 // Only the call's own arguments (not nested calls', already
-                // decided, nor nested literal pairs).
-                let mut depth = 0;
+                // decided, nor nested literal pairs), including the fields
+                // of a tuple argument (`writes.push((r, "CFrame", v))`).
+                let mut nest: Vec<bool> = Vec::new();
                 for (j, t) in toks.iter().enumerate().take(i).skip(open + 1) {
                     match t {
-                        Tok::Open(_) => depth += 1,
-                        Tok::Close(_) => depth -= 1,
-                        Tok::Str(_) if depth == 0 => {
+                        Tok::Open(b) => {
+                            let tuple = *b == b'('
+                                && !matches!(toks.get(j - 1), Some(Tok::Ident(_)))
+                                && nest.iter().all(|t| *t);
+                            nest.push(tuple);
+                        }
+                        Tok::Close(_) => {
+                            nest.pop();
+                        }
+                        Tok::Str(_) if nest.iter().all(|t| *t) => {
                             out.insert(j);
                         }
                         _ => {}
@@ -415,14 +431,32 @@ fn items(toks: &[Tok]) -> Vec<(String, BTreeSet<String>, BTreeSet<String>, Vec<(
             match t {
                 // An item reference: a call `f(`, a function value `f,` /
                 // `f)`, or a CONST / STATIC.
+                // (`f.call(…)` is a Lua function's method, not the domain's
+                // `call` dispatcher: it linked ext's prop_get to every
+                // literal its call reaches. Only the three dispatcher names:
+                // a domain's own methods called as `state.foo(…)` stay
+                // linked.)
                 Tok::Ident(i)
                     if n >= refs_from
+                        && !(matches!(i.as_str(), "call" | "prop_get" | "newindex")
+                            && matches!(n.checked_sub(1).and_then(|p| body.get(p)), Some(Tok::Dot)))
                         && (matches!(body.get(n + 1), Some(Tok::Open(b'(')) | Some(Tok::Comma) | Some(Tok::Close(b')')))
                             || (i.len() > 1 && i.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()))) =>
                 {
                     ids.insert(i.clone());
                 }
-                Tok::Str(s) if !used.contains(&n) && !args.contains(&n) => words(s, &mut strs),
+                // (A literal with whitespace, brackets or quotes in it is
+                // text, a message or Luau source the code builds, never a
+                // member key: the words of `game:GetService("CoreGui")` in
+                // a CoreScript shim made gui_input claim GetService on
+                // every class, so every GetService took the general path.)
+                Tok::Str(s)
+                    if !used.contains(&n)
+                        && !args.contains(&n)
+                        && !s.chars().any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'')) =>
+                {
+                    words(s, &mut strs)
+                }
                 _ => {}
             }
         }

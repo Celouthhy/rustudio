@@ -41,7 +41,7 @@ pub mod ui_ribbon;
 pub mod ui_shortcuts;
 pub mod vm;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mlua::Value;
 use rbx_dom_weak::types::Ref;
@@ -49,7 +49,7 @@ use rbx_dom_weak::WeakDom;
 
 use crate::app::Level;
 use rustudio_core::doc::Document;
-use rustudio_engine::runtime::{RunMode, Runtime, World, STACK_MARK};
+use rustudio_engine::runtime::{RunMode, Runtime, Side, World, STACK_MARK};
 
 pub use source::PluginSource;
 pub use vm::{EditorRequest, UiItem, UiKind};
@@ -151,6 +151,27 @@ pub struct PluginHost {
     requests: Vec<EditorRequest>,
     activation_seen: u64,
     activation_changed: bool,
+    play_ui: SharedPlayUi,
+}
+
+#[derive(Default)]
+struct PlayUi {
+    widgets: Vec<UiItem>,
+    ribbon: ui_ribbon::UiModel,
+}
+
+type SharedPlayUi = Arc<Mutex<[PlayUi; 2]>>;
+
+pub(crate) struct PlayPlugins {
+    specs: Vec<vm::LoadSpec>,
+    ui: SharedPlayUi,
+}
+
+fn play_side_index(side: Side) -> usize {
+    match side {
+        Side::Server => 0,
+        Side::Client => 1,
+    }
 }
 
 impl Default for PluginHost {
@@ -175,6 +196,7 @@ impl Default for PluginHost {
             requests: Vec::new(),
             activation_seen: 0,
             activation_changed: false,
+            play_ui: Default::default(),
         }
     }
 }
@@ -584,26 +606,47 @@ impl PluginHost {
         if !self.enabled {
             return;
         }
-        let mut any = false;
-        for s in self.specs.iter().filter(|s| s.running) {
-            if let Some(spec) = s.load_spec() {
-                if let Err(e) = vm::load(rt, &spec) {
-                    if let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) {
-                        w.output.push((Level::Error, format!("Plugin {} failed to load: {e}", s.name)));
-                    }
-                }
-                any = true;
-            }
-        }
-        if any {
-            vm::start_later(rt);
-            rt.dispatch();
-        }
+        load_play_plugins(rt, self.specs.iter().filter(|s| s.running).filter_map(Spec::load_spec));
     }
 
     /// The Play DataModel is closing: its plugins get Unloading (Studio
     /// unloads plugins with their DataModel).
     pub fn unload_from_play(&self, rt: &Runtime) {
+        unload_play_plugins(rt);
+    }
+
+    pub(crate) fn play_worker_plugins(&self) -> PlayPlugins {
+        *self.play_ui.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        let specs = self.specs.iter().filter(|s| self.enabled && s.running).filter_map(Spec::load_spec).collect();
+        PlayPlugins { specs, ui: self.play_ui.clone() }
+    }
+
+    pub(crate) fn play_widgets(&self, side: Side) -> Vec<UiItem> {
+        self.play_ui.lock().unwrap_or_else(|e| e.into_inner())[play_side_index(side)].widgets.clone()
+    }
+
+    pub(crate) fn play_ribbon(&self, side: Side) -> ui_ribbon::UiModel {
+        self.play_ui.lock().unwrap_or_else(|e| e.into_inner())[play_side_index(side)].ribbon.clone()
+    }
+}
+
+fn load_play_plugins(rt: &Runtime, specs: impl IntoIterator<Item = vm::LoadSpec>) {
+    let mut any = false;
+    for spec in specs {
+        if let Err(e) = vm::load(rt, &spec) {
+            if let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) {
+                w.output.push((Level::Error, format!("Plugin {} failed to load: {e}", spec.name)));
+            }
+        }
+        any = true;
+    }
+    if any {
+        vm::start_later(rt);
+        rt.dispatch();
+    }
+}
+
+fn unload_play_plugins(rt: &Runtime) {
         let ids: Vec<PluginId> = rt
             .lua
             .app_data_ref::<vm::PluginVm>()
@@ -612,6 +655,45 @@ impl PluginHost {
         for id in ids {
             vm::unload(rt, id);
         }
+}
+
+impl crate::game::GameHost for PlayPlugins {
+    fn load_plugins(&mut self, rt: &Runtime) {
+        load_play_plugins(rt, self.specs.iter().cloned());
+    }
+
+    fn unload_plugins(&mut self, rt: &Runtime) {
+        unload_play_plugins(rt);
+    }
+
+    fn plugin_pins(&self, lua: &mlua::Lua) -> std::collections::HashSet<Ref> {
+        vm::pinned(lua)
+    }
+
+    fn keep_play_layout(
+        &self,
+        old: &std::collections::HashMap<Ref, rustudio_engine::gui::GuiBox>,
+        new: &mut std::collections::HashMap<Ref, rustudio_engine::gui::GuiBox>,
+    ) {
+        widgets_ui::keep_play_layout(old, new);
+    }
+
+    fn capture_play_ui(&mut self, game: &mut crate::game::Game) -> Option<Box<dyn FnOnce() + Send>> {
+        if self.specs.is_empty() {
+            return None;
+        }
+        let mut all = <[PlayUi; 2]>::default();
+        for side in game.play_sides() {
+            all[play_side_index(side)] = game.with_play_side(side, |rt, _, _| {
+                let widgets = rt.lua.app_data_ref::<vm::PluginVm>()
+                    .map(|v| v.ui.clone()).unwrap_or_default();
+                let ribbon = rustudio_engine::runtime::world(&rt.lua)
+                    .map(|w| ui_ribbon::snapshot(&rt.lua, w.d())).unwrap_or_default();
+                PlayUi { widgets, ribbon }
+            }).unwrap_or_default();
+        }
+        let ui = self.ui.clone();
+        Some(Box::new(move || *ui.lock().unwrap_or_else(|e| e.into_inner()) = all))
     }
 }
 

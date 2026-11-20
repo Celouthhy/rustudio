@@ -82,8 +82,6 @@ thread_local! {
     static STATES: RefCell<HashMap<(u64, Ref), State>> = RefCell::new(HashMap::new());
     /// (document, platform) → (humanoid, its SkateboardController if mounted).
     static BOARDS: RefCell<HashMap<(u64, Ref), (Ref, Option<Ref>)>> = RefCell::new(HashMap::new());
-    /// (document) → (tree revision, the SkateboardPlatforms under Workspace).
-    static BOARD_LIST: RefCell<HashMap<u64, (u64, Vec<Ref>)>> = RefCell::new(HashMap::new());
     /// (document, controller) → bound buttons → last held state.
     static BUTTONS: RefCell<HashMap<(u64, Ref), HashMap<u32, bool>>> = RefCell::new(HashMap::new());
 }
@@ -138,7 +136,7 @@ fn to_lua(lua: &Lua, v: &Val) -> mlua::Result<Value> {
                 Vec3::new(c[4], c[7], c[10]),
                 Vec3::new(c[5], c[8], c[11]),
             );
-            Value::UserData(lua.create_userdata(LCFrame(Xform { pos: Vec3::new(c[0], c[1], c[2]), rot }))?)
+            LCFrame(Xform { pos: Vec3::new(c[0], c[1], c[2]), rot }).into_lua(lua)?
         }
         Val::Inst(r) => inst_value(lua, *r)?,
     })
@@ -256,7 +254,7 @@ fn control_state(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<
                 (Value::Nil, Kind::Vector3(_) | Kind::Unit3) => vec3(lua, Vec3::ZERO)?,
                 (Value::Nil, Kind::Vector2(_)) => Value::UserData(lua.create_userdata(LVector2(Vec2::ZERO))?),
                 (Value::Nil, Kind::CFrame) => vec3(lua, Vec3::ZERO).and_then(|_| {
-                    Ok(Value::UserData(lua.create_userdata(LCFrame(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY }))?))
+                    Ok(LCFrame(Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY }).into_lua(lua)?)
                 })?,
                 _ => default,
             };
@@ -352,32 +350,84 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
     Ok(false)
 }
 
+#[derive(Default)]
+struct BoardList {
+    doc_id: u64,
+    workspace: Option<Ref>,
+    tree_revision: u64,
+    journal: u64,
+    boards: Vec<Ref>,
+}
+
+impl BoardList {
+    fn update(&mut self, d: &doc::Document) {
+        let workspace = d.workspace();
+        let marks = d.marks_since(self.journal);
+        self.journal = d.journal_end();
+        let same_workspace = self.doc_id == d.id && self.workspace == workspace;
+        if same_workspace && self.tree_revision == d.tree_revision {
+            return;
+        }
+        self.doc_id = d.id;
+        self.workspace = workspace;
+        self.tree_revision = d.tree_revision;
+        let Some(ws) = workspace else {
+            self.boards.clear();
+            return;
+        };
+        if let Some(marks) = marks.filter(|_| same_workspace) {
+            self.boards.retain(|r| d.exists(*r) && (*r == ws || d.is_ancestor(ws, *r)));
+            for r in marks.iter().filter_map(|mark| match mark {
+                doc::Mark::Tree(r) if d.exists(*r) && (*r == ws || d.is_ancestor(ws, *r)) => Some(*r),
+                _ => None,
+            }) {
+                for i in d.dom.descendants_of(r).filter(|i| i.class == "SkateboardPlatform") {
+                    if !self.boards.contains(&i.referent()) {
+                        self.boards.push(i.referent());
+                    }
+                }
+            }
+            // Match the Workspace walk's breadth-first order, including
+            // when a script moves a platform or its ancestor.
+            self.boards.sort_by_cached_key(|r| {
+                let mut path = Vec::new();
+                for i in d.dom.ancestors_of(*r).take_while(|i| i.referent() != ws) {
+                    let parent = d.dom.get_by_ref(i.parent()).expect("platform parent");
+                    path.push(parent.children().iter().position(|child| *child == i.referent()).unwrap());
+                }
+                path.reverse();
+                (path.len(), path)
+            });
+            return;
+        }
+        self.boards = d.dom.descendants_of(ws)
+            .filter(|i| i.class == "SkateboardPlatform")
+            .map(|i| i.referent())
+            .collect();
+    }
+}
+
 /// Server: humanoids standing on free SkateboardPlatforms take them.
 fn skateboards(lua: &Lua) -> mlua::Result<()> {
+    let _scope = rustudio_core::bench::scope("control_skateboards");
+    if lua.app_data_ref::<BoardList>().is_none() {
+        lua.set_app_data(BoardList::default());
+    }
     let mounts: Vec<(Ref, Ref, bool)> = {
         let w = world(lua)?;
         if w.side != Side::Server {
             return Ok(());
         }
         let d = w.d();
-        let boards = BOARD_LIST.with(|m| {
-            let mut m = m.borrow_mut();
-            let e = m.entry(d.id).or_insert((u64::MAX, Vec::new()));
-            if e.0 != d.tree_revision {
-                e.0 = d.tree_revision;
-                e.1 = d
-                    .workspace()
-                    .map(|ws| d.dom.descendants_of(ws).filter(|i| i.class == "SkateboardPlatform").map(|i| i.referent()).collect())
-                    .unwrap_or_default();
-            }
-            e.1.clone()
-        });
+        let mut board_list = lua.app_data_mut::<BoardList>().expect("skateboard platforms");
+        board_list.update(d);
+        let boards = &board_list.boards;
         if boards.is_empty() {
             return Ok(());
         }
         let taken: Vec<Ref> = BOARDS.with(|m| m.borrow().keys().filter(|(i, _)| *i == d.id).map(|(_, r)| *r).collect());
         let mut v = Vec::new();
-        for b in boards.into_iter().filter(|b| !taken.contains(b) && d.exists(*b)) {
+        for b in boards.iter().copied().filter(|b| !taken.contains(b) && d.exists(*b)) {
             let (Some(bx), Some(bs)) = (xf(d, b, "CFrame"), v3p(d, b, "Size")) else { continue };
             let top = bx.pos.y + bs.y * 0.5;
             // A humanoid's root over the board, its feet on it.
@@ -480,4 +530,47 @@ pub fn step(lua: &Lua) -> mlua::Result<()> {
         world(lua)?.fire(r, "ButtonChanged", vec![item]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbx_dom_weak::InstanceBuilder;
+
+    #[test]
+    fn skateboard_index_follows_subtrees_in_workspace_order() {
+        let mut d = doc::Document::new_place();
+        let workspace = d.workspace().unwrap();
+        let root = d.dom.root_ref();
+        let mut list = BoardList::default();
+        list.update(&d);
+        assert!(list.boards.is_empty());
+
+        let folder = d.dom.insert(root, InstanceBuilder::new("Folder")
+            .with_child(InstanceBuilder::new("SkateboardPlatform")));
+        let nested = d.dom.get_by_ref(folder).unwrap().children()[0];
+        d.mark_tree(folder);
+        list.update(&d);
+        assert!(list.boards.is_empty());
+
+        d.dom.transfer_within(folder, workspace);
+        d.mark_tree(folder);
+        list.update(&d);
+        assert_eq!(list.boards, [nested]);
+
+        let top = d.dom.insert(workspace, InstanceBuilder::new("SkateboardPlatform"));
+        d.mark_tree(top);
+        list.update(&d);
+        assert_eq!(list.boards, [top, nested]);
+
+        d.dom.transfer_within(folder, root);
+        d.mark_tree(folder);
+        list.update(&d);
+        assert_eq!(list.boards, [top]);
+
+        d.dom.destroy(top);
+        d.mark_all();
+        list.update(&d);
+        assert!(list.boards.is_empty());
+    }
 }

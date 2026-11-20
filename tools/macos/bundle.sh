@@ -61,7 +61,9 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/rustudio.icns"
 rm -rf "$ICONSET"
 
-sed "s/@VERSION@/$VERSION/g" tools/macos/Info.plist > "$APP/Contents/Info.plist"
+# Info.plist versions are three integers: a pre-release (0.3.3-alpha.1)
+# carries its core version there and the full one in the zip name.
+sed "s/@VERSION@/${VERSION%%[-+]*}/g" tools/macos/Info.plist > "$APP/Contents/Info.plist"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 # Ad-hoc signature: required to run on Apple Silicon; no Apple ID involved.

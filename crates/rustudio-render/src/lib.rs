@@ -10,6 +10,7 @@
 //! `cargo build -p rustudio-render --example dof_regression` build without
 //! the editor.
 
+pub mod quality;
 pub mod render;
 pub mod gpu_timing;
 pub mod world_gui;
@@ -29,3 +30,4 @@ pub mod effects;
 pub mod lighting;
 pub mod scene;
 pub mod camera;
+pub mod snapshot;

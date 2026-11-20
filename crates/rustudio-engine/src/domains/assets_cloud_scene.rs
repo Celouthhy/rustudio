@@ -40,7 +40,14 @@ pub fn create_thread(lua:&Lua,f:mlua::Function)->mlua::Result<mlua::Thread>{
 }
 /// Class-level InternalTest access is checked before an Instance reaches Lua.
 pub fn access_blocked(lua:&Lua,r:Ref)->bool{
-    lua.try_app_data_ref::<Memory>().ok().flatten().is_some_and(|m|m.blocked.contains(&r))
+    any_access_blocked(lua, std::slice::from_ref(&r))
+}
+
+/// Check an entire Instance array before emitting wrappers to Lua.
+pub fn any_access_blocked(lua: &Lua, refs: &[Ref]) -> bool {
+    lua.try_app_data_ref::<Memory>().ok().flatten().is_some_and(|memory| {
+        !memory.blocked.is_empty() && refs.iter().any(|r| memory.blocked.contains(r))
+    })
 }
 pub fn scan_access(lua:&Lua,root:Ref)->mlua::Result<()>{
     let blocked={let w=world(lua)?;w.d().dom.descendants_of(root).filter(|i|i.class=="RealtimeMedia").map(|i|i.referent()).collect::<Vec<_>>()};

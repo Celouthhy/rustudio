@@ -1433,6 +1433,11 @@ impl Gui {
         rustudio_core::bench::add("gui_memo_hit", 0.0, std::mem::take(&mut self.memo_hits));
         rustudio_core::bench::add("gui_memo_walk", 0.0, std::mem::take(&mut self.memo_walks));
         self.drawn = out.len();
+        if rustudio_core::profiler::active() {
+            use rustudio_core::profiler::{counter, Cat};
+            counter("GUI items drawn", Cat::Gui, out.len() as f64);
+            counter("GUI layers", Cat::Gui, self.layout_roots.len() as f64);
+        }
         let _paint = rustudio_core::bench::scope("gui_paint");
         let clipped = painter.with_clip_rect(rect);
         // (RUSTUDIO_GUI_BLACK_BG: ScreenGuis over black, to compare GUI
@@ -2186,7 +2191,7 @@ impl SceneLight {
         let amb = rustudio_render::lighting::sq(rgb("Ambient", mech::AMBIENT));
         let out = rustudio_render::lighting::sq(rgb("OutdoorAmbient", mech::OUTDOOR_AMBIENT));
         let ambient = luma(amb) + (luma(out) - luma(amb)).max(0.0);
-        let clock = f32_of(get("ClockTime")).unwrap_or(mech::CLOCK_TIME);
+        let clock = rustudio_render::lighting::clock_hours(get("ClockTime"), get("TimeOfDay"));
         let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
         let sun = rustudio_render::lighting::sun_direction(clock, lat);
         let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);

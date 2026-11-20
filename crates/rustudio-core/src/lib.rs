@@ -19,6 +19,7 @@ pub mod paths;
 pub mod platform;
 pub mod assets;
 pub mod bench;
+pub mod profiler;
 pub mod collision_groups;
 pub mod crash;
 pub mod diagnostics;

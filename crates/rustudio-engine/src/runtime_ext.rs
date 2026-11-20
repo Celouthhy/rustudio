@@ -4485,35 +4485,19 @@ pub fn write_acts(class: &str, key: &str) -> bool {
     )
 }
 
-/// Lighting's time of day as hours from "HH:MM:SS" (Lighting.TimeOfDay).
-fn parse_time_of_day(s: &str) -> Option<f32> {
-    let mut p = s.split(':').map(|x| x.trim().parse::<f32>().ok());
-    let h = p.next()??;
-    let m = p.next().flatten().unwrap_or(0.0);
-    let sec = p.next().flatten().unwrap_or(0.0);
-    Some(h + m / 60.0 + sec / 3600.0)
-}
-
 /// Lighting.ClockTime and TimeOfDay are one value in Roblox (whole seconds
 /// in [0, 24], mech::clock_time): writing either sets both.
 fn set_clock(lua: &Lua, r: Ref, hours: f32) -> mlua::Result<()> {
     let t = mech::clock_time(hours);
-    let secs = (t * 3600.0).round() as u32;
-    let tod = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
     store_prop(lua, r, "ClockTime", Variant::Float32(t))?;
-    store_prop(lua, r, "TimeOfDay", Variant::String(tod))
+    store_prop(lua, r, "TimeOfDay", Variant::String(mech::format_time_of_day(t)))
 }
 
 /// Lighting's hours now: ClockTime, else the saved TimeOfDay, else 14.
 fn clock_hours(lua: &Lua, r: Ref) -> mlua::Result<f32> {
     let w = world(lua)?;
     let d = w.d();
-    Ok(rustudio_render::scene::f32_of(d.prop(r, "ClockTime"))
-        .or_else(|| match d.prop(r, "TimeOfDay") {
-            Some(Variant::String(s)) => parse_time_of_day(&s),
-            _ => None,
-        })
-        .unwrap_or(mech::CLOCK_TIME))
+    Ok(rustudio_render::lighting::clock_hours(d.prop(r, "ClockTime"), d.prop(r, "TimeOfDay")))
 }
 
 /// Write-side hooks: returns true when handled here.
@@ -4564,7 +4548,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         }
         ("Lighting", "TimeOfDay") => {
             let h = match value {
-                Value::String(s) => parse_time_of_day(&s.to_str()?),
+                Value::String(s) => mech::parse_time_of_day(&s.to_str()?),
                 _ => None,
             }
             .ok_or_else(|| rt_err("TimeOfDay: \"HH:MM:SS\" expected"))?;
@@ -4918,7 +4902,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 let w = world(lua)?;
                 let d = w.d();
                 (
-                    rustudio_render::scene::f32_of(d.prop(this, "ClockTime")).unwrap_or(14.0),
+                    rustudio_render::lighting::clock_hours(d.prop(this, "ClockTime"), d.prop(this, "TimeOfDay")),
                     rustudio_render::scene::f32_of(d.prop(this, "GeographicLatitude")).unwrap_or(41.733),
                 )
             };

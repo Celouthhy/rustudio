@@ -186,6 +186,10 @@ impl Editor {
                 if top_icon(ui, "users-group", theme::TEXT, false).on_hover_text(tc).clicked() {self.cloud.live_collaborators_open=true;}
                 top_icon(ui, "share", theme::TEXT, false).on_hover_text("Share: not in rustudio yet");
                 if ui.button("Collaborate").clicked() {self.cloud.live_collaborators_open=true;}
+                // (right to left: the MCP button sits left of Collaborate)
+                self.mcp_top_button(ui);
+                // (and File Sync left of MCP)
+                self.file_sync_top_button(ui);
             });
         });
     }

@@ -382,7 +382,7 @@ impl SunShadows {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -433,11 +433,11 @@ impl SunShadows {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sun shadow blur"),
             source: wgpu::ShaderSource::Wgsl(
-                format!(
+                crate::gpu_caps::shader_for(device, &format!(
                     "const EVSM_POS_EXP: f32 = {:?};\nconst EVSM_NEG_EXP: f32 = {:?};\n{BLUR_WGSL}",
                     mech::EVSM_POS_EXP,
                     mech::EVSM_NEG_EXP
-                )
+                ))
                 .into(),
             ),
         });

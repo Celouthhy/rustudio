@@ -15,6 +15,10 @@ pub struct Build {
     enable_codegen: bool,
     // Vector size, must be 3 (default) or 4
     vector_size: usize,
+    // rustudio: where the luau/ tree is (default: this crate's directory as
+    // it was when the crate compiled, which goes stale when a target dir is
+    // copied between checkouts).
+    source_dir: Option<PathBuf>,
 }
 
 /// Represents the artifacts produced by the build process.
@@ -34,6 +38,7 @@ impl Default for Build {
             use_longjmp: false,
             enable_codegen: false,
             vector_size: 3,
+            source_dir: None,
         }
     }
 }
@@ -87,6 +92,12 @@ impl Build {
     /// Sets whether to enable the code generator (JIT).
     ///
     /// Default is false.
+    /// rustudio: build the luau/ tree in `dir` (this crate's checkout).
+    pub fn source_dir(&mut self, dir: PathBuf) -> &mut Build {
+        self.source_dir = Some(dir);
+        self
+    }
+
     pub fn enable_codegen(&mut self, enable: bool) -> &mut Build {
         self.enable_codegen = enable;
         self
@@ -108,7 +119,8 @@ impl Build {
         let out_dir = self.out_dir.as_ref().expect("OUT_DIR is not set");
         let build_dir = out_dir.join("luau-build");
 
-        let source_base_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source_base_dir = self.source_dir.clone().unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let source_base_dir = source_base_dir.as_path();
         let luau_source_dir = source_base_dir.join("luau");
         let common_include_dir = luau_source_dir.join("Common").join("include");
         let vm_source_dir = luau_source_dir.join("VM").join("src");

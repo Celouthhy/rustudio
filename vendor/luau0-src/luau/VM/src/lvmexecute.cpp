@@ -23,6 +23,33 @@ LUAU_FASTFLAGVARIABLE(LuauPromoteProto)
 LUAU_FASTFLAG(LuauFastpcall)
 LUAU_FASTFLAG(LuauRuntimeFeedback)
 
+// rustudio (script profiler, exact mode): called on Lua function entry (0)
+// and return (1) with the Proto, and around C function calls (2 call,
+// 3 return) with the C function and a name (the __namecall method, or the
+// function's debug name; may be NULL). Only the single-step interpreter
+// calls it: exact mode runs the profiled threads with lua_singlestep on,
+// so the normal and native paths pay nothing.
+static lua_RsCallHook rustudio_callhook = NULL;
+
+void lua_rs_setcallhook(lua_RsCallHook hook)
+{
+    rustudio_callhook = hook;
+}
+
+
+// A C function's name for the hook: the call site's method / global, else
+// its debug name.
+static const char* rs_cname(lua_State* L, Closure* ccl)
+{
+    if (const char* n = lua_rs_callname(L, 0))
+        return n;
+    return ccl->c.debugname ? getstr(ccl->c.debugname) : NULL;
+}
+
+#define RS_CALLHOOK(event, key, name) \
+    if (SingleStep && rustudio_callhook) \
+        rustudio_callhook(L, event, key, name);
+
 // Disable c99-designator to avoid the warning in computed goto dispatch table
 #ifdef __clang__
 #if __has_warning("-Wc99-designator")
@@ -988,6 +1015,7 @@ reentry:
                         setobj2s(L, ra, fn);
 
                         L->namecall = tsvalue(kv);
+
                     }
                     else if ((tmi = fasttm(L, mt, TM_INDEX)) && ttistable(tmi))
                     {
@@ -1109,6 +1137,7 @@ reentry:
                     while (argi < argend)
                         setnilvalue(argi++); // complete missing arguments
                     L->top = p->is_vararg ? argi : ci->top;
+                    RS_CALLHOOK(0, p, NULL)
 
                     // reentry
                     // codeentry may point to NATIVECALL instruction when proto is compiled to native code
@@ -1123,7 +1152,9 @@ reentry:
                 else
                 {
                     lua_CFunction func = ccl->c.f;
+                    RS_CALLHOOK(2, (const void*)func, rs_cname(L, ccl))
                     int n = func(L);
+                    RS_CALLHOOK(3, (const void*)func, NULL)
 
                     // yield
                     if (n < 0)
@@ -1221,6 +1252,7 @@ reentry:
                     while (argi < argend)
                         setnilvalue(argi++); // complete missing arguments
                     L->top = p->is_vararg ? argi : ci->top;
+                    RS_CALLHOOK(0, p, NULL)
 
                     // reentry
                     // codeentry may point to NATIVECALL instruction when proto is compiled to native code
@@ -1238,7 +1270,9 @@ reentry:
                         VM_PATCH_AUX(pc - 1, LUAU_INSN_FBSLOT_SEALED);
 
                     lua_CFunction func = ccl->c.f;
+                    RS_CALLHOOK(2, (const void*)func, rs_cname(L, ccl))
                     int n = func(L);
+                    RS_CALLHOOK(3, (const void*)func, NULL)
 
                     // yield
                     if (n < 0)
@@ -1273,6 +1307,7 @@ reentry:
             VM_CASE(LOP_RETURN)
             {
                 VM_INTERRUPT();
+                RS_CALLHOOK(1, L->ci->p, NULL)
                 VM_CASE_INSTRUCTION insn = *pc++;
                 VM_CASE_STKID ra = &base[LUAU_INSN_A(insn)]; // note: this can point to L->top if b == LUA_MULTRET making VM_REG unsafe to use
                 int b = LUAU_INSN_B(insn) - 1;
@@ -3641,7 +3676,9 @@ reentry:
                         LUAU_ASSERT(tsvalue(kv)->atom >= 0);
 
                         uint16_t cachedslot = LUAU_INSN_AUX_SLOT(aux);
+                        RS_CALLHOOK(2, (const void*)onudatanamecall, getstr(tsvalue(kv)))
                         int results = onudatanamecall(L, udata, tsvalue(kv)->atom, &cachedslot, utag);
+                        RS_CALLHOOK(3, (const void*)onudatanamecall, NULL)
 
                         // update cached slot if instruction didn't deoptimize
                         if (cachedslot != LUAU_INSN_AUX_SLOT(aux) && LUAU_INSN_OP(*(ncslot - 1)) == LOP_NAMECALLUDATA)
@@ -4068,6 +4105,9 @@ int luau_precall(lua_State* L, StkId func, int nresults)
         L->top = p->is_vararg ? argi : ci->top;
 
         ci->savedpc = p->code;
+
+        if (LUAU_UNLIKELY(L->singlestep) && rustudio_callhook)
+            rustudio_callhook(L, 0, p, NULL);
 
 #if VM_HAS_NATIVE
         if (p->exectarget != 0 && p->execdata)

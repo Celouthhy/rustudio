@@ -319,6 +319,7 @@ impl CloudsGpu {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, shader_source: &str, hdr: wgpu::TextureFormat, samples: u32) -> Self {
         let src = format!("{shader_source}\n{}", include_str!("clouds.wgsl"));
         let src = if samples == 1 { src.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { src };
+        let src = crate::gpu_caps::shader_for(device, &src);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clouds"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -347,7 +348,7 @@ impl CloudsGpu {
                 tex(8, d2),
                 samp(9),
                 tex(10, d2),
-                E { binding: 11, visibility: S::FRAGMENT, ty: T::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: samples > 1 }, count: None },
+                E { binding: 11, visibility: S::FRAGMENT, ty: T::Texture { sample_type: crate::gpu_caps::depth_sample_type(device), view_dimension: d2, multisampled: samples > 1 }, count: None },
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

@@ -1469,7 +1469,10 @@ fn path_pool(task: PathTask) {
                 .spawn(move || loop {
                     let next = rx.lock().ok().and_then(|r| r.recv().ok());
                     match next {
-                        Some(t) => t(),
+                        Some(t) => {
+                            let _p = rustudio_core::profiler::scope("path_compute", rustudio_core::profiler::Cat::Pathfinding);
+                            t()
+                        }
                         None => break,
                     }
                 })

@@ -609,6 +609,7 @@ pub fn decode_async(bytes: std::sync::Arc<Vec<u8>>, done: std::sync::mpsc::Sende
                 while WAITING_BYTES.load(std::sync::atomic::Ordering::Relaxed) > WAITING_LIMIT && t0.elapsed().as_secs() < 15 {
                     std::thread::sleep(std::time::Duration::from_millis(4));
                 }
+                let _p = crate::profiler::scope("tex_decode", crate::profiler::Cat::Assets);
                 let r = decode(&bytes).map(|img| {
                     let mips = mip_chain_for(&img);
                     let waiting = Waiting::new(img.pixels.len() + mips.as_ref().map_or(0, |m| m.len()));

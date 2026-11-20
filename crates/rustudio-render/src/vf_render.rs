@@ -460,6 +460,7 @@ impl Renderer {
             &self.probe.slot_views[self.probe.next()],
             &self.brdf_view,
             &self.lshadow,
+            self.reduced,
         );
         // The background, premultiplied, in the frame's squared space.
         let b = req.background;

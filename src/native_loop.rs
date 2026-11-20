@@ -149,6 +149,12 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
                 !app.borrow().ed.game.is_playing()
             })
         });
+        if root && redraw {
+            // The display frame starts with the redraw (UI, paint, present);
+            // app.rs leaves the boundary to this loop when it runs.
+            NATIVE_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);
+            rustudio_core::profiler::frame(rustudio_core::profiler::FrameKind::Render);
+        }
         let _redraw = rustudio_core::bench::scope(if redraw { "native_redraw" } else { "loop_window_event" });
         self.eframe.window_event(event_loop, id, event);
         if idle_wheel && !event_loop.exiting() {
@@ -279,3 +285,6 @@ mod tests {
         );
     }
 }
+
+/// Set once the windowed loop marks the display frames itself.
+pub static NATIVE_FRAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

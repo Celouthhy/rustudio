@@ -61,6 +61,11 @@ pub enum Tab {
     TerrainEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
+    /// File Sync (src/file_sync): the project attached to the place.
+    FileSync,
+    /// View > MicroProfiler (Ctrl+F6): the profiler window
+    /// (crates/rustudio-profiler-ui), its own OS window by default.
+    Profiler,
     /// A script open in the code editor.
     Script(Ref),
     /// A plugin's DockWidgetPluginGui (src/plugin_host/widgets_ui.rs: the
@@ -78,6 +83,8 @@ impl Tab {
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
             Tab::Toolbox => "Toolbox",
+            Tab::FileSync => "File Sync",
+            Tab::Profiler => "MicroProfiler",
             Tab::Script(_) => "Script",
             Tab::Plugin(_) => "Plugin",
         }
@@ -189,10 +196,17 @@ pub struct Editor {
     /// RUSTUDIO_CONTROL: the comparison-capture socket (src/control.rs).
     #[cfg(unix)]
     pub control: Option<crate::control::Control>,
+    /// The built-in MCP server and its panel (src/mcp).
+    pub mcp: crate::mcp::Mcp,
+    /// File Sync: a project folder attached to the open place (src/file_sync).
+    pub file_sync: crate::file_sync::FileSync,
     /// The Terrain Editor's tools and settings.
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
+    /// The MicroProfiler window while its tab is open (recording runs while
+    /// it exists; dropping it stops recording).
+    pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
     /// This frame's Toolbox preview ViewportFrames (drawn with the GUI's).
     pub toolbox_vf: std::collections::HashMap<rbx_dom_weak::types::Ref, rustudio_render::render::vf::Request>,
     /// Physical key positions held (movement keys; src/keys.rs).
@@ -350,8 +364,11 @@ impl RustudioApp {
             plugin_bar: Default::default(),
             #[cfg(unix)]
             control: None,
+            mcp: Default::default(),
+            file_sync: Default::default(),
             terrain_ed: Default::default(),
             toolbox: Default::default(),
+            profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
             fly_idle: 0.0,
@@ -827,6 +844,7 @@ impl Editor {
                 self.save_local_plugin_to(path);
             }
             Purpose::TerrainImage { height } => self.load_import_image(path, height),
+            Purpose::FileSyncProject => self.file_sync.pick = path.display().to_string(),
             Purpose::ProjectParent => {
                 if let Some(d) = self.project_export.as_mut() {
                     d.parent = path.display().to_string();
@@ -1392,7 +1410,8 @@ impl Editor {
 
     /// Asks before throwing away unsaved changes.
     pub fn request(&mut self, action: PendingAction) {
-        if self.game.doc.dirty() && self.harness.selftest.is_none() {
+        // A live Team Create document asks only for what the server lacks.
+        if self.leave_check() != crate::cloud_ui::live_status::Leave::Free && self.harness.selftest.is_none() {
             self.confirm_discard = Some(action);
         } else {
             self.perform(action);
@@ -1451,6 +1470,7 @@ impl Editor {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         self.hud.status_drawn = true;
         ui.horizontal(|ui| {
+            self.live_status_ui(ui);
             let sel = self.game.doc.selection.len();
             if let Some(s) = self.game.play_status() {
                 ui.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
@@ -1479,6 +1499,8 @@ impl Editor {
     /// Opens requested scripts as tabs next to the viewport (or focuses
     /// them, in a panel window too).
     fn open_script_tabs(&mut self, dock: &mut DockState<Tab>, panels: &mut crate::panels::Panels) {
+        // Open In Editor: File Sync's scripts go to the OS editor instead.
+        self.file_sync_open_external();
         // Tabs plugins closed, then the open script tabs as
         // ScriptEditorService documents (a tab the person closed closes its
         // document; the front one is StudioService.ActiveScript).
@@ -1526,7 +1548,31 @@ impl Editor {
             return;
         };
         let mut decided: Option<bool> = None;
+        let leave = self.leave_check();
         egui::Modal::new(egui::Id::new("confirm_discard")).show(ctx, |ui| {
+            if let crate::cloud_ui::live_status::Leave::Ask { lacking, note } = &leave {
+                if !note.is_empty() {
+                    ui.label(RichText::new("Leave without these edits?").strong());
+                    ui.label(note);
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for item in lacking {
+                            ui.label(format!("• {item}"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Save As…").clicked() {
+                            self.save_as();
+                        }
+                        if ui.button("Close anyway").clicked() {
+                            decided = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            decided = Some(false);
+                        }
+                    });
+                    return;
+                }
+            }
             ui.label(RichText::new("Discard unsaved changes?").strong());
             ui.label(format!(
                 "{} has changes that are not saved.",
@@ -1610,6 +1656,19 @@ impl TabViewer for Viewer<'_> {
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
+            Tab::FileSync => self.ed.file_sync_panel_ui(ui),
+            Tab::Profiler => {
+                let rect = ui.available_rect_before_wrap();
+                let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                c.set_clip_rect(rect);
+                let p = self.ed.profiler.get_or_insert_with(rustudio_profiler_ui::ProfilerWindow::new);
+                p.can_open_scripts = true;
+                p.show(&mut c);
+                if let Some((path, line)) = p.take_open_script() {
+                    self.ed.open_script_named(&path, line);
+                }
+                ui.allocate_rect(rect, egui::Sense::hover());
+            }
             Tab::Script(r) => {
                 if !self.ed.document_tabs_reset {
                     self.ed.script_tab_ui(ui, *r);
@@ -1863,6 +1922,7 @@ impl eframe::App for RustudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        rustudio_render::gpu_health::check();
         self.last_ui_frame = Some(Instant::now());
         self.frame(ui);
     }
@@ -1901,6 +1961,11 @@ impl RustudioApp {
 
     /// One frame, in eframe's window or offscreen (src/offscreen.rs).
     pub fn frame(&mut self, ui: &mut egui::Ui) {
+        // A display frame ends here and the next begins (the profiler gathers
+        // every thread's records at this boundary).
+        if !crate::native_loop::NATIVE_FRAMES.load(std::sync::atomic::Ordering::Relaxed) {
+            rustudio_core::profiler::frame(rustudio_core::profiler::FrameKind::Render);
+        }
         // (the whole frame, for --bench: the editor's and --no-ui's alike)
         let _frame_scope = rustudio_core::bench::scope("frame");
         rustudio_core::sim_clock::advance();
@@ -1946,6 +2011,7 @@ impl RustudioApp {
         }
         self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();
+        ed.file_sync_tick();
         ed.plugins_tick();
         ed.toolbox_tick(&ctx);
         ed.toolbox_harness_tick();
@@ -1987,7 +2053,7 @@ impl RustudioApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested())
-            && ed.game.doc.dirty()
+            && ed.leave_check() != crate::cloud_ui::live_status::Leave::Free
             && ed.harness.run.screenshot.is_none()
             && ed.harness.selftest.is_none()
             && ed.harness.run.bench.is_none()
@@ -2004,7 +2070,7 @@ impl RustudioApp {
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox) {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::FileSync) {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2020,6 +2086,9 @@ impl RustudioApp {
             ed.confirm_ui(&ctx);
             ed.account_window(&ctx);
             ed.cloud_windows(&ctx);
+            ed.mcp_windows(&ctx);
+            ed.file_sync_popover_ui(&ctx);
+            ed.mcp_tick(&ctx);
             if ed.harness.run.screenshot.is_some() {
                 ed.harness_tick(&ctx);
                 ctx.request_repaint();
@@ -2154,6 +2223,13 @@ impl RustudioApp {
                         if let Some(w) = self.dock.get_window_state_mut(surface) {
                             w.set_position(at).set_size(size);
                         }
+                    } else if tab == Tab::Profiler && std::env::var_os("RUSTUDIO_PROFILER_DOCKED").is_some() {
+                        // (checks: docked under the 3D view so a window shot shows both)
+                        crate::panels::place(&mut self.dock, tab, &self.panels.homes);
+                    } else if tab == Tab::Profiler {
+                        // (the mockup's size, smaller on a small screen)
+                        let size = egui::vec2(1440.0, 900.0).min(ctx.content_rect().size() * 0.92);
+                        self.panels.pop_out(tab, [size.x, size.y], None);
                     } else if crate::panels::placement(tab.key()).floats {
                         self.panels.pop_out(tab, [420.0, 520.0], None);
                     } else {
@@ -2185,11 +2261,17 @@ impl RustudioApp {
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
             (Tab::Toolbox, "Toolbox"),
+            (Tab::FileSync, "File Sync"),
+            (Tab::Profiler, "MicroProfiler"),
         ]
         .into_iter()
         .filter(|(t, _)| self.panels.locate(&self.dock, t).is_some())
         .map(|(_, n)| n)
         .collect();
+        // Closing the MicroProfiler stops recording.
+        if self.ed.profiler.is_some() && !self.ed.ui.panels_open.contains("MicroProfiler") {
+            self.ed.profiler = None;
+        }
         let ed = &mut self.ed;
         ed.open_script_tabs(&mut self.dock, &mut self.panels);
         crate::panels::record_homes(&self.dock, &mut self.panels.homes);
@@ -2218,6 +2300,8 @@ impl RustudioApp {
         ed.account_window(&ctx);
         ed.character_builder_window(&ctx);
         ed.cloud_windows(&ctx);
+        ed.mcp_windows(&ctx);
+        ed.file_sync_popover_ui(&ctx);
         self.watchdog.stage("dock UI", "harness and screenshot readback");
         self.finish_frame(&ctx, frame_start, dt);
     }
@@ -2232,9 +2316,22 @@ impl RustudioApp {
         ed.harness_tick(&ctx);
         #[cfg(unix)]
         ed.control_tick(&ctx);
+        ed.mcp_tick(&ctx);
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
+        if rustudio_core::profiler::active() {
+            rustudio_player::profiler_counters::sample(&ed.game);
+            thread_local! { static TC: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) }; }
+            TC.with(|tc| {
+                let (mut s, mut r) = tc.get();
+                use std::sync::atomic::Ordering::Relaxed;
+                use rustudio_core::profiler::Cat;
+                rustudio_player::profiler_counters::rate_from_total("Team Create sent", Cat::Network, rustudio_net::rtcio::BYTES_SENT.load(Relaxed), &mut s);
+                rustudio_player::profiler_counters::rate_from_total("Team Create received", Cat::Network, rustudio_net::rtcio::BYTES_RECEIVED.load(Relaxed), &mut r);
+                tc.set((s, r));
+            });
+        }
         // RUSTUDIO_GPU_TIMING: resolve this frame's GPU timestamps, collect finished ones.
         if let Some(rs) = ed.game.render_state.as_ref() {
             rustudio_render::gpu_timing::end_frame(&rs.device, &rs.queue);

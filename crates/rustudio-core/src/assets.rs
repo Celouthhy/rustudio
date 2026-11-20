@@ -533,12 +533,15 @@ type DownloadJob = Box<dyn FnOnce() + Send>;
 static ASSET_WORKERS: LazyLock<Sender<DownloadJob>> = LazyLock::new(|| {
     let (send, receive) = channel::<DownloadJob>();
     let receive = Arc::new(Mutex::new(receive));
-    for _ in 0..MAX_ASSET_DOWNLOADS {
+    for i in 0..MAX_ASSET_DOWNLOADS {
         let receive = receive.clone();
-        std::thread::spawn(move || loop {
+        let _ = std::thread::Builder::new().name(format!("asset-download-{i}")).spawn(move || loop {
             let job = receive.lock().unwrap().recv();
             match job {
-                Ok(job) => job(),
+                Ok(job) => {
+                    let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
+                    job()
+                }
                 Err(_) => break,
             }
         });
@@ -1107,6 +1110,11 @@ impl AssetStore {
 
     pub fn busy(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// Downloads asked for and not finished.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// --fixed-dt (crates/rustudio-core/src/sim_clock.rs): waits until every download in flight

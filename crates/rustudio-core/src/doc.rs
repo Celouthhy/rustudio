@@ -193,6 +193,57 @@ pub use history::{studio_step_name, FinishOp, HistoryEvent};
 /// isn't the reflection database's: Lighting.Brightness reads 1 in Studio and
 /// 1.981 from the database (round 21, terrain corpus place: its sun was twice
 /// Studio's).
+/// The Name a new instance of `class` gets: the name each class's
+/// constructor gives it (Studio 0.748: the post effects pass
+/// it to their shared base constructor Studio, e.g. Studio passes
+/// "DepthOfField"; the rest by the same scan of creatable constructors),
+/// else the class name. Team Create leaves Name out when it is this.
+pub fn default_instance_name(class: &str) -> &str {
+    match class {
+        "BindableEvent" => "Event",
+        "BindableFunction" => "Function",
+        "WedgePart" => "Wedge",
+        "CornerWedgePart" => "CornerWedge",
+        "UnionOperation" => "Union",
+        "BloomEffect" => "Bloom",
+        "BlurEffect" => "Blur",
+        "ColorCorrectionEffect" => "ColorCorrection",
+        "ColorGradingEffect" => "ColorGrading",
+        "DepthOfFieldEffect" => "DepthOfField",
+        "SunRaysEffect" => "SunRays",
+        "TouchTransmitter" => "TouchInterest",
+        _ => class,
+    }
+}
+
+/// The attribute Studio leaves on Lighting once it has turned a place's
+/// Technology into LightingStyle / PrioritizeLightingQuality (its unified
+/// lighting migration); with it set, nothing is derived again.
+pub const LIGHTING_MIGRATED_ATTRIBUTE: &str = "RBX_LightingTechnologyUnifiedMigration";
+
+/// Lighting's LightingStyle (0 Realistic, 1 Soft) and
+/// PrioritizeLightingQuality when the instance stores none. Already migrated
+/// (LIGHTING_MIGRATED_ATTRIBUTE true, as every Team Create server's Lighting
+/// is): the constructor's values, Realistic and true (0.744 Studio
+/// stores 0 at and 1 at, the fields getters Studio and
+/// Studio read). Not migrated (older files): Studio's migration from
+/// Technology: Future → Realistic, true; ShadowMap → Soft, true; anything
+/// else → Soft, false (measured too: MECHANICS.md "LightingStyle default").
+pub fn lighting_style_default(inst: &rbx_dom_weak::Instance) -> (u32, bool) {
+    let migrated = match inst.properties.get(&ustr("Attributes")) {
+        Some(Variant::Attributes(a)) => matches!(a.get(LIGHTING_MIGRATED_ATTRIBUTE), Some(Variant::Bool(true))),
+        _ => false,
+    };
+    if migrated {
+        return (0, true);
+    }
+    let tech = match inst.properties.get(&ustr("Technology")) {
+        Some(Variant::Enum(e)) => e.to_u32(),
+        _ => crate::mech::TECHNOLOGY_SOFT[1],
+    };
+    (u32::from(crate::mech::TECHNOLOGY_SOFT.contains(&tech)), crate::mech::TECHNOLOGY_QUALITY.contains(&tech))
+}
+
 pub fn studio_default(class: &str, name: &str) -> Option<Variant> {
     match (class, name) {
         ("Lighting", "Brightness") => Some(Variant::Float32(crate::mech::LIGHTING_BRIGHTNESS_DEFAULT)),
@@ -256,6 +307,18 @@ fn prop_plan(class: Ustr, key: Ustr) -> Option<std::rc::Rc<PropPlan>> {
                 db.find_default_property(c, name)
                     .or_else(|| stored_as.as_deref().and_then(|alt| db.find_default_property(c, alt)))
                     .cloned()
+            })
+            .or_else(|| {
+                // The legacy name of a Content twin with no default of its
+                // own: the twin's (Sky.MoonTextureId reads the constructor's
+                // rbxasset://sky/moon.jpg: 0.748 Studio).
+                let t = twin?;
+                match db.find_default_property(c, t)? {
+                    Variant::Content(content) => content
+                        .as_uri()
+                        .map(|u| Variant::ContentId(rbx_dom_weak::types::ContentId::from(u.to_string()))),
+                    _ => None,
+                }
             })
             .or_else(|| {
                 // A content property the class has but nothing set: the
@@ -871,25 +934,8 @@ impl Document {
                 self.dom
                     .insert(ws, InstanceBuilder::new("Terrain").with_name("Terrain"));
             }
-            let current = match self.prop(ws, "CurrentCamera") {
-                Some(Variant::Ref(c)) if self.exists(c) => Some(c),
-                _ => None,
-            };
-            if current.is_none() {
-                let cam = self.find_child(ws, "Camera").unwrap_or_else(|| {
-                    self.dom.insert(
-                        ws,
-                        InstanceBuilder::new("Camera")
-                            .with_name("Camera")
-                            .with_property("FieldOfView", mech::FOV_DEG),
-                    )
-                });
-                if let Some(i) = self.dom.get_by_ref_mut(ws) {
-                    i.properties
-                        .insert(rbx_dom_weak::ustr("CurrentCamera"), Variant::Ref(cam));
-                }
-            }
         }
+        self.ensure_current_camera();
         // A place saved without LightingStyle: Studio takes it from
         // Technology (tools/fidelity: Place A, which saves neither, reads Soft
         // with PrioritizeLightingQuality false; the control place, Future,
@@ -897,26 +943,41 @@ impl Document {
         if let Some(l) = self.find_child(root, "Lighting") {
             if let Some(i) = self.dom.get_by_ref_mut(l) {
                 let key = |k: &str| rbx_dom_weak::ustr(k);
-                let tech = enum_u32(i.properties.get(&key("Technology")).cloned());
                 if !i.properties.contains_key(&key("LightingStyle")) {
                     // Neither saved (Place A: its chapel is built at run time)
-                    // reads Soft too: Studio's default.
-                    let t = tech.unwrap_or(mech::TECHNOLOGY_SOFT[1]);
-                    let soft = mech::TECHNOLOGY_SOFT.contains(&t);
-                    i.properties.insert(
-                        key("LightingStyle"),
-                        Variant::Enum(rbx_dom_weak::types::Enum::from_u32(u32::from(soft))),
-                    );
+                    // reads Soft too; a place Studio already migrated keeps
+                    // the constructor's (lighting_style_default).
+                    let (style, quality) = lighting_style_default(i);
+                    i.properties.insert(key("LightingStyle"), Variant::Enum(rbx_dom_weak::types::Enum::from_u32(style)));
                     if !i.properties.contains_key(&key("PrioritizeLightingQuality")) {
-                        i.properties.insert(
-                            key("PrioritizeLightingQuality"),
-                            Variant::Bool(mech::TECHNOLOGY_QUALITY.contains(&t)),
-                        );
+                        i.properties.insert(key("PrioritizeLightingQuality"), Variant::Bool(quality));
                     }
                 }
             }
         }
         added
+    }
+
+    /// Workspace.CurrentCamera: Studio makes the edit camera itself, in every
+    /// DataModel (a Team Create server never sends one: the 2026-11-20 FTF
+    /// [DEV] join has no Camera record). Made in place, not as an edit.
+    pub fn ensure_current_camera(&mut self) -> Option<Ref> {
+        let ws = self.workspace()?;
+        if let Some(Variant::Ref(c)) = self.prop(ws, "CurrentCamera") {
+            if self.exists(c) {
+                return Some(c);
+            }
+        }
+        let cam = self.find_child(ws, "Camera").unwrap_or_else(|| {
+            self.dom.insert(
+                ws,
+                InstanceBuilder::new("Camera").with_name("Camera").with_property("FieldOfView", mech::FOV_DEG),
+            )
+        });
+        if let Some(i) = self.dom.get_by_ref_mut(ws) {
+            i.properties.insert(rbx_dom_weak::ustr("CurrentCamera"), Variant::Ref(cam));
+        }
+        Some(cam)
     }
 
     pub fn encode(&self, refs: &[Ref], xml: bool) -> Result<Vec<u8>, String> {
@@ -1093,6 +1154,14 @@ impl Document {
         if let Some(v) = inst.properties.get(&key) {
             return Some(v.clone());
         }
+        if inst.class == "Lighting" && matches!(name, "LightingStyle" | "PrioritizeLightingQuality") {
+            let (style, quality) = lighting_style_default(inst);
+            return Some(if name == "LightingStyle" {
+                Variant::Enum(rbx_dom_weak::types::Enum::from_u32(style))
+            } else {
+                Variant::Bool(quality)
+            });
+        }
         // What doesn't depend on the instance (aliases, class defaults) is
         // worked out once per (class, name): the reflection walks it takes
         // were ~50 µs a part when a 50k-part map was cloned in.
@@ -1118,6 +1187,11 @@ impl Document {
                     .and_then(|o| crate::editable_source::content_uri(o, Some((r, name))))
                 {
                     return Some(Variant::ContentId(rbx_dom_weak::types::ContentId::from(uri)));
+                }
+                // Stored empty (Team Create sends SunTextureContent ""): the
+                // empty id, not the constructor's texture.
+                if c.as_object().is_none() {
+                    return Some(Variant::ContentId(rbx_dom_weak::types::ContentId::from(String::new())));
                 }
             }
             // Team Create's live stream gives Content twins as plain strings.
@@ -1347,7 +1421,9 @@ impl Document {
             .iter()
             .filter_map(|(r, name, value)| {
                 let class = self.dom.get_by_ref(*r)?.class;
-                screen_insets_twin(class.as_str(), name.as_str(), value).map(|(n, v)| (*r, ustr(n), v))
+                screen_insets_twin(class.as_str(), name.as_str(), value)
+                    .or_else(|| lighting_time_twin(class.as_str(), name.as_str(), value))
+                    .map(|(n, v)| (*r, ustr(n), v))
             })
             .collect();
         edits.extend(twins);
@@ -2191,6 +2267,21 @@ pub fn screen_insets_twin(class: &str, name: &str, value: &Variant) -> Option<(&
     }
 }
 
+/// Lighting.ClockTime and TimeOfDay are one value in Studio (the time of day
+/// in whole seconds; files and Team Create carry only TimeOfDay): setting
+/// either sets the other.
+pub fn lighting_time_twin(class: &str, name: &str, value: &Variant) -> Option<(&'static str, Variant)> {
+    if class != "Lighting" {
+        return None;
+    }
+    match (name, value) {
+        ("ClockTime", Variant::Float32(h)) => Some(("TimeOfDay", Variant::String(crate::mech::format_time_of_day(*h)))),
+        ("ClockTime", Variant::Float64(h)) => Some(("TimeOfDay", Variant::String(crate::mech::format_time_of_day(*h as f32)))),
+        ("TimeOfDay", Variant::String(s)) => crate::mech::parse_time_of_day(s).map(|h| ("ClockTime", Variant::Float32(crate::mech::clock_time(h)))),
+        _ => None,
+    }
+}
+
 /// The Content twin newer files keep a legacy asset-id property in
 /// (MeshId → MeshContent …). Roblox treats the pair as one property: setting
 /// either changes both.
@@ -2328,5 +2419,85 @@ mod surface_default_tests {
         // A saved Studs surface still shows.
         let r = d.dom.insert(root, InstanceBuilder::new("Part").with_property("TopSurface", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
         assert_eq!(d.prop(r, "TopSurface"), Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
+    }
+}
+
+#[cfg(test)]
+mod lighting_time_tests {
+    use super::*;
+
+    #[test]
+    fn clock_time_and_time_of_day_stay_one_value() {
+        let mut d = Document::empty();
+        d.ensure_services();
+        let l = d.find_child(d.dom.root_ref(), "Lighting").unwrap();
+        d.set_props("t", vec![(l, ustr("ClockTime"), Variant::Float32(20.3))], None);
+        assert_eq!(d.prop(l, "TimeOfDay"), Some(Variant::String("20:18:00".into())));
+        d.set_props("t", vec![(l, ustr("TimeOfDay"), Variant::String("02:48:00".into()))], None);
+        assert_eq!(d.prop(l, "ClockTime"), Some(Variant::Float32(2.8)));
+        // Clamped and cut to whole seconds, as Studio stores it.
+        d.set_props("t", vec![(l, ustr("ClockTime"), Variant::Float32(30.0))], None);
+        assert_eq!(d.prop(l, "TimeOfDay"), Some(Variant::String("24:00:00".into())));
+        assert_eq!(lighting_time_twin("Part", "ClockTime", &Variant::Float32(1.0)), None);
+        assert_eq!(crate::mech::parse_time_of_day("07:45:30"), Some(7.0 + 45.0 / 60.0 + 30.0 / 3600.0));
+    }
+}
+
+#[cfg(test)]
+mod studio_defaults_tests {
+    use super::*;
+
+    fn lighting(attrs: Option<bool>, tech: Option<u32>) -> (Document, Ref) {
+        let mut d = Document::empty();
+        let mut b = InstanceBuilder::new("Lighting").with_name("Lighting");
+        if let Some(t) = tech {
+            b = b.with_property("Technology", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(t)));
+        }
+        if let Some(m) = attrs {
+            let mut a = rbx_dom_weak::types::Attributes::new();
+            a.insert(LIGHTING_MIGRATED_ATTRIBUTE.into(), Variant::Bool(m));
+            b = b.with_property("Attributes", Variant::Attributes(a));
+        }
+        let root = d.dom.root_ref();
+        let l = d.dom.insert(root, b);
+        (d, l)
+    }
+
+    #[test]
+    fn lighting_style_follows_studio_migration_and_constructor() {
+        let style = |d: &Document, l| d.prop(l, "LightingStyle");
+        let quality = |d: &Document, l| d.prop(l, "PrioritizeLightingQuality");
+        let e = |v| Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(v)));
+        // Migrated (a Team Create server's Lighting): the constructor's
+        // Realistic / true whatever Technology says.
+        for tech in [None, Some(1), Some(3), Some(4)] {
+            let (d, l) = lighting(Some(true), tech);
+            assert_eq!(style(&d, l), e(0), "{tech:?}");
+            assert_eq!(quality(&d, l), Some(Variant::Bool(true)));
+        }
+        // Not migrated: derived from Technology.
+        for (tech, s, q) in [(Some(4), 0, true), (Some(3), 1, true), (Some(1), 1, false), (None, 1, false), (Some(0), 1, false)] {
+            let (d, l) = lighting(None, tech);
+            assert_eq!((style(&d, l), quality(&d, l)), (e(s), Some(Variant::Bool(q))), "{tech:?}");
+        }
+    }
+
+    #[test]
+    fn content_twins_fall_back_to_the_constructor_textures() {
+        let mut d = Document::empty();
+        let root = d.dom.root_ref();
+        let sky = d.dom.insert(root, InstanceBuilder::new("Sky"));
+        let id = |s: &str| Some(Variant::ContentId(rbx_dom_weak::types::ContentId::from(s.to_string())));
+        assert_eq!(d.prop(sky, "MoonTextureId"), id("rbxasset://sky/moon.jpg"));
+        assert_eq!(d.prop(sky, "SunTextureId"), id("rbxasset://sky/sun.jpg"));
+        // Sent empty (Team Create: SunTextureContent ""), as a string or as
+        // the empty Content the live model stores: empty.
+        d.dom.get_by_ref_mut(sky).unwrap().properties.insert(ustr("SunTextureContent"), Variant::String(String::new()));
+        assert_eq!(d.prop(sky, "SunTextureId"), id(""));
+        d.dom.get_by_ref_mut(sky).unwrap().properties.insert(ustr("SunTextureContent"), Variant::Content(rbx_dom_weak::types::Content::none()));
+        assert_eq!(d.prop(sky, "SunTextureId"), id(""));
+        assert_eq!(d.prop(sky, "MoonTextureId"), id("rbxasset://sky/moon.jpg"), "the omitted moon keeps its default");
+        assert_eq!(default_instance_name("DepthOfFieldEffect"), "DepthOfField");
+        assert_eq!(default_instance_name("Atmosphere"), "Atmosphere");
     }
 }

@@ -2164,6 +2164,35 @@ mod tests {
         assert!(!W::drag_active());
     }
 
+    /// Argon's settings widget: its BindToClose callback destroys the widget
+    /// and clears its state; a second × on the destroyed widget's panel must
+    /// not run the callback again.
+    #[test]
+    fn a_destroyed_widget_ignores_close() {
+        let (mut h, mut doc) = host_with(
+            r#"
+            local w = plugin:CreateDockWidgetPluginGui("S", DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, true, false, 200, 200))
+            local held = w
+            w:BindToClose(function()
+                print("[T] closing")
+                held:Destroy()
+                held = nil
+            end)
+            "#,
+        );
+        run(&mut h, &mut doc, 4);
+        let items = h.ui_items();
+        let w = items.iter().find(|u| matches!(&u.kind, UiKind::DockWidget { id, .. } if id == "S")).map(|u| u.r).unwrap();
+        h.with_edit(&mut doc, |rt| {
+            W::close(rt, w);
+            W::close(rt, w);
+        });
+        let log = h.take_log();
+        let closing = log.iter().filter(|(_, t)| t.starts_with("[T] closing")).count();
+        assert_eq!(closing, 1, "{log:#?}");
+        assert!(!log.iter().any(|(_, t)| t.contains("attempt to index nil")), "{log:#?}");
+    }
+
     #[test]
     fn create_dock_widget_yields_a_frame() {
         let (mut h, mut doc) = host_with(

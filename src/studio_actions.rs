@@ -86,6 +86,7 @@ impl Editor {
             "avatar_settings" => (true, open("Avatar Settings")),
             "terrain_editor" => (true, open("Terrain Editor")),
             "toolbox" => (true, open("Toolbox")),
+            "microprofiler" => (true, open("MicroProfiler")),
             a if a.starts_with("toolbox:") => (true, None),
             "character" => (edit, Some(self.chars.open)),
             a if a.starts_with("character:") => (edit, None),
@@ -246,6 +247,8 @@ impl Editor {
             "avatar_settings" => self.ui.panel_requests.push((Tab::AvatarSettings, None)),
             "terrain_editor" => self.ui.panel_requests.push((Tab::TerrainEditor, None)),
             "toolbox" => self.ui.panel_requests.push((Tab::Toolbox, None)),
+            "file_sync" => self.ui.panel_requests.push((Tab::FileSync, Some(true))),
+            "microprofiler" => self.ui.panel_requests.push((Tab::Profiler, None)),
             a if a.starts_with("toolbox:") => self.toolbox_action(a),
             "about" => self.ui.about = true,
             "logs_folder" => {

@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeMap;
 #[derive(Default)]
-struct Memory { scripts:HashMap<Ref,u8>, active:HashMap<usize,u8>, instances:HashMap<Ref,Option<Ref>>, creations:u64, blocked:std::collections::HashSet<Ref> }
+struct Memory { scripts:HashMap<Ref,u8>, active:HashMap<usize,u8>, vm:usize, instances:HashMap<Ref,Option<Ref>>, creations:u64, blocked:std::collections::HashSet<Ref> }
 fn category(lua:&Lua,r:Ref)->u8{
     let Some(mut memory)=lua.app_data_mut::<Memory>()else{return 0};
     if let Some(&id)=memory.scripts.get(&r){return id}
@@ -24,11 +24,34 @@ pub fn restore(lua:&Lua,category:u8)->mlua::Result<()>{
         mlua::ffi::lua_setmemcat(state,category as i32);
     })}
 }
+thread_local!{
+    /// Threads the GC destroyed, per VM (callbacks pointer), not yet
+    /// dropped from `Memory::active`.
+    static DEAD:std::cell::RefCell<Vec<(usize,usize)>>=const{std::cell::RefCell::new(Vec::new())};
+}
+/// Luau's thread destruction (security::userthread): no Lua access there.
+pub fn thread_died(vm:usize,thread:usize){
+    DEAD.with(|d|{let mut d=d.borrow_mut();if d.len()<1<<20{d.push((vm,thread));}});
+}
+/// Drops this VM's destroyed threads from the map (before a new thread can
+/// reuse an address).
+fn drain_dead(lua:&Lua){
+    let vm=lua.app_data_ref::<Memory>().map_or(0,|m|m.vm);
+    if vm==0{return}
+    let dead:Vec<usize>=DEAD.with(|d|{let mut d=d.borrow_mut();if d.is_empty(){return Vec::new()}
+        let mut mine=Vec::new();d.retain(|&(v,t)|if v==vm{mine.push(t);false}else{true});mine});
+    if dead.is_empty(){return}
+    if let Some(mut memory)=lua.app_data_mut::<Memory>(){for t in dead{memory.active.remove(&t);}}
+}
 pub fn script_thread(lua:&Lua,thread:&mlua::Thread,r:Ref)->mlua::Result<()>{
+    drain_dead(lua);
     let category=category(lua,r);
     unsafe{lua.exec_raw::<()>(thread.clone(),|state|{
         let thread=mlua::ffi::lua_tothread(state,-1);
-        if let Some(mut memory)=lua.app_data_mut::<Memory>(){memory.active.insert(thread as usize,category);}
+        if let Some(mut memory)=lua.app_data_mut::<Memory>(){
+            memory.active.insert(thread as usize,category);
+            if memory.vm==0{memory.vm=mlua::ffi::lua_callbacks(thread)as usize;}
+        }
         mlua::ffi::lua_setmemcat(thread,category as i32);
     })}
 }
@@ -37,6 +60,31 @@ pub fn create_thread(lua:&Lua,f:mlua::Function)->mlua::Result<mlua::Thread>{
     let thread=lua.create_thread(f)?;
     if let Some(r)=script{script_thread(lua,&thread,r)?;}
     Ok(thread)
+}
+/// The script a thread was created for (script profiler), by thread pointer.
+pub fn thread_script(lua:&Lua,thread:usize)->Option<Ref>{
+    let memory=lua.app_data_ref::<Memory>()?;
+    let category=*memory.active.get(&thread)?;
+    if category==0{return None}
+    memory.scripts.iter().find_map(|(r,&id)|(id==category).then_some(*r))
+}
+/// Heap per script memory category (script profiler).
+pub struct ScriptHeap{pub total:usize,pub other:usize,pub scripts:Vec<(Ref,usize,u32)>}
+pub fn memory_by_script(lua:&Lua)->Option<ScriptHeap>{
+    drain_dead(lua);
+    let (scripts,mut threads)={
+        let memory=lua.app_data_ref::<Memory>()?;
+        let mut threads=[0u32;256];
+        for &c in memory.active.values(){threads[c as usize]+=1;}
+        (memory.scripts.iter().map(|(&r,&c)|(r,c)).collect::<Vec<_>>(),threads)
+    };
+    let mut out=ScriptHeap{total:0,other:0,scripts:Vec::with_capacity(scripts.len())};
+    unsafe{lua.exec_raw::<()>((),|state|{
+        out.total=mlua::ffi::lua_totalbytes(state,-1);
+        out.other=mlua::ffi::lua_totalbytes(state,0);
+        for &(r,c) in &scripts{out.scripts.push((r,mlua::ffi::lua_totalbytes(state,c as i32),std::mem::take(&mut threads[c as usize])));}
+    })}.ok()?;
+    Some(out)
 }
 /// Class-level InternalTest access is checked before an Instance reaches Lua.
 pub fn access_blocked(lua:&Lua,r:Ref)->bool{

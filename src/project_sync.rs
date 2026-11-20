@@ -24,7 +24,7 @@ use rustudio_core::doc::{self, Document};
 use crate::project::{self, Origin, Reader, Snap};
 
 #[path = "project_write.rs"]
-mod write;
+pub(crate) mod write;
 #[path = "project_sourcemap.rs"]
 pub mod sourcemap;
 
@@ -128,6 +128,48 @@ pub fn open(file: &Path) -> Result<(Document, ProjectState), String> {
     st.watch();
     st.update_sourcemap(&doc);
     Ok((doc, st))
+}
+
+/// Attaches a project to a document that is already open (File Sync,
+/// src/file_sync): reads the project, starts watching its folder, and leaves
+/// the document alone (the caller matches the tree to it and fills `map`).
+pub fn attach(file: &Path, doc: &Document) -> Result<(ProjectState, Snap), String> {
+    let file = std::fs::canonicalize(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let root = file.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let pj: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+    let name = pj.get("name").and_then(|n| n.as_str()).unwrap_or("project").to_string();
+    let ignore: Vec<glob::Pattern> = ["globIgnorePaths", "ignoreGlobs"]
+        .iter()
+        .filter_map(|k| pj.get(*k).and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|g| g.as_str().and_then(|g| glob::Pattern::new(g).ok()))
+        .collect();
+    let (config, config_warnings) = crate::project_config::ProjectConfig::load(&file, &pj);
+    let mut st = ProjectState {
+        file: file.clone(),
+        root,
+        name,
+        place: None,
+        ignore,
+        mapped: Vec::new(),
+        map: HashMap::new(),
+        disk: HashMap::new(),
+        doc_id: doc.id,
+        watcher: None,
+        events: None,
+        pending: HashSet::new(),
+        pending_since: None,
+        place_dirty: false,
+        reapply_after_play: false,
+        warnings: config_warnings,
+        config: std::sync::Arc::new(config),
+        sourcemap_dirty: false,
+        log: Vec::new(),
+    };
+    let tree = st.read_tree().ok_or_else(|| format!("{}: the project file has no tree", file.display()))?;
+    st.watch();
+    Ok((st, tree))
 }
 
 /// `<name>.rbxl(x)` beside the project file, else the only place file there.
@@ -341,6 +383,30 @@ impl ProjectState {
             })
             .collect();
         (!changed.is_empty()).then_some(changed)
+    }
+}
+
+impl ProjectState {
+    /// Reads the project's tree again (File Sync): what was read becomes what
+    /// is known to be on disk, and the mapped paths follow the project file.
+    /// The project's own settings are active while it reads.
+    pub fn read_tree(&mut self) -> Option<Snap> {
+        let before = crate::project_config::active();
+        crate::project_config::set_active(Some(self.config.clone()));
+        let ignore = self.ignore.clone();
+        let root = self.root.clone();
+        let mut reader = Reader::new(&root, &ignore);
+        let tree = reader.project_file(&self.file);
+        crate::project_config::set_active(before);
+        self.warnings.extend(std::mem::take(&mut reader.warnings));
+        let tree = tree?;
+        self.disk = std::mem::take(&mut reader.read);
+        if let Ok(b) = std::fs::read(&self.file) {
+            self.disk.insert(self.file.clone(), b);
+        }
+        self.mapped.clear();
+        collect_mapped(&tree, &mut self.mapped);
+        Some(tree)
     }
 }
 

@@ -1321,6 +1321,16 @@ pub mod perf {
             return;
         }
         NET_TOTAL.fetch_add(bytes, Relaxed);
+        if rustudio_core::profiler::active() {
+            use rustudio_core::profiler::{rate, Cat, Unit};
+            let name = match (to_client, physics) {
+                (true, false) => "replication to client",
+                (true, true) => "physics to client",
+                (false, false) => "replication to server",
+                (false, true) => "physics to server",
+            };
+            rate(name, Cat::Network, Unit::BytesPerSec, bytes as f64);
+        }
         let i = (!to_client as usize) * 2 + physics as usize;
         if let Ok(mut q) = NET.lock() {
             let now = Instant::now();

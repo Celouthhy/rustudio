@@ -105,7 +105,9 @@ struct Job {
 }
 
 pub struct SkinGpu {
-    pipeline: wgpu::ComputePipeline,
+    /// None without compute shaders (OpenGL < 4.3): skinned parts then draw
+    /// their mesh at rest.
+    pipeline: Option<wgpu::ComputePipeline>,
     sources: HashMap<String, Arc<Source>>,
     jobs: HashMap<u32, Job>,
     due: Vec<u32>,
@@ -125,7 +127,10 @@ pub struct Request<'a> {
 }
 
 impl SkinGpu {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, compute: bool) -> Self {
+        if !compute {
+            return SkinGpu { pipeline: None, sources: HashMap::new(), jobs: HashMap::new(), due: Vec::new(), bytes: 0 };
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("skinning"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -138,7 +143,7 @@ impl SkinGpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        SkinGpu { pipeline, sources: HashMap::new(), jobs: HashMap::new(), due: Vec::new(), bytes: 0 }
+        SkinGpu { pipeline: Some(pipeline), sources: HashMap::new(), jobs: HashMap::new(), due: Vec::new(), bytes: 0 }
     }
 
     fn source(&mut self, device: &wgpu::Device, key: &str, base: &crate::skin::Base) -> Arc<Source> {
@@ -179,6 +184,7 @@ impl SkinGpu {
         vbuf: &wgpu::Buffer,
         req: &Request,
     ) {
+        let Some(pipeline) = self.pipeline.clone() else { return };
         let src = self.source(device, req.key, req.base);
         let bones = req.palette.len().max(1) as u32;
         let vbuf_id = vbuf as *const wgpu::Buffer as usize;
@@ -201,7 +207,7 @@ impl SkinGpu {
             });
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("skinning"),
-                layout: &self.pipeline.get_bind_group_layout(0),
+                layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: src.buf.as_entire_binding() },
@@ -263,11 +269,12 @@ impl SkinGpu {
 
     /// Records this frame's dispatches.
     pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        if self.due.is_empty() {
+        let Some(pipeline) = self.pipeline.as_ref().filter(|_| !self.due.is_empty()) else {
+            self.due.clear();
             return;
-        }
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("skinning"), timestamp_writes: None });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         for slot in self.due.drain(..) {
             if let Some(j) = self.jobs.get(&slot) {
                 pass.set_bind_group(0, &j.bind, &[]);

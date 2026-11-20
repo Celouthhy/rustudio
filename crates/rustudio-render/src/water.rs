@@ -97,7 +97,7 @@ impl WaterPass {
                 frag(
                     4,
                     wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: samples > 1,
                     },
@@ -239,6 +239,9 @@ fn load_normals(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::TextureVie
     if frames.len() != FRAMES as usize {
         // Flat: x, y at 0.5 (.wy), smooth.
         frames = vec![[0u8, 128, 128, 128].repeat((SIZE * SIZE) as usize)];
+        if crate::gpu_caps::single_layer_arrays_break(device) {
+            frames.push(frames[0].clone());
+        }
     }
     let layers = frames.len() as u32;
     let mips = 32 - SIZE.leading_zeros();

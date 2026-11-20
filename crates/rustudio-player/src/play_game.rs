@@ -164,6 +164,11 @@ pub struct GameState {
 }
 
 impl GameState {
+    /// Sounds playing now (the profiler's audio voices counter).
+    pub(crate) fn audio_voices(&self) -> usize {
+        self.audio.as_ref().map_or(0, |a| a.playing_count())
+    }
+
     /// View > Mute: silences the sounds playing now (later ones read the flag).
     pub fn set_muted(&mut self, on: bool) {
         if let Some(a) = self.audio.as_mut() {

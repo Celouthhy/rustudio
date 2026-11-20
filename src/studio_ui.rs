@@ -278,6 +278,7 @@ pub const VIEW: &[M] = &[
     I("Toggle Comment", "Ctrl+/", "toggle_comment"),
     S,
     I("Screenshot", "", "screenshot"),
+    I("MicroProfiler", "Ctrl+F6", "microprofiler"),
     S,
     I("Mute", "", "mute"),
 ];
@@ -325,6 +326,7 @@ pub const TEST: &[M] = &[
 
 pub const WINDOW: &[M] = &[
     I("Toolbox", "", "toolbox"),
+    I("File Sync", "", "file_sync"),
     I("Properties", "", "panel_properties"),
     I("Explorer", "Alt+X", "panel_explorer"),
     I("Output", "", "panel_output"),
@@ -345,7 +347,7 @@ pub const WINDOW: &[M] = &[
     Sub("Localization", &[I("Localization Tools", "", "localization_tools")]),
     Sub("Performance Summary", &[
         I("Performance Diagnostics", "", "perf_diagnostics"),
-        I("MicroProfiler", "Ctrl+Alt+F6", "microprofiler"),
+        I("MicroProfiler", "Ctrl+F6", "microprofiler"),
         I("Network Summary", "Ctrl+Shift+F3", "net_summary"),
         I("Performance Summary", "Ctrl+Shift+F5", "perf_summary"),
         I("Physics", "Ctrl+Shift+F4", "physics_stats"),
@@ -463,6 +465,13 @@ pub fn menu_shortcuts() -> Vec<(KeyboardShortcut, &'static str)> {
     for (_, items) in MENUS {
         walk(items, &mut out);
     }
+    // An action listed in two menus (MicroProfiler: View and Window) binds once.
+    let mut seen = Vec::new();
+    out.retain(|(k, a)| {
+        let dup = seen.contains(&(*k, *a));
+        seen.push((*k, *a));
+        !dup
+    });
     out.sort_by_key(|(k, _)| {
         std::cmp::Reverse(k.modifiers.command as u8 + k.modifiers.shift as u8 + k.modifiers.alt as u8)
     });

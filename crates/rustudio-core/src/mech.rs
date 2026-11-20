@@ -182,6 +182,19 @@ pub fn setter_clamp(class: &str, prop: &str, v: f32) -> Option<f32> {
 pub fn clock_time(v: f32) -> f32 {
     (v.clamp(0.0, CLOCK_TIME_MAX) * SECONDS_PER_HOUR).trunc() / SECONDS_PER_HOUR
 }
+/// Lighting.TimeOfDay "HH:MM:SS" as hours (missing fields are 0).
+pub fn parse_time_of_day(s: &str) -> Option<f32> {
+    let mut p = s.split(':').map(|x| x.trim().parse::<f32>().ok());
+    let h = p.next()??;
+    let m = p.next().flatten().unwrap_or(0.0);
+    let sec = p.next().flatten().unwrap_or(0.0);
+    Some(h + m / 60.0 + sec / 3600.0)
+}
+/// Hours as Lighting.TimeOfDay writes them: clamped to [0, 24], whole seconds.
+pub fn format_time_of_day(hours: f32) -> String {
+    let secs = (clock_time(hours) * SECONDS_PER_HOUR).round() as u32;
+    format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+}
 pub const MAX_LIGHTS: usize = 256; // nearest lights drawn per frame
 pub const SHADOW_MAP_TEXELS: u32 = 2048; // the depth map the sun's cascades are drawn into one at a time: the largest tile (SUN_CASCADE_TILES)
 pub const SHADOW_LOD_SCALE: f32 = 2.0; // casters can be this much smaller on screen than drawn parts before they're skipped

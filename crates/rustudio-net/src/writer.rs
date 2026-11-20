@@ -221,6 +221,8 @@ fn encode_value(out: &mut Vec<u8>, ty: u8, value: &PropValue) -> Result<(), Stri
 }
 
 /// NewObjectItem with schema-indexed properties and an empty early group.
+/// Every property must be sent; see [`create_partial`] to drop the ones this
+/// server cannot take.
 pub fn create(
     schema: &Schema,
     id: u64,
@@ -228,6 +230,27 @@ pub fn create(
     parent: u64,
     props: &[(String, PropValue)],
 ) -> Result<Vec<u8>, String> {
+    let (frame, skipped) = create_partial(schema, id, class, parent, props)?;
+    match skipped.into_iter().next() {
+        Some((_, reason)) => Err(reason),
+        None => Ok(frame),
+    }
+}
+
+/// Properties a create left out: (name, reason).
+pub type Skipped = Vec<(String, String)>;
+
+/// [`create`], leaving out each property the server's schema doesn't
+/// replicate for the class or whose value has no wire form here: those are
+/// returned as (name, reason) and the rest of the instance is still created.
+/// An unknown class fails the whole item.
+pub fn create_partial(
+    schema: &Schema,
+    id: u64,
+    class: &str,
+    parent: u64,
+    props: &[(String, PropValue)],
+) -> Result<(Vec<u8>, Skipped), String> {
     let (ci, cls) = schema
         .classes
         .iter()
@@ -239,13 +262,28 @@ pub fn create(
     put_reference(&mut out, id);
     out.extend_from_slice(&ci.to_le_bytes());
     let mut encoded=Vec::new();
+    let mut skipped=Vec::new();
     for (name,value) in props {
         let find=|n: &str| cls.props.iter().enumerate().find(|(_,p)| p.name==n);
-        let (pi,prop)=find(wire_name(name)).or_else(|| find(name))
-            .ok_or_else(|| format!("{class}.{name} is not replicated by this server"))?;
-        if pi>=255 {return Err("Property index exceeds protocol range".into());}
-        encoded.push((pi as u8,prop.ty,prepare_value(prop.ty,value)?));
+        let Some((pi,prop))=find(wire_name(name)).or_else(|| find(name)) else {
+            skipped.push((name.clone(),format!("{class}.{name} is not replicated by this server")));
+            continue;
+        };
+        if pi>=255 {skipped.push((name.clone(),"Property index exceeds protocol range".into()));continue;}
+        // Encode once here so a value without a wire form drops only itself.
+        let value=match prepare_value(prop.ty,value) {Ok(v)=>v,Err(e)=>{skipped.push((name.clone(),e));continue;}};
+        if let Err(e)=encode_value(&mut Vec::new(),prop.ty,&value) {skipped.push((name.clone(),format!("{class}.{name}: {e}")));continue;}
+        encoded.push((pi as u8,prop.ty,value));
     }
+    // Each group goes in ascending schema index, as the server's own
+    // NewObject items do. The CloudEdit server drops the session ("Error
+    // while receiving data", 0x104) on a property whose index is below the
+    // one before it: rustudio sent Name first, so a SurfaceAppearance with
+    // AlphaMode / EmissiveStrength / ColorMapContent (all below Name) and a
+    // LocalScript with Disabled / RunContext reset Place A's session (verified
+    // live on a test place, 2026-11-20: Name alone is accepted, Name + any of them
+    // resets).
+    encoded.sort_by_key(|(pi,_,_)| *pi);
     // Protected source is serialized in NewObject's early group.
     for &(pi,ty,ref value) in encoded.iter().filter(|(_,ty,_)| *ty==0x06) {
         out.push(pi);encode_value(&mut out,ty,value)?;
@@ -260,7 +298,7 @@ pub fn create(
     }
     put_reference(&mut out, parent);
     out.push(0);
-    Ok(out)
+    Ok((out, skipped))
 }
 
 pub fn delete(id: u64) -> Vec<u8> {
@@ -279,7 +317,12 @@ pub fn reparent(schema: &Schema, id: u64, parent: u64) -> Result<Vec<u8>, String
     put_reference(&mut out, id);
     out.extend_from_slice(&descriptor.to_le_bytes());
     out.push(0);
-    put_reference(&mut out, parent);
+    // Parent 0 is nil (no instance has referent 0).
+    if parent == 0 {
+        out.push(0);
+    } else {
+        put_reference(&mut out, parent);
+    }
     out.push(0);
     Ok(out)
 }
@@ -409,6 +452,50 @@ mod tests {
         let ops=dec.decode_frame(frame[0],&frame[1..]);
         assert!(matches!(&ops[0],RepOp::Event {args,..} if args==&vec![PropValue::Bool(true),metadata]));
         assert!(event(&schema,1,"TeamCreatePublishService","TeamCreatePlaceUploadRequest",&[]).is_err());
+    }
+
+    /// Properties go out in ascending schema index, whatever order the
+    /// caller gives (Name first used to come before lower indices).
+    #[test]
+    fn create_writes_properties_in_schema_order() {
+        let prop = |name: &str, ty| SchemaProp { name: name.into(), ty };
+        let schema = Schema {
+            classes: vec![SchemaClass {
+                name: "SurfaceAppearance".into(),
+                props: vec![prop("AlphaMode", 0x07), prop("ColorMapContent", 0x3d), prop("EmissiveStrength", 0x0b), prop("Name", 0x31)],
+                events: vec![],
+            }],
+            ..Default::default()
+        };
+        let props = vec![
+            ("Name".to_string(), PropValue::String("Look".into())),
+            ("EmissiveStrength".to_string(), PropValue::Float(0.0)),
+            ("AlphaMode".to_string(), PropValue::Enum(1)),
+            ("ColorMapContent".to_string(), PropValue::String("rbxassetid://1".into())),
+        ];
+        let frame = create(&schema, 7, "SurfaceAppearance", 1, &props).unwrap();
+        // 83 02, reference (01 + u32), u16 class, empty early group (ff),
+        // then the normal group: AlphaMode (index 0) first.
+        assert_eq!(frame[2 + 5 + 2 + 1], 0);
+        let mut dec = Decoder::new();
+        dec.schema = Some(schema);
+        let ops = dec.decode_frame(frame[0], &frame[1..]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        let RepOp::NewInstance { props: got, .. } = &ops[0] else { panic!() };
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["AlphaMode", "ColorMapContent", "EmissiveStrength", "Name"]);
+    }
+
+    /// Parent 0 is written as nil (scope 0), not as referent 0.
+    #[test]
+    fn reparent_to_nil() {
+        let schema = Schema { global_props: vec![(0, 0); 3], ..Default::default() };
+        let frame = reparent(&schema, (5u64 << 32) | 2, 0).unwrap();
+        assert_eq!(&frame[frame.len() - 2..], &[0, 0], "nil reference, then the end of the item list");
+        let mut dec = Decoder::new();
+        dec.schema = Some(schema);
+        let ops = dec.decode_frame(frame[0], &frame[1..]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
     }
 
     #[test]

@@ -795,6 +795,17 @@ impl StudioSolver {
         if !self.throttled && self.env_phase.is_none() {
             self.full_stats = st;
         }
+        if rustudio_core::profiler::active() {
+            use rustudio_core::profiler::{counter, Cat};
+            counter("physics bodies", Cat::Physics, st.bodies as f64);
+            counter("physics awake bodies", Cat::Physics, st.awake as f64);
+            counter("physics contact pairs", Cat::Physics, st.contact_pairs as f64);
+            counter("physics contact points", Cat::Physics, st.points as f64);
+            counter("physics joints", Cat::Physics, st.joints as f64);
+            counter("physics islands", Cat::Physics, st.islands as f64);
+            counter("physics largest island", Cat::Physics, st.largest_island as f64);
+            counter("physics solver rows", Cat::Physics, st.rows as f64);
+        }
         self.stats = st;
     }
 }

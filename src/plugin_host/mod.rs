@@ -394,6 +394,33 @@ impl PluginHost {
         Some(r)
     }
 
+    /// `with_edit`, starting the edit VM first when no plugin has (the MCP
+    /// server's Luau in the edit DataModel). Once started it ticks with the
+    /// editor like a plugin's, so a chunk that yields resumes.
+    pub fn with_edit_vm<R>(&mut self, doc: &mut Document, f: impl FnOnce(&Runtime) -> R) -> Result<R, String> {
+        if self.edit.as_ref().is_some_and(|e| e.doc_id != doc.id) {
+            return Err("The open place just changed; call again".into());
+        }
+        if self.edit.is_none() {
+            let (rt, world) = new_vm(RunMode::Edit)?;
+            if let Some(ctx) = &self.repaint_context {
+                rt.lua.set_app_data(ctx.clone());
+            }
+            self.edit = Some(EditVm { rt, world: Some(world), doc_id: doc.id, bound: false, gc_t: 0.0 });
+        }
+        if self.edit.as_ref().is_some_and(|e| !e.bound) {
+            studio_place_name(doc);
+            let bound = self
+                .with_edit(doc, |rt| rt.bind_globals().and_then(|_| edit_loadstring(rt)).map_err(|e| rustudio_engine::runtime::describe_error(&e)))
+                .ok_or("The edit DataModel's runtime is busy")?;
+            bound?;
+            if let Some(e) = self.edit.as_mut() {
+                e.bound = true;
+            }
+        }
+        self.with_edit(doc, f).ok_or_else(|| "The edit DataModel's runtime is busy".into())
+    }
+
     /// One edit frame: pending loads / unloads, edits made outside the VM
     /// as signals, RunService's edit-mode events (Heartbeat; RenderStepped
     /// and PreRender too unless Play is running, as Studio's edit

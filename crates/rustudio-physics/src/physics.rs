@@ -3681,6 +3681,9 @@ impl Physics {
             self.track_velocity_constraints();
             self.accum -= h;
             self.steps += 1;
+            rustudio_core::profiler::frame(rustudio_core::profiler::FrameKind::Physics);
+            // simulated seconds per real second (1.0 = real time)
+            rustudio_core::profiler::rate("physics sim rate", rustudio_core::profiler::Cat::Physics, rustudio_core::profiler::Unit::Ratio, h as f64);
             if studio {
                 self.throttle.record_tick(tick_start.elapsed().as_secs_f32() * 1000.0);
                 let ms = tick_start.elapsed().as_secs_f64() * 1000.0;

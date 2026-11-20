@@ -246,6 +246,17 @@ fn set_store(lua: &Lua, r: Ref, key: &str, v: Value) -> mlua::Result<()> {
 /// it set one (the widget stays; the plugin decides), else Enabled turns
 /// false (the panel closes, the Enabled changed signal fires).
 pub fn close(rt: &rustudio_engine::runtime::Runtime, r: Ref) {
+    // A widget the plugin destroyed has no panel in Studio. Its panel can
+    // still be up here until the dock catches up, and a × click (or one
+    // queued before the Destroy) ran the callback again: Argon's settings
+    // callback then indexed its cleared state ("attempt to index nil with
+    // 'Destroy'", Argon.App:269).
+    let gone = rt.world_mut().is_none_or(|mut w| {
+        w.destroyed.contains(&r) || w.dm().dom.get_by_ref(r).is_none_or(|i| i.parent().is_none())
+    });
+    if gone {
+        return;
+    }
     let lua = &rt.lua;
     let cb = store_table(lua, r).and_then(|t| t.get::<Value>("__close")).unwrap_or(Value::Nil);
     match cb {

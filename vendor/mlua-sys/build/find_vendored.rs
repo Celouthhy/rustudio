@@ -23,6 +23,13 @@ pub fn probe_lua() {
 
     #[cfg(feature = "luau")]
     let artifacts = luau0_src::Build::new()
+        // rustudio: the vendored tree next to this crate, found at run time
+        // (the luau0-src crate's compile-time path is stale when a target
+        // dir was copied from another checkout: a build slot compiled
+        // another tree's older Luau).
+        .source_dir(
+            std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../luau0-src"),
+        )
         .enable_codegen(cfg!(feature = "luau-codegen"))
         .set_max_cstack_size(1000000)
         .set_vector_size(if cfg!(feature = "luau-vector4") { 4 } else { 3 })

@@ -263,9 +263,22 @@ pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
         wgpu_setup: {
             let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
             let descriptor = setup.device_descriptor.clone();
+            // A real GPU before a software one, a native API before
+            // OpenGL (gpu_caps::rank_adapters): on Windows an HD 4600's GL
+            // driver before WARP, its only DX12 adapter. The vendored
+            // egui-wgpu tries the next one when a device can't be made.
+            setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+                rustudio_render::gpu_caps::rank_adapters(adapters, surface)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("no graphics adapter can draw to this window ({} found)", adapters.len()))
+            }));
             setup.device_descriptor = std::sync::Arc::new(move |adapter| {
                 let mut d = descriptor(adapter);
-                d.required_limits.max_sampled_textures_per_shader_stage = 24;
+                // Only what the adapter offers (gpu_caps.rs): unchanged on a
+                // capable GPU; OpenGL's 16 texture units, WARP's limits and
+                // the like get the renderer's reduced binding set.
+                d.required_limits = rustudio_render::gpu_caps::required_limits(&adapter.limits());
                 // Studio HBAO writes its full-resolution R8 visibility UAV.
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                 // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).

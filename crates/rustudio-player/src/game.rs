@@ -122,7 +122,14 @@ pub struct Game {
 
 impl Game {
     pub fn new(render_state: Option<egui_wgpu::RenderState>) -> Self {
-        let renderer = render_state.as_ref().map(|rs| Renderer::new(&rs.device, &rs.queue));
+        let renderer = render_state.as_ref().map(|rs| {
+            rustudio_render::gpu_health::watch(&rs.adapter, &rs.device);
+            // Weak-GPU mode and the renderer's binding set (gpu_caps.rs),
+            // before automatic_quality below takes its first level.
+            let caps = rustudio_render::gpu_caps::GpuCaps::of_adapter(&rs.adapter, &rs.device);
+            rustudio_core::rustudio_settings::set_weak_gpu(rustudio_render::gpu_caps::decide_lowend(&caps));
+            Renderer::with_caps(&rs.device, &rs.queue, &caps)
+        });
         Self {
             phys: Default::default(),
             fullscreen: false,

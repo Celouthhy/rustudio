@@ -21,6 +21,7 @@ fn load(session: &LiveSession) -> (LiveModel, u64) {
             }
             Ok(LiveEvent::Ready) => return (model, user),
             Ok(LiveEvent::Error(e) | LiveEvent::EditRejected(e) | LiveEvent::Disconnected(e)) => panic!("{e}"),
+            Ok(LiveEvent::EditFailed { error, .. } | LiveEvent::PropertySkipped { reason: error, .. }) => panic!("{error}"),
             Ok(LiveEvent::Notice(message)) => println!("notice: {message}"),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(e) => panic!("event channel: {e}"),

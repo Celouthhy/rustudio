@@ -213,10 +213,94 @@ static Closure* auxgetinfo(lua_State* L, const char* what, lua_Debug* ar, Closur
             cl = f;
             break;
         }
+        case 'N':
+        {
+            // rustudio (script profiler): userdata = 1 when the function
+            // runs as native code, 0 when it is interpreted (or C).
+            const Proto* p = f->isC ? NULL : (ci != nullptr ? ci->p : f->l.p);
+            ar->userdata = (void*)(uintptr_t)(p && p->execdata ? 1 : 0);
+            break;
+        }
         default:;
         }
     }
     return cl;
+}
+
+// rustudio (script profiler): the name a C function was called by at
+// stack `level`, read from its Lua caller's code: the method of the
+// NAMECALL / NAMECALLUDATA, or the global / import path, that loaded the
+// called register. NULL when the caller isn't Lua or nothing matches.
+const char* lua_rs_callname(lua_State* L, int level)
+{
+    static thread_local char buf[96];
+    if (level < 0 || unsigned(level + 1) >= unsigned(L->ci - L->base_ci))
+        return NULL;
+    CallInfo* ci = L->ci - (level + 1);
+    if (!isLua(ci) || !ci->savedpc)
+        return NULL;
+    Proto* p = ci->p;
+    const Instruction* pc = ci->savedpc;
+    // (native frames and metamethod calls can leave savedpc anywhere)
+    if (!p || !p->code || pc < p->code || pc > p->code + p->sizecode)
+        return NULL;
+    int at = int(pc - p->code);
+    int call = -1;
+    if (at >= 1 && LUAU_INSN_OP(p->code[at - 1]) == LOP_CALL)
+        call = at - 1;
+    else if (at >= 2 && LUAU_INSN_OP(p->code[at - 2]) == LOP_CALLFB)
+        call = at - 2;
+    if (call < 0)
+        return NULL;
+    int ra = LUAU_INSN_A(p->code[call]);
+    for (int i = call - 2; i >= 0 && i >= call - 96; i--)
+    {
+        Instruction insn = p->code[i];
+        if (LUAU_INSN_A(insn) != ra)
+            continue;
+        int op = LUAU_INSN_OP(insn);
+        if ((op == LOP_NAMECALL || op == LOP_NAMECALLUDATA) && i + 1 < p->sizecode)
+        {
+            uint32_t aux = p->code[i + 1];
+            int kidx = op == LOP_NAMECALLUDATA ? int(aux & 0xffff) : int(aux);
+            if (kidx < p->sizek && ttisstring(&p->k[kidx]))
+                return getstr(tsvalue(&p->k[kidx]));
+            return NULL;
+        }
+        if (op == LOP_GETGLOBAL && i + 1 < p->sizecode)
+        {
+            uint32_t aux = p->code[i + 1];
+            if (int(aux) < p->sizek && ttisstring(&p->k[aux]))
+                return getstr(tsvalue(&p->k[aux]));
+            return NULL;
+        }
+        if (op == LOP_GETIMPORT && i + 1 < p->sizecode)
+        {
+            uint32_t aux = p->code[i + 1];
+            int count = int(aux >> 30);
+            int ids[3] = {int(aux >> 20) & 1023, int(aux >> 10) & 1023, int(aux) & 1023};
+            size_t n = 0;
+            buf[0] = 0;
+            for (int j = 0; j < count && j < 3; j++)
+            {
+                if (ids[j] >= p->sizek || !ttisstring(&p->k[ids[j]]))
+                    return NULL;
+                const char* part = getstr(tsvalue(&p->k[ids[j]]));
+                size_t len = strlen(part);
+                if (n + len + 2 >= sizeof(buf))
+                    break;
+                if (j)
+                    buf[n++] = '.';
+                memcpy(buf + n, part, len);
+                n += len;
+                buf[n] = 0;
+            }
+            return n ? buf : NULL;
+        }
+        // Anything else writing the call register: unknown origin.
+        return NULL;
+    }
+    return NULL;
 }
 
 void lua_callhook(lua_State* L, lua_Hook hook, void* userdata)

@@ -28,6 +28,8 @@ struct PlayerApp {
     run: RunHarness,
     last_frame: Instant,
     last_work_ms: f32,
+    /// Ctrl+F6: the profiler over the lower part of the window.
+    profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
 }
 
 impl PlayerApp {
@@ -88,10 +90,11 @@ impl PlayerApp {
         game.keep_game_settings = run.bench.is_none() && run.screenshot.is_none()
             && run.input.actions.is_empty() && run.shots.is_empty()
             && std::env::var_os("RUSTUDIO_NO_LAYOUT").is_none();
-        Self { game, host: PlayerHost::default(), run, last_frame: Instant::now(), last_work_ms: 0.0 }
+        Self { game, host: PlayerHost::default(), run, last_frame: Instant::now(), last_work_ms: 0.0, profiler: None }
     }
 
     fn frame(&mut self, ui: &mut egui::Ui) {
+        rustudio_core::profiler::frame(rustudio_core::profiler::FrameKind::Render);
         let _frame_scope = rustudio_core::bench::scope("frame");
         rustudio_core::sim_clock::advance();
         let ctx = ui.ctx().clone();
@@ -117,6 +120,35 @@ impl PlayerApp {
             let _scope = rustudio_core::bench::scope("viewport");
             game.player_viewport(ui, self.run.started);
         });
+        // Ctrl+F6 (Studio's MicroProfiler key in a game): the profiler overlay;
+        // RUSTUDIO_PROFILER_OVERLAY=1 opens it from the start (checks).
+        let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F6))
+            || (self.profiler.is_none() && game.frame_no == 2 && std::env::var_os("RUSTUDIO_PROFILER_OVERLAY").is_some());
+        if toggle {
+            self.profiler = match self.profiler.take() {
+                Some(_) => None,
+                None => Some(rustudio_profiler_ui::ProfilerWindow::new()),
+            };
+        }
+        if let Some(p) = self.profiler.as_mut() {
+            let screen = ctx.content_rect();
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(screen.left() + 12.0, screen.top() + screen.height() * 0.34),
+                egui::pos2(screen.right() - 12.0, screen.bottom() - 12.0),
+            );
+            egui::Area::new(egui::Id::new("profiler-overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .fade_in(false)
+                .show(&ctx, |ui| {
+                    ui.set_min_size(rect.size());
+                    ui.set_max_size(rect.size());
+                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    c.set_clip_rect(rect);
+                    p.show(&mut c);
+                    ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                });
+        }
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, game.viewport_rect);
         if self.run.start_play && game.viewport_rect.is_positive() && game.frame_no >= 2 {
             self.run.start_play = false;
@@ -130,6 +162,7 @@ impl PlayerApp {
         let reason = self.run.tick_before_shot(game, self.last_work_ms)
             .or_else(|| self.run.tick_shots(game, &ctx, |_, _, _| {}));
         self.last_work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        crate::profiler_counters::sample(game);
         if let Some(rs) = game.render_state.as_ref() {
             rustudio_render::gpu_timing::end_frame(&rs.device, &rs.queue);
         }
@@ -148,6 +181,7 @@ impl PlayerApp {
 
 impl eframe::App for PlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        rustudio_render::gpu_health::check();
         self.frame(ui);
     }
 
@@ -168,6 +202,8 @@ pub fn run() -> eframe::Result<()> {
     let mut demo = false;
     let mut screenshot: Option<PathBuf> = None;
     let mut bench: Option<PathBuf> = None;
+    let mut profile_capture: Option<PathBuf> = None;
+    let mut profile_instr = false;
     let mut seconds = rustudio_core::mech::PERF_SECONDS;
     let mut seconds_given = false;
     let mut shot_after = None;
@@ -186,6 +222,8 @@ pub fn run() -> eframe::Result<()> {
         match a.as_str() {
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
             "--bench" => bench = args.next().map(PathBuf::from),
+            "--profile-capture" => profile_capture = args.next().map(PathBuf::from),
+            "--instr" => profile_instr = true,
             "--camera" => {
                 let v: Vec<f32> = args
                     .next()
@@ -346,6 +384,9 @@ pub fn run() -> eframe::Result<()> {
     rustudio_engine::runtime::luau_flags();
     rustudio_render::matpack::init_from_env();
     rustudio_core::rustudio_settings::init(std::env::var_os("RUSTUDIO_LAYOUT").is_some());
+    if profile_capture.is_none() {
+        rustudio_core::profiler::load_saved_config();
+    }
     if let Some(dt) = fixed_dt {
         rustudio_core::sim_clock::enable(dt);
     }
@@ -370,7 +411,7 @@ pub fn run() -> eframe::Result<()> {
             last_frame: None,
             no_ui: true,
             no_render,
-            end_after: (seconds_given && bench.is_none()).then_some(seconds),
+            end_after: (seconds_given && bench.is_none() && profile_capture.is_none()).then_some(seconds),
             fail_on_error,
             result,
             end_value: None,
@@ -385,6 +426,7 @@ pub fn run() -> eframe::Result<()> {
                     .unwrap_or_else(|| "new place".into());
                 rustudio_core::bench::Bench::new(Some(out), &label, true, seconds)
             }),
+            profile: profile_capture.map(|out| rustudio_core::profiler::cli::CliCapture::new(out, seconds, true, profile_instr)),
     };
     let bench_mode = run.bench.is_some() || rustudio_core::sim_clock::on();
     let (width, height) = window_arg(&argv)

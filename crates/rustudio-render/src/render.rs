@@ -400,6 +400,87 @@ fn transparent_order(a_kind: f32, a_distance: f32, b_kind: f32, b_distance: f32)
     b_glass.cmp(&a_glass).then_with(|| b_distance.total_cmp(&a_distance))
 }
 
+/// Builds the renderer on an adapter and draws frames through every pass
+/// (rustudio-render's GPU tests and tests/dx12.rs): panics with the adapter
+/// and wgpu's error when something is refused.
+#[doc(hidden)]
+pub mod gpu_check {
+    use super::*;
+
+    pub fn build_and_draw(instance: &wgpu::Instance, adapter: &wgpu::Adapter, limits: Option<wgpu::Limits>) {
+        let info = adapter.get_info();
+        let limits = limits.unwrap_or_else(|| crate::gpu_caps::required_limits(&adapter.limits()));
+        let desc = wgpu::DeviceDescriptor {
+            required_limits: limits,
+            required_features: adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            ..Default::default()
+        };
+        let (device, queue) = crate::gpu_caps::block_on(adapter.request_device(&desc))
+            .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
+        let caps = crate::gpu_caps::GpuCaps::of_adapter(adapter, &device);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut r = Renderer::with_caps(&device, &queue, &caps);
+        let rs = egui_wgpu::RenderState {
+            adapter: adapter.clone(),
+            available_adapters: vec![adapter.clone()],
+            instance: instance.clone(),
+            device: device.clone(),
+            queue: queue.clone(),
+            target_format: wgpu::TextureFormat::Rgba8Unorm,
+            renderer: std::sync::Arc::new(egui::mutex::RwLock::new(egui_wgpu::Renderer::new(
+                &device,
+                wgpu::TextureFormat::Rgba8Unorm,
+                Default::default(),
+            ))),
+            surface_config: egui_wgpu::SurfaceConfig::LOW_LATENCY,
+        };
+        let cam = Vec3::new(0.0, 20.0, 40.0);
+        let view = Mat4::look_at_rh(cam, Vec3::ZERO, Vec3::Y);
+        let proj = Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.1, 1000.0);
+        let mut globals: Globals = bytemuck::Zeroable::zeroed();
+        globals.view_proj = (proj * view).to_cols_array_2d();
+        let sun = Vec3::new(0.3, 0.8, 0.2).normalize();
+        let cascades = crate::sun_shadow::cascades(cam, -cam.normalize(), [0.5, 0.9], sun, 0.2);
+        for quality in [None, Some(crate::quality::Profile::at(1)), Some(crate::quality::Profile::at(17))] {
+            let frame = Frame {
+                globals,
+                quality,
+                cull_view_proj: proj * view,
+                fov_y: 1.0,
+                lights: &[],
+                shadows: true,
+                sun_cascades: cascades,
+                overlay: &[],
+                lines: &[],
+                sky: true,
+                water: Default::default(),
+                clouds: Some(crate::clouds::CloudsLook {
+                    cover: 0.5,
+                    density: 0.7,
+                    color: [1.0; 3],
+                    wind: Vec3::X,
+                    fog: [0.0; 4],
+                }),
+                probe: None,
+            };
+            r.render(&rs, [320, 180], &frame);
+        }
+        // The passes made on first use by a scene that has them.
+        for samples in [1, SAMPLES] {
+            drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
+            drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
+        }
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        drop(r);
+        let err = crate::gpu_caps::block_on(scope.pop());
+        assert!(err.is_none(), "{} ({:?}): {err:?}", info.name, info.backend);
+        eprintln!(
+            "renderer built and drew on {} ({:?}), {} sampled textures per stage, reduced bindings {}",
+            info.name, info.backend, device.limits().max_sampled_textures_per_shader_stage, caps.reduced_bindings()
+        );
+    }
+}
+
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
@@ -460,9 +541,7 @@ mod gpu_tests {
     fn export_integrated_grass_selection() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
-        let mut limits = wgpu::Limits::default();
-        limits.max_sampled_textures_per_shader_stage = 24;
-        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
+        let limits = crate::gpu_caps::required_limits(&adapter.limits());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap();
         let mut renderer = Renderer::new(&device, &queue);
         let mut vox = rustudio_core::terrain::Voxels::empty();
@@ -488,9 +567,11 @@ mod gpu_tests {
     }
 
     /// Every pipeline of the 3D view, built on this machine's GPU with the
-    /// limits the app asks for (main.rs): the WGSL through the platform's
-    /// shader compiler (Metal on macOS, Vulkan/SPIR-V on Linux), with wgpu's
-    /// validation errors caught. Skipped with a note where there is no GPU.
+    /// limits the app asks for (gpu_caps::required_limits): the WGSL through
+    /// the platform's shader compiler (Metal on macOS, Vulkan/SPIR-V on
+    /// Linux), with wgpu's validation errors caught, then frames drawn at
+    /// full quality and at Automatic level 1 (the lazily made passes: HBAO,
+    /// clouds, lower sample counts). Skipped with a note where there is no GPU.
     #[test]
     fn renderer_pipelines_build_on_this_gpu() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -498,20 +579,38 @@ mod gpu_tests {
             eprintln!("no GPU adapter here: skipped");
             return;
         };
-        let info = adapter.get_info();
-        let mut limits = wgpu::Limits::default();
-        limits.max_sampled_textures_per_shader_stage = 24;
-        limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
-        let desc = wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() };
-        let (device, queue) = pollster::block_on(adapter.request_device(&desc))
-            .unwrap_or_else(|e| panic!("{} ({:?}) refused rustudio's limits: {e}", info.name, info.backend));
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let r = Renderer::new(&device, &queue);
-        drop(r);
-        let err = pollster::block_on(scope.pop());
-        assert!(err.is_none(), "{} ({:?}): {err:?}", info.name, info.backend);
-        eprintln!("renderer built on {} ({:?})", info.name, info.backend);
+        build_and_draw(&instance, &adapter, None);
     }
+
+    /// The same at 16 sampled textures per stage and downlevel limits (the
+    /// most an OpenGL adapter offers, wgpu-hal gles MAX_TEXTURE_SLOTS): the
+    /// reduced binding set.
+    #[test]
+    fn renderer_builds_with_16_sampled_textures() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter here: skipped");
+            return;
+        };
+        let mut limits = wgpu::Limits::downlevel_defaults().or_better_values_from(&wgpu::Limits {
+            max_sampled_textures_per_shader_stage: 16,
+            max_samplers_per_shader_stage: 16,
+            ..wgpu::Limits::downlevel_defaults()
+        });
+        limits.max_sampled_textures_per_shader_stage = 16;
+        limits.max_samplers_per_shader_stage = 16;
+        // (what an HD 4600 offers through OpenGL besides the texture units)
+        limits.max_texture_dimension_2d = 8192;
+        limits.max_texture_dimension_3d = 2048;
+        limits.max_storage_buffers_per_shader_stage = 8;
+        limits.max_storage_textures_per_shader_stage = 8;
+        limits.max_storage_buffer_binding_size = 128 << 20;
+        limits.max_uniform_buffer_binding_size = 64 << 10;
+        build_and_draw(&instance, &adapter, Some(limits));
+    }
+
+    use super::gpu_check::build_and_draw;
+
 }
 
 #[cfg(test)]
@@ -1000,13 +1099,15 @@ impl MaterialArrays {
     }
 
     fn with_params(device: &wgpu::Device, size: u32, capacity: u32, params: Vec<[f32; 4]>) -> Self {
+        // (OpenGL: a one-layer array would be made a plain 2D texture)
+        let layers = if crate::gpu_caps::single_layer_arrays_break(device) { capacity.max(2) } else { capacity };
         let make = |label, format| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
                     width: size,
                     height: size,
-                    depth_or_array_layers: capacity,
+                    depth_or_array_layers: layers,
                 },
                 mip_level_count: mip_levels(size, size),
                 sample_count: 1,
@@ -1380,11 +1481,12 @@ impl ViewportPipelines {
         glass_layout: &wgpu::BindGroupLayout,
         terrain_bgl: &wgpu::BindGroupLayout,
         samples: u32,
+        reduced: bool,
     ) -> Self {
-        let source = shader_source().replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
+        let source = shader_source(reduced).replace("const VIEWPORT_SAMPLES: i32 = 4;", &format!("const VIEWPORT_SAMPLES: i32 = {samples};"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("viewport color and depth"),
-            source: wgpu::ShaderSource::Wgsl(if samples == 1 { single_sample_shader(source) } else { source }.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &if samples == 1 { single_sample_shader(source) } else { source }).into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("viewport"),
@@ -1631,7 +1733,7 @@ impl ViewportPipelines {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: samples > 1,
                     },
@@ -1898,6 +2000,10 @@ pub struct Renderer {
     /// Local light shadow maps (Studio's Future path) and their pass.
     lshadow: LightShadows,
     lshadow_pipe: wgpu::RenderPipeline,
+    /// The reduced binding set (gpu_caps::GpuCaps::reduced_bindings).
+    reduced: bool,
+    /// What the GPU can do (gpu_caps.rs).
+    caps: crate::gpu_caps::GpuCaps,
     /// Bumped whenever the static instances change.
     static_gen: u64,
     /// Bumped when the static scene changes in a way the shadow casters
@@ -1923,6 +2029,9 @@ pub struct Renderer {
     /// The globals alone, for the shadow pass (its map can't be bound there).
     shadow_globals_bg: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
+    /// The reduced binding set's clouds globals: the uniforms and the sky
+    /// alone (bindings 0, 2, 3), so the clouds' 8 textures fit in 16.
+    sky_globals: Option<(wgpu::BindGroupLayout, wgpu::BindGroup)>,
     lights_buf: wgpu::Buffer,
     /// The depth map the sun's cascades are drawn into, one at a time.
     shadow_view: wgpu::TextureView,
@@ -1994,9 +2103,18 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self::with_caps(device, queue, &crate::gpu_caps::GpuCaps::of_device(device))
+    }
+
+    /// The renderer for a device whose adapter is `caps`: under 24 sampled
+    /// textures per stage (OpenGL) it builds the reduced binding set
+    /// (REDUCED_BINDINGS) and skips the passes that only fed those bindings.
+    pub fn with_caps(device: &wgpu::Device, queue: &wgpu::Queue, caps: &crate::gpu_caps::GpuCaps) -> Self {
+        let reduced = caps.reduced_bindings();
+        let caps = caps.clone();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustudio viewport"),
-            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
+            source: wgpu::ShaderSource::Wgsl(crate::gpu_caps::shader_for(device, &shader_source(reduced)).into()),
         });
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -2016,7 +2134,7 @@ impl Renderer {
         };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[
+            entries: &reduce_bindings(reduced, vec![
                 uniform_entry,
                 frag(
                     1,
@@ -2162,7 +2280,7 @@ impl Renderer {
                         min_binding_size: None,
                     },
                 ),
-            ],
+            ], |e| e.binding),
         });
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow globals"),
@@ -2311,6 +2429,7 @@ impl Renderer {
             &probe.slot_views[1],
             &brdf_view,
             &lshadow,
+            reduced,
         );
         let globals_bg = Self::globals_group(
             device,
@@ -2331,6 +2450,7 @@ impl Renderer {
             &probe.slot_views[1],
             &brdf_view,
             &lshadow,
+            reduced,
         );
         let shadow_globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("shadow globals"),
@@ -2637,7 +2757,12 @@ impl Renderer {
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         };
         let bloom_up = device.create_render_pipeline(&bloom_up_desc);
-        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES);
+        let sky_globals = reduced.then(|| {
+            let layout = Self::sky_globals_layout(device);
+            let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
+            (layout, bg)
+        });
+        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES, reduced);
 
         let meshes = build_meshes()
             .into_iter()
@@ -2650,7 +2775,7 @@ impl Renderer {
             viewport,
             lower_samples: [None, None],
             terrain_layout: terrain_bgl,
-            skin: crate::skin_gpu::SkinGpu::new(device),
+            skin: crate::skin_gpu::SkinGpu::new(device, caps.compute()),
             gui_fog: ([0.0, 1e9, 0.0, 0.0], [0.0; 3]),
             gui_sun: Default::default(),
             gui_lightgrid: [0.0; 4],
@@ -2681,10 +2806,13 @@ impl Renderer {
             shadow_globals_bg,
             lshadow,
             lshadow_pipe,
+            reduced,
+            caps,
             static_gen: 0,
             caster_gen: 0,
             mesh_gen: 0,
             caster_flushes: 0,
+            sky_globals,
             globals_layout: bgl,
             lights_buf,
             shadow_view,
@@ -3042,12 +3170,13 @@ impl Renderer {
         indoor_next: &wgpu::TextureView,
         brdf: &wgpu::TextureView,
         lshadow: &LightShadows,
+        reduced: bool,
     ) -> wgpu::BindGroup {
         use wgpu::BindingResource as B;
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout,
-            entries: &[
+            entries: &reduce_bindings(reduced, vec![
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: globals.as_entire_binding(),
@@ -3129,7 +3258,7 @@ impl Renderer {
                     binding: 19,
                     resource: B::TextureView(&materials.emission_view),
                 },
-            ],
+            ], |e| e.binding),
         })
     }
 
@@ -3228,7 +3357,54 @@ impl Renderer {
         })
     }
 
+    fn sky_globals_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        let frag = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        };
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky globals"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                frag(2, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::Cube,
+                    multisampled: false,
+                }),
+                frag(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        })
+    }
+
+    fn sky_globals_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        globals: &wgpu::Buffer,
+        sky: &wgpu::TextureView,
+        sky_sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky globals"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(sky) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sky_sampler) },
+            ],
+        })
+    }
+
     fn rebind_globals(&mut self, device: &wgpu::Device) {
+        if let Some((layout, bg)) = &mut self.sky_globals {
+            *bg = Self::sky_globals_group(device, layout, &self.globals_buf, &self.sky_view, &self.sky_sampler);
+        }
         self.globals_bg = Self::globals_group(
             device,
             &self.globals_layout,
@@ -3248,6 +3424,7 @@ impl Renderer {
             &self.probe.slot_views[self.probe.next()],
             &self.brdf_view,
             &self.lshadow,
+            self.reduced,
         );
         self.probe_globals_bg = Self::globals_group(
             device,
@@ -3268,6 +3445,7 @@ impl Renderer {
             &self.probe.slot_views[self.probe.next()],
             &self.brdf_view,
             &self.lshadow,
+            self.reduced,
         );
     }
 
@@ -3601,7 +3779,7 @@ impl Renderer {
         } else {
             self.lower_samples[sample_slot(samples)].get_or_insert_with(|| ViewportPipelines::new(
                 device, &rs.queue, &self.globals_layout, &self.tex_layout, &self.glass_layout,
-                &self.terrain_layout, samples,
+                &self.terrain_layout, samples, self.reduced,
             ))
         };
         let tex =
@@ -4018,6 +4196,9 @@ impl Renderer {
         let svc_t0 = Instant::now();
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         crate::gpu_timing::set_automatic(frame.quality.is_some());
+        if rustudio_core::profiler::active() {
+            rustudio_core::profiler::counter("lights", rustudio_core::profiler::Cat::Render, frame.lights.len() as f64);
+        }
         // Shading detail Low draws one sample a pixel, as Studio does at
         // every quality level up to 16 (quality.rs samples(); a weak GPU's
         // levels): 4x MSAA multiplied the raster, the see-through encode
@@ -4026,6 +4207,10 @@ impl Renderer {
         let manual = if low_detail { 1 } else { SAMPLES };
         let mut samples = frame.quality.map_or(manual, |profile| profile.samples());
         if samples == 2 && !supports_two_samples(rs) {
+            samples = 1;
+        }
+        // (no multisampled textures to sample on OpenGL: gpu_caps.rs)
+        if !self.caps.sampled_msaa() {
             samples = 1;
         }
         self.ensure_target(rs, size, samples);
@@ -4378,10 +4563,14 @@ impl Renderer {
         crate::gpu_timing::mark(&mut encoder, "gpu: skinning");
         match frame.clouds.as_ref().filter(|_| frame.sky) {
             Some(look) => {
+                let (globals_layout, globals_bg) = match &self.sky_globals {
+                    Some((layout, bg)) => (layout, bg),
+                    None => (&self.globals_layout, &self.globals_bg),
+                };
                 let clouds = self.clouds[cloud_slot].get_or_insert_with(|| {
-                    crate::clouds::CloudsGpu::new(device, queue, &self.globals_layout, &shader_source(), HDR_FORMAT, samples)
+                    crate::clouds::CloudsGpu::new(device, queue, globals_layout, &shader_source(self.reduced), HDR_FORMAT, samples)
                 });
-                clouds.encode(device, queue, &mut encoder, &self.globals_bg, look, -frame.globals.sun_dir[1], target.size);
+                clouds.encode(device, queue, &mut encoder, globals_bg, look, -frame.globals.sun_dir[1], target.size);
             }
             None => {
                 if let Some(c) = self.clouds[cloud_slot].as_mut() {
@@ -4576,7 +4765,8 @@ impl Renderer {
                 }
                 h.finish()
             };
-            if !slots.is_empty() && self.lshadow.key != Some(key) {
+            // (the reduced binding set has no light shadow atlas to read)
+            if !self.reduced && !slots.is_empty() && self.lshadow.key != Some(key) {
                 self.lshadow.key = Some(key);
                 let n = rustudio_core::mech::LSHADOW_MAX_LIGHTS;
                 let mut slot_data = vec![0f32; n * 100];
@@ -5130,7 +5320,8 @@ impl Renderer {
         if let Some(c) = self.clouds[cloud_slot].as_mut().filter(|_| frame.clouds.is_some() && frame.sky) {
             encoder.copy_texture_to_texture(target.hdr.as_image_copy(), target.scene_copy.as_image_copy(),
                 wgpu::Extent3d { width: target.size[0], height: target.size[1], depth_or_array_layers: 1 });
-            c.composite(device, &mut encoder, &self.globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
+            let globals_bg = self.sky_globals.as_ref().map_or(&self.globals_bg, |(_, bg)| bg);
+            c.composite(device, &mut encoder, globals_bg, &target.hdr_view, &target.scene_copy_view, &target.depth);
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
         self.encode_bloom(&mut encoder, target, globals.bloom[1]);
@@ -5283,7 +5474,7 @@ impl SunCache {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
+                    sample_type: crate::gpu_caps::depth_sample_type(device),
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -5293,7 +5484,7 @@ impl SunCache {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sun cache"),
             source: wgpu::ShaderSource::Wgsl(
-                r#"
+                crate::gpu_caps::shader_for(device, r#"
 @group(0) @binding(0) var cached: texture_depth_2d;
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -5304,7 +5495,7 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
     return textureLoad(cached, vec2<i32>(p.xy), 0);
 }
-"#
+"#)
                 .into(),
             ),
         });
@@ -6072,7 +6263,45 @@ fn to_raw(p: &PartDraw, bias: f32) -> InstanceRaw {
 }
 
 /// shader.wgsl with the measured constants from mech.rs put in front.
-fn shader_source() -> String {
+/// Globals bindings the reduced set leaves out: the local light shadow
+/// atlas (15), the BRDF table (14) and the scene probe's blend target (21).
+/// With them the part pass binds 10 + 3 + 2 textures, post 10 + 3 + 3:
+/// OpenGL's 16 texture units per pipeline.
+pub const REDUCED_BINDINGS: [u32; 3] = [14, 15, 21];
+
+fn reduce_bindings<T>(reduced: bool, mut entries: Vec<T>, binding: impl Fn(&T) -> u32) -> Vec<T> {
+    if reduced {
+        entries.retain(|e| !REDUCED_BINDINGS.contains(&binding(e)));
+    }
+    entries
+}
+
+/// shader.wgsl's `//#if FULL_BINDINGS` / `//#else` / `//#endif` blocks:
+/// the first branch for the full binding set, the second for the reduced
+/// one. The full source is shader.wgsl's code unchanged.
+fn select_bindings(src: &str, reduced: bool) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut branch: Option<bool> = None;
+    for line in src.split_inclusive('\n') {
+        match line.trim() {
+            "//#if FULL_BINDINGS" => { assert!(branch.is_none(), "nested //#if FULL_BINDINGS"); branch = Some(true); continue; }
+            "//#else" => { branch = Some(false); continue; }
+            "//#endif" => { branch = None; continue; }
+            _ => {}
+        }
+        if branch.is_none_or(|full| full != reduced) {
+            out.push_str(line);
+        }
+    }
+    assert!(branch.is_none(), "unterminated //#if FULL_BINDINGS");
+    out
+}
+
+fn shader_source(reduced: bool) -> String {
+    select_bindings(&shader_source_all(), reduced)
+}
+
+fn shader_source_all() -> String {
     let grass = format!("const GRASS_RADIUS: f32 = {:?};\nconst GRASS_FADE_LEN: f32 = {:?};\nconst GRASS_NEAR_RADIUS: f32 = {:?};\nconst GRASS_NEAR_FADE_LEN: f32 = {:?};\n", rustudio_core::mech::GRASS_RADIUS, rustudio_core::mech::GRASS_FADE_LEN, rustudio_core::mech::GRASS_NEAR_RADIUS, rustudio_core::mech::GRASS_NEAR_FADE_LEN);
     use rustudio_core::mech as m;
     let [a, b, c, d, e] = m::TONE_CURVE;

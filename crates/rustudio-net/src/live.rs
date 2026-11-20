@@ -25,6 +25,13 @@ const REP_CONTROL: [u8; 7] = [0x83, 0x23, 0, 0, 0, 0, 0];
 const BATCH_SIZE: usize = 512;
 const MAX_FRAME_SIZE: usize = 64 << 20;
 const QUIET_PERIOD: Duration = Duration::from_millis(1500);
+/// Edits written to the replication stream per 20 ms tick, at most: a
+/// plugin's burst (hundreds of creates, megabytes of Source) goes out over
+/// several ticks, so pings and replication control keep their turn.
+const EDITS_PER_TICK: usize = 64;
+const BYTES_PER_TICK: usize = 1 << 20;
+/// Written edits kept for the log line a server-ended session prints.
+const RECENT_EDITS: usize = 32;
 
 #[derive(Debug)]
 pub enum LiveEvent {
@@ -38,6 +45,13 @@ pub enum LiveEvent {
     Notice(String),
     /// A persistent document edit was not transmitted; saving must stay blocked.
     EditRejected(String),
+    /// The edit of instance `id` (its referent as sent) was not transmitted:
+    /// it could not be encoded, or it depends on an instance that was not
+    /// created. Saving stays blocked, as for `EditRejected`.
+    EditFailed { id: u64, error: String },
+    /// Instance `id` was created without property `name`, which this server
+    /// cannot take from rustudio (`reason`). The rest of it was sent.
+    PropertySkipped { id: u64, name: String, reason: String },
     Error(String),
     Disconnected(String),
 }
@@ -96,22 +110,46 @@ enum LiveEdit {
     },
 }
 
+impl LiveEdit {
+    /// One line for the log: kind, class, referent and property names.
+    fn describe(&self) -> String {
+        match self {
+            LiveEdit::Event { id, class, name, .. } => format!("event {class}.{name} on {id:#x}"),
+            LiveEdit::Property { id, class, name, .. } => format!("set {class}.{name} on {id:#x}"),
+            LiveEdit::Create { id, class, parent, props } => format!(
+                "create {class} {id:#x} under {parent:#x} [{}]",
+                props.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            LiveEdit::Delete(id) => format!("delete {id:#x}"),
+            LiveEdit::Reparent { id, parent } => format!("move {id:#x} under {parent:#x}"),
+        }
+    }
+}
+
 pub struct LiveSession {
     pub events: mpsc::Receiver<LiveEvent>,
     cancel: Arc<AtomicBool>,
-    commands: mpsc::SyncSender<LiveEdit>,
+    commands: mpsc::Sender<LiveEdit>,
     next_id: Arc<AtomicU64>,
 }
 
 impl LiveSession {
     pub fn connect(universe: u64, place: u64) -> Result<Self> {
+        Self::connect_as(universe, place, None)
+    }
+
+    /// [`LiveSession::connect`] as a saved account (account switching's
+    /// `roblox-account-<id>` keyring entry) instead of the active session.
+    pub fn connect_as(universe: u64, place: u64, account: Option<u64>) -> Result<Self> {
         if universe == 0 || place == 0 {
             return Err(NetError::Other("A universe and place are required".into()));
         }
         // Bound pending model work: a large place cannot enqueue its entire
         // DataModel while the editor is applying a previous batch.
         let (tx, events) = mpsc::sync_channel(8);
-        let (commands, command_rx) = mpsc::sync_channel(256);
+        // Unbounded: every queued edit must reach the worker in order (a
+        // dropped one leaves the server half-edited); the worker paces them.
+        let (commands, command_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let next_id = Arc::new(AtomicU64::new(0));
@@ -123,6 +161,7 @@ impl LiveSession {
                 let result = prepare_and_run(
                     universe,
                     place,
+                    account,
                     &tx,
                     worker_cancel.clone(),
                     command_rx,
@@ -152,14 +191,12 @@ impl LiveSession {
         name: String,
         value: PropValue,
     ) -> Result<()> {
-        self.commands
-            .try_send(LiveEdit::Property {
-                id,
-                class,
-                name,
-                value,
-            })
-            .map_err(|_| NetError::Other("Team Create edit queue is unavailable".into()))
+        self.send_edit(LiveEdit::Property {
+            id,
+            class,
+            name,
+            value,
+        })
     }
     pub fn send_event(&self, id: u64, class: String, name: String, args: Vec<PropValue>) -> Result<()> {
         self.send_edit(LiveEdit::Event {id,class,name,args})
@@ -173,7 +210,7 @@ impl LiveSession {
     }
     fn send_edit(&self, edit: LiveEdit) -> Result<()> {
         self.commands
-            .try_send(edit)
+            .send(edit)
             .map_err(|_| NetError::Other("Team Create edit queue is unavailable".into()))
     }
     pub fn send_create(
@@ -220,6 +257,7 @@ fn templates() -> (ProtocolSyncTemplate, TicketTemplate) {
 fn prepare_and_run(
     universe: u64,
     place: u64,
+    account: Option<u64>,
     tx: &mpsc::SyncSender<LiveEvent>,
     cancel: Arc<AtomicBool>,
     commands: mpsc::Receiver<LiveEdit>,
@@ -229,9 +267,14 @@ fn prepare_and_run(
         return Ok(());
     }
     let _ = tx.send(LiveEvent::Stage(JoinStage::SignIn));
-    let (cookie, _) = rustudio_account::session::load_cookie(false)
-        .map_err(|_| NetError::Other("Could not load your Roblox sign-in".into()))?
-        .ok_or_else(|| NetError::Other("Sign in to Roblox before joining Team Create".into()))?;
+    let cookie = match account {
+        Some(id) => rustudio_account::session::account_cookie(id)
+            .ok_or_else(|| NetError::Other(format!("No saved sign-in for account {id}")))?,
+        None => rustudio_account::session::load_cookie(false)
+            .map_err(|_| NetError::Other("Could not load your Roblox sign-in".into()))?
+            .ok_or_else(|| NetError::Other("Sign in to Roblox before joining Team Create".into()))?
+            .0,
+    };
     let session = rustudio_account::Session::validate(cookie)
         .map_err(|_| NetError::Other("Your Roblox sign-in could not be validated".into()))?;
     if cancel.load(Ordering::Acquire) {
@@ -264,6 +307,13 @@ fn prepare_and_run(
     if cancel.load(Ordering::Acquire) {
         return Ok(());
     }
+    // Which server instance this is: a place left by its last editor saves
+    // and shuts down, and the next join may land on a new server loaded from
+    // that save (edits of the last moments can be missing there for a while).
+    log::info!(
+        "Team Create server for place {place}: job {}",
+        joined.join.game_id.as_deref().unwrap_or("unknown")
+    );
     let raw: serde_json::Value = serde_json::from_str(joined.raw.expose())
         .map_err(|_| NetError::Other("Roblox returned invalid join information".into()))?;
     let target = QuicTarget::from_join(&joined.join)
@@ -466,6 +516,7 @@ async fn receive_lane(
         if frame[0] == packet_id::NEW_SCHEMA {
             *shared_schema.lock().unwrap() = decoder.schema.clone();
         }
+        reserve_seen_ids(&next_id, &ops);
         let instances = ops.iter().any(|op| matches!(op, RepOp::NewInstance { .. }));
         let mut pending = Vec::with_capacity(BATCH_SIZE);
         for op in ops {
@@ -497,6 +548,32 @@ async fn receive_lane(
         state.instances |= instances;
         state.initial_data_complete = decoder.initial_data_complete;
         state.delivering = false;
+    }
+}
+
+/// Keeps this session's next instance referent past every referent in its
+/// scope the server has: scopes are a per-server-run counter, and instances
+/// a peer made keep their scoped referents in the saved place (Place A holds 765
+/// scope-5 instances while its session got scope 8; a game's first
+/// session got 5, later ones 13 and 16 alongside 1462 scope-5 instances).
+/// A later server run can hand the same scope out again; allocating from
+/// index 1 then reused a saved instance's referent, so a new script took
+/// LocalMapAssets' referent and its Destroy() was never sent.
+fn reserve_seen_ids(next_id: &AtomicU64, ops: &[RepOp]) {
+    let scope = next_id.load(Ordering::Acquire) >> 32;
+    if scope <= 1 {
+        return;
+    }
+    let highest = ops
+        .iter()
+        .filter_map(|op| match op {
+            RepOp::NewInstance { id, .. } => Some(*id),
+            _ => None,
+        })
+        .filter(|id| id >> 32 == scope && *id as u32 != u32::MAX)
+        .max();
+    if let Some(id) = highest {
+        next_id.fetch_max(id + 1, Ordering::AcqRel);
     }
 }
 
@@ -563,6 +640,10 @@ async fn run(
     let mut control_started = false;
     let mut ready = false;
     let mut rejected_document_edit = false;
+    let mut gate = EditGate::default();
+    // The last edits written, logged if the server ends the session, so a
+    // reset ("Error while receiving data") can be traced to an item.
+    let mut recent: std::collections::VecDeque<(Instant, String)> = Default::default();
     loop {
         tokio::select! {
             incoming = connection.accept_uni() => {
@@ -582,30 +663,38 @@ async fn run(
                     rtcio::send(&mut replication, &REP_CONTROL).await?;
                     control_started = true;
                 }
-                for _ in 0..64 {
+                let mut written = 0;
+                for _ in 0..EDITS_PER_TICK {
+                    if written >= BYTES_PER_TICK { break; }
                     let Ok(edit) = commands.try_recv() else { break; };
-                    let document_edit=matches!(&edit,LiveEdit::Create {..}|LiveEdit::Delete(_)|LiveEdit::Reparent {..})
-                        || matches!(&edit,LiveEdit::Property {class,..} if class!="Player");
                     if rejected_document_edit && matches!(&edit,LiveEdit::Event {class,name,..} if class=="TeamCreatePublishService" && name=="TeamCreatePlaceUploadRequest") {
                         emit(&tx,&cancel,LiveEvent::EditRejected("Save blocked because a local edit could not be synchronized; retain a local copy and reopen the live place".into())).await;
                         continue;
                     }
-                    let encoded = {
+                    let what = edit.describe();
+                    let outcomes = {
                         let schema = shared_schema.lock().unwrap();
-                        schema.as_ref().ok_or_else(|| "The live schema is not ready".to_string())
-                            .and_then(|schema| match edit {
-                                LiveEdit::Event {id,class,name,args} => crate::writer::event(schema,id,&class,&name,&args),
-                                LiveEdit::Property {id, class, name, value} => crate::writer::property(schema, id, &class, &name, &value),
-                                LiveEdit::Create {id, class, parent, props} => crate::writer::create(schema, id, &class, parent, &props),
-                                LiveEdit::Delete(id) => Ok(crate::writer::delete(id)),
-                                LiveEdit::Reparent {id, parent} => crate::writer::reparent(schema, id, parent),
-                            })
+                        gate.encode(schema.as_ref(), edit)
                     };
-                    match encoded {
-                        Ok(frame) => rtcio::send(&mut replication, &frame).await?,
-                        Err(error) => {
-                            if document_edit {rejected_document_edit=true;emit(&tx,&cancel,LiveEvent::EditRejected(error)).await;}
-                            else {emit(&tx, &cancel, LiveEvent::Notice(error)).await;}
+                    for outcome in outcomes {
+                        match outcome {
+                            Outcome::Frame(frame) => {
+                                written += frame.len();
+                                if recent.len() == RECENT_EDITS { recent.pop_front(); }
+                                recent.push_back((Instant::now(), format!("{what} ({} bytes)", frame.len())));
+                                log::debug!("Team Create wrote {what} ({} bytes)", frame.len());
+                                rtcio::send(&mut replication, &frame).await?;
+                            }
+                            Outcome::Failed { id, error } => {
+                                rejected_document_edit = true;
+                                emit(&tx, &cancel, LiveEvent::EditFailed { id, error }).await;
+                            }
+                            Outcome::Skipped { id, name, reason } => {
+                                emit(&tx, &cancel, LiveEvent::PropertySkipped { id, name, reason }).await;
+                            }
+                            Outcome::Notice(message) => {
+                                emit(&tx, &cancel, LiveEvent::Notice(message)).await;
+                            }
                         }
                     }
                 }
@@ -623,13 +712,197 @@ async fn run(
             }
         }
     }
+    if !cancel.load(Ordering::Acquire) && !recent.is_empty() {
+        log::warn!("Team Create session ended (place={place}); the last {} edit(s) written, oldest first:", recent.len());
+        for (at, what) in &recent {
+            log::warn!("  {:.1} s before the end: {what}", at.elapsed().as_secs_f32());
+        }
+    }
     connection.close(0u32.into(), b"editor closed session");
     Ok(())
+}
+
+/// What one queued edit turns into on the wire.
+#[derive(Debug)]
+enum Outcome {
+    Frame(Vec<u8>),
+    /// A document edit that was not sent.
+    Failed { id: u64, error: String },
+    /// A created instance's property that was left out.
+    Skipped { id: u64, name: String, reason: String },
+    /// A non-document message (presence, events) that could not be sent.
+    Notice(String),
+}
+
+/// Encodes queued edits against the server schema and keeps the stream
+/// causally valid: an instance whose create was not sent never has a child
+/// created under it, a reparent into or of it, a property change or a
+/// reference to it written, since the server drops the whole session on an
+/// item naming an instance it doesn't have ("Error while receiving data").
+#[derive(Default)]
+struct EditGate {
+    failed: std::collections::HashSet<u64>,
+}
+
+impl EditGate {
+    fn encode(&mut self, schema: Option<&Schema>, edit: LiveEdit) -> Vec<Outcome> {
+        let Some(schema) = schema else {
+            let error = "The live schema is not ready".to_string();
+            return vec![match edit {
+                LiveEdit::Event { .. } => Outcome::Notice(error),
+                LiveEdit::Property { class, .. } if class == "Player" => Outcome::Notice(error),
+                LiveEdit::Property { id, .. } | LiveEdit::Create { id, .. } | LiveEdit::Reparent { id, .. } | LiveEdit::Delete(id) => {
+                    self.failed.insert(id);
+                    Outcome::Failed { id, error }
+                }
+            }];
+        };
+        let failed_ref = |failed: &std::collections::HashSet<u64>, value: &PropValue| {
+            matches!(value, PropValue::Ref(Some(target)) if failed.contains(target))
+        };
+        match edit {
+            LiveEdit::Event { id, class, name, args } => vec![match crate::writer::event(schema, id, &class, &name, &args) {
+                Ok(frame) => Outcome::Frame(frame),
+                Err(error) => Outcome::Notice(error),
+            }],
+            LiveEdit::Property { id, class, name, value } => {
+                let document = class != "Player";
+                if self.failed.contains(&id) || failed_ref(&self.failed, &value) {
+                    return vec![Outcome::Failed { id, error: format!("{class}.{name} refers to an instance that was not created on the server") }];
+                }
+                vec![match crate::writer::property(schema, id, &class, &name, &value) {
+                    Ok(frame) => Outcome::Frame(frame),
+                    Err(error) if document => Outcome::Failed { id, error },
+                    Err(error) => Outcome::Notice(error),
+                }]
+            }
+            LiveEdit::Create { id, class, parent, mut props } => {
+                if self.failed.contains(&parent) {
+                    self.failed.insert(id);
+                    return vec![Outcome::Failed { id, error: format!("{class} was not created because its parent was not") }];
+                }
+                let mut out = Vec::new();
+                props.retain(|(name, value)| {
+                    let keep = !failed_ref(&self.failed, value);
+                    if !keep {
+                        out.push(Outcome::Skipped { id, name: name.clone(), reason: "it refers to an instance that was not created".into() });
+                    }
+                    keep
+                });
+                match crate::writer::create_partial(schema, id, &class, parent, &props) {
+                    Ok((frame, skipped)) => {
+                        out.extend(skipped.into_iter().map(|(name, reason)| Outcome::Skipped { id, name, reason }));
+                        out.insert(0, Outcome::Frame(frame));
+                    }
+                    Err(error) => {
+                        self.failed.insert(id);
+                        out = vec![Outcome::Failed { id, error }];
+                    }
+                }
+                out
+            }
+            // Never created there: nothing to delete.
+            LiveEdit::Delete(id) if self.failed.contains(&id) => Vec::new(),
+            LiveEdit::Delete(id) => vec![Outcome::Frame(crate::writer::delete(id))],
+            LiveEdit::Reparent { id, parent } => {
+                if self.failed.contains(&id) || self.failed.contains(&parent) {
+                    return vec![Outcome::Failed { id, error: "The move was not sent because the instance or its new parent was not created on the server".into() }];
+                }
+                vec![match crate::writer::reparent(schema, id, parent) {
+                    Ok(frame) => Outcome::Frame(frame),
+                    Err(error) => Outcome::Failed { id, error },
+                }]
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replicator::{SchemaClass, SchemaProp};
+
+    fn schema() -> Schema {
+        let prop = |name: &str, ty| SchemaProp { name: name.into(), ty };
+        Schema {
+            classes: vec![
+                SchemaClass { name: "Folder".into(), props: vec![prop("Name", 0x31), prop("Capabilities", 0x37)], events: vec![] },
+                SchemaClass { name: "ModuleScript".into(), props: vec![prop("Name", 0x31), prop("Source", 0x06)], events: vec![] },
+                SchemaClass { name: "ObjectValue".into(), props: vec![prop("Name", 0x31), prop("Value", 0x1c)], events: vec![] },
+            ],
+            global_props: vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)],
+            ..Default::default()
+        }
+    }
+
+    fn create(id: u64, class: &str, parent: u64, props: Vec<(&str, PropValue)>) -> LiveEdit {
+        LiveEdit::Create { id, class: class.into(), parent, props: props.into_iter().map(|(n, v)| (n.into(), v)).collect() }
+    }
+
+    /// A reused scope: new referents start past the saved instances' ones.
+    #[test]
+    fn allocation_skips_referents_the_server_already_has() {
+        let next = AtomicU64::new((5 << 32) | 1);
+        let new = |id: u64| RepOp::NewInstance { id, class: "Folder".into(), parent: Some(1), props: vec![] };
+        reserve_seen_ids(&next, &[new((5 << 32) | 0xa709e), new((5 << 32) | 0x10), new(0x3d6d), new((7 << 32) | 0xffff_fff0)]);
+        assert_eq!(next.load(Ordering::Acquire), (5 << 32) | 0xa709f);
+        reserve_seen_ids(&next, &[new((5 << 32) | 3)]);
+        assert_eq!(next.load(Ordering::Acquire), (5 << 32) | 0xa709f, "never goes back");
+        let unassigned = AtomicU64::new(0);
+        reserve_seen_ids(&unassigned, &[new((5 << 32) | 3)]);
+        assert_eq!(unassigned.load(Ordering::Acquire), 0);
+    }
+
+    fn frames(out: &[Outcome]) -> usize {
+        out.iter().filter(|o| matches!(o, Outcome::Frame(_))).count()
+    }
+
+    /// A create that can't be sent takes down every edit that names it:
+    /// children, moves into it, property changes and references.
+    #[test]
+    fn a_failed_create_blocks_every_edit_that_names_it() {
+        let s = schema();
+        let mut gate = EditGate::default();
+        let out = gate.encode(Some(&s), create(10, "NotAClass", 1, vec![]));
+        assert!(matches!(out[..], [Outcome::Failed { id: 10, .. }]));
+        let out = gate.encode(Some(&s), create(11, "Folder", 10, vec![("Name", PropValue::String("Child".into()))]));
+        assert!(matches!(out[..], [Outcome::Failed { id: 11, .. }]), "{out:?}");
+        let out = gate.encode(Some(&s), create(12, "ModuleScript", 11, vec![]));
+        assert!(matches!(out[..], [Outcome::Failed { id: 12, .. }]), "grandchildren too");
+        let out = gate.encode(Some(&s), LiveEdit::Reparent { id: 5, parent: 11 });
+        assert!(matches!(out[..], [Outcome::Failed { id: 5, .. }]));
+        let out = gate.encode(Some(&s), LiveEdit::Property { id: 6, class: "ObjectValue".into(), name: "Value".into(), value: PropValue::Ref(Some(12)) });
+        assert!(matches!(out[..], [Outcome::Failed { id: 6, .. }]));
+        assert!(gate.encode(Some(&s), LiveEdit::Delete(10)).is_empty(), "nothing to delete on the server");
+        // Unrelated edits still go out.
+        assert_eq!(frames(&gate.encode(Some(&s), create(13, "Folder", 1, vec![]))), 1);
+        assert_eq!(frames(&gate.encode(Some(&s), LiveEdit::Delete(7))), 1);
+    }
+
+    /// One property the server can't take drops only itself.
+    #[test]
+    fn unsupported_properties_are_skipped_not_the_instance() {
+        let s = schema();
+        let mut gate = EditGate::default();
+        let out = gate.encode(Some(&s), create(20, "Folder", 1, vec![
+            ("Name", PropValue::String("Kit".into())),
+            ("Capabilities", PropValue::Bool(true)),
+            ("NotReplicated", PropValue::Bool(true)),
+        ]));
+        assert!(matches!(out[0], Outcome::Frame(_)), "{out:?}");
+        let skipped: Vec<_> = out.iter().filter_map(|o| match o { Outcome::Skipped { name, .. } => Some(name.as_str()), _ => None }).collect();
+        assert_eq!(skipped, ["Capabilities", "NotReplicated"]);
+        let Outcome::Frame(frame) = &out[0] else { unreachable!() };
+        let mut dec = crate::replicator::Decoder::new();
+        dec.schema = Some(s.clone());
+        let ops = dec.decode_frame(frame[0], &frame[1..]);
+        assert!(dec.errors.is_empty(), "{:?}", dec.errors);
+        assert!(matches!(&ops[0], RepOp::NewInstance { id: 20, props, .. } if props.len() == 1));
+        // A reference to an instance that wasn't created is dropped too.
+        gate.encode(Some(&s), create(21, "Nope", 1, vec![]));
+        let out = gate.encode(Some(&s), create(22, "ObjectValue", 1, vec![("Value", PropValue::Ref(Some(21)))]));
+        assert!(matches!(out[..], [Outcome::Frame(_), Outcome::Skipped { id: 22, .. }]), "{out:?}");
+    }
 
     #[test]
     fn quiet_gap_before_the_end_of_initial_data_cannot_finish_a_join() {

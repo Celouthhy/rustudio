@@ -97,6 +97,7 @@ pub const PLACEMENTS: &[Placement] = &[
     // Right: Explorer above Properties, two groups (not tabbed together).
     row("explorer", "Explorer", Right, &[Above("properties", 0.54)], 0.24),
     row("properties", "Properties", Right, &[Below("explorer", 0.46)], 0.24),
+    row("file_sync", "File Sync", Right, &[TabWith("properties")], 0.24),
     row("tag_editor", "Tag Editor", Right, &[], 0.2),
     row("collision_groups", "Collision Groups", Right, &[], 0.24),
     row("live_collaborators", "Live Collaborators", Right, &[], 0.2),
@@ -134,6 +135,7 @@ pub const PLACEMENTS: &[Placement] = &[
     // Studio opens these floating.
     float("manage_plugins", "Manage Plugins"),
     float("version_history", "Version History"),
+    float("microprofiler", "MicroProfiler"),
 ];
 
 /// Where Studio docks a plugin's DockWidgetPluginGui for its
@@ -178,6 +180,8 @@ impl Tab {
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
             Tab::Toolbox => "toolbox",
+            Tab::FileSync => "file_sync",
+            Tab::Profiler => "microprofiler",
             Tab::Script(_) => "script",
             Tab::Plugin(n) => crate::plugin_host::widgets_ui::slot_key(*n),
         }

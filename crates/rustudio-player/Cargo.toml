@@ -13,6 +13,7 @@ rustudio-render = { path = "../rustudio-render" }
 rustudio-engine = { path = "../rustudio-engine" }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }
 egui = "0.36"
+rustudio-profiler-ui = { path = "../rustudio-profiler-ui" }
 egui-wgpu = "0.36"
 rbx_dom_weak = "4"
 gilrs = "0.11"

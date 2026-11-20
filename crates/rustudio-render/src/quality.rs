@@ -22,6 +22,10 @@ const SPRITE_QUALITY: [u8; 21] = [
 pub struct Profile(u8);
 
 impl Profile {
+    /// The profile of quality level `level` (1..=21).
+    pub fn at(level: u8) -> Self {
+        Self(level.clamp(1, MAX_LEVEL))
+    }
     pub fn level(self) -> u8 {
         self.0
     }
@@ -58,7 +62,14 @@ impl Profile {
         }
     }
     pub fn grass(self) -> usize {
-        if self.0 <= 6 { 1 } else { 0 }
+        // (weak-GPU mode: off below level 4, where sun shadows start)
+        if self.0 <= 3 && rustudio_core::rustudio_settings::weak_gpu() {
+            2
+        } else if self.0 <= 6 {
+            1
+        } else {
+            0
+        }
     }
     pub fn bloom(self) -> bool {
         self.0 >= 6
@@ -125,10 +136,16 @@ pub struct Automatic {
     step_hill: [f32; 21],
 }
 
+/// Weak-GPU mode's first level: the lowest, with HBAO, sun and light
+/// shadows, clouds, depth of field, bloom and the scene probe off, and
+/// (weak GPUs only) no grass, so the first frames stay far below a Windows
+/// TDR (2 s) on an HD 4600 or WARP. Automatic raises it as frame times allow.
+const WEAK_START_LEVEL: u8 = 1;
+
 impl Default for Automatic {
     fn default() -> Self {
         Self {
-            level: START_LEVEL,
+            level: if rustudio_core::rustudio_settings::weak_gpu() { WEAK_START_LEVEL } else { START_LEVEL },
             times: History::default(),
             averages: History::default(),
             render_times: History::default(),

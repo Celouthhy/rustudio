@@ -45,6 +45,9 @@ pub mod fidelity;
 pub mod engine_tables;
 pub mod icons;
 pub mod live_drafts;
+pub mod live_sync;
+pub mod mcp;
+pub mod file_sync;
 pub mod layout_store;
 mod panel_cache;
 pub mod panels;
@@ -174,6 +177,20 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --camera X,Y,Z,YAW,PITCH  start the editor camera there (degrees)
   --bench FILE         measure frame times (after a 3 s warm-up) for N seconds
                        (default 10) at 1265x900 without vsync, write JSON, exit
+  --profile-capture OUT  record a profiler capture of N seconds (--seconds,
+                       default 10; after the --bench warm-up, from Play's start
+                       with --play) and exit. OUT.rsprof opens in the
+                       MicroProfiler; any other name is Chrome trace JSON
+                       (Perfetto, chrome://tracing)
+  --instr              with --profile-capture: scopes also count instructions
+                       (Linux; Windows counts CPU cycles); reports then rank by them
+  --profile-report FILE [TOP] [--json] [--spikes N]  a capture (.rsprof or
+                       Chrome trace) as text or JSON: frames, lanes, the TOP
+                       hottest scopes with source lines, the N worst frames and
+                       what made them slow, counters, scripts (docs/PROFILING.md)
+  --profile-diff A B [TOP] [--json]  compare two captures: frames and scopes,
+                       change and whether it is outside run-to-run noise
+  --profile-convert IN OUT  rewrite a capture (OUT.rsprof native, else Chrome trace)
   --seconds N          with --bench: how long to measure; with --no-ui (no
                        --bench): end the run at N seconds (from Play's start
                        with --from-play)
@@ -403,7 +420,7 @@ fn restore_parent_fds() {}
 /// a CI result, or a --no-ui run with --seconds): no window on screen.
 fn is_test_run(argv: &[String]) -> bool {
     let has = |f: &str| argv.iter().any(|a| a == f);
-    ["--screenshot", "--self-test", "--bench", "--ui-shots", "--result", "--fail-on-error"].iter().any(|f| has(f))
+    ["--screenshot", "--self-test", "--bench", "--profile-capture", "--ui-shots", "--result", "--fail-on-error"].iter().any(|f| has(f))
         || ((has("--no-ui") || has("--play-only")) && has("--seconds"))
 }
 
@@ -416,6 +433,14 @@ fn window_arg(argv: &[String]) -> Option<(u32, u32)> {
 /// The whole program: parse the command line and run the editor, a tool
 /// command or a harness run (`src/main.rs` calls this).
 pub fn run() -> eframe::Result<()> {
+    // `rustudio mcp`: the stdio MCP bridge to the open windows (src/mcp/
+    // bridge.rs). No window, nothing else on stdout.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).is_some_and(|a| a == "mcp") {
+            std::process::exit(mcp::bridge::run(&argv[2..]));
+        }
+    }
     // Headless runs are silent unless --audio (before any thread starts).
     {
         let argv: Vec<String> = std::env::args().collect();
@@ -631,6 +656,8 @@ pub fn run() -> eframe::Result<()> {
     let mut demo = false;
     let mut start_play = false;
     let mut bench: Option<PathBuf> = None;
+    let mut profile_capture: Option<PathBuf> = None;
+    let mut profile_instr = false;
     let mut camera: Option<[f32; 5]> = None;
     let mut seconds = rustudio_core::mech::PERF_SECONDS;
     let mut shot_after: Option<f32> = None;
@@ -661,6 +688,8 @@ pub fn run() -> eframe::Result<()> {
         match a.as_str() {
             "--screenshot" => screenshot = args.next().map(PathBuf::from),
             "--bench" => bench = args.next().map(PathBuf::from),
+            "--profile-capture" => profile_capture = args.next().map(PathBuf::from),
+            "--instr" => profile_instr = true,
             "--camera" => {
                 let v: Vec<f32> = args
                     .next()
@@ -807,6 +836,63 @@ pub fn run() -> eframe::Result<()> {
                 let path = args.next().map(PathBuf::from).unwrap_or_default();
                 match rustudio_core::doc::Document::open(&path) {
                     Ok(d) => print!("{}", d.stats()),
+                    Err(e) => eprintln!("{e}"),
+                }
+                return Ok(());
+            }
+            "--profile-report" => {
+                // A profiler capture as text or JSON (no window):
+                // --profile-report FILE [TOP] [--json] [--spikes N]
+                let path = args.next().map(PathBuf::from).unwrap_or_default();
+                let (mut top, mut json, mut spikes) = (30usize, false, 5usize);
+                while let Some(a) = args.next() {
+                    match a.as_str() {
+                        "--json" => json = true,
+                        "--spikes" => spikes = args.next().and_then(|n| n.parse().ok()).unwrap_or(spikes),
+                        n => top = n.parse().unwrap_or(top),
+                    }
+                }
+                match rustudio_core::profiler::export::open(&path) {
+                    Ok(cap) if json => println!("{}", serde_json::to_string_pretty(&rustudio_core::profiler::report::report_json(&cap, top, spikes)).unwrap_or_default()),
+                    Ok(cap) => print!("{}", rustudio_core::profiler::report::report_text(&cap, top, spikes)),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+            "--profile-diff" => {
+                // Before / after: --profile-diff A B [TOP] [--json]
+                let a = args.next().map(PathBuf::from).unwrap_or_default();
+                let b = args.next().map(PathBuf::from).unwrap_or_default();
+                let (mut top, mut json) = (30usize, false);
+                for x in args.by_ref() {
+                    match x.as_str() {
+                        "--json" => json = true,
+                        n => top = n.parse().unwrap_or(top),
+                    }
+                }
+                let open = |p: &PathBuf| rustudio_core::profiler::export::open(p);
+                match (open(&a), open(&b)) {
+                    (Ok(ca), Ok(cb)) if json => println!("{}", serde_json::to_string_pretty(&rustudio_core::profiler::report::diff_json(&ca, &cb, top)).unwrap_or_default()),
+                    (Ok(ca), Ok(cb)) => print!("{}", rustudio_core::profiler::report::diff_text(&ca, &cb, top)),
+                    (Err(e), _) | (_, Err(e)) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+            "--profile-convert" => {
+                // Rewrites a capture in another format (no window): IN OUT,
+                // OUT.rsprof native, anything else Chrome trace JSON.
+                let input = args.next().map(PathBuf::from).unwrap_or_default();
+                let out = args.next().map(PathBuf::from).unwrap_or_default();
+                match rustudio_core::profiler::export::open(&input)
+                    .and_then(|cap| rustudio_core::profiler::export::save(&cap, &out).map_err(|e| e.to_string()))
+                {
+                    Ok(()) => println!("{} -> {}", input.display(), out.display()),
                     Err(e) => eprintln!("{e}"),
                 }
                 return Ok(());
@@ -993,7 +1079,7 @@ pub fn run() -> eframe::Result<()> {
             last_frame: None,
             no_ui,
             no_render,
-            end_after: (no_ui && seconds_given && bench.is_none()).then_some(seconds),
+            end_after: (no_ui && seconds_given && bench.is_none() && profile_capture.is_none()).then_some(seconds),
             fail_on_error,
             result,
             end_value: None,
@@ -1008,6 +1094,7 @@ pub fn run() -> eframe::Result<()> {
                     .unwrap_or_else(|| "new place".into());
                 rustudio_core::bench::Bench::new(Some(out), &label, start_play, seconds)
             }),
+            profile: profile_capture.map(|out| rustudio_core::profiler::cli::CliCapture::new(out, seconds, start_play, profile_instr)),
         },
         selftest: selftest.map(selftest::SelfTest::new),
         ui_shots: ui_shots.map(ui_shots::UiShots::new),
@@ -1040,6 +1127,10 @@ pub fn run() -> eframe::Result<()> {
     // rustudio's own options: likewise only for runs a person drives, never
     // under RUSTUDIO_DETERMINISTIC (crates/rustudio-core/src/rustudio_settings.rs).
     rustudio_core::rustudio_settings::init(layout_store::enabled(&harness));
+    // (a --profile-capture run keeps the settings it chose)
+    if harness.run.profile.is_none() {
+        rustudio_core::profiler::load_saved_config();
+    }
     // The saved window (src/layout_store.rs), for plain interactive runs.
     let saved_layout = (!harness.run.no_ui && layout_store::enabled(&harness)).then(layout_store::load).flatten();
     let icon = egui::IconData {

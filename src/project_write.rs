@@ -86,7 +86,7 @@ fn script_kind(class: &str) -> Option<FileKind> {
 }
 
 /// Properties a file's own contents already hold (not written to data files).
-fn held_by_file(kind: FileKind, prop: &str) -> bool {
+pub(crate) fn held_by_file(kind: FileKind, prop: &str) -> bool {
     match kind {
         FileKind::Server | FileKind::Client | FileKind::Module | FileKind::JsonModule => {
             prop == "Source"
@@ -238,7 +238,13 @@ impl ProjectState {
             // A rebuild (load, a whole-document change): nothing to write.
             Marks::All => return,
         };
-        if marks.is_empty() {
+        self.write_marks(doc, marks);
+    }
+
+    /// Writes these journal marks to their files (File Sync passes the ones
+    /// its Two-Way settings let through).
+    pub fn write_marks(&mut self, doc: &mut Document, marks: Vec<doc::Mark>) {
+        if marks.is_empty() || doc.id != self.doc_id {
             return;
         }
         let mut models: HashSet<PathBuf> = HashSet::new();

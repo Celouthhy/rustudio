@@ -174,6 +174,56 @@ impl Game {
         });
     }
 
+    /// The owning client's writes to its character that the world steps take:
+    /// AssemblyLinearVelocity / AssemblyAngularVelocity a client script set (Place A's own
+    /// jump), and the client's movers on the character (Place A's LinearVelocity and
+    /// AlignOrientation) plus what else the player owns. Read in `hum_pre` and again
+    /// after Stepped / PreSimulation (play.rs): Studio solves a value a script wrote
+    /// there in that frame's world steps (probe T26_presim_echo: PostSimulation reads
+    /// the PreSimulation write back the same frame). Read only before PreSimulation,
+    /// Place A' Movement (pmove from AssemblyLinearVelocity each PreSimulation into a
+    /// planar LinearVelocity) got every value one frame late: each speed showed on two
+    /// frames and friction stopped the player at half rate (T26_presim_pmove: below 20
+    /// u/s 0.55 s after release where Studio takes 0.27).
+    pub(super) fn hum_client_writes(&mut self, model: Ref) {
+        let s = self.play.as_mut().expect("playing");
+        let model_c = s.map.s2c.get(&model).copied();
+        let reqs: Vec<(Ref, Vec3)> = match s.client.as_mut().and_then(|c| c.world.as_mut()) {
+            Some(w) => {
+                let mine: Vec<(Ref, Vec3)> = w
+                    .velocity_requests
+                    .iter()
+                    .filter(|(r, _)| s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)))
+                    .copied()
+                    .collect();
+                w.velocity_requests.retain(|(r, _)| !s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)));
+                mine
+            }
+            None => Vec::new(),
+        };
+        if let Some((_, v)) = reqs.last() {
+            s.physics.set_humanoid_velocity(model, Some(*v), None);
+        }
+        // … and AssemblyAngularVelocity (T16: a Ragdoll given a spin).
+        if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
+            let spins = rustudio_physics::physics::live::take_spin_sets_of(cid, |r| {
+                s.map.c2s.get(&r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model))
+            });
+            if let Some((_, w)) = spins.last() {
+                s.physics.set_humanoid_velocity(model, None, Some(*w));
+            }
+        }
+        // The client's own movers on the character.
+        if let (Some(cd), Some(mc)) = (s.other_doc.as_ref(), model_c) {
+            s.physics.set_client_movers(cd, &s.map.c2s, mc);
+            // What the player owns besides its character: parts a script
+            // gave it, the seat it sits in.
+            let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
+            owned.extend(s.character.as_ref().and_then(|c| c.seat));
+            s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
+        }
+    }
+
     /// RotationType CameraRelative (shift lock, first person): the root
     /// faces the camera's way, at once. Measured in Studio 0.747
     /// (checks/humanoid-physics/feel/traces/studio-yaw.log, studio-yaw2.log;
@@ -310,45 +360,9 @@ impl Game {
             let at = if held { ch.last_root.or_else(|| rustudio_render::scene::xform_of(&self.doc, root)) } else { None };
             s.physics.anchor_humanoid(model, at);
         }
-        // AssemblyLinearVelocity a client script gave its character (Place A's own jump).
-        {
-            let s = self.play.as_mut().expect("playing");
-            let model_c = s.map.s2c.get(&model).copied();
-            let reqs: Vec<(Ref, Vec3)> = match s.client.as_mut().and_then(|c| c.world.as_mut()) {
-                Some(w) => {
-                    let mine: Vec<(Ref, Vec3)> = w
-                        .velocity_requests
-                        .iter()
-                        .filter(|(r, _)| s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)))
-                        .copied()
-                        .collect();
-                    w.velocity_requests.retain(|(r, _)| !s.map.c2s.get(r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model)));
-                    mine
-                }
-                None => Vec::new(),
-            };
-            if let Some((_, v)) = reqs.last() {
-                s.physics.set_humanoid_velocity(model, Some(*v), None);
-            }
-            // … and AssemblyAngularVelocity (T16: a Ragdoll given a spin).
-            if let Some(cid) = s.other_doc.as_ref().map(|d| d.id) {
-                let spins = rustudio_physics::physics::live::take_spin_sets_of(cid, |r| {
-                    s.map.c2s.get(&r).is_some_and(|sr| s.physics.hums.of_part.get(sr) == Some(&model))
-                });
-                if let Some((_, w)) = spins.last() {
-                    s.physics.set_humanoid_velocity(model, None, Some(*w));
-                }
-            }
-            // The client's own movers on the character.
-            if let (Some(cd), Some(mc)) = (s.other_doc.as_ref(), model_c) {
-                s.physics.set_client_movers(cd, &s.map.c2s, mc);
-                // What the player owns besides its character: parts a script
-                // gave it, the seat it sits in.
-                let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
-                owned.extend(s.character.as_ref().and_then(|c| c.seat));
-                s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
-            }
-        }
+        // What the client's PreAnimation / RenderStepped wrote (again after PreSimulation:
+        // `hum_client_writes`).
+        self.hum_client_writes(model);
         // The client's Humanoid values (it owns the character).
         let speed = self.owned_humanoid_f32(humanoid, "WalkSpeed", mech::WALK_SPEED);
         let use_power = matches!(self.owned_humanoid_prop(humanoid, "UseJumpPower"), Some(Variant::Bool(true)));
@@ -968,6 +982,91 @@ mod anchored_root_tests {
         tick(&mut game, 120);
         assert_eq!(
             game.run_luau(Side::Server, "local a = _G.anch; assert(a.root.Position.Y < a.y1 - 4, 'stayed at ' .. a.root.Position.Y)"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod presim_mover_tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio (probe T26_presim_echo, Studio 2026-11-19): a client's LinearVelocity on
+    /// its character, set in RunService.PreSimulation, is solved in that frame's world
+    /// steps: PostSimulation reads the write back (6 / 12 on alternate frames, 12.2 /
+    /// 6.15 with the Humanoid's floor forces). rustudio read the client's movers before
+    /// PreSimulation fired, so it solved the frame before's write (12 → 6.35, 6 →
+    /// 11.65), which made Place A' pmove friction act at half rate.
+    #[test]
+    fn presimulation_mover_write_is_solved_that_frame() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 120);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local RunService = game:GetService("RunService")
+                local ch = game:GetService("Players").LocalPlayer.Character
+                assert(ch and ch:FindFirstChild("HumanoidRootPart"), "no character")
+                local root = ch.HumanoidRootPart
+                ch:FindFirstChildOfClass("Humanoid").WalkSpeed = 0
+                local att = Instance.new("Attachment")
+                att.Parent = root
+                local lv = Instance.new("LinearVelocity")
+                lv.Attachment0 = att
+                lv.RelativeTo = Enum.ActuatorRelativeTo.World
+                lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+                lv.PrimaryTangentAxis = Vector3.xAxis
+                lv.SecondaryTangentAxis = Vector3.zAxis
+                lv.ForceLimitsEnabled = false
+                lv.Parent = root
+                local k, wrote = 0, 0
+                _G.echo = {}
+                RunService.PreSimulation:Connect(function()
+                    k += 1
+                    wrote = if k % 2 == 0 then 12 else 6
+                    lv.PlaneVelocity = Vector2.new(0, -wrote)
+                end)
+                RunService.PostSimulation:Connect(function()
+                    if k > 0 then
+                        table.insert(_G.echo, { k, wrote, -root.AssemblyLinearVelocity.Z })
+                    end
+                end)
+            "#),
+            None
+        );
+        tick(&mut game, 40);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local rows = _G.echo
+                assert(#rows >= 30, "only " .. #rows .. " frames")
+                local near, bad = 0, {}
+                for i = 2, #rows do
+                    local w, prev, got = rows[i][2], rows[i - 1][2], rows[i][3]
+                    if math.abs(got - w) < math.abs(got - prev) and math.abs(got - w) < 1 then
+                        near += 1
+                    elseif #bad < 4 then
+                        table.insert(bad, string.format("frame %d wrote %g read %.3f", rows[i][1], w, got))
+                    end
+                end
+                assert(near == #rows - 1, near .. " / " .. (#rows - 1) .. " frames read their own write; " .. table.concat(bad, ", "))
+            "#),
             None
         );
     }

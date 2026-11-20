@@ -220,6 +220,9 @@ pub(super) static BASEPLATE: &[Inst] = &[
         ("EnvironmentSpecularScale", F(1.0)),
         ("FogColor", C3(0.75294125, 0.75294125, 0.75294125)),
         ("GeographicLatitude", F(0.0)),
+        // What Studio's migration stored on open (ShadowMap → Soft): with
+        // the attribute set nothing is derived again (doc::lighting_style_default).
+        ("LightingStyle", E(1)),
         ("OutdoorAmbient", C3(0.27450982, 0.27450982, 0.27450982)),
         ("Outlines", B(false)),
         ("PrioritizeLightingQuality", B(true)),

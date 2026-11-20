@@ -27,6 +27,11 @@ pub struct LiveModel {
     waiting_asset_targets: HashMap<(Ref, String), NetAssetId>,
     /// Unions given their geometry since the last `take_resolved`.
     resolved: Vec<Ref>,
+    /// SET_GLOBALS' top-level services by server referent (class names).
+    services: HashMap<u64, String>,
+    /// Referents the server sent for two different instances, with both
+    /// instances: neither can be edited or deleted safely by referent.
+    conflicts: Vec<(u64, Ref, Ref)>,
 }
 
 struct PendingInstance {
@@ -56,6 +61,8 @@ impl LiveModel {
             waiting_assets: HashMap::new(),
             waiting_asset_targets: HashMap::new(),
             resolved: Vec::new(),
+            services: HashMap::new(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -71,6 +78,29 @@ impl LiveModel {
     /// Bind a locally created DOM instance before its server echo arrives.
     pub fn bind_local(&mut self, id: u64, reference: Ref) {
         self.refs.insert(id, reference);
+    }
+    /// Whether `reference` was on the server but no longer has a referent
+    /// rustudio can name it by: another instance took it (an id handed out
+    /// twice, or two instances sent with one referent). Edits of it can't be
+    /// sent, and must be reported rather than dropped.
+    pub fn lost_referent(&self, reference: Ref) -> bool {
+        self.refs.lost(reference)
+    }
+    /// Referents the server sent for two different instances since the last
+    /// call: (referent, the first instance, the second).
+    pub fn take_conflicts(&mut self) -> Vec<(u64, Ref, Ref)> {
+        std::mem::take(&mut self.conflicts)
+    }
+    /// Forget a local instance's server referent (its server copy was
+    /// deleted): putting it back into the place creates a new one.
+    pub fn unbind(&mut self, reference: Ref) {
+        self.refs.remove_ref(reference);
+    }
+    /// The server referent of a top-level service of `class` that the server
+    /// listed but no live instance holds yet: a service the editor created
+    /// locally (a plugin's GetService) binds to it instead of being local.
+    pub fn unbound_service(&self, class: &str) -> Option<u64> {
+        self.services.iter().find_map(|(&id, c)| (c == class && self.refs.get(id).is_none()).then_some(id))
     }
     /// Unions that got their geometry since the last call (for change marks).
     pub fn take_resolved(&mut self) -> Vec<Ref> {
@@ -133,6 +163,15 @@ impl LiveModel {
                 }
                 self.net_assets.insert(key, asset);
             }
+            RepOp::Services(list) => {
+                for (id, class) in list {
+                    self.services.insert(id, class);
+                    // Children that arrived before the table.
+                    if self.pending.contains_key(&id) {
+                        self.service_instance(id);
+                    }
+                }
+            }
             RepOp::Presence { .. } | RepOp::Event { .. } | RepOp::Unhandled { .. } => {}
         }
     }
@@ -149,6 +188,26 @@ impl LiveModel {
             .get(id)
             .filter(|r| self.dom.get_by_ref(*r).is_some())
         {
+            // The same referent for an instance of another class: the server
+            // holds two instances under one referent (a peer handed out an id
+            // a saved instance already had). Which one an edit by that
+            // referent reaches is unknown, so neither keeps it.
+            let known = self.dom.get_by_ref(reference).map(|i| i.class.to_string());
+            if known.as_deref().is_some_and(|c| c != class) {
+                let parent_ref = parent.and_then(|p| self.refs.get(p)).filter(|p| self.dom.get_by_ref(*p).is_some()).unwrap_or(self.dom.root_ref());
+                let second = self.insert_child(parent_ref, id, &class, &props);
+                self.refs.mark_lost(second);
+                self.refs.mark_lost(reference);
+                self.conflicts.push((id, reference, second));
+                return;
+            }
+            // A listed service made early for its children still names the
+            // DataModel's referent when it arrives (see below).
+            if let Some(pid) = parent.filter(|&p| class == "Workspace" && self.root_server_id.is_none() && self.refs.get(p).is_none()) {
+                self.root_server_id = Some(pid);
+                self.refs.insert(pid, self.dom.root_ref());
+                self.drain_pending(pid);
+            }
             self.apply_props(reference, &props);
             if let Some(parent) = parent
                 .and_then(|p| self.refs.get(p))
@@ -184,6 +243,11 @@ impl LiveModel {
                     self.drain_pending(pid);
                     self.dom.root_ref()
                 }
+                // A listed service the server never sends (ReplicatedFirst):
+                // made here, as the native client makes its services.
+                None if self.services.contains_key(&pid) => {
+                    self.service_instance(pid)
+                }
                 None => {
                     // Parent not here yet: park it.
                     self.pending
@@ -207,14 +271,7 @@ impl LiveModel {
     ) -> Ref {
         // Replication omits Name when it matches the native constructor default.
         // Native defaults can differ from the class name used by InstanceBuilder.
-        let default_name = match class {
-            "BindableEvent" => "Event",
-            "BindableFunction" => "Function",
-            "WedgePart" => "Wedge",
-            "CornerWedgePart" => "CornerWedge",
-            "UnionOperation" => "Union",
-            _ => class,
-        };
+        let default_name = default_instance_name(class);
         let mut builder = InstanceBuilder::new(class).with_name(default_name);
         // An explicit wire Name always wins, including an empty name.
         if let Some((_, PropValue::String(name))) = props.iter().find(|(k, _)| k == "Name") {
@@ -294,6 +351,12 @@ impl LiveModel {
                     continue;
                 }
                 if let Some(value) = to_variant(value, name) {
+                    // Studio keeps one time of day and the wire carries only
+                    // TimeOfDay: a ClockTime kept beside it locally would
+                    // win over the server's new value in every reader.
+                    if name == "TimeOfDay" && inst.class.as_str() == "Lighting" {
+                        inst.properties.remove(&rbx_dom_weak::ustr("ClockTime"));
+                    }
                     inst.properties.insert(name.clone().into(), value);
                 }
             }
@@ -318,14 +381,73 @@ impl LiveModel {
     fn drain_pending_into(&mut self, id: u64, parent_ref: Ref) {
         if let Some(children) = self.pending.remove(&id) {
             for c in children {
-                let r = self.insert_child(parent_ref, c.id, &c.class, &c.props);
+                // Its referent already names an instance of its class: a
+                // listed service made early for children that came first.
+                // The server has one; its record fills that one (a second
+                // copy held the properties while lookups by name found the
+                // first: Lighting without its TimeOfDay).
+                let existing = self.refs.get(c.id).filter(|r| self.dom.get_by_ref(*r).is_some_and(|i| i.class == c.class.as_str()));
+                let r = match existing {
+                    Some(r) => {
+                        self.apply_props(r, &c.props);
+                        if r != self.dom.root_ref() && r != parent_ref {
+                            self.dom.transfer_within(r, parent_ref);
+                        }
+                        r
+                    }
+                    None => self.insert_child(parent_ref, c.id, &c.class, &c.props),
+                };
                 self.drain_pending_into(c.id, r);
             }
         }
     }
+    /// The live instance of listed service `id`, made under the root (or an
+    /// existing unbound one of its class bound) on first use.
+    fn service_instance(&mut self, id: u64) -> Ref {
+        if let Some(r) = self.refs.get(id).filter(|r| self.dom.get_by_ref(*r).is_some()) {
+            return r;
+        }
+        let class = self.services[&id].clone();
+        let root = self.dom.root_ref();
+        let existing = self.dom.root().children().iter().copied().find(|&c| {
+            self.refs.server_id(c).is_none() && self.dom.get_by_ref(c).is_some_and(|i| i.class == class.as_str())
+        });
+        let r = match existing {
+            Some(r) => {
+                self.refs.insert(id, r);
+                r
+            }
+            None => self.insert_child(root, id, &class, &[("Name".into(), PropValue::String(class.clone()))]),
+        };
+        self.drain_pending_into(id, r);
+        r
+    }
+
     fn drain_pending(&mut self, id: u64) {
         let r = self.refs.get(id).unwrap_or(self.dom.root_ref());
         self.drain_pending_into(id, r);
+    }
+}
+
+/// The Name an instance has when the wire leaves it out: the class's
+/// constructor default (Studio 0.748; the same table as
+/// `rustudio_core::doc::default_instance_name`, which this crate can't
+/// depend on: the app crate's test keeps the two equal).
+pub fn default_instance_name(class: &str) -> &str {
+    match class {
+        "BindableEvent" => "Event",
+        "BindableFunction" => "Function",
+        "WedgePart" => "Wedge",
+        "CornerWedgePart" => "CornerWedge",
+        "UnionOperation" => "Union",
+        "BloomEffect" => "Bloom",
+        "BlurEffect" => "Blur",
+        "ColorCorrectionEffect" => "ColorCorrection",
+        "ColorGradingEffect" => "ColorGrading",
+        "DepthOfFieldEffect" => "DepthOfField",
+        "SunRaysEffect" => "SunRays",
+        "TouchTransmitter" => "TouchInterest",
+        _ => class,
     }
 }
 
@@ -741,5 +863,123 @@ mod tests {
         assert!(matches!(anchored, Some(Variant::Bool(true))));
         m.apply(RepOp::DeleteInstance { id: 2 });
         assert_eq!(m.dom().get_by_ref(root).unwrap().children().len(), 0);
+    }
+
+    /// ReplicatedFirst is only in SET_GLOBALS' service table; its children
+    /// name it as parent and must not stay parked (Place A: ReplicatedFirst.First
+    /// never showed, so a plugin re-added it under a local ReplicatedFirst).
+    #[test]
+    fn listed_services_hold_their_children_and_bind_local_copies() {
+        use crate::replicator::{top_services, SchemaClass};
+        let class = |name: &str| SchemaClass { name: name.into(), props: vec![], events: vec![] };
+        let schema = crate::replicator::Schema {
+            classes: vec![class("Folder"), class("ReplicatedFirst"), class("Workspace"), class("Lighting")],
+            ..Default::default()
+        };
+        // flags, terrain flag, 5 bytes, peer scope 8, u32 0, count 3, then
+        // (reference, u16 class, two flags) as in the Place A join capture.
+        let mut body = vec![1, 0, 0, 0, 0, 0, 1, 8, 0, 0, 0, 0, 3];
+        for (id, class) in [(0x2110u32, 1u16), (0xe, 2), (0x3d6d, 3)] {
+            body.push(1);
+            body.extend_from_slice(&id.to_le_bytes());
+            body.extend_from_slice(&class.to_le_bytes());
+            body.extend_from_slice(&[1, 1]);
+        }
+        let services = top_services(&schema, &body).unwrap();
+        assert_eq!(services[0], (0x2110, "ReplicatedFirst".to_string()));
+        assert!(top_services(&schema, &body[..body.len() - 1]).is_err());
+
+        let mut m = LiveModel::new();
+        m.apply(RepOp::Services(services));
+        // A child of ReplicatedFirst before Workspace (and the DataModel) is known.
+        m.apply(RepOp::NewInstance { id: 0x2f13, class: "Folder".into(), parent: Some(0x2110), props: vec![("Name".into(), PropValue::String("First".into()))] });
+        m.apply(RepOp::NewInstance { id: 0xe, class: "Workspace".into(), parent: Some(0xd), props: vec![] });
+        m.apply(RepOp::NewInstance { id: 0x3d6d, class: "Lighting".into(), parent: Some(0xd), props: vec![] });
+        let root = m.dom().root_ref();
+        let first = m.dom().get_by_ref(m.reference(0x2f13).unwrap()).unwrap();
+        let rf = m.dom().get_by_ref(first.parent()).unwrap();
+        assert_eq!((rf.class.as_str(), rf.parent()), ("ReplicatedFirst", root));
+        assert_eq!(m.dom().get_by_ref(m.reference(0x3d6d).unwrap()).unwrap().parent(), root, "services still bind under the root");
+        assert_eq!(m.dom().get_by_ref(root).unwrap().children().len(), 3);
+        assert_eq!(m.unbound_service("ReplicatedFirst"), None, "already bound");
+        // A locally made copy (GetService before the server's) binds to the id.
+        let mut m = LiveModel::new();
+        m.apply(RepOp::Services(vec![(0x2110, "ReplicatedFirst".into())]));
+        let root = m.dom().root_ref();
+        let local = m.dom_mut().insert(root, InstanceBuilder::new("ReplicatedFirst"));
+        assert_eq!(m.unbound_service("ReplicatedFirst"), Some(0x2110));
+        m.bind_local(0x2110, local);
+        assert_eq!(m.unbound_service("ReplicatedFirst"), None);
+        m.unbind(local);
+        assert_eq!(m.server_id(local), None);
+    }
+
+    /// A listed service's own record parked before the DataModel's referent
+    /// is known, then a child of it (which makes the service early), then
+    /// Workspace: one service, with the server's properties and the child
+    /// (a test place join 2026-11-20 had two Lightings, the child
+    /// one without TimeOfDay, so the view showed 14:00 for a night place).
+    #[test]
+    fn a_parked_service_record_fills_the_service_made_for_its_children() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::Services(vec![(0x3d6d, "Lighting".into()), (0xe, "Workspace".into())]));
+        let tod = vec![("TimeOfDay".to_string(), PropValue::String("02:48:00".into()))];
+        m.apply(RepOp::NewInstance { id: 0x3d6d, class: "Lighting".into(), parent: Some(0xd), props: tod });
+        m.apply(RepOp::NewInstance { id: 0x4000, class: "Sky".into(), parent: Some(0x3d6d), props: vec![] });
+        m.apply(RepOp::NewInstance { id: 0xe, class: "Workspace".into(), parent: Some(0xd), props: vec![] });
+        let root = m.dom().root_ref();
+        let lightings: Vec<Ref> = m.dom().get_by_ref(root).unwrap().children().iter().copied()
+            .filter(|c| m.dom().get_by_ref(*c).unwrap().class == "Lighting").collect();
+        assert_eq!(lightings.len(), 1, "one Lighting, as the server has");
+        let l = m.dom().get_by_ref(lightings[0]).unwrap();
+        assert_eq!(m.reference(0x3d6d), Some(lightings[0]));
+        assert_eq!(l.properties.get(&rbx_dom_weak::ustr("TimeOfDay")), Some(&Variant::String("02:48:00".into())));
+        assert_eq!(l.children().len(), 1, "the Sky stays under it");
+        // A ClockTime kept locally (a script's write) gives way to the
+        // server's next TimeOfDay: Studio holds one time of day.
+        m.dom_mut().get_by_ref_mut(lightings[0]).unwrap().properties.insert(rbx_dom_weak::ustr("ClockTime"), Variant::Float32(14.0));
+        // Later changes reach the same instance.
+        m.apply(RepOp::ChangeProperty { id: 0x3d6d, name: "TimeOfDay".into(), value: PropValue::String("21:00:00".into()) });
+        let l = m.dom().get_by_ref(lightings[0]).unwrap();
+        assert_eq!(l.properties.get(&rbx_dom_weak::ustr("TimeOfDay")), Some(&Variant::String("21:00:00".into())));
+        assert_eq!(l.properties.get(&rbx_dom_weak::ustr("ClockTime")), None, "the stale ClockTime is gone");
+    }
+
+    #[test]
+    fn omitted_effect_names_are_the_constructor_defaults() {
+        let mut m = LiveModel::new();
+        for (class, expected) in [("BloomEffect", "Bloom"), ("ColorCorrectionEffect", "ColorCorrection"), ("DepthOfFieldEffect", "DepthOfField"), ("SunRaysEffect", "SunRays"), ("BlurEffect", "Blur"), ("TouchTransmitter", "TouchInterest"), ("Atmosphere", "Atmosphere")] {
+            let id = 0x9000 + expected.len() as u64 * 7 + class.len() as u64;
+            m.apply(RepOp::NewInstance { id, class: class.into(), parent: None, props: vec![] });
+            if let Some(r) = m.reference(id).filter(|r| *r != m.dom().root_ref()) {
+                assert_eq!(m.dom().get_by_ref(r).unwrap().name, expected, "{class}");
+            }
+        }
+        assert_eq!(default_instance_name("Part"), "Part");
+    }
+
+    /// Two instances sent under one referent (a referent handed out twice):
+    /// both stay visible, neither keeps the referent, and it is reported.
+    #[test]
+    fn one_referent_for_two_instances_binds_neither() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(RepOp::NewInstance { id: 2, class: "Folder".into(), parent: Some(1), props: vec![("Name".into(), PropValue::String("Game".into()))] });
+        let x = (5u64 << 32) | 4;
+        let named = |n: &str| vec![("Name".to_string(), PropValue::String(n.into()))];
+        m.apply(RepOp::NewInstance { id: x, class: "Folder".into(), parent: Some(2), props: named("LocalMapAssets") });
+        let folder = m.reference(x).unwrap();
+        // The same referent again for the same class is an update, as before.
+        m.apply(RepOp::NewInstance { id: x, class: "Folder".into(), parent: Some(2), props: named("LocalMapAssets") });
+        assert!(m.take_conflicts().is_empty());
+        m.apply(RepOp::NewInstance { id: x, class: "ModuleScript".into(), parent: Some(2), props: named("Audio") });
+        let conflicts = m.take_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        let (id, first, second) = conflicts[0];
+        assert_eq!((id, first), (x, folder));
+        assert_eq!(m.dom().get_by_ref(first).unwrap().name, "LocalMapAssets", "the folder keeps its own name");
+        assert_eq!(m.dom().get_by_ref(second).unwrap().class.as_str(), "ModuleScript");
+        assert_eq!((m.server_id(first), m.server_id(second)), (None, None));
+        assert!(m.lost_referent(first) && m.lost_referent(second));
     }
 }

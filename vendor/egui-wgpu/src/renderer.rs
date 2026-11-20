@@ -242,6 +242,10 @@ pub struct Renderer {
 
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
+    /// rustudio: the last `update_buffers` could not stage its vertex or
+    /// index data (device lost, out of memory): `render` draws nothing
+    /// instead of panicking.
+    upload_failed: bool,
     uniform_bind_group: wgpu::BindGroup,
     texture_bind_group_layout: wgpu::BindGroupLayout,
 
@@ -456,6 +460,7 @@ impl Renderer {
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
+            upload_failed: false,
             uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
@@ -483,6 +488,10 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) {
         profiling::function_scope!();
+
+        if self.upload_failed {
+            return;
+        }
 
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
@@ -921,6 +930,8 @@ impl Renderer {
         screen_descriptor: &ScreenDescriptor,
     ) -> Vec<wgpu::CommandBuffer> {
         profiling::function_scope!();
+        let was_failing = self.upload_failed;
+        self.upload_failed = false;
 
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
 
@@ -981,11 +992,21 @@ impl Renderer {
             );
 
             let Some(mut index_buffer_staging) = index_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                // rustudio: wgpu refuses the staging buffer when the device
+                // is lost or out of memory. Skip this frame's egui draw
+                // (logged once per failure run) rather than panic; the
+                // device-lost callback reports why.
+                if !was_failing {
+                    log::error!(
+                        "Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.index_buffer.buffer.size(),
                     self.index_buffer.capacity
-                );
+                    );
+                }
+                self.upload_failed = true;
+                self.index_buffer.slices.clear();
+                self.vertex_buffer.slices.clear();
+                return Vec::new();
             };
 
             let mut index_offset = 0;
@@ -1027,11 +1048,21 @@ impl Renderer {
             );
 
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
-                panic!(
-                    "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
+                // rustudio: wgpu refuses the staging buffer when the device
+                // is lost or out of memory. Skip this frame's egui draw
+                // (logged once per failure run) rather than panic; the
+                // device-lost callback reports why.
+                if !was_failing {
+                    log::error!(
+                        "Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)",
                     self.vertex_buffer.buffer.size(),
                     self.vertex_buffer.capacity
-                );
+                    );
+                }
+                self.upload_failed = true;
+                self.index_buffer.slices.clear();
+                self.vertex_buffer.slices.clear();
+                return Vec::new();
             };
 
             let mut vertex_offset = 0;

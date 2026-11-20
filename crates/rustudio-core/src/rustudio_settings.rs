@@ -199,6 +199,12 @@ fn saved(key: &str) -> Option<Value> {
     STORE.read().unwrap().vals.as_ref()?.get(key).cloned()
 }
 
+/// A saved value that isn't one of the dialog's options (the profiler's
+/// settings and layout keep a JSON object each).
+pub fn saved_value(key: &str) -> Option<Value> {
+    saved(key)
+}
+
 /// The dialog: a new value (None = back to the default). Kept in memory for
 /// any run; written only when a file was loaded.
 pub fn set(key: &str, v: Option<Value>) {
@@ -439,10 +445,30 @@ pub enum Shown {
     Path(String),
 }
 
+static WEAK_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Weak-GPU mode (rustudio-render gpu_caps.rs: software adapters, OpenGL,
+/// old Intel graphics, RUSTUDIO_LOWEND=1): Graphics quality defaults to
+/// Automatic, which then starts at its lowest level.
+pub fn set_weak_gpu(on: bool) {
+    WEAK_GPU.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn weak_gpu() -> bool {
+    WEAK_GPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A Performance row's default when nothing is saved or set.
+fn choice_default(key: &str) -> Option<&'static str> {
+    (key == "quality" && weak_gpu()).then_some("automatic")
+}
+
 pub fn performance_choice(key: &str) -> usize {
     let o = opt(key);
     let OptKind::Choice(items) = o.kind else { return 0 };
-    let value = env(o.env).or_else(|| saved(key)?.as_str().map(str::to_owned));
+    let value = env(o.env)
+        .or_else(|| saved(key)?.as_str().map(str::to_owned))
+        .or_else(|| choice_default(key).map(str::to_owned));
     items.iter().position(|(id, _)| Some(*id) == value.as_deref()).unwrap_or(0)
 }
 
@@ -484,6 +510,7 @@ pub fn set_bool(key: &str, b: bool) {
 }
 
 pub fn set_choice(key: &str, v: &str, default: &str) {
+    let default = choice_default(key).unwrap_or(default);
     set(key, (v != default).then(|| Value::String(v.to_string())));
 }
 

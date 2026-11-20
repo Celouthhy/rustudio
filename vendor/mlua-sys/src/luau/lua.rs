@@ -531,12 +531,20 @@ pub type lua_Coverage = unsafe extern "C-unwind" fn(
 pub type lua_CounterFunction =
     unsafe extern "C-unwind" fn(context: *mut c_void, function: *const c_char, linedefined: c_int);
 
+/// rustudio: see `lua_rs_setcallhook`.
+pub type lua_RsCallHook =
+    unsafe extern "C" fn(L: *mut lua_State, event: c_int, key: *const c_void, name: *const c_char);
+
 pub type lua_CounterValue =
     unsafe extern "C-unwind" fn(context: *mut c_void, kind: c_int, line: c_int, hits: u64);
 
 unsafe extern "C-unwind" {
     pub fn lua_callhook(L: *mut lua_State, hook: lua_Hook, userdata: *mut c_void);
     pub fn lua_stackdepth(L: *mut lua_State) -> c_int;
+    /// rustudio (script profiler): a C frame's call-site name (vendored ldebug.cpp).
+    pub fn lua_rs_callname(L: *mut lua_State, level: c_int) -> *const c_char;
+    /// rustudio (script profiler, exact mode): the single-step call/return hook.
+    pub fn lua_rs_setcallhook(hook: Option<lua_RsCallHook>);
     pub fn lua_getinfo(L: *mut lua_State, level: c_int, what: *const c_char, ar: *mut lua_Debug) -> c_int;
     pub fn lua_getargument(L: *mut lua_State, level: c_int, n: c_int) -> c_int;
     pub fn lua_getlocal(L: *mut lua_State, level: c_int, n: c_int) -> *const c_char;

@@ -96,7 +96,10 @@ pub fn start(req: Request) -> u64 {
     std::thread::Builder::new()
         .name("rustudio-http".into())
         .spawn(move || {
-            let r = run(req);
+            let r = {
+                let _p = rustudio_core::profiler::scope("http_request", rustudio_core::profiler::Cat::Network);
+                run(req)
+            };
             done().lock().unwrap().insert(id, r);
         })
         .ok();

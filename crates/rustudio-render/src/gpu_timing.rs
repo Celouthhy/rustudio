@@ -34,7 +34,13 @@ pub(crate) fn set_automatic(enabled: bool) {
 }
 
 fn on() -> bool {
-    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed)
+    benchmark_enabled() || AUTOMATIC.load(Ordering::Relaxed) || rustudio_core::profiler::gpu_wanted()
+}
+
+/// Every labelled span is timed (the bench or the profiler wants them), not
+/// only the scene span automatic quality reads.
+fn detailed() -> bool {
+    benchmark_enabled() || rustudio_core::profiler::gpu_wanted()
 }
 
 /// Keep timestamp queries available if Automatic is selected after startup.
@@ -57,6 +63,9 @@ struct Slot {
     scene_span: Option<(u32, u32)>,
     used: u32,
     state: Arc<AtomicU8>,
+    /// The profiler's clock when the frame's work was submitted (where its
+    /// GPU spans are placed on the timeline).
+    cpu_ns: u64,
 }
 
 struct State {
@@ -105,6 +114,7 @@ fn init(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<State> {
             scene_span: None,
             used: 0,
             state: Arc::new(AtomicU8::new(FREE)),
+            cpu_ns: 0,
         })
         .collect();
     Some(State {
@@ -147,7 +157,7 @@ pub fn begin(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::Com
 
 /// Books the GPU time since the last `begin` / `mark` in this encoder to `label`.
 pub fn mark(encoder: &mut wgpu::CommandEncoder, label: &'static str) {
-    if !on() || (!benchmark_enabled() && label != "gpu: post") {
+    if !on() || (!detailed() && label != "gpu: post") {
         return;
     }
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,6 +188,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
             enc.resolve_query_set(&slot.set, 0..slot.used, &slot.resolve, 0);
             enc.copy_buffer_to_buffer(&slot.resolve, 0, &slot.read, 0, slot.used as u64 * 8);
             queue.submit([enc.finish()]);
+            slot.cpu_ns = rustudio_core::profiler::now_ns();
             slot.state.store(MAPPING, Ordering::Release);
             let state = slot.state.clone();
             slot.read.slice(..slot.used as u64 * 8).map_async(wgpu::MapMode::Read, move |r| {
@@ -199,6 +210,9 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
         }
         if let Ok(data) = slot.read.slice(..slot.used as u64 * 8).get_mapped_range() {
             let ts: Vec<u64> = data.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8]))).collect();
+            if rustudio_core::profiler::active() {
+                profile_slot(slot, &ts, period);
+            }
             let mut total = 0.0;
             for (a, b, label) in &slot.spans {
                 let ms = ts[*b as usize].wrapping_sub(ts[*a as usize]) as f64 * period / 1e6;
@@ -236,6 +250,25 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     st.cur = st.slots.iter().position(|s| s.state.load(Ordering::Acquire) == FREE && s.used == 0);
 }
 
+/// Hands a finished frame's spans to the profiler's GPU lane. GPU and CPU
+/// clocks aren't related: the frame's first timestamp is placed at the time
+/// its work was submitted, the rest keep their offsets from it.
+fn profile_slot(slot: &Slot, ts: &[u64], period: f64) {
+    use rustudio_core::profiler::{frame_at, lane_span, Cat, FrameKind};
+    let Some(base) = slot.spans.iter().map(|(a, _, _)| ts[*a as usize]).min() else { return };
+    let at = |t: u64| slot.cpu_ns + (t.wrapping_sub(base) as f64 * period) as u64;
+    frame_at(FrameKind::Gpu, slot.cpu_ns);
+    let mut spans: Vec<_> = slot.spans.iter().filter(|(a, b, _)| ts[*b as usize] >= ts[*a as usize]).collect();
+    spans.sort_by_key(|(_, b, _)| ts[*b as usize]);
+    for (a, b, label) in spans {
+        let (s, e) = (at(ts[*a as usize]), at(ts[*b as usize]));
+        // (a counter that went backwards or a bogus value: dropped)
+        if e.saturating_sub(s) < 1_000_000_000 {
+            lane_span("GPU", label, Cat::Gpu, s, e);
+        }
+    }
+}
+
 /// The GPU milliseconds per label since the last call, and each finished
 /// frame's total.
 pub fn take() -> (Vec<(&'static str, f64)>, Vec<f64>) {
@@ -258,7 +291,7 @@ pub fn submit(
     label: &'static str,
     bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
 ) {
-    if !benchmark_enabled() || UNSUPPORTED.get().is_some() {
+    if !detailed() || UNSUPPORTED.get().is_some() {
         queue.submit(bufs);
         return;
     }

@@ -250,6 +250,9 @@ pub struct ScriptBuf {
 #[derive(Default)]
 pub struct ScriptTabs {
     pub bufs: HashMap<Ref, ScriptBuf>,
+    /// Lines (1-based) to put the cursor on and scroll to once the tab
+    /// draws (the profiler's "Open script at line N").
+    pub goto: HashMap<Ref, usize>,
 }
 
 impl Editor {
@@ -288,6 +291,7 @@ impl Editor {
             completions: Vec::new(),
         });
         let editor_id = egui::Id::new(("script_text", r));
+        let goto = self.scripts.goto.get(&r).copied();
         let focused = ui.ctx().memory(|m| m.has_focus(editor_id));
         // Undo/redo or a script change elsewhere: follow the document.
         if (!focused || follow_live_source) && buf.text != source {
@@ -428,6 +432,10 @@ impl Editor {
                         changed = true;
                         buf.edited = Instant::now();
                     }
+                    if let Some(line) = goto {
+                        let y = resp.rect.top() + line.saturating_sub(1) as f32 * row_h;
+                        ui.scroll_to_rect(egui::Rect::from_min_size(egui::pos2(resp.rect.left(), y), egui::vec2(1.0, row_h)), Some(egui::Align::Center));
+                    }
                 });
             });
         // The cursor / selection as the plugins' ScriptDocument sees it
@@ -444,6 +452,14 @@ impl Editor {
                     word_end = Some(a);
                 }
             }
+        }
+        if let (Some(line), Some(mut st)) = (goto, state.clone()) {
+            // (the profiler's jump: the cursor at the line's start, focused)
+            let at = crate::plugin_host::script_docs::index_of(&buf.text, line as i64, 1);
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+            st.store(ui.ctx(), editor_id);
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+            self.scripts.goto.remove(&r);
         }
         if let Some((sel, mut st)) = crate::plugin_host::script_docs::take_selection_request(r).zip(state) {
             let a = crate::plugin_host::script_docs::index_of(&buf.text, sel.0, sel.1);
@@ -498,6 +514,32 @@ impl Editor {
         }
         if buf_needs_repaint(self.scripts.bufs.get(&r)) {
             ui.ctx().request_repaint_after(Duration::from_millis(300));
+        }
+    }
+
+    /// Opens the script at instance path `path` (as the profiler names it),
+    /// at `line` if given. False when no script has that path.
+    pub fn open_script_named(&mut self, path: &str, line: Option<u32>) -> bool {
+        let found = self
+            .game
+            .doc
+            .dom
+            .descendants()
+            .filter(|i| matches!(i.class.as_str(), "Script" | "LocalScript" | "ModuleScript"))
+            .map(|i| i.referent())
+            .find(|&r| self.full_name(r) == path);
+        match found {
+            Some(r) => {
+                self.open_script.push(r);
+                if let Some(l) = line {
+                    self.scripts.goto.insert(r, l as usize);
+                }
+                true
+            }
+            None => {
+                self.warn(format!("MicroProfiler: no script named {path} in the DataModel being shown"));
+                false
+            }
         }
     }
 

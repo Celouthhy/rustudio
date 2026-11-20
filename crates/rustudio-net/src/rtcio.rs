@@ -45,7 +45,13 @@ pub async fn open_lane(
     Ok(s)
 }
 
+/// Bytes written to / read from the session's lanes so far (the profiler's
+/// Team Create counters).
+pub static BYTES_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BYTES_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub async fn send(s: &mut quinn::SendStream, msg: &[u8]) -> Result<()> {
+    BYTES_SENT.fetch_add(msg.len() as u64 + 4, std::sync::atomic::Ordering::Relaxed);
     s.write_all(&frame(msg))
         .await
         .map_err(|e| NetError::Other(format!("write: {e}")))
@@ -73,6 +79,7 @@ pub async fn read_msg_result(r: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     r.read_exact(&mut m)
         .await
         .map_err(|e| NetError::Other(format!("read {n}-byte frame: {e}")))?;
+    BYTES_RECEIVED.fetch_add(n as u64 + 4, std::sync::atomic::Ordering::Relaxed);
     Ok(m)
 }
 

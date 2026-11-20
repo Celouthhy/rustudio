@@ -302,6 +302,9 @@ unsafe fn set_ident(l: *mut ffi::lua_State, id: u8) {
 unsafe extern "C-unwind" fn userthread(parent: *mut ffi::lua_State, child: *mut ffi::lua_State) {
     if !parent.is_null() {
         unsafe { ffi::lua_setthreaddata(child, ffi::lua_getthreaddata(parent)) }
+    } else {
+        // Destroyed: drop it from the per-script thread map.
+        crate::runtime::domains::assets_cloud::scene::thread_died(unsafe { ffi::lua_callbacks(child) } as usize, child as usize);
     }
 }
 

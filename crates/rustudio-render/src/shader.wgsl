@@ -70,7 +70,11 @@ struct ShadowSlot {
     vp: array<mat4x4<f32>, 6>, // per face (+X, −X, +Y, −Y, +Z, −Z): view-projection
     pos: vec4<f32>,            // light position, w 1 / Range
 };
+// (Bindings 14, 15 and 21 are left out of the reduced binding set for
+// OpenGL's 16 texture units: render.rs REDUCED_BINDINGS.)
+//#if FULL_BINDINGS
 @group(0) @binding(15) var lshadow_tex: texture_2d<f32>;
+//#endif
 @group(0) @binding(16) var lshadow_sampler: sampler;
 @group(0) @binding(17) var<storage, read> lshadow_slots: array<ShadowSlot>;
 @group(0) @binding(20) var localgrid_tex: texture_3d<f32>;
@@ -78,8 +82,10 @@ struct ShadowSlot {
 // The scene environment probe (env_probe.rs): PrefilteredEnvIndoorTexture
 // and PrefilteredEnvBlendTargetTexture, linear RGB, 128 px, 8 levels.
 @group(0) @binding(13) var indoor_tex: texture_cube<f32>;
+//#if FULL_BINDINGS
 @group(0) @binding(21) var indoor_next: texture_cube<f32>;
 @group(0) @binding(14) var brdf_lut: texture_2d<f32>;
+//#endif
 
 @group(2) @binding(0) var glass_scene: texture_2d<f32>;
 @group(2) @binding(1) var glass_depth: texture_2d<f32>;
@@ -663,7 +669,14 @@ fn env_cube(n: vec3<f32>, sky: f32) -> vec3<f32> {
 /// Studio's PrecomputedBRDFTexture (brdfLUT.dds) at (roughness, N·V): the
 /// split-sum (A, B).
 fn brdf_ab(rough: f32, nv: f32) -> vec2<f32> {
+//#if FULL_BINDINGS
     return textureSampleLevel(brdf_lut, sky_sampler, vec2<f32>(rough, max(nv, 1e-4)), 0.0).rg;
+//#else
+    // Reduced bindings: Karis's analytic fit of the same split-sum table.
+    let r = rough * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(r.x * r.x, exp2(-9.28 * max(nv, 1e-4))) * r.x + r.y;
+    return vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+//#endif
 }
 
 /// The prefiltered environment a part reflects along `r` at roughness
@@ -682,9 +695,11 @@ fn env_reflect(r: vec3<f32>, rough: f32, sky: f32, sharp: bool) -> vec3<f32> {
     // Captured Future FS (Laser Tag door view, event 562): t14 at the
     // reflection's lod, mixed toward t2 by CB0[32].w when that's non-zero.
     var inside = textureSampleLevel(indoor_tex, sky_sampler, r, lod_i).rgb;
+//#if FULL_BINDINGS
     if (g.env_spec.w != 0.0) {
         inside = mix(inside, textureSampleLevel(indoor_next, sky_sampler, r, lod_i).rgb, g.env_spec.w);
     }
+//#endif
     return mix(inside, outside, sky);
 }
 
@@ -847,6 +862,7 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
 /// at the point, Chebyshev on both warps with the bias as minimum variance,
 /// light-bleed cut (p − 0.2) × 1.25, the lesser of the two.
 fn light_shadow(slot: i32, world: vec3<f32>) -> f32 {
+//#if FULL_BINDINGS
     let s = lshadow_slots[slot];
     let v = world - s.pos.xyz;
     let a = abs(v);
@@ -866,6 +882,10 @@ fn light_shadow(slot: i32, world: vec3<f32>) -> f32 {
     let uv = (cell + ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * LSHADOW_CELL;
     let m = textureSampleLevel(lshadow_tex, lshadow_sampler, uv, 0.0);
     return evsm_visibility(m, 2.0 * (w * s.pos.w) - 1.0);
+//#else
+    // Reduced bindings: no light shadow atlas (render.rs skips its pass).
+    return 1.0;
+//#endif
 }
 
 // The light shadow pass: one cube face at a time (render.rs), writing EVSM

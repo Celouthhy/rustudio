@@ -111,21 +111,18 @@ pub fn sun_direction(clock: f32, latitude: f32) -> Vec3 {
     Vec3::new(th.cos() * ph.cos(), th.sin() * ph.cos(), ph.sin())
 }
 
-/// Lighting.LightingStyle is Soft (enum 1; Realistic 0).
-/// Old places and live joins may contain Technology without LightingStyle.
-/// Apply the same migration as Document::ensure_services for file loads.
+/// Lighting.LightingStyle is Soft (enum 1; Realistic 0). Without a stored
+/// one (old places, live joins) it is what Studio has then
+/// (`doc::lighting_style_default`: the constructor's Realistic once the place
+/// was migrated, else derived from Technology).
 pub fn soft_style(d: &Document) -> bool {
     let Some(l) = d.find_child(d.dom.root_ref(), "Lighting") else {
         return false;
     };
-    let own = d.dom.get_by_ref(l).and_then(|i| {
-        i.properties
-            .get(&rbx_dom_weak::ustr("LightingStyle"))
-            .cloned()
-    });
-    match enum_u32(own) {
+    let Some(i) = d.dom.get_by_ref(l) else { return false };
+    match enum_u32(i.properties.get(&rbx_dom_weak::ustr("LightingStyle")).cloned()) {
         Some(style) => style == 1,
-        None => mech::TECHNOLOGY_SOFT.contains(&enum_u32(d.prop(l, "Technology")).unwrap_or(mech::TECHNOLOGY_SOFT[1])),
+        None => rustudio_core::doc::lighting_style_default(i).0 == 1,
     }
 }
 
@@ -307,6 +304,20 @@ pub fn sky_levels(clock: f32, s: f32) -> (Vec3, Vec3, f32) {
     (c0, c1, k)
 }
 
+/// Lighting's time of day in hours, as every reader takes it: ClockTime
+/// (scripts and edits keep it beside TimeOfDay), else TimeOfDay (what files
+/// and Team Create carry), else 14:00; clamped and cut to whole seconds as
+/// Studio stores it.
+pub fn clock_hours(clock: Option<Variant>, time_of_day: Option<Variant>) -> f32 {
+    f32_of(clock)
+        .or_else(|| match time_of_day {
+            Some(Variant::String(s)) => mech::parse_time_of_day(&s),
+            _ => None,
+        })
+        .map(mech::clock_time)
+        .unwrap_or(mech::CLOCK_TIME)
+}
+
 pub fn globals(
     d: &Document,
     cam: &Camera,
@@ -318,25 +329,7 @@ pub fn globals(
 ) -> FrameLighting {
     let lighting = d.find_child(d.dom.root_ref(), "Lighting");
     let get = |name: &str| override_prop(name).or_else(|| lighting.and_then(|l| d.prop(l, name)));
-    // Files keep the time as TimeOfDay ("HH:MM:SS"); scripts set ClockTime.
-    let time_of_day = || match get("TimeOfDay") {
-        Some(Variant::String(s)) => {
-            let p: Vec<f32> = s
-                .split(':')
-                .map(|x| x.trim().parse::<f32>().unwrap_or(0.0))
-                .collect();
-            Some(
-                p.first().copied().unwrap_or(0.0)
-                    + p.get(1).copied().unwrap_or(0.0) / 60.0
-                    + p.get(2).copied().unwrap_or(0.0) / 3600.0,
-            )
-        }
-        _ => None,
-    };
-    let clock = f32_of(get("ClockTime"))
-        .or_else(time_of_day)
-        .map(mech::clock_time)
-        .unwrap_or(mech::CLOCK_TIME); // clamp + whole seconds
+    let clock = clock_hours(get("ClockTime"), get("TimeOfDay"));
     let lat = f32_of(get("GeographicLatitude")).unwrap_or(mech::GEOGRAPHIC_LATITUDE);
     let brightness = f32_of(get("Brightness")).unwrap_or(mech::LIGHT_BRIGHTNESS);
     let exposure = f32_of(get("ExposureCompensation")).unwrap_or(0.0);
@@ -1161,5 +1154,22 @@ mod tests {
         let lights = cache.gather(&mut d, &Camera::default(), &|_, _| true, false);
         assert_eq!(lights.len(), 1);
         assert_eq!(&lights[0].pos_range[..3], &[11., 1., 0.]);
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn time_of_day_alone_sets_the_clock() {
+        // A live Team Create Lighting carries only TimeOfDay.
+        let h = clock_hours(None, Some(Variant::String("02:48:00".into())));
+        assert!((h - 2.8).abs() < 1e-4, "{h}");
+        assert_eq!(clock_hours(Some(Variant::Float32(7.75)), Some(Variant::String("02:48:00".into()))), 7.75);
+        assert_eq!(clock_hours(None, None), mech::CLOCK_TIME);
+        // The sun is below the horizon at 02:48, above it at 14:00 (latitude 60).
+        assert!(sun_direction(clock_hours(None, Some(Variant::String("02:48:00".into()))), 60.0).y < 0.0);
+        assert!(sun_direction(clock_hours(None, None), 60.0).y > 0.0);
     }
 }

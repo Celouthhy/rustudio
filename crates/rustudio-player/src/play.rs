@@ -2597,6 +2597,16 @@ impl Game {
                 ..Default::default()
             });
         }
+        if rustudio_core::profiler::active() {
+            use rustudio_core::profiler::{counter_unit, frame, Cat, FrameKind, Unit};
+            frame(FrameKind::Heartbeat);
+            if let Some(s) = self.play.as_ref() {
+                let server = s.server.as_ref().map_or(0, |x| x.runtime.lua.used_memory());
+                let client = s.client.as_ref().map_or(0, |x| x.runtime.lua.used_memory());
+                counter_unit("Luau heap (server)", Cat::Script, Unit::Bytes, server as f64);
+                counter_unit("Luau heap (client)", Cat::Script, Unit::Bytes, client as f64);
+            }
+        }
         self.server_front();
         if let Some(h) = self.play.as_mut().and_then(|s| {
             std::mem::take(&mut s.game.reset_request)
@@ -2672,6 +2682,14 @@ impl Game {
         {
             let _s = rustudio_core::bench::scope("p2b_lua_pre");
             self.lua_pre_physics(mode, dt, 1);
+        }
+        // The client's writes to its character in Stepped / PreSimulation (a mover's
+        // value, AssemblyLinearVelocity) are this frame's (probe T26_presim_*).
+        if hum_out.is_some() {
+            let _s = rustudio_core::bench::scope("p2_client_writes");
+            if let Some(model) = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model) {
+                self.hum_client_writes(model);
+            }
         }
         // Changes from Stepped / PreSimulation reach this frame's solve.
         {

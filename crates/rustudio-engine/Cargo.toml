@@ -27,6 +27,7 @@ rbx_xml = "3"
 rbx_reflection = "7"
 rbx_types = "3"
 glam = { version = "0.30", features = ["bytemuck"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rustc-hash = "2"
 # EditableImage / EditableMesh texel and mesh reads, media_misc's image decode.

@@ -510,6 +510,7 @@ pub struct Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         interrupt_watchdog::unregister(self.callbacks);
+        crate::script_profiler::detach(self.callbacks);
     }
 }
 
@@ -5354,6 +5355,7 @@ impl Runtime {
             Ok(mlua::VmState::Continue)
         });
         let shared = lua.create_table().map_err(|e| e.to_string())?;
+        crate::script_profiler::attach(&lua, callbacks as *mut mlua::ffi::lua_Callbacks);
         interrupt_watchdog::register(callbacks as *mut mlua::ffi::lua_Callbacks);
         let rt = Runtime { lua, shared, callbacks };
         rustudio_core::load_trace::mark("runtime: hooks");
@@ -5379,9 +5381,10 @@ impl Runtime {
                 }
                 let r = {
                     let mut w = world(lua)?;
+                    // The constructor's Name (BindableEvent "Event", BloomEffect "Bloom" …).
                     let r = w.dm().dom.insert(
                         Ref::none(),
-                        InstanceBuilder::new(class.as_str()).with_name(class.as_str()),
+                        InstanceBuilder::new(class.as_str()).with_name(doc::default_instance_name(&class)),
                     );
                     w.structure_changed = true;
                     r
@@ -5428,7 +5431,11 @@ impl Runtime {
             lua.create_function(|lua, args: Variadic<Value>| {
                 let mut it = args.into_iter();
                 let th = thread_arg(lua, it.next(), "task.spawn")?;
-                resume(lua, &th, it.collect());
+                crate::script_profiler::with_entry(
+                    crate::script_profiler::EntryKind::Spawn,
+                    || (None, None),
+                    || resume(lua, &th, it.collect()),
+                );
                 Ok(th)
             })?,
         )?;
@@ -5821,7 +5828,18 @@ impl Runtime {
         // false for an end with nothing open (library.luau warns).
         g.set(
             "__rs_profile",
-            lua.create_function(|lua, delta: i32| {
+            lua.create_function(|lua, (delta, label): (i32, Value)| {
+                if crate::script_profiler::on() {
+                    if delta > 0 {
+                        let label = match &label {
+                            Value::String(s) => s.to_string_lossy(),
+                            _ => "(unnamed)".to_string(),
+                        };
+                        crate::script_profiler::marker_begin(&label);
+                    } else {
+                        crate::script_profiler::marker_end(lua);
+                    }
+                }
                 let th = lua.current_thread().to_pointer() as usize;
                 let Some(mut p) = lua.app_data_mut::<ProfileDepth>() else {
                     return Ok(true);
@@ -6153,7 +6171,11 @@ impl Runtime {
                 || format!("(start) {}", world(lua).map(|w| w.full_name(r)).unwrap_or_default()),
                 || resume(lua, &th, vec![]),
             ),
-            Ok(th) => resume(lua, &th, vec![]),
+            Ok(th) => crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Start,
+                || (Some("(main chunk)".into()), None),
+                || resume(lua, &th, vec![]),
+            ),
             Err(e) => report(lua, &e),
         }
     }
@@ -6214,6 +6236,7 @@ impl Runtime {
         if let Ok(mut s) = sched(lua) {
             s.step += 1;
         }
+        crate::script_profiler::vm_frame(lua);
         {
             let _s = rustudio_core::bench::scope("rt_domains_step");
             let _ = domains::step(lua, dt);
@@ -6264,7 +6287,11 @@ impl Runtime {
                     let real = if fixed_step { 0.0 } else { rustudio_core::sim_clock::since(t.wall).as_secs_f64() };
                     vec![Value::Number((now - t.started).max(real))]
                 });
-            resume_thread_timed(lua, &t.thread, args);
+            crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Timer,
+                || (None, None),
+                || resume_thread_timed(lua, &t.thread, args),
+            );
         }
         drop(_st);
         let _s2 = rustudio_core::bench::scope("rt_dispatch2");
@@ -6526,7 +6553,11 @@ impl Runtime {
             }
             let _sc = rustudio_core::bench::scope("dis_deferred");
             for (th, args) in deferred {
-                resume_thread_timed(lua, &th, args);
+                crate::script_profiler::with_entry(
+                    crate::script_profiler::EntryKind::Deferred,
+                    || (None, None),
+                    || resume_thread_timed(lua, &th, args),
+                );
             }
             drop(_sc);
             let _sc = rustudio_core::bench::scope("dis_events");
@@ -6742,7 +6773,11 @@ pub fn resume(lua: &Lua, th: &Thread, args: Vec<Value>) {
             p.0.remove(&(th.to_pointer() as usize));
         }
     }
+    let prof = crate::script_profiler::begin_resume(lua, th);
     let r = th.resume::<MultiValue>(MultiValue::from_iter(args));
+    if let Some(p) = prof {
+        crate::script_profiler::end_resume(p, th.status() != ThreadStatus::Resumable);
+    }
     if let (Some(t0), Some(l)) = (hitch, label) {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if ms > 10.0 {
@@ -7064,7 +7099,11 @@ impl Runtime {
             for a in args {
                 vals.push(import(lua, a, map)?);
             }
-            resume(lua, &th, vals);
+            crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Remote,
+                || (None, None),
+                || resume(lua, &th, vals),
+            );
             Ok(())
         };
         if let Err(e) = run() {
@@ -7089,7 +7128,11 @@ impl Runtime {
             for a in args {
                 vals.push(import(lua, a, map)?);
             }
-            resume(lua, &th, vals);
+            crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Remote,
+                || (None, None),
+                || resume(lua, &th, vals),
+            );
             Ok(())
         };
         if let Err(e) = run() {
@@ -7118,7 +7161,11 @@ impl Runtime {
                 .iter()
                 .filter_map(|a| import(lua, a, map).ok())
                 .collect();
-            resume(lua, &th, vals);
+            crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Remote,
+                || (None, None),
+                || resume(lua, &th, vals),
+            );
         } else {
             let msg = match args.first() {
                 Some(Xfer::Str(s)) => String::from_utf8_lossy(s).into_owned(),

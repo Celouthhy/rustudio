@@ -95,7 +95,12 @@ struct DiagnosticLogger;
 
 impl ::log::Log for DiagnosticLogger {
     fn enabled(&self, metadata: &::log::Metadata<'_>) -> bool {
-        metadata.level() <= ::log::Level::Info && metadata.target().starts_with("rustudio")
+        let target = metadata.target();
+        metadata.level() <= ::log::Level::Info && target.starts_with("rustudio")
+            // The graphics stack's warnings and errors: a lost device or a
+            // refused allocation is otherwise only a panic with no cause.
+            || metadata.level() <= ::log::Level::Warn
+                && ["wgpu", "naga", "egui_wgpu", "eframe"].iter().any(|t| target.starts_with(t))
     }
 
     fn log(&self, record: &::log::Record<'_>) {

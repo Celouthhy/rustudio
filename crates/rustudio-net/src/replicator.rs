@@ -95,6 +95,10 @@ pub enum RepOp {
     /// A net asset (a union's SolidMeshHolder contents) from the 0xa5
     /// channel, keyed by the id a holder property refers to.
     NetAsset { key: NetAssetId, data: Vec<u8> },
+    /// SET_GLOBALS' top-level service table: (server referent, class). Some
+    /// services (ReplicatedFirst) are never sent as NewInstance, only listed
+    /// here, while their children arrive with the listed referent as parent.
+    Services(Vec<(u64, String)>),
 }
 
 /// A property value in transit.
@@ -644,6 +648,36 @@ pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
     Ok(scope as u32)
 }
 
+/// SET_GLOBALS' top-level service table, after the peer scope: a u32 (zero
+/// in every capture), a varint count, then per service its reference, the
+/// u16 LE schema class and two flag bytes. Verified on the Place A join capture
+/// (72 services; ReplicatedFirst 0x2110 is listed with flags `00 01` and never
+/// sent as NewInstance, while ReplicatedFirst.First arrives with parent 0x2110).
+pub fn top_services(schema: &Schema, body: &[u8]) -> Result<Vec<(u64, String)>, String> {
+    let mut c = Cur::new(body);
+    let e = |e: DecodeError| format!("{e:?}");
+    c.u8().map_err(e)?;
+    if c.u8().map_err(e)? != 0 {
+        return Err("terrain globals block".into());
+    }
+    c.take(5).map_err(e)?;
+    c.varint().map_err(e)?;
+    c.take(4).map_err(e)?;
+    let count = c.varint().map_err(e)?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let id = c.reference().map_err(e)?.ok_or("nil service reference")?;
+        let class = usize::from(c.u16().map_err(e)?);
+        c.take(2).map_err(e)?;
+        let class = schema.classes.get(class).ok_or("service class index")?;
+        out.push((id, class.name.clone()));
+    }
+    if c.left() != 0 {
+        return Err("service table has trailing bytes".into());
+    }
+    Ok(out)
+}
+
 /// The stateful decoder for one replication stream (server → client).
 #[derive(Default)]
 pub struct Decoder {
@@ -672,6 +706,16 @@ impl Decoder {
             packet_id::NEW_SCHEMA => self.schema_msg(body),
             packet_id::DATA => self.data_msg(body, &mut ops),
             packet_id::SOLID_MESH => self.net_asset_msg(body, &mut ops),
+            packet_id::SET_GLOBALS if self.schema.is_some() => {
+                match top_services(self.schema.as_ref().unwrap(), body) {
+                    Ok(services) => ops.push(RepOp::Services(services)),
+                    // The service table is optional for editing (services
+                    // also arrive as NewInstance); a layout it doesn't know
+                    // must not stop the session.
+                    Err(e) => log::warn!("Team Create service table not read: {e}"),
+                }
+                Ok(())
+            }
             _ => Ok(()),
         };
         if let Err(e) = r {
@@ -1092,6 +1136,9 @@ impl Decoder {
 pub struct RefMap {
     fwd: std::collections::HashMap<u64, Ref>,
     reverse: std::collections::HashMap<Ref, u64>,
+    /// Instances whose referent another instance took (an id handed out
+    /// twice): they still exist on the server, but can't be named there.
+    lost: std::collections::HashSet<Ref>,
 }
 
 impl RefMap {
@@ -1108,11 +1155,28 @@ impl RefMap {
         if let Some(old_ref) = self.fwd.insert(server_id, r) {
             if old_ref != r {
                 self.reverse.remove(&old_ref);
+                self.lost.insert(old_ref);
             }
         }
+        self.lost.remove(&r);
+    }
+    /// Whether `r` lost its referent to another instance (see `lost`).
+    pub fn lost(&self, r: Ref) -> bool {
+        self.lost.contains(&r)
+    }
+    /// Marks `r` as lost without binding anything to its referent.
+    pub fn mark_lost(&mut self, r: Ref) {
+        self.remove_ref(r);
+        self.lost.insert(r);
     }
     pub fn server_id(&self, reference: Ref) -> Option<u64> {
         self.reverse.get(&reference).copied()
+    }
+    /// Drops `r`'s server referent (both directions).
+    pub fn remove_ref(&mut self, r: Ref) {
+        if let Some(id) = self.reverse.remove(&r) {
+            self.fwd.remove(&id);
+        }
     }
     pub fn len(&self) -> usize {
         self.fwd.len()

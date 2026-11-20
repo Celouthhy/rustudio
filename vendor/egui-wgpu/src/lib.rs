@@ -235,7 +235,7 @@ impl RenderState {
                         request_adapter(instance, power_preference, compatible_surface, &[]).await
                     }
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(native_adapter_selector) = _native_adapter_selector {
+                    if let Some(native_adapter_selector) = &_native_adapter_selector {
                         native_adapter_selector(&available_adapters, compatible_surface)
                             .map_err(WgpuError::CustomNativeAdapterSelectionError)
                     } else {
@@ -249,11 +249,46 @@ impl RenderState {
                     }
                 }?;
 
-                let (device, queue) = {
+                // rustudio: never fail to start because the preferred
+                // adapter refused the device (a missing limit or feature on
+                // that backend): try the next one the selector picks from
+                // those not tried yet.
+                #[allow(clippy::allow_attributes, unused_mut)]
+                let mut adapter = adapter;
+                #[cfg(not(target_arch = "wasm32"))]
+                let mut tried: Vec<wgpu::AdapterInfo> = Vec::new();
+                let (device, queue) = loop {
                     profiling::scope!("request_device");
-                    adapter
-                        .request_device(&(*device_descriptor)(&adapter))
-                        .await?
+                    let err = match adapter.request_device(&(*device_descriptor)(&adapter)).await {
+                        Ok(device_queue) => break device_queue,
+                        Err(err) => err,
+                    };
+                    #[cfg(target_arch = "wasm32")]
+                    return Err(err.into());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        log::warn!(
+                            target: "rustudio::gpu",
+                            "{} refused the device ({err}); trying the next adapter",
+                            adapter_info_summary(&adapter.get_info())
+                        );
+                        tried.push(adapter.get_info());
+                        let rest: Vec<wgpu::Adapter> = available_adapters
+                            .iter()
+                            .filter(|a| !tried.contains(&a.get_info()))
+                            .cloned()
+                            .collect();
+                        let next = match &_native_adapter_selector {
+                            Some(select) => select(&rest, compatible_surface).ok(),
+                            None => rest
+                                .into_iter()
+                                .find(|a| compatible_surface.is_none_or(|s| a.is_surface_supported(s))),
+                        };
+                        match next {
+                            Some(next) => adapter = next,
+                            None => return Err(err.into()),
+                        }
+                    }
                 };
 
                 (instance.clone(), adapter, device, queue)

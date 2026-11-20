@@ -20,15 +20,15 @@ use rustudio_core::doc;
 use rustudio_core::math::Xform;
 use crate::props_layout::{Category, Frame, Row};
 
-const ROW_H: f32 = 21.0;
-const CAT_H: f32 = 25.0;
-const INDENT: f32 = 25.0;
-const DIVIDER: f32 = 0.48;
+pub(crate) const ROW_H: f32 = 21.0;
+pub(crate) const CAT_H: f32 = 25.0;
+pub(crate) const INDENT: f32 = 25.0;
+pub(crate) const DIVIDER: f32 = 0.48;
 pub const TEXT: Color32 = Color32::from_rgb(188, 190, 200);
 pub const READ_ONLY: Color32 = Color32::from_rgb(73, 77, 90);
 pub const BAND: Color32 = Color32::from_rgb(32, 34, 39);
 const BOX_OFF: Color32 = Color32::from_rgb(40, 41, 49);
-const FONT: f32 = 12.5;
+pub(crate) const FONT: f32 = 12.5;
 
 #[derive(Default)]
 pub struct PropertiesState {

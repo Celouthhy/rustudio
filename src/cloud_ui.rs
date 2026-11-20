@@ -175,7 +175,16 @@ struct LiveView {
     script_commits: HashMap<i64,(u64,std::time::Instant,String)>,
     last_presence: std::time::Instant,
     last_camera: Option<[f32; 5]>,
-    locally_deleted: HashSet<rbx_types::Ref>,
+    /// What each referent sent this session is (by path), for reports.
+    labels: HashMap<u64,String>,
+    /// Referents this session deleted: a later server op naming one means
+    /// the server did not apply the delete.
+    deleted: HashMap<u64,String>,
+    /// Document edits queued, newest last: (when, what), for the report a
+    /// disconnect gives of edits the server may not have applied.
+    sent: std::collections::VecDeque<(std::time::Instant,String)>,
+    /// Edits that were not sent at all this session.
+    unsynced: Vec<String>,
     collaborators: HashSet<rbx_types::Ref>,
     players: HashMap<u64,u64>,
     selections: HashMap<u64,Vec<u64>>,
@@ -244,87 +253,50 @@ pub struct CloudUi {
     /// the place (and so its PlaceId / GameId) is in, as Studio only lets Play
     /// run on a loaded DataModel.
     play_when_loaded: Option<rustudio_engine::runtime::RunMode>,
+    /// The live session that ended while its document stays open.
+    ended_live: Option<live_status::EndedLive>,
 }
+
+// The MCP server's view of the live session (src/mcp).
+#[path = "cloud_mcp.rs"]
+mod mcp_hooks;
+// The status bar's connection indicator and what leaving the live document loses.
+#[path = "live_status.rs"]
+pub(crate) mod live_status;
+pub(crate) use mcp_hooks::DraftState;
 
 fn live_source_text(value:&rustudio_net::replicator::PropValue)->Option<String> {
     use rustudio_net::replicator::PropValue as P;
     match value {P::String(text)=>Some(text.clone()),P::SharedString(bytes)|P::CachedSharedString{bytes,..}=>String::from_utf8(bytes.clone()).ok(),_=>None}
 }
 
-/// Studio may create services locally when a plugin calls GetService.
-/// Their presence in the schema does not make them valid NewObject edits.
-/// Keep session-only services and detached plugin trees local.
-fn is_local_live_instance(
-    doc: &Document,
-    model: &rustudio_net::model::LiveModel,
-    reference: rbx_types::Ref,
-) -> bool {
-    use rbx_reflection::ClassTag;
+/// How long after an edit is sent a disconnect still leaves it in doubt.
+const UNCONFIRMED_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
-    let mut current = reference;
-    while let Some(instance) = doc.dom.get_by_ref(current) {
-        if instance.parent().is_none() {
-            return instance.class.as_str() == "Plugin";
-        }
-        if instance.parent() == doc.dom.root_ref() {
-            let class = instance.class.as_str();
-            if rustudio_core::doc::UNSAVED_SERVICES.contains(&class) {
-                return true;
-            }
-            return model.server_id(current).is_none()
-                && rustudio_core::doc::db().classes.get(class).is_some_and(|descriptor| {
-                    descriptor.tags.contains(&ClassTag::Service)
-                        && (current == reference || descriptor.tags.contains(&ClassTag::NotReplicated))
-                });
-        }
-        current = instance.parent();
-    }
-    false
+/// The server's reason, when the stream reset carries a Roblox disconnect
+/// code (QUIC application error `0x100_0000_0000 | code`; the texts are
+/// Studio's own, checks/tc/disconnect_codes.txt).
+fn disconnect_reason(error: &str) -> String {
+    let code = error.rsplit("error ").next().and_then(|n| n.trim().parse::<u64>().ok()).filter(|c| c >> 40 == 1).map(|c| c & 0xffff);
+    let text = match code {
+        Some(0x102) => "unsupported version",
+        Some(0x103) => "protocol mismatch",
+        Some(0x104) => "the server could not read an edit rustudio sent (Error while receiving data)",
+        Some(0x105) => "Error while streaming data",
+        Some(0x106) => "Error while sending data",
+        Some(0x109) => "Error processing ticket",
+        Some(0x114) => "the same account joined from somewhere else",
+        _ => return error.to_string(),
+    };
+    format!("{text} ({error})")
 }
 
 #[cfg(test)]
 #[test]
-fn live_journal_excludes_local_services_and_keeps_place_edits() {
-    use rbx_dom_weak::{InstanceBuilder, WeakDom};
-    use rustudio_net::model::LiveModel;
-
-    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
-    let root = dom.root_ref();
-    let run = dom.insert(root, InstanceBuilder::new("RunService"));
-    let widgets = dom.insert(root, InstanceBuilder::new("PluginGuiService"));
-    let widget = dom.insert(widgets, InstanceBuilder::new("Folder"));
-    let plugin = dom.insert(rbx_types::Ref::none(), InstanceBuilder::new("Plugin"));
-    let plugin_script = dom.insert(plugin, InstanceBuilder::new("Script"));
-    let workspace = dom.insert(root, InstanceBuilder::new("Workspace"));
-    let part = dom.insert(workspace, InstanceBuilder::new("Part"));
-    let doc = Document::from_play_dom(dom, "Team Create".into());
-    let mut model = LiveModel::new();
-    model.bind_local(123, workspace);
-
-    for reference in [run, widgets, widget, plugin, plugin_script] {
-        assert!(is_local_live_instance(&doc, &model, reference));
-    }
-    for reference in [workspace, part] {
-        assert!(!is_local_live_instance(&doc, &model, reference));
-    }
-}
-
-fn live_value(value: &rbx_types::Variant, model: &rustudio_net::model::LiveModel) -> Option<rustudio_net::replicator::PropValue> {
-    use rbx_types::Variant as V;
-    use rustudio_net::replicator::PropValue as P;
-    Some(match value {
-        V::Bool(v) => P::Bool(*v), V::Int32(v) => P::Int(*v as i64), V::Int64(v) => P::Int(*v),
-        V::Float32(v) => P::Float(*v as f64), V::Float64(v) => P::Float(*v),
-        V::Enum(v) => P::Enum(v.to_u32()), V::String(v) => P::String(v.clone()),
-        V::BinaryString(v)=>P::BinaryString(v.clone().into_vec()),
-        V::Attributes(v)=>{let mut bytes=Vec::new();v.to_writer(&mut bytes).ok()?;P::BinaryString(bytes)},
-        V::SharedString(v) => P::SharedString(v.data().to_vec()),
-        V::Color3(v) => P::Color3([v.r, v.g, v.b]), V::Color3uint8(v) => P::Color3uint8([v.r, v.g, v.b]),
-        V::Vector2(v) => P::Vector2([v.x, v.y]), V::Vector3(v) => P::Vector3([v.x, v.y, v.z]),
-        V::CFrame(v) => P::CFrame { pos: [v.position.x, v.position.y, v.position.z], rot: [v.orientation.x.x, v.orientation.x.y, v.orientation.x.z, v.orientation.y.x, v.orientation.y.y, v.orientation.y.z, v.orientation.z.x, v.orientation.z.y, v.orientation.z.z] },
-        V::Ref(v) if v.is_none() => P::Ref(None), V::Ref(v) => P::Ref(Some(model.server_id(*v)?)),
-        other => rustudio_net::model::typed_value(other)?,
-    })
+fn disconnect_codes_name_the_server_reason() {
+    let reason = disconnect_reason("The replication stream ended: stream reset by peer: error 1099511628036");
+    assert!(reason.starts_with("the server could not read an edit"), "{reason}");
+    assert_eq!(disconnect_reason("The Team Create connection ended"), "The Team Create connection ended");
 }
 
 impl CloudUi {
@@ -374,6 +346,7 @@ impl CloudUi {
             picker_when_ready: None,
             opening: 0,
             play_when_loaded: None,
+            ended_live: None,
         }
     }
 
@@ -856,7 +829,7 @@ impl Editor {
                     session, model: rustudio_net::model::LiveModel::new(),
                     origin: self.cloud.live_origin.take(), place, universe, document_id: None, requested_document_id: self.game.doc.id,
                     owner_user: None, own_player: None, publish_service: None, save_pending: None, sync_failed: false, drafts: crate::live_drafts::DraftStore::for_place(place), script_service: None, script_configuration_sent: false, next_script_request: 1, script_commits: HashMap::new(),
-                    last_presence: std::time::Instant::now(), last_camera: None, locally_deleted: HashSet::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None,
+                    last_presence: std::time::Instant::now(), last_camera: None, labels: HashMap::new(), deleted: HashMap::new(), sent: Default::default(), unsynced: Vec::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None,
                 });
                 self.info(format!("Joining live Team Create place {place}…"));
             }
@@ -959,83 +932,127 @@ impl Editor {
         }
     }
 
-    fn sync_live_tree(&mut self, live: &mut LiveView, reference: rbx_types::Ref) -> Result<(), String> {
-        let Some(inst) = self.game.doc.dom.get_by_ref(reference) else {
-            if !live.locally_deleted.insert(reference) { return Ok(()); }
-            if let Some(id) = live.model.server_id(reference) {
-                live.session.send_delete(id).map_err(|e| e.to_string())?;
+    /// Sends one frame's journal marks, planned by [`crate::live_sync`].
+    fn send_live_edits(&mut self, live: &mut LiveView, marks: &[rustudio_core::doc::Mark]) {
+        use crate::live_sync::LiveOp;
+        let session = &live.session;
+        let plan = crate::live_sync::plan(&self.game.doc, &mut live.model, marks, &mut || session.allocate_id().map_err(|e| e.to_string()));
+        for message in plan.skipped {
+            self.warn(format!("Team Create: not synchronized: {message}"));
+            live.unsynced.push(message);
+        }
+        for message in plan.unsynced {
+            live.sync_failed = true;
+            self.warn(format!("Team Create: not synchronized: {message}"));
+            live.unsynced.push(message);
+        }
+        for op in plan.ops {
+            let (label, result) = match op {
+                LiveOp::Create { reference, id, class, parent, props } => {
+                    let label = format!("created {}", crate::live_sync::path(&self.game.doc, reference));
+                    if let Some((_, rustudio_net::replicator::PropValue::String(source))) = props.iter().find(|(n, _)| n == "Source") {
+                        let guid = self.game.doc.prop(reference, "ScriptGuid").and_then(|v| if let rbx_types::Variant::String(g) = v { Some(g) } else { None });
+                        if let Err(error) = live.drafts.register(id, guid.as_deref(), source.clone()) { self.warn(error); }
+                    }
+                    live.labels.insert(id, crate::live_sync::path(&self.game.doc, reference));
+                    log::info!("Team Create: {label} ({class} {id:#x} under {parent:#x})");
+                    (label, live.session.send_create(id, class, parent, props))
+                }
+                LiveOp::Reparent { reference, id, parent } => {
+                    (format!("moved {}", crate::live_sync::path(&self.game.doc, reference)), live.session.send_reparent(id, parent))
+                }
+                LiveOp::Property { reference, id, class, name, value } => {
+                    (format!("set {}.{name}", crate::live_sync::path(&self.game.doc, reference)), live.session.send_property(id, class, name, value))
+                }
+                LiveOp::Source { id, text } => {
+                    if let Err(error) = live.drafts.edit(id, text) { self.warn(error); }
+                    continue;
+                }
+                LiveOp::Delete { reference, id } => {
+                    let label = format!("deleted {}", live.labels.get(&id).cloned().unwrap_or_else(|| crate::live_sync::path(&self.game.doc, reference)));
+                    log::info!("Team Create: {label} ({id:#x})");
+                    live.deleted.insert(id, label.clone());
+                    (label, live.session.send_delete(id))
+                }
+            };
+            match result {
+                Ok(()) => live.sent.push_back((std::time::Instant::now(), label)),
+                Err(error) => {
+                    live.sync_failed = true;
+                    self.warn(format!("Team Create: {label} was not sent: {error}"));
+                    live.unsynced.push(label);
+                }
             }
-            return Ok(());
+        }
+        // Kept for the disconnect report only.
+        while live.sent.front().is_some_and(|(at, _)| at.elapsed() > UNCONFIRMED_WINDOW) { live.sent.pop_front(); }
+    }
+
+    /// Instances the server sent under one referent: rustudio can't name
+    /// either, so it won't edit or delete them (a delete by that referent
+    /// could remove the other one).
+    fn report_live_conflicts(&mut self, live: &mut LiveView) {
+        for (id, first, second) in live.model.take_conflicts() {
+            let (a, b) = (crate::live_sync::path(&self.game.doc, first), crate::live_sync::path(&self.game.doc, second));
+            log::warn!("Team Create (place={}): referent {id:#x} is used by both {a} and {b}", live.place);
+            self.error(format!("Team Create: the server holds two instances under one referent ({a} and {b}); rustudio will not edit or delete either. Change them in Roblox Studio"));
+        }
+    }
+
+    /// After a disconnect: the edits that never left, and the ones sent just
+    /// before it that the server may not have applied (it doesn't confirm
+    /// edits; a reset drops whatever it had not processed).
+    fn report_live_loss(&mut self, live: &LiveView) {
+        let recent: Vec<&String> = live.sent.iter().filter(|(at, _)| at.elapsed() <= UNCONFIRMED_WINDOW).map(|(_, l)| l).collect();
+        if live.unsynced.is_empty() && recent.is_empty() { return; }
+        let list = |items: &[&String]| {
+            let mut text = items.iter().take(12).map(|l| format!("\n  • {l}")).collect::<String>();
+            if items.len() > 12 { text += &format!("\n  … and {} more (all in the log)", items.len() - 12); }
+            text
         };
-        let parent = live.model.server_id(inst.parent()).ok_or("The live parent has not synchronized yet")?;
-        if !live.locally_deleted.remove(&reference) {
-            if let Some(id) = live.model.server_id(reference) {
-                return live.session.send_reparent(id, parent).map_err(|e| e.to_string());
-            }
+        let mut message = String::from("Team Create disconnected. Your local copy still has every edit; the server may not.");
+        if !live.unsynced.is_empty() {
+            let items: Vec<&String> = live.unsynced.iter().collect();
+            message += &format!("\n{} local edit(s) never reached the server:{}", items.len(), list(&items));
         }
-        // Allocate the entire subtree first so references between its nodes resolve.
-        let mut nodes = vec![reference];
-        let mut index = 0;
-        while index < nodes.len() {
-            let r = nodes[index]; index += 1;
-            if let Some(i) = self.game.doc.dom.get_by_ref(r) { nodes.extend_from_slice(i.children()); }
-            let id = live.session.allocate_id().map_err(|e| e.to_string())?;
-            live.model.bind_local(id, r);
+        if !recent.is_empty() {
+            message += &format!("\n{} edit(s) sent in the last {} s before the disconnect may not have been applied:{}", recent.len(), UNCONFIRMED_WINDOW.as_secs(), list(&recent));
         }
-        for r in nodes {
-            let inst = self.game.doc.dom.get_by_ref(r).ok_or("A new live instance disappeared")?;
-            let id = live.model.server_id(r).unwrap();
-            let parent = live.model.server_id(inst.parent()).ok_or("A new live parent is unavailable")?;
-            let mut props = vec![("Name".into(), rustudio_net::replicator::PropValue::String(inst.name.clone()))];
-            for (name, value) in &inst.properties {
-                let value=live_value(value,&live.model).ok_or_else(||format!("Team Create cannot synchronize {}.{name} yet",inst.class))?;
-                props.push((name.to_string(),value));
-            }
-            live.session.send_create(id, inst.class.to_string(), parent, props).map_err(|e| e.to_string())?;
-            if let Some(rbx_types::Variant::String(source))=inst.properties.get(&"Source".into()) {
-                let guid=inst.properties.get(&"ScriptGuid".into()).and_then(|v| if let rbx_types::Variant::String(g)=v {Some(g.as_str())} else {None});
-                live.drafts.register(id,guid,source.clone())?;
-            }
-        }
-        Ok(())
+        message += "\nKeep a local copy (File > Save As), then reopen the live place and compare.";
+        for label in live.unsynced.iter().chain(recent.iter().copied()) { log::warn!("Team Create edit possibly not on the server (place={}): {label}", live.place); }
+        self.error(message);
     }
 
     fn poll_live_team_create(&mut self, ctx: &egui::Context) {
         use rustudio_net::live::LiveEvent;
         let Some(mut live) = self.cloud.live.take() else { return; };
-        if live.document_id.unwrap_or(live.requested_document_id) != self.game.doc.id { return; }
+        let live_doc = live.document_id.unwrap_or(live.requested_document_id);
+        if live_doc != self.game.doc.id {
+            // Play shows its own document and keeps the live one aside: the
+            // session stays (server changes wait in its bounded queue and
+            // apply when Play stops). This returned without putting it back,
+            // so the first frame of Play (an MCP play call included) dropped
+            // the connection without a word, and every edit after it stayed
+            // local while the window still looked live.
+            if self.game.play_saved_doc().is_some_and(|d| d.id == live_doc) {
+                self.cloud.live = Some(live);
+                return;
+            }
+            // Another place replaced it: the session ends, and says so.
+            log::info!("Team Create: left the live session of place {} (another place was opened)", live.place);
+            self.warn(format!("Left the live Team Create session of place {}: another place was opened", live.place));
+            self.note_live_ended(&live, "another place was opened");
+            self.report_live_loss(&live);
+            return;
+        }
         if live.document_id.is_some() {
-            if let rustudio_core::doc::Marks::Some(mut marks) = self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate) {
-                marks.sort_by_key(|mark| matches!(mark, rustudio_core::doc::Mark::Tree(_)));
-                let mut sent = HashSet::new();
-                let mut sent_trees = HashSet::new();
-                for mark in marks {
-                    use rustudio_core::doc::Mark;
-                    let (Mark::Prop(reference, _) | Mark::Tree(reference)) = mark;
-                    if is_local_live_instance(&self.game.doc, &live.model, reference) {
-                        continue;
-                    }
-                    match mark {
-                        Mark::Prop(reference, name) if sent.insert((reference, name)) => {
-                            let Some(id) = live.model.server_id(reference) else { continue; };
-                            let Some(inst) = self.game.doc.dom.get_by_ref(reference) else { continue; };
-                            if name.as_str()=="Source" {
-                                if let Some(rbx_types::Variant::String(text))=self.game.doc.prop(reference,"Source") {
-                                    if let Err(error)=live.drafts.edit(id,text) {self.warn(error);}
-                                }
-                                continue;
-                            }
-                            let value = if name.as_str() == "Name" { Some(rbx_types::Variant::String(inst.name.clone())) }
-                                else { self.game.doc.prop(reference, name.as_str()) };
-                            if let Some(value) = value.and_then(|v| live_value(&v, &live.model)) {
-                                if let Err(e) = live.session.send_property(id, inst.class.to_string(), name.to_string(), value) { live.sync_failed=true;self.warn(e.to_string()); }
-                            } else { live.sync_failed=true;self.warn(format!("Team Create cannot synchronize {name} yet")); }
-                        }
-                        Mark::Tree(reference) if sent_trees.insert(reference) => {
-                            if let Err(error) = self.sync_live_tree(&mut live, reference) { live.sync_failed=true;self.warn(error); }
-                        }
-                        _ => {}
-                    }
+            match self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate) {
+                rustudio_core::doc::Marks::Some(marks) => self.send_live_edits(&mut live, &marks),
+                // The journal overflowed: which edits were made is unknown.
+                rustudio_core::doc::Marks::All => {
+                    live.sync_failed = true;
+                    live.unsynced.push("a burst of edits too large for the change journal".into());
+                    self.error("Team Create: too many edits at once to synchronize; keep a local copy and reopen the live place");
                 }
             }
         }
@@ -1074,7 +1091,7 @@ impl Editor {
                 Ok(event) => event,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.warn("Team Create connection ended"); keep = false; break;
+                    self.warn("Team Create connection ended"); self.note_live_ended(&live, "the connection ended"); self.report_live_loss(&live); keep = false; break;
                 }
             };
             match event {
@@ -1093,6 +1110,15 @@ impl Editor {
                         std::mem::swap(live.model.dom_mut(), &mut self.game.doc.dom);
                     }
                     for op in ops {
+                        if let rustudio_net::replicator::RepOp::NewInstance { id, .. } | rustudio_net::replicator::RepOp::ChangeProperty { id, .. } | rustudio_net::replicator::RepOp::Reparent { id, .. } = &op {
+                            if let Some(label) = live.deleted.remove(id) {
+                                let message = format!("{label}: the server still has it (it sent a change to it after the delete); delete it again or in Roblox Studio");
+                                log::warn!("Team Create (place={}): {message} ({id:#x})", live.place);
+                                self.error(format!("Team Create: {message}"));
+                                live.sync_failed = true;
+                                live.unsynced.push(message);
+                            }
+                        }
                         if let rustudio_net::replicator::RepOp::Event {id,name,args} = &op {
                             if Some(*id)==live.script_service && name=="LiveScriptingService.SendAtomicUpdateResponse" {
                                 use rustudio_net::replicator::PropValue as P;
@@ -1174,6 +1200,8 @@ impl Editor {
                             Op::ChangeProperty { id, name, .. } => Some((*id, Some(name.clone()))),
                             Op::DeleteInstance { .. } => { live_rebuild = true; None }
                             Op::JoinDataBegin => { live_rebuild = true; None }
+                            // A listed service may be made here, with children parked for it.
+                            Op::Services(_) => { live_rebuild = true; None }
                             Op::Presence { .. } | Op::Event { .. } | Op::Unhandled { .. } | Op::NetAsset { .. } => None,
                         };
                         live.model.apply(op);
@@ -1232,6 +1260,7 @@ impl Editor {
                             .unwrap_or_else(|| format!("Place {}", live.place));
                         let mut document = Document::from_play_dom(dom, format!("{title} (Live)"));
                         document.cloud = live.origin.clone();
+                        document.ensure_current_camera(); // Studio's own, never sent (live_sync::local_camera)
                         self.set_document(document);
                         live.document_id = Some(self.game.doc.id);
                         self.game.doc.marks_for(rustudio_core::doc::Reader::TeamCreate);
@@ -1240,6 +1269,7 @@ impl Editor {
                         live.script_service=self.game.doc.dom.descendants().find(|i|i.class.as_str()=="LiveScriptingService").and_then(|i|live.model.server_id(i.referent()));
                         self.cloud.open = false;
                         self.info(format!("Joined live Team Create place {}: {} instances", live.place, live.model.instance_count()));
+                        self.report_live_conflicts(&mut live);
                     }
                 }
                 LiveEvent::Identity(user) => live.owner_user = Some(user),
@@ -1248,18 +1278,33 @@ impl Editor {
                     self.fail_live_save(&mut live, "The Team Create server rejected a local edit during the save");
                     self.error(format!("Team Create: {message}"));
                 }
+                LiveEvent::EditFailed { id, error } => {
+                    live.sync_failed = true;
+                    let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
+                    self.error(format!("Team Create: {what} did not reach the server: {error}"));
+                    live.unsynced.push(format!("{what}: {error}"));
+                }
+                LiveEvent::PropertySkipped { id, name, reason } => {
+                    let what = live.labels.get(&id).cloned().unwrap_or_else(|| format!("instance {id:#x}"));
+                    self.warn(format!("Team Create: {what} was created without {name}: {reason}"));
+                    live.unsynced.push(format!("{what}.{name}: {reason}"));
+                }
                 LiveEvent::Notice(message) => self.warn(format!("Team Create: {message}")),
                 LiveEvent::Error(e) => {
                     if live.document_id.is_none() { if let Some(j) = self.cloud.join.as_mut() { j.fail(e.clone()); } }
-                    self.error(format!("Team Create: {e}")); self.cloud.open_error = Some(e); keep = false; break;
+                    self.error(format!("Team Create: {e}")); self.note_live_ended(&live, &e); self.cloud.open_error = Some(e); self.report_live_loss(&live); keep = false; break;
                 }
                 LiveEvent::Disconnected(e) => {
                     if live.document_id.is_none() { if let Some(j) = self.cloud.join.as_mut() { j.fail(e.clone()); } }
-                    self.warn(format!("Team Create disconnected: {e}")); keep = false; break;
+                    let reason = disconnect_reason(&e);
+                    self.warn(format!("Team Create disconnected: {reason}"));
+                    self.note_live_ended(&live, &reason);
+                    self.report_live_loss(&live); keep = false; break;
                 }
             }
         }
         if changed {
+            if live.document_id.is_some() { self.report_live_conflicts(&mut live); }
             if live_rebuild || live_marks.len() > rustudio_core::mech::JOURNAL_READER_LAG / 2 {
                 self.game.doc.mark_all();
             } else {

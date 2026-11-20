@@ -10,17 +10,22 @@ thread_local! {
 }
 
 /// Adds the time until the guard drops to section `name`.
+/// Also a profiler scope (`profiler::scope`, category from the name) while
+/// the profiler records.
 pub struct Scope {
     name: &'static str,
     t0: Instant,
     i0: u64,
+    _prof: crate::profiler::Guard,
 }
 
+#[track_caller]
 pub fn scope(name: &'static str) -> Scope {
     Scope {
         name,
         t0: Instant::now(),
         i0: if instr_on() { instructions() } else { 0 },
+        _prof: crate::profiler::scope(name, crate::profiler::Cat::Auto),
     }
 }
 
@@ -757,6 +762,22 @@ pub mod perf {
         let mut f = Frame { n: [0; 8], cpu_s, gpu_s };
         for (i, a) in ACC.iter().enumerate() {
             f.n[i] = a.swap(0, Relaxed);
+        }
+        if crate::profiler::active() {
+            use crate::profiler::{counter, counter_unit, Cat, Unit};
+            const NAMES: [&str; 8] = [
+                "scene draw calls", "scene triangles", "shadow draw calls", "shadow triangles",
+                "UI 2D draw calls", "UI 2D triangles", "UI 3D draw calls", "UI 3D triangles",
+            ];
+            for (i, n) in NAMES.iter().enumerate() {
+                counter(n, Cat::Render, f.n[i] as f64);
+            }
+            counter("draw calls (all)", Cat::Render, (f.n[0] + f.n[2] + f.n[4] + f.n[6]) as f64);
+            counter("triangles (all)", Cat::Render, (f.n[1] + f.n[3] + f.n[5] + f.n[7]) as f64);
+            counter_unit("render CPU encode", Cat::Render, Unit::Ms, cpu_s * 1000.0);
+            if gpu_s > 0.0 {
+                counter_unit("GPU frame", Cat::Gpu, Unit::Ms, gpu_s * 1000.0);
+            }
         }
         if let Ok(mut l) = LAST.lock() {
             *l = f;

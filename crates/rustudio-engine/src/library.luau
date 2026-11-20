@@ -10,7 +10,7 @@ local rs_identity = __rs_identity
 -- was nothing open); an end after a yield warns as Studio does (Place B's
 -- RbxCharacterSounds AtomicBinding, whose bound function waits).
 pcall(function()
-    function debug.profilebegin() __rs_profile(1) end
+    function debug.profilebegin(label) __rs_profile(1, label) end
     function debug.profileend()
         if __rs_profile(-1) then return end
         local src, line = debug.info(2, "sl")

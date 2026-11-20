@@ -286,7 +286,11 @@ fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
                 || format!("{} {}", function_label(&f), key.1),
                 || resume(lua, &th, args.to_vec()),
             ),
-            Ok(th) => resume(lua, &th, args.to_vec()),
+            Ok(th) => crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Event,
+                || (Some(function_label(&f)), Some(key.1.to_string())),
+                || resume(lua, &th, args.to_vec()),
+            ),
             Err(e) => report(lua, &e),
         }
     }
@@ -298,7 +302,11 @@ fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
                 || resume(lua, &th, args.to_vec()),
             )
         } else {
-            resume(lua, &th, args.to_vec());
+            crate::script_profiler::with_entry(
+                crate::script_profiler::EntryKind::Wait,
+                || (None, Some(key.1.to_string())),
+                || resume(lua, &th, args.to_vec()),
+            );
         }
     }
 }

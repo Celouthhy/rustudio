@@ -1,11 +1,11 @@
 [workspace]
-members = [".", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net"]
+members = [".", "crates/rustudio-profiler-ui", "crates/rustudio-core", "crates/rustudio-physics", "crates/rustudio-render", "crates/rustudio-engine", "crates/rustudio-player", "crates/rustudio-account", "crates/rustudio-net"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.3.3-alpha.1"
+version = "0.3.3-alpha.2"
 
 [package]
 name = "rustudio"
@@ -23,6 +23,7 @@ rustudio-physics = { path = "crates/rustudio-physics" }
 rustudio-render = { path = "crates/rustudio-render" }
 rustudio-engine = { path = "crates/rustudio-engine" }
 rustudio-player = { path = "crates/rustudio-player" }
+rustudio-profiler-ui = { path = "crates/rustudio-profiler-ui" }
 rustudio-net = { path = "crates/rustudio-net" }
 libc = "0.2"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "wayland", "x11", "default_fonts", "links"] }

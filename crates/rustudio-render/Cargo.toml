@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+log = "0.4"
 rustudio-core = { path = "../rustudio-core" }
 # matpack's KTX2 pack fetch asks assetdelivery as the editor's session does
 # (agent(), PLACE_CONTEXT), the same way assets does; core already depends on

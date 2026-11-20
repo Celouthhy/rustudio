@@ -19,6 +19,8 @@ pub struct RunHarness {
     pub start_play: bool,
     /// `--bench`: frame-time measurement.
     pub bench: Option<rustudio_core::bench::Bench>,
+    /// `--profile-capture OUT`: a profiler capture of `--seconds` written to OUT.
+    pub profile: Option<rustudio_core::profiler::cli::CliCapture>,
     /// `--camera x,y,z,yaw,pitch`: starting camera (degrees).
     pub camera: Option<[f32; 5]>,
     /// `--shots T1,T2,…`: a window and a viewport screenshot at each time
@@ -461,6 +463,19 @@ impl RunHarness {
     }
 
     pub fn bench_frame(&mut self, game: &mut Game, ctx: &egui::Context, work_ms: f32, dt: f32) -> bool {
+        let mut bench_done = self.bench_frame_inner(game, ctx, work_ms, dt);
+        // --profile-capture: the run ends once it and any --bench are both done.
+        if let Some(p) = self.profile.as_mut() {
+            let ready = !p.play || self.play_started.is_some();
+            let wrote = p.tick(ready);
+            ctx.request_repaint();
+            let bench_over = self.bench.as_ref().is_none_or(|b| b.done);
+            bench_done = (bench_done || wrote) && p.done && bench_over;
+        }
+        bench_done
+    }
+
+    fn bench_frame_inner(&mut self, game: &mut Game, ctx: &egui::Context, work_ms: f32, dt: f32) -> bool {
         let mut bench_done = false;
         if let Some(b) = self.bench.as_mut() {
             // Edit-mode benchmark: turn the camera slowly so several views count.
@@ -477,6 +492,9 @@ impl RunHarness {
                 if let Some(frames) = report["frames"].as_f64().filter(|frames| *frames > 0.0) {
                     if let Some(profile) = game.worker_lua_profile(frames) {
                         report["gameplay_lua"] = profile;
+                    }
+                    if let Some(scripts) = rustudio_engine::script_profiler::bench_report() {
+                        report["scripts"] = scripts;
                     }
                 }
                 if let Some(r) = game.renderer.as_ref() {

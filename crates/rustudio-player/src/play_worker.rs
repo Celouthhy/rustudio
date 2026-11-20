@@ -715,6 +715,22 @@ impl Game {
             .and_then(|reply| reply.recv()).ok().flatten()
     }
 
+    /// Runs `f` on the Play worker's game (editor edits flushed to it
+    /// first, as for a Luau command) and waits for its answer. None when
+    /// Play isn't threaded or the worker is gone.
+    pub(crate) fn on_play_worker<R: Send + 'static>(&mut self, f: impl FnOnce(&mut Game) -> R + Send + 'static) -> Option<R> {
+        self.play_thread.as_ref()?;
+        let edits = EditorEdits::take(self);
+        let worker = self.play_thread.as_mut()?;
+        worker.queue_edits(edits);
+        let edits = worker.queued_edits.take().expect("edits scanned before the call");
+        worker.worker.submit(move |game, _| {
+            edits.apply(game);
+            f(game)
+        })
+            .and_then(|reply| reply.recv()).ok()
+    }
+
     pub(crate) fn threaded_status(&self) -> Option<String> {
         self.play.as_ref()?.presentation.as_ref().map(|view| view.status.clone())
     }

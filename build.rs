@@ -180,6 +180,32 @@ fn engine_tables() {
     std::fs::write(out, code).unwrap();
 }
 
+/// RUSTUDIO_GIT_SHA: the commit being built (profiler captures carry it so
+/// a capture says which build made it). Rebuilt when HEAD moves, not on
+/// every edit; no git (a source archive): unset.
+fn git_sha() {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if let Some(sha) = git(&["rev-parse", "--short=10", "HEAD"]) {
+        println!("cargo:rustc-env=RUSTUDIO_GIT_SHA={sha}");
+    }
+    // (a worktree's HEAD and its branch ref live in the git dirs git names)
+    if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        println!("cargo:rerun-if-changed={dir}/HEAD");
+    }
+    if let (Some(common), Some(r)) = (git(&["rev-parse", "--git-common-dir"]), git(&["symbolic-ref", "-q", "HEAD"])) {
+        let common = std::path::Path::new(&common);
+        let common = if common.is_absolute() { common.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(common) };
+        println!("cargo:rerun-if-changed={}", common.join(r).display());
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=assets/icons/rustudio.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
@@ -191,6 +217,7 @@ fn main() {
 
     plugin_claims();
     engine_tables();
+    git_sha();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=crates/rustudio-engine/build/source_claims.rs");
 }

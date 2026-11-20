@@ -889,6 +889,7 @@ fn mip_dirty_rect(rect: [u32; 4], source: [u32; 2], target: [u32; 2]) -> [u32; 4
 impl WorldGuiPass {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target: wgpu::TextureFormat, samples: u32) -> Self {
         let source = if samples == 1 { SHADER.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { SHADER.to_owned() };
+        let source = crate::gpu_caps::shader_for(device, &source);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui"),
             source: wgpu::ShaderSource::Wgsl(
@@ -910,7 +911,7 @@ impl WorldGuiPass {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
+                        sample_type: crate::gpu_caps::depth_sample_type(device),
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: samples > 1,
                     },

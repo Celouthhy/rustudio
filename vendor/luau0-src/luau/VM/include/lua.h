@@ -565,6 +565,14 @@ LUA_API int lua_stackdepth(lua_State* L);
 LUA_API int lua_getinfo(lua_State* L, int level, const char* what, lua_Debug* ar);
 // rustudio: lua_getinfo as scripts see it (engine "=rustudio.*" closures read as C)
 LUA_API int lua_getinfoscript(lua_State* L, int level, const char* what, lua_Debug* ar);
+// rustudio (script profiler): the name a C function at stack `level` was
+// called by (its Lua caller's NAMECALL method or global / import path).
+LUA_API const char* lua_rs_callname(lua_State* L, int level);
+// rustudio (script profiler, exact mode): a hook the single-step interpreter
+// calls on Lua function entry (0) / return (1) with the Proto and around C
+// calls (2 / 3) with the C function and its name. NULL to remove.
+typedef void (*lua_RsCallHook)(lua_State* L, int event, const void* key, const char* name);
+LUA_API void lua_rs_setcallhook(lua_RsCallHook hook);
 LUA_API int lua_getargument(lua_State* L, int level, int n);
 LUA_API const char* lua_getlocal(lua_State* L, int level, int n);
 LUA_API const char* lua_setlocal(lua_State* L, int level, int n);

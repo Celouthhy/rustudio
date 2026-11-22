@@ -114,6 +114,40 @@ impl LiveModel {
         self.refs.len()
     }
 
+    /// Sets one attribute from a ChangeAttributeItem body (type byte +
+    /// value); an empty body removes it. Parsed by wrapping it as a
+    /// one-entry `Attributes` blob (u32 count, u32 name length, name, body).
+    fn change_attribute(&mut self, r: Ref, name: &str, value: &[u8]) {
+        let Some(inst) = self.dom.get_by_ref_mut(r) else { return };
+        let mut attributes = match inst.properties.get(&rbx_dom_weak::ustr("Attributes")) {
+            Some(Variant::Attributes(a)) => a.clone(),
+            _ => rbx_types::Attributes::new(),
+        };
+        // Removed: an empty body, or the nil type alone (Studio's
+        // SetAttribute(name, nil) sends `01`).
+        if value.is_empty() || value == [0x01] {
+            attributes.remove(name);
+        } else {
+            let mut blob = Vec::with_capacity(value.len() + name.len() + 8);
+            blob.extend_from_slice(&1u32.to_le_bytes());
+            blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            blob.extend_from_slice(name.as_bytes());
+            blob.extend_from_slice(value);
+            match rbx_types::Attributes::from_reader(blob.as_slice()) {
+                Ok(one) => {
+                    for (key, v) in one {
+                        attributes.insert(key, v);
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Team Create: attribute {name:?} not read: {error}");
+                    return;
+                }
+            }
+        }
+        inst.properties.insert("Attributes".into(), Variant::Attributes(attributes));
+    }
+
     /// Apply one op. Unknown/undecoded ops are ignored safely.
     pub fn apply(&mut self, op: RepOp) {
         match op {
@@ -127,6 +161,11 @@ impl LiveModel {
             RepOp::ChangeProperty { id, name, value } => {
                 if let Some(r) = self.refs.get(id) {
                     self.apply_props(r, &[(name, value)]);
+                }
+            }
+            RepOp::ChangeAttribute { id, name, value } => {
+                if let Some(r) = self.refs.get(id) {
+                    self.change_attribute(r, &name, &value);
                 }
             }
             RepOp::DeleteInstance { id } => {
@@ -164,12 +203,15 @@ impl LiveModel {
                 self.net_assets.insert(key, asset);
             }
             RepOp::Services(list) => {
-                for (id, class) in list {
-                    self.services.insert(id, class);
-                    // Children that arrived before the table.
-                    if self.pending.contains_key(&id) {
-                        self.service_instance(id);
-                    }
+                for (id, class) in &list {
+                    self.services.insert(*id, class.clone());
+                }
+                // Every listed service exists, as in Studio's DataModel: the
+                // server never sends an empty one (ReplicatedFirst), and
+                // children that arrived before the table attach to theirs.
+                // One the server does send later fills this instance.
+                for (id, _) in list {
+                    self.service_instance(id);
                 }
             }
             RepOp::Presence { .. } | RepOp::Event { .. } | RepOp::Unhandled { .. } | RepOp::Terrain { .. } => {}
@@ -287,13 +329,21 @@ impl LiveModel {
     }
 
     fn apply_props(&mut self, r: Ref, props: &[(String, PropValue)]) {
-        let mesh_part = self.dom.get_by_ref(r).is_some_and(|i| i.class.as_str() == "MeshPart");
         for (wire_name, value) in props {
+            // Content properties (MeshContent, TextureContent …) keep their
+            // own name for every class, MeshPart's too: Document::prop gives
+            // the legacy name (TextureID) the twin's id as a string, as
+            // Studio reads it. (Stored under TextureID, MeshPart.TextureID
+            // read a Content and TextureContent the empty default: captured
+            // run r1.) A legacy value kept beside it would win in readers.
+            if wire_name.ends_with("Content") {
+                if let Some(inst) = self.dom.get_by_ref_mut(r) {
+                    for legacy in content_legacy_names(wire_name) {
+                        inst.properties.remove(&rbx_dom_weak::ustr(legacy));
+                    }
+                }
+            }
             let name = match wire_name.as_str() {
-                // Only MeshPart calls its texture TextureID; ParticleEmitter,
-                // Beam, Trail, Decal and SpecialMesh read TextureContent
-                // (renaming it for every class lost every emitter's texture).
-                "TextureContent" if !mesh_part => "TextureContent",
                 "size" => "Size",
                 "shape" => "Shape",
                 "formFactorRaw" => "FormFactor",
@@ -302,8 +352,6 @@ impl LiveModel {
                 "CollisionGroupReplicate" => "CollisionGroup",
                 "AttributesReplicate" => "Attributes",
                 "RenderFidelityReplicate" => "RenderFidelity",
-                "MeshContent" if mesh_part => "MeshId",
-                "TextureContent" => "TextureID",
                 _ => wire_name.as_str(),
             };
             let name = &name.to_owned();
@@ -431,6 +479,34 @@ impl LiveModel {
     }
 }
 
+/// The legacy names whose Content twin is `twin` (the inverse of
+/// `rustudio_core::doc::content_twin`, which this crate can't depend on).
+fn content_legacy_names(twin: &str) -> &'static [&'static str] {
+    match twin {
+        "MeshContent" => &["MeshId"],
+        "TextureContent" => &["TextureID", "TextureId", "Texture"],
+        "ShirtTemplateContent" => &["ShirtTemplate"],
+        "PantsTemplateContent" => &["PantsTemplate"],
+        "GraphicContent" => &["Graphic"],
+        "ImageContent" => &["Image"],
+        "ColorMapContent" => &["ColorMap"],
+        "NormalMapContent" => &["NormalMap"],
+        "MetalnessMapContent" => &["MetalnessMap"],
+        "RoughnessMapContent" => &["RoughnessMap"],
+        "AudioContent" => &["SoundId", "Asset"],
+        "AnimationContent" => &["AnimationId"],
+        "SkyboxBackContent" => &["SkyboxBk"],
+        "SkyboxDownContent" => &["SkyboxDn"],
+        "SkyboxFrontContent" => &["SkyboxFt"],
+        "SkyboxLeftContent" => &["SkyboxLf"],
+        "SkyboxRightContent" => &["SkyboxRt"],
+        "SkyboxUpContent" => &["SkyboxUp"],
+        "SunTextureContent" => &["SunTextureId"],
+        "MoonTextureContent" => &["MoonTextureId"],
+        _ => &[],
+    }
+}
+
 /// The Name an instance has when the wire leaves it out: the class's
 /// constructor default (Studio 0.748; the same table as
 /// `rustudio_core::doc::default_instance_name`, which this crate can't
@@ -449,6 +525,32 @@ pub fn default_instance_name(class: &str) -> &str {
         "DepthOfFieldEffect" => "DepthOfField",
         "SunRaysEffect" => "SunRays",
         "TouchTransmitter" => "TouchInterest",
+        // Measured 2026-11-21: Instance.new(class).Name in Studio for every
+        // creatable class (measured in Studio).
+        "AnimationGraphDefinition" | "AnimationNodeDefinition" | "AnimationValueNodeDefinition" |
+        "AnimationValueOutputDefinition" | "Annotation" | "AudioSearchParams" |
+        "BubbleChatMessageProperties" | "CompositeValueCurve" | "CurveAnimation" |
+        "DataStoreGetOptions" | "DataStoreIncrementOptions" | "DataStoreOptions" |
+        "DataStoreSetOptions" | "EulerRotationCurve" | "ExperienceInviteOptions" | "FloatCurve" |
+        "GetTextBoundsParams" | "HiddenSurfaceRemovalAsset" | "HumanoidController" | "MarkerCurve" |
+        "PartOperationAsset" | "PluginAction" | "ReflectionMetadata" | "ReflectionMetadataCallbacks" |
+        "ReflectionMetadataClass" | "ReflectionMetadataClasses" | "ReflectionMetadataEnum" |
+        "ReflectionMetadataEnumItem" | "ReflectionMetadataEnums" | "ReflectionMetadataEvents" |
+        "ReflectionMetadataFunctions" | "ReflectionMetadataMember" | "ReflectionMetadataProperties" |
+        "ReflectionMetadataYieldFunctions" | "RotationCurve" | "StateMachineTransitionDefinition" |
+        "TeleportOptions" | "TextChatMessageProperties" | "ValueCurve" | "Vector3Curve" |
+        "VehicleController" | "VisualizationMode" | "VisualizationModeCategory" | "WorkspaceAnnotation" => "Instance",
+        "BinaryStringValue" | "BoolValue" | "BrickColorValue" | "CFrameValue" | "Color3Value" |
+        "IntValue" | "NumberValue" | "ObjectValue" | "RayValue" | "StringValue" | "Vector3Value" => "Value",
+        "BlockMesh" | "FileMesh" | "SpecialMesh" => "Mesh",
+        "Pants" | "Shirt" => "Clothing",
+        "BodyColors" => "Body Colors",
+        "GeneratedFolder" => "Folder",
+        "IntersectOperation" => "Intersection",
+        "NegateOperation" => "NegativePart",
+        "NumberPose" => "Pose",
+        "ShirtGraphic" => "Shirt Graphic",
+        "TrussPart" => "Truss",
         _ => class,
     }
 }
@@ -473,6 +575,37 @@ pub fn typed_value(v: &Variant) -> Option<PropValue> {
                 b.extend_from_slice(&d.offset.to_le_bytes());
             }
             typed(0x0e, b)
+        }
+        Variant::Ray(r) => {
+            for x in [
+                r.origin.x,
+                r.origin.y,
+                r.origin.z,
+                r.direction.x,
+                r.direction.y,
+                r.direction.z,
+            ] {
+                f(x);
+            }
+            typed(0x0f, b)
+        }
+        Variant::Faces(faces) => {
+            b.extend_from_slice(&u32::from(faces.bits()).to_le_bytes());
+            typed(0x10, b)
+        }
+        Variant::Axes(axes) => {
+            b.extend_from_slice(&u32::from(axes.bits()).to_le_bytes());
+            typed(0x11, b)
+        }
+        Variant::BrickColor(c) => {
+            b.extend_from_slice(&(*c as u16).to_le_bytes());
+            typed(0x12, b)
+        }
+        Variant::Vector2int16(v) => {
+            for c in [v.x, v.y] {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+            typed(0x18, b)
         }
         Variant::Vector3int16(v) => {
             for c in [v.x, v.y, v.z] {
@@ -517,6 +650,44 @@ pub fn typed_value(v: &Variant) -> Option<PropValue> {
             }
             typed(0x29, b)
         }
+        Variant::Region3(r) => {
+            for x in [r.min.x, r.min.y, r.min.z, r.max.x, r.max.y, r.max.z] {
+                f(x);
+            }
+            typed(0x2a, b)
+        }
+        Variant::Region3int16(r) => {
+            for c in [r.min.x, r.min.y, r.min.z, r.max.x, r.max.y, r.max.z] {
+                b.extend_from_slice(&c.to_le_bytes());
+            }
+            typed(0x2b, b)
+        }
+        Variant::OptionalCFrame(None) => typed(0x32, b),
+        Variant::OptionalCFrame(Some(cf)) => {
+            for x in [
+                cf.position.x,
+                cf.position.y,
+                cf.position.z,
+                cf.orientation.x.x,
+                cf.orientation.x.y,
+                cf.orientation.x.z,
+                cf.orientation.y.x,
+                cf.orientation.y.y,
+                cf.orientation.y.z,
+                cf.orientation.z.x,
+                cf.orientation.z.y,
+                cf.orientation.z.z,
+            ] {
+                f(x);
+            }
+            typed(0x32, b)
+        }
+        Variant::UniqueId(id) => {
+            b.extend_from_slice(&(id.random() as u64).to_le_bytes());
+            b.extend_from_slice(&id.time().to_le_bytes());
+            b.extend_from_slice(&id.index().to_le_bytes());
+            typed(0x34, b)
+        }
         Variant::Font(font) => {
             b.extend_from_slice(&font.weight.as_u16().to_le_bytes());
             b.push(font.style.as_u8());
@@ -527,22 +698,16 @@ pub fn typed_value(v: &Variant) -> Option<PropValue> {
             b.extend_from_slice(face.as_bytes());
             typed(0x36, b)
         }
+        Variant::SecurityCapabilities(caps) => {
+            b.extend_from_slice(&caps.bits().to_le_bytes());
+            typed(0x37, b)
+        }
         Variant::Content(c) => match c.value() {
             rbx_types::ContentType::Uri(u) => Some(PropValue::String(u.clone())),
             rbx_types::ContentType::Object(_) => None,
             _ => Some(PropValue::String(String::new())),
         },
         Variant::ContentId(c) => Some(PropValue::String(c.as_str().to_string())),
-        Variant::BrickColor(c) => Some(PropValue::Int(i64::from(*c as u16))),
-        Variant::OptionalCFrame(None) => Some(PropValue::Raw(Vec::new())),
-        Variant::OptionalCFrame(Some(cf)) => Some(PropValue::CFrame {
-            pos: [cf.position.x, cf.position.y, cf.position.z],
-            rot: [
-                cf.orientation.x.x, cf.orientation.x.y, cf.orientation.x.z,
-                cf.orientation.y.x, cf.orientation.y.y, cf.orientation.y.z,
-                cf.orientation.z.x, cf.orientation.z.y, cf.orientation.z.z,
-            ],
-        }),
         Variant::Tags(t) => Some(PropValue::SharedString(t.encode())),
         _ => None,
     }
@@ -553,20 +718,30 @@ pub fn typed_value(v: &Variant) -> Option<PropValue> {
 /// live instances fell back to class defaults: every ParticleEmitter's
 /// Size / Transparency / Color / Lifetime / Speed, every GUI's UDim2, Fonts
 /// and CustomPhysicalProperties.
-fn typed_variant(ty: u8, b: &[u8]) -> Option<Variant> {
+pub(crate) fn typed_variant(ty: u8, b: &[u8]) -> Option<Variant> {
     use rbx_types as t;
     let f = |i: usize| -> Option<f32> { Some(f32::from_le_bytes(b.get(i * 4..i * 4 + 4)?.try_into().ok()?)) };
     let i32_at = |o: usize| -> Option<i32> { Some(i32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    let u32_at = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    let i16_at = |o: usize| -> Option<i16> { Some(i16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?)) };
     Some(match ty {
         0x0d => Variant::UDim(t::UDim::new(f(0)?, i32_at(4)?)),
         0x0e => Variant::UDim2(t::UDim2::new(
             t::UDim::new(f(0)?, i32_at(4)?),
             t::UDim::new(f(2)?, i32_at(12)?),
         )),
-        0x19 => {
-            let s = |o: usize| -> Option<i16> { Some(i16::from_le_bytes(b.get(o..o + 2)?.try_into().ok()?)) };
-            Variant::Vector3int16(t::Vector3int16::new(s(0)?, s(2)?, s(4)?))
+        0x0f => Variant::Ray(t::Ray::new(
+            t::Vector3::new(f(0)?, f(1)?, f(2)?),
+            t::Vector3::new(f(3)?, f(4)?, f(5)?),
+        )),
+        0x10 => Variant::Faces(t::Faces::from_bits((u32_at(0)? as u8) & 0x3f)?),
+        0x11 => Variant::Axes(t::Axes::from_bits((u32_at(0)? as u8) & 0x07)?),
+        0x12 => {
+            let n = u16::from_le_bytes(b.get(0..2)?.try_into().ok()?);
+            Variant::BrickColor(t::BrickColor::from_number(n)?)
         }
+        0x18 => Variant::Vector2int16(t::Vector2int16::new(i16_at(0)?, i16_at(2)?)),
+        0x19 => Variant::Vector3int16(t::Vector3int16::new(i16_at(0)?, i16_at(2)?, i16_at(4)?)),
         0x23 => Variant::NumberSequence(t::NumberSequence {
             keypoints: b
                 .chunks_exact(12)
@@ -597,6 +772,32 @@ fn typed_variant(ty: u8, b: &[u8]) -> Option<Variant> {
                 ),
             )),
         },
+        0x2a => Variant::Region3(t::Region3::new(
+            t::Vector3::new(f(0)?, f(1)?, f(2)?),
+            t::Vector3::new(f(3)?, f(4)?, f(5)?),
+        )),
+        0x2b => Variant::Region3int16(t::Region3int16::new(
+            t::Vector3int16::new(i16_at(0)?, i16_at(2)?, i16_at(4)?),
+            t::Vector3int16::new(i16_at(6)?, i16_at(8)?, i16_at(10)?),
+        )),
+        0x32 => match b.len() {
+            0 => Variant::OptionalCFrame(None),
+            48 => Variant::OptionalCFrame(Some(t::CFrame::new(
+                t::Vector3::new(f(0)?, f(1)?, f(2)?),
+                t::Matrix3::new(
+                    t::Vector3::new(f(3)?, f(4)?, f(5)?),
+                    t::Vector3::new(f(6)?, f(7)?, f(8)?),
+                    t::Vector3::new(f(9)?, f(10)?, f(11)?),
+                ),
+            ))),
+            _ => return None,
+        },
+        0x34 => {
+            let random = u64::from_le_bytes(b.get(0..8)?.try_into().ok()?) as i64;
+            let time = u32_at(8)?;
+            let index = u32_at(12)?;
+            Variant::UniqueId(t::UniqueId::new(index, time, random))
+        }
         0x36 => {
             let weight = u16::from_le_bytes(b.get(0..2)?.try_into().ok()?);
             let style = *b.get(2)?;
@@ -614,6 +815,10 @@ fn typed_variant(ty: u8, b: &[u8]) -> Option<Variant> {
                 font.cached_face_id = Some(face.to_string());
             }
             Variant::Font(font)
+        }
+        0x37 => {
+            let bits = u64::from_le_bytes(b.get(0..8)?.try_into().ok()?);
+            Variant::SecurityCapabilities(t::SecurityCapabilities::from_bits(bits))
         }
         _ => return None,
     })
@@ -638,6 +843,16 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
                 rbx_types::Content::from_uri(uri.clone())
             }));
         }
+    }
+    if name == "MaterialColors" {
+        let bytes = match v {
+            PropValue::String(text) => text.as_bytes(),
+            PropValue::BinaryString(bytes)
+            | PropValue::SharedString(bytes)
+            | PropValue::CachedSharedString { bytes, .. } => bytes.as_slice(),
+            _ => return None,
+        };
+        return Some(Variant::BinaryString(bytes.to_vec().into()));
     }
     if name=="Attributes" {
         let bytes=match v {PropValue::String(text)=>text.as_bytes(),PropValue::BinaryString(bytes)=>bytes.as_slice(),_=>return None};
@@ -707,12 +922,76 @@ mod tests {
     #[test]
     fn omitted_names_use_constructor_defaults_and_explicit_names_win() {
         let mut m = LiveModel::new();
-        for (class, expected) in [("BindableEvent", "Event"), ("BindableFunction", "Function"), ("WedgePart", "Wedge"), ("CornerWedgePart", "CornerWedge"), ("UnionOperation", "Union"), ("Part", "Part"), ("LocalScript", "LocalScript")] {
+        for (class, expected) in [("BindableEvent", "Event"), ("BindableFunction", "Function"), ("WedgePart", "Wedge"), ("CornerWedgePart", "CornerWedge"), ("UnionOperation", "Union"), ("Part", "Part"), ("LocalScript", "LocalScript"), ("IntValue", "Value"), ("SpecialMesh", "Mesh"), ("BodyColors", "Body Colors"), ("TrussPart", "Truss"), ("TeleportOptions", "Instance")] {
             let r = m.insert_child(m.dom.root_ref(), 1, class, &[]);
             assert_eq!(m.dom.get_by_ref(r).unwrap().name, expected);
             let r = m.insert_child(m.dom.root_ref(), 2, class, &[("Name".into(), PropValue::String("".into()))]);
             assert_eq!(m.dom.get_by_ref(r).unwrap().name, "");
         }
+    }
+
+    /// MeshPart's TextureContent stays TextureContent (Document::prop reads
+    /// TextureID through it, as a string), and replaces a kept TextureID.
+    #[test]
+    fn mesh_part_content_keeps_its_name() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(RepOp::NewInstance { id: 2, class: "MeshPart".into(), parent: Some(1), props: vec![] });
+        let r = m.reference(2).unwrap();
+        m.dom.get_by_ref_mut(r).unwrap().properties.insert(rbx_dom_weak::ustr("TextureID"), Variant::String("old".into()));
+        m.apply(RepOp::ChangeProperty { id: 2, name: "TextureContent".into(), value: PropValue::String("rbxassetid://12345678".into()) });
+        let props = &m.dom.get_by_ref(r).unwrap().properties;
+        assert!(props.get(&rbx_dom_weak::ustr("TextureID")).is_none());
+        assert_eq!(
+            props.get(&rbx_dom_weak::ustr("TextureContent")),
+            Some(&Variant::Content(rbx_types::Content::from_uri("rbxassetid://12345678")))
+        );
+    }
+
+    /// SetAttribute(name, nil) arrives as the nil type byte alone (captured
+    /// run r1, the attributes step): it removes the attribute.
+    #[test]
+    fn a_nil_attribute_body_removes_it() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(RepOp::NewInstance { id: 2, class: "Folder".into(), parent: Some(1), props: vec![] });
+        let attrs = |m: &LiveModel| match m.dom.get_by_ref(m.reference(2).unwrap()).unwrap().properties.get(&rbx_dom_weak::ustr("Attributes")) {
+            Some(Variant::Attributes(a)) => a.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        m.apply(RepOp::ChangeAttribute { id: 2, name: "a_bool".into(), value: vec![0x03, 1] });
+        m.apply(RepOp::ChangeAttribute { id: 2, name: "b".into(), value: vec![0x03, 0] });
+        assert_eq!(attrs(&m), ["a_bool", "b"]);
+        m.apply(RepOp::ChangeAttribute { id: 2, name: "a_bool".into(), value: vec![0x01] });
+        assert_eq!(attrs(&m), ["b"]);
+    }
+
+    /// Every listed service exists, as in Studio (the server never sends an
+    /// empty ReplicatedFirst); one the server sends later fills that one.
+    #[test]
+    fn listed_services_exist_and_their_records_fill_them() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::Services(vec![(0x20, "ReplicatedFirst".into()), (0x21, "Lighting".into()), (0xe, "Workspace".into())]));
+        let count = |m: &LiveModel, class: &str| m.dom.descendants().filter(|i| i.class.as_str() == class).count();
+        assert_eq!(count(&m, "ReplicatedFirst"), 1);
+        let rf = m.reference(0x20).unwrap();
+        assert_eq!(m.dom.get_by_ref(rf).unwrap().name, "ReplicatedFirst");
+        assert_eq!(m.dom.get_by_ref(rf).unwrap().parent(), m.dom.root_ref());
+        // The services arrive with the DataModel's referent as their parent.
+        m.apply(RepOp::NewInstance { id: 0xe, class: "Workspace".into(), parent: Some(0xd), props: vec![] });
+        m.apply(RepOp::NewInstance {
+            id: 0x21,
+            class: "Lighting".into(),
+            parent: Some(0xd),
+            props: vec![("GlobalShadows".into(), PropValue::Bool(true))],
+        });
+        m.apply(RepOp::NewInstance { id: 0x30, class: "Folder".into(), parent: Some(0x20), props: vec![] });
+        assert_eq!(count(&m, "Lighting"), 1);
+        assert_eq!(count(&m, "Workspace"), 1);
+        let lighting = m.reference(0x21).unwrap();
+        assert_eq!(m.dom.get_by_ref(lighting).unwrap().parent(), m.dom.root_ref());
+        assert_eq!(m.dom.get_by_ref(lighting).unwrap().properties.get(&rbx_dom_weak::ustr("GlobalShadows")), Some(&Variant::Bool(true)));
+        assert_eq!(m.dom.get_by_ref(m.reference(0x30).unwrap()).unwrap().parent(), rf);
     }
 
     #[test]
@@ -918,16 +1197,19 @@ mod tests {
         assert_eq!(m.dom().get_by_ref(m.reference(0x3d6d).unwrap()).unwrap().parent(), root, "services still bind under the root");
         assert_eq!(m.dom().get_by_ref(root).unwrap().children().len(), 3);
         assert_eq!(m.unbound_service("ReplicatedFirst"), None, "already bound");
-        // A locally made copy (GetService before the server's) binds to the id.
+        // A locally made copy (GetService before the list) is the one bound.
         let mut m = LiveModel::new();
-        m.apply(RepOp::Services(vec![(0x2110, "ReplicatedFirst".into())]));
         let root = m.dom().root_ref();
         let local = m.dom_mut().insert(root, InstanceBuilder::new("ReplicatedFirst"));
+        m.apply(RepOp::Services(vec![(0x2110, "ReplicatedFirst".into())]));
+        assert_eq!(m.server_id(local), Some(0x2110));
+        assert_eq!(m.dom().root().children().len(), 1);
+        // Unbound again (its server copy deleted), it is free to bind.
+        m.unbind(local);
+        assert_eq!(m.server_id(local), None);
         assert_eq!(m.unbound_service("ReplicatedFirst"), Some(0x2110));
         m.bind_local(0x2110, local);
         assert_eq!(m.unbound_service("ReplicatedFirst"), None);
-        m.unbind(local);
-        assert_eq!(m.server_id(local), None);
     }
 
     /// A listed service's own record parked before the DataModel's referent

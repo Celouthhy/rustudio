@@ -35,7 +35,7 @@ use crate::{
     app::{Editor, Harness},
     explorer::ExplorerState,
     game::GameHost,
-    plugin_host::PluginHost,
+    plugin_host::{PlaytestCompletion, PluginHost},
     viewport::GizmoDrag,
 };
 
@@ -58,6 +58,13 @@ impl GameHost for StudioGameHost<'_> {
     }
 
     fn load_plugins(&mut self, runtime: &Runtime) {
+        if let Some((args, _)) = &self.plugins.playtest {
+            if let Err(err) = rustudio_engine::runtime::domains::testing::set_test_args(&runtime.lua, args) {
+                if let Some(mut world) = runtime.world_mut() {
+                    world.output.push((rustudio_core::log::Level::Error, err.to_string()));
+                }
+            }
+        }
         self.plugins.load_into_play(runtime);
     }
 
@@ -74,6 +81,10 @@ impl GameHost for StudioGameHost<'_> {
     }
 
     fn end_test(&mut self, value: String, log: &[LogLine]) {
+        if let Some((_, completion)) = self.plugins.playtest.take() {
+            let _ = completion.set(Ok(value));
+            return;
+        }
         if self.harness.run.ends_on_end_test() {
             self.harness.run.end_value = Some(value);
         } else {
@@ -123,8 +134,35 @@ impl Editor {
         });
     }
 
+    pub(crate) fn start_plugin_playtest(&mut self, mode: RunMode, args: String, completion: PlaytestCompletion) {
+        if self.game.is_playing() || self.plugins.playtest.is_some() {
+            let _ = completion.set(Err("A playtest is already running".into()));
+            return;
+        }
+        if self.place_loading() {
+            let _ = completion.set(Err("The place is still loading".into()));
+            return;
+        }
+        self.plugins.playtest = Some((args, completion));
+        self.start_play(mode);
+        if !self.game.is_playing() {
+            if let Some((_, completion)) = self.plugins.playtest.take() {
+                let _ = completion.set(Err("Could not start the playtest".into()));
+            }
+        }
+    }
+
+    fn finish_stopped_plugin_playtest(&mut self) {
+        if !self.game.is_playing() {
+            if let Some((_, completion)) = self.plugins.playtest.take() {
+                let _ = completion.set(Ok("null".into()));
+            }
+        }
+    }
+
     pub fn stop_play(&mut self) {
         self.with_game_host(|game, host| game.stop_play(host));
+        self.finish_stopped_plugin_playtest();
         self.restore_place_context();
     }
 
@@ -155,6 +193,7 @@ impl Editor {
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         self.with_game_host(|game, host| game.play_tick(ctx, dt, host, no_ui, shift));
         self.teleport_tick();
+        self.finish_stopped_plugin_playtest();
     }
 
     /// play_tick for a window the compositor isn't drawing (app.rs background_tick).
@@ -163,5 +202,6 @@ impl Editor {
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         self.with_game_host(|game, host| game.play_tick_hidden(dt, host, no_ui));
         self.teleport_tick();
+        self.finish_stopped_plugin_playtest();
     }
 }

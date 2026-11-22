@@ -35,6 +35,7 @@ pub enum SavedTab {
     AvatarSettings,
     TerrainEditor,
     Toolbox,
+    AssetManager,
     FileSync,
     Profiler,
 }
@@ -49,6 +50,7 @@ impl SavedTab {
             Tab::AvatarSettings => SavedTab::AvatarSettings,
             Tab::TerrainEditor => SavedTab::TerrainEditor,
             Tab::Toolbox => SavedTab::Toolbox,
+            Tab::AssetManager => SavedTab::AssetManager,
             Tab::FileSync => SavedTab::FileSync,
             Tab::Profiler => SavedTab::Profiler,
             Tab::Script(_) | Tab::Plugin(_) => return None,
@@ -63,6 +65,7 @@ impl SavedTab {
             SavedTab::AvatarSettings => Tab::AvatarSettings,
             SavedTab::TerrainEditor => Tab::TerrainEditor,
             SavedTab::Toolbox => Tab::Toolbox,
+            SavedTab::AssetManager => Tab::AssetManager,
             SavedTab::FileSync => Tab::FileSync,
             SavedTab::Profiler => Tab::Profiler,
         }

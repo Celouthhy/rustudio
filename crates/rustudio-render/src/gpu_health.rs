@@ -8,6 +8,10 @@ use std::sync::OnceLock;
 
 static ADAPTER: OnceLock<String> = OnceLock::new();
 static LOST: OnceLock<String> = OnceLock::new();
+/// The first GPU error nothing captured (out of memory, validation), for the
+/// editor's Output; taken once.
+static UNCAPTURED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static UNCAPTURED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn describe(info: &wgpu::AdapterInfo) -> String {
     format!(
@@ -21,6 +25,31 @@ pub fn watch(adapter: &wgpu::Adapter, device: &wgpu::Device) {
     let gpu = describe(&adapter.get_info());
     log::info!(target: "rustudio::gpu", "GPU: {gpu}");
     let _ = ADAPTER.set(gpu);
+    // wgpu's default for an error no error scope catches is a panic: an
+    // allocation the GPU refused (a 2.4M-instance place on an RTX 4070 Ti,
+    // 2026-11-22: "wgpu error: Out of Memory" in Device::create_texture)
+    // took the whole editor down. Log it with what failed and keep going;
+    // the resource that failed just doesn't draw.
+    device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+        let n = UNCAPTURED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let gpu = ADAPTER.get().map(String::as_str).unwrap_or("unknown GPU");
+        let kind = match &error {
+            wgpu::Error::OutOfMemory { .. } => "out of GPU memory",
+            wgpu::Error::Validation { .. } => "GPU validation error",
+            wgpu::Error::Internal { .. } => "internal GPU error",
+        };
+        // Every one goes to the diagnostic log (the first 200 in full).
+        if n < 200 {
+            log::error!(target: "rustudio::gpu", "{kind} on {gpu}: {error:?}");
+        }
+        if n == 0 {
+            let detail = error.to_string();
+            let first = detail.lines().next().unwrap_or("").to_string();
+            *UNCAPTURED.lock().unwrap() = Some(format!(
+                "{kind} on {gpu}: {first}. Some parts or textures may not draw; the diagnostic log has the details."
+            ));
+        }
+    }));
     device.set_device_lost_callback(|reason, message| {
         if matches!(reason, wgpu::DeviceLostReason::Destroyed) {
             return;
@@ -30,6 +59,11 @@ pub fn watch(adapter: &wgpu::Adapter, device: &wgpu::Device) {
         log::error!(target: "rustudio::gpu", "{text}");
         let _ = LOST.set(text);
     });
+}
+
+/// The first uncaptured GPU error, once (for a warning in Output).
+pub fn take_uncaptured() -> Option<String> {
+    UNCAPTURED.lock().ok()?.take()
 }
 
 /// Why the device was lost, once it has been.

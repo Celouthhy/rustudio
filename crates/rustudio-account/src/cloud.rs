@@ -882,6 +882,96 @@ impl CloudApi {
     ) -> Result<u64> {
         upload_place(&self.session, &self.ep.apis, place_id, bytes, is_xml, vt)
     }
+
+    /// Creates a new asset (Decal, Audio, Model, etc.) via Roblox's user-auth
+    /// assets endpoint and polls the operation until it finishes, returning
+    /// the new asset ID.
+    pub fn upload_asset(
+        &self,
+        asset_type: &str,
+        display_name: &str,
+        description: &str,
+        group_id: Option<u64>,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<u64> {
+        upload_asset(
+            &self.session,
+            &self.ep.apis,
+            asset_type,
+            display_name,
+            description,
+            group_id,
+            filename,
+            mime,
+            bytes,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn upload_asset(
+    session: &Session,
+    apis: &str,
+    asset_type: &str,
+    display_name: &str,
+    description: &str,
+    group_id: Option<u64>,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<u64> {
+    let creator = match group_id {
+        Some(gid) => serde_json::json!({ "groupId": gid.to_string() }),
+        None => serde_json::json!({ "userId": session.profile.id.to_string() }),
+    };
+    let request = serde_json::json!({
+        "assetType": asset_type,
+        "displayName": display_name,
+        "description": description,
+        "creationContext": { "creator": creator },
+    });
+    let (content_type, body) = asset_upload::multipart(&request, filename, mime, bytes);
+    let cookie = session.cookie();
+    let error = |detail: String| {
+        if cookie.appears_in(&detail) || session.cookie().appears_in(&detail) {
+            Error::new("Asset upload failed")
+        } else {
+            let detail: String = detail.chars().take(300).collect();
+            Error::new(format!("Asset upload: {detail}"))
+        }
+    };
+    let check_reply = |status, body: String| {
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        let detail = error_message(&body).unwrap_or(body);
+        Err(error(format!("HTTP {status}: {}", detail.trim())))
+    };
+    let url = format!("{apis}{ASSETS_PATH}");
+    let (status, text) = session
+        .send_csrf_with_timeout("POST", &url, &content_type, &body, Some(Duration::from_secs(120)))
+        .map_err(|e| error(e.0))?;
+    let initial = check_reply(status, text)?;
+    let operation = asset_upload::wait_for_operation(
+        &initial,
+        &format!("{apis}{OPERATIONS_PATH}"),
+        |url| {
+            let (status, body) = session
+                .get_with_timeout(url, Some(Duration::from_secs(20)))
+                .map_err(|e| error(e.0))?;
+            check_reply(status, body)
+        },
+        error,
+    )?;
+    let asset_id = operation
+        .pointer("/response/assetId")
+        .or_else(|| operation.pointer("/response/id"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|v| *v > 0)
+        .ok_or_else(|| Error::new("Asset upload: completed operation has no valid assetId"))?;
+    Ok(asset_id)
 }
 
 pub(crate) fn upload_place(
@@ -904,7 +994,13 @@ pub(crate) fn upload_place(
     } else {
         ("place.rbxl", "application/octet-stream")
     };
-    let (content_type, body) = asset_upload::multipart(&request, filename, mime, bytes);
+    if bytes.len() > asset_upload::PLACE_SIZE_LIMIT {
+        return Err(Error::new(format!(
+            "Place Publishing: the place is {:.1} MB; Roblox accepts places up to {} MB",
+            bytes.len() as f64 / 1_048_576.0,
+            asset_upload::PLACE_SIZE_LIMIT / 1_048_576
+        )));
+    }
     let cookie = session.cookie();
     let error = |detail: String| {
         if cookie.appears_in(&detail) || session.cookie().appears_in(&detail) {
@@ -922,10 +1018,27 @@ pub(crate) fn upload_place(
         Err(error(format!("HTTP {status}: {}", detail.trim())))
     };
     let url = format!("{apis}{ASSETS_PATH}/{place_id}");
-    let (status, text) = session
-        .send_csrf_with_timeout("PATCH", &url, &content_type, &body, Some(Duration::from_secs(120)))
-        .map_err(|e| error(e.0))?;
-    let initial = check_reply(status, text)?;
+    let initial = if bytes.len() > asset_upload::MULTIPART_THRESHOLD {
+        // Over 7 MiB Studio uses the chunked route; the form endpoint
+        // refuses bodies over 50 MiB.
+        asset_upload::multipart_upload(
+            session,
+            apis,
+            "PATCH",
+            &format!("{url}:multipartUpload"),
+            &request,
+            mime,
+            bytes,
+            error,
+            check_reply,
+        )?
+    } else {
+        let (content_type, body) = asset_upload::multipart(&request, filename, mime, bytes);
+        let (status, text) = session
+            .send_csrf_with_timeout("PATCH", &url, &content_type, &body, Some(Duration::from_secs(120)))
+            .map_err(|e| error(e.0))?;
+        check_reply(status, text)?
+    };
     let operation = asset_upload::wait_for_operation(
         &initial,
         &format!("{apis}{OPERATIONS_PATH}"),

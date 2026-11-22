@@ -61,6 +61,8 @@ pub enum Tab {
     TerrainEditor,
     /// Studio's Toolbox (Home / View > Toolbox): src/toolbox.
     Toolbox,
+    /// Studio's Asset Manager (Home > Assets, Window > Asset Manager): src/asset_manager.
+    AssetManager,
     /// File Sync (src/file_sync): the project attached to the place.
     FileSync,
     /// View > MicroProfiler (Ctrl+F6): the profiler window
@@ -83,6 +85,7 @@ impl Tab {
             Tab::AvatarSettings => "Avatar Settings",
             Tab::TerrainEditor => "Terrain Editor",
             Tab::Toolbox => "Toolbox",
+            Tab::AssetManager => "Asset Manager",
             Tab::FileSync => "File Sync",
             Tab::Profiler => "MicroProfiler",
             Tab::Script(_) => "Script",
@@ -204,6 +207,8 @@ pub struct Editor {
     pub terrain_ed: crate::terrain_editor::TerrainEditor,
     /// The Toolbox panel's state (src/toolbox), kept while it is hidden.
     pub toolbox: crate::toolbox::Toolbox,
+    /// The Asset Manager panel's state (src/asset_manager), kept while hidden.
+    pub asset_manager: crate::asset_manager::AssetManager,
     /// The MicroProfiler window while its tab is open (recording runs while
     /// it exists; dropping it stops recording).
     pub profiler: Option<rustudio_profiler_ui::ProfilerWindow>,
@@ -375,6 +380,7 @@ impl RustudioApp {
             file_sync: Default::default(),
             terrain_ed: Default::default(),
             toolbox: Default::default(),
+            asset_manager: Default::default(),
             profiler: None,
             toolbox_vf: Default::default(),
             fly_held: 0.0,
@@ -834,6 +840,11 @@ impl Editor {
     /// A file dialog closed: act on its answer.
     pub fn poll_file_dialogs(&mut self) {
         use crate::file_dialog::Purpose;
+        if let Some((purpose, paths)) = self.dialogs.poll_multi() {
+            if !paths.is_empty() && purpose == Purpose::AssetManagerImport {
+                self.asset_manager_import_files(paths);
+            }
+        }
         let Some((purpose, path)) = self.dialogs.poll() else {
             return;
         };
@@ -860,6 +871,8 @@ impl Editor {
                     d.parent = path.display().to_string();
                 }
             }
+            Purpose::AssetManagerImport => self.asset_manager_import_files(vec![path]),
+            Purpose::TemplateAdd | Purpose::TemplateThumb(_) | Purpose::TemplateReplace(_) => self.start_template_file(&purpose, path),
         }
     }
 
@@ -925,7 +938,7 @@ impl Editor {
         self.dialogs.start(Purpose::InsertModel, d, Kind::PickFile);
     }
 
-    fn insert_model_file(&mut self, path: PathBuf) {
+    pub(crate) fn insert_model_file(&mut self, path: PathBuf) {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let parent = self.paste_target(false);
@@ -1724,6 +1737,7 @@ impl TabViewer for Viewer<'_> {
             Tab::TerrainEditor => self.ed.terrain_editor_ui(ui),
             Tab::Plugin(n) => self.ed.plugin_widget_ui(ui, *n),
             Tab::Toolbox => self.ed.toolbox_ui(ui),
+            Tab::AssetManager => self.ed.asset_manager_ui(ui),
             Tab::FileSync => self.ed.file_sync_panel_ui(ui),
             Tab::Profiler => {
                 let rect = ui.available_rect_before_wrap();
@@ -1991,6 +2005,9 @@ impl eframe::App for RustudioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
+            self.ed.warn(message);
+        }
         self.last_ui_frame = Some(Instant::now());
         if self.egui_ctx.is_none() {
             rustudio_core::load_trace::mark("first ui pass");
@@ -2148,8 +2165,10 @@ impl RustudioApp {
         self.watchdog.stage("plugins", "project and scene synchronization");
         ed.project_tick();
         ed.file_sync_tick();
+        ed.template_preview_tick();
         ed.plugins_tick();
         ed.toolbox_tick(&ctx);
+        ed.asset_manager_tick(&ctx);
         ed.toolbox_harness_tick();
         if self.ed.harness.run.no_ui {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
@@ -2206,7 +2225,7 @@ impl RustudioApp {
             self.panels = crate::panels::Panels::default();
             self.dock = default_dock();
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::FileSync) {
+                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync) {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2397,6 +2416,7 @@ impl RustudioApp {
             (Tab::AvatarSettings, "Avatar Settings"),
             (Tab::TerrainEditor, "Terrain Editor"),
             (Tab::Toolbox, "Toolbox"),
+            (Tab::AssetManager, "Asset Manager"),
             (Tab::FileSync, "File Sync"),
             (Tab::Profiler, "MicroProfiler"),
         ]

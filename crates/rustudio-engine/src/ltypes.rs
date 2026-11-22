@@ -3423,6 +3423,26 @@ pub fn datatype_to_variant(v: &mlua::Value) -> Option<rbx_types::Variant> {
 /// Property Variant → Lua value for the same types (None for other variants).
 /// `PhysicalProperties::Default` maps to `Some(nil)`, like CustomPhysicalProperties.
 #[allow(dead_code)]
+/// SecurityCapabilities' bits (the wire's and the file's u64), by
+/// capability: not the Enum.SecurityCapability values. Measured 2026-11-21:
+/// Studio set each capability alone on a folder in a Team Create place and
+/// rustudio read the bit it received (every one a plugin may set; Avatar and
+/// AssetRequire are AvatarAppearance and LoadUnownedAsset there). The ones a
+/// plugin can't set (Plugin, LocalUser, RobloxScript …) read as their bit's
+/// number.
+pub const SECURITY_CAPABILITY_BITS: [(u8, &str); 41] = [
+    (8, "RunClientScript"), (9, "RunServerScript"), (11, "AccessOutsideWrite"), (16, "LoadUnownedAsset"),
+    (17, "LoadString"), (18, "ScriptGlobals"), (19, "CreateInstances"), (20, "Basic"), (21, "Audio"),
+    (22, "DataStore"), (23, "Network"), (24, "Physics"), (25, "UI"), (26, "CSG"), (27, "Chat"),
+    (28, "Animation"), (29, "AvatarAppearance"), (30, "Input"), (31, "Environment"), (32, "RemoteEvent"),
+    (33, "LegacySound"), (34, "Players"), (35, "CapabilityControl"), (36, "AssetRead"),
+    (37, "AssetManagement"), (38, "DynamicGeneration"), (39, "PlatformAvatarEditing"),
+    (40, "AssetCreateUpdate"), (41, "Capture"), (42, "SensitiveInput"), (43, "Monetization"),
+    (44, "LoadOwnedAsset"), (45, "Social"), (46, "ServerCommunication"), (47, "Logging"),
+    (48, "PromptExternalPurchase"), (49, "Groups"), (50, "Teleport"), (51, "Consequences"), (52, "Material"),
+    (53, "AvatarBehavior"),
+];
+
 pub fn variant_to_datatype(
     lua: &mlua::Lua,
     v: &rbx_types::Variant,
@@ -3432,6 +3452,20 @@ pub fn variant_to_datatype(
         Ok(Some(Value::UserData(lua.create_userdata(x)?)))
     }
     match v {
+        V::SecurityCapabilities(c) => u(
+            lua,
+            crate::runtime::domains::services::reflect::LCaps(
+                (0..64u8)
+                    .filter(|n| c.bits() & (1u64 << n) != 0)
+                    .map(|n| {
+                        SECURITY_CAPABILITY_BITS
+                            .iter()
+                            .find(|(b, _)| *b == n)
+                            .map_or_else(|| n.to_string(), |(_, name)| name.to_string())
+                    })
+                    .collect(),
+            ),
+        ),
         V::NumberSequence(s) => u(
             lua,
             LNumberSequence {

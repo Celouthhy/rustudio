@@ -53,7 +53,7 @@ mod debug;
 #[path = "testing_studio.rs"]
 pub mod studio;
 
-pub use service::{report_test_run, take_end_request};
+pub use service::{report_test_run, set_test_args, take_end_request};
 pub use studio::{set_editor_state, EditorState};
 
 pub const METHODS: &[(&str, &str)] = &[

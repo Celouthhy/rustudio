@@ -14,6 +14,9 @@ pub struct ExportDialog {
     /// The folder the project folder is made in.
     pub parent: String,
     pub open_after: bool,
+    /// Keep this place open and attach the new folder with File Sync
+    /// (Place wins), instead of reopening it as a project.
+    pub attach_after: bool,
     pub error: Option<String>,
 }
 
@@ -50,8 +53,19 @@ impl Editor {
             opts: ExportOptions { name: safe_name(&name), ..Default::default() },
             parent: parent.display().to_string(),
             open_after: true,
+            attach_after: false,
             error: None,
         });
+    }
+
+    /// File Sync's "New project…": the same window, set to attach the new
+    /// folder to the open place.
+    pub fn open_export_dialog_attach(&mut self) {
+        self.open_export_dialog();
+        if let Some(d) = &mut self.project_export {
+            d.open_after = false;
+            d.attach_after = true;
+        }
     }
 
     pub fn open_settings_dialog(&mut self) {
@@ -124,7 +138,17 @@ impl Editor {
                 ui.add_space(6.0);
                 ui.checkbox(&mut d.opts.lua, "Use .lua instead of .luau");
                 ui.checkbox(&mut d.opts.sourcemap, "Keep a sourcemap.json up to date (for luau-lsp)");
-                ui.checkbox(&mut d.open_after, "Open the project folder afterwards");
+                if ui
+                    .checkbox(&mut d.attach_after, "Attach to this place with File Sync")
+                    .on_hover_text("Keeps this place open and links the new folder to it (Place wins: nothing in the place changes)")
+                    .changed()
+                    && d.attach_after
+                {
+                    d.open_after = false;
+                }
+                if ui.checkbox(&mut d.open_after, "Open the project folder afterwards").changed() && d.open_after {
+                    d.attach_after = false;
+                }
                 if let Some(e) = &d.error {
                     ui.colored_label(egui::Color32::from_rgb(230, 90, 80), e);
                 }
@@ -158,7 +182,11 @@ impl Editor {
                     for w in rep.warnings.iter().take(20) {
                         self.warn(format!("Project export: {w}"));
                     }
-                    if d.open_after {
+                    if d.attach_after {
+                        if let Err(e) = self.file_sync_attach(&rep.project_file, crate::file_sync::settings::Initial::Place) {
+                            self.error(format!("Saved the project, but File Sync couldn't attach it: {e}"));
+                        }
+                    } else if d.open_after {
                         self.open_project(&rep.project_file);
                     }
                     return;

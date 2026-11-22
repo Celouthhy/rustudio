@@ -405,11 +405,11 @@ impl Document {
     }
 
     /// Pushes an already-applied step (no journal marks: the changes were
-    /// marked when made).
-    fn push_step(&mut self, label: String, display: Option<String>, mut changes: Vec<Change>) {
+    /// marked when made). Returns whether a non-empty step was pushed.
+    fn push_step(&mut self, label: String, display: Option<String>, mut changes: Vec<Change>) -> bool {
         coalesce(&mut changes);
         if changes.is_empty() {
-            return;
+            return false;
         }
         self.redo.clear();
         let sel_before = self.selection.clone();
@@ -425,6 +425,18 @@ impl Document {
         if self.undo.len() > crate::mech::UNDO_LIMIT {
             self.undo.remove(0);
         }
+        true
+    }
+
+    /// Commits pending script changes as one undo step when there are any
+    /// (and no ChangeHistoryService recording is open). Unlike
+    /// `chs_set_waypoint`, a no-op call leaves the redo stack intact.
+    pub fn commit_pending_script_changes(&mut self, label: &str) -> bool {
+        if self.history.recording.is_some() || self.history.pending.is_empty() {
+            return false;
+        }
+        let changes = std::mem::take(&mut self.history.pending);
+        self.push_step(label.to_string(), None, changes)
     }
 
     // ------------------------------------------- ChangeHistoryService calls

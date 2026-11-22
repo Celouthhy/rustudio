@@ -80,3 +80,118 @@ pub(crate) fn wait_for_operation<E>(
         "Upload operation did not finish after 60 polls".into(),
     ))
 }
+
+/// Studio sends uploads above `FIntAssetsUploadUseMultiPartSizeThresholdBytes`
+/// through the chunked route, in `DFIntMultiPartUploadMaxChunkSizeByte`
+/// pieces (both 7 MiB in PCStudioApp's settings). The single-part form
+/// endpoint refuses bodies over 50 MiB.
+pub(crate) const MULTIPART_THRESHOLD: usize = 7_340_032;
+const MULTIPART_CHUNK: usize = 7_340_032;
+/// `FIntPublicStudioPlaceUploadSizeLimitBytes` (98 MiB).
+pub(crate) const PLACE_SIZE_LIMIT: usize = 102_760_448;
+/// `DFIntMultiPartUploadS3RequestTimeout`.
+const S3_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Chunked upload, the way Studio does it:
+/// 1. PATCH `…/assets/{id}:multipartUpload` (or POST `…/assets:multipartUpload`
+///    for a new asset) with `{asset, file: {contentType, filesize,
+///    md5Checksum (hex), chunkPlan: [sizes]}}` → `{operationPath,
+///    uploadUrls: [{httpVerb, url, chunkNum, contentStart, contentLength}]}`;
+/// 2. each chunk goes to its presigned S3 URL (no cookie), then
+///    POST `…/{operationPath}:multipartUploadChunkComplete` `{chunkNum, etag}`
+///    with the ETag S3 answered;
+/// 3. POST `…/{operationPath}:multipartUploadComplete` `{}` returns the
+///    operation, polled like a single-part upload.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multipart_upload<E>(
+    session: &crate::session::Session,
+    apis: &str,
+    method: &str,
+    start_url: &str,
+    asset: &Value,
+    content_type: &str,
+    bytes: &[u8],
+    error: impl Fn(String) -> E,
+    check_reply: impl Fn(u16, String) -> Result<String, E>,
+) -> Result<String, E> {
+    use md5::{Digest, Md5};
+    let md5: String = Md5::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let plan: Vec<usize> = bytes.chunks(MULTIPART_CHUNK).map(<[u8]>::len).collect();
+    let start = serde_json::json!({
+        "asset": asset,
+        "file": {
+            "contentType": content_type,
+            "filesize": bytes.len(),
+            "md5Checksum": md5,
+            "chunkPlan": plan,
+        },
+    });
+    let call = |method: &str, url: &str, body: &[u8]| -> Result<String, E> {
+        let (status, text) = session
+            .send_csrf_with_timeout(method, url, "application/json", body, Some(Duration::from_secs(60)))
+            .map_err(|e| error(e.0))?;
+        check_reply(status, text)
+    };
+    let reply = call(method, start_url, start.to_string().as_bytes())?;
+    let reply: Value = serde_json::from_str(&reply)
+        .map_err(|e| error(format!("Invalid multipart upload reply: {e}")))?;
+    let operation = reply
+        .get("operationPath")
+        .and_then(Value::as_str)
+        .and_then(|p| p.strip_prefix("operations/"))
+        .filter(|id| {
+            !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or_else(|| error("Multipart upload reply has no valid operationPath".into()))?;
+    let base = format!("{apis}{OPERATIONS_PATH}/{operation}");
+    let urls = reply
+        .get("uploadUrls")
+        .and_then(Value::as_array)
+        .filter(|urls| !urls.is_empty())
+        .ok_or_else(|| error("Multipart upload reply has no uploadUrls".into()))?;
+    let number = |v: Option<&Value>| -> Option<usize> {
+        v.and_then(|v| v.as_u64().map(|n| n as usize).or_else(|| v.as_str()?.parse().ok()))
+    };
+    let s3: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(S3_TIMEOUT))
+        .build()
+        .into();
+    for part in urls {
+        let chunk = number(part.get("chunkNum"))
+            .ok_or_else(|| error("Multipart upload URL has no chunkNum".into()))?;
+        let start = number(part.get("contentStart")).unwrap_or(0);
+        let len = number(part.get("contentLength"))
+            .ok_or_else(|| error(format!("Multipart chunk {chunk} has no contentLength")))?;
+        let piece = start
+            .checked_add(len)
+            .and_then(|end| bytes.get(start..end))
+            .ok_or_else(|| error(format!("Multipart chunk {chunk} is outside the file")))?;
+        let url = part
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| u.starts_with("https://"))
+            .ok_or_else(|| error(format!("Multipart chunk {chunk} has no https upload URL")))?;
+        let verb = part.get("httpVerb").and_then(Value::as_str).unwrap_or("PUT");
+        if verb != "PUT" {
+            return Err(error(format!("Multipart chunk {chunk} wants HTTP {verb}")));
+        }
+        let mut sent = None;
+        for _ in 0..3 {
+            match s3.put(url).send(piece) {
+                Ok(r) if r.status().is_success() => {
+                    sent = r.headers().get("etag").and_then(|h| h.to_str().ok()).map(str::to_owned);
+                    if sent.is_some() {
+                        break;
+                    }
+                }
+                _ => std::thread::sleep(Duration::from_secs(1)),
+            }
+        }
+        let etag = sent.ok_or_else(|| error(format!("Uploading chunk {chunk} to storage failed")))?;
+        let done = serde_json::json!({ "chunkNum": chunk, "etag": etag });
+        call("POST", &format!("{base}:multipartUploadChunkComplete"), done.to_string().as_bytes())?;
+    }
+    call("POST", &format!("{base}:multipartUploadComplete"), b"{}")
+}

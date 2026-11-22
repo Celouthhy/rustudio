@@ -179,6 +179,10 @@ struct LiveView {
     publish_service: Option<u64>,
     save_pending: Option<LiveSave>,
     sync_failed: bool,
+    /// The last poll ran out of time with events still queued (the server's
+    /// backlog after a long Play): the next poll gets a bigger budget so the
+    /// catch-up ends quickly instead of replaying collaborators' cameras.
+    backlogged: bool,
     drafts: crate::live_drafts::DraftStore,
     script_service: Option<u64>,
     script_configuration_sent: bool,
@@ -204,7 +208,7 @@ struct LiveView {
     last_active: Option<bool>,
     /// The place's saved terrain voxels (SmoothGrid), fetched when the join
     /// brought a Terrain without any (`saved_terrain`).
-    saved_terrain: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    saved_terrain: Option<std::sync::mpsc::Receiver<SavedPlaceTerrain>>,
     terrain_lods: HashMap<[i32; 3], u8>,
 }
 
@@ -212,6 +216,8 @@ pub struct CloudUi {
     /// File > Open from Roblox.
     pub open: bool,
     pub live_collaborators_open: bool,
+    /// Projected 2D name labels for active Team Create collaborators (drawn in `viewport.rs`).
+    pub collaborator_labels: Vec<(glam::Vec3, String)>,
     /// File > Experience Settings (the place's info).
     pub settings_open: bool,
     pub tab: PickerTab,
@@ -320,6 +326,7 @@ impl CloudUi {
         CloudUi {
             open: false,
             live_collaborators_open: false,
+            collaborator_labels: Vec::new(),
             settings_open: false,
             tab: PickerTab::Recent,
             cache: PlaceCache::default(),
@@ -620,8 +627,12 @@ impl CloudUi {
             let result = (|| {
                 let mut api = api.ok_or_else(|| "Sign in to save or publish places to Roblox".to_owned())?;
                 api.session = api.session.with_timeout(std::time::Duration::from_secs(20));
+                // Studio compresses uploaded place chunks with zstd
+                // (DFFlagStudioZstdPlaceUploadCompressionRollout).
                 let mut bytes = Vec::new();
-                rbx_binary::to_writer(&mut bytes, &dom, &roots)
+                rbx_binary::Serializer::new()
+                    .compression_type(rbx_binary::CompressionType::Zstd)
+                    .serialize(&mut bytes, &dom, &roots)
                     .map_err(|err| format!("Could not encode the place: {err}"))?;
                 let (mut origin, outcome) = if let Some(origin) = job.origin.take() {
                     let outcome = api.save_place(&origin, &bytes, false, job.vt, overwrite)
@@ -753,7 +764,11 @@ impl Editor {
         if let Some(o) = self.cloud.take_opened() {
             self.set_cloud_document(o);
         }
+        self.game.extra_adorn.clear();
+        self.game.extra_highlights.clear();
+        self.cloud.collaborator_labels.clear();
         self.poll_live_team_create(ctx);
+        self.collect_debug_collaborators();
         if self.cloud.jobs == 0 {
             self.cloud.opening = 0;
         }
@@ -844,7 +859,7 @@ impl Editor {
                 self.cloud.live = Some(LiveView {
                     session, model: rustudio_net::model::LiveModel::new(),
                     origin: self.cloud.live_origin.take(), place, universe, document_id: None, requested_document_id: self.game.doc.id,
-                    owner_user: None, own_player: None, publish_service: None, save_pending: None, sync_failed: false, drafts: crate::live_drafts::DraftStore::for_place(place), script_service: None, script_configuration_sent: false, next_script_request: 1, script_commits: HashMap::new(),
+                    owner_user: None, own_player: None, publish_service: None, save_pending: None, sync_failed: false, backlogged: false, drafts: crate::live_drafts::DraftStore::for_place(place), script_service: None, script_configuration_sent: false, next_script_request: 1, script_commits: HashMap::new(),
                     last_presence: std::time::Instant::now(), last_camera: None, labels: HashMap::new(), deleted: HashMap::new(), sent: Default::default(), unsynced: Vec::new(), collaborators: HashSet::new(), players: HashMap::new(), selections: HashMap::new(), last_selection: None, last_activity: std::time::Instant::now(), last_active: None, saved_terrain: None, terrain_lods: HashMap::new(),
                 });
                 self.info(format!("Joining live Team Create place {place}…"));
@@ -954,6 +969,7 @@ impl Editor {
     /// Sends one frame's journal marks, planned by [`crate::live_sync`].
     fn send_live_edits(&mut self, live: &mut LiveView, marks: &[rustudio_core::doc::Mark]) {
         use crate::live_sync::LiveOp;
+        crate::live_sync::renew_shared_script_guids(&mut self.game.doc, &live.model, marks);
         let session = &live.session;
         let plan = crate::live_sync::plan(&self.game.doc, &mut live.model, marks, &mut || session.allocate_id().map_err(|e| e.to_string()));
         for message in plan.skipped {
@@ -1106,14 +1122,63 @@ impl Editor {
         let was_dirty = self.game.doc.dirty();
         // The saved terrain arrived (see `saved_terrain`): it goes in as the
         // server's own data, never sent back.
-        if let Some(bytes) = live.saved_terrain.as_ref().and_then(|rx| rx.try_recv().ok()) {
+        if let Some(saved) = live.saved_terrain.as_ref().and_then(|rx| rx.try_recv().ok()) {
             live.saved_terrain = None;
             if live.document_id == Some(self.game.doc.id) {
-                if let Some(terrain) = live_terrain_without_voxels(&self.game.doc) {
-                    if let Some(inst) = self.game.doc.dom.get_by_ref_mut(terrain) {
-                        inst.properties.insert("SmoothGrid".into(), rbx_types::Variant::BinaryString(bytes.into()));
-                        live_marks.push(rustudio_core::doc::Mark::Prop(terrain, "SmoothGrid".into()));
-                        changed = true;
+                let mut loaded_voxels = false;
+                let mut loaded_style = false;
+                if let Some(ws) = self.game.doc.workspace() {
+                    if let Some(terrain) = self.game.doc.find_child(ws, "Terrain") {
+                        let need_voxels = live_terrain_without_voxels(&self.game.doc) == Some(terrain);
+                        if let Some(inst) = self.game.doc.dom.get_by_ref_mut(terrain) {
+                            if need_voxels {
+                                if let Some(grid) = saved.smooth_grid {
+                                    inst.properties.insert("SmoothGrid".into(), rbx_types::Variant::BinaryString(grid.into()));
+                                    live_marks.push(rustudio_core::doc::Mark::Prop(terrain, "SmoothGrid".into()));
+                                    loaded_voxels = true;
+                                }
+                            }
+                            if !inst.properties.contains_key(&rbx_dom_weak::ustr("MaterialColors")) {
+                                if let Some(colors) = saved.material_colors {
+                                    inst.properties.insert("MaterialColors".into(), rbx_types::Variant::BinaryString(colors.into()));
+                                    live_marks.push(rustudio_core::doc::Mark::Prop(terrain, "MaterialColors".into()));
+                                    loaded_style = true;
+                                }
+                            }
+                            if !inst.properties.contains_key(&rbx_dom_weak::ustr("GrassLength")) {
+                                if let Some(gl) = saved.grass_length {
+                                    inst.properties.insert("GrassLength".into(), rbx_types::Variant::Float32(gl));
+                                    live_marks.push(rustudio_core::doc::Mark::Prop(terrain, "GrassLength".into()));
+                                    loaded_style = true;
+                                }
+                            }
+                            if !inst.properties.contains_key(&rbx_dom_weak::ustr("Decoration")) {
+                                if let Some(dec) = saved.decoration {
+                                    inst.properties.insert("Decoration".into(), rbx_types::Variant::Bool(dec));
+                                    live_marks.push(rustudio_core::doc::Mark::Prop(terrain, "Decoration".into()));
+                                    loaded_style = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(use_2022) = saved.use_2022_materials {
+                    let root = self.game.doc.dom.root_ref();
+                    if let Some(ms) = self.game.doc.find_child(root, "MaterialService") {
+                        if let Some(inst) = self.game.doc.dom.get_by_ref_mut(ms) {
+                            let has_2022 = inst.properties.contains_key(&rbx_dom_weak::ustr("Use2022Materials"))
+                                || inst.properties.contains_key(&rbx_dom_weak::ustr("Use2022MaterialsXml"));
+                            if !has_2022 {
+                                inst.properties.insert("Use2022MaterialsXml".into(), rbx_types::Variant::Bool(use_2022));
+                                live_marks.push(rustudio_core::doc::Mark::Prop(ms, "Use2022MaterialsXml".into()));
+                                loaded_style = true;
+                            }
+                        }
+                    }
+                }
+                if loaded_voxels || loaded_style {
+                    changed = true;
+                    if loaded_voxels {
                         self.info("Team Create: terrain loaded from the place's saved version");
                     }
                 }
@@ -1121,10 +1186,15 @@ impl Editor {
         }
         // Limit UI work per frame while retaining the stream's batch ordering.
         let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(12) {
+        let budget = std::time::Duration::from_millis(if live.backlogged { 60 } else { 12 });
+        live.backlogged = true;
+        while started.elapsed() < budget {
             let event = match live.session.events.try_recv() {
                 Ok(event) => event,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    live.backlogged = false;
+                    break;
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.warn("Team Create connection ended"); self.note_live_ended(&live, "the connection ended"); self.report_live_loss(&live); keep = false; break;
                 }
@@ -1149,7 +1219,7 @@ impl Editor {
                             terrain_packets.push((id, chunks));
                             continue;
                         }
-                        if let rustudio_net::replicator::RepOp::NewInstance { id, .. } | rustudio_net::replicator::RepOp::ChangeProperty { id, .. } | rustudio_net::replicator::RepOp::Reparent { id, .. } = &op {
+                        if let rustudio_net::replicator::RepOp::NewInstance { id, .. } | rustudio_net::replicator::RepOp::ChangeProperty { id, .. } | rustudio_net::replicator::RepOp::ChangeAttribute { id, .. } | rustudio_net::replicator::RepOp::Reparent { id, .. } = &op {
                             if let Some(label) = live.deleted.remove(id) {
                                 let message = format!("{label}: the server still has it (it sent a change to it after the delete); delete it again or in Roblox Studio");
                                 log::warn!("Team Create (place={}): {message} ({id:#x})", live.place);
@@ -1237,6 +1307,7 @@ impl Editor {
                         let touched = match &op {
                             Op::NewInstance { id, .. } | Op::Reparent { id, .. } => Some((*id, None)),
                             Op::ChangeProperty { id, name, .. } => Some((*id, Some(name.clone()))),
+                            Op::ChangeAttribute { id, .. } => Some((*id, Some("Attributes".to_string()))),
                             Op::DeleteInstance { .. } => { live_rebuild = true; None }
                             Op::JoinDataBegin => { live_rebuild = true; None }
                             // A listed service may be made here, with children parked for it.
@@ -1315,8 +1386,9 @@ impl Editor {
                         live.script_service=self.game.doc.dom.descendants().find(|i|i.class.as_str()=="LiveScriptingService").and_then(|i|live.model.server_id(i.referent()));
                         self.cloud.open = false;
                         self.info(format!("Joined live Team Create place {}: {} instances", live.place, live.model.instance_count()));
-                        if live.terrain_lods.is_empty() && terrain_packets.is_empty()
-                            && live_terrain_without_voxels(&self.game.doc).is_some()
+                        if (live.terrain_lods.is_empty() && terrain_packets.is_empty()
+                            && live_terrain_without_voxels(&self.game.doc).is_some())
+                            || live_missing_terrain_style(&self.game.doc)
                         {
                             live.saved_terrain = self.game.account.shared_client().and_then(|client| saved_terrain(client, live.place));
                         }
@@ -1421,34 +1493,8 @@ impl Editor {
             }
             live.last_presence = std::time::Instant::now();
         }
-        if live.document_id.is_some() && self.hud.viewport_drawn && self.game.viewport_rect.is_positive() {
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("live_collaborator_cameras"))).with_clip_rect(self.game.viewport_rect);
-            for reference in &live.collaborators {
-                let Some(inst) = self.game.doc.dom.get_by_ref(*reference) else { continue; };
-                if matches!(inst.properties.get(&"UserId".into()), Some(rbx_types::Variant::Int64(id)) if Some(*id as u64)==live.owner_user) { continue; }
-                let color = match inst.properties.get(&"CollaboratorColor3".into()) {
-                    Some(rbx_types::Variant::Color3(c)) => egui::Color32::from_rgb((c.r*255.0) as u8,(c.g*255.0) as u8,(c.b*255.0) as u8),
-                    _ => egui::Color32::from_rgb(80,190,255),
-                };
-                let user=inst.properties.get(&"UserId".into()).and_then(|v|if let rbx_types::Variant::Int64(user)=v {Some(*user as u64)} else {None});
-                if let Some(player)=live.players.iter().find_map(|(player,u)| (Some(*u)==user).then_some(*player)) {
-                    if let Some(selection)=live.selections.get(&player) {
-                        for id in selection {
-                            if let Some(reference)=live.model.reference(*id) {
-                                if let Some(part)=self.game.scene.get(reference) {self.draw_box(&painter,self.game.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}
-                                else {for inst in self.game.doc.dom.descendants_of(reference).take(512) {if let Some(part)=self.game.scene.get(inst.referent()) {self.draw_box(&painter,self.game.viewport_rect,&part.xf,part.size,egui::Stroke::new(1.5,color));}}}
-                            }
-                        }
-                    }
-                }
-                let Some(rbx_types::Variant::CFrame(frame)) = inst.properties.get(&"CFrame".into()) else { continue; };
-                let world = glam::Vec3::new(frame.position.x, frame.position.y, frame.position.z);
-                let Some(point) = self.game.cam.project(self.game.viewport_rect, world) else { continue; };
-                if !self.game.viewport_rect.contains(point) { continue; }
-                let name = match inst.properties.get(&"Username".into()) { Some(rbx_types::Variant::String(s)) => s.as_str(), _ => inst.name.as_str() };
-                painter.rect_filled(egui::Rect::from_center_size(point, egui::vec2(12.0,9.0)), 2.0, color);
-                painter.text(point+egui::vec2(0.0,11.0), egui::Align2::CENTER_TOP, name, egui::FontId::proportional(12.0), color);
-            }
+        if live.document_id.is_some() {
+            self.collect_live_collaborators(&live);
         }
         let timed_out:Vec<_>=live.script_commits.iter().filter_map(|(request,(_,sent,_))| (sent.elapsed()>std::time::Duration::from_secs(60)).then_some(*request)).collect();
         for request in timed_out {live.script_commits.remove(&request);self.warn("The server has not confirmed the script commit; the local draft is retained");}
@@ -1458,6 +1504,170 @@ impl Editor {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else {
             self.fail_live_save(&mut live, "Team Create disconnected before confirming the save; check Version History before retrying");
+        }
+    }
+
+    fn collect_live_collaborators(&mut self, live: &LiveView) {
+        let mut entries: Vec<(f32, rustudio_core::math::Xform, [f32; 3], String)> = Vec::new();
+        for reference in &live.collaborators {
+            let Some(inst) = self.game.doc.dom.get_by_ref(*reference) else { continue; };
+            // Studio 0.748 CloudEditAdornable: skip local player.
+            let user = inst.properties.get(&"UserId".into()).and_then(|v| match v {
+                rbx_types::Variant::Int64(id) => Some(*id as u64),
+                _ => None,
+            });
+            if user.is_some() && user == live.owner_user {
+                continue;
+            }
+            let player_server_id = live.players.iter().find_map(|(p, u)| (Some(*u) == user).then_some(*p));
+            let player_inst = player_server_id
+                .and_then(|id| live.model.reference(id))
+                .and_then(|r| self.game.doc.dom.get_by_ref(r));
+            // Studio 0.748: skip idle collaborators
+            // (`Collaborator.IsIdle`, or `!Player.CloudEditPlayerActive` if absent).
+            let is_idle = match inst.properties.get(&"IsIdle".into()) {
+                Some(rbx_types::Variant::Bool(b)) => *b,
+                _ => player_inst.is_some_and(|p| matches!(
+                    p.properties.get(&"CloudEditPlayerActive".into()),
+                    Some(rbx_types::Variant::Bool(false))
+                )),
+            };
+            if is_idle {
+                continue;
+            }
+            // Studio 0.748: CollaboratorColor3.
+            let color = match inst.properties.get(&"CollaboratorColor3".into()) {
+                Some(rbx_types::Variant::Color3(c)) => [c.r, c.g, c.b],
+                _ => [80.0 / 255.0, 190.0 / 255.0, 1.0],
+            };
+            // Studio 0.748 collaborator selection Highlight:
+            // FillColor = OutlineColor = CollaboratorColor3, FillTransparency = 0.75 (alpha 0.25),
+            // OutlineTransparency = 0.0 (alpha 1.0), DepthMode = Occluded (on_top = false).
+            if let Some(selection) = player_server_id.and_then(|id| live.selections.get(&id)) {
+                let mut items = Vec::new();
+                for id in selection {
+                    let Some(sel_ref) = live.model.reference(*id) else { continue; };
+                    if self.game.scene.get(sel_ref).is_some() {
+                        items.push(sel_ref);
+                    } else {
+                        for desc in self.game.doc.dom.descendants_of(sel_ref).take(512) {
+                            if self.game.scene.get(desc.referent()).is_some() {
+                                items.push(desc.referent());
+                            }
+                        }
+                    }
+                }
+                if !items.is_empty() {
+                    self.game.extra_highlights.push(rustudio_render::highlight::HighlightDraw {
+                        items,
+                        fill: [color[0], color[1], color[2], 0.25],
+                        outline: [color[0], color[1], color[2], 1.0],
+                        on_top: false,
+                    });
+                }
+            }
+            // Studio 0.748: reads Player.CloudEditCameraCoordinateFrame,
+            // falling back to Collaborator.CFrame if the Player lacks it.
+            let cframe = player_inst
+                .and_then(|p| match p.properties.get(&"CloudEditCameraCoordinateFrame".into()) {
+                    Some(rbx_types::Variant::CFrame(cf)) => Some(*cf),
+                    _ => None,
+                })
+                .or_else(|| match inst.properties.get(&"CFrame".into()) {
+                    Some(rbx_types::Variant::CFrame(cf)) => Some(*cf),
+                    _ => None,
+                });
+            let Some(frame) = cframe else { continue; };
+            let xf = rustudio_core::math::Xform::from_cframe(&frame);
+            let name = player_inst
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| match inst.properties.get(&"Username".into()) {
+                    Some(rbx_types::Variant::String(s)) => s.clone(),
+                    _ => inst.name.clone(),
+                });
+            let dist_sq = (xf.pos - self.game.cam.pos).length_squared();
+            entries.push((dist_sq, xf, color, name));
+        }
+        // Far-to-near for translucent gizmos.
+        entries.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, xf, color, name) in entries {
+            self.game.extra_adorn.extend(rustudio_render::adorn::collaborator_camera_draws(xf, color));
+            self.cloud.collaborator_labels.push((xf.pos, name));
+        }
+    }
+
+    /// Test/visual-check hook: `RUSTUDIO_DEBUG_COLLABORATORS` injects fake
+    /// collaborators without a live Team Create session.
+    /// Format (semicolon-separated entries):
+    /// `name,x,y,z,yaw_deg,pitch_deg,r,g,b[,idle[,select_part_name]]`
+    fn collect_debug_collaborators(&mut self) {
+        let Ok(spec) = std::env::var("RUSTUDIO_DEBUG_COLLABORATORS") else { return; };
+        if spec.trim().is_empty() {
+            return;
+        }
+        let mut entries: Vec<(f32, rustudio_core::math::Xform, [f32; 3], String)> = Vec::new();
+        for raw in spec.split(';') {
+            let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+            if parts.len() < 9 {
+                continue;
+            }
+            let name = parts[0].to_string();
+            let (Ok(x), Ok(y), Ok(z), Ok(yaw), Ok(pitch), Ok(r), Ok(g), Ok(b)) = (
+                parts[1].parse::<f32>(),
+                parts[2].parse::<f32>(),
+                parts[3].parse::<f32>(),
+                parts[4].parse::<f32>(),
+                parts[5].parse::<f32>(),
+                parts[6].parse::<f32>(),
+                parts[7].parse::<f32>(),
+                parts[8].parse::<f32>(),
+            ) else { continue; };
+            let is_idle = parts.get(9).is_some_and(|v| matches!(*v, "1" | "true" | "idle"));
+            if is_idle {
+                continue;
+            }
+            let color = [r, g, b];
+            if let Some(sel_name) = parts.get(10).filter(|s| !s.is_empty()) {
+                if let Some(ws) = self.game.doc.workspace() {
+                    let items: Vec<rbx_types::Ref> = self
+                        .game
+                        .doc
+                        .dom
+                        .descendants_of(ws)
+                        .filter(|i| i.name == *sel_name)
+                        .flat_map(|i| {
+                            let r = i.referent();
+                            if self.game.scene.get(r).is_some() {
+                                vec![r]
+                            } else {
+                                self.game
+                                    .doc
+                                    .dom
+                                    .descendants_of(r)
+                                    .filter_map(|d| self.game.scene.get(d.referent()).map(|_| d.referent()))
+                                    .collect()
+                            }
+                        })
+                        .collect();
+                    if !items.is_empty() {
+                        self.game.extra_highlights.push(rustudio_render::highlight::HighlightDraw {
+                            items,
+                            fill: [color[0], color[1], color[2], 0.25],
+                            outline: [color[0], color[1], color[2], 1.0],
+                            on_top: false,
+                        });
+                    }
+                }
+            }
+            let rot = glam::Mat3::from_euler(glam::EulerRot::YXZ, yaw.to_radians(), pitch.to_radians(), 0.0);
+            let xf = rustudio_core::math::Xform { pos: glam::Vec3::new(x, y, z), rot };
+            let dist_sq = (xf.pos - self.game.cam.pos).length_squared();
+            entries.push((dist_sq, xf, color, name));
+        }
+        entries.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, xf, color, name) in entries {
+            self.game.extra_adorn.extend(rustudio_render::adorn::collaborator_camera_draws(xf, color));
+            self.cloud.collaborator_labels.push((xf.pos, name));
         }
     }
 
@@ -2379,8 +2589,11 @@ fn write_live_terrain(
     applied
 }
 
-/// Apply the finest received LOD for each 16-voxel box. The server can send
-/// several updates to the same box, including an empty update that clears it.
+/// Apply received terrain chunks. Live edits (mode 2), non-streaming packets
+/// (`mode: None`), and empty clear chunks (e.g. `lod = 3, size_log2 = 1`
+/// clears sent after carving/cleanup) always overwrite the box; streamed
+/// non-empty chunks only overwrite if their LOD is at least as fine as the
+/// last applied LOD for that origin.
 fn apply_live_terrain(
     grid: &mut rustudio_core::terrain::Voxels,
     lods: &mut HashMap<[i32; 3], u8>,
@@ -2391,7 +2604,8 @@ fn apply_live_terrain(
 
     let mut applied = 0;
     let cells = chunks.into_iter().flat_map(|mut chunk| {
-        let selected = lods.get(&chunk.origin).is_none_or(|lod| chunk.lod <= *lod)
+        let authoritative = chunk.runs.is_empty() || matches!(chunk.mode, None | Some(2));
+        let selected = (authoritative || lods.get(&chunk.origin).is_none_or(|lod| chunk.lod <= *lod))
             && chunk.runs.iter().all(|run| material_name(run.material) != "Unknown");
         if !selected {
             return Vec::new();
@@ -2451,38 +2665,123 @@ fn live_terrain_without_voxels(doc: &Document) -> Option<rbx_types::Ref> {
     empty.then_some(terrain)
 }
 
+/// True when the live Team Create DOM is missing Terrain/MaterialService
+/// styling properties that are stored in the place file (MaterialColors,
+/// GrassLength, Decoration, or MaterialService.Use2022Materials*).
+fn live_missing_terrain_style(doc: &rustudio_core::doc::Document) -> bool {
+    let missing_terrain = doc
+        .workspace()
+        .and_then(|ws| doc.find_child(ws, "Terrain"))
+        .and_then(|t| doc.dom.get_by_ref(t))
+        .is_some_and(|i| {
+            !i.properties.contains_key(&rbx_dom_weak::ustr("MaterialColors"))
+                || !i.properties.contains_key(&rbx_dom_weak::ustr("GrassLength"))
+                || !i.properties.contains_key(&rbx_dom_weak::ustr("Decoration"))
+        });
+    let missing_2022 = doc
+        .find_child(doc.dom.root_ref(), "MaterialService")
+        .and_then(|ms| doc.dom.get_by_ref(ms))
+        .is_some_and(|i| {
+            !i.properties.contains_key(&rbx_dom_weak::ustr("Use2022Materials"))
+                && !i.properties.contains_key(&rbx_dom_weak::ustr("Use2022MaterialsXml"))
+        });
+    missing_terrain || missing_2022
+}
+
+/// Terrain voxels and material/grass styling recovered from a place's saved
+/// RBXL when the Team Create stream omits them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SavedPlaceTerrain {
+    pub smooth_grid: Option<Vec<u8>>,
+    pub material_colors: Option<Vec<u8>>,
+    pub grass_length: Option<f32>,
+    pub decoration: Option<bool>,
+    pub use_2022_materials: Option<bool>,
+}
+
+impl SavedPlaceTerrain {
+    fn is_empty(&self) -> bool {
+        self.smooth_grid.is_none()
+            && self.material_colors.is_none()
+            && self.grass_length.is_none()
+            && self.decoration.is_none()
+            && self.use_2022_materials.is_none()
+    }
+}
+
 /// Fetches the place's latest saved version on a worker and hands back its
-/// Terrain.SmoothGrid when it has voxels.
-fn saved_terrain(client: rustudio_core::assets::SharedClient, place: u64) -> Option<std::sync::mpsc::Receiver<Vec<u8>>> {
+/// Terrain voxels and material/grass styling properties.
+fn saved_terrain(client: rustudio_core::assets::SharedClient, place: u64) -> Option<std::sync::mpsc::Receiver<SavedPlaceTerrain>> {
     let session = client.lock().ok()?.as_ref()?.session.downloader();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("tc-saved-terrain".into())
         .spawn(move || {
             let Ok(bytes) = session.download_asset(place, None) else { return };
-            if let Some(grid) = smooth_grid_of_place(&bytes) {
-                let _ = tx.send(grid);
+            if let Some(saved) = saved_place_terrain_of_place(&bytes) {
+                let _ = tx.send(saved);
             }
         })
         .ok()?;
     Some(rx)
 }
 
-/// Terrain.SmoothGrid of a place file (binary or XML), when it holds voxels.
-pub(crate) fn smooth_grid_of_place(bytes: &[u8]) -> Option<Vec<u8>> {
+/// Terrain voxels + MaterialColors/GrassLength/Decoration + MaterialService
+/// Use2022Materials from a place file (binary or XML).
+pub(crate) fn saved_place_terrain_of_place(bytes: &[u8]) -> Option<SavedPlaceTerrain> {
     let dom = if bytes.starts_with(b"<roblox!") {
         rbx_binary::from_reader(bytes).ok()?
     } else {
         rbx_xml::from_reader_default(bytes).ok()?
     };
-    let ws = dom.root().children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class.as_str() == "Workspace")?;
-    let terrain = ws.children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class.as_str() == "Terrain")?;
-    let grid: Vec<u8> = match terrain.properties.get(&rbx_dom_weak::ustr("SmoothGrid"))? {
-        rbx_types::Variant::BinaryString(b) => { let s: &[u8] = b.as_ref(); s.to_vec() }
-        rbx_types::Variant::SharedString(s) => s.data().to_vec(),
-        _ => return None,
-    };
-    (grid.len() > 2).then_some(grid)
+    let mut out = SavedPlaceTerrain::default();
+    if let Some(ws) = dom.root().children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class.as_str() == "Workspace") {
+        if let Some(terrain) = ws.children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class.as_str() == "Terrain") {
+            if let Some(grid) = terrain.properties.get(&rbx_dom_weak::ustr("SmoothGrid")).and_then(|v| match v {
+                rbx_types::Variant::BinaryString(b) => { let s: &[u8] = b.as_ref(); Some(s.to_vec()) }
+                rbx_types::Variant::SharedString(s) => Some(s.data().to_vec()),
+                _ => None,
+            }) {
+                if grid.len() > 2 {
+                    out.smooth_grid = Some(grid);
+                }
+            }
+            out.material_colors = terrain
+                .properties
+                .get(&rbx_dom_weak::ustr("MaterialColors"))
+                .and_then(rustudio_core::terrain_mat::material_colors_bytes);
+            out.grass_length = terrain
+                .properties
+                .get(&rbx_dom_weak::ustr("GrassLength"))
+                .and_then(|v| match v {
+                    rbx_types::Variant::Float32(f) => Some(*f),
+                    rbx_types::Variant::Float64(f) => Some(*f as f32),
+                    _ => None,
+                });
+            out.decoration = terrain
+                .properties
+                .get(&rbx_dom_weak::ustr("Decoration"))
+                .and_then(|v| match v {
+                    rbx_types::Variant::Bool(b) => Some(*b),
+                    _ => None,
+                });
+        }
+    }
+    if let Some(ms) = dom.root().children().iter().filter_map(|r| dom.get_by_ref(*r)).find(|i| i.class.as_str() == "MaterialService") {
+        out.use_2022_materials = ["Use2022Materials", "Use2022MaterialsXml"].iter().find_map(|k| {
+            match ms.properties.get(&rbx_dom_weak::ustr(k)) {
+                Some(rbx_types::Variant::Bool(b)) => Some(*b),
+                _ => None,
+            }
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Terrain.SmoothGrid of a place file (binary or XML), when it holds voxels.
+#[cfg(test)]
+pub(crate) fn smooth_grid_of_place(bytes: &[u8]) -> Option<Vec<u8>> {
+    saved_place_terrain_of_place(bytes)?.smooth_grid
 }
 
 #[cfg(test)]
@@ -2572,5 +2871,32 @@ mod saved_terrain_tests {
         assert_eq!(super::smooth_grid_of_place(&place(Some(grid.clone()))), Some(grid));
         assert_eq!(super::smooth_grid_of_place(&place(Some(vec![1, 5]))), None);
         assert_eq!(super::smooth_grid_of_place(&place(None)), None);
+    }
+
+    #[test]
+    fn saved_place_terrain_recovers_material_colors_grass_and_2022() {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let ws = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace").with_name("Workspace"));
+        let mut colors = vec![0u8; 69];
+        colors[12..15].copy_from_slice(&[104, 113, 93]);
+        let terrain = InstanceBuilder::new("Terrain")
+            .with_name("Terrain")
+            .with_property("MaterialColors", rbx_types::BinaryString::from(colors.clone()))
+            .with_property("GrassLength", 0.3f32)
+            .with_property("Decoration", true);
+        dom.insert(ws, terrain);
+        let ms = dom.insert(
+            dom.root_ref(),
+            InstanceBuilder::new("MaterialService")
+                .with_name("MaterialService")
+                .with_property("Use2022MaterialsXml", true),
+        );
+        let mut out = Vec::new();
+        rbx_binary::to_writer(&mut out, &dom, &[ws, ms]).unwrap();
+        let saved = super::saved_place_terrain_of_place(&out).expect("saved terrain style");
+        assert_eq!(saved.material_colors, Some(colors));
+        assert_eq!(saved.grass_length, Some(0.3));
+        assert_eq!(saved.decoration, Some(true));
+        assert_eq!(saved.use_2022_materials, Some(true));
     }
 }

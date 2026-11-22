@@ -25,7 +25,7 @@ use rbx_types::{Ref, Variant};
 use rustudio_core::doc::{Document, Mark};
 use rustudio_net::model::LiveModel;
 use rustudio_net::replicator::PropValue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// One edit for the server, in send order.
 #[derive(Debug)]
@@ -111,6 +111,8 @@ pub fn plan(
         }
     }
     let mut created = HashSet::new();
+    // Reference properties of new instances, sent once every create is out.
+    let mut deferred: Vec<(Ref, String)> = Vec::new();
     for top in create_roots {
         let Some(parent) = doc.dom.get_by_ref(top).and_then(|i| model.server_id(i.parent())) else {
             out.unsynced.push(format!(
@@ -146,7 +148,7 @@ pub fn plan(
             };
             model.bind_local(id, r);
             created.insert(r);
-            let props = create_props(doc, model, r, &mut out.skipped);
+            let props = create_props(doc, model, r, &mut out.skipped, &mut deferred);
             out.ops.push(LiveOp::Create { reference: r, id, class: inst.class.to_string(), parent, props });
             queue.extend(inst.children().iter().map(|&c| (c, id)));
         }
@@ -160,6 +162,19 @@ pub fn plan(
         match model.server_id(inst.parent()) {
             Some(parent) => out.ops.push(LiveOp::Reparent { reference: r, id, parent }),
             None => out.unsynced.push(format!("{}: moved under an instance that is not on the server", path(doc, r))),
+        }
+    }
+    // A NewObject carrying any Ref-typed property (Motor6D.Part0,
+    // ObjectValue.Value, even a nil one) resets the session (0x104), while
+    // the same value sent as a property change after the create is applied
+    // (live probes on a test place, 2026-11-21). Sent here, after every
+    // create, they can also name instances created later in the same tree
+    // (a Model's PrimaryPart).
+    for (r, name) in deferred {
+        let (Some(id), Some(inst)) = (model.server_id(r), doc.dom.get_by_ref(r)) else { continue };
+        match doc.prop(r, &name).as_ref().and_then(|v| live_value(v, model)) {
+            Some(value) => out.ops.push(LiveOp::Property { reference: r, id, class: inst.class.to_string(), name, value }),
+            None => out.unsynced.push(format!("{}.{name}: refers to an instance that is not on the Team Create server", path(doc, r))),
         }
     }
     let mut props_seen = HashSet::new();
@@ -179,6 +194,9 @@ pub fn plan(
         // Not replicated (the server's schema has only TimeOfDay, its twin,
         // which is marked with it): sending it would fail Lighting's edits.
         if name.as_str() == "ClockTime" && inst.class.as_str() == "Lighting" {
+            continue;
+        }
+        if server_owned(inst.class.as_str(), name.as_str()) {
             continue;
         }
         if name.as_str() == "Source" {
@@ -244,16 +262,24 @@ fn in_place(doc: &Document, r: Ref) -> bool {
 /// plugin made with RunContext = Legacy and Disabled = false set explicitly,
 /// while ModuleScripts (no such properties) went through. A value without a
 /// wire form is left out and reported; the rest of the instance is created.
-fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<String>) -> Vec<(String, PropValue)> {
+fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<String>, deferred: &mut Vec<(Ref, String)>) -> Vec<(String, PropValue)> {
     let Some(inst) = doc.dom.get_by_ref(r) else { return Vec::new() };
-    let db = rustudio_core::doc::db();
-    let class = db.classes.get(inst.class.as_str());
     let mut props = vec![("Name".to_string(), PropValue::String(inst.name.clone()))];
     let mut names: Vec<_> = inst.properties.iter().collect();
     names.sort_by_key(|(name, _)| name.as_str());
     for (name, value) in names {
+        if server_owned(inst.class.as_str(), name.as_str()) {
+            continue;
+        }
         let always = matches!(name.as_str(), "Source" | "ScriptGuid");
-        if !always && class.and_then(|c| db.find_default_property(c, name.as_str())) == Some(value) {
+        // The server's default is the constructor's (Studio's measured
+        // values where the reflection database is wrong: a Part's Smooth
+        // top, the database's default, has to be sent, or it is Studs).
+        if !always && rustudio_core::doc::class_default(inst.class.as_str(), name.as_str()).as_ref() == Some(value) {
+            continue;
+        }
+        if matches!(value, Variant::Ref(_)) {
+            deferred.push((r, name.to_string()));
             continue;
         }
         match live_value(value, model) {
@@ -262,6 +288,75 @@ fn create_props(doc: &Document, model: &LiveModel, r: Ref, skipped: &mut Vec<Str
         }
     }
     props
+}
+
+/// A new script (not yet on the server) whose ScriptGuid another script in
+/// the place already has gets a fresh one before it is sent, as Studio gives
+/// copies their own (not a server rule: the test-place resets of
+/// 2026-11-21 were re-sent shared strings, see writer::SharedSent). Paste,
+/// duplicate and insert renew them already; this covers Clone() from
+/// plugins, MCP and the command bar.
+pub fn renew_shared_script_guids(doc: &mut Document, model: &LiveModel, marks: &[Mark]) {
+    let guid_of = |doc: &Document, r: Ref| match doc.dom.get_by_ref(r).and_then(|i| i.properties.get(&"ScriptGuid".into())) {
+        Some(Variant::String(g)) if !g.is_empty() => Some(g.clone()),
+        _ => None,
+    };
+    let mut fresh = Vec::new();
+    let mut seen = HashSet::new();
+    for mark in marks {
+        let Mark::Tree(r) = *mark else { continue };
+        for d in doc.subtree(r) {
+            if seen.insert(d) && model.server_id(d).is_none() && guid_of(doc, d).is_some() {
+                fresh.push(d);
+            }
+        }
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    let mut owners: HashMap<String, Vec<Ref>> = HashMap::new();
+    for d in doc.dom.descendants() {
+        if let Some(Variant::String(g)) = d.properties.get(&"ScriptGuid".into()) {
+            if !g.is_empty() {
+                owners.entry(g.clone()).or_default().push(d.referent());
+            }
+        }
+    }
+    for r in fresh {
+        let Some(guid) = guid_of(doc, r) else { continue };
+        let others = owners.get(&guid).map_or(0, |v| v.iter().filter(|&&o| o != r).count());
+        if others == 0 {
+            continue;
+        }
+        let new = rustudio_core::doc::new_script_guid();
+        log::info!("Team Create: {} shared ScriptGuid {guid} with another script; sent as {new}", path(doc, r));
+        if let Some(list) = owners.get_mut(&guid) {
+            list.retain(|&o| o != r);
+        }
+        if let Some(i) = doc.dom.get_by_ref_mut(r) {
+            i.properties.insert("ScriptGuid".into(), Variant::String(new));
+        }
+    }
+}
+
+/// State the server streams to clients and never takes back: an instance
+/// copied from the live DataModel keeps it, and sending it in a NewObject
+/// reset a test place's session (0x104, 2026-11-21: a pasted R6 rig whose
+/// Parts carried NetworkOwnerV3 and whose containers carried
+/// numExpectedDirectChildren). Covers the runtime-only properties
+/// (not saved, not scriptable) and the ones the reflection DB doesn't list
+/// but the stream carries.
+pub fn server_owned(class: &str, name: &str) -> bool {
+    use rbx_reflection::{PropertyKind, PropertySerialization, PropertyTag};
+    if matches!(name, "numExpectedDirectChildren" | "NetworkOwnerV3" | "NetworkOwnerV2" | "NetworkIsSleeping") {
+        return true;
+    }
+    let db = rustudio_core::doc::db();
+    let Some(class) = db.classes.get(class) else { return false };
+    db.superclasses_iter(class).find_map(|c| c.properties.get(name)).is_some_and(|p| {
+        p.tags.contains(&PropertyTag::NotScriptable)
+            && matches!(p.kind, PropertyKind::Canonical { serialization: PropertySerialization::DoesNotSerialize })
+    })
 }
 
 /// `game.Workspace.Model.Part` (or `(removed) Part`).
@@ -370,6 +465,86 @@ mod tests {
         for reference in [workspace, part] {
             assert!(!is_local_live_instance(&doc, &model, reference));
         }
+    }
+
+    /// A test place's reset: a rig copied from the live DataModel kept the
+    /// server's streaming state. Creates carry the place's own values only.
+    #[test]
+    fn creates_leave_out_server_owned_state() {
+        let (mut live, [server, ..]) = Live::new();
+        live.start();
+        let part = live.new_inst(
+            InstanceBuilder::new("Part")
+                .with_name("Head")
+                .with_property("Size", rbx_types::Vector3::new(2.0, 1.0, 1.0))
+                .with_property("NetworkOwnerV3", 2i32)
+                .with_property("numExpectedDirectChildren", 6i32),
+        );
+        live.set_parent(part, server);
+        let plan = live.plan();
+        let Some(LiveOp::Create { props, .. }) = plan.ops.first() else { panic!("{:?}", kinds(&plan)) };
+        let names: Vec<_> = props.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"Size"), "{names:?}");
+        assert!(!names.contains(&"NetworkOwnerV3") && !names.contains(&"numExpectedDirectChildren"), "{names:?}");
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        assert!(!server_owned("Part", "Size") && !server_owned("Script", "Source"));
+    }
+
+    /// Two copies of one script made by Clone() go out with different
+    /// ScriptGuids; one keeps the original.
+    #[test]
+    fn copies_sharing_a_script_guid_get_fresh_ones() {
+        let (mut live, [server, ..]) = Live::new();
+        live.start();
+        let guid = "{FC4009F0-1F59-4E83-8D70-0C5E9E5357A7}";
+        let a = live.new_inst(InstanceBuilder::new("Script").with_name("Respawn").with_property("ScriptGuid", guid));
+        let b = live.new_inst(InstanceBuilder::new("Script").with_name("Respawn").with_property("ScriptGuid", guid));
+        live.set_parent(a, server);
+        live.set_parent(b, server);
+        let rustudio_core::doc::Marks::Some(marks) = live.doc.marks_for(rustudio_core::doc::Reader::TeamCreate) else { panic!() };
+        renew_shared_script_guids(&mut live.doc, &live.model, &marks);
+        let g = |r| live.doc.prop(r, "ScriptGuid");
+        assert_ne!(g(a), g(b));
+        assert!(g(a) == Some(Variant::String(guid.into())) || g(b) == Some(Variant::String(guid.into())));
+        let Some(Variant::String(other)) = [g(a), g(b)].into_iter().flatten().find(|v| *v != Variant::String(guid.into())) else { panic!() };
+        assert!(other.len() == 38 && other.starts_with('{') && other.as_bytes()[15] == b'4', "{other}");
+    }
+
+    /// A test place's rig: references never ride in a create (any Ref in a
+    /// NewObject resets the session); they follow every create, so a
+    /// Model's PrimaryPart can name a child created after it.
+    #[test]
+    fn references_follow_the_creates() {
+        let (mut live, [server, ..]) = Live::new();
+        live.start();
+        let rig = live.new_inst(InstanceBuilder::new("Model").with_name("Rig"));
+        let root = live.doc.dom.insert(rig, InstanceBuilder::new("Part").with_name("HumanoidRootPart"));
+        let torso = live.doc.dom.insert(rig, InstanceBuilder::new("Part").with_name("Torso"));
+        let joint = live.doc.dom.insert(root, InstanceBuilder::new("Motor6D").with_name("RootJoint"));
+        live.doc.dom.get_by_ref_mut(rig).unwrap().properties.insert("PrimaryPart".into(), Variant::Ref(root));
+        let j = live.doc.dom.get_by_ref_mut(joint).unwrap();
+        j.properties.insert("Part0".into(), Variant::Ref(root));
+        j.properties.insert("Part1".into(), Variant::Ref(torso));
+        live.set_parent(rig, server);
+        let plan = live.plan();
+        assert!(plan.unsynced.is_empty(), "{:?}", plan.unsynced);
+        let creates = plan.ops.iter().take_while(|op| matches!(op, LiveOp::Create { .. })).count();
+        assert_eq!(creates, 4, "{:?}", kinds(&plan));
+        for op in &plan.ops[..creates] {
+            let LiveOp::Create { props, .. } = op else { unreachable!() };
+            assert!(props.iter().all(|(_, v)| !matches!(v, PropValue::Ref(_))), "{props:?}");
+        }
+        let id = |r| live.model.server_id(r).unwrap();
+        let mut refs: Vec<(String, u64, Option<u64>)> = plan.ops[creates..].iter().map(|op| match op {
+            LiveOp::Property { id, name, value: PropValue::Ref(target), .. } => (name.clone(), *id, *target),
+            other => panic!("{other:?}"),
+        }).collect();
+        refs.sort();
+        assert_eq!(refs, vec![
+            ("Part0".into(), id(joint), Some(id(root))),
+            ("Part1".into(), id(joint), Some(id(torso))),
+            ("PrimaryPart".into(), id(rig), Some(id(root))),
+        ]);
     }
 
     struct Live {
@@ -526,10 +701,14 @@ mod tests {
 
     /// A new tree under ReplicatedFirst, which the editor made itself: it
     /// binds to the server's listed service and the tree is created there.
+    /// (A join makes every listed service in the model's own tree, which
+    /// becomes the document: this is a service listed with no instance.)
     #[test]
     fn a_local_service_the_server_lists_is_bound() {
         let (mut live, _) = Live::new();
         live.model.apply(rustudio_net::replicator::RepOp::Services(vec![(0x2110, "ReplicatedFirst".into())]));
+        let made = live.model.reference(0x2110).expect("the model makes the listed service");
+        live.model.unbind(made);
         let root = live.doc.dom.root_ref();
         let rf = live.doc.dom.insert(root, InstanceBuilder::new("ReplicatedFirst").with_name("ReplicatedFirst"));
         live.start();
@@ -620,6 +799,86 @@ mod studio_parity_tests {
     /// encodes them against the schema in the captured join stream at
     /// RUSTUDIO_TC_REPRO_STREAM and decodes each frame back. Prints every
     /// create: class, wire properties (name:type), bytes. Sends nothing.
+    /// Offline: the creates one subtree of a place file (RUSTUDIO_TC_REPRO_RBXL,
+    /// the first instance whose child is named RUSTUDIO_TC_REPRO_CHILD, or
+    /// whose path is RUSTUDIO_TC_REPRO_PATH) turns into, encoded against the
+    /// captured join stream's schema (RUSTUDIO_TC_REPRO_STREAM) and decoded
+    /// back. Sends nothing.
+    #[test]
+    #[ignore = "needs a place file and a captured stream (env)"]
+    fn repro_subtree_push_offline() {
+        use rustudio_net::replicator::{Decoder, RepOp};
+        let (Ok(file), Ok(stream)) = (std::env::var("RUSTUDIO_TC_REPRO_RBXL"), std::env::var("RUSTUDIO_TC_REPRO_STREAM")) else {
+            return;
+        };
+        let data = std::fs::read(stream).unwrap();
+        let mut dec = Decoder::new();
+        let mut p = 7;
+        while p + 4 <= data.len() && dec.schema.is_none() {
+            let len = (u32::from_be_bytes(data[p..p + 4].try_into().unwrap()) & 0x7fff_ffff) as usize;
+            let f = &data[p + 4..p + 4 + len];
+            p += 4 + len;
+            if !f.is_empty() {
+                dec.decode_frame(f[0], &f[1..]);
+            }
+        }
+        let schema = dec.schema.clone().unwrap();
+        let mut doc = Document::open(std::path::Path::new(&file)).unwrap();
+        let all = doc.subtree(doc.dom.root_ref());
+        let top = match (std::env::var("RUSTUDIO_TC_REPRO_PATH"), std::env::var("RUSTUDIO_TC_REPRO_CHILD")) {
+            (Ok(want), _) => all.iter().copied().find(|&r| path(&doc, r) == want),
+            (_, Ok(child)) => all.iter().copied().find(|&r| {
+                doc.dom.get_by_ref(r).unwrap().children().iter().any(|&c| doc.dom.get_by_ref(c).unwrap().name == child)
+            }),
+            _ => None,
+        }
+        .expect("no such instance");
+        println!("subtree {} ({} instances)", path(&doc, top), doc.subtree(top).len());
+        let inside: HashSet<Ref> = doc.subtree(top).into_iter().collect();
+        let mut model = LiveModel::new();
+        let mut next = 0x100u64;
+        for r in all {
+            if !inside.contains(&r) {
+                next += 1;
+                model.bind_local(next, r);
+            }
+        }
+        let _ = doc.marks_for(rustudio_core::doc::Reader::TeamCreate);
+        doc.mark_tree(top);
+        let rustudio_core::doc::Marks::Some(marks) = doc.marks_for(rustudio_core::doc::Reader::TeamCreate) else { panic!() };
+        let mut next = (7u64 << 32) | 1;
+        let plan = plan(&doc, &mut model, &marks, &mut || {
+            next += 1;
+            Ok(next)
+        });
+        for line in &plan.skipped {
+            println!("SKIPPED {line}");
+        }
+        for line in &plan.unsynced {
+            println!("UNSYNCED {line}");
+        }
+        for op in plan.ops {
+            let (reference, class, frame, skipped) = match op {
+                LiveOp::Create { reference, id, class, parent, props } => {
+                    let (frame, skipped) = rustudio_net::writer::create_partial(&schema, id, &class, parent, &props).unwrap();
+                    (reference, class, frame, skipped)
+                }
+                other => {
+                    println!("OTHER {other:?}");
+                    continue;
+                }
+            };
+            let mut d = Decoder::new();
+            d.schema = Some(schema.clone());
+            let ops = d.decode_frame(frame[0], &frame[1..]);
+            let wire: Vec<String> = match ops.first() {
+                Some(RepOp::NewInstance { props, .. }) => props.iter().map(|(n, v)| format!("{n}={}", format!("{v:?}").chars().take(60).collect::<String>())).collect(),
+                _ => vec![format!("DECODE FAILED {:?}", d.errors)],
+            };
+            println!("{} {class} {} bytes; wire: {}; writer skipped: {skipped:?}", path(&doc, reference), frame.len(), wire.join(" | "));
+        }
+    }
+
     #[test]
     #[ignore = "needs a project and a captured stream (env)"]
     fn repro_live_push_offline() {

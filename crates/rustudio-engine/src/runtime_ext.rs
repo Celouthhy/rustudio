@@ -500,12 +500,12 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
     if name == "SetMaterialColor" || name == "GetMaterialColor" {
         let slot = terrain_material(args, 1, name)? as usize;
         let mut w = world(lua)?;
-        let mut blob: Vec<u8> = match w.d().prop(this, "MaterialColors") {
-            Some(Variant::BinaryString(b)) if AsRef::<[u8]>::as_ref(&b).len() >= 69 => {
-                AsRef::<[u8]>::as_ref(&b).to_vec()
-            }
-            _ => (0..23u8).flat_map(terrain::material_color).collect(),
-        };
+        let mut blob: Vec<u8> = w
+            .d()
+            .prop(this, "MaterialColors")
+            .as_ref()
+            .and_then(rustudio_core::terrain_mat::material_colors_bytes)
+            .unwrap_or_else(|| (0..23u8).flat_map(terrain::material_color).collect());
         if name == "GetMaterialColor" {
             let c = &blob[slot * 3..slot * 3 + 3];
             drop(w);
@@ -543,15 +543,28 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
         _ => {}
     }
     // The voxels being edited: this frame's copy, else the saved grid.
-    let mut voxels = {
+    // `pending`: the copy holds unflushed edits. A read (ReadVoxels,
+    // ReadVoxelChannels, CopyRegion) puts back only such a copy: one made
+    // from the saved grid would be flushed as an edit of SmoothGrid, which
+    // a Team Create session sends to the server (and it refuses it).
+    let (mut voxels, pending) = {
         let mut w = world(lua)?;
         match w.terrain_edit.take() {
-            Some((r, v)) if r == this => v,
-            _ => match Voxels::from_dom(&w.d().dom) {
-                Some(Ok(v)) => v,
-                _ => Voxels::empty(),
-            },
+            Some((r, v)) if r == this => (v, true),
+            other => {
+                w.terrain_edit = other;
+                match Voxels::from_dom(&w.d().dom) {
+                    Some(Ok(v)) => (v, false),
+                    _ => (Voxels::empty(), false),
+                }
+            }
         }
+    };
+    let keep_read = |lua: &Lua, voxels: Voxels| -> mlua::Result<()> {
+        if pending {
+            world(lua)?.terrain_edit = Some((this, voxels));
+        }
+        Ok(())
     };
     let corners = |xf: &Xform, h: Vec3| {
         let e = xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z;
@@ -640,7 +653,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
             let (lo, hi) = (rg.min.0.map(i32::from), rg.max.0.map(i32::from));
             let size = [0, 1, 2].map(|k| (hi[k] - lo[k] + 1).max(0));
             let region = rustudio_core::terrain_region::Region::copy(&voxels, lo, size);
-            world(lua)?.terrain_edit = Some((this, voxels));
+            keep_read(lua, voxels)?;
             let r = create_any(lua, "TerrainRegion")?;
             let v3 = |c: [i32; 3]| Variant::Vector3int16(rbx_dom_weak::types::Vector3int16::new(c[0] as i16, c[1] as i16, c[2] as i16));
             if let Some(i) = world(lua)?.dm().dom.get_by_ref_mut(r) {
@@ -676,7 +689,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
             match region {
                 Ok(region) => region.paste(&mut voxels, corner, paste_empty),
                 Err(e) => {
-                    world(lua)?.terrain_edit = Some((this, voxels));
+                    keep_read(lua, voxels)?;
                     return Err(rt_err(format!("Terrain:PasteRegion: {e}")));
                 }
             }
@@ -738,7 +751,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                     out.raw_set(*ch, t)?;
                 }
                 out.raw_set("Size", vec3_value(lua, n.as_vec3())?)?;
-                world(lua)?.terrain_edit = Some((this, voxels));
+                keep_read(lua, voxels)?;
                 return one(Value::Table(out));
             }
             let Value::Table(chans) = arg(args, 3) else {
@@ -830,7 +843,7 @@ fn terrain_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Re
                 let size = LVector3(n.as_vec3()).into_value();
                 mats.raw_set("Size", size.clone())?;
                 occs.raw_set("Size", size)?;
-                world(lua)?.terrain_edit = Some((this, voxels));
+                keep_read(lua, voxels)?;
                 return Ok(MultiValue::from_iter([Value::Table(mats), Value::Table(occs)]));
             }
             let (Value::Table(mats), Value::Table(occs)) = (arg(args, 3), arg(args, 4)) else {

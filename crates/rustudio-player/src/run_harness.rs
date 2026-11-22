@@ -576,6 +576,11 @@ pub enum HarnessAction {
     /// `--action NAME@S`: a Studio menu action by id (`panel_output` closes
     /// or opens the Output panel, resizing the 3D view mid-run).
     UiAction(String),
+    /// `--ui-click X,Y@S`: the pointer at WINDOW position X,Y (any panel,
+    /// not just the 3D view), then the left button down and up on later
+    /// frames, as a real click arrives (egui widgets need the hover first).
+    UiPointer(f32, f32),
+    UiButton(f32, f32, bool),
 }
 
 impl HarnessAction {
@@ -602,6 +607,20 @@ impl HarnessAction {
             }
             None => Some(vec![(at.trim().parse().ok()?, HarnessAction::Key(key))]),
         }
+    }
+
+    /// `--ui-click X,Y@S` (window coordinates): move there at S, press at
+    /// S + 0.05, let go at S + 0.1.
+    pub fn parse_ui_click(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (xy, at) = s.split_once('@')?;
+        let at: f32 = at.trim().parse().ok()?;
+        let (x, y) = xy.split_once(',')?;
+        let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+        Some(vec![
+            (at, HarnessAction::UiPointer(x, y)),
+            (at + 0.05, HarnessAction::UiButton(x, y, true)),
+            (at + 0.1, HarnessAction::UiButton(x, y, false)),
+        ])
     }
 
     /// `--wheel NOTCHES@S` or `--wheel NOTCHES@S:X,Y` (view coordinates).
@@ -803,6 +822,19 @@ impl HarnessInput {
                     raw.events.push(egui::Event::MouseMoved(egui::vec2(dx, dy)));
                 }
                 HarnessAction::UiAction(name) => ui_action(name, raw),
+                HarnessAction::UiPointer(x, y) => {
+                    raw.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+                }
+                HarnessAction::UiButton(x, y, pressed) => {
+                    let p = egui::pos2(x, y);
+                    raw.events.push(egui::Event::PointerMoved(p));
+                    raw.events.push(egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
             }
         }
         self.update_pointer(raw);

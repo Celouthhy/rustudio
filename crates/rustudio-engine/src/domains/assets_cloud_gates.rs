@@ -40,8 +40,21 @@ pub const LUA_METHODS:&[(&str,&str)]=&[
 ];
 pub fn install(lua:&Lua)->mlua::Result<()> {
     lua.globals().set("__ac_is_server",lua.create_function(|lua,()|Ok(world(lua)?.side != Side::Client))?)?;
+    // name -> the classes these gates are for (LUA_METHODS)
+    let owners=lua.create_table()?;
+    for (name,class) in LUA_METHODS {
+        let list:mlua::Table=match owners.get::<Option<mlua::Table>>(*name)? {Some(t)=>t,None=>{let t=lua.create_table()?;owners.set(*name,t.clone())?;t}};
+        list.push(*class)?;
+    }
     lua.load(r#"
+local owners=...
 local M=__rs_lua_methods
+-- __rs_lua_methods is keyed by method name alone: a gate written here for
+-- one class (RealtimeMedia:SendMessage) replaced every class's method of
+-- that name (Actor:SendMessage, a game's weather actors, 2026-11-21).
+-- Each gate below is wrapped at the end so other classes keep theirs.
+local before={}
+for k,v in pairs(M) do before[k]=v end
 if Instance then
     local new=Instance.new
     Instance.new=function(class,...)
@@ -139,7 +152,21 @@ M.InvokeAsync=function(self,version,method,args,headers)
     error('Unable to find version.',0)
 end
 
-"#).set_name("=rustudio.assets_cloud.gates").exec()
+for name,fn in pairs(M) do
+    local prior=before[name]
+    local classes=owners[name]
+    if fn~=prior and prior~=nil and classes then
+        M[name]=function(self,...)
+            if typeof(self)=='Instance' then
+                local mine=false
+                for _,c in classes do if self:IsA(c) then mine=true break end end
+                if not mine then return prior(self,...) end
+            end
+            return fn(self,...)
+        end
+    end
+end
+"#).set_name("=rustudio.assets_cloud.gates").call::<()>(owners)
 }
 #[cfg(test)]
 mod tests {

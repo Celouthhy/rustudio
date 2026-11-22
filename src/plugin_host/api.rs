@@ -49,6 +49,8 @@ pub mod studio_service;
 pub mod fbx_anim;
 #[path = "api_text.rs"]
 pub mod text;
+#[path = "api_testing.rs"]
+mod testing;
 
 /// The plugin domain's member claims (build.rs scans src/plugin_host/api*.rs).
 /// The engine's member_claims.rs cannot include them (this file is above the
@@ -198,6 +200,8 @@ pub const EVENTS: &[(&str, &str)] = &[
 ];
 
 pub const LUA_METHODS: &[(&str, &str)] = &[
+    ("ExecutePlayModeAsync", "StudioTestService"),
+    ("ExecuteRunModeAsync", "StudioTestService"),
     // api_script_editor.rs (yields a frame: DidClose fires first)
     ("CloseAsync", "ScriptDocument"),
     // api_studio_service.rs (dialogs: yield until answered)
@@ -348,7 +352,8 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     menus::install(lua)?;
     script_editor::install(lua)?;
     studio_service::install(lua)?;
-    widgets::install(lua)
+    widgets::install(lua)?;
+    testing::install(lua)
 }
 
 pub fn step(_lua: &Lua, _dt: f64) -> mlua::Result<()> {

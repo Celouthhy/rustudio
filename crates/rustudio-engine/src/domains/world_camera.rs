@@ -16,7 +16,8 @@
 //!   without firing. (Studio's path curves about the focus and its final
 //!   Focus differs; rustudio's is straight.)
 //! - ProjectionType / OrthographicMode / OrthographicSize / ViewStretch:
-//!   kept and read back (defaults Perspective, Vertical, 300, 1;
+//!   kept and read back (defaults Perspective, Vertical, 35, 1 — 35 as
+//!   Instance.new reads in Studio 0.748, doc::constructor_default;
 //!   OrthographicSize clamped to [0.001, 100000]). Studio gates them on the
 //! feature flag SupportOrthoCameraApi ( asks
 //! which refuses anything but Perspective while the flag at
@@ -184,7 +185,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 None => enum_item(lua, ty, def)?,
             }
         }
-        "OrthographicSize" => Value::Number(f32p(world(lua)?.d(), r, key, 300.0) as f64),
+        "OrthographicSize" => Value::Number(f32p(world(lua)?.d(), r, key, 35.0) as f64),
         "ViewStretch" => Value::Number(f32p(world(lua)?.d(), r, key, 1.0) as f64),
         _ => return Ok(None),
     }))

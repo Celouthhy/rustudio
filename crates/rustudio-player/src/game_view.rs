@@ -756,8 +756,8 @@ impl Game {
                 let mesh_id = shown.as_deref().or(hsr_id.as_deref()).unwrap_or(&asset.id);
                 rustudio_engine::runtime::editable::live_user(mesh_id, sp.r);
                 let got = meshes.live(mesh_id, &mut |v| renderer.add_mesh_vertices(&device, v)).or_else(|| {
-                    meshes.get_colored(mesh_id, asset.vertex_colors, dir, assets, &mut |p, n, u, c, planes| {
-                        renderer.add_mesh_projected(&device, p, n, u, c, planes)
+                    meshes.get_colored(mesh_id, asset.vertex_colors, dir, assets, &mut |p, n, u, c, planes, lods| {
+                        renderer.add_mesh_lods(&device, p, n, u, c, planes, lods)
                     })
                 });
                 drop(sd);
@@ -1120,9 +1120,19 @@ impl Game {
                 let class = self.doc.class_of(sp.r);
                 let csg = class.as_ref().is_some_and(|c| matches!(c.as_str(), "UnionOperation" | "NegateOperation" | "IntersectOperation"));
                 if !csg {
-                    let double = class.as_ref().is_some_and(|c| c == "MeshPart")
+                    use rustudio_render::render::MeshFidelity;
+                    let mesh_part = class.as_ref().is_some_and(|c| c == "MeshPart");
+                    let double = mesh_part
                         && matches!(self.doc.prop(sp.r, "DoubleSided"), Some(rbx_dom_weak::types::Variant::Bool(true)));
-                    d.custom_mesh = Some(renderer.mesh_cull_slot(i, !double));
+                    let fidelity = if mesh_part {
+                        match self.doc.prop(sp.r, "RenderFidelity") {
+                            Some(rbx_dom_weak::types::Variant::Enum(value)) => MeshFidelity::from_enum(value.to_u32()),
+                            _ => MeshFidelity::Automatic,
+                        }
+                    } else {
+                        MeshFidelity::Precise
+                    };
+                    d.custom_mesh = Some(renderer.mesh_cull_slot(i, !double, fidelity));
                 }
             }
             // A MaterialVariant draws through the part material shader, like
@@ -1904,13 +1914,11 @@ impl Game {
             return;
         };
         let terrain = *terrain;
-        let colors = match self.doc.prop(terrain, "MaterialColors") {
-            Some(Variant::BinaryString(b)) if AsRef::<[u8]>::as_ref(&b).len() >= 69 => {
-                Some(AsRef::<[u8]>::as_ref(&b).to_vec())
-            }
-            Some(Variant::MaterialColors(c)) => Some(c.encode()),
-            _ => None,
-        };
+        let colors = self
+            .doc
+            .prop(terrain, "MaterialColors")
+            .as_ref()
+            .and_then(rustudio_core::terrain_mat::material_colors_bytes);
         let use2022 = scene::use_2022_materials(&self.doc);
         let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref())
         else {
@@ -2274,12 +2282,18 @@ impl Game {
             }
         }
         // SurfaceGuis / BillboardGuis behind the world stay behind it (round 23).
-        let hl = self.highlight_draws();
+        let mut hl = self.highlight_draws();
+        if !self.extra_highlights.is_empty() {
+            let room = rustudio_render::highlight::MAX.saturating_sub(hl.len());
+            hl.extend(self.extra_highlights.iter().take(room).cloned());
+        }
         if let (Some(r), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
             let _g = rustudio_core::bench::scope("gui_world_pass");
             // The same tone curve rule as the 3D view (lighting::tone_curve_on).
             let curve = rustudio_render::lighting::tone_curve_on(&self.doc).then_some(mech::TONE_CURVE);
             r.draw_world_gui(rs, ctx.font_texture_update(), &self.gui.world_batches, self.effects.drawn(), curve);
+            // 3D viewport adornments (Team Create collaborator camera gizmos, adorn.rs).
+            r.draw_adorn(rs, &self.extra_adorn);
             // Highlights last, over the finished image (highlight.rs).
             r.draw_highlights(rs, &hl);
         }

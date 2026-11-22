@@ -100,13 +100,24 @@ enum Action {
     Apply,
     Retry,
     Detach,
+    /// The place is a project folder opened as one: its own sync runs, so
+    /// File Sync only offers the folder.
+    ShowFolder,
+}
+
+fn open_in_file_manager(dir: &std::path::Path) {
+    let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(opener).arg(dir).spawn();
 }
 
 impl Editor {
     /// One line for the button's tooltip, MCP and the Output.
     pub fn file_sync_status_text(&self) -> (Color32, String) {
         let fs = &self.file_sync;
-        let col = status_color(fs.status());
+        let col = status_color(self.file_sync_ui_status());
+        if let (None, Some(p)) = (&fs.att, &self.project) {
+            return (col, format!("{} · opened as a project folder: its files sync with the place", p.name));
+        }
         let Some(a) = &fs.att else {
             return (col, match &fs.error {
                 Some(e) => format!("Not attached · {e}"),
@@ -135,6 +146,9 @@ impl Editor {
     /// The state in a word or two.
     fn file_sync_word(&self) -> String {
         let fs = &self.file_sync;
+        if fs.att.is_none() && self.project.is_some() {
+            return "Synced as project".into();
+        }
         let Some(a) = &fs.att else {
             return if fs.error.is_some() { "Error".into() } else { "Not attached".into() };
         };
@@ -160,8 +174,18 @@ impl Editor {
         "Synced".into()
     }
 
+    /// The status the File Sync UI shows: a project folder opened as one
+    /// syncs through its own project sync, which counts as synced here.
+    fn file_sync_ui_status(&self) -> Status {
+        if self.file_sync.att.is_none() && self.project.is_some() {
+            return Status::Synced;
+        }
+        self.file_sync.status()
+    }
+
     fn file_sync_action(&self) -> Action {
         match (&self.file_sync.att, &self.file_sync.pending) {
+            (None, _) if self.project.is_some() => Action::ShowFolder,
             (None, _) => Action::Attach,
             (Some(_), Some(_)) => Action::Apply,
             (Some(_), None) if self.file_sync.error.is_some() => Action::Retry,
@@ -191,6 +215,22 @@ impl Editor {
         (!p.is_empty()).then(|| crate::mcp::project_apply::project_file(std::path::Path::new(p)).ok()).flatten()
     }
 
+    /// Projects attached before (newest first), other than the pick: the
+    /// popover offers them as suggestions, never as this place's own.
+    fn file_sync_recent(&self, max: usize) -> Vec<std::path::PathBuf> {
+        let pick = self.file_sync_pick();
+        let mut v: Vec<std::path::PathBuf> = Vec::new();
+        for r in self.file_sync.settings.remembered.iter().rev() {
+            if v.len() >= max {
+                break;
+            }
+            if Some(&r.project) != pick.as_ref() && !v.contains(&r.project) && r.project.exists() {
+                v.push(r.project.clone());
+            }
+        }
+        v
+    }
+
     fn file_sync_do(&mut self, action: Action) {
         match action {
             Action::Attach => match self.file_sync_pick() {
@@ -212,6 +252,11 @@ impl Editor {
                 self.file_sync_run(super::plan::Scope::All, false, None);
             }
             Action::Detach => self.file_sync_detach(false),
+            Action::ShowFolder => {
+                if let Some(p) = &self.project {
+                    open_in_file_manager(&p.root);
+                }
+            }
         }
     }
 
@@ -222,7 +267,7 @@ impl Editor {
             Action::Attach => {
                 let blocked = self.file_sync_blocked();
                 let label = match self.file_sync_pick() {
-                    Some(p) => format!("Attach {}", p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                    Some(p) => format!("Attach {}", project_label(&p)),
                     None => "Attach…".into(),
                 };
                 let r = ui.add_enabled(blocked.is_none(), egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(theme::ACCENT));
@@ -235,6 +280,10 @@ impl Editor {
             }
             Action::Retry => ui.button("Retry").on_hover_text("Compare every file with the place again").clicked(),
             Action::Detach => ui.button("Detach").on_hover_text("Stop syncing; the place keeps what it has").clicked(),
+            Action::ShowFolder => ui
+                .button("Open folder")
+                .on_hover_text(self.project.as_ref().map(|p| p.root.display().to_string()).unwrap_or_default())
+                .clicked(),
         }
     }
 
@@ -268,12 +317,16 @@ impl Editor {
             return;
         }
         let Some(button) = self.ui_rects.get("filesync.button").copied() else { return };
-        let status = self.file_sync.status();
+        let status = self.file_sync_ui_status();
         let word = self.file_sync_word();
         let action = self.file_sync_action();
         let mut run = None;
         let mut skip = false;
         let mut open = false;
+        let mut attach_recent: Option<std::path::PathBuf> = None;
+        let mut new_project = false;
+        let recent = if action == Action::Attach && self.file_sync_pick().is_none() { self.file_sync_recent(3) } else { Vec::new() };
+        let blocked = self.file_sync_blocked();
         let area = egui::Area::new(egui::Id::new("filesync_popover"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::RIGHT_TOP)
@@ -287,8 +340,20 @@ impl Editor {
                         ui.label(RichText::new(&word).strong());
                         if let Some(a) = &self.file_sync.att {
                             ui.label(RichText::new(&a.st.name).color(theme::TEXT_DIM)).on_hover_text(self.file_sync_details());
+                        } else if let Some(p) = &self.project {
+                            ui.label(RichText::new(&p.name).color(theme::TEXT_DIM)).on_hover_text(p.file.display().to_string());
                         }
                     });
+                    if action == Action::ShowFolder {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("This place was opened from its project folder, so the files are the truth: edits sync both ways and Ctrl+S writes them. File Sync isn't needed.")
+                                    .size(12.0)
+                                    .color(theme::TEXT_DIM),
+                            )
+                            .wrap(),
+                        );
+                    }
                     if let (None, Some(e)) = (&self.file_sync.att, &self.file_sync.error) {
                         ui.add(egui::Label::new(RichText::new(e).size(12.0).color(theme::ERROR)).wrap());
                     }
@@ -306,12 +371,42 @@ impl Editor {
                             }
                         });
                     });
+                    if action == Action::Attach {
+                        if !recent.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Recent projects").size(11.5).color(theme::TEXT_DIM));
+                            for p in &recent {
+                                let name = project_label(p);
+                                let r = ui.add_enabled(
+                                    blocked.is_none(),
+                                    egui::Button::new(RichText::new(format!("{name}  ·  recent")).size(12.5)).frame(false),
+                                );
+                                if r.on_hover_text(format!("Attach {} to this place", p.display())).clicked() {
+                                    attach_recent = Some(p.clone());
+                                }
+                            }
+                        }
+                        ui.add_space(4.0);
+                        let r = ui.add_enabled(blocked.is_none(), egui::Button::new("New project…"));
+                        if r.on_hover_text("Write this place out as a new project folder and attach it").clicked() {
+                            new_project = true;
+                        }
+                    }
                 });
             });
         let clicked_outside = ctx.input(|i| i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p) && !button.contains(p)));
         let closed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if let Some(a) = run {
             self.file_sync_do(a);
+            self.file_sync.popover = false;
+        }
+        if let Some(p) = attach_recent {
+            self.file_sync.pick = p.display().to_string();
+            self.file_sync_do(Action::Attach);
+            self.file_sync.popover = false;
+        }
+        if new_project {
+            self.open_export_dialog_attach();
             self.file_sync.popover = false;
         }
         if skip {
@@ -394,7 +489,7 @@ impl Editor {
     }
 
     fn file_sync_status_row(&mut self, ui: &mut egui::Ui) {
-        let status = self.file_sync.status();
+        let status = self.file_sync_ui_status();
         let word = self.file_sync_word();
         let action = self.file_sync_action();
         let w = ui.available_width();
@@ -441,6 +536,9 @@ impl Editor {
                 if let Some(a) = &self.file_sync.att {
                     ui.add_space(4.0);
                     ui.add(egui::Label::new(RichText::new(&a.st.name).size(13.0).color(theme::TEXT_DIM)).truncate()).on_hover_text(self.file_sync_details());
+                } else if let Some(p) = &self.project {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(&p.name).size(13.0).color(theme::TEXT_DIM)).truncate()).on_hover_text(p.file.display().to_string());
                 }
             });
         });
@@ -469,8 +567,7 @@ impl Editor {
             }
             Some(1) => {
                 if let Some(dir) = self.file_sync.att.as_ref().map(|a| a.st.root.clone()) {
-                    let opener = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                    let _ = std::process::Command::new(opener).arg(dir).spawn();
+                    open_in_file_manager(&dir);
                 }
             }
             Some(2) => self.file_sync_detach(false),
@@ -523,6 +620,17 @@ impl Editor {
 
     fn file_sync_changes_ui(&mut self, ui: &mut egui::Ui) {
         if self.file_sync.att.is_none() {
+            if self.project.is_some() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("This place was opened from its project folder: the files are the truth, edits sync both ways and Ctrl+S writes them. Nothing to attach.")
+                            .size(12.5)
+                            .color(theme::TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+                return;
+            }
             self.file_sync_attach_form(ui);
             return;
         }
@@ -996,4 +1104,9 @@ fn combo<T: Copy + PartialEq>(ui: &mut egui::Ui, id: &str, v: Rect, value: &mut 
             ui.selectable_value(value, *o, *l);
         }
     });
+}
+
+/// A project's name for buttons: its folder's name.
+fn project_label(p: &std::path::Path) -> String {
+    p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }

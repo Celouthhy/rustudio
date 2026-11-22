@@ -264,6 +264,24 @@ struct InstanceRaw {
     tint: [f32; 4],
 }
 
+/// The mesh detail policy stored on a MeshPart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeshFidelity {
+    Automatic,
+    Precise,
+    Performance,
+}
+
+impl MeshFidelity {
+    pub fn from_enum(value: u32) -> Self {
+        match value {
+            1 => Self::Precise,
+            2 => Self::Performance,
+            _ => Self::Automatic,
+        }
+    }
+}
+
 /// How a texture combines with the part (shader `extra.w`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TexMode {
@@ -538,6 +556,9 @@ mod gpu_tests {
     #[test]
     fn primitive_parity_geometry() {
         let meshes = build_meshes();
+        assert_eq!(meshes[MeshKind::Block as usize].len() / 3, 12);
+        assert_eq!(meshes[MeshKind::Ball as usize].len() / 3, 432);
+        assert_eq!(meshes[MeshKind::Cylinder as usize].len() / 3, 96);
         let points: Vec<_> = ball_outline_points().collect();
         for vertex in &meshes[MeshKind::Ball as usize] {
             assert!(points.iter().any(|p| p.distance(Vec3::from_array(vertex.pos)) < 1e-6));
@@ -548,6 +569,25 @@ mod gpu_tests {
         for index in [0usize, MeshKind::Ball as usize, MeshKind::Cylinder as usize] {
             assert!(meshes[index].iter().all(|v| v.projection[0] == 0.0));
         }
+    }
+
+    #[test]
+    fn frustum_box_inside_distinguishes_interior_straddling_and_outside() {
+        let proj = Mat4::perspective_rh(70.0_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let view = Mat4::look_to_rh(Vec3::ZERO, -Vec3::Z, Vec3::Y);
+        let planes = frustum(proj * view);
+
+        // Strictly inside frustum
+        assert!(box_visible(&planes, Vec3::new(-1.0, -1.0, -25.0), Vec3::new(1.0, 1.0, -20.0)));
+        assert!(box_inside(&planes, Vec3::new(-1.0, -1.0, -25.0), Vec3::new(1.0, 1.0, -20.0)));
+
+        // Straddling left frustum plane
+        assert!(box_visible(&planes, Vec3::new(-100.0, -1.0, -25.0), Vec3::new(0.0, 1.0, -20.0)));
+        assert!(!box_inside(&planes, Vec3::new(-100.0, -1.0, -25.0), Vec3::new(0.0, 1.0, -20.0)));
+
+        // Completely behind camera
+        assert!(!box_visible(&planes, Vec3::new(-1.0, -1.0, 10.0), Vec3::new(1.0, 1.0, 20.0)));
+        assert!(!box_inside(&planes, Vec3::new(-1.0, -1.0, 10.0), Vec3::new(1.0, 1.0, 20.0)));
     }
 
     #[test]
@@ -894,6 +934,7 @@ struct Batch {
     hi: Vec3,
     start: u32,
     count: u32,
+    has_hidden: bool,
 }
 
 /// Anchored, opaque parts: uploaded once, sorted by (pass, mesh/texture,
@@ -907,6 +948,10 @@ struct StaticLayout {
     /// Bounding radius per instance (descending within a batch).
     radii: Vec<f32>,
     batches: Vec<Batch>,
+    /// Conservative solid occluder boxes extracted from opaque static parts,
+    /// grouped into 128-stud cells sorted by surface area descending.
+    occluders: Vec<crate::occlusion::OccluderBox>,
+    occluder_cells: Vec<crate::occlusion::OccluderCell>,
     hidden: usize,
     /// Slots changed in place, uploaded next frame.
     writes: Vec<u32>,
@@ -1067,6 +1112,45 @@ fn box_visible(planes: &[glam::Vec4; 5], lo: Vec3, hi: Vec3) -> bool {
         );
         p.truncate().dot(v) + p.w >= 0.0
     })
+}
+
+/// True when the entire box `[lo, hi]` lies strictly inside all five frustum planes.
+fn box_inside(planes: &[glam::Vec4; 5], lo: Vec3, hi: Vec3) -> bool {
+    planes.iter().all(|p| {
+        let v = Vec3::new(
+            if p.x > 0.0 { lo.x } else { hi.x },
+            if p.y > 0.0 { lo.y } else { hi.y },
+            if p.z > 0.0 { lo.z } else { hi.z },
+        );
+        p.truncate().dot(v) + p.w >= 0.0
+    })
+}
+
+/// World-space AABB of an uploaded `InstanceRaw`.
+fn raw_aabb(raw: &InstanceRaw) -> (Vec3, Vec3) {
+    let h = Vec3::new(raw.size[0], raw.size[1], raw.size[2]) * 0.5;
+    let ext = Vec3::new(raw.r0[0], raw.r0[1], raw.r0[2]).abs() * h.x
+        + Vec3::new(raw.r1[0], raw.r1[1], raw.r1[2]).abs() * h.y
+        + Vec3::new(raw.r2[0], raw.r2[1], raw.r2[2]).abs() * h.z;
+    let pos = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+    (pos - ext, pos + ext)
+}
+
+/// True when an `InstanceRaw` is strictly opaque solid geometry eligible to act
+/// as a software occlusion culler occluder (excludes hidden, transparent, Glass,
+/// Water, ForceField, Decal, and Cutout draws).
+fn raw_is_solid_occluder(raw: &InstanceRaw) -> bool {
+    let kind = raw.extra[0] as u32 & 7;
+    let tm = raw.extra[3];
+    raw.color[3] >= 0.999
+        && raw.size[0] > 0.0
+        && raw.size[1] > 0.0
+        && raw.size[2] > 0.0
+        && kind != 3
+        && kind != 5
+        && kind != 6
+        && tm != 2.0
+        && tm != 5.0
 }
 
 pub fn sphere_visible(planes: &[glam::Vec4; 5], c: Vec3, r: f32) -> bool {
@@ -1535,6 +1619,7 @@ fn fresh_bind_key() -> u64 {
 pub(crate) type Bound = std::cell::Cell<[u64; 2]>;
 pub(crate) const UNBOUND: [u64; 2] = [u64::MAX; 2];
 
+#[derive(Clone)]
 pub(crate) struct Mesh {
     vbuf: wgpu::Buffer,
     /// The first vertex (pooled: its place in the slab) and first index.
@@ -1543,9 +1628,14 @@ pub(crate) struct Mesh {
     /// Binding identity of (vbuf, ibuf): the slab's id when pooled.
     bind_key: u64,
     /// The slab range, kept while any copy of the mesh lives.
-    range: Option<std::sync::Arc<SlabRange>>,
+    _pool_range: Option<std::sync::Arc<SlabRange>>,
     /// Corners drawn: the index count when indexed, else the vertex count.
     count: u32,
+    /// Relative corner offsets for the asset's resident LOD ranges.
+    lod_offsets: Option<std::sync::Arc<[u32]>>,
+    /// The resident prefix available to Automatic, from the mesh header.
+    high_quality_lods: u8,
+    fidelity: MeshFidelity,
     /// Indexed meshes (`indexed`): identical corners share one vertex, so
     /// the vertex shader runs once per distinct corner instead of three
     /// times a triangle. Same triangles, same vertex values.
@@ -1562,9 +1652,104 @@ pub(crate) struct Mesh {
     cull: Option<bool>,
     /// Made for the skinning pass (STORAGE usage).
     storage: bool,
+    /// Conservative local-space inscribed solid box for software occlusion culling.
+    occluder: Option<(Vec3, Vec3)>,
+}
+
+// Studio 0.748 loads this distance table from the served
+// settings and compares it with the squared distance to the box.
+// The versioned render pipeline has a separate rollout gate.
+const MESH_LOD_DISTANCES: [f32; 4] = [250.0, 500.0, 2000.0, 3000.0];
+
+#[derive(Clone, Copy)]
+struct MeshLodView {
+    camera: Vec3,
+    thresholds: [f32; 4],
+}
+
+impl MeshLodView {
+    fn new(camera: Vec3, tan_half_fov: f32) -> Self {
+        let scale = 35.0_f32.to_radians().tan() / tan_half_fov;
+        Self {
+            camera,
+            thresholds: MESH_LOD_DISTANCES.map(|distance| (distance * scale).powi(2)),
+        }
+    }
+
+    fn distance_squared(self, raw: &InstanceRaw) -> f32 {
+        let centre = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
+        let half = Vec3::from_slice(&raw.size) * 0.5;
+        let extent = Vec3::from_slice(&raw.r0).abs() * half.x
+            + Vec3::from_slice(&raw.r1).abs() * half.y
+            + Vec3::from_slice(&raw.r2).abs() * half.z;
+        ((self.camera - centre).abs() - extent).max(Vec3::ZERO).length_squared()
+    }
+
+    fn level(self, distance_squared: f32, coarsest: usize) -> usize {
+        self.thresholds[..coarsest].partition_point(|&threshold| threshold <= distance_squared)
+    }
+}
+
+#[cfg(test)]
+mod mesh_lod_tests {
+    use super::*;
+
+    #[test]
+    fn studio_legacy_boundaries() {
+        let view = MeshLodView::new(Vec3::ZERO, 35.0_f32.to_radians().tan());
+        for (level, threshold) in MESH_LOD_DISTANCES.into_iter().enumerate() {
+            assert_eq!(view.level((threshold - 0.01).powi(2), 4), level);
+            assert_eq!(view.level(threshold.powi(2), 4), level + 1);
+        }
+        assert_eq!(view.level(750.0_f32.powi(2), 1), 1);
+        let narrow = MeshLodView::new(Vec3::ZERO, 17.5_f32.to_radians().tan());
+        assert_eq!(narrow.level(500.0_f32.powi(2), 4), 0);
+        assert_eq!(narrow.level(560.0_f32.powi(2), 4), 1);
+    }
+
+    #[test]
+    fn distance_uses_world_aabb_of_rotated_part() {
+        let view = MeshLodView::new(Vec3::new(11.0, 7.0, 0.0), 35.0_f32.to_radians().tan());
+        let raw = InstanceRaw {
+            size: [2.0, 8.0, 4.0, 0.0],
+            r0: [0.0, 1.0, 0.0, 2.0],
+            r1: [-1.0, 0.0, 0.0, 3.0],
+            r2: [0.0, 0.0, 1.0, 0.0],
+            ..HIDDEN
+        };
+        // Half extents in world space: (4, 1, 2).
+        assert_eq!(view.distance_squared(&raw), 34.0);
+    }
 }
 
 impl Mesh {
+    fn scene_lod(&self, view: MeshLodView, instances: &[InstanceRaw]) -> usize {
+        let Some(offsets) = &self.lod_offsets else { return 0 };
+        let limit = match self.fidelity {
+            MeshFidelity::Precise => return 0,
+            MeshFidelity::Automatic => usize::from(self.high_quality_lods),
+            MeshFidelity::Performance => offsets.len() - 1,
+        };
+        let mut coarsest = (limit - 1).min(offsets.len() - 2).min(MESH_LOD_DISTANCES.len());
+        for instance in instances {
+            if coarsest == 0 {
+                break;
+            }
+            if instance.color[3] > 0.0 {
+                coarsest = view.level(view.distance_squared(instance), coarsest);
+            }
+        }
+        coarsest
+    }
+
+    fn lod_corners(&self, lod: usize) -> std::ops::Range<u32> {
+        if lod == 0 {
+            return 0..self.count;
+        }
+        let offsets = self.lod_offsets.as_ref().expect("selected LOD has offsets");
+        offsets[lod]..offsets[lod + 1]
+    }
+
     /// Binds the mesh (slot 0, and its indices) and draws `instances`.
     pub(crate) fn draw(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>) {
         // (an empty mesh draws nothing; wgpu refuses a slice of its empty
@@ -1587,7 +1772,17 @@ impl Mesh {
     /// bound in the pass (usize::MAX = unknown; reset it after binding any
     /// other vertex buffer 0 or index buffer). The draws are the same.
     pub(crate) fn draw_bound(&self, pass: &mut wgpu::RenderPass, instances: std::ops::Range<u32>, bound: &Bound) {
-        if self.count == 0 || self.vbuf.size() == 0 {
+        self.draw_bound_range(pass, instances, 0..self.count, bound);
+    }
+
+    fn draw_bound_range(
+        &self,
+        pass: &mut wgpu::RenderPass,
+        instances: std::ops::Range<u32>,
+        corners: std::ops::Range<u32>,
+        bound: &Bound,
+    ) {
+        if corners.is_empty() || self.vbuf.size() == 0 {
             return;
         }
         let mut b = bound.get();
@@ -1602,11 +1797,11 @@ impl Mesh {
                     b[1] = self.bind_key;
                 }
                 bound.set(b);
-                pass.draw_indexed(self.first_index..self.first_index + self.count, self.base_vertex as i32, instances);
+                pass.draw_indexed(self.first_index + corners.start..self.first_index + corners.end, self.base_vertex as i32, instances);
             }
             None => {
                 bound.set(b);
-                pass.draw(self.base_vertex..self.base_vertex + self.count, instances);
+                pass.draw(self.base_vertex + corners.start..self.base_vertex + corners.end, instances);
             }
         }
     }
@@ -1704,12 +1899,16 @@ impl Mesh {
                     first_index: range.i.map_or(0, |i| (i.0 / 4) as u32),
                     bind_key: slab.id,
                     count,
+                    lod_offsets: None,
+                    high_quality_lods: 1,
+                    fidelity: MeshFidelity::Precise,
                     ibuf: index.map(|_| slab.ibuf.clone()),
                     remap: indexed.map(|(_, index)| std::sync::Arc::from(index)),
                     bounds,
                     cull,
                     storage: false,
-                    range: Some(std::sync::Arc::new(range)),
+                    occluder: None,
+                    _pool_range: Some(std::sync::Arc::new(range)),
                 });
             }
         }
@@ -1730,7 +1929,7 @@ impl Mesh {
             contents: bytemuck::cast_slice(&vdata),
             usage,
         });
-        Some(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), range: None, count, ibuf, remap, bounds, cull, storage: false })
+        Some(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf, remap, bounds, cull, storage: false, occluder: None })
     }
 
     /// `corners` (one vertex per corner, as uploaded) as this mesh's
@@ -1881,6 +2080,10 @@ struct Target {
     bloom_levels: Vec<wgpu::TextureView>,
     bloom_down_bgs: Vec<wgpu::BindGroup>,
     bloom_up_bgs: Vec<wgpu::BindGroup>,
+    /// Native BlurEffect: 1/4-res ping-pong targets + bind groups
+    /// (downsample -> H -> V; final blurred HDR scene in `blur_views[1]`).
+    blur_views: [wgpu::TextureView; 2],
+    blur_bgs: [wgpu::BindGroup; 3],
     /// SSAO at half resolution: the AO depth, then (occlusion, depth) ping-
     /// ponged through the blurs; a bind group per pass (depth + its input).
     ssao_depth_view: wgpu::TextureView,
@@ -2599,6 +2802,8 @@ pub struct Renderer {
     skin: crate::skin_gpu::SkinGpu,
     /// Highlight instances over the finished image (highlight.rs).
     highlight: [Option<crate::highlight::HighlightPass>; 3],
+    /// 3D viewport adornments (collaborator camera gizmos, adorn.rs).
+    adorn: [Option<crate::adorn::AdornPass>; 3],
     /// The last frame's view-projection (Highlights draw with it).
     last_view_proj: Mat4,
     /// SurfaceGuis / BillboardGuis tested against the scene's depth (round 23).
@@ -2624,6 +2829,10 @@ pub struct Renderer {
     bloom_down: wgpu::RenderPipeline,
     bloom_up: wgpu::RenderPipeline,
     post_bloom_size: f32,
+    blur_down: wgpu::RenderPipeline,
+    blur_h: wgpu::RenderPipeline,
+    blur_v: wgpu::RenderPipeline,
+    post_blur_size: f32,
     shadow: wgpu::RenderPipeline,
     /// Each sun cascade's static casters, kept between redraws (SunCache).
     sun_cache: SunCache,
@@ -2703,7 +2912,7 @@ pub struct Renderer {
     /// The slabs loaded meshes are placed in.
     pool: MeshPool,
     /// (mesh, cull back) -> the second slot drawing it the other way.
-    cull_alias: HashMap<(u32, bool), u32>,
+    cull_alias: HashMap<(u32, bool, MeshFidelity), u32>,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// Texture bind groups; index 0 is plain white.
@@ -2720,10 +2929,13 @@ pub struct Renderer {
     items_generation: u64,
     /// Items drawn from the per-frame list (pending and dynamic).
     per_frame: RefSet,
+    /// Subset of `per_frame` items containing an opaque solid occluder candidate.
+    dyn_occluders: RefSet,
     /// ViewportFrames' parts (vf_render.rs): never in the world's lists;
     /// each frame's items, and a generation bumped whenever one changes.
     vf: vf::Layers,
     st: StaticLayout,
+    occlusion: crate::occlusion::OcclusionBuffer,
     pending: usize,
     pending_at: Option<Instant>,
     /// Last static rebuild / quiet-part scan (both rate-limited).
@@ -3392,6 +3604,9 @@ impl Renderer {
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         };
         let bloom_up = device.create_render_pipeline(&bloom_up_desc);
+        let blur_down = fullscreen("blur down", "fs_blur_down", 1);
+        let blur_h = fullscreen("blur across", "fs_blur_h", 1);
+        let blur_v = fullscreen("blur down", "fs_blur_v", 1);
         let sky_globals = reduced.then(|| {
             let layout = Self::sky_globals_layout(device);
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
@@ -3399,10 +3614,15 @@ impl Renderer {
         });
         let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, startup_samples(&caps), reduced);
 
-        let meshes = build_meshes()
+        let mut meshes: Vec<Mesh> = build_meshes()
             .into_iter()
             .map(|verts| Mesh::upload(device, "mesh", &verts, wgpu::BufferUsages::VERTEX, Some(true)))
             .collect();
+        // Built-in conservative inscribed solid boxes for software occlusion culling.
+        meshes[MeshKind::Block as usize].occluder = Some((Vec3::splat(-0.5), Vec3::splat(0.5)));
+        meshes[MeshKind::Ball as usize].occluder = Some((Vec3::splat(-0.265), Vec3::splat(0.265)));
+        meshes[MeshKind::Cylinder as usize].occluder =
+            Some((Vec3::new(-0.5, -0.34, -0.34), Vec3::new(0.5, 0.34, 0.34)));
 
         let instance_cap = 1024;
         let line_cap = 4096;
@@ -3419,6 +3639,7 @@ impl Renderer {
             gui_n_lights: 0,
             world_gui: [None, None, None],
             highlight: [None, None, None],
+            adorn: [None, None, None],
             last_view_proj: Mat4::IDENTITY,
             glass_layout,
             material_epoch: Instant::now(),
@@ -3429,6 +3650,10 @@ impl Renderer {
             bloom_down,
             bloom_up,
             post_bloom_size: 24.0,
+            blur_down,
+            blur_h,
+            blur_v,
+            post_blur_size: 0.0,
             shadow,
             sun_cache,
             terrain_shadow,
@@ -3493,8 +3718,10 @@ impl Renderer {
             items: RefMap::default(),
             items_generation: 0,
             per_frame: RefSet::default(),
+            dyn_occluders: RefSet::default(),
             vf: Default::default(),
             st: StaticLayout::default(),
+            occlusion: crate::occlusion::OcclusionBuffer::new(),
             pending: 0,
             pending_at: None,
             last_rebuild: Instant::now(),
@@ -4596,6 +4823,19 @@ impl Renderer {
         };
         let bloom_down_bgs = (0..5).map(|i| pair("bloom pyramid down", if i == 0 { &hdr_view } else { &bloom_levels[i-1] }, &hdr_view)).collect();
         let bloom_up_bgs = (1..5).map(|i| pair("bloom pyramid up", &bloom_levels[i], &hdr_view)).collect();
+        let blur_tex = |label: &str| device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: (size[0] >> 2).max(1), height: (size[1] >> 2).max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+        let blur_views = [blur_tex("blur a"), blur_tex("blur b")];
+        let blur_bgs = [
+            pair("blur down", &hdr_view, &self.black_view),
+            pair("blur across", &blur_views[1], &self.black_view),
+            pair("blur down", &blur_views[0], &self.black_view),
+        ];
         let near_views: Vec<_> = (0..11).map(|i| device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dof near quarter"), size: wgpu::Extent3d { width: (size[0]/4).max(1), height: if i == 0 {size[1]} else {(size[1]/4).max(1)}, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: HDR_FORMAT,
@@ -4642,7 +4882,15 @@ impl Renderer {
                 ],
             })
         };
-        let post_depth_bg = ssao_bg("post depth and near", &near_views[10]);
+        let post_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post depth, near and blur"),
+            layout: &viewport.ssao_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&near_views[10]) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&blur_views[1]) },
+            ],
+        });
         // down (input unused) → a … occlusion reads the depth → a, blur
         // across a → b, blur down b → a, apply reads a.
         let ssao_bgs = [
@@ -4704,6 +4952,8 @@ impl Renderer {
             bloom_levels,
             bloom_down_bgs,
             bloom_up_bgs,
+            blur_views,
+            blur_bgs,
             ssao_depth_view,
             ssao_views,
             ssao_bgs,
@@ -4774,6 +5024,18 @@ impl Renderer {
         pass.draw(&rs.device, &rs.queue, t.size, t.samples, &t.depth, &t.display_view, self.last_view_proj, &work);
     }
 
+    /// 3D viewport adornments (collaborator camera gizmos, adorn.rs) drawn
+    /// onto the finished image, depth-tested against the scene's depth buffer.
+    pub fn draw_adorn(&mut self, rs: &egui_wgpu::RenderState, list: &[crate::adorn::AdornDraw]) {
+        if list.is_empty() {
+            return;
+        }
+        let Some(t) = self.target.as_ref() else { return };
+        let pass = self.adorn[sample_slot(t.samples)]
+            .get_or_insert_with(|| crate::adorn::AdornPass::new(&rs.device, &rs.queue, DISPLAY_FORMAT, t.samples));
+        pass.draw(&rs.device, &rs.queue, &t.depth, &t.display_view, self.last_view_proj, list);
+    }
+
     /// The bloom and the final image again, from the HDR image as it is now
     /// (effects drawn into it after `render`; the frame's globals still
     /// bound).
@@ -4802,12 +5064,41 @@ impl Renderer {
         }
     }
 
+    fn encode_blur(&self, encoder: &mut wgpu::CommandEncoder, target: &Target, size: f32) {
+        if size <= 0.0 { return; }
+        let passes: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, &wgpu::TextureView); 3] = [
+            ("blur down", &self.blur_down, &target.blur_bgs[0], &target.blur_views[1]),
+            ("blur across", &self.blur_h, &target.blur_bgs[1], &target.blur_views[0]),
+            ("blur vertical", &self.blur_v, &target.blur_bgs[2], &target.blur_views[1]),
+        ];
+        for (label, pipeline, bg, view) in passes {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
     fn finish_again(&self, rs: &egui_wgpu::RenderState) {
         let _b = rustudio_core::bench::scope("fx_post_again");
         let Some(target) = self.target.as_ref() else { return };
         let viewport = self.pipelines(target.samples);
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("effects post") });
         self.encode_bloom(&mut encoder, target, self.post_bloom_size);
+        self.encode_blur(&mut encoder, target, self.post_blur_size);
         let steps: [(&str, &wgpu::RenderPipeline, &wgpu::BindGroup, Vec<&wgpu::TextureView>); 14] = [
             ("dof across", &viewport.dof_h, &target.dof_bgs[0], vec![&target.dof_views[0]]),
             ("dof down", &self.dof_v, &target.dof_bgs[1], vec![&target.dof_views[1]]),
@@ -4933,6 +5224,7 @@ impl Renderer {
             globals.env_spec[3] = pf.blend;
         }
         self.post_bloom_size = globals.bloom[1];
+        self.post_blur_size = globals.sky_rot[1];
         // NearIntensity below 0.22 takes the cheap full-resolution pass
         // (fs_dof_v), not the near chain (shader.wgsl DOF_CHEAP_BELOW).
         self.post_dof_near = globals.dof[2] >= DOF_CHEAP_BELOW;
@@ -4987,18 +5279,75 @@ impl Renderer {
             frame.globals.cam_pos[2],
         );
         let planes = frustum(frame.cull_view_proj);
+        let tan_half_fov = (frame.fov_y * 0.5).tan();
+        let mesh_lod_view = MeshLodView::new(cam, tan_half_fov);
+        let scene_lod = |key: (usize, usize), instances: &[InstanceRaw]| {
+            self.meshes.get(key.0).map_or(0, |mesh| mesh.scene_lod(mesh_lod_view, instances))
+        };
         // A part whose bounding radius covers less than LOD_MIN_PX pixels is skipped.
-        let focal = size[1] as f32 * 0.5 / (frame.fov_y * 0.5).tan().max(1e-3);
+        let focal = size[1] as f32 * 0.5 / tan_half_fov.max(1e-3);
         let lod_px = frame.quality.map_or(rustudio_core::mech::LOD_MIN_PX, |p| p.lod_radius_pixels(size[1]));
         let lod_k = lod_px / focal;
         let draw_distance = frame.quality.map_or(f32::INFINITY, |p| p.distance());
 
+        static NO_OCCLUSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let occlusion_enabled = !*NO_OCCLUSION.get_or_init(|| std::env::var_os("RUSTUDIO_NO_OCCLUSION").is_some());
+        if occlusion_enabled {
+            let _occ_scope = rustudio_core::bench::scope("r_occlusion");
+            let mut dyn_occluders: Vec<crate::occlusion::OccluderBox> = Vec::new();
+            for r in &self.dyn_occluders {
+                let Some(item) = self.items.get(r) else { continue };
+                for d in &item.draws {
+                    if !shows(d) || pass_of(d) != Some(Pass::Opaque) || d.alpha < 0.999 {
+                        continue;
+                    }
+                    let mslot = mesh_slot(d);
+                    let Some(m) = self.meshes.get(mslot) else { continue };
+                    if m.storage || m.cull == Some(false) {
+                        continue;
+                    }
+                    let Some((olo, ohi)) = m.occluder else { continue };
+                    let raw = to_raw(d, item.bias);
+                    if !raw_is_solid_occluder(&raw) {
+                        continue;
+                    }
+                    if let Some(ob) = crate::occlusion::OccluderBox::from_part(
+                        u32::MAX,
+                        raw.r0,
+                        raw.r1,
+                        raw.r2,
+                        [raw.size[0], raw.size[1], raw.size[2]],
+                        olo,
+                        ohi,
+                    ) {
+                        dyn_occluders.push(ob);
+                    }
+                }
+            }
+            let st_raw = &self.st.raw;
+            self.occlusion.build(
+                frame.cull_view_proj,
+                cam,
+                &planes,
+                draw_distance,
+                &self.st.occluders,
+                &self.st.occluder_cells,
+                |slot| st_raw.get(slot as usize).is_some_and(raw_is_solid_occluder),
+                &dyn_occluders,
+            );
+        } else {
+            self.occlusion.build(frame.cull_view_proj, cam, &planes, draw_distance, &[], &[], |_| false, &[]);
+        }
+
         let r_scope = rustudio_core::bench::scope("r_static_cull");
-        // Static batches: frustum test per cell, then trim the smallest parts.
-        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32)> = Vec::new();
-        let mut push_range = |pass, key, start, end| match static_ranges.last_mut() {
-            Some(last) if last.0 == pass && last.1 == key && last.3 == start => last.3 = end,
-            _ => static_ranges.push((pass, key, start, end)),
+        // Static batches: frustum + occlusion test per cell, then trim the smallest parts.
+        let mut static_ranges: Vec<(Pass, (usize, usize), u32, u32, usize)> = Vec::new();
+        let mut push_range = |pass, key, start, end| {
+            let lod = scene_lod(key, &self.st.raw[start as usize..end as usize]);
+            match static_ranges.last_mut() {
+                Some(last) if last.0 == pass && last.1 == key && last.3 == start && last.4 == lod => last.3 = end,
+                _ => static_ranges.push((pass, key, start, end, lod)),
+            }
         };
         let mut see_bounds = SeeBounds::new(Mat4::from_cols_array_2d(&frame.globals.view_proj), size);
         for b in &self.st.batches {
@@ -5008,6 +5357,11 @@ impl Renderer {
             }
             let distance = box_distance(cam, b.lo, b.hi);
             if distance > draw_distance {
+                stats.culled_batches += 1;
+                continue;
+            }
+            let occ_vis = self.occlusion.test_aabb(b.lo, b.hi);
+            if occ_vis == crate::occlusion::Visibility::Occluded {
                 stats.culled_batches += 1;
                 continue;
             }
@@ -5021,23 +5375,50 @@ impl Renderer {
             if b.pass == Pass::Decal {
                 see_bounds.add_box(b.lo, b.hi);
             }
-            if frame.quality.is_some() {
+            let straddles_frustum = !box_inside(&planes, b.lo, b.hi);
+            let straddles_dist = frame.quality.is_some() && {
                 let far = (cam - b.lo).abs().max((cam - b.hi).abs());
-                if far.length_squared() > draw_distance * draw_distance {
-                    // A static cell can straddle the Automatic view distance.
-                    // Use the same sphere-range test as the moving draws.
-                    for slot in b.start..b.start + n {
-                        let raw = &self.st.raw[slot as usize];
+                far.length_squared() > draw_distance * draw_distance
+            };
+            let tris_per_inst = self.meshes.get(b.key.0).map_or(0, |m| m.count / 3);
+            let per_inst_occ = occ_vis == crate::occlusion::Visibility::Partial && tris_per_inst >= 2000;
+            if straddles_frustum || straddles_dist || per_inst_occ || b.has_hidden {
+                let mut run_start = u32::MAX;
+                for slot in b.start..b.start + n {
+                    let raw = &self.st.raw[slot as usize];
+                    let mut keep = raw.size[0] > 0.0;
+                    if keep && (straddles_frustum || straddles_dist) {
                         let centre = Vec3::new(raw.r0[3], raw.r1[3], raw.r2[3]);
-                        let limit = draw_distance + self.st.radii[slot as usize];
-                        if (centre - cam).length_squared() <= limit * limit {
-                            push_range(b.pass, b.key, slot, slot + 1);
-                        } else {
-                            stats.lod_skipped += 1;
+                        let rad = self.st.radii[slot as usize];
+                        if straddles_frustum && !sphere_visible(&planes, centre, rad) {
+                            keep = false;
+                        } else if straddles_dist {
+                            let limit = draw_distance + rad;
+                            if (centre - cam).length_squared() > limit * limit {
+                                keep = false;
+                                stats.lod_skipped += 1;
+                            }
                         }
                     }
-                    continue;
+                    if keep && per_inst_occ {
+                        let (ilo, ihi) = raw_aabb(raw);
+                        if self.occlusion.is_occluded(ilo, ihi) {
+                            keep = false;
+                        }
+                    }
+                    if keep {
+                        if run_start == u32::MAX {
+                            run_start = slot;
+                        }
+                    } else if run_start != u32::MAX {
+                        push_range(b.pass, b.key, run_start, slot);
+                        run_start = u32::MAX;
+                    }
                 }
+                if run_start != u32::MAX {
+                    push_range(b.pass, b.key, run_start, b.start + n);
+                }
+                continue;
             }
             push_range(b.pass, b.key, b.start, b.start + n);
         }
@@ -5071,13 +5452,23 @@ impl Renderer {
                 if !shows(d) || !sphere_visible(&planes, d.xf.pos, rad) {
                     continue;
                 }
-                // A piece of terrain water: frustum-culled by its own box
+                // A piece of terrain water: frustum-culled and occlusion-culled by its own box
                 // (every piece has the whole water's box; game_view.rs).
                 let piece_hidden = d.material == 5.0
                     && d.custom_mesh.is_some()
                     && self.meshes.get(mesh_slot(d)).and_then(|m| m.bounds).is_some_and(|(lo, hi)| {
                         let c = d.xf.pos + d.xf.rot * ((lo + hi) * 0.5 * d.size);
-                        !sphere_visible(&planes, c, ((hi - lo) * d.size).length() * 0.5)
+                        let half = (hi - lo) * 0.5 * d.size;
+                        let rad_p = half.length();
+                        if !sphere_visible(&planes, c, rad_p) {
+                            return true;
+                        }
+                        if self.occlusion.is_active() {
+                            let r = d.xf.rot;
+                            let ext = r.x_axis.abs() * half.x + r.y_axis.abs() * half.y + r.z_axis.abs() * half.z;
+                            return self.occlusion.is_occluded(c - ext, c + ext);
+                        }
+                        false
                     });
                 let dist = (d.xf.pos - cam).length();
                 if dist - rad > draw_distance || rad < lod_k * (dist - rad).max(0.0) {
@@ -5568,6 +5959,7 @@ impl Renderer {
         let draw = |pass: &mut wgpu::RenderPass,
                     key: (usize, usize),
                     range: std::ops::Range<u32>,
+                    lod: usize,
                     calls: &mut usize| {
             let Some(mesh) = self.meshes.get(key.0) else {
                 return;
@@ -5577,10 +5969,39 @@ impl Renderer {
                 pass.set_bind_group(1, &self.textures[tex], &[]);
                 bound_tex.set(tex);
             }
-            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (mesh.count / 3) as u64 * (range.end - range.start) as u64);
-            draw_top::add(0, key.0, (mesh.count / 3) as u64, (range.end - range.start) as u64);
-            mesh.draw_bound(pass, range, &bound_mesh);
+            let corners = mesh.lod_corners(lod);
+            let triangles = u64::from((corners.end - corners.start) / 3);
+            let instances = u64::from(range.end - range.start);
+            rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, triangles * instances);
+            draw_top::add(0, key.0, triangles, instances);
+            mesh.draw_bound_range(pass, range, corners, &bound_mesh);
             *calls += 1;
+        };
+        // Uncounted draw helper for auxiliary passes (env probe cube faces and
+        // decal depth prepass) that do not contribute to Studio's main-view
+        // SceneTriangleCount / SceneDrawcallCount.
+        let draw_uncounted = |pass: &mut wgpu::RenderPass,
+                              key: (usize, usize),
+                              range: std::ops::Range<u32>,
+                              lod: usize| {
+            let Some(mesh) = self.meshes.get(key.0) else {
+                return;
+            };
+            let tex = if key.1 < self.textures.len() { key.1 } else { 0 };
+            if bound_tex.get() != tex {
+                pass.set_bind_group(1, &self.textures[tex], &[]);
+                bound_tex.set(tex);
+            }
+            let corners = mesh.lod_corners(lod);
+            mesh.draw_bound_range(pass, range, corners, &bound_mesh);
+        };
+        let draw_scene_dynamic = |pass: &mut wgpu::RenderPass, key, range: std::ops::Range<u32>, calls: &mut usize| {
+            let lod = scene_lod(key, &raw[range.start as usize..range.end as usize]);
+            draw(pass, key, range, lod, calls);
+        };
+        let draw_dynamic_uncounted = |pass: &mut wgpu::RenderPass, key, range: std::ops::Range<u32>| {
+            let lod = scene_lod(key, &raw[range.start as usize..range.end as usize]);
+            draw_uncounted(pass, key, range, lod);
         };
         // Scene environment probe work (env_probe.rs): Studio draws one cube
         // face a frame at the probe box's centre (Studio; 90 degrees,
@@ -5625,12 +6046,12 @@ impl Renderer {
                                 continue;
                             }
                             pass.set_pipeline(if self.culls_back(b.key.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
-                            draw(&mut pass, b.key, b.start..b.start + b.count, &mut calls);
+                            draw_uncounted(&mut pass, b.key, b.start..b.start + b.count, 0);
                         }
                         pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                         for r in &opaque_runs {
                             pass.set_pipeline(if self.culls_back(r.0.0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
-                            draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                            draw_uncounted(&mut pass, r.0, r.1..r.2, 0);
                         }
                         if !self.terrain_chunks.is_empty() {
                             pass.set_pipeline(&self.viewport.terrain);
@@ -5672,7 +6093,7 @@ impl Renderer {
                 pass.set_pipeline(&pipes.transparent);
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &surface_decal_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
                 pass.set_bind_group(1, &self.textures[0], &[]);
                 unbind();
@@ -5684,11 +6105,11 @@ impl Renderer {
             pass.set_pipeline(&pipes.transparent);
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Decal) {
-                draw(pass, r.1, r.2..r.3, calls);
+                draw(pass, r.1, r.2..r.3, r.4, calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &decal_runs {
-                draw(pass, r.0, r.1..r.2, calls);
+                draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             for r in &blend_runs {
                 pass.set_pipeline(if r.1 < glass_end {
@@ -5698,12 +6119,12 @@ impl Renderer {
                 } else {
                     &pipes.transparent
                 });
-                draw(pass, r.0, r.1..r.2, calls);
+                draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
             }
             if !overlay_runs.is_empty() {
                 pass.set_pipeline(&pipes.overlay);
                 for r in &overlay_runs {
-                    draw(pass, r.0, r.1..r.2, calls);
+                    draw_scene_dynamic(pass, r.0, r.1..r.2, calls);
                 }
             }
         };
@@ -5859,12 +6280,12 @@ impl Renderer {
             pass.set_vertex_buffer(1, self.static_buf.slice(..));
             for r in static_ranges.iter().filter(|r| r.0 == Pass::Opaque) {
                 pass.set_pipeline(opaque_pipe(r.1, &self.st.raw[r.2 as usize..r.3 as usize]));
-                draw(&mut pass, r.1, r.2..r.3, &mut calls);
+                draw(&mut pass, r.1, r.2..r.3, r.4, &mut calls);
             }
             pass.set_vertex_buffer(1, self.instance_buf.slice(..));
             for r in &opaque_runs {
                 pass.set_pipeline(opaque_pipe(r.0, &raw[r.1 as usize..r.2 as usize]));
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                draw_scene_dynamic(&mut pass, r.0, r.1..r.2, &mut calls);
             }
             // Only opaque authored decal texels contribute scene depth. The
             // shader rejects other blended materials and fractional coverage;
@@ -5872,7 +6293,7 @@ impl Renderer {
             // sorted color pass for layer order and semitransparent edges.
             pass.set_pipeline(&viewport.decal_depth);
             for r in &surface_decal_runs {
-                draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
             }
             for r in &blend_runs {
                 // fs_decal_depth discards every mode except Decal.
@@ -5880,7 +6301,7 @@ impl Renderer {
                     .iter()
                     .any(|part| part.extra[3] == DECAL_TEX_MODE)
                 {
-                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                    draw_dynamic_uncounted(&mut pass, r.0, r.1..r.2);
                 }
             }
             // Terrain chunks in view.
@@ -5890,6 +6311,7 @@ impl Renderer {
                 for c in self.terrain_chunks.values().chain(self.terrain_grass.values()) {
                     if box_visible(&planes, c.lo, c.hi)
                         && (frame.quality.is_none() || box_distance(cam, c.lo, c.hi) <= draw_distance)
+                        && !self.occlusion.is_occluded(c.lo, c.hi)
                     {
                         rustudio_core::bench::perf::draw(rustudio_core::bench::perf::SCENE, 1, (c.count / 3) as u64);
                         draw_top::add(0, usize::MAX, (c.count / 3) as u64, 1);
@@ -5967,7 +6389,7 @@ impl Renderer {
                 unbind();
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
                 for r in &water_runs {
-                    draw(&mut pass, r.0, r.1..r.2, &mut calls);
+                    draw_scene_dynamic(&mut pass, r.0, r.1..r.2, &mut calls);
                 }
             }
             if water_seen || !water_runs.is_empty() {
@@ -6065,6 +6487,7 @@ impl Renderer {
         }
         crate::gpu_timing::mark(&mut encoder, "gpu: clouds composite");
         self.encode_bloom(&mut encoder, target, globals.bloom[1]);
+        self.encode_blur(&mut encoder, target, globals.sky_rot[1]);
         crate::gpu_timing::mark(&mut encoder, "gpu: bloom");
         let mut fullscreen = |label: &str,
                               pipeline: &wgpu::RenderPipeline,
@@ -6148,24 +6571,30 @@ impl Renderer {
 const BUILTIN_MESHES: usize = 5;
 
 impl Renderer {
-    /// The mesh index to draw loaded mesh `index` single-sided (back faces
-    /// culled) or two-sided with: `index` itself, or, when another part
-    /// already draws that shared mesh the other way (a DoubleSided MeshPart
-    /// beside single-sided ones), a second slot over the same vertices.
-    /// Skinned slots are a part's own and are set in place.
-    pub fn mesh_cull_slot(&mut self, index: u32, cull_back: bool) -> u32 {
+    /// Get a mesh slot for this combination of culling and fidelity.
+    /// Aliases share the original GPU allocation. Skinned slots belong to
+    /// one part and can change culling in place.
+    pub fn mesh_cull_slot(&mut self, index: u32, cull_back: bool, fidelity: MeshFidelity) -> u32 {
         let Some(m) = self.meshes.get_mut(index as usize + BUILTIN_MESHES) else { return index };
-        if m.storage || m.cull.is_none_or(|c| c == cull_back) {
+        let fidelity = if m.lod_offsets.is_none()
+            || (fidelity == MeshFidelity::Automatic && m.high_quality_lods <= 1)
+        {
+            MeshFidelity::Precise
+        } else {
+            fidelity
+        };
+        if m.storage || (fidelity == m.fidelity && m.cull.is_none_or(|c| c == cull_back)) {
             m.cull = Some(cull_back);
             return index;
         }
-        if let Some(&a) = self.cull_alias.get(&(index, cull_back)) {
+        let key = (index, cull_back, fidelity);
+        if let Some(&a) = self.cull_alias.get(&key) {
             return a;
         }
-        let alias = Mesh { vbuf: m.vbuf.clone(), base_vertex: m.base_vertex, first_index: m.first_index, bind_key: m.bind_key, range: m.range.clone(), count: m.count, ibuf: m.ibuf.clone(), remap: m.remap.clone(), bounds: m.bounds, cull: Some(cull_back), storage: false };
+        let alias = Mesh { cull: Some(cull_back), fidelity, ..m.clone() };
         self.meshes.push(alias);
         let a = (self.meshes.len() - 1 - BUILTIN_MESHES) as u32;
-        self.cull_alias.insert((index, cull_back), a);
+        self.cull_alias.insert(key, a);
         a
     }
 
@@ -6393,6 +6822,47 @@ impl Renderer {
         self.add_mesh_with(device, positions, normals, uvs, colors, planes, false)
     }
 
+    /// Upload all levels together. The ordinary draw and collision-independent
+    /// tools use the first range. Scene batches may choose another range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_mesh_lods(
+        &mut self,
+        device: &wgpu::Device,
+        positions: &[Vec3],
+        normals: &[Vec3],
+        uvs: &[glam::Vec2],
+        colors: &[glam::Vec4],
+        planes: &[glam::Vec4],
+        lods: &rustudio_core::mesh::MeshLods,
+    ) -> u32 {
+        let index = self.add_mesh_projected(device, positions, normals, uvs, colors, planes);
+        let mesh = &mut self.meshes[index as usize + BUILTIN_MESHES];
+        if let [0, first_end, _, ..] = lods.face_offsets.as_slice() {
+            if mesh.count as usize == positions.len() {
+                mesh.count = first_end * 3;
+                mesh.high_quality_lods = lods.high_quality_count.max(1);
+                mesh.lod_offsets = Some(lods.face_offsets.iter().map(|offset| offset * 3).collect());
+                let lod0 = &positions[..(*first_end as usize * 3)];
+                mesh.bounds = Some(lod0.iter().fold(
+                    (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+                    |(lo, hi), point| (lo.min(*point), hi.max(*point)),
+                ));
+            } else {
+                // The combined geometry may exceed the device buffer limit
+                // even when LOD0 fits. Keep the full-detail draw available.
+                let end = *first_end as usize * 3;
+                let retry = self.add_mesh_projected(
+                    device, &positions[..end], &normals[..end], &uvs[..end],
+                    colors.get(..end).unwrap_or(&[]), &planes[..end],
+                );
+                let full = self.meshes.pop().expect("LOD0 upload creates a mesh slot");
+                debug_assert_eq!(retry, index + 1);
+                self.meshes[index as usize + BUILTIN_MESHES] = full;
+            }
+        }
+        index
+    }
+
     /// `add_mesh_projected`; `storage` also lets the skinning pass write it.
     #[allow(clippy::too_many_arguments)]
     fn add_mesh_with(
@@ -6418,7 +6888,7 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             });
-            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), range: None, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage }
+            Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage, occluder: None }
         } else {
             Mesh::upload_pooled(&mut self.pool, device, "loaded mesh", &verts, wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, None)
         };
@@ -6434,7 +6904,7 @@ impl Renderer {
             contents: bytemuck::cast_slice(verts),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        self.meshes.push(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), range: None, count: verts.len() as u32, ibuf: None, remap: None, bounds: None, cull: None, storage: false });
+        self.meshes.push(Mesh { vbuf, base_vertex: 0, first_index: 0, bind_key: fresh_bind_key(), _pool_range: None, count: verts.len() as u32, lod_offsets: None, high_quality_lods: 1, fidelity: MeshFidelity::Precise, ibuf: None, remap: None, bounds: None, cull: None, storage: false, occluder: None });
         (self.meshes.len() - 1 - BUILTIN_MESHES) as u32
     }
 
@@ -6650,10 +7120,18 @@ impl Renderer {
             items,
             st,
             per_frame,
+            dyn_occluders,
             pending,
             pending_at,
             ..
         } = self;
+        let has_dyn_occ = draws.iter().any(|d| {
+            shows(d)
+                && pass_of(d) == Some(Pass::Opaque)
+                && d.alpha >= 0.999
+                && d.size.max_element() >= 5.0
+                && d.size.min_element() >= 0.4
+        });
         let static_ok = draws.iter().all(|d| !shows(d) || pass_of(d).is_some());
         let Some(item) = items.get_mut(&r) else {
             let bias = bias_of(&draws);
@@ -6667,6 +7145,9 @@ impl Renderer {
                 },
             );
             per_frame.insert(r);
+            if has_dyn_occ {
+                dyn_occluders.insert(r);
+            }
             *pending += 1;
             // Settle time counts from the first waiting part: a game that
             // spawns something every few frames would otherwise never settle.
@@ -6683,6 +7164,11 @@ impl Renderer {
             });
         item.draws = draws;
         update_item_slots(r, item, st, per_frame, pending, same_place, static_ok);
+        if matches!(item.state, ItemState::Static(_)) || !has_dyn_occ {
+            dyn_occluders.remove(&r);
+        } else {
+            dyn_occluders.insert(r);
+        }
     }
 
     /// Apply the host transform to draws whose geometry and materials are
@@ -6718,6 +7204,17 @@ impl Renderer {
         update_item_slots(
             r, item, &mut self.st, &mut self.per_frame, &mut self.pending, same_place, true,
         );
+        if !matches!(item.state, ItemState::Static(_))
+            && item.draws.iter().any(|d| {
+                shows(d)
+                    && pass_of(d) == Some(Pass::Opaque)
+                    && d.alpha >= 0.999
+                    && d.size.max_element() >= 5.0
+                    && d.size.min_element() >= 0.4
+            })
+        {
+            self.dyn_occluders.insert(r);
+        }
         true
     }
 
@@ -6781,6 +7278,10 @@ impl Renderer {
                         let old = raw_sphere(&self.st.raw[s as usize], self.st.radii[s as usize]);
                         self.st.caster_dirty.push(old);
                         self.st.raw[s as usize] = HIDDEN;
+                        let bi = self.st.batches.partition_point(|b| b.start + b.count <= s);
+                        if let Some(b) = self.st.batches.get_mut(bi) {
+                            b.has_hidden = true;
+                        }
                         self.st.writes.push(s);
                         self.st.caster_writes = true;
                         self.st.hidden += 1;
@@ -6791,6 +7292,7 @@ impl Renderer {
             ItemState::Dynamic => {}
         }
         self.per_frame.remove(&r);
+        self.dyn_occluders.remove(&r);
     }
 
     pub fn clear_items(&mut self) {
@@ -6798,6 +7300,7 @@ impl Renderer {
         let layered = &self.vf.layer_of;
         self.items.retain(|r, _| layered.contains_key(r));
         self.per_frame.clear();
+        self.dyn_occluders.clear();
         self.st = StaticLayout::default();
         self.static_gen += 1;
         self.caster_gen += 1;
@@ -6975,7 +7478,7 @@ impl Renderer {
                 }
                 _ => {
                     cell_of_batch = key.2;
-                    st.batches.push(Batch { pass: key.0, key: key.1, lo, hi, start: slot, count: 1 });
+                    st.batches.push(Batch { pass: key.0, key: key.1, lo, hi, start: slot, count: 1, has_hidden: false });
                 }
             }
         }
@@ -7104,6 +7607,7 @@ impl Renderer {
                         hi: row.hi,
                         start: slot,
                         count: 1,
+                        has_hidden: false,
                     });
                 }
             }
@@ -7114,7 +7618,7 @@ impl Renderer {
     }
 
     /// Uploads a new static layout and makes it current.
-    fn finish_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, st: StaticLayout) {
+    fn finish_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut st: StaticLayout) {
         let scope = rustudio_core::bench::scope("rs_upload");
         if st.raw.len() > self.static_cap {
             self.static_cap = st.raw.len().next_power_of_two();
@@ -7129,11 +7633,36 @@ impl Renderer {
         }
         drop(scope);
         let scope = rustudio_core::bench::scope("rs_swap");
+        st.occluders.clear();
+        for (slot, (raw, &(pass, key))) in st.raw.iter().zip(&st.keys).enumerate() {
+            if pass != Pass::Opaque || !raw_is_solid_occluder(raw) {
+                continue;
+            }
+            let Some(m) = self.meshes.get(key.0) else { continue };
+            if m.storage || m.cull == Some(false) {
+                continue;
+            }
+            let Some((olo, ohi)) = m.occluder else { continue };
+            if let Some(ob) = crate::occlusion::OccluderBox::from_part(
+                slot as u32,
+                raw.r0,
+                raw.r1,
+                raw.r2,
+                [raw.size[0], raw.size[1], raw.size[2]],
+                olo,
+                ohi,
+            ) {
+                st.occluders.push(ob);
+            }
+        }
+        st.occluder_cells = crate::occlusion::build_occluder_cells(&mut st.occluders, CELL);
         self.st = st;
         self.static_gen += 1;
         self.caster_gen += 1;
         let items = &self.items;
         self.per_frame
+            .retain(|r| items.get(r).is_some_and(|i| i.state == ItemState::Dynamic));
+        self.dyn_occluders
             .retain(|r| items.get(r).is_some_and(|i| i.state == ItemState::Dynamic));
         self.pending = 0;
         self.pending_at = None;
@@ -7204,6 +7733,10 @@ fn update_item_slots(
                 if s != u32::MAX {
                     st.caster_dirty.push(raw_sphere(&st.raw[s as usize], st.radii[s as usize]));
                     st.raw[s as usize] = HIDDEN;
+                    let bi = st.batches.partition_point(|b| b.start + b.count <= s);
+                    if let Some(b) = st.batches.get_mut(bi) {
+                        b.has_hidden = true;
+                    }
                     st.writes.push(s);
                     st.caster_writes = true;
                     st.hidden += 1;
@@ -7621,9 +8154,9 @@ impl MeshBuilder {
 
 /// Selection uses the same tessellation and size transform as the visible ball.
 pub(crate) fn ball_outline_points() -> impl Iterator<Item = Vec3> {
-    (0..=18).flat_map(|i| (0..32).map(move |j| {
-        let th = std::f32::consts::PI * i as f32 / 18.0;
-        let ph = std::f32::consts::TAU * j as f32 / 32.0;
+    (0..=10).flat_map(|i| (0..24).map(move |j| {
+        let th = std::f32::consts::PI * i as f32 / 10.0;
+        let ph = std::f32::consts::TAU * j as f32 / 24.0;
         Vec3::new(th.sin() * ph.cos(), th.cos(), th.sin() * ph.sin()) * 0.5
     }))
 }
@@ -7654,9 +8187,9 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
         }
     }
 
-    // Ball
+    // Ball: Studio's built-in sphere primitive has 432 triangles (10 rings x 24 segs).
     let mut ball = MeshBuilder::default();
-    let (rings, segs) = (18, 32);
+    let (rings, segs) = (10, 24);
     let sp = |i: usize, j: usize| {
         let th = std::f32::consts::PI * i as f32 / rings as f32;
         let ph = std::f32::consts::TAU * j as f32 / segs as f32;
@@ -7675,9 +8208,9 @@ fn build_meshes() -> Vec<Vec<Vertex>> {
         }
     }
 
-    // Cylinder (axis along X, like Roblox cylinders)
+    // Cylinder (axis along X, like Roblox cylinders): Studio's built-in cylinder has 96 triangles (24 segs).
     let mut cyl = MeshBuilder::default();
-    let segs = 32;
+    let segs = 24;
     let ring = |j: usize| {
         let a = std::f32::consts::TAU * j as f32 / segs as f32;
         Vec3::new(0.0, a.cos(), a.sin())

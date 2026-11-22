@@ -290,6 +290,28 @@ mod tests {
     }
 }
 
+/// Decode a Terrain `MaterialColors` property from any Variant representation
+/// used across RBXL files, live Team Create replication, and Luau writes.
+pub fn material_colors_bytes(v: &rbx_dom_weak::types::Variant) -> Option<Vec<u8>> {
+    use rbx_dom_weak::types::Variant;
+    match v {
+        Variant::MaterialColors(c) => Some(c.encode()),
+        Variant::BinaryString(b) => {
+            let bytes: &[u8] = b.as_ref();
+            (bytes.len() >= 69).then(|| bytes.to_vec())
+        }
+        Variant::SharedString(s) => {
+            let bytes = s.data();
+            (bytes.len() >= 69).then(|| bytes.to_vec())
+        }
+        Variant::String(s) => {
+            let bytes = s.as_bytes();
+            (bytes.len() >= 69).then(|| bytes.to_vec())
+        }
+        _ => None,
+    }
+}
+
 /// Include the actual palette in the upload generation. Live runtime writes can
 /// precede the scene journal's mesh rebuild; palette uploads must see them now.
 pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
@@ -299,10 +321,8 @@ pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
     crate::doc::use_2022_materials(doc).hash(&mut h);
     let parent = doc.workspace().unwrap_or(doc.dom.root_ref());
     if let Some(terrain) = doc.find_child(parent, "Terrain") {
-        match doc.prop(terrain, "MaterialColors") {
-            Some(rbx_dom_weak::types::Variant::BinaryString(bytes)) => AsRef::<[u8]>::as_ref(&bytes).hash(&mut h),
-            Some(rbx_dom_weak::types::Variant::MaterialColors(colors)) => colors.encode().hash(&mut h),
-            _ => {},
+        if let Some(bytes) = doc.prop(terrain, "MaterialColors").as_ref().and_then(material_colors_bytes) {
+            bytes.hash(&mut h);
         }
     }
     for m in 2..23 {
@@ -333,6 +353,17 @@ mod live_palette_tests {
         assert_ne!(binary_generation, palette_generation(&doc, 5));
         assert_ne!(initial, palette_generation(&doc, 5));
         assert_ne!(palette_generation(&doc, 5), palette_generation(&doc, 6));
+    }
+
+    #[test]
+    fn material_colors_bytes_decodes_all_variants() {
+        let mut raw = vec![0u8; 69];
+        raw[12..15].copy_from_slice(&[104, 113, 93]);
+        assert_eq!(material_colors_bytes(&Variant::BinaryString(raw.clone().into())), Some(raw.clone()));
+        assert_eq!(material_colors_bytes(&Variant::SharedString(rbx_dom_weak::types::SharedString::new(raw.clone()))), Some(raw.clone()));
+        let ascii = "A".repeat(69);
+        assert_eq!(material_colors_bytes(&Variant::String(ascii.clone())), Some(ascii.into_bytes()));
+        assert_eq!(material_colors_bytes(&Variant::BinaryString(vec![1, 2, 3].into())), None);
     }
 }
 

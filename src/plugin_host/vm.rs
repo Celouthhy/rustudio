@@ -31,7 +31,7 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
 use rustudio_engine::runtime::security;
-use rustudio_engine::runtime::{world, Runtime};
+use rustudio_engine::runtime::{world, RunMode, Runtime};
 
 use super::PluginId;
 
@@ -131,6 +131,11 @@ pub enum EditorRequest {
     OpenScript { script: Ref, line: i64 },
     OpenWikiPage(String),
     SelectRibbonTool { tool: String },
+    StartPlaytest {
+        mode: RunMode,
+        args: String,
+        completion: super::PlaytestCompletion,
+    },
 }
 
 impl PluginVm {

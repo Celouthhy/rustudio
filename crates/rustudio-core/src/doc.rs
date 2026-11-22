@@ -214,6 +214,32 @@ pub fn default_instance_name(class: &str) -> &str {
         "DepthOfFieldEffect" => "DepthOfField",
         "SunRaysEffect" => "SunRays",
         "TouchTransmitter" => "TouchInterest",
+        // Measured 2026-11-21: Instance.new(class).Name in Studio for every
+        // creatable class (measured in Studio).
+        "AnimationGraphDefinition" | "AnimationNodeDefinition" | "AnimationValueNodeDefinition" |
+        "AnimationValueOutputDefinition" | "Annotation" | "AudioSearchParams" |
+        "BubbleChatMessageProperties" | "CompositeValueCurve" | "CurveAnimation" |
+        "DataStoreGetOptions" | "DataStoreIncrementOptions" | "DataStoreOptions" |
+        "DataStoreSetOptions" | "EulerRotationCurve" | "ExperienceInviteOptions" | "FloatCurve" |
+        "GetTextBoundsParams" | "HiddenSurfaceRemovalAsset" | "HumanoidController" | "MarkerCurve" |
+        "PartOperationAsset" | "PluginAction" | "ReflectionMetadata" | "ReflectionMetadataCallbacks" |
+        "ReflectionMetadataClass" | "ReflectionMetadataClasses" | "ReflectionMetadataEnum" |
+        "ReflectionMetadataEnumItem" | "ReflectionMetadataEnums" | "ReflectionMetadataEvents" |
+        "ReflectionMetadataFunctions" | "ReflectionMetadataMember" | "ReflectionMetadataProperties" |
+        "ReflectionMetadataYieldFunctions" | "RotationCurve" | "StateMachineTransitionDefinition" |
+        "TeleportOptions" | "TextChatMessageProperties" | "ValueCurve" | "Vector3Curve" |
+        "VehicleController" | "VisualizationMode" | "VisualizationModeCategory" | "WorkspaceAnnotation" => "Instance",
+        "BinaryStringValue" | "BoolValue" | "BrickColorValue" | "CFrameValue" | "Color3Value" |
+        "IntValue" | "NumberValue" | "ObjectValue" | "RayValue" | "StringValue" | "Vector3Value" => "Value",
+        "BlockMesh" | "FileMesh" | "SpecialMesh" => "Mesh",
+        "Pants" | "Shirt" => "Clothing",
+        "BodyColors" => "Body Colors",
+        "GeneratedFolder" => "Folder",
+        "IntersectOperation" => "Intersection",
+        "NegateOperation" => "NegativePart",
+        "NumberPose" => "Pose",
+        "ShirtGraphic" => "Shirt Graphic",
+        "TrussPart" => "Truss",
         _ => class,
     }
 }
@@ -247,27 +273,92 @@ pub fn lighting_style_default(inst: &rbx_dom_weak::Instance) -> (u32, bool) {
 }
 
 pub fn studio_default(class: &str, name: &str) -> Option<Variant> {
+    if let Some(v) = constructor_default(class, name) {
+        return Some(v);
+    }
     match (class, name) {
         ("Lighting", "Brightness") => Some(Variant::Float32(crate::mech::LIGHTING_BRIGHTNESS_DEFAULT)),
-        // On in Studio; the reflection database's default is false, which
-        // left a new place (and any file that leaves it out) without shadows.
-        ("Lighting", "GlobalShadows") => Some(Variant::Bool(true)),
         // Studio's UICorner default; the reflection database has none, and
         // files saved at the default leave it out (Place B's index UI).
         ("UICorner", "CornerRadius") => Some(Variant::UDim(rbx_dom_weak::types::UDim::new(0.0, 8))),
         // Every instance's (a plugin reads false: ); the
         // reflection database has no default.
         (_, "RobloxLocked") => Some(Variant::Bool(false)),
-        // Studio's Instance.new / Insert Part are Smooth on every face (the
-        // API dump's default); the reflection database still has the old
-        // Studs top / Inlet bottom, which put studs on every part a script
-        // made or a file left them out of. TrussPart keeps its own.
+        // Every instance's: the empty set (Studio reads an empty
+        // SecurityCapabilities; the reflection database has no default).
+        (_, "Capabilities") => Some(Variant::SecurityCapabilities(rbx_dom_weak::types::SecurityCapabilities::from_bits(0))),
+        // The other BaseParts are Smooth on every face from the constructor
+        // (measured: MeshPart, CornerWedgePart, UnionOperation …; Part and
+        // its kin are in constructor_default); the reflection database still
+        // has the old Studs top / Inlet bottom. TrussPart keeps its own.
         (
             c,
             "TopSurface" | "BottomSurface" | "FrontSurface" | "BackSurface" | "LeftSurface" | "RightSurface",
         ) if c != "TrussPart" && is_a(c, "BasePart") => {
             Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0)))
         }
+        _ => None,
+    }
+}
+
+/// A property's class default, as `Document::prop` reads a missing one
+/// (Studio's measured values first, then the reflection database's, its
+/// serialized name followed). It is also what a Team Create server leaves out
+/// of a record.
+pub fn class_default(class: &str, name: &str) -> Option<Variant> {
+    prop_plan(ustr(class), ustr(name)).and_then(|p| p.fixed.clone())
+}
+
+/// What `Instance.new(class)` reads in Studio where the reflection
+/// database's default (or, for classes newer than it, the API stubs') is
+/// wrong. A Team Create server leaves a property out of a record when it
+/// equals this value, so the live model reads the same through it.
+/// Measured 2026-11-21 in Studio for every creatable class, compared with a
+/// bare rustudio instance (measuring Studio lists any
+/// difference left); services (Lighting, Terrain) from the Team Create mass
+/// test: values the server omitted that Studio reads.
+pub fn constructor_default(class: &str, name: &str) -> Option<Variant> {
+    use rbx_dom_weak::types::{Content, ContentId, Enum};
+    const SMOOTH: u32 = 0;
+    const STUDS: u32 = 3;
+    const INLET: u32 = 4;
+    let id = |s: &str| Some(Variant::ContentId(ContentId::from(s.to_string())));
+    match (class, name) {
+        // The Part constructor's Studs top / Inlet bottom (Insert Part makes
+        // them Smooth: new_part); WedgePart has an Inlet bottom only.
+        ("Part" | "Seat" | "SpawnLocation" | "VehicleSeat" | "Terrain", "TopSurface") => Some(Variant::Enum(Enum::from_u32(STUDS))),
+        ("WedgePart", "TopSurface") => Some(Variant::Enum(Enum::from_u32(SMOOTH))),
+        ("Part" | "Seat" | "SpawnLocation" | "VehicleSeat" | "Terrain" | "WedgePart", "BottomSurface") => {
+            Some(Variant::Enum(Enum::from_u32(INLET)))
+        }
+        // The constructor's (and the reflection database's) false; Studio's
+        // new-place template turns it on (Document::new_place does too).
+        ("Lighting", "GlobalShadows") => Some(Variant::Bool(false)),
+        ("AdGui", "Active" | "AutoLocalize" | "EnableVideoAds" | "Enabled" | "ResetOnSpawn") => Some(Variant::Bool(true)),
+        ("AdGui", "Face") => Some(Variant::Enum(Enum::from_u32(5))), // Front
+        ("AdGui", "FallbackImageContent") => Some(Variant::Content(Content::none())),
+        ("AudioDeviceInput", "Active") => Some(Variant::Bool(false)),
+        ("AudioSearchParams", "MaxDuration") => Some(Variant::Int32(i32::MAX)),
+        ("AvatarAccessoryRules", n) if n.ends_with("AccessoryOverride") => Some(Variant::Int64(-1)),
+        ("AvatarAnimationRules", n) if n.ends_with("AnimationOverride") => Some(Variant::Int64(-1)),
+        ("AvatarBodyRules", n) if n.ends_with("Override") => Some(Variant::Int64(-1)),
+        // (Not the Classic* / *Shoes ones: Studio can't read those.)
+        (
+            "AvatarClothingRules",
+            "DressSkirtAccessoryOverride" | "JacketAccessoryOverride" | "PantsAccessoryOverride" | "ShirtAccessoryOverride"
+            | "ShortsAccessoryOverride" | "SweaterAccessoryOverride" | "TShirtAccessoryOverride",
+        ) => Some(Variant::Int64(-1)),
+        ("Camera" | "ViewportCamera", "OrthographicSize") => Some(Variant::Float32(35.0)),
+        ("ViewportCamera", "ViewStretch") => Some(Variant::Float32(1.0)),
+        // An asset number, not a content id.
+        ("CharacterMesh", "MeshId" | "BaseTextureId" | "OverlayTextureId") => Some(Variant::Int64(0)),
+        ("DataStoreGetOptions", "UseCache") => Some(Variant::Bool(true)),
+        ("DebuggerWatch", "Expression") => Some(Variant::String(String::new())),
+        ("GetTextBoundsParams", "Size") => Some(Variant::Float32(20.0)),
+        ("ScrollingFrame", "TopImage") => id("rbxasset://textures/ui/Scroll/scroll-top.png"),
+        ("ScrollingFrame", "MidImage") => id("rbxasset://textures/ui/Scroll/scroll-middle.png"),
+        ("ScrollingFrame", "BottomImage") => id("rbxasset://textures/ui/Scroll/scroll-bottom.png"),
+        ("SurfaceAppearance", "SurfaceSlot") => Some(Variant::Int32(-1)),
         _ => None,
     }
 }
@@ -296,7 +387,17 @@ fn prop_plan(class: Ustr, key: Ustr) -> Option<std::rc::Rc<PropPlan>> {
     let name = key.as_str();
     let plan = (|| {
         let db = db();
-        let c = db.classes.get(class.as_str())?;
+        let Some(c) = db.classes.get(class.as_str()) else {
+            // Newer than the reflection database: only a measured default.
+            return Some(std::rc::Rc::new(PropPlan {
+                stored_as: None,
+                twin: None,
+                fixed: Some(studio_default(class.as_str(), name)?),
+                xml: ustr(&format!("{name}_XML")),
+                xml_default: None,
+                upper: None,
+            }));
+        };
         let stored_as = db.superclasses_iter(c).find_map(|c| match &c.properties.get(name)?.kind {
             rbx_reflection::PropertyKind::Canonical {
                 serialization: rbx_reflection::PropertySerialization::SerializesAs(alt),
@@ -325,7 +426,12 @@ fn prop_plan(class: Ustr, key: Ustr) -> Option<std::rc::Rc<PropPlan>> {
             .or_else(|| {
                 // A content property the class has but nothing set: the
                 // empty id (MeshPart.TextureID reads "" in Roblox, not nil).
-                (twin.is_some() && db.superclasses_iter(c).any(|c| c.properties.contains_key(name)))
+                // (Only a content property: CharacterMesh.MeshId is an asset
+                // number, and reads 0.)
+                let content = db.superclasses_iter(c).find_map(|c| c.properties.get(name)).is_some_and(|p| {
+                    matches!(p.data_type, rbx_reflection::DataType::Value(rbx_dom_weak::types::VariantType::ContentId))
+                });
+                (twin.is_some() && content)
                     .then(|| Variant::ContentId(rbx_dom_weak::types::ContentId::from(String::new())))
             });
         let xml = format!("{name}_XML");
@@ -552,7 +658,11 @@ pub fn new_part(
                 CFrame::identity().orientation,
             ),
         )
-        .with_property("Color", Color3uint8::new(color[0], color[1], color[2]));
+        .with_property("Color", Color3uint8::new(color[0], color[1], color[2]))
+        // Insert Part's smooth faces: the constructor's are a Studs top and
+        // an Inlet bottom (constructor_default).
+        .with_property("TopSurface", Enum::from_u32(0))
+        .with_property("BottomSurface", Enum::from_u32(0));
     // Block is the default shape; wedge classes have no Shape property at all.
     if shape != 1 {
         b.add_property("Shape", Enum::from_u32(shape));
@@ -759,12 +869,16 @@ impl Document {
                         "CFrame",
                         CFrame::new(Vector3::new(0.0, 0.5, 0.0), CFrame::identity().orientation),
                     )
-                    .with_property("Color", Color3uint8::new(163, 162, 165)),
+                    .with_property("Color", Color3uint8::new(163, 162, 165))
+                    .with_property("TopSurface", rbx_dom_weak::types::Enum::from_u32(0))
+                    .with_property("BottomSurface", rbx_dom_weak::types::Enum::from_u32(0)),
             );
         let lighting = InstanceBuilder::new("Lighting")
             .with_name("Lighting")
             .with_property("ClockTime", mech::CLOCK_TIME)
             .with_property("Brightness", mech::LIGHT_BRIGHTNESS)
+            // On in Studio's templates (the constructor's is off).
+            .with_property("GlobalShadows", true)
             // Studio's Baseplate template is lit by Future (Realistic).
             .with_property(
                 "Technology",
@@ -1589,6 +1703,25 @@ impl Document {
         self.encode(&top, false).ok()
     }
 
+    /// Gives every script in these subtrees a new ScriptGuid, as Studio does
+    /// for a paste, duplicate or insert (Studio parity; tools that track
+    /// scripts by ScriptGuid need them unique).
+    pub fn renew_script_guids(&mut self, roots: &[Ref]) {
+        let mut targets = Vec::new();
+        for &root in roots {
+            for r in self.subtree(root) {
+                if matches!(self.dom.get_by_ref(r).and_then(|i| i.properties.get(&Ustr::from("ScriptGuid"))), Some(Variant::String(g)) if !g.is_empty()) {
+                    targets.push(r);
+                }
+            }
+        }
+        for r in targets {
+            if let Some(i) = self.dom.get_by_ref_mut(r) {
+                i.properties.insert("ScriptGuid".into(), Variant::String(new_script_guid()));
+            }
+        }
+    }
+
     /// Inserts clipboard bytes under `parent`; returns the new top-level refs.
     pub fn paste(&mut self, bytes: &[u8], parent: Ref, label: &str) -> Vec<Ref> {
         let Ok(mut tmp) = Self::decode(bytes) else {
@@ -1605,6 +1738,7 @@ impl Document {
             tmp.transfer(*r, &mut self.dom, parent);
             changes.push(Change::Create { r: *r, parent });
         }
+        self.renew_script_guids(&roots);
         self.push(label, changes, None);
         roots
     }
@@ -1625,6 +1759,7 @@ impl Document {
             }
             out.extend(roots);
         }
+        self.renew_script_guids(&out);
         self.push(label, changes, None);
         out
     }
@@ -1654,6 +1789,7 @@ impl Document {
                 out.push(nr);
             }
         }
+        self.renew_script_guids(&out);
         self.push("Duplicate", changes, None);
         out
     }
@@ -1989,6 +2125,48 @@ mod tests {
         assert_eq!(d.prop(keep, "Reflectance"), Some(Variant::Float32(0.3)));
         assert!(!d.exists(roots[0]) && !d.exists(inside));
         assert_eq!(d.can_redo(), None);
+    }
+
+    #[test]
+    fn commit_pending_script_changes_isolates_manual_delete_and_preserves_redo() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let a = d.insert(ws, new_part("A", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let b = d.insert(ws, new_part("B", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        let before = d.undo_len();
+
+        // Simulate a script (e.g. MCP run_luau) mutating A without SetWaypoint.
+        script_prop(&mut d, a, "Transparency", Variant::Float32(0.5));
+        assert!(d.commit_pending_script_changes("Run Luau (MCP)"));
+        assert_eq!(d.undo_len(), before + 1);
+        assert_eq!(d.can_undo(), Some("Run Luau (MCP)"));
+
+        // Deleting B next must create its own step without absorbing the script edit.
+        assert_eq!(d.remove(&[b]), 1);
+        assert!(!d.exists(b));
+        assert_eq!(d.can_undo(), Some("Delete"));
+
+        // First undo reverts only the Delete of B; A's scripted edit remains.
+        assert_eq!(d.undo().as_deref(), Some("Delete"));
+        assert!(d.exists(b));
+        assert_eq!(d.prop(a, "Transparency"), Some(Variant::Float32(0.5)));
+        assert_eq!(d.can_undo(), Some("Run Luau (MCP)"));
+        assert_eq!(d.can_redo(), Some("Delete"));
+
+        // A no-op commit (read-only run_luau) does not clear the redo stack.
+        assert!(!d.commit_pending_script_changes("Run Luau (MCP)"));
+        assert_eq!(d.can_redo(), Some("Delete"));
+
+        // Second undo cleanly reverts the scripted edit.
+        assert_eq!(d.undo().as_deref(), Some("Run Luau (MCP)"));
+        assert_ne!(d.prop(a, "Transparency"), Some(Variant::Float32(0.5)));
+
+        // An open CHS recording is left alone.
+        let rec = d.chs_begin_recording("CustomRec", None).expect("recording");
+        script_prop(&mut d, a, "Transparency", Variant::Float32(0.25));
+        assert!(!d.commit_pending_script_changes("Run Luau (MCP)"));
+        d.chs_finish_recording(&rec, FinishOp::Commit).expect("commit");
+        assert_eq!(d.can_undo(), Some("CustomRec"));
     }
 
     /// Ctrl+Z mid-drag took the insert to the redo stack: the drag-out
@@ -2409,15 +2587,23 @@ mod surface_default_tests {
     use rbx_dom_weak::{types::Variant, InstanceBuilder};
 
     #[test]
-    fn new_parts_are_smooth_like_studio() {
+    fn new_parts_have_studios_constructor_surfaces() {
         let mut d = super::Document::empty();
         let root = d.dom.root_ref();
-        for class in ["Part", "WedgePart", "CornerWedgePart", "MeshPart"] {
+        let e = |v| Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(v)));
+        // Instance.new in Studio (measured in Studio):
+        // Part a Studs top and an Inlet bottom, WedgePart an Inlet bottom,
+        // the rest smooth.
+        for (class, top, bottom) in [("Part", 3, 4), ("SpawnLocation", 3, 4), ("WedgePart", 0, 4), ("CornerWedgePart", 0, 0), ("MeshPart", 0, 0)] {
             let r = d.dom.insert(root, InstanceBuilder::new(class));
-            for face in ["TopSurface", "BottomSurface", "FrontSurface"] {
-                assert_eq!(d.prop(r, face), Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(0))), "{class}.{face}");
-            }
+            assert_eq!(d.prop(r, "TopSurface"), e(top), "{class}.TopSurface");
+            assert_eq!(d.prop(r, "BottomSurface"), e(bottom), "{class}.BottomSurface");
+            assert_eq!(d.prop(r, "FrontSurface"), e(0), "{class}.FrontSurface");
         }
+        // Insert Part's are smooth.
+        let r = d.dom.insert(root, super::new_part("Part", 1, glam::Vec3::ZERO, glam::Vec3::ONE, [1, 2, 3]));
+        assert_eq!(d.prop(r, "TopSurface"), e(0));
+        assert_eq!(d.prop(r, "BottomSurface"), e(0));
         // A saved Studs surface still shows.
         let r = d.dom.insert(root, InstanceBuilder::new("Part").with_property("TopSurface", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
         assert_eq!(d.prop(r, "TopSurface"), Some(Variant::Enum(rbx_dom_weak::types::Enum::from_u32(3))));
@@ -2502,4 +2688,24 @@ mod studio_defaults_tests {
         assert_eq!(default_instance_name("DepthOfFieldEffect"), "DepthOfField");
         assert_eq!(default_instance_name("Atmosphere"), "Atmosphere");
     }
+}
+
+/// A new ScriptGuid in Studio's form (`{8-4-4-4-12}` upper-case hex, v4).
+pub fn new_script_guid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut word = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.finish()
+    };
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&word().to_le_bytes());
+    b[8..].copy_from_slice(&word().to_le_bytes());
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02X}")).collect();
+    format!("{{{}-{}-{}-{}-{}}}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }

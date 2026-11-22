@@ -23,10 +23,12 @@ use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, Exper
 use crate::app::{Editor, PendingAction};
 use crate::cloud_ui::Paged;
 use rustudio_engine::theme;
+use template_prefs::{Custom, Entry, TemplatePrefs};
 use templates::{Kind, Source, TemplateInfo};
 
 mod builtin;
 mod group_cache;
+pub mod template_prefs;
 #[cfg(test)]
 mod studio_diff;
 pub mod templates;
@@ -43,6 +45,9 @@ enum Msg {
     Templates(Result<Vec<TemplateInfo>, String>),
     /// A template's place file, or why there isn't one.
     TemplatePlace(TemplateInfo, Result<(Vec<u8>, Source), String>),
+    /// One of the person's templates, read from its stored file.
+    /// (key, name, the place file)
+    CustomPlace(String, String, Result<Vec<u8>, String>),
     Done,
 }
 
@@ -82,6 +87,24 @@ pub struct StartPage {
     opening: Option<String>,
     /// A fetched template place, for the editor to open.
     opened: Option<(TemplateInfo, Result<(Vec<u8>, Source), String>)>,
+    opened_custom: Option<(String, String, Result<Vec<u8>, String>)>,
+    /// A template just opened: its preview is taken from the 3D view once
+    /// the place has loaded (key, document, when it opened).
+    tpl_capture: Option<(String, u64, std::time::Instant)>,
+    /// A preview being saved off the UI thread: (key, the picture or why not).
+    tpl_preview_rx: Option<Receiver<(String, Result<Option<PathBuf>, String>)>>,
+    /// Hidden templates, the person's own and the order (templates.json).
+    pub tpl: TemplatePrefs,
+    /// The "My Templates" tab (template_tab is then ignored).
+    tpl_mine: bool,
+    /// A template being renamed: (key, text).
+    tpl_rename: Option<(String, String)>,
+    /// A Remove clicked once: the second click removes.
+    tpl_remove: Option<String>,
+    /// The last thing a template edit said (text, is an error).
+    tpl_note: Option<(String, bool)>,
+    /// Custom thumbnails by file.
+    tpl_thumbs: HashMap<PathBuf, Option<egui::TextureHandle>>,
 }
 
 impl StartPage {
@@ -121,6 +144,15 @@ impl Default for StartPage {
             template_tab: None,
             opening: None,
             opened: None,
+            opened_custom: None,
+            tpl_capture: None,
+            tpl_preview_rx: None,
+            tpl: TemplatePrefs::load(),
+            tpl_mine: false,
+            tpl_rename: None,
+            tpl_remove: None,
+            tpl_note: None,
+            tpl_thumbs: HashMap::new(),
         }
     }
 }
@@ -132,6 +164,16 @@ enum Do {
     ShowAll(String),
     Template(TemplateInfo),
     TemplateTab(Option<Kind>),
+    TemplateMine,
+    TemplateCustom(Custom),
+    TemplateHide(String, bool),
+    TemplateMove(String, String, bool),
+    TemplateAdd,
+    TemplateRename(String, String),
+    TemplateThumb(String),
+    TemplateReplace(String),
+    TemplateRemove(String),
+    TemplateRestore,
     OpenFile(Option<PathBuf>),
     OpenFolder,
     Cloud(u64, bool),
@@ -196,6 +238,10 @@ impl StartPage {
                 Msg::TemplatePlace(t, r) => {
                     self.opening = None;
                     self.opened = Some((t, r));
+                }
+                Msg::CustomPlace(key, name, r) => {
+                    self.opening = None;
+                    self.opened_custom = Some((key, name, r));
                 }
                 Msg::Done => self.jobs = self.jobs.saturating_sub(1),
             }
@@ -417,6 +463,117 @@ impl Editor {
         }
     }
 
+    fn start_open_custom(&mut self, c: Custom) {
+        if self.start.opening.is_some() {
+            return;
+        }
+        self.start.opening = Some(c.name.clone());
+        let (client, ep) = self.start_client();
+        self.start.spawn(client, ep, move |_, tx| {
+            let r = std::fs::read(&c.file).map_err(|e| format!("{}: {e}", c.file.display()));
+            let _ = tx.send(Msg::CustomPlace(format!("c:{}", c.id), c.name, r));
+        });
+    }
+
+    fn start_finish_custom(&mut self) {
+        let Some((key, name, r)) = self.start.opened_custom.take() else { return };
+        match r.and_then(|b| rustudio_core::doc::Document::from_place_bytes(&b, name.clone())) {
+            Ok(doc) => {
+                self.set_document(doc);
+                self.start.tpl_capture = Some((key, self.game.doc.id, std::time::Instant::now()));
+                self.info(format!("New place from your {name} template"));
+            }
+            Err(e) => self.start.tpl_note = Some((format!("Couldn't open {name}: {e}"), true)),
+        }
+    }
+
+    /// Once a frame: a template opened a moment ago gets its preview, the 3D
+    /// view as drawn once the place and its assets have loaded (through the
+    /// place's saved camera, unless the person already moved it). One frame
+    /// read back, nothing rendered for it.
+    pub fn template_preview_tick(&mut self) {
+        if let Some(rx) = &self.start.tpl_preview_rx {
+            match rx.try_recv() {
+                Ok((key, Ok(Some(path)))) => {
+                    self.start.tpl.set_preview(&key, path);
+                    self.start_save_templates();
+                    self.start.tpl_preview_rx = None;
+                }
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => self.start.tpl_preview_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let Some((key, doc, at)) = self.start.tpl_capture.clone() else { return };
+        if self.game.doc.id != doc || at.elapsed().as_secs() > 120 {
+            // Closed, or Play started, or it never settled.
+            self.start.tpl_capture = None;
+            return;
+        }
+        let settled = at.elapsed().as_secs_f32() >= 2.0
+            && self.game.play.is_none()
+            && self.game.viewport_rect.is_positive()
+            && !self.place_loading()
+            && self.game.draw_cache.waiting.is_empty()
+            && rustudio_core::assets::content_queue_size() == 0
+            && !self.game.assets.busy()
+            && !self.game.textures.decoding();
+        if !settled {
+            return;
+        }
+        self.start.tpl_capture = None;
+        let frame = self.game.renderer.as_ref().zip(self.game.render_state.as_ref()).and_then(|(r, rs)| r.read_frame(rs));
+        let Some((w, h, rgba)) = frame else { return };
+        let Some(id) = key.strip_prefix("c:").map(str::to_string) else { return };
+        let (tx, rx) = channel();
+        self.start.tpl_preview_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send((key, template_prefs::save_preview(&id, w, h, rgba)));
+        });
+    }
+
+    /// A file dialog for the template editor closed with a file.
+    pub fn start_template_file(&mut self, purpose: &crate::file_dialog::Purpose, path: PathBuf) {
+        use crate::file_dialog::Purpose;
+        let r = match purpose {
+            Purpose::TemplateAdd => self.start.tpl.add(&path).map(|key| {
+                // Where the new card shows: All, with its name ready to edit.
+                if self.start.template_tab.is_some() {
+                    self.start.template_tab = None;
+                }
+                let name = self.start.tpl.custom.last().map(|c| c.name.clone()).unwrap_or_default();
+                self.start.tpl_rename = Some((key, name.clone()));
+                format!("Added {name}: name it, or press Enter to keep that name")
+            }),
+            Purpose::TemplateThumb(key) => self.start.tpl.set_thumb(key, &path).map(|_| "Thumbnail set".to_string()),
+            Purpose::TemplateReplace(key) => self.start.tpl.replace_file(key, &path).map(|_| format!("Now opens a copy of {}", path.display())),
+            _ => return,
+        };
+        self.start.tpl_note = Some(match r {
+            Ok(m) => (m, false),
+            Err(e) => (e, true),
+        });
+        self.start_save_templates();
+    }
+
+    fn start_save_templates(&mut self) {
+        if let Err(e) = self.start.tpl.save() {
+            self.start.tpl_note = Some((format!("Couldn't save the template list: {e}"), true));
+        }
+    }
+
+    fn start_template_dialog(&mut self, purpose: crate::file_dialog::Purpose) {
+        use crate::file_dialog::{Kind as DKind, Purpose};
+        let d = match purpose {
+            Purpose::TemplateThumb(_) => rfd::AsyncFileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]),
+            _ => rfd::AsyncFileDialog::new().add_filter("Roblox place", &["rbxl", "rbxlx"]),
+        };
+        let d = match self.ui.recent.iter().find(|p| p.is_file()).and_then(|p| p.parent()) {
+            Some(dir) => d.set_directory(dir),
+            None => d,
+        };
+        self.dialogs.start(purpose, d, DKind::PickFile);
+    }
+
     /// Draws the Start Page over the whole window. False once it has gone
     /// (something was opened): the editor draws this frame instead.
     pub fn start_page_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -440,6 +597,9 @@ impl Editor {
         }
         if !self.start.templates_asked {
             self.start_templates();
+        }
+        if self.start.opened_custom.is_some() {
+            self.start_finish_custom();
         }
         if self.start.opened.is_some() {
             self.start_finish_template();
@@ -500,7 +660,51 @@ impl Editor {
                 Do::Refresh => self.start_load_all(),
                 Do::More(src) => self.start_load_page(src),
                 Do::Template(t) => self.start_open_template(t),
-                Do::TemplateTab(k) => self.start.template_tab = k,
+                Do::TemplateTab(k) => {
+                    self.start.template_tab = k;
+                    self.start.tpl_mine = false;
+                }
+                Do::TemplateMine => {
+                    self.start.template_tab = None;
+                    self.start.tpl_mine = true;
+                }
+                Do::TemplateCustom(c) => self.start_open_custom(c),
+                Do::TemplateHide(k, hide) => {
+                    self.start.tpl.set_hidden(&k, hide);
+                    self.start_save_templates();
+                }
+                Do::TemplateMove(from, to, after) => {
+                    let roblox = self.start.templates.clone();
+                    self.start.tpl.move_entry(&roblox, &from, &to, after);
+                    self.start_save_templates();
+                }
+                Do::TemplateAdd => self.start_template_dialog(crate::file_dialog::Purpose::TemplateAdd),
+                Do::TemplateRename(k, name) => {
+                    let name = name.trim().to_string();
+                    if let (false, Some(c)) = (name.is_empty(), self.start.tpl.custom_mut(&k)) {
+                        c.name = name;
+                        self.start_save_templates();
+                    }
+                    self.start.tpl_rename = None;
+                }
+                Do::TemplateThumb(k) => self.start_template_dialog(crate::file_dialog::Purpose::TemplateThumb(k)),
+                Do::TemplateReplace(k) => self.start_template_dialog(crate::file_dialog::Purpose::TemplateReplace(k)),
+                Do::TemplateRemove(k) => {
+                    if self.start.tpl_remove.as_deref() == Some(k.as_str()) {
+                        let name = self.start.tpl.custom_mut(&k).map(|c| c.name.clone()).unwrap_or_default();
+                        self.start.tpl.remove(&k);
+                        self.start.tpl_remove = None;
+                        self.start.tpl_note = Some((format!("Removed {name}"), false));
+                        self.start_save_templates();
+                    } else {
+                        self.start.tpl_remove = Some(k);
+                    }
+                }
+                Do::TemplateRestore => {
+                    self.start.tpl.restore_defaults();
+                    self.start.tpl_note = Some(("Roblox's templates are all back, in Roblox's order".into(), false));
+                    self.start_save_templates();
+                }
                 Do::OpenFile(p) => self.request(PendingAction::Open(p)),
                 Do::OpenFolder => self.request(PendingAction::OpenFolder),
                 Do::Cloud(p, copy) => {
@@ -697,11 +901,6 @@ impl Editor {
         });
     }
 
-    fn section(ui: &mut egui::Ui, title: &str) {
-        ui.label(RichText::new(title).size(16.0).strong().color(theme::TEXT));
-        ui.add_space(8.0);
-    }
-
     /// A foldable section header (click to fold). Returns whether it's open.
     fn fold_header(&mut self, ui: &mut egui::Ui, key: &str, title: &str, count: Option<String>, todo: &mut Vec<Do>) -> bool {
         let open = !self.start.collapsed.contains(key);
@@ -889,30 +1088,70 @@ impl Editor {
     /// "Open a Template", as Studio's Home page has it: Roblox's templates
     /// in its order with their icons and names, the first HOME_MAX with
     /// "See All" for the rest, and the Templates page's tabs (All, Blank,
-    /// Gameplay, Themed).
+    /// Gameplay, Themed). Plus rustudio's Edit mode: hide templates, drag
+    /// them into another order, and add the person's own from place files
+    /// ("My Templates"; template_prefs.rs).
     fn start_templates_section(&mut self, ui: &mut egui::Ui, searching: bool, todo: &mut Vec<Do>) {
         let tab = self.start.template_tab;
-        let list: Vec<TemplateInfo> = self
-            .start
-            .templates
-            .iter()
-            .filter(|t| tab.is_none_or(|k| t.kind == k) && self.matches(&t.name))
-            .cloned()
+        let mine = self.start.tpl_mine;
+        let entries = self.start.tpl.entries(&self.start.templates);
+        let hidden_n = entries.iter().filter(|e| self.start.tpl.is_hidden(e)).count();
+        let has_custom = !self.start.tpl.custom.is_empty();
+        let list: Vec<Entry> = entries
+            .into_iter()
+            .filter(|e| {
+                let in_tab = match e {
+                    Entry::Roblox(t) => !mine && tab.is_none_or(|k| t.kind == k),
+                    Entry::Custom(_) => tab.is_none(),
+                };
+                in_tab && !self.start.tpl.is_hidden(e) && self.matches(e.name())
+            })
             .collect();
         if searching && list.is_empty() {
             return;
         }
-        Self::section(ui, "Open a Template");
-        ui.label(
-            RichText::new("See what's possible on Roblox in popular genres with our ready-made experiences, or start from scratch.")
-                .color(theme::TEXT_DIM),
-        );
+        self.start_template_drops(ui);
+
+        // Title; on the right, Reset once something was hidden or moved.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Open a Template").size(16.0).strong().color(theme::TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if (hidden_n > 0 || !self.start.tpl.order.is_empty())
+                    && ui
+                        .add(egui::Button::new(RichText::new("Reset").color(theme::TEXT_DIM)).frame(false))
+                        .on_hover_text(format!("Bring back {} hidden template(s) and Roblox's order (your own templates stay)", hidden_n))
+                        .clicked()
+                {
+                    todo.push(Do::TemplateRestore);
+                }
+            });
+        });
+        ui.add_space(2.0);
+        if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
+            egui::Frame::new()
+                .fill(theme::SELECT_BG)
+                .stroke(Stroke::new(1.0, theme::SELECT))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Drop a .rbxl or .rbxlx file to add it as a template").color(theme::TEXT));
+                });
+        } else {
+            ui.label(
+                RichText::new("See what's possible on Roblox in popular genres with our ready-made experiences, or start from scratch.")
+                    .color(theme::TEXT_DIM),
+            );
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             for (k, label) in [(None, "All"), (Some(Kind::Generic), Kind::Generic.label()), (Some(Kind::Gameplay), Kind::Gameplay.label()), (Some(Kind::Theme), Kind::Theme.label())] {
-                if ui.selectable_label(tab == k, label).clicked() {
+                if ui.selectable_label(!mine && tab == k, label).clicked() {
                     todo.push(Do::TemplateTab(k));
                 }
+            }
+            if has_custom && ui.selectable_label(mine, "My Templates").clicked() {
+                todo.push(Do::TemplateMine);
             }
             if let Some(name) = &self.start.opening {
                 ui.add_space(12.0);
@@ -920,30 +1159,220 @@ impl Editor {
                 ui.label(RichText::new(format!("Opening {name}…")).color(theme::TEXT_DIM));
             }
         });
+        if let Some((note, err)) = &self.start.tpl_note {
+            ui.add_space(4.0);
+            ui.label(RichText::new(note).color(if *err { theme::WARN } else { theme::TEXT_DIM }));
+        }
         ui.add_space(8.0);
-        if list.is_empty() {
+        let all = self.start.expanded.contains("templates") || searching || tab.is_some() || mine;
+        let shown = if all { list.len() } else { list.len().min(templates::HOME_MAX) };
+        // The Add card ends the list (not in Blank / Gameplay / Themed, nor
+        // while searching).
+        let add = !searching && tab.is_none();
+        if list.is_empty() && !add {
             ui.label(RichText::new("No Templates to display.").color(theme::TEXT_DIM));
             ui.add_space(14.0);
             return;
         }
-        let all = self.start.expanded.contains("templates") || searching || tab.is_some();
-        let shown = if all { list.len() } else { list.len().min(templates::HOME_MAX) };
-        grid(ui, shown, |ui, i| {
-            let t = &list[i];
-            let icon = self.start.icons.get(&t.universe_id).map(|x| x.id());
-            let r = card(ui, &t.name, t.kind.label(), |p, rect| icon_thumb(p, rect, icon, &t.name));
-            let r = r.on_hover_text(format!("{} template\nplace {} · universe {}", t.name, t.place_id, t.universe_id));
-            if r.clicked() {
-                todo.push(Do::Template(t.clone()));
+        grid(ui, shown + usize::from(add), |ui, i| {
+            if i == shown {
+                if add_card(ui).on_hover_text("Add a place file (.rbxl / .rbxlx) as a template, or drop one on the page").clicked() {
+                    todo.push(Do::TemplateAdd);
+                }
+                return;
             }
+            self.template_card(ui, &list[i], todo);
         });
-        if !searching && tab.is_none() && list.len() > templates::HOME_MAX {
+        if !searching && tab.is_none() && !mine && list.len() > templates::HOME_MAX {
             let label = if all { "Show less".to_string() } else { "See All".to_string() };
             if pill_button(ui, &label, true) {
                 todo.push(Do::ShowAll("templates".into()));
             }
         }
         ui.add_space(14.0);
+    }
+
+    /// Place files dropped on the Start Page become templates.
+    fn start_template_drops(&mut self, ui: &egui::Ui) {
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        for p in dropped {
+            self.start_template_file(&crate::file_dialog::Purpose::TemplateAdd, p);
+        }
+    }
+
+    /// A custom template's thumbnail, loaded once.
+    fn template_thumb(&mut self, ctx: &egui::Context, path: &PathBuf) -> Option<egui::TextureId> {
+        self.start
+            .tpl_thumbs
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let img = image::open(path).ok()?.to_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                Some(ctx.load_texture(format!("tpl_thumb_{}", path.display()), ci, egui::TextureOptions::LINEAR))
+            })
+            .as_ref()
+            .map(|t| t.id())
+    }
+
+    /// One template card: click opens it, drag reorders; on hover the eye
+    /// hides it (custom ones also get a ⋯ menu). The title is a text box
+    /// while renaming.
+    fn template_card(&mut self, ui: &mut egui::Ui, e: &Entry, todo: &mut Vec<Do>) {
+        let key = e.key();
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click_and_drag());
+        let thumb = match e {
+            Entry::Roblox(t) => self.start.icons.get(&t.universe_id).map(|x| x.id()),
+            Entry::Custom(c) => c.thumb.clone().or(c.preview.clone()).and_then(|p| self.template_thumb(ui.ctx(), &p)),
+        };
+        let sub = match e {
+            Entry::Roblox(t) => t.kind.label().to_string(),
+            Entry::Custom(c) => format!("My Template  ·  {}", c.source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+        };
+        let renaming = self.start.tpl_rename.as_ref().is_some_and(|(k, _)| *k == key);
+        let dragging = resp.dragged();
+        // Over the card or its overlay buttons, nothing being carried.
+        let carrying = egui::DragAndDrop::has_any_payload(ui.ctx());
+        let hov = ui.rect_contains_pointer(r) && !dragging && !carrying;
+        let title = if renaming { "" } else { e.name() };
+        paint_card(ui, r, hov, title, &sub, |p, tr| match e {
+            Entry::Roblox(t) => icon_thumb(p, tr, thumb, &t.name),
+            Entry::Custom(c) => custom_thumb(p, tr, thumb, c.thumb.is_none() && c.preview.is_some(), &c.name),
+        });
+        let p = ui.painter().with_clip_rect(r.expand(GAP));
+        let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
+        if dragging {
+            // The card's slot while it's carried, and the card at the pointer.
+            p.rect_filled(r, CornerRadius::same(6), theme::BG);
+            dashed_rect(&p, r.shrink(1.0), theme::SELECT);
+            if let Some(at) = ui.ctx().pointer_interact_pos() {
+                let gp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tpl_ghost")));
+                let g = Rect::from_min_size(at + Vec2::new(10.0, 10.0), Vec2::new(150.0, 34.0));
+                gp.rect_filled(g, CornerRadius::same(6), theme::ACTIVE_TAB);
+                gp.rect_stroke(g, CornerRadius::same(6), Stroke::new(1.5, theme::SELECT), egui::StrokeKind::Inside);
+                let font = egui::FontId::proportional(13.0);
+                let name = elide(&gp, e.name(), &font, 130.0);
+                gp.text(g.left_center() + Vec2::new(10.0, 0.0), egui::Align2::LEFT_CENTER, name, font, theme::TEXT);
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        {
+            resp.dnd_set_drag_payload(TplDrag(key.clone()));
+            if let Some(d) = resp.dnd_hover_payload::<TplDrag>().filter(|d| d.0 != key) {
+                let after = ui.ctx().pointer_interact_pos().is_some_and(|q| q.x > r.center().x);
+                let x = if after { r.max.x + GAP / 2.0 } else { r.min.x - GAP / 2.0 };
+                ui.painter().with_clip_rect(r.expand(GAP)).line_segment(
+                    [Pos2::new(x, r.min.y + 4.0), Pos2::new(x, r.max.y - 4.0)],
+                    Stroke::new(3.0, theme::SELECT),
+                );
+                if let Some(d2) = resp.dnd_release_payload::<TplDrag>() {
+                    todo.push(Do::TemplateMove(d2.0.clone(), key.clone(), after));
+                }
+                drop(d);
+            }
+        }
+        // The overlay buttons (top right of the thumbnail).
+        let mut bx = tr.max.x - 30.0;
+        let mut menu_btn: Option<egui::Response> = None;
+        if hov {
+            let eye = Rect::from_min_size(Pos2::new(bx, tr.min.y + 6.0), Vec2::splat(24.0));
+            let er = ui.interact(eye, ui.id().with(("tpl_eye", &key)), Sense::click());
+            round_button_bg(ui.painter(), eye, er.hovered());
+            paint_eye(ui.painter(), eye.center(), !er.hovered(), if er.hovered() { Color32::WHITE } else { theme::TEXT });
+            if er.on_hover_text("Hide this template (Reset brings it back)").clicked() {
+                todo.push(Do::TemplateHide(key.clone(), true));
+            }
+            bx -= 28.0;
+        }
+        let more_id = ui.id().with(("tpl_more", &key));
+        let menu_open = egui::Popup::is_id_open(ui.ctx(), more_id.with("popup"));
+        if matches!(e, Entry::Custom(_)) && (hov || menu_open) {
+            let dots = Rect::from_min_size(Pos2::new(bx, tr.min.y + 6.0), Vec2::splat(24.0));
+            let mr = ui.interact(dots, more_id, Sense::click());
+            round_button_bg(ui.painter(), dots, mr.hovered());
+            for dx in [-5.0, 0.0, 5.0] {
+                ui.painter().circle_filled(dots.center() + Vec2::new(dx, 0.0), 1.7, theme::TEXT);
+            }
+            menu_btn = Some(mr);
+        }
+        // Renaming: the title is a text box.
+        if renaming {
+            let tbox = Rect::from_min_size(Pos2::new(r.min.x + 6.0, tr.max.y + 5.0), Vec2::new(CARD_W - 12.0, 22.0));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let (k, text) = self.start.tpl_rename.as_mut().unwrap();
+            let k = k.clone();
+            let te = ui.put(tbox, egui::TextEdit::singleline(text).font(egui::FontId::proportional(13.5)).margin(egui::Margin::symmetric(4, 2)));
+            if !te.has_focus() && !te.lost_focus() && ui.memory(|m| m.focused().is_none()) {
+                te.request_focus();
+            }
+            if te.lost_focus() {
+                let name = if escape { e.name().to_string() } else { text.clone() };
+                todo.push(Do::TemplateRename(k, name));
+            }
+        }
+        if resp.clicked() {
+            match e {
+                Entry::Roblox(t) => todo.push(Do::Template(t.clone())),
+                Entry::Custom(c) => todo.push(Do::TemplateCustom(c.clone())),
+            }
+        }
+        let tip = match e {
+            Entry::Roblox(t) => format!("{} template\nplace {} · universe {}", t.name, t.place_id, t.universe_id),
+            Entry::Custom(c) => format!("{}\nfrom {}", c.name, c.source.display()),
+        };
+        let resp = if dragging || carrying { resp } else { resp.on_hover_text(tip) };
+        let menu = |ui: &mut egui::Ui, todo: &mut Vec<Do>, start: &mut StartPage| {
+            if ui.button("Open").clicked() {
+                match e {
+                    Entry::Roblox(t) => todo.push(Do::Template(t.clone())),
+                    Entry::Custom(c) => todo.push(Do::TemplateCustom(c.clone())),
+                }
+                ui.close();
+            }
+            if let Entry::Custom(c) = e {
+                if ui.button("Rename").clicked() {
+                    start.tpl_rename = Some((key.clone(), c.name.clone()));
+                    ui.close();
+                }
+                if ui.button("Set thumbnail…").clicked() {
+                    todo.push(Do::TemplateThumb(key.clone()));
+                    ui.close();
+                }
+                if ui.button("Replace place file…").clicked() {
+                    todo.push(Do::TemplateReplace(key.clone()));
+                    ui.close();
+                }
+                if ui.button("Copy original path").on_hover_text(c.source.display().to_string()).clicked() {
+                    todo.push(Do::Copy(c.source.display().to_string()));
+                    ui.close();
+                }
+            }
+            if let Entry::Roblox(t) = e {
+                if ui.button("Copy place ID").clicked() {
+                    todo.push(Do::Copy(t.place_id.to_string()));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Hide").clicked() {
+                todo.push(Do::TemplateHide(key.clone(), true));
+                ui.close();
+            }
+            if matches!(e, Entry::Custom(_)) {
+                let armed = start.tpl_remove.as_deref() == Some(key.as_str());
+                let label = RichText::new(if armed { "Click again to remove" } else { "Remove…" }).color(theme::ERROR);
+                if ui.button(label).clicked() {
+                    todo.push(Do::TemplateRemove(key.clone()));
+                    if armed {
+                        ui.close();
+                    }
+                }
+            }
+        };
+        if let Some(mr) = &menu_btn {
+            egui::Popup::menu(mr).show(|ui| menu(ui, todo, &mut self.start));
+        }
+        resp.context_menu(|ui| menu(ui, todo, &mut self.start));
     }
 
     fn start_files(&mut self, ui: &mut egui::Ui, max: usize, todo: &mut Vec<Do>) {
@@ -1228,8 +1657,12 @@ fn grid(ui: &mut egui::Ui, n: usize, mut each: impl FnMut(&mut egui::Ui, usize))
 /// A card: thumbnail (drawn by `thumb`), title and one dim line.
 fn card(ui: &mut egui::Ui, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
+    paint_card(ui, r, resp.hovered(), title, sub, thumb);
+    resp
+}
+
+fn paint_card(ui: &egui::Ui, r: Rect, hov: bool, title: &str, sub: &str, thumb: impl FnOnce(&egui::Painter, Rect)) {
     let p = ui.painter().with_clip_rect(r);
-    let hov = resp.hovered();
     p.rect_filled(r, CornerRadius::same(6), if hov { theme::ACTIVE_TAB } else { theme::PANEL_DARK });
     let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
     thumb(&p.with_clip_rect(tr), tr);
@@ -1245,7 +1678,102 @@ fn card(ui: &mut egui::Ui, title: &str, sub: &str, thumb: impl FnOnce(&egui::Pai
     if hov {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+}
+
+/// What a template card carries while it's dragged: its key.
+struct TplDrag(String);
+
+/// The dashed "Add template" card at the end of the list in Edit mode.
+fn add_card(ui: &mut egui::Ui) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
+    let p = ui.painter().with_clip_rect(r.expand(2.0));
+    let hov = resp.hovered();
+    if hov {
+        p.rect_filled(r, CornerRadius::same(6), theme::PANEL_DARK);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    dashed_rect(&p, r.shrink(1.0), if hov { theme::SELECT } else { theme::DIVIDER });
+    let c = Pos2::new(r.center().x, r.min.y + THUMB_H / 2.0 + 4.0);
+    p.circle_filled(c, 22.0, if hov { theme::ACCENT } else { theme::PANEL_ALT });
+    let col = if hov { Color32::WHITE } else { theme::TEXT };
+    p.line_segment([c - Vec2::new(8.0, 0.0), c + Vec2::new(8.0, 0.0)], Stroke::new(2.0, col));
+    p.line_segment([c - Vec2::new(0.0, 8.0), c + Vec2::new(0.0, 8.0)], Stroke::new(2.0, col));
+    let tr = Rect::from_min_size(r.min, Vec2::new(CARD_W, THUMB_H));
+    p.text(Pos2::new(r.min.x + 10.0, tr.max.y + 16.0), egui::Align2::LEFT_CENTER, "Add template", egui::FontId::proportional(13.5), theme::TEXT);
+    p.text(
+        Pos2::new(r.min.x + 10.0, tr.max.y + 35.0),
+        egui::Align2::LEFT_CENTER,
+        "From a place file…",
+        egui::FontId::proportional(11.5),
+        theme::TEXT_DIM,
+    );
     resp
+}
+
+fn dashed_rect(p: &egui::Painter, r: Rect, col: Color32) {
+    let s = Stroke::new(1.5, col);
+    let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+    for w in corners.windows(2) {
+        p.extend(egui::Shape::dashed_line(&[w[0], w[1]], s, 6.0, 4.0));
+    }
+}
+
+/// The dark round backing of a button drawn over a thumbnail.
+fn round_button_bg(p: &egui::Painter, r: Rect, hov: bool) {
+    p.circle_filled(r.center(), r.width() / 2.0, if hov { theme::ACCENT } else { Color32::from_black_alpha(170) });
+}
+
+/// An eye (open), or one struck through (hidden).
+fn paint_eye(p: &egui::Painter, c: Pos2, open: bool, col: Color32) {
+    let n = 12;
+    let lid = |sign: f32| -> Vec<Pos2> {
+        (0..=n)
+            .map(|i| {
+                let t = i as f32 / n as f32 * 2.0 - 1.0;
+                c + Vec2::new(t * 7.0, sign * 4.2 * (1.0 - t * t))
+            })
+            .collect()
+    };
+    let s = Stroke::new(1.4, col);
+    p.add(egui::Shape::line(lid(-1.0), s));
+    p.add(egui::Shape::line(lid(1.0), s));
+    p.circle_filled(c, 2.1, col);
+    if !open {
+        p.line_segment([c + Vec2::new(-6.5, -6.0), c + Vec2::new(6.5, 6.0)], Stroke::new(1.6, col));
+    }
+}
+
+/// One of the person's templates: the picture they set (a square, like
+/// Roblox's icons), else its preview (the whole thumbnail: the 3D view the
+/// last time it was opened), else a tile with its initials in a colour
+/// from its name.
+fn custom_thumb(p: &egui::Painter, r: Rect, tex: Option<egui::TextureId>, full: bool, name: &str) {
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    if let (Some(t), true) = (tex, full) {
+        p.add(egui::epaint::RectShape::filled(r, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, Color32::WHITE).with_texture(t, uv));
+        return;
+    }
+    p.rect_filled(r, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, theme::PANEL_ALT);
+    let side = r.height() - 16.0;
+    let ir = Rect::from_center_size(r.center(), Vec2::splat(side));
+    if let Some(t) = tex {
+        p.image(t, ir, uv, Color32::WHITE);
+        return;
+    }
+    let h = name.bytes().fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    let hue = (h % 360) as f32 / 360.0;
+    let base: Color32 = egui::ecolor::Hsva::new(hue, 0.55, 0.62, 1.0).into();
+    p.rect_filled(ir, CornerRadius::same(8), base);
+    // A lighter top half reads as a soft gradient.
+    let top = Rect::from_min_max(ir.min, Pos2::new(ir.max.x, ir.center().y));
+    p.rect_filled(top, CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, Color32::from_white_alpha(22));
+    let initials: String = name
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    p.text(ir.center(), egui::Align2::CENTER_CENTER, initials, egui::FontId::proportional(32.0), Color32::WHITE);
 }
 
 fn elide(p: &egui::Painter, s: &str, font: &egui::FontId, max: f32) -> String {

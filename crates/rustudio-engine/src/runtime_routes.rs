@@ -265,7 +265,8 @@ fn compute(class: rbx_dom_weak::Ustr, key: &str) -> Route {
         set_part: doc::is_a(c, "BasePart")
             && matches!(key, "Position" | "Orientation" | "Rotation" | "BrickColor" | "AssemblyLinearVelocity" | "Velocity"),
         set,
-        plain: plain && !restricted,
+        // (a script-hidden property may yield to a child: the full path)
+        plain: plain && !restricted && !prop_hidden_from_scripts(c, key),
         child_only: special == Special::None
             && matches!(d, Disp::Other)
             && domains_bits == 0

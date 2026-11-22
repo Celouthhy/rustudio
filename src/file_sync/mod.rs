@@ -175,8 +175,11 @@ pub struct FileSync {
     pub commits: Vec<Commit>,
     /// The last thing that went wrong (the button is red until a sync works).
     pub error: Option<String>,
-    /// The project picker's text.
+    /// The project picker's text: the open place's remembered project, or
+    /// what the person picked for it (never another place's project).
     pub pick: String,
+    /// The document `pick` was filled for.
+    pick_doc: Option<u64>,
     /// Remember the pair when attaching from the panel.
     pub remember: bool,
     /// The document auto-attach looked at (once per document).
@@ -216,6 +219,7 @@ impl Default for FileSync {
             commits: Vec::new(),
             error: None,
             pick: String::new(),
+            pick_doc: None,
             remember: true,
             auto_done: None,
             env_attach: None,
@@ -253,9 +257,6 @@ impl FileSync {
             if !p.is_empty() {
                 self.env_attach = Some((PathBuf::from(p), mode.unwrap_or(self.settings.initial)));
             }
-        }
-        if let Some(r) = self.settings.remembered.last() {
-            self.pick = r.project.display().to_string();
         }
     }
 
@@ -671,6 +672,15 @@ impl Editor {
                 self.file_sync.commits.clear();
                 self.file_sync_log(LogLevel::Info, format!("{label} closed: detached"), None);
             }
+        }
+        if !playing && self.file_sync.pick_doc != Some(self.game.doc.id) {
+            self.file_sync.pick_doc = Some(self.game.doc.id);
+            let attached = self.file_sync.att.as_ref().filter(|a| a.st.doc_id == self.game.doc.id).map(|a| a.st.file.clone());
+            let remembered = || {
+                let (key, _) = self.file_sync_place_key()?;
+                self.file_sync.settings.remembered_for(&key).map(|r| r.project.clone())
+            };
+            self.file_sync.pick = attached.or_else(remembered).map(|p| p.display().to_string()).unwrap_or_default();
         }
         if self.file_sync.att.is_none() {
             self.file_sync_auto_attach();

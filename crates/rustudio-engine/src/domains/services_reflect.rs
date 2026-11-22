@@ -29,7 +29,8 @@ impl UserData for LCaps {
         f.add_meta_field("__type", "SecurityCapabilities");
     }
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        m.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(this.0.join(", ")));
+        // Studio: "RunClientScript | Physics" (empty: "").
+        m.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(this.0.join(" | ")));
         m.add_meta_method(MetaMethod::Eq, |_, this, other: mlua::AnyUserData| {
             Ok(other.borrow::<LCaps>().map(|o| o.0 == this.0).unwrap_or(false))
         });

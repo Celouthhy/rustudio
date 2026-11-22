@@ -318,7 +318,7 @@ impl Editor {
             "client" => Some(Side::Client),
             t => return Err(format!("target must be edit, server or client (not {t:?})")),
         };
-        match side {
+        let done = match side {
             None => {
                 if self.game.play.is_some() {
                     return Err("Play is running; the edit DataModel is put away until Stop. Use target \"server\" or \"client\", or call stop first.".into());
@@ -327,11 +327,15 @@ impl Editor {
                     return Err("A place is still loading; try again when it has opened.".into());
                 }
                 let identity = rustudio_engine::runtime::security::COMMAND;
-                self.plugins.with_edit_vm(&mut self.game.doc, |rt| {
-                    let r = rustudio_player::luau_eval::start(&rt.lua, &code, id, identity);
+                let sync_done = self.plugins.with_edit_vm(&mut self.game.doc, |rt| -> R<Option<J>> {
+                    rustudio_player::luau_eval::start(&rt.lua, &code, id, identity)?;
                     rt.dispatch();
-                    r
+                    Ok(rustudio_player::luau_eval::poll(&rt.lua, id))
                 })??;
+                if sync_done.is_some() {
+                    self.game.doc.commit_pending_script_changes("Run Luau (MCP)");
+                }
+                sync_done.map(|v| (v, 0))
             }
             Some(side) => {
                 if !self.game.is_playing() {
@@ -341,9 +345,10 @@ impl Editor {
                     return Err("This Play session has no client (Run mode): use target \"server\".".into());
                 }
                 self.game.mcp_eval_start(side, &code, id)?;
+                None
             }
-        }
-        Ok(Step::Wait(Op::Eval { side, id, out_from, done: None }, timeout))
+        };
+        Ok(Step::Wait(Op::Eval { side, id, out_from, done }, timeout))
     }
 
     fn mcp_eval_poll(&mut self, side: Option<Side>, id: u64) -> Option<J> {
@@ -863,12 +868,18 @@ impl Editor {
             Op::Eval { side, id, out_from, done } => {
                 if done.is_none() {
                     *done = self.mcp_eval_poll(*side, *id).map(|v| (v, 0));
+                    if done.is_some() && side.is_none() {
+                        self.game.doc.commit_pending_script_changes("Run Luau (MCP)");
+                    }
                 }
                 // Prints reach the Output a frame or two after the chunk.
                 let (v, frames) = done.as_mut()?;
                 *frames += 1;
                 if *frames < 3 {
                     return None;
+                }
+                if side.is_none() {
+                    self.game.doc.commit_pending_script_changes("Run Luau (MCP)");
                 }
                 let output = self.mcp.output.text_since(*out_from, 400);
                 let ok = v["ok"].as_bool().unwrap_or(false);
@@ -938,6 +949,7 @@ impl Editor {
                 match side {
                     None => {
                         let _ = self.plugins.with_edit_vm(&mut self.game.doc, |rt| rustudio_player::luau_eval::forget(&rt.lua, *id));
+                        self.game.doc.commit_pending_script_changes("Run Luau (MCP)");
                     }
                     Some(side) if self.game.is_playing() => self.game.mcp_eval_forget(*side, *id),
                     Some(_) => {}

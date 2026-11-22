@@ -19,6 +19,7 @@ use egui_wgpu::wgpu;
 use glam::Mat4;
 
 /// One Highlight's geometry and look for the frame.
+#[derive(Clone)]
 pub struct HighlightDraw {
     /// The parts it covers (the renderer's items).
     pub items: Vec<rbx_dom_weak::types::Ref>,

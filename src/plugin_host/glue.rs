@@ -122,6 +122,9 @@ impl Editor {
         }
         for req in self.plugins.take_requests() {
             match req {
+                super::EditorRequest::StartPlaytest { mode, args, completion } => {
+                    self.start_plugin_playtest(mode, args, completion);
+                }
                 super::EditorRequest::OpenScript { script, line } => {
                     super::script_docs::open(script, Some(line), false);
                 }

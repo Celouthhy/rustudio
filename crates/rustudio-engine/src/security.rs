@@ -436,6 +436,14 @@ fn check_identity(lua: &Lua, verb: &str, name: &str, req: Req) -> mlua::Result<(
     }
 }
 
+/// Check a method's capability at invocation, even through an internal Lua wrapper.
+pub fn check_method_identity(lua: &Lua, class: &str, name: &str) -> mlua::Result<()> {
+    if let Some(rule) = rule(class, name) {
+        check_identity(lua, "call", name, rule.read)?;
+    }
+    Ok(())
+}
+
 /// A global that wants a legacy capability (settings, PluginManager).
 /// rustudio's own Lua never calls either.
 pub fn check_global(lua: &Lua, name: &str) -> mlua::Result<()> {

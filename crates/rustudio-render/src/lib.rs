@@ -11,6 +11,7 @@
 //! the editor.
 
 pub mod quality;
+pub mod occlusion;
 pub mod render;
 pub mod gpu_timing;
 pub mod gpu_health;
@@ -18,6 +19,7 @@ pub mod gpu_caps;
 pub mod world_gui;
 pub mod sun_shadow;
 pub mod highlight;
+pub mod adorn;
 pub mod water;
 pub mod clouds;
 pub mod skin;

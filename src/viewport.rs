@@ -679,6 +679,30 @@ impl Editor {
         }
         self.game.finish_view_gui(&ctx, rect, dt);
 
+        // Team Create collaborator camera name labels (Studio 0.748        // CloudEditAdornable): projected sphere center,
+        // zero offset, centered X/Y, 14px, white text with black outline, no
+        // background box, hidden when behind camera.
+        if !self.cloud.collaborator_labels.is_empty() {
+            let label_painter = painter.with_clip_rect(rect);
+            let font = egui::FontId::proportional(14.0);
+            for (world, name) in &self.cloud.collaborator_labels {
+                let Some(point) = self.game.cam.project(rect, *world) else { continue; };
+                if !rect.contains(point) {
+                    continue;
+                }
+                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    label_painter.text(
+                        point + egui::vec2(dx, dy),
+                        egui::Align2::CENTER_CENTER,
+                        name,
+                        font.clone(),
+                        Color32::BLACK,
+                    );
+                }
+                label_painter.text(point, egui::Align2::CENTER_CENTER, name, font.clone(), Color32::WHITE);
+            }
+        }
+
         // Playing: clicks, keys and the hotbar go to the game.
         // (a press a plugin took keeps its release and drag: not the editor's click)
         let (pressed, held) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));

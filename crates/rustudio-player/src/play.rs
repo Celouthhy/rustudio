@@ -2999,7 +2999,10 @@ impl Game {
         // read the editor's settings (runtime/domains/testing*.rs).
         {
             use rustudio_engine::runtime::domains::testing as t;
-            if let Some(value) = t::take_end_request() {
+            let ended = self.play.as_ref()
+                .and_then(|p| p.server.as_ref())
+                .and_then(|s| t::take_end_request(&s.runtime.lua));
+            if let Some(value) = ended {
                 self.stop_play(host);
                 host.end_test(value, &self.log);
                 return true;
@@ -3850,7 +3853,7 @@ impl Game {
             // ProjectionType Orthographic (domains/world_camera.rs).
             let ortho = (rustudio_render::scene::enum_u32(cd.prop(cam, "ProjectionType")) == Some(1)).then(|| {
                 (
-                    f32_of(cd.prop(cam, "OrthographicSize")).unwrap_or(300.0),
+                    f32_of(cd.prop(cam, "OrthographicSize")).unwrap_or(35.0),
                     rustudio_render::scene::enum_u32(cd.prop(cam, "OrthographicMode")).unwrap_or(0),
                 )
             });

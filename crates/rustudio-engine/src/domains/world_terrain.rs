@@ -255,12 +255,14 @@ fn slot_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resul
                         [0.0; 3]
                     } else {
                         let w = world(lua)?;
-                        let rgb = match w.d().prop(this, "MaterialColors") {
-                            Some(rbx_dom_weak::types::Variant::BinaryString(b)) if AsRef::<[u8]>::as_ref(&b).len() >= 69 => {
-                                let b: &[u8] = b.as_ref();
-                                [b[m as usize * 3], b[m as usize * 3 + 1], b[m as usize * 3 + 2]]
-                            }
-                            _ => terrain::material_color(m),
+                        let rgb = match w
+                            .d()
+                            .prop(this, "MaterialColors")
+                            .as_ref()
+                            .and_then(rustudio_core::terrain_mat::material_colors_bytes)
+                        {
+                            Some(b) => [b[m as usize * 3], b[m as usize * 3 + 1], b[m as usize * 3 + 2]],
+                            None => terrain::material_color(m),
                         };
                         rgb.map(|x| x as f32 / 255.0)
                     };

@@ -32,7 +32,7 @@ pub(crate) mod encoding;
 #[path = "services_http.rs"]
 mod http;
 #[path = "services_reflect.rs"]
-mod reflect;
+pub(crate) mod reflect;
 #[path = "services_stream.rs"]
 pub mod stream;
 

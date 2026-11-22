@@ -538,6 +538,26 @@ async fn receive_lane(
         }
         let errors = decoder.errors.len();
         let ops = decoder.decode_frame(frame[0], &frame[1..]);
+        if !decoder.skipped.is_empty() {
+            let kinds: Vec<String> = decoder.skipped.drain(..).map(|k| format!("{k:#04x}")).collect();
+            let saved = save_unknown_frame(&schema_frame, &frame, &kinds.join("-"));
+            log::warn!(
+                "Team Create skipped unknown item {} (place={place}, packet={:#04x}, bytes={}){}",
+                kinds.join(", "),
+                frame[0],
+                frame.len(),
+                saved.as_ref().map(|p| format!(", saved to {}", p.display())).unwrap_or_default()
+            );
+            emit(
+                &tx,
+                &cancel,
+                LiveEvent::Notice(format!(
+                    "skipped a live update rustudio can't read yet (item {}); the session continues, but a change from a collaborator may be missing",
+                    kinds.join(", ")
+                )),
+            )
+            .await;
+        }
         if decoder.errors.len() != errors {
             if frame[0] == packet_id::TERRAIN {
                 initial.lock().unwrap().delivering = false;
@@ -857,6 +877,8 @@ enum Outcome {
 #[derive(Default)]
 struct EditGate {
     failed: std::collections::HashSet<u64>,
+    /// Shared strings (script Source) already sent on this connection.
+    shared: crate::writer::SharedSent,
 }
 
 impl EditGate {
@@ -885,7 +907,7 @@ impl EditGate {
                 if self.failed.contains(&id) || failed_ref(&self.failed, &value) {
                     return vec![Outcome::Failed { id, error: format!("{class}.{name} refers to an instance that was not created on the server") }];
                 }
-                vec![match crate::writer::property(schema, id, &class, &name, &value) {
+                vec![match crate::writer::property_with(schema, id, &class, &name, &value, &mut self.shared) {
                     Ok(frame) => Outcome::Frame(frame),
                     Err(error) if document => Outcome::Failed { id, error },
                     Err(error) => Outcome::Notice(error),
@@ -904,7 +926,7 @@ impl EditGate {
                     }
                     keep
                 });
-                match crate::writer::create_partial(schema, id, &class, parent, &props) {
+                match crate::writer::create_partial_with(schema, id, &class, parent, &props, &mut self.shared) {
                     Ok((frame, skipped)) => {
                         out.extend(skipped.into_iter().map(|(name, reason)| Outcome::Skipped { id, name, reason }));
                         out.insert(0, Outcome::Frame(frame));
@@ -1072,4 +1094,47 @@ mod tests {
         assert!(!state.can_finish(finished_at));
         assert!(state.can_finish(finished_at + QUIET_PERIOD));
     }
+}
+
+/// Writes a message with an unknown item (after its schema message, in the
+/// `RUSTUDIO_TC_BAD_FRAME` format) to `<cache>/rustudio/tc-unknown/` so the
+/// item can be decoded later. Keeps the newest 20.
+fn save_unknown_frame(schema: &[u8], frame: &[u8], kinds: &str) -> Option<std::path::PathBuf> {
+    use std::io::Write;
+    let dir = std::env::var("RUSTUDIO_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+                .map(|d| d.join("rustudio"))
+        })?
+        .join("tc-unknown");
+    std::fs::create_dir_all(&dir).ok()?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        if files.len() >= 20 {
+            files.sort();
+            for old in &files[..files.len() - 19] {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let path = dir.join(format!("{stamp}-item-{kinds}.stream"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).ok()?;
+    file.write_all(&[6, 1, 4, 0, 0, 0, 1]).ok()?;
+    file.write_all(&rtcio::frame(schema)).ok()?;
+    file.write_all(&rtcio::frame(frame)).ok()?;
+    Some(path)
 }

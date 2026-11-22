@@ -744,37 +744,63 @@ fn emitter_cfg(d: &Document, r: Ref) -> EmitterCfg {
     }
 }
 
-/// Legacy Sparkles: a fixed emitter tinted SparkleColor (accessories such
-/// as Spring Fairy 150381051 still wear one in their Handle). Glowing
-/// sparkle stars flung a few studs out in every direction, fading as they
-/// slow; only Enabled, SparkleColor and TimeScale are its own.
-fn sparkles_cfg(d: &Document, r: Ref) -> EmitterCfg {
-    let mut c = emitter_cfg(d, r);
+/// Legacy Sparkles, as Studio draws them:
+/// Studio builds TWO additive `sparkles_main.dds` emitters tinted by SparkleColor:
+/// - Emitter 1 (rising stars): Rate 30, Drag 0.2, Accel (0,1,0), Speed 5,
+///   Spread 100°, Lifetime 1.3, Rotation (-90°,90°), RotSpeed (40,100)°/s, Size 0.5.
+/// - Emitter 2 (fast spinning burst stars): Rate 5, Drag 2.0, Accel (0,0,0),
+///   Speed 8, Spread 150°, Lifetime 1.7, Rotation (-90°,90°), RotSpeed (-500,500)°/s, Size 0.2.
+fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
+    let base = emitter_cfg(d, r);
     let color = match d.prop(r, "SparkleColor").or_else(|| d.prop(r, "Color")) {
         Some(Variant::Color3(k)) => Vec3::new(k.r, k.g, k.b),
         Some(Variant::Color3uint8(k)) => Vec3::new(k.r as f32, k.g as f32, k.b as f32) / 255.0,
         _ => Vec3::new(144.0, 25.0, 255.0) / 255.0,
     };
-    c.color = CSeq(vec![(0.0, color)]);
-    c.rate = 20.0;
-    c.life = (0.8, 1.4);
-    c.speed = (2.5, 5.0);
-    c.spread = Vec2::new(180.0, 180.0);
-    c.dir = 1;
-    c.shape = 0;
-    c.drag = 1.5;
-    c.accel = Vec3::ZERO;
-    c.size = Seq(vec![(0.0, 0.2, 0.0), (0.25, 0.9, 0.25), (1.0, 0.15, 0.0)]);
-    c.transparency = Seq(vec![(0.0, 0.0, 0.0), (0.6, 0.1, 0.0), (1.0, 1.0, 0.0)]);
-    c.squash = Seq(vec![(0.0, 0.0, 0.0)]);
-    c.rotation = (0.0, 360.0);
-    c.rot_speed = (-90.0, 90.0);
-    c.texture = Some("rbxasset://textures/particles/sparkles_main.dds".into());
-    c.grid = (1, 1);
-    c.locked = false;
-    c.inherit = 0.0;
-    c.look = Look { influence: 0.0, brightness: 1.5, emission: 1.0, alpha: c.look.alpha };
-    c
+    // Studio's transparency curve.
+    let transparency = Seq(vec![
+        (0.0, 0.776, 0.0),
+        (0.067, 0.161, 0.0),
+        (0.133, 0.0, 0.0),
+        (0.667, 0.0, 0.0),
+        (0.733, 0.161, 0.0),
+        (0.8, 0.337, 0.0),
+        (0.867, 0.533, 0.0),
+        (0.933, 0.694, 0.0),
+        (1.0, 0.888, 0.0),
+    ]);
+    let mut e1 = base.clone();
+    e1.color = CSeq(vec![(0.0, color)]);
+    e1.rate = 30.0;
+    e1.life = (1.3, 1.3);
+    e1.speed = (5.0, 5.0);
+    e1.spread = Vec2::new(100.0, 100.0);
+    e1.dir = 1;
+    e1.shape = 0;
+    e1.drag = 0.2;
+    e1.accel = Vec3::new(0.0, 1.0, 0.0);
+    e1.size = Seq(vec![(0.0, 0.5, 0.0)]);
+    e1.transparency = transparency.clone();
+    e1.squash = Seq(vec![(0.0, 0.0, 0.0)]);
+    e1.rotation = (-90.0, 90.0);
+    e1.rot_speed = (40.0, 100.0);
+    e1.texture = Some("rbxasset://textures/particles/sparkles_main.dds".into());
+    e1.grid = (1, 1);
+    e1.locked = false;
+    e1.inherit = 0.0;
+    e1.look = Look { influence: 0.0, brightness: 1.5, emission: 1.0, alpha: base.look.alpha };
+
+    let mut e2 = e1.clone();
+    e2.rate = 5.0;
+    e2.life = (1.7, 1.7);
+    e2.speed = (8.0, 8.0);
+    e2.spread = Vec2::new(150.0, 150.0);
+    e2.drag = 2.0;
+    e2.accel = Vec3::ZERO;
+    e2.size = Seq(vec![(0.0, 0.2, 0.0)]);
+    e2.rot_speed = (-500.0, 500.0);
+
+    [e1, e2]
 }
 
 #[derive(Clone)]
@@ -880,6 +906,7 @@ fn trail_cfg(d: &Document, r: Ref) -> TrailCfg {
 enum Cfg {
     Constraint(Ref),
     Emitter(Box<EmitterCfg>),
+    Sparkles(Box<[EmitterCfg; 2]>),
     Beam(Box<BeamCfg>),
     Trail(Box<TrailCfg>),
 }
@@ -1762,6 +1789,7 @@ pub struct Effects {
     /// Properties, read again when the journal says one changed.
     cfg: FxHashMap<Ref, Cfg>,
     emitters: FxHashMap<Ref, EmitterState>,
+    sparkles_extra: FxHashMap<Ref, EmitterState>,
     trails: FxHashMap<Ref, TrailState>,
     /// Beam:SetTextureOffset: (offset, effects time it was set).
     beam_phase: FxHashMap<Ref, (f32, f64)>,
@@ -1932,6 +1960,27 @@ impl Effects {
                     .map(|p| vec3_of(d.prop(p, "AssemblyLinearVelocity")).unwrap_or(Vec3::ZERO));
                 Pose::Host(host_xform(d, c.host), moving)
             }
+            Cfg::Sparkles(pair) => {
+                let c = &pair[0];
+                let body = match c.host {
+                    Host::Part(p) => {
+                        deps.push(p);
+                        Some(p)
+                    }
+                    Host::Attachment(a) => {
+                        chain_of(d, a, &mut deps);
+                        d.dom.get_by_ref(a).map(|i| i.parent())
+                    }
+                    Host::None => None,
+                };
+                if let Some(b) = body {
+                    deps.push(b);
+                }
+                let moving = body
+                    .filter(|&p| flag(d, p, "Anchored", false))
+                    .map(|p| vec3_of(d.prop(p, "AssemblyLinearVelocity")).unwrap_or(Vec3::ZERO));
+                Pose::Host(host_xform(d, c.host), moving)
+            }
             Cfg::Constraint(_) => Pose::Ends(None, None),
         };
         for dep in deps {
@@ -2005,6 +2054,7 @@ impl Effects {
         self.pose_deps.clear();
         self.kept.clear();
         self.emitters.clear();
+        self.sparkles_extra.clear();
         self.trails.clear();
     }
 
@@ -2041,6 +2091,9 @@ impl Effects {
                     Req::Emit(n) => *emits.entry(*r).or_default() += n,
                     Req::Clear => {
                         if let Some(s) = self.emitters.get_mut(r) {
+                            s.particles.clear();
+                        }
+                        if let Some(s) = self.sparkles_extra.get_mut(r) {
                             s.particles.clear();
                         }
                         // Trail:Clear (domains/world_misc.rs).
@@ -2103,7 +2156,7 @@ impl Effects {
             let cfg = self.cfg.entry(r).or_insert_with(|| {
                 match d.class_of(r).as_deref() {
                     Some("ParticleEmitter") => Cfg::Emitter(Box::new(emitter_cfg(d, r))),
-                    Some("Sparkles") => Cfg::Emitter(Box::new(sparkles_cfg(d, r))),
+                    Some("Sparkles") => Cfg::Sparkles(Box::new(sparkles_cfgs(d, r))),
                     Some("Beam") => Cfg::Beam(Box::new(beam_cfg(d, r))),
                     Some("RopeConstraint" | "RodConstraint" | "SpringConstraint") => Cfg::Constraint(r),
                     _ => Cfg::Trail(Box::new(trail_cfg(d, r))),
@@ -2137,6 +2190,32 @@ impl Effects {
                     st.step(c, r, &xf, size, dt, emits.remove(&r).unwrap_or(0), moving, wind);
                     t_sim += rustudio_core::bench::now() - t0;
                     if !st.particles.is_empty() {
+                        live = true;
+                        emitters.push((dist, r, xf, size));
+                    }
+                }
+                Cfg::Sparkles(pair) => {
+                    let Pose::Host(Some((xf, size)), moving) = pose else { continue };
+                    let dist = (xf.pos - view.pos).length() - size.length() * 0.5;
+                    if dist > mech::FX_MAX_DIST {
+                        if let Some(s) = self.emitters.get_mut(&r) {
+                            s.particles.clear();
+                            s.last = None;
+                        }
+                        if let Some(s) = self.sparkles_extra.get_mut(&r) {
+                            s.particles.clear();
+                            s.last = None;
+                        }
+                        continue;
+                    }
+                    let emit = emits.remove(&r).unwrap_or(0);
+                    let st1 = self.emitters.entry(r).or_default();
+                    let st2 = self.sparkles_extra.entry(r).or_default();
+                    let t0 = rustudio_core::bench::now();
+                    st1.step(&pair[0], r, &xf, size, dt, emit, moving, wind);
+                    st2.step(&pair[1], r, &xf, size, dt, 0, moving, wind);
+                    t_sim += rustudio_core::bench::now() - t0;
+                    if !st1.particles.is_empty() || !st2.particles.is_empty() {
                         live = true;
                         emitters.push((dist, r, xf, size));
                     }
@@ -2234,18 +2313,35 @@ impl Effects {
         let particle_budget = f.quality.map_or(mech::FX_PARTICLES_MAX, |profile| profile.particle_budget());
         let mut budget = particle_budget;
         for (_, r, xf, _) in emitters {
-            let (Some(Cfg::Emitter(c)), Some(st)) = (self.cfg.get(&r), self.emitters.get(&r)) else {
-                continue;
-            };
-            n_particles += st.particles.len();
-            // (a ParticleEmitter with no Texture draws nothing in Studio,
-            // effects place; Beams and Trails without one draw flat colour)
-            if c.texture.is_none() {
-                continue;
-            }
-            let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
-            if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
-                draws.push(dr);
+            match self.cfg.get(&r) {
+                Some(Cfg::Emitter(c)) => {
+                    let Some(st) = self.emitters.get(&r) else { continue };
+                    n_particles += st.particles.len();
+                    if c.texture.is_none() {
+                        continue;
+                    }
+                    let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
+                    if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
+                        draws.push(dr);
+                    }
+                }
+                Some(Cfg::Sparkles(pair)) => {
+                    for (c, st) in [
+                        (&pair[0], self.emitters.get(&r)),
+                        (&pair[1], self.sparkles_extra.get(&r)),
+                    ] {
+                        let Some(st) = st else { continue };
+                        if st.particles.is_empty() || c.texture.is_none() {
+                            continue;
+                        }
+                        n_particles += st.particles.len();
+                        let Some(tex) = texture_id(&c.texture, &mut texture) else { continue };
+                        if let Some(dr) = particles_draw(c, st, &xf, &view, tex, &mut budget) {
+                            draws.push(dr);
+                        }
+                    }
+                }
+                _ => continue,
             }
         }
         rustudio_core::bench::add("fx_particles", 0.0, n_particles as u64);
@@ -2738,5 +2834,43 @@ mod texture_tests {
         assert_eq!(texture_of(&d, cleared), None);
         let twin = d.dom.insert(ws, InstanceBuilder::new("ParticleEmitter").with_property("TextureContent", Content::from_uri("rbxassetid://9")));
         assert_eq!(texture_of(&d, twin).as_deref(), Some("rbxassetid://9"));
+    }
+
+    #[test]
+    fn sparkles_dual_emitter_matches_native_parameters_and_rises() {
+        let mut d = Document::new_place();
+        let ws = d.workspace().unwrap();
+        let part = d.dom.insert(ws, InstanceBuilder::new("Part"));
+        let sp = d.dom.insert(
+            part,
+            InstanceBuilder::new("Sparkles")
+                .with_property("Enabled", true)
+                .with_property("SparkleColor", rbx_dom_weak::types::Color3::new(1.0, 0.35, 0.7)),
+        );
+        let [e1, e2] = sparkles_cfgs(&d, sp);
+        assert_eq!(e1.rate, 30.0);
+        assert_eq!(e1.drag, 0.2);
+        assert_eq!(e1.accel, Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(e1.speed, (5.0, 5.0));
+        assert_eq!(e1.spread, Vec2::new(100.0, 100.0));
+        assert_eq!(e1.life, (1.3, 1.3));
+        assert_eq!(e2.rate, 5.0);
+        assert_eq!(e2.drag, 2.0);
+        assert_eq!(e2.accel, Vec3::ZERO);
+        assert_eq!(e2.speed, (8.0, 8.0));
+        assert_eq!(e2.spread, Vec2::new(150.0, 150.0));
+        assert_eq!(e2.life, (1.7, 1.7));
+
+        let mut st1 = EmitterState::default();
+        let mut st2 = EmitterState::default();
+        let xf = Xform { pos: Vec3::ZERO, rot: glam::Mat3::IDENTITY };
+        for _ in 0..90 {
+            st1.step(&e1, sp, &xf, Vec3::ONE, 1.0 / 60.0, 0, None, Vec3::ZERO);
+            st2.step(&e2, sp, &xf, Vec3::ONE, 1.0 / 60.0, 0, None, Vec3::ZERO);
+        }
+        let total = st1.particles.len() + st2.particles.len();
+        assert!(total >= 35, "expected >= 35 live sparkle particles, got {total}");
+        let max_y = st1.particles.iter().map(|p| p.pos.y).fold(0.0f32, f32::max);
+        assert!(max_y >= 4.0, "expected sparkles to rise >= 4 studs, got {max_y:.2}");
     }
 }

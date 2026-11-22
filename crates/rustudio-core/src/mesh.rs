@@ -4,7 +4,7 @@
 //! Every read is bounds-checked; malformed or unsupported input yields
 //! `Err(String)` rather than a panic. Positions, normals, UVs, vertex colours
 //! and skinning are extracted; tangents, subsets and FACS data are skipped.
-//! For multi-LOD meshes only the highest-detail LOD is used.
+//! The default parser returns LOD0. Renderers can opt into all stored LODs.
 //!
 //! UVs follow the image convention: (0,0) is the top-left of the texture and
 //! v grows downwards. Binary Roblox meshes already store UVs this way; v1.x
@@ -90,18 +90,39 @@ pub struct Skin {
 /// Returns Err(String) for unsupported versions/encodings (e.g. Draco-compressed
 /// v7 geometry) or malformed data; never panics on bad input.
 pub fn parse(bytes: &[u8]) -> Result<MeshData, String> {
+    parse_impl(bytes, None)
+}
+
+/// Metadata for a multi-LOD render mesh. Each consecutive pair of offsets
+/// bounds one LOD in faces, with three corners per face.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MeshLods {
+    pub face_offsets: Vec<u32>,
+    pub lod_type: u16,
+    pub high_quality_count: u8,
+}
+
+/// Parse the concatenated triangle lists, with the same bounds as LOD0.
+/// Meshes without a valid LOD table return the normal geometry and empty offsets.
+pub fn parse_with_lods(bytes: &[u8]) -> Result<(MeshData, MeshLods), String> {
+    let mut lods = MeshLods::default();
+    let mesh = parse_impl(bytes, Some(&mut lods))?;
+    Ok((mesh, lods))
+}
+
+fn parse_impl(bytes: &[u8], lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(bytes).take(64 * 1024 * 1024).read_to_end(&mut decoded).map_err(|e| e.to_string())?;
-        return parse(&decoded);
+        return parse_impl(&decoded, lods);
     }
     if bytes.starts_with(b"<roblox!") {
         let dom = rbx_binary::from_reader(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
         for inst in dom.descendants() {
             if inst.class != "PartOperationAsset" { continue; }
             if let Some(rbx_dom_weak::types::Variant::BinaryString(blob)) = inst.properties.get(&"MeshData".into()) {
-                return parse(blob.as_ref());
+                return parse_impl(blob.as_ref(), lods);
             }
         }
         return Err("PartOperationAsset: missing MeshData".into());
@@ -111,7 +132,7 @@ pub fn parse(bytes: &[u8]) -> Result<MeshData, String> {
     } else if is_csgmdl(bytes) {
         parse_csgmdl(bytes)
     } else if bytes.starts_with(b"version ") {
-        parse_roblox(bytes)
+        parse_roblox(bytes, lods)
     } else {
         parse_obj(bytes)
     }
@@ -257,7 +278,7 @@ pub fn stored(bytes: &[u8]) -> Option<Stored> {
 }
 
 /// Splits off the `version X.YY` line and dispatches on the version string.
-fn parse_roblox(bytes: &[u8]) -> Result<MeshData, String> {
+fn parse_roblox(bytes: &[u8], lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
     let nl = bytes
         .iter()
         .position(|&b| b == b'\n')
@@ -269,10 +290,10 @@ fn parse_roblox(bytes: &[u8]) -> Result<MeshData, String> {
         "1.00" => parse_v1(body, 0.5),
         "1.01" => parse_v1(body, 1.0),
         "2.00" => parse_v2(body),
-        "3.00" | "3.01" => parse_v3(body),
-        "4.00" | "4.01" => parse_v4(body, 24),
-        "5.00" => parse_v4(body, 32),
-        "6.00" | "7.00" => parse_chunked(body),
+        "3.00" | "3.01" => parse_v3(body, lods),
+        "4.00" | "4.01" => parse_v4(body, 24, lods),
+        "5.00" => parse_v4(body, 32, lods),
+        "6.00" | "7.00" => parse_chunked(body, lods),
         other => Err(format!("mesh: unsupported version {other:?}")),
     }
 }
@@ -355,7 +376,7 @@ fn parse_v2(body: &[u8]) -> Result<MeshData, String> {
 /// Version 3.00/3.01: u16 header size, u8 vertex size, u8 face size, u16 LOD
 /// entry size, u16 LOD count, u32 vertex count, u32 face count; then vertices,
 /// faces, LOD offsets.
-fn parse_v3(body: &[u8]) -> Result<MeshData, String> {
+fn parse_v3(body: &[u8], render_lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
     let mut r = Reader::new(body);
     let header_size = r.u16()? as usize;
     let vertex_size = r.u8()? as usize;
@@ -369,7 +390,7 @@ fn parse_v3(body: &[u8]) -> Result<MeshData, String> {
     let (verts, off) = read_vertices(body, header_size, num_verts, vertex_size)?;
     let (faces, off) = read_faces(body, off, num_faces, face_size)?;
     let lods = read_lods(body, off, num_lods, lod_size)?;
-    build_indexed(&verts, lod0_faces(&faces, &lods))
+    build_lods(&verts, &faces, lods, render_lods, 0, 0).map(|(mesh, _)| mesh)
 }
 
 /// Versions 4.00/4.01 (header 24 bytes) and 5.00 (header 32 bytes, adding
@@ -378,10 +399,10 @@ fn parse_v3(body: &[u8]) -> Result<MeshData, String> {
 /// subset count, u8 HQ LOD count, u8 padding, [u32 FACS format, u32 FACS size].
 /// Body: 40-byte vertices, skinning (8 bytes/vertex, only if bones > 0), faces,
 /// LOD offsets, then bones/names/subsets/FACS (ignored).
-fn parse_v4(body: &[u8], min_header: usize) -> Result<MeshData, String> {
+fn parse_v4(body: &[u8], min_header: usize, render_lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
     let mut r = Reader::new(body);
     let header_size = r.u16()? as usize;
-    let _lod_type = r.u16()?;
+    let lod_type = r.u16()?;
     let num_verts = r.u32()? as usize;
     let num_faces = r.u32()? as usize;
     let num_lods = r.u16()? as usize;
@@ -396,15 +417,14 @@ fn parse_v4(body: &[u8], min_header: usize) -> Result<MeshData, String> {
     }
     let (faces, off) = read_faces(body, off, num_faces, 12)?;
     let lods = read_lods(body, off, num_lods, 4)?;
-    let lod0 = lod0_faces(&faces, &lods);
-    let mut m = build_indexed(&verts, lod0)?;
+    let (mut m, render_faces) = build_lods(&verts, &faces, lods, render_lods, lod_type, body[22])?;
     if num_bones > 0 && header_size >= 24 {
         // Header (v4+): …, u16 bones at 14, u32 bone-name bytes at 16, u16
         // subsets at 20. Bones, names and subsets follow the LOD offsets.
         let names_len = u32_at(body, 16) as usize;
         let subsets = u16::from_le_bytes([body[20], body[21]]) as usize;
         let bones_at = off + num_lods * 4;
-        m.skin = read_skin(body, envelopes, num_verts, bones_at, num_bones, names_len, subsets, lod0);
+        m.skin = read_skin(body, envelopes, num_verts, bones_at, num_bones, names_len, subsets, render_faces);
     }
     Ok(m)
 }
@@ -531,10 +551,12 @@ fn read_skin(
 /// (v1: u32 vertex count, 40-byte vertices, u32 face count, u32x3 faces; v2 is
 /// Draco-compressed and unsupported). `LODS` v1 holds u16 LOD type, u8 HQ LOD
 /// count, u32 LOD count, u32 face offsets. Other chunk types are skipped.
-fn parse_chunked(body: &[u8]) -> Result<MeshData, String> {
+fn parse_chunked(body: &[u8], render_lods: Option<&mut MeshLods>) -> Result<MeshData, String> {
     let mut r = Reader::new(body);
     let mut core: Option<(Vec<Vertex>, Vec<[u32; 3]>)> = None;
     let mut lods: Vec<u32> = Vec::new();
+    let mut lod_type = 0;
+    let mut high_quality_count = 0;
     let mut skinning: Option<&[u8]> = None;
     while r.pos < body.len() {
         let header = r.take(16).map_err(|_| "mesh: truncated chunk header")?;
@@ -571,8 +593,8 @@ fn parse_chunked(body: &[u8]) -> Result<MeshData, String> {
             },
             b"LODS\0\0\0\0" if version == 1 => {
                 let mut c = Reader::new(data);
-                let _lod_type = c.u16()?;
-                let _hq_lods = c.u8()?;
+                lod_type = c.u16()?;
+                high_quality_count = c.u8()?;
                 let num_lods = c.u32()? as usize;
                 lods = read_lods(data, c.pos, num_lods, 4)?;
             }
@@ -582,8 +604,7 @@ fn parse_chunked(body: &[u8]) -> Result<MeshData, String> {
         }
     }
     let (verts, faces) = core.ok_or("mesh: no COREMESH chunk")?;
-    let lod0 = lod0_faces(&faces, &lods);
-    let mut m = build_indexed(&verts, lod0)?;
+    let (mut m, render_faces) = build_lods(&verts, &faces, lods, render_lods, lod_type, high_quality_count)?;
     // SKINNING v1: u32 envelope count, envelopes, u32 bone count, bones,
     // u32 name bytes, names, u32 subset count, subsets.
     if let Some(d) = skinning {
@@ -607,7 +628,7 @@ fn parse_chunked(body: &[u8]) -> Result<MeshData, String> {
                     flat.extend_from_slice(d.get(bones_at..names_count_at).unwrap_or(&[]));
                     flat.extend_from_slice(d.get(names_count_at + 4..subsets_count_at).unwrap_or(&[]));
                     flat.extend_from_slice(d.get(subsets_count_at + 4..(subsets_count_at + 4).saturating_add(subsets.saturating_mul(72)).min(d.len())).unwrap_or(&[]));
-                    m.skin = read_skin(&flat, env, n_env, b_at, num_bones, names_len, subsets, lod0);
+                    m.skin = read_skin(&flat, env, n_env, b_at, num_bones, names_len, subsets, render_faces);
                 }
             }
         }
@@ -803,6 +824,37 @@ fn lod0_faces<'a>(faces: &'a [[u32; 3]], lods: &[u32]) -> &'a [[u32; 3]] {
         }
     }
     faces
+}
+
+/// Match the ordinary LOD0 bounds even when lower levels include vertices
+/// beyond the full-detail silhouette. An invalid table retains the original
+/// LOD0 parser's compatibility behavior.
+fn build_lods<'a>(
+    verts: &[Vertex],
+    faces: &'a [[u32; 3]],
+    offsets: Vec<u32>,
+    render_lods: Option<&mut MeshLods>,
+    lod_type: u16,
+    high_quality_count: u8,
+) -> Result<(MeshData, &'a [[u32; 3]]), String> {
+    if let Some(render_lods) = render_lods {
+        if offsets.len() >= 3
+            && offsets.first() == Some(&0)
+            && offsets.last().is_some_and(|&end| end as usize == faces.len())
+            && offsets.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            let mut mesh = build_indexed(verts, faces)?;
+            (mesh.min, mesh.max) = bounds(&mesh.positions[..offsets[1] as usize * 3]);
+            *render_lods = MeshLods {
+                face_offsets: offsets,
+                lod_type,
+                high_quality_count,
+            };
+            return Ok((mesh, faces));
+        }
+    }
+    let lod0 = lod0_faces(faces, &offsets);
+    Ok((build_indexed(verts, lod0)?, lod0))
 }
 
 /// De-indexes faces against vertex arrays; out-of-range indices are an error.
@@ -1325,6 +1377,22 @@ struct TriBuilder {
     colors: Vec<glam::Vec4>,
 }
 
+fn bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &position in positions {
+        if position.is_finite() {
+            min = min.min(position);
+            max = max.max(position);
+        }
+    }
+    if min.is_finite() && max.is_finite() {
+        (min, max)
+    } else {
+        (Vec3::ZERO, Vec3::ZERO)
+    }
+}
+
 impl TriBuilder {
     fn with_capacity(tris: usize) -> Self {
         // Cap the up-front reservation; the real size is bounded by input anyway.
@@ -1359,18 +1427,7 @@ impl TriBuilder {
 
     /// Computes bounds (ignoring non-finite components) and returns the mesh.
     fn finish(self) -> MeshData {
-        let mut min = Vec3::splat(f32::INFINITY);
-        let mut max = Vec3::splat(f32::NEG_INFINITY);
-        for p in &self.positions {
-            if p.is_finite() {
-                min = min.min(*p);
-                max = max.max(*p);
-            }
-        }
-        if !min.is_finite() || !max.is_finite() {
-            min = Vec3::ZERO;
-            max = Vec3::ZERO;
-        }
+        let (min, max) = bounds(&self.positions);
         // All-white (or absent / partial) colours change nothing: leave them
         // out so the mesh draws exactly as before.
         let colors = if self.colors.len() == self.positions.len()
@@ -1509,6 +1566,27 @@ mod tests {
         b.zeros(60); // one bone record (ignored)
         b.0.extend_from_slice(names);
         b.0
+    }
+
+    #[test]
+    fn parse_all_render_lods_keeps_lod0_bounds_and_skin() {
+        let bytes = v4_bytes();
+        let full = parse(&bytes).unwrap();
+        let (mesh, lods) = parse_with_lods(&bytes).unwrap();
+        assert_eq!(lods.face_offsets, [0, 2, 3]);
+        assert_eq!(mesh.positions.len(), 9);
+        assert_eq!(mesh.positions[..6], full.positions);
+        assert_eq!(mesh.positions[8], Vec3::splat(5.0));
+        assert_eq!((mesh.min, mesh.max), (full.min, full.max));
+        assert_eq!(mesh.skin.unwrap().corner_vertex, [0, 1, 2, 0, 2, 3, 2, 3, 4]);
+    }
+
+    #[test]
+    fn render_lods_with_missing_end_preserve_lod0() {
+        let bytes = v3_bytes();
+        let (mesh, lods) = parse_with_lods(&bytes).unwrap();
+        assert!(lods.face_offsets.is_empty());
+        assert_eq!(mesh, parse(&bytes).unwrap());
     }
 
     fn v5_bytes() -> Vec<u8> {
@@ -1790,9 +1868,17 @@ mod tests {
 
     #[test]
     fn v6_coremesh_with_lods() {
-        let m = parse(&v6_bytes()).unwrap();
+        let bytes = v6_bytes();
+        let m = parse(&bytes).unwrap();
         assert_quad(&m);
         assert!(m.uvs.iter().all(|&t| t == Vec2::new(0.25, 0.75)));
+
+        let (all, lods) = parse_with_lods(&bytes).unwrap();
+        assert_eq!(lods.face_offsets, [0, 2, 3]);
+        assert_eq!(lods.high_quality_count, 1);
+        assert_eq!(all.positions.len(), 9);
+        assert_eq!(all.positions[..6], m.positions);
+        assert_eq!((all.min, all.max), (m.min, m.max));
     }
 
     #[test]

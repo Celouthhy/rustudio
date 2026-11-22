@@ -51,14 +51,16 @@ struct Collected {
 
 static COLLECTED: Mutex<Vec<Collected>> = Mutex::new(Vec::new());
 
-/// StudioTestService:EndTest's value (JSON) once a script ended the test.
-static END_REQUEST: Mutex<Option<String>> = Mutex::new(None);
+/// The play session polls its server VM for an EndTest result.
+pub fn take_end_request(lua: &Lua) -> Option<String> {
+    let value = lua.named_registry_value::<Option<String>>("rs_end_test").ok()??;
+    let _ = lua.unset_named_registry_value("rs_end_test");
+    Some(value)
+}
 
-/// The play session polls this each frame: Some(value JSON) once a server
-/// script called StudioTestService:EndTest (the session then stops, as
-/// Studio's does).
-pub fn take_end_request() -> Option<String> {
-    END_REQUEST.lock().ok().and_then(|mut e| e.take())
+/// Assign the plugin's test arguments before the play VM starts scripts.
+pub fn set_test_args(lua: &Lua, args: &str) -> mlua::Result<()> {
+    lua.set_named_registry_value("rs_test_args", args)
 }
 
 /// After an EndTest stop: with RUSTUDIO_TEST_RESULT=FILE (a headless test
@@ -91,9 +93,6 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     if world(lua).is_ok_and(|w| w.side == Side::Server) {
         if let Ok(mut c) = COLLECTED.lock() {
             c.clear();
-        }
-        if let Ok(mut e) = END_REQUEST.lock() {
-            *e = None;
         }
     }
     Ok(())
@@ -533,12 +532,16 @@ fn studio_test_service(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> O
         // A test run's arguments (ExecutePlayModeAsync / ExecuteRunModeAsync
         // in Studio; RUSTUDIO_TEST_ARGS, JSON, for a headless rustudio run);
         // nil in a plain Play, as Studio's.
-        "GetTestArgs" => match std::env::var("RUSTUDIO_TEST_ARGS") {
-            Ok(s) if !s.trim().is_empty() => json_fn(lua, "decode")
-                .and_then(|f| f.call::<Value>(s))
-                .and_then(ret1),
-            _ => ret1(Value::Nil),
-        },
+        "GetTestArgs" => (|| {
+            let args = lua.named_registry_value::<Option<String>>("rs_test_args")?
+                .or_else(|| std::env::var("RUSTUDIO_TEST_ARGS").ok());
+            match args {
+                Some(s) if !s.trim().is_empty() => json_fn(lua, "decode")?
+                    .call::<Value>(s)
+                    .and_then(ret1),
+                _ => ret1(Value::Nil),
+            }
+        })(),
         "EndTest" => {
             if side != Side::Server {
                 Err(rt_err(
@@ -547,9 +550,7 @@ fn studio_test_service(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> O
             } else {
                 (|| {
                     let s: String = json_fn(lua, "encode")?.call(arg(args, 1))?;
-                    if let Ok(mut e) = END_REQUEST.lock() {
-                        *e = Some(s);
-                    }
+                    lua.set_named_registry_value("rs_end_test", s)?;
                     ret0()
                 })()
             }

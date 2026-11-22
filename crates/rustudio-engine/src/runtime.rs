@@ -1097,6 +1097,20 @@ const LUA_METHODS: &[(&str, &str)] = &[
 
 /// Property lookup through the class chain; aliases resolve to their
 /// canonical property. Returns (canonical name, type, read-only).
+/// The reflected property `name` of `class` is no member for scripts
+/// (Scriptability::None, or tagged NotScriptable: Instance.Attributes and
+/// Tags are Custom + NotScriptable): Studio's `inst.name` finds a child.
+pub(super) fn prop_hidden_from_scripts(class: &str, name: &str) -> bool {
+    let db = doc::db();
+    let Some(c) = db.classes.get(class) else { return false };
+    db.superclasses_iter(c)
+        .find_map(|cls| cls.properties.get(name))
+        .is_some_and(|p| {
+            !matches!(p.kind, PropertyKind::Alias { .. })
+                && (matches!(p.scriptability, Scriptability::None) || p.tags.contains(&PropertyTag::NotScriptable))
+        })
+}
+
 fn prop_desc(class: &str, name: &str) -> Option<(&'static str, DataType<'static>, bool)> {
     // Sound.Pitch is a deprecated alias of PlaybackSpeed in Roblox, but the
     // reflection database lists it as its own property (RbxCharacterSounds sets it).
@@ -2539,6 +2553,13 @@ fn prop_get_plain(
             return Ok(Some(Value::Function(f.clone())));
         }
     }
+    // A property scripts can't see (reflection NotScriptable, e.g.
+    // Instance.Attributes): a child of that name answers, as in Studio.
+    // A game's `require(Packages.Attributes)` got nil here and its
+    // whole player setup failed (2026-11-21).
+    if prop.is_some() && prop_hidden_from_scripts(class, key) && find_named_child(lua, r, key)?.is_some() {
+        return Ok(None);
+    }
     let (enum_name, value, defaulted) = match prop {
         Some(p) => {
             let (stored, v) = {
@@ -2564,8 +2585,17 @@ fn prop_get_plain(
                 // intern every child name a script indexes.)
                 .and_then(|i| i.properties.get(&rbx_dom_weak::Ustr::from_existing(key)?).cloned());
             match v {
+                // A stored non-reflected value (the file's own data) never
+                // hides a child of that name (see `prop_hidden_from_scripts`).
+                Some(_) if find_named_child(lua, r, key)?.is_some() => return Ok(None),
                 Some(v) => (None, Some(v), None),
-                None => return Ok(None),
+                // A class newer than the reflection database: Studio's
+                // measured constructor value where there is one
+                // (doc::constructor_default), else the stub's.
+                None => match doc::class_default(class, key) {
+                    Some(v) => (None, Some(v), None),
+                    None => return Ok(None),
+                },
             }
         }
     };

@@ -32,8 +32,13 @@ impl Profile {
     pub fn distance(self) -> f32 {
         DRAW_DISTANCE[usize::from(self.0 - 1)]
     }
+    /// Small-part screen-size cull radius in viewport pixels.
+    /// Studio 0.748: `max(0.05, low + (high - low) * min(level / 21, 1)) / 1080`
+    /// where `0.05` is the floor clamp, `1.0` is the
+    /// high-level pixel cutoff, and `low = 8.0` is the desktop profile override
+    /// (`4.0` built-in default).
     pub fn lod_radius_pixels(self, height: u32) -> f32 {
-        let cutoff = 8.0 + (0.05 - 8.0) * f32::from(self.0) / f32::from(MAX_LEVEL);
+        let cutoff = (8.0 + (1.0 - 8.0) * f32::from(self.0) / f32::from(MAX_LEVEL)).max(0.05);
         0.5 * cutoff * height as f32 / 1080.0
     }
     pub fn detail(self) -> f32 {
@@ -310,5 +315,14 @@ mod tests {
             Profile(21).particle_budget(),
             rustudio_core::mech::FX_PARTICLES_MAX
         );
+    }
+
+    #[test]
+    fn small_part_cull_cutoff_matches_studio_endpoints() {
+        // At 1080p, diameter cutoff interpolates linearly from 8.0 px (L0) to
+        // 1.0 px (L21), with radius = half diameter.
+        assert!((Profile::at(21).lod_radius_pixels(1080) - 0.5).abs() < 1e-5);
+        assert!((Profile::at(8).lod_radius_pixels(1080) - (0.5 * (8.0 - 7.0 * 8.0 / 21.0))).abs() < 1e-5);
+        assert!((Profile::at(1).lod_radius_pixels(1080) - (0.5 * (8.0 - 7.0 / 21.0))).abs() < 1e-5);
     }
 }

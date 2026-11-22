@@ -180,6 +180,7 @@ impl Tab {
             Tab::AvatarSettings => "avatar_settings",
             Tab::TerrainEditor => "terrain_editor",
             Tab::Toolbox => "toolbox",
+            Tab::AssetManager => "asset_manager",
             Tab::FileSync => "file_sync",
             Tab::Profiler => "microprofiler",
             Tab::Script(_) => "script",

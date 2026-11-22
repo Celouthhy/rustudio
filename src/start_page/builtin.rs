@@ -23,11 +23,13 @@ pub(super) static BASEPLATE: &[Inst] = &[
     ] },
     Inst { path: "Workspace/Baseplate", class: "Part", props: &[
         ("Anchored", B(true)),
+        ("BottomSurface", E(0)),
         ("CFrame", Cf([0.0, -8.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])),
         ("Color", C8(91, 91, 91)),
         ("FormFactor", E(0)),
         ("Locked", B(true)),
         ("Size", V3(2048.0, 16.0, 2048.0)),
+        ("TopSurface", E(0)),
     ] },
     Inst { path: "Workspace/Baseplate/Texture", class: "Texture", props: &[
         ("Color3", C3(0.0, 0.0, 0.0)),
@@ -47,9 +49,11 @@ pub(super) static BASEPLATE: &[Inst] = &[
     ] },
     Inst { path: "Workspace/SpawnLocation", class: "SpawnLocation", props: &[
         ("Anchored", B(true)),
+        ("BottomSurface", E(0)),
         ("CFrame", Cf([0.0, 0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])),
         ("Duration", I(0)),
         ("Size", V3(12.0, 1.0, 12.0)),
+        ("TopSurface", E(0)),
     ] },
     Inst { path: "Workspace/SpawnLocation/Decal", class: "Decal", props: &[
         ("Face", E(1)),
@@ -220,6 +224,7 @@ pub(super) static BASEPLATE: &[Inst] = &[
         ("EnvironmentSpecularScale", F(1.0)),
         ("FogColor", C3(0.75294125, 0.75294125, 0.75294125)),
         ("GeographicLatitude", F(0.0)),
+        ("GlobalShadows", B(true)),
         // What Studio's migration stored on open (ShadowMap → Soft): with
         // the attribute set nothing is derived again (doc::lighting_style_default).
         ("LightingStyle", E(1)),

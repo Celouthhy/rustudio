@@ -2793,8 +2793,58 @@ fn dof_weight(coc: f32, intensity: f32) -> f32 {
     return vec4<f32>(mix(center.rgb, blurred.rgb, dof_weight(c, intensity)), center.a);
 }
 
+// Studio's BlurEffect (Blur7FS.0.glsl,
+// ImageProcessBlurFXCompositionLinearFS.0.glsl): 1/4-res downsample + separable
+// 7-pair bilinear Gaussian blur with sigma = clamp(Size * 0.125, 0, 7).
+@fragment
+fn fs_blur_down(in: PostOut) -> @location(0) vec4<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(hdr_tex));
+    let cap = vec3<f32>(4.0 / max(g.params.y, 1e-4));
+    let o = texel;
+    let c0 = min(textureSampleLevel(hdr_tex, hdr_sampler, clamp(in.uv + vec2<f32>(-o.x, -o.y), texel * 0.5, vec2<f32>(1.0) - texel * 0.5), 0.0).rgb, cap);
+    let c1 = min(textureSampleLevel(hdr_tex, hdr_sampler, clamp(in.uv + vec2<f32>( o.x, -o.y), texel * 0.5, vec2<f32>(1.0) - texel * 0.5), 0.0).rgb, cap);
+    let c2 = min(textureSampleLevel(hdr_tex, hdr_sampler, clamp(in.uv + vec2<f32>(-o.x,  o.y), texel * 0.5, vec2<f32>(1.0) - texel * 0.5), 0.0).rgb, cap);
+    let c3 = min(textureSampleLevel(hdr_tex, hdr_sampler, clamp(in.uv + vec2<f32>( o.x,  o.y), texel * 0.5, vec2<f32>(1.0) - texel * 0.5), 0.0).rgb, cap);
+    return vec4<f32>((c0 + c1 + c2 + c3) * 0.25, 1.0);
+}
+
+fn blur_gaussian_1d(uv: vec2<f32>, axis: vec2<f32>) -> vec4<f32> {
+    let dim = vec2<f32>(textureDimensions(hdr_tex));
+    let texel = 1.0 / dim;
+    let step = axis * texel;
+    let uv_min = texel * 0.5;
+    let uv_max = vec2<f32>(1.0) - uv_min;
+    let sigma = max(clamp(g.sky_rot.y * 0.125, 0.0, 7.0), 0.25);
+    let denom = 2.0 * sigma * sigma;
+    var acc = textureSampleLevel(hdr_tex, hdr_sampler, clamp(uv, uv_min, uv_max), 0.0).rgb;
+    var wsum = 1.0;
+    for (var k = 0; k < 7; k++) {
+        let a = f32(2 * k + 1);
+        let b = a + 1.0;
+        let wb = exp(-(b * b) / denom);
+        let w = exp(-(a * a) / denom) + wb;
+        let off = step * (a + wb / max(w, 1e-8));
+        let p = textureSampleLevel(hdr_tex, hdr_sampler, clamp(uv + off, uv_min, uv_max), 0.0).rgb;
+        let m = textureSampleLevel(hdr_tex, hdr_sampler, clamp(uv - off, uv_min, uv_max), 0.0).rgb;
+        acc += (p + m) * w;
+        wsum += 2.0 * w;
+    }
+    return vec4<f32>(acc / wsum, 1.0);
+}
+
+@fragment
+fn fs_blur_h(in: PostOut) -> @location(0) vec4<f32> {
+    return blur_gaussian_1d(in.uv, vec2<f32>(1.0, 0.0));
+}
+
+@fragment
+fn fs_blur_v(in: PostOut) -> @location(0) vec4<f32> {
+    return blur_gaussian_1d(in.uv, vec2<f32>(0.0, 1.0));
+}
+
 @group(2) @binding(0) var fx_depth_ms: texture_depth_multisampled_2d;
 @group(2) @binding(1) var fx_unused: texture_2d<f32>;
+@group(2) @binding(2) var fx_blur: texture_2d<f32>;
 fn fx_depth(uv: vec2<f32>) -> f32 {
     let size = vec2<i32>(textureDimensions(fx_depth_ms));
     let p = clamp(vec2<i32>(uv * vec2<f32>(size)), vec2<i32>(0), size - vec2<i32>(1));
@@ -2816,6 +2866,17 @@ fn post_near(uv: vec2<f32>) -> vec4<f32> {
                    textureLoad(fx_unused, clamp(b + vec2<i32>(1,0), vec2<i32>(0), hi), 0), f.x),
                mix(textureLoad(fx_unused, clamp(b + vec2<i32>(0,1), vec2<i32>(0), hi), 0),
                    textureLoad(fx_unused, clamp(b + vec2<i32>(1,1), vec2<i32>(0), hi), 0), f.x), f.y);
+}
+
+fn post_blur(uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<i32>(textureDimensions(fx_blur));
+    let p = uv * vec2<f32>(size) - 0.5;
+    let b = vec2<i32>(floor(p)); let f = fract(p);
+    let hi = size - vec2<i32>(1);
+    return mix(mix(textureLoad(fx_blur, clamp(b, vec2<i32>(0), hi), 0).rgb,
+                   textureLoad(fx_blur, clamp(b + vec2<i32>(1,0), vec2<i32>(0), hi), 0).rgb, f.x),
+               mix(textureLoad(fx_blur, clamp(b + vec2<i32>(0,1), vec2<i32>(0), hi), 0).rgb,
+                   textureLoad(fx_blur, clamp(b + vec2<i32>(1,1), vec2<i32>(0), hi), 0).rgb, f.x), f.y);
 }
 
 @fragment
@@ -2868,9 +2929,14 @@ fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
     // sqrt(L × 0.25 × exposure) stored clamped to 1: the composited scene
     // never exceeds 4 / exposure (bloom_scene_sample applies the same).
     c = min(c, vec3<f32>(4.0 / max(g.params.y, 1e-4)));
-    // ImageProcessFXCompositionLinearFS: add bloom to the resolved scene,
-    // then apply the rational tone curve and colour correction.
+    // ImageProcessFXCompositionLinearFS / ImageProcessBlurFXCompositionLinearFS:
+    // add bloom to the resolved scene, blend 1/4-res BlurEffect (
+    // weight = clamp(Size / 12, 0, 1)), then apply tone curve and colour correction.
     c += textureSampleLevel(bloom_tex, hdr_sampler, in.uv, 0.0).rgb * g.cc_tint.w / max(g.params.y, 1e-3);
+    if (g.sky_rot.y > 0.0) {
+        let blur_weight = clamp(g.sky_rot.y * (1.0 / 12.0), 0.0, 1.0);
+        c = mix(c, post_blur(in.uv), blur_weight);
+    }
     c = tonemap(c * g.params.y);
 
     // ColorCorrectionEffect (display space).

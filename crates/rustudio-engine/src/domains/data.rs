@@ -197,13 +197,17 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
 fn install_mode(lua: &Lua, local_mode: bool) -> mlua::Result<()> {
     lua.set_app_data(State::default());
     lua.set_app_data(budget::Budget::default());
-    lua.load(local::SOURCE)
-        .set_name("=rustudio.data.local")
-        .call::<()>(local_mode)?;
     let create = lua.create_function(|lua, class: String| {
         let r = crate::runtime::ext::create_any(lua, &class)?;
         crate::runtime::inst_value(lua, r)
     })?;
+    let key_props = lua.create_function(|lua, (obj, props): (crate::runtime::LInst, Table)| {
+        lua.app_data_mut::<State>().unwrap().properties.insert(obj.0, props);
+        Ok(())
+    })?;
+    lua.load(local::SOURCE)
+        .set_name("=rustudio.data.local")
+        .call::<()>((local_mode, create.clone(), key_props))?;
     let register =
         lua.create_function(
             |lua,

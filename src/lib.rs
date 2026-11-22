@@ -17,6 +17,7 @@
 //!
 //! `src/main.rs` is the GUI entry point and calls [`run`].
 
+pub mod asset_manager;
 pub mod plugin_store;
 pub mod toolbox;
 pub mod ui_pointer;
@@ -175,6 +176,8 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
   --ldrag X1,Y1>X2,Y2@S  left-drag in the 3D view between view positions
   --lhold X,Y@S:HOLD   press the left button at X,Y at S seconds, let go HOLD seconds later
   --click X,Y@S        click the 3D view at X,Y (pixels) S seconds after start
+  --ui-click X,Y@S     click anywhere in the window (panels, menus) at window
+                       pixels X,Y S seconds after start (hover, press, release)
   --key NAME@S         press a key (egui name, e.g. Enter, B) S seconds after start
   --window WxH         window size for test runs
   --camera X,Y,Z,YAW,PITCH  start the editor camera there (degrees)
@@ -714,6 +717,13 @@ pub fn run() -> eframe::Result<()> {
             "--from-play" => from_play = true,
             "--bench-vsync" => bench_vsync = true,
             "--log" => log_out = args.next().map(PathBuf::from),
+            "--ui-click" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_ui_click(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--ui-click: can't read {v:?} (X,Y@S, window pixels)"),
+                }
+            }
             "--click" | "--key" => {
                 let v = args.next().unwrap_or_default();
                 match app::HarnessAction::parse(&v, a == "--click") {

@@ -54,6 +54,8 @@ use rustudio_engine::runtime::{RunMode, Runtime, Side, World, STACK_MARK};
 pub use source::PluginSource;
 pub use vm::{EditorRequest, UiItem, UiKind};
 
+pub(crate) type PlaytestCompletion = std::sync::Arc<std::sync::OnceLock<Result<String, String>>>;
+
 /// A plugin's id in this rustudio session (stable across reloads).
 /// (The type lives in the engine: engine code names it.)
 pub use rustudio_engine::runtime::domains::plugin_api::PluginId;
@@ -149,6 +151,7 @@ pub struct PluginHost {
     cmds: Vec<Cmd>,
     log: Vec<(Level, String)>,
     requests: Vec<EditorRequest>,
+    pub(super) playtest: Option<(String, PlaytestCompletion)>,
     activation_seen: u64,
     activation_changed: bool,
     play_ui: SharedPlayUi,
@@ -194,6 +197,7 @@ impl Default for PluginHost {
             cmds: Vec::new(),
             log: Vec::new(),
             requests: Vec::new(),
+            playtest: None,
             activation_seen: 0,
             activation_changed: false,
             play_ui: Default::default(),

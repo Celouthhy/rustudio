@@ -554,7 +554,11 @@ pub fn build_default(
             .with_property("Size", rv(size))
             .with_property("CFrame", cf_at(center))
             .with_property("Color", Color3uint8::new(color[0], color[1], color[2]))
-            .with_property("Material", Enum::from_u32(272));
+            .with_property("Material", Enum::from_u32(272))
+            // Smooth like an avatar's parts (a bare Part's are a Studs top
+            // and an Inlet bottom: doc::constructor_default).
+            .with_property("TopSurface", Enum::from_u32(0))
+            .with_property("BottomSurface", Enum::from_u32(0));
         if p.limb == Limb::Root {
             b.add_property("Transparency", 1.0f32);
         }

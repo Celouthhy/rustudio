@@ -194,10 +194,21 @@ pub fn studio_superclass(class: &str) -> Option<String> {
 pub fn listed_root_children(doc: &Document, prefs: Prefs) -> Vec<Ref> {
     let lists = PlaceLists::of(doc);
     let root = doc.dom.root();
+    // Without Studio's ReflectionMetadata (content not installed yet, or
+    // RUSTUDIO_NO_STUDIO_FETCH) step 4 would hide every service: list all but
+    // the ones Studio forces off, plus StudioService.
+    let have_meta = !crate::studio_panels::class_meta().is_empty();
     root.children()
         .iter()
         .filter_map(|r| doc.dom.get_by_ref(*r))
-        .filter(|i| visible(i.class.as_str(), !i.children().is_empty(), &lists, prefs, &studio_meta, &studio_superclass))
+        .filter(|i| {
+            if have_meta {
+                return visible(i.class.as_str(), !i.children().is_empty(), &lists, prefs, &studio_meta, &studio_superclass);
+            }
+            let c = i.class.as_str();
+            visible(c, !i.children().is_empty(), &lists, prefs, &|_| Some(Meta { explorer_order: Some(0), service_visibility: None }), &|_| None)
+                && (prefs.show_hidden || c != "StudioService")
+        })
         .map(|i| i.referent())
         .collect()
 }

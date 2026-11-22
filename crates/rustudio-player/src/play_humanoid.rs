@@ -1187,9 +1187,18 @@ mod script_moves_player_character_tests {
         // in flight is published (an idle direct step skips a display while its
         // batch runs, so how many ticks that takes depends on the machine), and
         // keeps it from then on.
+        // Ticks don't wait for the workers: on a slow, busy machine (CI's
+        // macOS Intel runner) 120 back-to-back ticks can all run before the
+        // batch is published, so wait in wall-clock time (up to ~10 s) and
+        // then check 60 more frames.
         let mut client_since = None;
-        for n in 1..=120 {
+        let mut n = 0;
+        while client_since.map_or(n < 2000, |s| n < s + 60) {
+            n += 1;
             tick(&mut game, &ctx, 1);
+            if client_since.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert_eq!(
                 game.run_luau(Side::Server, r#"
                     local p = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart.Position

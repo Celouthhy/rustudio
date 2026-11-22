@@ -19,7 +19,10 @@ pub struct ProbeGpu {
     src: wgpu::Texture,
     src_view: wgpu::TextureView,
     src_level_views: Vec<wgpu::TextureView>,
-    pub face_msaa: wgpu::TextureView,
+    /// The face is drawn here: multisampled and resolved to
+    /// face_resolve_view, or that view itself at one sample (OpenGL).
+    face_msaa: wgpu::TextureView,
+    samples: u32,
     pub face_depth: wgpu::TextureView,
     face_resolve_view: wgpu::TextureView,
     pub globals_buf: wgpu::Buffer,
@@ -78,11 +81,6 @@ impl ProbeGpu {
         let src_view = cube_view(&src, 0, None);
         let src_level_views = (0..LEVELS).map(|m| cube_view(&src, m, Some(1))).collect();
         let size = wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 };
-        let face_msaa = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("env probe face"), size, mip_level_count: 1, sample_count: samples,
-            dimension: wgpu::TextureDimension::D2, format: FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
-        }).create_view(&Default::default());
         let face_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("env probe face depth"), size, mip_level_count: 1, sample_count: samples,
             dimension: wgpu::TextureDimension::D2, format: depth_format,
@@ -93,6 +91,11 @@ impl ProbeGpu {
             dimension: wgpu::TextureDimension::D2, format: FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default());
+        let face_msaa = if samples == 1 { face_resolve_view.clone() } else { device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("env probe face"), size, mip_level_count: 1, sample_count: samples,
+            dimension: wgpu::TextureDimension::D2, format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        }).create_view(&Default::default()) };
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("env probe globals"), size: globals_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
@@ -166,7 +169,7 @@ impl ProbeGpu {
             down: pipe("fs_probe_down"),
             conv: pipe("fs_probe_conv"),
             slots, slot_views, cur: 0, src, src_view, src_level_views,
-            face_msaa, face_depth, face_resolve_view, globals_buf, params,
+            face_msaa, samples, face_depth, face_resolve_view, globals_buf, params,
             params_cpu: Vec::new(), coeff, sampler, layout,
         }
     }
@@ -240,8 +243,18 @@ impl ProbeGpu {
         self.pass(device, encoder, &pipeline, &target, &env, [0.0, face as f32, 0.0, 0.0]);
     }
 
-    pub fn face_resolve(&self) -> &wgpu::TextureView {
-        &self.face_resolve_view
+    /// The colour attachment a face is drawn to (resolved when multisampled).
+    pub fn face_color(&self) -> wgpu::RenderPassColorAttachment<'_> {
+        let multisampled = self.samples > 1;
+        wgpu::RenderPassColorAttachment {
+            view: &self.face_msaa,
+            depth_slice: None,
+            resolve_target: multisampled.then_some(&self.face_resolve_view),
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: if multisampled { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+            },
+        }
     }
 
     /// Pyramid and convolution steps (Task::Face is drawn by the renderer).

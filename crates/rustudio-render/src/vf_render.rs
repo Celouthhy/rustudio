@@ -23,7 +23,7 @@ use rbx_dom_weak::types::Ref;
 
 use super::{
     draw_key, pass_of, radius_of, shows, sphere_visible, frustum, to_raw, transparent_order, Globals,
-    InstanceRaw, Pass, Renderer, TexMode, DEPTH_FORMAT, HDR_FORMAT, SAMPLES,
+    InstanceRaw, Pass, Renderer, TexMode, DEPTH_FORMAT, HDR_FORMAT,
 };
 use rustudio_core::math::Xform;
 
@@ -310,10 +310,17 @@ impl Renderer {
             })
         };
         let att = wgpu::TextureUsages::RENDER_ATTACHMENT;
-        let msaa = tex("viewport frame msaa", HDR_FORMAT, SAMPLES, att).create_view(&Default::default());
-        let depth = tex("viewport frame depth", DEPTH_FORMAT, SAMPLES, att).create_view(&Default::default());
+        // The sample count of the pipelines it is drawn with (1 on OpenGL);
+        // at one sample the scene is drawn straight into `resolve`.
+        let samples = self.viewport.samples;
+        let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
         let resolve = tex("viewport frame resolve", HDR_FORMAT, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
+        let msaa = if samples == 1 {
+            resolve.clone()
+        } else {
+            tex("viewport frame msaa", HDR_FORMAT, samples, att).create_view(&Default::default())
+        };
         let out = tex("viewport frame", wgpu::TextureFormat::Rgba8Unorm, 1, att | wgpu::TextureUsages::TEXTURE_BINDING);
         let out_view = out.create_view(&Default::default());
         let id = rs.renderer.write().register_native_texture(device, &out_view, wgpu::FilterMode::Linear);
@@ -466,6 +473,7 @@ impl Renderer {
         // The background, premultiplied, in the frame's squared space.
         let b = req.background;
         let clear = wgpu::Color { r: (b[0] * b[0] * b[3]) as f64, g: (b[1] * b[1] * b[3]) as f64, b: (b[2] * b[2] * b[3]) as f64, a: b[3] as f64 };
+        let multisampled = self.viewport.samples > 1;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport frame") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -473,8 +481,11 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &t.msaa,
                     depth_slice: None,
-                    resolve_target: Some(&t.resolve),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
+                    resolve_target: multisampled.then_some(&t.resolve),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: if multisampled { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,

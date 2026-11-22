@@ -477,8 +477,46 @@ pub mod gpu_check {
             };
             r.render(&rs, [320, 180], &frame);
         }
+        // The env probe's faces and a ViewportFrame: drawn with the startup
+        // pipelines into their own targets, so their sample counts must
+        // agree (one sample on OpenGL).
+        let mut tasks = vec![env_probe_gpu::Task::Face(0), env_probe_gpu::Task::Pyramid];
+        tasks.push(env_probe_gpu::Task::Convolve { mip: 1, first: 0, count: 1 });
+        let probe = env_probe_gpu::ProbeFrame { centre: Vec3::ZERO, tasks, blend: 0.5, swap: false };
+        let frame = Frame {
+            globals,
+            quality: None,
+            cull_view_proj: proj * view,
+            fov_y: 1.0,
+            lights: &[],
+            shadows: true,
+            sun_cascades: cascades,
+            overlay: &[],
+            lines: &[],
+            sky: true,
+            water: Default::default(),
+            clouds: None,
+            probe: Some(probe),
+        };
+        r.render(&rs, [320, 180], &frame);
+        let (layer, part) = (Ref::new(), Ref::new());
+        r.set_layer(part, Some(layer));
+        r.set_item(part, vec![PartDraw { custom_mesh: None, ..scene.parts[0].draw }]);
+        let req = vf::Request {
+            size: [64, 64],
+            cam: Xform { pos: Vec3::new(0.0, 0.0, 10.0), rot: glam::Mat3::IDENTITY },
+            fov_y: 1.0,
+            ambient: [0.5; 3],
+            light: [1.0; 3],
+            light_dir: -Vec3::Y,
+            background: [0.0, 0.0, 0.0, 1.0],
+        };
+        r.render_viewport_frames(&rs, &std::collections::HashMap::from([(layer, req)]));
+        assert!(r.vf_texture(layer).is_some(), "the ViewportFrame was not drawn");
         // The passes made on first use by a scene that has them.
-        for samples in [1, SAMPLES] {
+        // (a device that cannot sample multisampled textures never builds 4x)
+        let sample_counts: &[u32] = if caps.sampled_msaa() { &[1, SAMPLES] } else { &[1] };
+        for &samples in sample_counts {
             drop(crate::world_gui::WorldGuiPass::new(&device, &queue, DISPLAY_FORMAT, samples));
             drop(crate::highlight::HighlightPass::new(&device, DISPLAY_FORMAT, DEPTH_FORMAT, samples, std::mem::size_of::<Vertex>() as u64));
         }
@@ -1854,6 +1892,8 @@ struct Target {
 }
 
 struct ViewportPipelines {
+    /// The sample count these pipelines were built for (1 on OpenGL).
+    samples: u32,
     water: crate::water::WaterPass,
     glass_resolve: wgpu::RenderPipeline,
     sky: wgpu::RenderPipeline,
@@ -2363,6 +2403,7 @@ impl ViewportPipelines {
 
 
         Self {
+            samples,
             water,
             glass_resolve,
             sky,
@@ -2506,6 +2547,15 @@ impl ViewportPipelines {
             }
         }
     }
+}
+
+/// The sample count the startup viewport pipelines (and the env probe and
+/// ViewportFrame targets drawn with them) are built for. The 4x shader
+/// variant reads the MSAA scene with textureSamples (GL 4.5, or
+/// ARB_shader_texture_image_samples, which pre-Skylake Intel drivers lack),
+/// and an OpenGL device draws one sample anyway (gpu_caps::sampled_msaa).
+fn startup_samples(caps: &crate::gpu_caps::GpuCaps) -> u32 {
+    if caps.sampled_msaa() { SAMPLES } else { 1 }
 }
 
 fn sample_slot(samples: u32) -> usize {
@@ -2994,7 +3044,7 @@ impl Renderer {
         let sun = crate::sun_shadow::SunShadows::new(device, &shadow_view);
         // Studio's scene environment probe (env_probe.rs): binding 13 is its
         // current slot, 21 the slot it blends to.
-        let probe = env_probe_gpu::ProbeGpu::new(device, queue, SAMPLES, DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
+        let probe = env_probe_gpu::ProbeGpu::new(device, queue, startup_samples(&caps), DEPTH_FORMAT, std::mem::size_of::<Globals>() as u64);
         let probe_globals_bg = Self::globals_group(
             device,
             &bgl,
@@ -3347,7 +3397,7 @@ impl Renderer {
             let bg = Self::sky_globals_group(device, &layout, &globals_buf, &sky_view, &sky_sampler);
             (layout, bg)
         });
-        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, SAMPLES, reduced);
+        let viewport = ViewportPipelines::new(device, queue, &bgl, &tex_layout, &glass_layout, &terrain_bgl, startup_samples(&caps), reduced);
 
         let meshes = build_meshes()
             .into_iter()
@@ -3463,7 +3513,7 @@ impl Renderer {
         let one_sample_likely = rustudio_core::rustudio_settings::weak_gpu()
             || rustudio_core::rustudio_settings::performance_value("quality") == "automatic"
             || rustudio_core::rustudio_settings::performance_value("detail") == "low";
-        if SAMPLES != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
+        if r.viewport.samples != 1 && one_sample_likely && std::env::var_os("RUSTUDIO_NO_PIPELINE_PREBUILD").is_none() {
             let (device, queue) = (device.clone(), queue.clone());
             let (g, t, gl, tr, reduced) = (r.globals_layout.clone(), r.tex_layout.clone(), r.glass_layout.clone(), r.terrain_layout.clone(), r.reduced);
             let (tx, rx) = std::sync::mpsc::channel();
@@ -4387,7 +4437,7 @@ impl Renderer {
     }
 
     fn pipelines(&self, samples: u32) -> &ViewportPipelines {
-        if samples == SAMPLES {
+        if samples == self.viewport.samples {
             &self.viewport
         } else {
             self.lower_samples[sample_slot(samples)].as_ref().expect("viewport pipelines")
@@ -4399,7 +4449,7 @@ impl Renderer {
             return;
         }
         let device = &rs.device;
-        let viewport = if samples == SAMPLES {
+        let viewport = if samples == self.viewport.samples {
             &self.viewport
         } else {
             if samples == 1 && self.lower_samples[sample_slot(1)].is_none() {
@@ -5195,7 +5245,7 @@ impl Renderer {
         };
 
         let target = self.target.as_ref()?;
-        let viewport = if samples == SAMPLES { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
+        let viewport = if samples == self.viewport.samples { &self.viewport } else { self.lower_samples[sample_slot(samples)].as_ref()? };
         let cloud_slot = sample_slot(samples);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewport"),
@@ -5556,12 +5606,7 @@ impl Renderer {
                     {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("env probe face"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &self.probe.face_msaa,
-                                depth_slice: None,
-                                resolve_target: Some(self.probe.face_resolve()),
-                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
-                            })],
+                            color_attachments: &[Some(self.probe.face_color())],
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                                 view: &self.probe.face_depth,
                                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),

@@ -2757,13 +2757,14 @@ fn in_data_model(lua: &Lua, r: Ref) -> mlua::Result<bool> {
     Ok(r == root || d.is_ancestor(root, r))
 }
 
-fn add_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
+pub(crate) fn add_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
     let mut tags = tags_of(lua, r)?;
     if tags.iter().any(|t| t == tag) {
         return Ok(());
     }
     tags.push(tag.to_string());
     set_tags(lua, r, tags)?;
+    world(lua)?.record(RepOp::Tag(r, tag.to_string()));
     // InstanceAdded only fires for instances in the DataModel; one tagged
     // while out of it fires when it is parented in (set_parent).
     if !in_data_model(lua, r)? {
@@ -2777,12 +2778,13 @@ fn add_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
     Ok(())
 }
 
-fn remove_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
+pub(crate) fn remove_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
     let tags = tags_of(lua, r)?;
     if !tags.iter().any(|t| t == tag) {
         return Ok(());
     }
     set_tags(lua, r, tags.into_iter().filter(|t| t != tag).collect())?;
+    world(lua)?.record(RepOp::Tag(r, tag.to_string()));
     if !in_data_model(lua, r)? {
         return Ok(());
     }

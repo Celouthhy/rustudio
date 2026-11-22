@@ -77,6 +77,12 @@ impl Side {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepOp {
     Prop(Ref, String),
+    /// One attribute changed or cleared on the server: replicated by name so
+    /// client-local attributes survive server attribute changes.
+    Attr(Ref, String),
+    /// One CollectionService tag added or removed on the server: replicated by
+    /// tag so client-local tags survive server tag changes.
+    Tag(Ref, String),
     Name(Ref),
     Parent(Ref),
     /// Physics moved a part: its CFrame is copied without Changed events
@@ -3427,6 +3433,52 @@ pub(crate) fn note_script_prop(w: &mut World, r: Ref, key: rbx_dom_weak::Ustr, o
     }
 }
 
+/// Sets or clears one attribute on `r`, preserving all other attributes,
+/// firing `AttributeChanged` / `AttributeChanged:{name}`, and recording a
+/// per-attribute replication op on the server.
+fn set_attr(lua: &Lua, r: Ref, name: &str, var: Option<Variant>) -> mlua::Result<()> {
+    let mut w = world(lua)?;
+    let key = ustr("Attributes");
+    let old_prop = {
+        let Some(inst) = w.dm().dom.get_by_ref_mut(r) else {
+            return Err(rt_err("the Instance no longer exists"));
+        };
+        let empty = Attributes::new();
+        let old = match inst.properties.get(&key) {
+            Some(Variant::Attributes(a)) => a,
+            _ => &empty,
+        };
+        // The value it already has: nothing changes and nothing fires
+        // (Roblox fires AttributeChanged only on a change).
+        if old.get(name) == var.as_ref() {
+            return Ok(());
+        }
+        // Rebuild without the key, then add the new value (nil clears it).
+        let mut attrs = Attributes::new();
+        for (k, v) in old.iter() {
+            if k.as_str() != name {
+                attrs.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(var) = var {
+            attrs.insert(name.to_string(), var);
+        }
+        inst.properties.insert(key, Variant::Attributes(attrs))
+    };
+    note_script_prop(&mut w, r, key, old_prop);
+    w.dm().mark_prop(r, key);
+    w.record(RepOp::Attr(r, name.to_string()));
+    if !w.listening.contains(&r) && !rustudio_core::telemetry::on() {
+        return Ok(());
+    }
+    drop(w);
+    let an = Value::String(lua.create_string(name)?);
+    let mut w = world(lua)?;
+    w.fire(r, "AttributeChanged", vec![an]);
+    w.fire(r, &format!("AttributeChanged:{name}"), vec![]);
+    Ok(())
+}
+
 fn set_callback(lua: &Lua, r: Ref, key: &str, value: Value) -> mlua::Result<()> {
     let mut c = cache(lua)?;
     match value {
@@ -4880,31 +4932,7 @@ fn call_method_routed(
             let n = arg_str(&args, 1, "string")?;
             check_attribute_name(&n)?;
             let var = attribute_value(&arg(&args, 2))?;
-            let old = match world(lua)?.d().prop(this, "Attributes") {
-                Some(Variant::Attributes(a)) => a,
-                _ => Attributes::new(),
-            };
-            // The value it already has: nothing changes and nothing fires
-            // (Roblox fires AttributeChanged only on a change).
-            let current = old.iter().find(|(k, _)| k.as_str() == n).map(|(_, v)| v);
-            if current == var.as_ref() {
-                return none();
-            }
-            // Rebuild without the key, then add the new value (nil clears it).
-            let mut attrs = Attributes::new();
-            for (k, v) in old.iter() {
-                if k.as_str() != n {
-                    attrs.insert(k.clone(), v.clone());
-                }
-            }
-            if let Some(var) = var {
-                attrs.insert(n.clone(), var);
-            }
-            store_prop(lua, this, "Attributes", Variant::Attributes(attrs))?;
-            let an = Value::String(lua.create_string(&n)?);
-            let mut w = world(lua)?;
-            w.fire(this, "AttributeChanged", vec![an]);
-            w.fire(this, &format!("AttributeChanged:{n}"), vec![]);
+            set_attr(lua, this, &n, var)?;
             none()
         }
         "GetPropertyChangedSignal" => {
@@ -7398,35 +7426,6 @@ impl Runtime {
 
     /// Replication: sets a property as the server did (fires Changed here).
     pub fn apply_prop(&self, r: Ref, name: &str, v: Variant) {
-        // Attributes: each one that changed fires AttributeChanged (and its
-        // GetAttributeChangedSignal), as when a script sets it.
-        let changed_attrs: Vec<String> = if name == "Attributes" {
-            let old = world(&self.lua)
-                .ok()
-                .and_then(|w| match w.d().prop(r, "Attributes") {
-                    Some(Variant::Attributes(a)) => Some(a),
-                    _ => None,
-                });
-            match (&v, old) {
-                (Variant::Attributes(new), old) => {
-                    let old = old.unwrap_or_default();
-                    let mut keys: Vec<String> = new
-                        .iter()
-                        .filter(|(k, val)| old.get(k.as_str()) != Some(*val))
-                        .map(|(k, _)| k.to_string())
-                        .collect();
-                    keys.extend(
-                        old.iter()
-                            .filter(|(k, _)| new.get(k.as_str()).is_none())
-                            .map(|(k, _)| k.to_string()),
-                    );
-                    keys
-                }
-                _ => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
         // A Humanoid's Health from the server fires HealthChanged here, and
         // Died when it reaches 0 (Roblox fires both on the clients too).
         let health = (name == "Health")
@@ -7470,15 +7469,32 @@ impl Runtime {
                 }
             }
         }
-        if !changed_attrs.is_empty() {
-            if let Ok(mut w) = world(&self.lua) {
-                for k in changed_attrs {
-                    if let Ok(s) = self.lua.create_string(&k) {
-                        w.fire(r, "AttributeChanged", vec![Value::String(s)]);
-                    }
-                    w.fire(r, &format!("AttributeChanged:{k}"), vec![]);
-                }
-            }
+    }
+
+    /// Replication: sets or clears one attribute as the server did, preserving
+    /// every other attribute (including client-local ones).
+    pub fn apply_attr(&self, r: Ref, name: &str, v: Option<Variant>) {
+        if world(&self.lua).ok().is_none_or(|w| !w.d().exists(r)) {
+            return;
+        }
+        if let Err(e) = set_attr(&self.lua, r, name, v) {
+            report(&self.lua, &e);
+        }
+    }
+
+    /// Replication: adds or removes one CollectionService tag as the server
+    /// did, preserving every other tag (including client-local ones).
+    pub fn apply_tag(&self, r: Ref, tag: &str, present: bool) {
+        if world(&self.lua).ok().is_none_or(|w| !w.d().exists(r)) {
+            return;
+        }
+        let res = if present {
+            ext::add_tag(&self.lua, r, tag)
+        } else {
+            ext::remove_tag(&self.lua, r, tag)
+        };
+        if let Err(e) = res {
+            report(&self.lua, &e);
         }
     }
 

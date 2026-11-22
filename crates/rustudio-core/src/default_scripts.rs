@@ -22,9 +22,8 @@
 //!   StarterPlayerScripts.`RbxCharacterSounds`. The tree is the install's
 //!   own project file, `ExtraContent/scripts/PlayerScripts/PlayerScripts.rbxp`.
 //!   Studio 0.748 and later reference an external `InputContexts.rbxp` subtree.
-//! - The older layout (that property Disabled, an install without the
-//!   project file, or a place with its own PlayerModule / PlayerScriptsLoader
-//!   in StarterPlayerScripts): StarterPlayerScripts gets `PlayerScriptsLoader`
+//! - The older layout (that property Disabled or an install without the
+//!   project file): StarterPlayerScripts gets `PlayerScriptsLoader`
 //!   (LocalScript), `PlayerModule` (ModuleScript tree: CameraModule,
 //!   ControlModule, CommonUtils) and `RbxCharacterSounds` (LocalScript +
 //!   AtomicBinding), from
@@ -36,8 +35,9 @@
 //!   `content/avatar/scripts/humanoidAnimateR15_DEPRECATED_20260813.rbxm`,
 //!   R6 `content/avatar/scripts/humanoidAnimatePlayEmote.rbxm`).
 //!
-//! A place's own script of the same name (in StarterPlayerScripts or
-//! StarterCharacterScripts) wins, as in Studio.
+//! A place's own script of the same name in the destination wins. In the
+//! current layout a custom module in StarterPlayerScripts can coexist with
+//! the default module under StarterPlayer.
 
 use std::path::{Path, PathBuf};
 
@@ -342,8 +342,7 @@ fn input_action_system_off(doc: &Document) -> bool {
         .is_some_and(|ws| crate::doc::enum_u32(doc.prop(ws, "PlayerScriptsUseInputActionSystem")) == Some(1))
 }
 
-/// Puts the default player scripts into StarterPlayer.StarterPlayerScripts
-/// (made if missing) unless the place has its own of the same name. Returns
+/// Installs the default player scripts into the StarterPlayer tree. Returns
 /// the names inserted.
 pub fn insert_player_scripts(doc: &mut Document) -> Result<Vec<&'static str>, String> {
     let Some(root_dir) = studio_dir() else {
@@ -371,8 +370,7 @@ fn insert_player_scripts_from(doc: &mut Document, root_dir: &Path) -> Result<Vec
     let base = root_dir.join(PLAYER_SCRIPTS);
     let mut added = Vec::new();
     // Studio's current layout: StarterPlayer.PlayerModule (see the module docs).
-    let own_old = ["PlayerModule", "PlayerScriptsLoader"].iter().any(|n| child_named(doc, sps, n).is_some());
-    if !own_old && !input_action_system_off(doc) {
+    if !input_action_system_off(doc) {
         let project = base.join("PlayerScripts.rbxp");
         let present = project.try_exists().map_err(|e| format!("{}: {e}", project.display()))?;
         if present {
@@ -482,6 +480,58 @@ pub fn insert_character_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_player_module_coexists_with_the_input_action_system() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rustudio-custom-player-{unique}"));
+        let base = root.join(PLAYER_SCRIPTS);
+        let module = base.join("StarterPlayer/PlayerModule");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("init.lua"), "return 'default'").unwrap();
+        std::fs::write(module.join("PlayerScriptsLoader.client.lua"), "return").unwrap();
+        std::fs::write(
+            base.join("PlayerScripts.rbxp"),
+            r#"{"instanceHierarchy":{"tree":{"StarterPlayer":{"$path":"StarterPlayer"}}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(base.join("StarterPlayerScripts")).unwrap();
+        std::fs::write(
+            base.join("StarterPlayerScripts/PlayerScriptsLoader.lua"),
+            "return",
+        )
+        .unwrap();
+
+        let mut doc = Document::new_place();
+        let starter = doc.find_child(doc.dom.root_ref(), "StarterPlayer").unwrap();
+        let scripts = doc.find_child(starter, "StarterPlayerScripts").unwrap();
+        let custom = doc.dom.insert(
+            scripts,
+            script("ModuleScript", "PlayerModule", "return 'custom'".into()),
+        );
+
+        let mut legacy = doc.clone_for_play("legacy".into());
+        let workspace = legacy.workspace().unwrap();
+        legacy.dom.get_by_ref_mut(workspace).unwrap().properties.insert(
+            "PlayerScriptsUseInputActionSystem".into(),
+            Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1)),
+        );
+        let legacy_added = insert_player_scripts_from(&mut legacy, &root);
+        let modern_added = insert_player_scripts_from(&mut doc, &root);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(legacy_added.unwrap(), ["PlayerScriptsLoader"]);
+        let legacy_starter = legacy.find_child(legacy.dom.root_ref(), "StarterPlayer").unwrap();
+        assert!(child_named(&legacy, legacy_starter, "PlayerModule").is_none());
+        assert_eq!(modern_added.unwrap(), ["PlayerModule"]);
+        assert_eq!(child_named(&doc, scripts, "PlayerModule"), Some(custom));
+        assert!(child_named(&doc, scripts, "PlayerScriptsLoader").is_none());
+        let default_module = child_named(&doc, starter, "PlayerModule").unwrap();
+        assert!(child_named(&doc, default_module, "PlayerScriptsLoader").is_some());
+    }
 
     #[test]
     fn project_imports_input_contexts_with_properties_and_rejects_missing_sources() {

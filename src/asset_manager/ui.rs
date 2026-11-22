@@ -1695,10 +1695,10 @@ impl AssetManager {
                                     ui.label(RichText::new("Uploading...").size(11.0).color(LINK));
                                 }
                                 ImportStatus::Done(id) => {
-                                    ui.label(RichText::new(format!("✓ {id}")).size(11.0).color(GOOD));
+                                    ui.label(RichText::new(format!("✔ {id}")).size(11.0).color(GOOD));
                                 }
                                 ImportStatus::LocalImported => {
-                                    ui.label(RichText::new("✓ Inserted locally").size(11.0).color(GOOD));
+                                    ui.label(RichText::new("✔ Inserted locally").size(11.0).color(GOOD));
                                 }
                                 ImportStatus::Failed(e) => {
                                     ui.label(RichText::new("Failed").size(11.0).color(theme::ERROR)).on_hover_text(e);

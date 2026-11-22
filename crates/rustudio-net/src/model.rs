@@ -920,6 +920,41 @@ mod tests {
     }
 
     #[test]
+    fn live_mesh_group_keeps_the_mesh_child_name() {
+        let mut model = LiveModel::new();
+        for (id, class, parent, name) in [
+            (1, "DataModel", None, None),
+            (2, "Model", Some(1), Some("MeshGroup")),
+            (3, "Part", Some(2), Some("Handle")),
+            (4, "SpecialMesh", Some(3), None),
+            (5, "SpecialMesh", Some(3), Some("CustomMesh")),
+        ] {
+            model.apply(RepOp::NewInstance {
+                id,
+                class: class.into(),
+                parent,
+                props: name
+                    .map(|name| ("Name".into(), PropValue::String(name.into())))
+                    .into_iter()
+                    .collect(),
+            });
+        }
+
+        let mesh_group = model.reference(2).unwrap();
+        let mut dom = model.dom;
+        let clone = dom.clone_within(mesh_group);
+        let handle = dom.get_by_ref(clone).unwrap().children()[0];
+        let meshes: Vec<_> = dom
+            .get_by_ref(handle)
+            .unwrap()
+            .children()
+            .iter()
+            .map(|child| dom.get_by_ref(*child).unwrap().name.as_str())
+            .collect();
+        assert_eq!(meshes, ["Mesh", "CustomMesh"]);
+    }
+
+    #[test]
     fn omitted_names_use_constructor_defaults_and_explicit_names_win() {
         let mut m = LiveModel::new();
         for (class, expected) in [("BindableEvent", "Event"), ("BindableFunction", "Function"), ("WedgePart", "Wedge"), ("CornerWedgePart", "CornerWedge"), ("UnionOperation", "Union"), ("Part", "Part"), ("LocalScript", "LocalScript"), ("IntValue", "Value"), ("SpecialMesh", "Mesh"), ("BodyColors", "Body Colors"), ("TrussPart", "Truss"), ("TeleportOptions", "Instance")] {

@@ -403,7 +403,7 @@ impl Schema {
     }
 
     /// Decode one property value of schema type `ty` (with ContentId prefix
-    /// compression enabled, as in `ChangePropertyItem` and    /// `EventInvocationItem`).
+    /// compression enabled, as in `ChangePropertyItem` and `EventInvocationItem`).
     fn value(&self, ty: u8, c: &mut Cur) -> R<PropValue> {
         self.value_at_depth(ty, c, 0, true)
     }
@@ -469,7 +469,7 @@ impl Schema {
         self.value_at_depth(ety, c, depth + 1, compress_content)
     }
 
-    /// Studio 0.748 master value deserializer (valid    /// range `0x02..=0x47` excluding `0x04, 0x05, 0x17,
+    /// Studio 0.748 master value deserializer (valid range `0x02..=0x47` excluding `0x04, 0x05, 0x17,
     /// 0x2d, 0x40`).
     fn value_at_depth(
         &self,

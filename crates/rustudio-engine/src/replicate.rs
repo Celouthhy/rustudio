@@ -15,6 +15,16 @@ use crate::runtime::{RemoteMsg, RepOp, Runtime};
 /// Services whose contents never reach the client.
 pub const SERVER_ONLY: &[&str] = &["ServerStorage", "ServerScriptService"];
 
+/// Deduplication key for queued per-instance updates (properties, attributes
+/// and tags share separate namespaces so an attribute named "Name" never
+/// collides with the property `Name`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum RepKey {
+    Prop(Ustr),
+    Attr(Ustr),
+    Tag(Ustr),
+}
+
 /// Server ↔ client instance pairs, and the changes on their way over.
 #[derive(Default)]
 pub struct RepMap {
@@ -24,9 +34,9 @@ pub struct RepMap {
     queue: VecDeque<Pending>,
     /// Ops enqueued so far (each op's sequence number).
     seq: u64,
-    /// Prop / CFrame ops waiting in the queue (a newer one adds nothing:
-    /// the value is read from the server when the op is applied).
-    queued_props: rustc_hash::FxHashSet<(Ref, Ustr)>,
+    /// Prop / Attr / Tag / CFrame ops waiting in the queue (a newer one adds
+    /// nothing: the value is read from the server when the op is applied).
+    queued_props: rustc_hash::FxHashSet<(Ref, RepKey)>,
     /// Server → client remote calls waiting for the replication sent
     /// before them (Roblox keeps remotes and replication in one order).
     held: VecDeque<(u64, RemoteMsg)>,
@@ -140,8 +150,10 @@ impl RepMap {
         let cframe = ustr("CFrame");
         for op in ops {
             let key = match &op {
-                RepOp::Prop(r, n) => Some((*r, ustr(n))),
-                RepOp::Moved(r) => Some((*r, cframe)),
+                RepOp::Prop(r, n) => Some((*r, RepKey::Prop(ustr(n)))),
+                RepOp::Attr(r, n) => Some((*r, RepKey::Attr(ustr(n)))),
+                RepOp::Tag(r, t) => Some((*r, RepKey::Tag(ustr(t)))),
+                RepOp::Moved(r) => Some((*r, RepKey::Prop(cframe))),
                 _ => None,
             };
             if let Some(k) = key {
@@ -382,8 +394,8 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
                 let r = *r;
                 map.queue.pop_front();
                 map.frame_items += 1;
-                map.queued_props.remove(&(r, cframe));
-                if map.buffered.contains(&r) || !seen_props.insert((r, cframe)) {
+                map.queued_props.remove(&(r, RepKey::Prop(cframe)));
+                if map.buffered.contains(&r) || !seen_props.insert((r, RepKey::Prop(cframe))) {
                     continue;
                 }
                 let (Some(&target), Some(value)) = (
@@ -417,8 +429,17 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
         });
         match p.kind {
             PendingKind::Op(op) => {
-                if let RepOp::Prop(r, n) = &op {
-                    map.queued_props.remove(&(*r, ustr(n)));
+                match &op {
+                    RepOp::Prop(r, n) => {
+                        map.queued_props.remove(&(*r, RepKey::Prop(ustr(n))));
+                    }
+                    RepOp::Attr(r, n) => {
+                        map.queued_props.remove(&(*r, RepKey::Attr(ustr(n))));
+                    }
+                    RepOp::Tag(r, t) => {
+                        map.queued_props.remove(&(*r, RepKey::Tag(ustr(t))));
+                    }
+                    _ => {}
                 }
                 apply_op(server, client, map, op, p.seq, budgeted, &mut seen_props, &mut created);
             }
@@ -542,12 +563,12 @@ fn apply_op(
     op: RepOp,
     seq: u64,
     budgeted: bool,
-    seen_props: &mut rustc_hash::FxHashSet<(Ref, Ustr)>,
+    seen_props: &mut rustc_hash::FxHashSet<(Ref, RepKey)>,
     created: &mut Vec<Ref>,
 ) {
     match op {
         RepOp::Prop(r, name) => {
-            if !seen_props.insert((r, ustr(&name))) {
+            if !seen_props.insert((r, RepKey::Prop(ustr(&name)))) {
                 return;
             }
             let Some(c) = map.s2c.get(&r).copied() else {
@@ -576,6 +597,43 @@ fn apply_op(
             }
             let v = remap_value(server, c, &name, v, map);
             client.apply_prop(c, &name, v);
+        }
+        RepOp::Attr(r, name) => {
+            if !seen_props.insert((r, RepKey::Attr(ustr(&name)))) {
+                return;
+            }
+            let Some(c) = map.s2c.get(&r).copied() else {
+                return;
+            };
+            let Some(inst) = server.dom.get_by_ref(r) else {
+                return;
+            };
+            let val = match inst.properties.get(&ustr("Attributes")) {
+                Some(Variant::Attributes(a)) => a.get(name.as_str()).cloned(),
+                _ => None,
+            };
+            let bytes = 6 + name.len() as u64 + val.as_ref().map_or(1, crate::runtime::domains::services::perf::value_bytes);
+            crate::runtime::domains::services::perf::net(true, false, bytes);
+            client.apply_attr(c, &name, val);
+        }
+        RepOp::Tag(r, tag) => {
+            if !seen_props.insert((r, RepKey::Tag(ustr(&tag)))) {
+                return;
+            }
+            let Some(c) = map.s2c.get(&r).copied() else {
+                return;
+            };
+            let Some(inst) = server.dom.get_by_ref(r) else {
+                return;
+            };
+            let has = match inst.properties.get(&ustr("Tags")) {
+                Some(Variant::Tags(t)) => t.iter().any(|s| s == tag),
+                Some(Variant::BinaryString(b)) => rbx_dom_weak::types::Tags::decode(b.as_ref())
+                    .is_ok_and(|t| t.iter().any(|s| s == tag)),
+                _ => false,
+            };
+            crate::runtime::domains::services::perf::net(true, false, 6 + tag.len() as u64 + 1);
+            client.apply_tag(c, &tag, has);
         }
         RepOp::Moved(_) => unreachable!("moves are applied in batches"),
         RepOp::Name(r) => {
@@ -866,5 +924,171 @@ mod tests {
         assert_eq!(kids(clist), names);
         let first = c.dom.get_by_ref(clist).unwrap().children()[0];
         assert_eq!(kids(first), ["Desert1", "Desert2"]);
+    }
+
+    /// Attributes replicate one name at a time: client-local attributes
+    /// survive server sets and clears, a server write to the same name wins,
+    /// and a newly replicated instance still arrives with all its attributes.
+    #[test]
+    fn attributes_replicate_per_name_without_wiping_client_locals() {
+        let (s, c, mut map) = pair();
+        s.lua.load(
+            "local p = Instance.new('Part'); p.Name = 'Target'; p.Parent = workspace",
+        ).exec().unwrap();
+        sync(&s, &c, &mut map, false);
+
+        // Client sets local attributes and listens for AttributeChanged.
+        c.lua.load(r#"
+            local p = workspace:FindFirstChild("Target")
+            p:SetAttribute("LocalFly", true)
+            p:SetAttribute("Shared", "client")
+            _G.changed = {}
+            _G.fly_hits = 0
+            p.AttributeChanged:Connect(function(k) table.insert(_G.changed, k) end)
+            p:GetAttributeChangedSignal("LocalFly"):Connect(function() _G.fly_hits += 1 end)
+        "#).exec().unwrap();
+
+        // 1. Server sets different attributes: client-local ones survive.
+        s.lua.load(r#"
+            local p = workspace.Target
+            p:SetAttribute("AimPitch", 1)
+            p:SetAttribute("Keep", "srv")
+        "#).exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local p = workspace.Target
+            table.sort(_G.changed)
+            local out = table.concat({
+                tostring(p:GetAttribute("LocalFly")),
+                tostring(p:GetAttribute("Shared")),
+                tostring(p:GetAttribute("AimPitch")),
+                tostring(p:GetAttribute("Keep")),
+                tostring(_G.fly_hits),
+                table.concat(_G.changed, ","),
+            }, "|")
+            _G.changed = {}
+            return out
+        "#).eval().unwrap();
+        assert_eq!(res, "true|client|1|srv|0|AimPitch,Keep");
+
+        // 2. Server clears one attribute to nil: only that name is removed.
+        s.lua.load("workspace.Target:SetAttribute('AimPitch', nil)").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local p = workspace.Target
+            local out = table.concat({
+                tostring(p:GetAttribute("LocalFly")),
+                tostring(p:GetAttribute("Shared")),
+                tostring(p:GetAttribute("AimPitch")),
+                tostring(p:GetAttribute("Keep")),
+                tostring(_G.fly_hits),
+                table.concat(_G.changed, ","),
+            }, "|")
+            _G.changed = {}
+            return out
+        "#).eval().unwrap();
+        assert_eq!(res, "true|client|nil|srv|0|AimPitch");
+
+        // 3. Server writes a name the client also set locally: server wins.
+        s.lua.load("workspace.Target:SetAttribute('Shared', 'server')").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local p = workspace.Target
+            local out = table.concat({
+                tostring(p:GetAttribute("LocalFly")),
+                tostring(p:GetAttribute("Shared")),
+                tostring(p:GetAttribute("Keep")),
+                tostring(_G.fly_hits),
+                table.concat(_G.changed, ","),
+            }, "|")
+            _G.changed = {}
+            return out
+        "#).eval().unwrap();
+        assert_eq!(res, "true|server|srv|0|Shared");
+
+        // 4. Server sets an attribute named after a real property in the same
+        //    frame as that property: neither deduplicates the other.
+        s.lua.load(r#"
+            local p = workspace.Target
+            p.Transparency = 0.5
+            p:SetAttribute("Transparency", 99)
+        "#).exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local p = workspace.Target
+            return tostring(p.Transparency) .. "|" .. tostring(p:GetAttribute("Transparency")) .. "|" .. tostring(p:GetAttribute("LocalFly"))
+        "#).eval().unwrap();
+        assert_eq!(res, "0.5|99|true");
+
+        // 5. Initial replication of a new instance carries all of its attributes.
+        s.lua.load(r#"
+            local fresh = Instance.new("Folder")
+            fresh.Name = "Fresh"
+            fresh:SetAttribute("A", 1)
+            fresh:SetAttribute("B", "two")
+            fresh:SetAttribute("C", true)
+            fresh.Parent = workspace
+        "#).exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local f = workspace:FindFirstChild("Fresh")
+            return table.concat({
+                tostring(f:GetAttribute("A")),
+                tostring(f:GetAttribute("B")),
+                tostring(f:GetAttribute("C")),
+            }, "|")
+        "#).eval().unwrap();
+        assert_eq!(res, "1|two|true");
+    }
+
+    /// CollectionService tags replicate per tag: client-local tags survive
+    /// server AddTag / RemoveTag, and signals + GetTagged stay in sync.
+    #[test]
+    fn tags_replicate_per_tag_without_wiping_client_locals() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local p = Instance.new('Part'); p.Name = 'Tagged'; p.Parent = workspace").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+
+        c.lua.load(r#"
+            local CS = game:GetService("CollectionService")
+            local p = workspace:FindFirstChild("Tagged")
+            p:AddTag("ClientOnly")
+            _G.added = 0
+            _G.removed = 0
+            CS:GetInstanceAddedSignal("ServerTag"):Connect(function() _G.added += 1 end)
+            CS:GetInstanceRemovedSignal("ServerTag"):Connect(function() _G.removed += 1 end)
+        "#).exec().unwrap();
+
+        s.lua.load("workspace.Tagged:AddTag('ServerTag'); workspace.Tagged:AddTag('KeepTag')").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local CS = game:GetService("CollectionService")
+            local p = workspace.Tagged
+            return table.concat({
+                tostring(p:HasTag("ClientOnly")),
+                tostring(p:HasTag("ServerTag")),
+                tostring(p:HasTag("KeepTag")),
+                tostring(#CS:GetTagged("ServerTag")),
+                tostring(_G.added),
+                tostring(_G.removed),
+            }, "|")
+        "#).eval().unwrap();
+        assert_eq!(res, "true|true|true|1|1|0");
+
+        s.lua.load("workspace.Tagged:RemoveTag('ServerTag')").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let res: String = c.lua.load(r#"
+            local CS = game:GetService("CollectionService")
+            local p = workspace.Tagged
+            return table.concat({
+                tostring(p:HasTag("ClientOnly")),
+                tostring(p:HasTag("ServerTag")),
+                tostring(p:HasTag("KeepTag")),
+                tostring(#CS:GetTagged("ServerTag")),
+                tostring(_G.added),
+                tostring(_G.removed),
+            }, "|")
+        "#).eval().unwrap();
+        assert_eq!(res, "true|false|true|0|1|1");
     }
 }

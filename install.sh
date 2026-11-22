@@ -25,8 +25,9 @@ uninstall=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --prefix) [ $# -ge 2 ] || { echo "--prefix needs a folder" >&2; exit 1; }
+        --prefix) [ -n "${2-}" ] || { echo "--prefix needs a folder" >&2; exit 1; }
                   prefix="$2"; shift ;;
+        --prefix=) echo "--prefix needs a folder" >&2; exit 1 ;;
         --prefix=*) prefix="${1#--prefix=}" ;;
         --no-build) build=0 ;;
         --uninstall) uninstall=1 ;;

@@ -1338,7 +1338,9 @@ fn particles_draw(
             ((w - view.pos).dot(view.forward), i, w)
         })
         .collect();
-    order.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // (far first, ties in particle order: the order a stable sort by
+    // distance gives, the index making every key distinct)
+    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     let max_size = c.size.0.iter().map(|k| (k.1 + k.2.abs()) * mech::FX_PARTICLE_HALF_SIZE).fold(0.0f32, f32::max);
     let centre = (lo + hi) * 0.5;
     let radius = (hi - lo).length() * 0.5 + max_size;

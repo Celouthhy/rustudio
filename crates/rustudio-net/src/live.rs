@@ -22,6 +22,32 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REP_CONTROL: [u8; 7] = [0x83, 0x23, 0, 0, 0, 0, 0];
+// Studio grants an initial instance quota when the streaming join completes.
+// A smaller radius on later quota reports limits the incremental stream.
+const INITIAL_STREAM_QUOTA: i32 = 10_000;
+const EDITOR_STREAM_REGION_RADIUS: i64 = 65_536;
+
+fn stream_credit(instances: i32, radius: i16) -> [u8; 10] {
+    let mut frame = [0x83, 0x1c, 0, 0, 0, 0, 0, 0, 0, 0];
+    frame[3..7].copy_from_slice(&instances.to_le_bytes());
+    frame[7..9].copy_from_slice(&radius.to_le_bytes());
+    frame
+}
+
+fn initial_stream_request(schema: &Schema, player: u64) -> std::result::Result<Vec<u8>, String> {
+    let mut frame = crate::writer::property(
+        schema, player, "Player", "ChararacterRegionId", &PropValue::Vector3([0.0; 3]),
+    )?;
+    let radius = PropValue::Int(EDITOR_STREAM_REGION_RADIUS);
+    let override_radii = crate::writer::event(
+        schema, player, "Player", "OverrideStreamRadii", &[radius.clone(), radius],
+    )?;
+    frame.pop();
+    frame.extend_from_slice(&stream_credit(INITIAL_STREAM_QUOTA, i16::MAX)[1..9]);
+    frame.extend_from_slice(&override_radii[1..]);
+    Ok(frame)
+}
+
 const BATCH_SIZE: usize = 512;
 const MAX_FRAME_SIZE: usize = 64 << 20;
 const QUIET_PERIOD: Duration = Duration::from_millis(1500);
@@ -270,7 +296,12 @@ fn prepare_and_run(
     let cookie = match account {
         Some(id) => rustudio_account::session::account_cookie(id)
             .ok_or_else(|| NetError::Other(format!("No saved sign-in for account {id}")))?,
-        None => rustudio_account::session::load_cookie(false)
+        // The same sign-in the editor uses (Client::open): the cookie file is
+        // read too unless the person signed out (it is the only copy where no
+        // keyring exists).
+        None => rustudio_account::session::load_cookie(
+            !rustudio_account::AccountConfig::load().map(|c| c.signed_out).unwrap_or(false),
+        )
             .map_err(|_| NetError::Other("Could not load your Roblox sign-in".into()))?
             .ok_or_else(|| NetError::Other("Sign in to Roblox before joining Team Create".into()))?
             .0,
@@ -334,12 +365,15 @@ fn prepare_and_run(
         .build()
         .map_err(|_| NetError::Other("Could not start Team Create network runtime".into()))?;
     runtime
-        .block_on(run(place, target, opening, tx.clone(), cancel, commands, next_id))
+        .block_on(run(place, target, opening, tx.clone(), cancel, commands, next_id, session.profile.id))
         .map_err(|_| NetError::Other("The Team Create network session failed".into()))
 }
 
 #[derive(Default)]
 struct InitialState {
+    streaming: bool,
+    local_user: u64,
+    local_player: Option<u64>,
     schema: bool,
     marker: bool,
     instances: bool,
@@ -412,6 +446,7 @@ async fn receive_lane(
     let primary = channel == CH_REPLICATION && tag == lane_tag(1);
     let mut decoder = Decoder::new();
     let mut schema_frame = Vec::new();
+    let mut warned_terrain = false;
     let mut capture = if primary {
         std::env::var("RUSTUDIO_TC_STREAM_OUT")
             .ok()
@@ -431,6 +466,26 @@ async fn receive_lane(
     } else {
         None
     };
+    // RUSTUDIO_TC_LANES_OUT=DIR: every other lane's frames too, one file per
+    // channel and lane (same format), for offline decoding.
+    let mut lane_capture = if primary {
+        None
+    } else {
+        std::env::var("RUSTUDIO_TC_LANES_OUT").ok().and_then(|dir| {
+            use std::io::Write;
+            let name = format!("ch{channel}-{}.stream", tag.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(std::path::Path::new(&dir).join(name)).ok()?;
+            f.write_all(&[6, 1, channel, tag[0], tag[1], tag[2], tag[3]]).ok()?;
+            Some(f)
+        })
+    };
     loop {
         let frame = match read_frame(&mut stream).await {
             Ok(frame) => frame,
@@ -445,6 +500,10 @@ async fn receive_lane(
         if cancel.load(Ordering::Acquire) {
             return;
         }
+        if let Some(file) = lane_capture.as_mut() {
+            use std::io::Write;
+            let _ = file.write_all(&rtcio::frame(&frame));
+        }
         if !primary || frame.is_empty() {
             continue;
         }
@@ -453,6 +512,7 @@ async fn receive_lane(
             let _ = file.write_all(&rtcio::frame(&frame));
         }
         if frame[0] == packet_id::SET_GLOBALS {
+            initial.lock().unwrap().streaming = frame.get(1) == Some(&1);
             match crate::replicator::assigned_peer_scope(&frame[1..]) {
                 Ok(scope) => {
                     next_id.store((u64::from(scope) << 32) | 1, Ordering::Release);
@@ -479,6 +539,16 @@ async fn receive_lane(
         let errors = decoder.errors.len();
         let ops = decoder.decode_frame(frame[0], &frame[1..]);
         if decoder.errors.len() != errors {
+            if frame[0] == packet_id::TERRAIN {
+                initial.lock().unwrap().delivering = false;
+                if !warned_terrain {
+                    let error = decoder.errors.last().unwrap();
+                    log::warn!("Team Create skipped an unreadable terrain packet (place={place}): {error}");
+                    warned_terrain = true;
+                }
+                decoder.errors.truncate(errors);
+                continue;
+            }
             if let Some(error) = decoder.errors.last() {
                 eprintln!("Team Create decode error: {error}");
                 log::error!(
@@ -518,6 +588,18 @@ async fn receive_lane(
         }
         reserve_seen_ids(&next_id, &ops);
         let instances = ops.iter().any(|op| matches!(op, RepOp::NewInstance { .. }));
+        {
+            let mut state = initial.lock().unwrap();
+            if state.local_player.is_none() {
+                state.local_player = ops.iter().find_map(|op| match op {
+                    RepOp::NewInstance { id, class, props, .. }
+                        if class == "Player" && props.iter().any(|(name, value)| {
+                            name == "UserId" && matches!(value, PropValue::Int(user) | PropValue::Int64(user) if *user as u64 == state.local_user)
+                        }) => Some(*id),
+                    _ => None,
+                });
+            }
+        }
         let mut pending = Vec::with_capacity(BATCH_SIZE);
         for op in ops {
             pending.push(op);
@@ -591,6 +673,7 @@ async fn run(
     cancel: Arc<AtomicBool>,
     commands: mpsc::Receiver<LiveEdit>,
     next_id: Arc<AtomicU64>,
+    local_user: u64,
 ) -> Result<()> {
     emit(&tx, &cancel, LiveEvent::Stage(JoinStage::Connecting)).await;
     let (_endpoint, connection, _socket) = tokio::select! {
@@ -605,7 +688,7 @@ async fn run(
     let shared_schema = Arc::new(Mutex::new(None::<Schema>));
     let seen_sync = Arc::new(AtomicBool::new(false));
     let lane_ended = Arc::new(AtomicBool::new(false));
-    let initial = Arc::new(Mutex::new(InitialState::default()));
+    let initial = Arc::new(Mutex::new(InitialState { local_user, ..InitialState::default() }));
     let mut held_lanes = vec![rtcio::open_lane(&connection, CH_REPLICATION, lane_tag(0)).await?];
     let mut replication = rtcio::open_lane(&connection, CH_REPLICATION, lane_tag(1)).await?;
     for seq in [2, 4, 7, 8, 9, 10, 12, 13] {
@@ -639,13 +722,24 @@ async fn run(
     let mut last_ping = Instant::now();
     let mut control_started = false;
     let mut ready = false;
+    let mut sent_stream_request = false;
     let mut rejected_document_edit = false;
     let mut gate = EditGate::default();
     // The last edits written, logged if the server ends the session, so a
     // reset ("Error while receiving data") can be traced to an item.
     let mut recent: std::collections::VecDeque<(Instant, String)> = Default::default();
+    let mut dgram_capture = std::env::var("RUSTUDIO_TC_LANES_OUT").ok().and_then(|dir| {
+        std::fs::File::create(std::path::Path::new(&dir).join("datagrams.bin")).ok()
+    });
     loop {
         tokio::select! {
+            dgram = connection.read_datagram() => {
+                if let (Ok(d), Some(f)) = (&dgram, dgram_capture.as_mut()) {
+                    use std::io::Write;
+                    let _ = f.write_all(&rtcio::frame(d));
+                }
+                if dgram.is_err() { dgram_capture = None; }
+            }
             incoming = connection.accept_uni() => {
                 match incoming {
                     Ok(stream) => {
@@ -662,6 +756,27 @@ async fn run(
                 if seen_sync.swap(false, Ordering::AcqRel) {
                     rtcio::send(&mut replication, &REP_CONTROL).await?;
                     control_started = true;
+                }
+                let streaming_player = {
+                    let state = initial.lock().unwrap();
+                    if !sent_stream_request && state.streaming && state.initial_data_complete {
+                        state.local_player
+                    } else {
+                        None
+                    }
+                };
+                if let Some(player) = streaming_player {
+                    let request = shared_schema.lock().unwrap().as_ref()
+                        .map(|schema| initial_stream_request(schema, player));
+                    match request {
+                        Some(Ok(frame)) => {
+                            rtcio::send(&mut replication, &frame).await?;
+                            log::info!("Team Create requested initial terrain streaming (place={place})");
+                        }
+                        Some(Err(error)) => log::warn!("Team Create initial streaming request: {error}"),
+                        None => {}
+                    }
+                    sent_stream_request = true;
                 }
                 let mut written = 0;
                 for _ in 0..EDITS_PER_TICK {
@@ -821,6 +936,36 @@ impl EditGate {
 mod tests {
     use super::*;
     use crate::replicator::{SchemaClass, SchemaProp};
+
+    #[test]
+    fn initial_stream_request_matches_studio() {
+        use crate::replicator::SchemaEvent;
+        let mut schema = Schema {
+            classes: vec![SchemaClass {
+                name: "Player".into(),
+                props: vec![SchemaProp { name: "ChararacterRegionId".into(), ty: 0x16 }],
+                events: vec![SchemaEvent {
+                    name: "OverrideStreamRadii".into(), arg_types: vec![0x0a, 0x0a],
+                }],
+            }],
+            ..Schema::default()
+        };
+        schema.global_props.resize(0x1c96, (0, 1));
+        schema.global_props[0x1c95] = (0, 0);
+        schema.global_events.resize(0x104f, (0, 1));
+        schema.global_events[0x104e] = (0, 0);
+        // Reserve the preceding indices for other descriptors.
+        schema.classes[0].props.push(SchemaProp { name: "Name".into(), ty: 0x31 });
+        schema.classes[0].events.push(SchemaEvent { name: "Other".into(), arg_types: vec![] });
+        let frame = initial_stream_request(&schema, 0x30aa).unwrap();
+        assert_eq!(frame, [
+            0x83, 0x03, 0x01, 0xaa, 0x30, 0, 0, 0x95, 0x1c, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x1c, 0, 0x10, 0x27, 0, 0, 0xff, 0x7f,
+            0x07, 0x01, 0xaa, 0x30, 0, 0, 0x4e, 0x10,
+            0x80, 0x80, 0x08, 0x80, 0x80, 0x08, 0,
+        ]);
+    }
 
     fn schema() -> Schema {
         let prop = |name: &str, ty| SchemaProp { name: name.into(), ty };

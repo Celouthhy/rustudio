@@ -80,6 +80,11 @@ pub struct TextureAtlas {
     /// rustudio: lay text out without rasterizing glyphs (see
     /// [`crate::text::Fonts::set_measure_only`]).
     pub(crate) measure_only: bool,
+
+    /// rustudio: the height last uploaded, when the image has grown taller
+    /// since (`take_delta` then sends a full image marked
+    /// [`crate::ImageDelta::grown`], with `dirty` the texels that changed).
+    grown_from: Option<usize>,
 }
 
 impl TextureAtlas {
@@ -92,6 +97,7 @@ impl TextureAtlas {
             row_height: 0,
             overflowed: false,
             measure_only: false,
+            grown_from: None,
             discs: vec![], // will be filled in below
             options,
         };
@@ -224,10 +230,20 @@ impl TextureAtlas {
         let texture_options = Self::texture_options();
 
         let dirty = core::mem::replace(&mut self.dirty, Rectu::NOTHING);
-        if dirty == Rectu::NOTHING {
-            None
-        } else if dirty == Rectu::EVERYTHING {
+        let grown_from = self.grown_from.take();
+        if dirty == Rectu::EVERYTHING {
             Some(ImageDelta::full(self.image.clone(), texture_options))
+        } else if let Some(old_height) = grown_from {
+            let changed = if dirty == Rectu::NOTHING {
+                [0; 4]
+            } else {
+                [dirty.min_x, dirty.min_y, dirty.max_x - dirty.min_x, dirty.max_y - dirty.min_y]
+            };
+            let mut delta = ImageDelta::full(self.image.clone(), texture_options);
+            delta.grown = Some(crate::image::GrownAtlas { old_height, changed });
+            Some(delta)
+        } else if dirty == Rectu::NOTHING {
+            None
         } else {
             let pos = [dirty.min_x, dirty.min_y];
             let size = [dirty.max_x - dirty.min_x, dirty.max_y - dirty.min_y];
@@ -268,8 +284,14 @@ impl TextureAtlas {
 
             self.cursor = (0, self.image.height() / 3); // Restart a bit down - the top of the atlas has too many important things in it
             self.overflowed = true; // this will signal the user that we need to recreate the texture atlas next frame.
-        } else if resize_to_min_height(&mut self.image, required_height) {
-            self.dirty = Rectu::EVERYTHING;
+        } else {
+            let old_height = self.image.height();
+            if resize_to_min_height(&mut self.image, required_height) {
+                // (rustudio: the rows above stay as they were; see `grown_from`)
+                if self.dirty != Rectu::EVERYTHING {
+                    self.grown_from.get_or_insert(old_height);
+                }
+            }
         }
 
         let pos = self.cursor;

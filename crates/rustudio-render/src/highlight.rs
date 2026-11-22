@@ -356,6 +356,46 @@ impl HighlightPass {
             queue.write_buffer(&self.params, i as u64 * PARAMS_STRIDE, bytemuck::bytes_of(&p));
         }
         let Some((_, ms, one, bg)) = self.target.as_ref() else { return };
+        // The composite's pixels: the highlighted meshes' screen box and a
+        // margin (outside it the mask and its four neighbours are empty, so
+        // fs_comp discards); the whole view when a box reaches behind the
+        // camera or a mesh is skinned (its vertices leave its box).
+        let rect_of = |meshes: &Vec<(&crate::render::Mesh, Inst)>| -> [u32; 4] {
+            let full = [0, 0, size[0], size[1]];
+            let (mut lo, mut hi) = (glam::Vec2::splat(f32::INFINITY), glam::Vec2::splat(f32::NEG_INFINITY));
+            for (mesh, inst) in meshes {
+                let Some((blo, bhi)) = mesh.screen_bounds() else { return full };
+                let axis = |r: [f32; 4]| glam::Vec3::new(r[0], r[1], r[2]);
+                let origin = glam::Vec3::new(inst.r0[3], inst.r1[3], inst.r2[3]);
+                let s = glam::Vec3::new(inst.size[0], inst.size[1], inst.size[2]);
+                for c in 0..8 {
+                    let l = glam::Vec3::new(
+                        if c & 1 == 0 { blo.x } else { bhi.x },
+                        if c & 2 == 0 { blo.y } else { bhi.y },
+                        if c & 4 == 0 { blo.z } else { bhi.z },
+                    ) * s;
+                    let world = axis(inst.r0) * l.x + axis(inst.r1) * l.y + axis(inst.r2) * l.z + origin;
+                    let clip = view_proj * world.extend(1.0);
+                    if clip.w <= 1e-3 {
+                        return full;
+                    }
+                    let ndc = glam::Vec2::new(clip.x, clip.y) / clip.w;
+                    let px = glam::Vec2::new((ndc.x + 1.0) * 0.5 * size[0] as f32, (1.0 - ndc.y) * 0.5 * size[1] as f32);
+                    lo = lo.min(px);
+                    hi = hi.max(px);
+                }
+            }
+            if !(lo.x.is_finite() && lo.y.is_finite() && hi.x.is_finite() && hi.y.is_finite()) {
+                return full;
+            }
+            // (four pixels of margin: rasterization's own rounding plus the
+            // outline's one-pixel reach)
+            let x0 = (lo.x.floor() - 4.0).clamp(0.0, size[0] as f32) as u32;
+            let y0 = (lo.y.floor() - 4.0).clamp(0.0, size[1] as f32) as u32;
+            let x1 = (hi.x.ceil() + 4.0).clamp(0.0, size[0] as f32) as u32;
+            let y1 = (hi.y.ceil() + 4.0).clamp(0.0, size[1] as f32) as u32;
+            [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+        };
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("highlights") });
         let mut first = 0u32;
         for (i, (h, meshes)) in list.iter().enumerate().take(MAX) {
@@ -422,6 +462,11 @@ impl HighlightPass {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+                let [x, y, w, h] = rect_of(meshes);
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                pass.set_scissor_rect(x, y, w, h);
                 pass.set_pipeline(&self.comp);
                 pass.set_bind_group(0, bg, &off);
                 pass.draw(0..3, 0..1);

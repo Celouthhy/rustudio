@@ -995,6 +995,14 @@ impl FontsImpl {
         let initial_height = (8 * 1024 * 1024 / texture_width.max(1))
             .next_power_of_two()
             .clamp(32, texture_width.max(32));
+        // (RUSTUDIO_ATLAS_START_ROWS: a test switch that starts it shorter,
+        // so captures go through the atlas growing taller)
+        #[cfg(not(target_arch = "wasm32"))]
+        let initial_height = std::env::var("RUSTUDIO_ATLAS_START_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|h| h.is_power_of_two() && *h >= 32)
+            .map_or(initial_height, |h| h.min(initial_height));
         let atlas = TextureAtlas::new([texture_width, initial_height], options);
 
         let mut fonts_by_id: nohash_hasher::IntMap<FontFaceKey, FontFace> = Default::default();
@@ -1084,6 +1092,8 @@ struct GalleyCache {
     /// Frame counter used to do garbage collection on the cache
     generation: u32,
     cache: nohash_hasher::IntMap<u64, CachedGalley>,
+    /// rustudio: shaped text kept across wrap widths (`text_layout::ShapedCache`).
+    shaped: super::text_layout::ShapedCache,
 }
 
 impl GalleyCache {
@@ -1165,7 +1175,7 @@ impl GalleyCache {
                     );
                     galley
                 } else {
-                    let galley = super::layout(fonts, pixels_per_point, job);
+                    let galley = super::text_layout::layout_shaped(fonts, pixels_per_point, job, Some(&mut self.shaped));
                     let galley = Arc::new(galley);
                     entry.insert(CachedGalley {
                         last_used: self.generation,
@@ -1309,6 +1319,7 @@ impl GalleyCache {
             cached.last_used == current_generation // only keep those that were used this frame
         });
         self.generation = self.generation.wrapping_add(1);
+        self.shaped.flush();
     }
 }
 

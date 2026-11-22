@@ -20,6 +20,8 @@ pub use wgpu;
 
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 mod renderer;
+/// rustudio: textures made ahead of need (see the module).
+pub mod prewarm;
 
 mod setup;
 

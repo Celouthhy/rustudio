@@ -401,7 +401,9 @@ pub struct Scene {
     pub doc_id: u64,
     pub(crate) glass_generation: u64,
     pub parts: Vec<ScenePart>,
-    pub index: HashMap<Ref, usize>,
+    /// Part → its slot in `parts` (Fx hashing: looked up per part per
+    /// frame by the editor's outlines and picking; never iterated).
+    pub index: rustc_hash::FxHashMap<Ref, usize>,
     /// Bounding sphere per part (centre, radius), parallel to `parts`.
     pub bounds: Vec<Vec4>,
     is_part: HashMap<Ustr, bool>,

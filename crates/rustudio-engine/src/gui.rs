@@ -212,6 +212,47 @@ enum Img {
     Failed,
 }
 
+/// An image's pixels and its mip levels (`half_image` each), or None when
+/// it doesn't decode.
+type DecodedImage = (String, Option<(egui::ColorImage, Vec<egui::ColorImage>)>);
+
+fn decode_gui_image(bytes: &[u8]) -> Option<(egui::ColorImage, Vec<egui::ColorImage>)> {
+    let img = rustudio_core::texture::decode(bytes).ok()?;
+    let size = [img.width as usize, img.height as usize];
+    let base = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
+    let mut levels = Vec::new();
+    let mut cur = base.clone();
+    while levels.len() < 8 && (cur.size[0] >= 8 || cur.size[1] >= 8) {
+        cur = half_image(&cur);
+        levels.push(cur.clone());
+    }
+    Some((base, levels))
+}
+
+/// Runs `job` on the GUI image decode threads (two, started on first use).
+fn decode_off_thread(job: Box<dyn FnOnce() + Send>) {
+    use std::sync::{mpsc, Mutex, OnceLock};
+    type Job = Box<dyn FnOnce() + Send>;
+    static POOL: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..2 {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("gui-decode-{i}")).spawn(move || loop {
+                let job = rx.lock().ok().and_then(|r| r.recv().ok());
+                let Some(job) = job else { return };
+                let _p = rustudio_core::profiler::scope("gui_image_decode", rustudio_core::profiler::Cat::Assets);
+                job();
+            });
+        }
+        Mutex::new(tx)
+    });
+    if let Ok(tx) = pool.lock() {
+        let _ = tx.send(job);
+    }
+}
+
 /// GUI state kept between frames (textures, fonts, hover, focus).
 #[derive(Default)]
 pub struct Gui {
@@ -234,6 +275,11 @@ pub struct Gui {
     vf_walked: HashMap<Ref, Option<egui::TextureId>>,
     vf_live: HashSet<Ref>,
     images: HashMap<String, Img>,
+    /// Images being decoded off the main thread (`texture`), the channel
+    /// their pixels come back on, and decoded ones waiting for their upload.
+    images_decoding: HashSet<String>,
+    image_decode: Option<(std::sync::mpsc::Sender<DecodedImage>, std::sync::mpsc::Receiver<DecodedImage>)>,
+    images_ready: std::collections::VecDeque<DecodedImage>,
     /// EditableImage textures (runtime/editable.rs) by id without the
     /// generation: the generation shown (updated in place when it moves on).
     editable_gens: HashMap<String, u64>,
@@ -256,7 +302,7 @@ pub struct Gui {
     /// GUI walked again replaces its own entries (`layout_from`), one no
     /// longer drawn takes them away; `layout_changed` tells the game.
     pub layout: HashMap<Ref, GuiBox>,
-    layout_from: HashMap<Ref, Vec<Ref>>,
+    layout_from: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
     layout_roots: Vec<Ref>,
     layout_changed: bool,
     hovered: HashSet<Ref>,
@@ -288,18 +334,24 @@ pub struct Gui {
     /// face_file per (family, weight, italic), with when it was looked up.
     faces: HashMap<(String, u32, bool), (Option<String>, std::time::Instant)>,
     /// Each GUI root's layout from its last walk (for frames it is skipped).
-    root_boxes: HashMap<Ref, Vec<(Ref, GuiBox)>>,
+    root_boxes: rustc_hash::FxHashMap<Ref, Vec<(Ref, GuiBox)>>,
     /// ScreenGuis drawn as they were last frame (gui_input.rs `RootCache`).
-    cache: HashMap<Ref, input::RootCache>,
+    cache: rustc_hash::FxHashMap<Ref, input::RootCache>,
     /// Model billboard anchors, invalidated through the document journal.
     billboard_model_centers: HashMap<Ref, Option<Vec3>>,
     /// Workspace SurfaceGuis' own placement properties (gui_input.rs
     /// `SurfaceSpec`), invalidated through the document journal.
     surface_specs: rustc_hash::FxHashMap<Ref, input::SurfaceSpec>,
+    /// Each placed SurfaceSpec's corners for its host part's last CFrame and
+    /// Size (gui_input.rs `SurfaceGeo`): recomputed when those change.
+    surface_geo: rustc_hash::FxHashMap<Ref, Option<input::SurfaceGeo>>,
+    /// Each drawn root's own ZIndexBehavior and ClipsDescendants (gui_input.rs
+    /// `RootProps`), dropped with `surface_specs` by the journal.
+    root_props: rustc_hash::FxHashMap<Ref, input::RootProps>,
     /// Reads from archived canvases can outlive the active walk's ownership.
     billboard_archive_owner: rustc_hash::FxHashMap<Ref, Ref>,
     /// Recent exact canvas layouts for each billboard.
-    billboard_canvases: HashMap<Ref, input::BillboardArchive>,
+    billboard_canvases: rustc_hash::FxHashMap<Ref, input::BillboardArchive>,
     /// What a cached ScreenGui's walk read → that ScreenGui: instances whose
     /// properties it read (`cache_owner`) and whose children it listed
     /// (`cache_kids`); per ScreenGui, both lists, to drop them again. A
@@ -311,7 +363,7 @@ pub struct Gui {
     /// Bumped per `cache_own`: which walk last read an instance.
     own_gen: u32,
     cache_kids: rustc_hash::FxHashMap<Ref, Ref>,
-    cache_owned: HashMap<Ref, (Vec<(Ref, Ref)>, Vec<Ref>)>,
+    cache_owned: rustc_hash::FxHashMap<Ref, (Vec<(Ref, Ref)>, Vec<Ref>)>,
     /// The current walk's reads (see `cache_owner`): (instance, reader).
     walk_reads: Vec<(Ref, Ref)>,
     walk_kids: Vec<Ref>,
@@ -809,9 +861,37 @@ fn subdivide<'a>(
             projected.clear();
             return Cow::Borrowed(m);
         }
-        if m.vertices.is_empty() || b.size().length() * (whi / wlo - 1.0) * 0.25 <= err {
-            return Cow::Borrowed(m);
+        let screen = |p: Pos2| screen(p).map(|(p, w)| (p, w, ()));
+        match subdivide_known(m, err, view, screen, b, wlo, whi, &mut Vec::new()) {
+            None => Cow::Borrowed(m),
+            Some(out) => {
+                projected.clear();
+                Cow::Owned(out)
+            }
         }
+    }
+}
+
+/// `subdivide` once every vertex is known to be in front of the camera,
+/// with the screen bounds `b` of their projections and their least and
+/// greatest clip-space w: None when the mesh needs no splitting. `screen`
+/// may give something more with each projection (a world point): the
+/// split mesh's vertices then get theirs in `seen`, in order (None: one
+/// behind the camera).
+#[allow(clippy::too_many_arguments)]
+fn subdivide_known<X: Copy>(
+    m: &Mesh,
+    err: f32,
+    view: Rect,
+    screen: impl Fn(Pos2) -> Option<(Pos2, f32, X)>,
+    b: Rect,
+    wlo: f32,
+    whi: f32,
+    seen: &mut Vec<Option<(Pos2, X)>>,
+) -> Option<Mesh> {
+    seen.clear();
+    if m.vertices.is_empty() || b.size().length() * (whi / wlo - 1.0) * 0.25 <= err {
+        return None;
     }
     let flat = |a: &Vertex, b: &Vertex, c: &Vertex| {
         a.uv == b.uv && a.uv == c.uv && a.color == b.color && a.color == c.color
@@ -825,9 +905,8 @@ fn subdivide<'a>(
         _ => true,
     };
     if m.indices.chunks_exact(3).all(tri_flat) {
-        return Cow::Borrowed(m);
+        return None;
     }
-    projected.clear();
     let mut out = Mesh::with_texture(m.texture_id);
     let mut stack: Vec<([Vertex; 3], u8)> = Vec::new();
     for tri in m.indices.chunks_exact(3) {
@@ -842,7 +921,7 @@ fn subdivide<'a>(
     }
     while let Some(([a, b, c], depth)) = stack.pop() {
         let on_screen = (screen(a.pos), screen(b.pos), screen(c.pos));
-        if let (Some((pa, _)), Some((pb, _)), Some((pc, _))) = on_screen {
+        if let (Some((pa, _, _)), Some((pb, _, _)), Some((pc, _, _))) = on_screen {
             let past = |f: &dyn Fn(Pos2) -> bool| f(pa) && f(pb) && f(pc);
             if past(&|p| p.x < view.min.x)
                 || past(&|p| p.x > view.max.x)
@@ -855,7 +934,7 @@ fn subdivide<'a>(
         let done = depth >= 5
             || flat(&a, &b, &c)
             || match on_screen {
-                (Some((pa, wa)), Some((pb, wb)), Some((pc, wc))) => {
+                (Some((pa, wa, _)), Some((pb, wb, _)), Some((pc, wc, _))) => {
                     let long = (pa - pb).length().max((pb - pc).length()).max((pc - pa).length());
                     let ratio = wa.max(wb).max(wc) / wa.min(wb).min(wc);
                     long * (ratio - 1.0) * 0.25 <= err
@@ -867,6 +946,8 @@ fn subdivide<'a>(
             let base = out.vertices.len() as u32;
             out.vertices.extend_from_slice(&[a, b, c]);
             out.indices.extend_from_slice(&[base, base + 1, base + 2]);
+            let (sa, sb, sc) = on_screen;
+            seen.extend([sa, sb, sc].map(|s| s.map(|(p, _, x)| (p, x))));
             continue;
         }
         let (ab, bc, ca) = (
@@ -878,7 +959,7 @@ fn subdivide<'a>(
             stack.push((t, depth + 1));
         }
     }
-    Cow::Owned(out)
+    Some(out)
 }
 
 fn point_in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
@@ -1411,11 +1492,18 @@ impl Gui {
         if !store.allows(id) {
             return None;
         }
+        if self.images_decoding.contains(id) {
+            self.poll_images(ctx);
+        }
         if let Some(i) = self.images.get(id) {
             return match i {
                 Img::Ready(h, s) => Some((h.id(), *s)),
                 Img::Failed => None,
             };
+        }
+        if self.images_decoding.contains(id) {
+            self.no_cache = Some("image loading");
+            return None;
         }
         let _load = rustudio_core::bench::scope("gui_image_load");
         let mut bytes = match store.content(id, doc_dir) {
@@ -1452,32 +1540,75 @@ impl Gui {
                 }
             }
         }
-        match rustudio_core::texture::decode(&bytes) {
-            Ok(img) => {
-                let size = [img.width as usize, img.height as usize];
-                let base = egui::ColorImage::from_rgba_unmultiplied(size, &img.pixels);
-                let mut levels = Vec::new();
-                let mut cur = base.clone();
-                while levels.len() < 8 && (cur.size[0] >= 8 || cur.size[1] >= 8) {
-                    cur = half_image(&cur);
-                    levels.push(ctx.load_texture(
-                        format!("gui:{id}#{}", levels.len() + 1),
-                        cur.clone(),
-                        egui::TextureOptions::LINEAR,
-                    ));
-                }
-                self.mips.insert(id.to_string(), levels);
-                let h = ctx.load_texture(format!("gui:{id}"), base, egui::TextureOptions::LINEAR);
-                let out = (h.id(), size);
-                self.images.insert(id.to_string(), Img::Ready(h, size));
-                share().loaded.insert(id.to_string());
-                Some(out)
-            }
-            Err(_) => {
-                self.images.insert(id.to_string(), Img::Failed);
-                None
-            }
+        // Fixed-step runs decode here, so captures don't depend on the
+        // host's timing; otherwise the decode and mip levels are made on
+        // the decode threads and the image shows from the frame they land
+        // (as while it downloads).
+        if rustudio_core::sim_clock::on() {
+            let decoded = decode_gui_image(&bytes);
+            return self.finish_image(ctx, id, decoded);
         }
+        let (tx, _) = self.image_decode.get_or_insert_with(std::sync::mpsc::channel);
+        let tx = tx.clone();
+        let repaint = ctx.clone();
+        let name = id.to_string();
+        decode_off_thread(Box::new(move || {
+            let decoded = decode_gui_image(&bytes);
+            let _ = tx.send((name, decoded));
+            repaint.request_repaint();
+        }));
+        self.images_decoding.insert(id.to_string());
+        self.no_cache = Some("image loading");
+        None
+    }
+
+    /// Makes the textures of images decoded off the main thread, at most
+    /// about 8 MB of new texels a frame (the rest the next frames: one image
+    /// at least).
+    fn poll_images(&mut self, ctx: &egui::Context) {
+        if let Some((_, rx)) = &self.image_decode {
+            self.images_ready.extend(rx.try_iter());
+        }
+        let mut budget: usize = 8 << 20;
+        let mut first = true;
+        while let Some((_, decoded)) = self.images_ready.front() {
+            let bytes = decoded.as_ref().map_or(0, |(base, _)| base.pixels.len() * 4 * 4 / 3);
+            if !first && bytes > budget {
+                ctx.request_repaint();
+                break;
+            }
+            first = false;
+            budget = budget.saturating_sub(bytes);
+            let (id, decoded) = self.images_ready.pop_front().expect("front");
+            self.images_decoding.remove(&id);
+            self.finish_image(ctx, &id, decoded);
+        }
+    }
+
+    /// An image's textures (mip levels first, then the image, as they were
+    /// always made) from its decoded pixels.
+    fn finish_image(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        decoded: Option<(egui::ColorImage, Vec<egui::ColorImage>)>,
+    ) -> Option<(egui::TextureId, [usize; 2])> {
+        let Some((base, levels)) = decoded else {
+            self.images.insert(id.to_string(), Img::Failed);
+            return None;
+        };
+        let levels = levels
+            .into_iter()
+            .enumerate()
+            .map(|(i, level)| ctx.load_texture(format!("gui:{id}#{}", i + 1), level, egui::TextureOptions::LINEAR))
+            .collect();
+        self.mips.insert(id.to_string(), levels);
+        let size = base.size;
+        let h = ctx.load_texture(format!("gui:{id}"), base, egui::TextureOptions::LINEAR);
+        let out = (h.id(), size);
+        self.images.insert(id.to_string(), Img::Ready(h, size));
+        share().loaded.insert(id.to_string());
+        Some(out)
     }
 
     /// The texture to draw image `id` with when `minify` texels of its level

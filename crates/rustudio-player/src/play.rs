@@ -101,6 +101,9 @@ pub struct Character {
     ladder_wait: u8,
     /// Studio's Humanoid controller state (the dynamic body, play_humanoid.rs).
     dynamic: hum_glue::HumDyn,
+    /// Parts welded onto the body after it spawned (play_npc.rs `npc_journal`):
+    /// taken out of the loose simulation while they hang from it.
+    pub(crate) carried: HashSet<Ref>,
 }
 
 /// FindLadder's period in a state, vtable : Running (and Landed,
@@ -225,6 +228,169 @@ struct PendingPlayFrame {
     skip: rustc_hash::FxHashSet<Ref>,
 }
 
+/// What the server half of a finished Play tick hands its client half
+/// (play.rs `finish_server_phase` / `finish_client_phase`).
+pub(crate) struct ServerPhase {
+    mode: RunMode,
+    dt: f32,
+    realtime: bool,
+    part_touches: Vec<(Ref, Ref, bool)>,
+    char_part: Ref,
+    char_began: Vec<Ref>,
+    char_ended: Vec<Ref>,
+    client_only: HashSet<Ref>,
+    velocities: rustc_hash::FxHashMap<Ref, Vec3>,
+    state_names: HashMap<Ref, &'static str>,
+    npc_events: Vec<npc::NpcEvent>,
+    state_change: Option<(State, State)>,
+    seat_change: Option<SeatChange>,
+    move_event: Option<(&'static str, f32)>,
+    running_speed: Option<f32>,
+    humanoid_server: Option<Ref>,
+    seat_server: Option<Ref>,
+    server_out: (Vec<Ref>, Vec<Ref>),
+}
+
+impl ServerPhase {
+    fn fire_npcs(&self, rt: &Runtime, map: Option<&rustudio_core::RefMap>) {
+        let m = |r: Ref| match map {
+            Some(m) => m.get(&r).copied(),
+            None => Some(r),
+        };
+        for e in &self.npc_events {
+            match e {
+                npc::NpcEvent::State(h, old, new) => {
+                    let Some(h) = m(*h) else { continue };
+                    let item = |s: State| {
+                        LEnumItem::from_name("HumanoidStateType", s.enum_name())
+                            .and_then(|e| rustudio_engine::ltypes::enum_value(&rt.lua, e).ok())
+                            .unwrap_or(Value::Nil)
+                    };
+                    rt.fire(h, "StateChanged", vec![item(*old), item(*new)]);
+                    match new {
+                        State::Jumping => rt.fire(h, "Jumping", vec![Value::Boolean(true)]),
+                        State::Freefall => rt.fire(h, "FreeFalling", vec![Value::Boolean(true)]),
+                        _ => {}
+                    }
+                    if *old == State::Freefall {
+                        rt.fire(h, "FreeFalling", vec![Value::Boolean(false)]);
+                    }
+                    for (s, on) in [(*old, false), (*new, true)] {
+                        if matches!(s, State::FallingDown | State::GettingUp | State::Ragdoll) {
+                            rt.fire(h, s.enum_name(), vec![Value::Boolean(on)]);
+                        }
+                    }
+                }
+                npc::NpcEvent::Running(h, sp) => {
+                    if let Some(h) = m(*h) {
+                        rt.fire(h, "Running", vec![Value::Number(*sp as f64)]);
+                    }
+                }
+                npc::NpcEvent::Move(h, ev, sp) => {
+                    if let Some(h) = m(*h) {
+                        rt.fire(h, ev, vec![Value::Number(*sp as f64)]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn fire_touches(&self, rt: &Runtime, map: Option<&rustudio_core::RefMap>) {
+        let m = |r: Ref| match map {
+            Some(m) => m.get(&r).copied().or_else(|| self.client_only.contains(&r).then_some(r)),
+            None => (!self.client_only.contains(&r)).then_some(r),
+        };
+        for (a, b, started) in &self.part_touches {
+            let ev = if *started { "Touched" } else { "TouchEnded" };
+            // Studio fires the deprecated twins with them: StoppedTouching
+            // with TouchEnded, LocalSimulationTouched with Touched where
+            // the part is simulated (the server's parts).
+            let twin = match (*started, map.is_none()) {
+                (true, true) => Some("LocalSimulationTouched"),
+                (false, _) => Some("StoppedTouching"),
+                _ => None,
+            };
+            if let (Some(a), Some(b)) = (m(*a), m(*b)) {
+                rt.fire(a, ev, vec![rt.inst(b)]);
+                rt.fire(b, ev, vec![rt.inst(a)]);
+                if *started {
+                    rustudio_engine::rig::fire_humanoid_touched(rt, a, b);
+                }
+                if let Some(t) = twin {
+                    rt.fire(a, t, vec![rt.inst(b)]);
+                    rt.fire(b, t, vec![rt.inst(a)]);
+                }
+            }
+        }
+        if let Some(cp) = m(self.char_part) {
+            for p in &self.char_began {
+                if let Some(p) = m(*p) {
+                    rt.fire(p, "Touched", vec![rt.inst(cp)]);
+                    rt.fire(cp, "Touched", vec![rt.inst(p)]);
+                    rustudio_engine::rig::fire_humanoid_touched(rt, cp, p);
+                    // The character is simulated by its client.
+                    if map.is_some() {
+                        rt.fire(cp, "LocalSimulationTouched", vec![rt.inst(p)]);
+                    }
+                }
+            }
+            for p in &self.char_ended {
+                if let Some(p) = m(*p) {
+                    rt.fire(p, "TouchEnded", vec![rt.inst(cp)]);
+                    rt.fire(p, "StoppedTouching", vec![rt.inst(cp)]);
+                }
+            }
+        }
+    }
+
+    fn fire_humanoid(&self, rt: &Runtime, h: Option<Ref>, seat: Option<Ref>, client: bool) {
+        let Some(h) = h else { return };
+        if let Some((old, new)) = self.state_change {
+            let item = |s: State| {
+                LEnumItem::from_name("HumanoidStateType", s.enum_name())
+                    .and_then(|i| rustudio_engine::ltypes::enum_value(&rt.lua, i).ok())
+                    .unwrap_or(Value::Nil)
+            };
+            rt.fire(h, "StateChanged", vec![item(old), item(new)]);
+            match new {
+                State::Jumping => rt.fire(h, "Jumping", vec![Value::Boolean(true)]),
+                State::Freefall => rt.fire(h, "FreeFalling", vec![Value::Boolean(true)]),
+                _ => {}
+            }
+            if old == State::Freefall {
+                rt.fire(h, "FreeFalling", vec![Value::Boolean(false)]);
+            }
+            // The (active) events of held states: true on entering,
+            // false on leaving (Humanoid.FallingDown / GettingUp / Ragdoll).
+            for (s, on) in [(old, false), (new, true)] {
+                if matches!(s, State::FallingDown | State::GettingUp | State::Ragdoll) {
+                    rt.fire(h, s.enum_name(), vec![Value::Boolean(on)]);
+                }
+                // PlatformStanding reaches the client (its Animate) from
+                // the state; the side whose script set PlatformStand got it
+                // then (runtime_ext). A test place sets it on the server.
+                if client && s == State::PlatformStanding {
+                    rt.fire(h, "PlatformStanding", vec![Value::Boolean(on)]);
+                }
+            }
+        }
+        if let Some(c) = &self.seat_change {
+            let part = if c.active {
+                seat.map(|s| rt.inst(s)).unwrap_or(Value::Nil)
+            } else {
+                Value::Nil
+            };
+            rt.fire(h, "Seated", vec![Value::Boolean(c.active), part]);
+        }
+        if let Some((ev, sp)) = self.move_event {
+            rt.fire(h, ev, vec![Value::Number(sp as f64)]);
+        }
+        if let Some(sp) = self.running_speed {
+            rt.fire(h, "Running", vec![Value::Number(sp as f64)]);
+        }
+    }
+}
+
 pub struct PlaySession {
     pub mode: RunMode,
     /// Place content loads only Roblox content while this session lives
@@ -243,6 +409,10 @@ pub struct PlaySession {
     pub map: RepMap,
     pub physics: PlayPhysics,
     pending_frame: Option<PendingPlayFrame>,
+    /// A tick whose server half the gameplay worker already ran while it
+    /// waited for the display boundary (`play_worker_idle`), with the
+    /// elapsed time its step deferred.
+    server_phase: Option<(ServerPhase, f32)>,
     /// (server, client) `World::touch_rev` the physics' touch interest was built from.
     touch_seen: Option<(u64, u64)>,
     pub character: Option<Character>,
@@ -301,12 +471,16 @@ pub struct PlaySession {
     /// The other Humanoids in Workspace (NPCs), driven like the player's
     /// with the dynamic Humanoid (play_npc.rs).
     pub(crate) npcs: npc::Npcs,
+    /// The client refs of the physics skip set (play_game.rs `own_parts`),
+    /// with the fingerprint of the set and map sizes it was mapped from.
+    pub(crate) own_client: std::cell::RefCell<Option<((u64, usize, u64), rustc_hash::FxHashSet<Ref>)>>,
 }
 
 impl PlaySession {
     pub(super) fn new(mode: RunMode, saved_doc: Document, saved_cam: Camera, saved_sel: Vec<Ref>) -> Self {
         Self {
             npcs: Default::default(),
+            own_client: Default::default(),
             mode,
             _scripts_running: None,
             saved_doc: Some(saved_doc),
@@ -320,6 +494,7 @@ impl PlaySession {
             map: Default::default(),
             physics: PlayPhysics(None),
             pending_frame: None,
+            server_phase: None,
             touch_seen: None,
             character: None,
             player: Ref::none(),
@@ -763,6 +938,9 @@ impl Game {
         } else {
             Vec::new()
         };
+        // Tools saved in an NPC's hand: gripped as the session's DataModel loads (Handle
+        // CanCollide false, tool_grip.rs), before the client's copy is made from it.
+        rustudio_engine::tool_grip::grip_at_load(&mut server_doc);
         let (client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
@@ -976,6 +1154,7 @@ impl Game {
             self.wait_for_play_physics();
             if let Some(s) = self.play.as_mut() {
                 s.pending_frame = None;
+                s.server_phase = None;
             }
             self.server_front();
             self.fire_player_removing();
@@ -1120,10 +1299,10 @@ impl Game {
             player,
             InstanceBuilder::new("PlayerGui").with_name("PlayerGui"),
         );
-        for (from, to) in [
-            (self.doc.find_child(root, "StarterPack"), backpack),
-            (self.doc.find_child(root, "StarterGui"), gui),
-        ] {
+        // PlayerGui starts empty: StarterGui is copied in when a character
+        // spawns (reset_player_gui), as on Roblox.
+        let _ = gui;
+        for (from, to) in [(self.doc.find_child(root, "StarterPack"), backpack)] {
             let Some(from) = from else { continue };
             for k in self
                 .doc
@@ -1232,9 +1411,13 @@ impl Game {
                 }
             }
             cdoc.mark_tree(scripts);
+            // ReplicatedFirst's LocalScripts run before anything else on the
+            // client (Roblox docs, ReplicatedFirst; Studio Play agrees), so a
+            // loading cover they parent is already there when the
+            // PlayerScripts / PlayerGui scripts look for it.
             local = client_scripts(
                 cdoc,
-                &[Some(cplayer), cdoc.find_child(root, "ReplicatedFirst")],
+                &[cdoc.find_child(root, "ReplicatedFirst"), Some(cplayer)],
             );
             // RunContext = Client Scripts run anywhere replicated.
             for i in cdoc.dom.descendants() {
@@ -1761,6 +1944,7 @@ impl Game {
             ladder: None,
             ladder_wait: 0,
             dynamic: Default::default(),
+            carried: HashSet::new(),
         };
         let mut ch = ch;
         let pose = character_pose(&ch, &HashMap::new());
@@ -1800,13 +1984,30 @@ impl Game {
             rt.dispatch();
         });
         // Replicate the new character, then the client's CharacterAdded and LocalScripts.
+        // (Its LocalScripts wait for CharacterAdded and the GUI's: `held` below.)
         self.record(RepOp::Parent(m));
         self.record(RepOp::Prop(player, "Character".into()));
+        self.with_side(Side::Client, |rt, _, _| {
+            if let Some(mut w) = rt.world_mut() {
+                w.hold_character_scripts = true;
+            }
+        });
         self.replicate_now();
+        let held = self
+            .with_side(Side::Client, |rt, _, _| {
+                rt.world_mut()
+                    .map(|mut w| {
+                        w.hold_character_scripts = false;
+                        std::mem::take(&mut w.held)
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let (cplayer, cmodel) = match self.play.as_ref() {
             Some(s) => (s.map.s2c.get(&player).copied(), s.map.s2c.get(&m).copied()),
             None => (None, None),
         };
+        let mut character_scripts = Vec::new();
         if let (Some(cp), Some(cm)) = (cplayer, cmodel) {
             let local = self
                 .play
@@ -1838,12 +2039,111 @@ impl Game {
                     rt.set(cam, "CameraSubject", rt.inst(h));
                 }
                 rt.fire(cp, "CharacterAdded", vec![rt.inst(cm)]);
-                for r in local {
+                rt.dispatch();
+            });
+            character_scripts = held.into_iter().chain(local).collect();
+        }
+        // StarterGui into PlayerGui after CharacterAdded on both sides (Studio:
+        // StarterGui's LocalScripts start after the client's CharacterAdded
+        // and the deferred work it queued).
+        let gui_copies = self.reset_player_gui(player, first);
+        self.replicate_now();
+        if let Some(cp) = cplayer {
+            self.start_client_gui(cp, &gui_copies, first);
+        }
+        // Then the new character's (and its tools') LocalScripts: Studio Play's
+        // client runs Added → the new GUI LocalScript → the new character
+        // LocalScript (measured in Play).
+        if !character_scripts.is_empty() {
+            self.with_side(Side::Client, |rt, _, _| {
+                for r in character_scripts {
                     rt.start_collected(r);
                 }
                 rt.dispatch();
             });
         }
+    }
+
+    /// A character spawn's PlayerGui reset on the server (measured in Studio
+    /// Play): on a respawn everything there goes but the LayerCollectors with
+    /// ResetOnSpawn false (a Folder too, made by a script or copied); the
+    /// first spawn keeps what scripts made before it. Then StarterGui's
+    /// children are copied in (a ResetOnSpawn false gui only the first time).
+    /// Server Scripts in the copies start now; returns the copies for the
+    /// client, whose LocalScripts start after its CharacterAdded.
+    fn reset_player_gui(&mut self, player: Ref, first: bool) -> Vec<Ref> {
+        let root = self.doc.dom.root_ref();
+        let (Some(pg), Some(sg)) = (
+            self.doc.find_child(player, "PlayerGui"),
+            self.doc.find_child(root, "StarterGui"),
+        ) else {
+            return Vec::new();
+        };
+        let old: Vec<Ref> = self
+            .doc
+            .dom
+            .get_by_ref(pg)
+            .map(|i| i.children().to_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !first && !kept_on_spawn(&self.doc, *c))
+            .collect();
+        self.with_side(Side::Server, |rt, _, _| {
+            for c in &old {
+                rt.apply_destroy(*c);
+            }
+        });
+        let mut copies = Vec::new();
+        for k in self.doc.dom.get_by_ref(sg).map(|i| i.children().to_vec()).unwrap_or_default() {
+            if kept_on_spawn(&self.doc, k) && !first {
+                continue;
+            }
+            let c = self.doc.dom.clone_within(k);
+            self.doc.dom.transfer_within(c, pg);
+            self.doc.mark_tree(c);
+            self.record(RepOp::Parent(c));
+            copies.push(c);
+        }
+        let scripts: Vec<Ref> = copies.iter().flat_map(|c| self.server_scripts(Some(*c))).collect();
+        self.with_side(Side::Server, |rt, _, _| {
+            for r in scripts {
+                rt.start_collected(r);
+            }
+            rt.dispatch();
+        });
+        copies
+    }
+
+    /// The client's side of a PlayerGui reset, after its CharacterAdded:
+    /// what it made there goes too unless kept (the server's went by replication),
+    /// then the replicated StarterGui copies' LocalScripts start.
+    fn start_client_gui(&mut self, cplayer: Ref, copies: &[Ref], first: bool) {
+        let Some((gone, local)) = self.play.as_ref().and_then(|s| {
+            let cd = s.other_doc.as_ref()?;
+            let pg = cd.find_child(cplayer, "PlayerGui")?;
+            let ccopies: Vec<Ref> = copies.iter().filter_map(|c| s.map.s2c.get(c).copied()).collect();
+            let gone: Vec<Ref> = cd
+                .dom
+                .get_by_ref(pg)
+                .map(|i| i.children().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| !first && !ccopies.contains(c) && !kept_on_spawn(cd, *c))
+                .collect();
+            let under: Vec<Option<Ref>> = ccopies.into_iter().map(Some).collect();
+            Some((gone, client_scripts(cd, &under)))
+        }) else {
+            return;
+        };
+        self.with_side(Side::Client, |rt, _, _| {
+            for c in gone {
+                rt.apply_destroy(c);
+            }
+            for r in local {
+                rt.start_collected(r);
+            }
+            rt.dispatch();
+        });
     }
 
     /// StarterPlayer.StarterCharacter (a Model holding a Humanoid) and its
@@ -2089,15 +2389,26 @@ impl Game {
         // The tool it held goes with it (it isn't put back in the Backpack).
         self.drop_equipped();
         self.unequip_client_tool_dropped();
-        // Roblox destroys the old character (Destroying on it and all it
-        // holds; a no-op when a script destroyed it already).
-        if let Some(old) = self.play.as_mut().and_then(|s| s.character.take()) {
+        // The old character leaves Workspace before the new one is stored and
+        // CharacterAdded fires, and is destroyed (Destroying on it and all it
+        // holds; a no-op when a script destroyed it already) only after: the        // Character setter's pre-store hook emits
+        // CharacterRemoving, detaches and defers the disposal
+        // (Studio Play's server: Removing,
+        // detach -> new CharacterAdded -> old Destroying).
+        let old = self.play.as_mut().and_then(|s| s.character.take()).map(|c| c.model);
+        if let Some(old) = old {
             self.with_side(Side::Server, |rt, _, _| {
-                rt.apply_destroy(old.model);
+                rt.apply_parent(old, Ref::none());
                 rt.dispatch();
             });
         }
         self.spawn_character();
+        if let Some(old) = old {
+            self.with_side(Side::Server, |rt, _, _| {
+                rt.apply_destroy(old);
+                rt.dispatch();
+            });
+        }
     }
 
     /// Each spawn after the first: the Backpack is emptied and StarterPack
@@ -2539,8 +2850,58 @@ impl Game {
         }
     }
 
+    /// Whether the gameplay worker should look in on its world's physics
+    /// while it waits for the next step (`play_worker_idle`).
+    pub(crate) fn play_worker_idle_due(&self) -> bool {
+        self.fixed_dt.is_none()
+            && self.play.as_ref().is_some_and(|s| {
+                s.server_phase.is_none() && s.pending_frame.as_ref().is_some_and(|p| p.job.is_some())
+            })
+    }
+
+    /// The gameplay worker between steps: once the world's batch has
+    /// finished, the tick's server half runs now instead of after the next
+    /// display boundary. It needs nothing from that boundary (the keys reach
+    /// the client half, which still runs there), and it shortens the next
+    /// step's path to its physics batch by the server's scripts and
+    /// replication (a test place on a low-end laptop: ~3.3 of ~11 ms). An unfinished
+    /// batch is left to the step, which can still hurry it.
+    pub(crate) fn play_worker_idle(&mut self) {
+        if !self.play_worker_idle_due() {
+            return;
+        }
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(pending) = s.pending_frame.as_mut() else { return };
+        let Some((physics, ready)) = pending.job.as_ref().and_then(|job| job.try_join()) else { return };
+        pending.job = None;
+        s.physics.0 = Some(physics);
+        pending.ready = Some(ready);
+        let Some(pending) = s.pending_frame.take() else { return };
+        let _early = rustudio_core::bench::scope("gameplay_early_server");
+        self.server_front();
+        // (Before the batch's poses land: a script's move of the player's
+        // character while it ran, `hum_script_moves`.)
+        self.hum_script_moves();
+        let result = self.play.as_mut().expect("playing").physics.finish_frame(
+            &mut self.doc, pending.ready.expect("joined physics frame"),
+        );
+        let phase = self.finish_server_phase(pending.input, result);
+        if let Some(s) = self.play.as_mut() {
+            s.server_phase = Some((phase, pending.deferred_dt));
+        }
+        self.shown_front();
+    }
+
     pub(crate) fn step_play(&mut self, dt: f32, host: &mut dyn GameHost, keyboard: &PlayKeyboard, render_in_parallel: bool) -> bool {
         let mut dt = dt;
+        let mut display_keys = None;
+        if let Some((phase, deferred)) = self.play.as_mut().and_then(|s| s.server_phase.take()) {
+            // (Its server half ran early: play_worker_idle.)
+            dt += deferred;
+            self.server_front();
+            let keys = display_keys.insert(self.capture_play_keys(keyboard));
+            self.finish_client_phase(host, phase, keys);
+        }
         if let Some(s) = self.play.as_mut() {
             if let Some(pending) = s.pending_frame.as_mut() {
                 if let Some(job) = pending.job.as_ref() {
@@ -2563,10 +2924,14 @@ impl Game {
                         // ready. Threaded Play keeps drawing its last snapshot
                         // while this waits, except at the first input edge.
                         let moving = pending.input.humanoid.as_ref().is_some_and(|h| h.active_input);
-                        // (a fixed-step worker replay completes every
-                        // step, as the direct path's slower frames do)
-                        let must_publish = moving
-                            || (render_in_parallel && (pending.input.local_input_edge || self.fixed_dt.is_some()));
+                        // On the gameplay worker every step completes: waiting
+                        // here blocks only the worker (the viewport keeps
+                        // drawing the last publication), while skipping cost a
+                        // whole display boundary for a batch that was usually
+                        // a few ms from done (a test place on a low-end laptop: 215 of 1,893
+                        // displays carried no new state). The direct path
+                        // still skips while idle so it never stalls a frame.
+                        let must_publish = moving || render_in_parallel;
                         must_publish.then(|| {
                             let _wait = rustudio_core::bench::scope("physics_pose_wait");
                             pending.job.take().expect("pending physics job").join()
@@ -2590,10 +2955,12 @@ impl Game {
                 }
             }
         }
-        let mut display_keys = None;
         if let Some(pending) = self.play.as_mut().and_then(|s| s.pending_frame.take()) {
             dt += pending.deferred_dt;
             self.server_front();
+            // (Before the batch's poses land: a script's move of the player's
+            // character while it ran, `hum_script_moves`.)
+            self.hum_script_moves();
             let result = self.play.as_mut().unwrap().physics.finish_frame(
                 &mut self.doc, pending.ready.expect("joined physics frame"),
             );
@@ -2755,6 +3122,9 @@ impl Game {
             }
         }
         if hum_out.is_some() {
+            self.hum_roots_seen();
+        }
+        if hum_out.is_some() {
             let _pose = rustudio_core::bench::scope("p2_humanoid_pose");
             self.hum_pose();
         }
@@ -2799,11 +3169,17 @@ impl Game {
     }
 
     fn finish_play_tick(&mut self, host: &mut dyn GameHost, input: PlayFrameInput, result: StepResult, display_keys: &mut PlayKeys) {
+        let phase = self.finish_server_phase(input, result);
+        self.finish_client_phase(host, phase, display_keys);
+    }
+
+    /// The server half of a finished tick (the world's step published,
+    /// touches, server scripts, replication). Its client half follows at
+    /// the display boundary with that boundary's keys (`finish_client_phase`);
+    /// a gameplay worker whose physics finished early runs this half in
+    /// the idle time before the boundary (`play_worker_idle`).
+    fn finish_server_phase(&mut self, input: PlayFrameInput, result: StepResult) -> ServerPhase {
         let PlayFrameInput { mode, dt, realtime, humanoid: hum_out, .. } = input;
-        let PlayKeys { focused: focused_now, keys, began, ended } = display_keys;
-        let focused_now = *focused_now;
-        let began = std::mem::take(began);
-        let ended = std::mem::take(ended);
         let sc = rustudio_core::bench::scope("p3_physics_publish");
         let mut char_touches: Vec<Ref> = Vec::new();
         let mut state_change: Option<(State, State)> = None;
@@ -2835,10 +3211,29 @@ impl Game {
         for (r, _) in &result.moved {
             self.record(RepOp::Moved(*r));
         }
+        // Below FallenPartsDestroyHeight a part is taken out of the tree: its
+        // Parent goes to nil (Studio: ChildRemoved and AncestryChanged fire, not
+        // Destroying, and it can be parented back). Scripts watching it see
+        // that, as in Studio (a game's welded copy of an accessory restored the
+        // hidden original when its copy fell away).
+        let mut fallen_signals: Vec<(Ref, Ref, Vec<Ref>)> = Vec::new();
         for r in &result.fallen {
+            let old = self.doc.dom.get_by_ref(*r).map(|i| i.parent()).unwrap_or_else(Ref::none);
+            let below: Vec<Ref> = if old.is_some() {
+                // (The moved instance first, then the subtree below it.)
+                std::iter::once(*r).chain(self.doc.dom.descendants_of(*r).map(|i| i.referent()).filter(|d| d != r)).collect()
+            } else {
+                Vec::new()
+            };
             self.doc.dom.transfer_within(*r, Ref::none());
             self.doc.mark_tree(*r);
             self.record(RepOp::Parent(*r));
+            if old.is_some() {
+                fallen_signals.push((*r, old, below));
+            }
+        }
+        for (r, old, below) in fallen_signals {
+            self.with_side(Side::Server, |rt, _, _| rt.notify_parent(r, old, Ref::none(), below));
         }
         if let Some(s) = self.play.as_mut() {
             s.engine_orphans.extend(result.fallen.iter().copied());
@@ -2902,158 +3297,26 @@ impl Game {
             }
             None => Vec::new(),
         };
-        let fire_npcs = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
-            let m = |r: Ref| match map {
-                Some(m) => m.get(&r).copied(),
-                None => Some(r),
-            };
-            for e in &npc_events {
-                match e {
-                    npc::NpcEvent::State(h, old, new) => {
-                        let Some(h) = m(*h) else { continue };
-                        let item = |s: State| {
-                            LEnumItem::from_name("HumanoidStateType", s.enum_name())
-                                .and_then(|e| rustudio_engine::ltypes::enum_value(&rt.lua, e).ok())
-                                .unwrap_or(Value::Nil)
-                        };
-                        rt.fire(h, "StateChanged", vec![item(*old), item(*new)]);
-                        match new {
-                            State::Jumping => rt.fire(h, "Jumping", vec![Value::Boolean(true)]),
-                            State::Freefall => rt.fire(h, "FreeFalling", vec![Value::Boolean(true)]),
-                            _ => {}
-                        }
-                        if *old == State::Freefall {
-                            rt.fire(h, "FreeFalling", vec![Value::Boolean(false)]);
-                        }
-                        for (s, on) in [(*old, false), (*new, true)] {
-                            if matches!(s, State::FallingDown | State::GettingUp | State::Ragdoll) {
-                                rt.fire(h, s.enum_name(), vec![Value::Boolean(on)]);
-                            }
-                        }
-                    }
-                    npc::NpcEvent::Running(h, sp) => {
-                        if let Some(h) = m(*h) {
-                            rt.fire(h, "Running", vec![Value::Number(*sp as f64)]);
-                        }
-                    }
-                    npc::NpcEvent::Move(h, ev, sp) => {
-                        if let Some(h) = m(*h) {
-                            rt.fire(h, ev, vec![Value::Number(*sp as f64)]);
-                        }
-                    }
-                }
-            }
-        };
-
-        // 4. Server scripts.
-        let fire_touches = |rt: &Runtime, map: Option<&HashMap<Ref, Ref>>| {
-            let m = |r: Ref| match map {
-                Some(m) => m.get(&r).copied().or_else(|| client_only.contains(&r).then_some(r)),
-                None => (!client_only.contains(&r)).then_some(r),
-            };
-            for (a, b, started) in &part_touches {
-                let ev = if *started { "Touched" } else { "TouchEnded" };
-                // Studio fires the deprecated twins with them: StoppedTouching
-                // with TouchEnded, LocalSimulationTouched with Touched where
-                // the part is simulated (the server's parts).
-                let twin = match (*started, map.is_none()) {
-                    (true, true) => Some("LocalSimulationTouched"),
-                    (false, _) => Some("StoppedTouching"),
-                    _ => None,
-                };
-                if let (Some(a), Some(b)) = (m(*a), m(*b)) {
-                    rt.fire(a, ev, vec![rt.inst(b)]);
-                    rt.fire(b, ev, vec![rt.inst(a)]);
-                    if *started {
-                        rustudio_engine::rig::fire_humanoid_touched(rt, a, b);
-                    }
-                    if let Some(t) = twin {
-                        rt.fire(a, t, vec![rt.inst(b)]);
-                        rt.fire(b, t, vec![rt.inst(a)]);
-                    }
-                }
-            }
-            if let Some(cp) = m(char_part) {
-                for p in &char_began {
-                    if let Some(p) = m(*p) {
-                        rt.fire(p, "Touched", vec![rt.inst(cp)]);
-                        rt.fire(cp, "Touched", vec![rt.inst(p)]);
-                        rustudio_engine::rig::fire_humanoid_touched(rt, cp, p);
-                        // The character is simulated by its client.
-                        if map.is_some() {
-                            rt.fire(cp, "LocalSimulationTouched", vec![rt.inst(p)]);
-                        }
-                    }
-                }
-                for p in &char_ended {
-                    if let Some(p) = m(*p) {
-                        rt.fire(p, "TouchEnded", vec![rt.inst(cp)]);
-                        rt.fire(p, "StoppedTouching", vec![rt.inst(cp)]);
-                    }
-                }
-            }
-        };
-        let fire_humanoid = |rt: &Runtime, h: Option<Ref>, seat: Option<Ref>, client: bool| {
-            let Some(h) = h else { return };
-            if let Some((old, new)) = state_change {
-                let item = |s: State| {
-                    LEnumItem::from_name("HumanoidStateType", s.enum_name())
-                        .and_then(|i| rustudio_engine::ltypes::enum_value(&rt.lua, i).ok())
-                        .unwrap_or(Value::Nil)
-                };
-                rt.fire(h, "StateChanged", vec![item(old), item(new)]);
-                match new {
-                    State::Jumping => rt.fire(h, "Jumping", vec![Value::Boolean(true)]),
-                    State::Freefall => rt.fire(h, "FreeFalling", vec![Value::Boolean(true)]),
-                    _ => {}
-                }
-                if old == State::Freefall {
-                    rt.fire(h, "FreeFalling", vec![Value::Boolean(false)]);
-                }
-                // The (active) events of held states: true on entering,
-                // false on leaving (Humanoid.FallingDown / GettingUp / Ragdoll).
-                for (s, on) in [(old, false), (new, true)] {
-                    if matches!(s, State::FallingDown | State::GettingUp | State::Ragdoll) {
-                        rt.fire(h, s.enum_name(), vec![Value::Boolean(on)]);
-                    }
-                    // PlatformStanding reaches the client (its Animate) from
-                    // the state; the side whose script set PlatformStand got it
-                    // then (runtime_ext). Place C sets it on the server.
-                    if client && s == State::PlatformStanding {
-                        rt.fire(h, "PlatformStanding", vec![Value::Boolean(on)]);
-                    }
-                }
-            }
-            if let Some(c) = &seat_change {
-                let part = if c.active {
-                    seat.map(|s| rt.inst(s)).unwrap_or(Value::Nil)
-                } else {
-                    Value::Nil
-                };
-                rt.fire(h, "Seated", vec![Value::Boolean(c.active), part]);
-            }
-            if let Some((ev, sp)) = move_event {
-                rt.fire(h, ev, vec![Value::Number(sp as f64)]);
-            }
-            if let Some(sp) = running_speed {
-                rt.fire(h, "Running", vec![Value::Number(sp as f64)]);
-            }
-        };
         let seat_server = seat_change.as_ref().and_then(|c| c.seat);
         drop(sc);
         let sc = rustudio_core::bench::scope("p4_server_lua");
         let root = self.doc.dom.root_ref();
         let run_service = self.doc.find_child(root, "RunService");
         let humanoid_server = humanoid_ref.is_some().then_some(humanoid_ref);
-        let server_out = self
+        let mut phase = ServerPhase {
+            mode, dt, realtime, part_touches, char_part, char_began, char_ended, client_only, velocities,
+            state_names, npc_events, state_change, seat_change, move_event, running_speed, humanoid_server,
+            seat_server, server_out: Default::default(),
+        };
+        phase.server_out = self
             .with_side(Side::Server, |rt, _, _| {
                 if let Some(mut w) = rt.world_mut() {
-                    w.velocities = velocities.iter().map(|(k, v)| (*k, *v)).collect();
-                    w.humanoid_states.clone_from(&state_names);
+                    w.velocities = phase.velocities.iter().map(|(k, v)| (*k, *v)).collect();
+                    w.humanoid_states.clone_from(&phase.state_names);
                 }
-                fire_touches(rt, None);
-                fire_humanoid(rt, humanoid_server, seat_server, false);
-                fire_npcs(rt, None);
+                phase.fire_touches(rt, None);
+                phase.fire_humanoid(rt, humanoid_server, seat_server, false);
+                phase.fire_npcs(rt, None);
                 if let Some(rs) = run_service {
                     // A server frame in Studio's order (Run mode probe):
                     // PreAnimation (then the Animator), Stepped,
@@ -3090,13 +3353,30 @@ impl Game {
         self.replicate();
         self.handover_frame();
         drop(sc);
+        phase
+    }
+
+    /// The client half of a finished tick: client scripts with the keys of
+    /// this display boundary, the client's own simulation, respawns, the view.
+    fn finish_client_phase(&mut self, host: &mut dyn GameHost, mut phase: ServerPhase, display_keys: &mut PlayKeys) {
+        let PlayKeys { focused: focused_now, keys, began, ended } = display_keys;
+        let focused_now = *focused_now;
+        let began = std::mem::take(began);
+        let ended = std::mem::take(ended);
+        let (mode, dt, realtime) = (phase.mode, phase.dt, phase.realtime);
+        let (char_part, humanoid_server, seat_server) = (phase.char_part, phase.humanoid_server, phase.seat_server);
+        let part_touches = std::mem::take(&mut phase.part_touches);
+        let char_began = std::mem::take(&mut phase.char_began);
+        let char_ended = std::mem::take(&mut phase.char_ended);
+        let velocities = std::mem::take(&mut phase.velocities);
+        let state_names = std::mem::take(&mut phase.state_names);
         let sc = rustudio_core::bench::scope("p6_client_lua");
         if mode == RunMode::Play {
             let prep = rustudio_core::bench::scope("p6a_prep");
             // Server → client refs for just what this phase looks up (touches,
             // the character, humanoid states, moving parts): cloning the whole
-            // map (Place B: 116k instances) was 0.75 ms a frame.
-            let map_s2c: HashMap<Ref, Ref> = self
+            // map (a large test place: 116k instances) was 0.75 ms a frame.
+            let map_s2c: rustudio_core::RefMap = self
                 .play
                 .as_ref()
                 .map(|s| {
@@ -3187,8 +3467,8 @@ impl Game {
                 .map(|s| s.gamepads.poll(accepts_gamepad))
                 .unwrap_or_default();
             // Moving parts' velocities on the client, its own character's too.
-            let client_velocities: HashMap<Ref, Vec3> = {
-                let mut v: HashMap<Ref, Vec3> = velocities
+            let client_velocities: rustc_hash::FxHashMap<Ref, Vec3> = {
+                let mut v: rustc_hash::FxHashMap<Ref, Vec3> = velocities
                     .iter()
                     .filter_map(|(k, v)| map_s2c.get(k).map(|c| (*c, *v)))
                     .collect();
@@ -3323,7 +3603,7 @@ impl Game {
                 }
                 // Button releases after the GUI's events (Up / Click / Activated).
                 mouse_buttons(false);
-                fire_touches(rt, Some(&map_s2c));
+                phase.fire_touches(rt, Some(&map_s2c));
                 for (a, b, started) in &client_touches {
                     let (ev, twin) = if *started { ("Touched", "LocalSimulationTouched") } else { ("TouchEnded", "StoppedTouching") };
                     rt.fire(*a, ev, vec![rt.inst(*b)]);
@@ -3334,8 +3614,8 @@ impl Game {
                     rt.fire(*a, twin, vec![rt.inst(*b)]);
                     rt.fire(*b, twin, vec![rt.inst(*a)]);
                 }
-                fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
-                fire_npcs(rt, Some(&map_s2c));
+                phase.fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
+                phase.fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
                     w.input.gamepads = gamepads.connected;
                 }
@@ -3526,7 +3806,7 @@ impl Game {
         self.collect_garbage(dt, host);
 
         // 6. Deaths and respawns.
-        let (died, reload) = server_out;
+        let (died, reload) = std::mem::take(&mut phase.server_out);
         let my_humanoid = self
             .play
             .as_ref()
@@ -3619,6 +3899,7 @@ impl Game {
         }
         self.shown_front();
     }
+
 
     /// Runs a Luau chunk on one side of the Play session (test harness);
     /// its prints go to Output like a script's. Returns an error message.
@@ -3745,6 +4026,14 @@ fn script_enabled(d: &Document, r: Ref) -> bool {
 }
 
 /// LocalScripts (and RunContext=Client Scripts) under the given client instances.
+/// What a character spawn leaves in PlayerGui: a LayerCollector (ScreenGui,
+/// BillboardGui, SurfaceGui) with ResetOnSpawn false. Everything else there
+/// goes (measured in Studio Play, a script's Folder too).
+fn kept_on_spawn(d: &Document, r: Ref) -> bool {
+    d.class_of(r).is_some_and(|c| doc::is_a(&c, "LayerCollector"))
+        && matches!(d.prop(r, "ResetOnSpawn"), Some(Variant::Bool(false)))
+}
+
 fn client_scripts(cd: &Document, under: &[Option<Ref>]) -> Vec<Ref> {
     let mut out = Vec::new();
     for u in under.iter().flatten() {
@@ -3869,5 +4158,373 @@ impl Game {
             }
         }
         s.physics.set_touch_interest(parts);
+    }
+}
+
+#[cfg(test)]
+mod client_start_order_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio Play: a ReplicatedFirst LocalScript runs before the
+    /// StarterPlayerScripts and StarterGui ones. A Future test place's
+    /// boot cover (made in ReplicatedFirst, found and removed by a
+    /// StarterPlayerScripts script) stayed black because rustudio ran the
+    /// PlayerScripts first, which made a second cover nobody removed.
+    #[test]
+    fn replicated_first_local_scripts_run_first() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let ls = |src: &str| InstanceBuilder::new("LocalScript").with_property("Source", src.to_string());
+        let rf = game.doc.find_child(root, "ReplicatedFirst")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("ReplicatedFirst").with_name("ReplicatedFirst")));
+        let sp = game.doc.find_child(root, "StarterPlayer")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer")));
+        let sps = game.doc.find_child(sp, "StarterPlayerScripts")
+            .unwrap_or_else(|| game.doc.dom.insert(sp, InstanceBuilder::new("StarterPlayerScripts").with_name("StarterPlayerScripts")));
+        let sg = game.doc.find_child(root, "StarterGui")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui")));
+        let gui = game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        game.doc.dom.insert(sps, ls(r#"
+            _G.order = (_G.order or "") .. "sps,"
+            local pg = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+            _G.found = pg:FindFirstChild("Cover") ~= nil
+        "#));
+        game.doc.dom.insert(gui, ls(r#"_G.order = (_G.order or "") .. "gui,""#));
+        game.doc.dom.insert(rf, ls(r#"
+            _G.order = (_G.order or "") .. "rf,"
+            local c = Instance.new("ScreenGui")
+            c.Name = "Cover"
+            c.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+        "#));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        for _ in 0..30 {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                assert(string.sub(_G.order or "", 1, 3) == "rf,", "order " .. tostring(_G.order))
+                assert(_G.found == true, "PlayerScripts script did not see ReplicatedFirst's cover")
+            "#),
+            None
+        );
+    }
+
+    fn tick(game: &mut Game, n: usize) {
+        let ctx = egui::Context::default();
+        for _ in 0..n {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+    }
+
+    /// Studio Play (measured): ReplicatedFirst, then StarterPlayerScripts
+    /// (no character yet), then CharacterAdded, and only then StarterGui's
+    /// LocalScripts, copied into PlayerGui when the character spawns. A
+    /// CharacterAdded handler's deferred work runs before they start.
+    #[test]
+    fn starter_gui_copies_in_after_character_added() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let ls = |src: &str| InstanceBuilder::new("LocalScript").with_property("Source", src.to_string());
+        let sp = game.doc.find_child(root, "StarterPlayer")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer")));
+        let sps = game.doc.find_child(sp, "StarterPlayerScripts")
+            .unwrap_or_else(|| game.doc.dom.insert(sp, InstanceBuilder::new("StarterPlayerScripts").with_name("StarterPlayerScripts")));
+        let sg = game.doc.find_child(root, "StarterGui")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui")));
+        let gui = game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        game.doc.dom.insert(sps, ls(r#"
+            local p = game:GetService("Players").LocalPlayer
+            _G.log = { "sps char=" .. tostring(p.Character ~= nil) .. " g=" .. tostring(p.PlayerGui:FindFirstChild("G") ~= nil) }
+            -- made before the first spawn: Studio keeps both through it
+            Instance.new("ScreenGui", p.PlayerGui).Name = "PreGui"
+            Instance.new("Folder", p.PlayerGui).Name = "PreFolder"
+            p.CharacterAdded:Connect(function()
+                table.insert(_G.log, "added")
+                task.defer(function() table.insert(_G.log, "deferred") end)
+            end)
+        "#));
+        game.doc.dom.insert(gui, ls(r#"
+            local p = game:GetService("Players").LocalPlayer
+            table.insert(_G.log, "gui char=" .. tostring(p.Character ~= nil))
+        "#));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local got = table.concat(_G.log, ",")
+                assert(got == "sps char=false g=false,added,deferred,gui char=true", got)
+                local pg = game:GetService("Players").LocalPlayer.PlayerGui
+                assert(pg:FindFirstChild("PreGui") and pg:FindFirstChild("PreFolder"), "first spawn reset PlayerGui")
+            "#),
+            None
+        );
+    }
+
+    /// Studio Play's respawn (measured): a ResetOnSpawn ScreenGui in PlayerGui
+    /// is replaced by a fresh StarterGui copy, one a LocalScript made goes, a
+    /// Folder too; a ResetOnSpawn false one (copied or made) stays, never
+    /// copied twice.
+    #[test]
+    fn respawn_resets_player_gui() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let sg = game.doc.find_child(root, "StarterGui")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui")));
+        game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("Resets"));
+        game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("Keeps").with_property("ResetOnSpawn", false));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local pg = game:GetService("Players").LocalPlayer.PlayerGui
+                _G.r, _G.k = pg:WaitForChild("Resets"), pg:WaitForChild("Keeps")
+                local a = Instance.new("ScreenGui"); a.Name = "MadeResets"; a.Parent = pg
+                local b = Instance.new("ScreenGui"); b.Name = "MadeKeeps"; b.ResetOnSpawn = false; b.Parent = pg
+                local f = Instance.new("Folder"); f.Name = "MadeFolder"; f.Parent = pg
+            "#),
+            None
+        );
+        assert_eq!(game.run_luau(Side::Server, "game:GetService('Players'):GetPlayers()[1]:LoadCharacter()"), None);
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local pg = game:GetService("Players").LocalPlayer.PlayerGui
+                local function n(name) local k = 0 for _, c in pg:GetChildren() do if c.Name == name then k += 1 end end return k end
+                assert(n("Resets") == 1 and pg.Resets ~= _G.r, "Resets not replaced")
+                assert(n("Keeps") == 1 and pg.Keeps == _G.k, "Keeps copied again or replaced")
+                assert(n("MadeResets") == 0, "MadeResets survived")
+                assert(n("MadeKeeps") == 1, "MadeKeeps went")
+                assert(n("MadeFolder") == 0, "MadeFolder survived")
+            "#),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod character_weld_and_fall_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    fn tick(game: &mut Game, n: usize) {
+        let ctx = egui::Context::default();
+        for _ in 0..n {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+    }
+
+    fn with_floor() -> Game {
+        let mut game = Game::new(None);
+        let ws = game.doc.workspace().expect("workspace");
+        game.doc.dom.insert(ws, InstanceBuilder::new("Part").with_name("Floor")
+            .with_property("Anchored", true)
+            .with_property("Size", rbx_dom_weak::types::Vector3::new(200.0, 2.0, 200.0))
+            .with_property("CFrame", rbx_dom_weak::types::CFrame::new(rbx_dom_weak::types::Vector3::new(0.0, -1.0, 0.0), rbx_dom_weak::types::Matrix3::identity())));
+        game
+    }
+
+    /// A part a server script welds onto the character after it spawned
+    /// (the weld made while the part is still unparented, then the part put
+    /// in the character, as a game's accessory copy does) moves with the
+    /// character as one assembly, as in Studio. It used to be simulated loose
+    /// as well, fell away and was culled at FallenPartsDestroyHeight.
+    #[test]
+    fn part_welded_onto_character_after_spawn_rides_with_it() {
+        let mut game = with_floor();
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 60);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local ch = game:GetService("Players"):GetPlayers()[1].Character
+            assert(ch, "no character")
+            local head = ch:FindFirstChild("Head")
+            local p = Instance.new("Part")
+            p.Name = "Carried"; p.Size = Vector3.new(1, 1, 1); p.CanCollide = false; p.Massless = true
+            p.CFrame = head.CFrame
+            local w = Instance.new("Weld"); w.Part0 = head; w.Part1 = p; w.Parent = p
+            p.Parent = ch
+        "#), None);
+        tick(&mut game, 180);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local ch = game:GetService("Players"):GetPlayers()[1].Character
+            local p = ch:FindFirstChild("Carried")
+            assert(p, "the welded part left the character")
+            local d = (p.Position - ch.Head.Position).Magnitude
+            assert(d < 0.5, "welded part " .. d .. " studs from the head")
+        "#), None);
+    }
+
+    /// Studio (measured in Play): a part below FallenPartsDestroyHeight goes
+    /// to Parent nil: ChildRemoved and AncestryChanged fire, Destroying does
+    /// not, and it can be parented back.
+    #[test]
+    fn fallen_part_is_unparented_with_signals() {
+        let mut game = with_floor();
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 10);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            _G.fall = {}
+            local m = Instance.new("Model"); m.Name = "FallTest"; m.Parent = workspace
+            local p = Instance.new("Part"); p.Size = Vector3.new(1, 1, 1)
+            p.Position = Vector3.new(50, -490, 50); p.Parent = m
+            p.AncestryChanged:Connect(function(_, par) table.insert(_G.fall, "ancestry " .. tostring(par)) end)
+            p.Destroying:Connect(function() table.insert(_G.fall, "destroying") end)
+            m.ChildRemoved:Connect(function(c) table.insert(_G.fall, "removed " .. c.Name) end)
+            _G.fallPart = p
+        "#), None);
+        tick(&mut game, 180);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local got = table.concat(_G.fall, ",")
+            assert(_G.fallPart.Parent == nil, "still parented: " .. got)
+            assert(string.find(got, "removed Part", 1, true), got)
+            assert(string.find(got, "ancestry nil", 1, true), got)
+            assert(not string.find(got, "destroying", 1, true), got)
+            _G.fallPart.Parent = workspace
+            assert(_G.fallPart.Parent == workspace)
+        "#), None);
+    }
+}
+
+#[cfg(test)]
+mod spawn_script_order_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio Play: on each spawn the client
+    /// runs CharacterAdded, then the new ResetOnSpawn GUI's LocalScript, then the
+    /// new character's LocalScript (StarterCharacterScripts). rustudio started the
+    /// character's scripts with CharacterAdded, before the GUI's.
+    #[test]
+    fn gui_local_scripts_start_before_the_characters() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let ls = |src: &str| InstanceBuilder::new("LocalScript").with_property("Source", src.to_string());
+        let child = |game: &mut Game, parent, class: &str| {
+            game.doc.find_child(parent, class)
+                .unwrap_or_else(|| game.doc.dom.insert(parent, InstanceBuilder::new(class).with_name(class)))
+        };
+        let sp = child(&mut game, root, "StarterPlayer");
+        let scs = child(&mut game, sp, "StarterCharacterScripts");
+        let sps = child(&mut game, sp, "StarterPlayerScripts");
+        let sg = child(&mut game, root, "StarterGui");
+        let gui = game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        game.doc.dom.insert(sps, ls(r#"
+            _G.log = {}
+            game:GetService("Players").LocalPlayer.CharacterAdded:Connect(function() table.insert(_G.log, "added") end)
+        "#));
+        game.doc.dom.insert(gui, ls(r#"table.insert(_G.log, "gui")"#));
+        game.doc.dom.insert(scs, ls(r#"table.insert(_G.log, "char")"#).with_name("Probe"));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local got = table.concat(_G.log, ",")
+                assert(got == "added,gui,char", got)
+            "#),
+            None
+        );
+        assert_eq!(game.run_luau(Side::Server, "game:GetService('Players'):GetPlayers()[1]:LoadCharacter()"), None);
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local got = table.concat(_G.log, ",")
+                assert(got == "added,gui,char,added,gui,char", got)
+            "#),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod respawn_gui_tests {
+    use crate::game::Game;
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    /// Studio 0.748 (a test place's HP bar): on each
+    /// spawn after the first, PlayerGui's ResetOnSpawn children are destroyed and
+    /// StarterGui's copied in again, with Player.Character already the new model, so
+    /// the copy's LocalScript reads the new Humanoid (100 / 100). rustudio kept the
+    /// first copy, still bound to the dead Humanoid (HP 0 / 100).
+    #[test]
+    fn respawn_recopies_reset_on_spawn_guis_bound_to_the_new_humanoid() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let sg = match game.doc.find_child(root, "StarterGui") {
+            Some(s) => s,
+            None => game.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui")),
+        };
+        let script = |counter: &str| {
+            format!(
+                r#"local p = game:GetService("Players").LocalPlayer
+                local c = p.Character or p.CharacterAdded:Wait()
+                local h = c:WaitForChild("Humanoid")
+                script.Parent:SetAttribute("hp", h.Health)
+                _G.{counter} = (_G.{counter} or 0) + 1"#
+            )
+        };
+        for (name, reset) in [("Reset", true), ("Keep", false)] {
+            let g = game.doc.dom.insert(
+                sg,
+                InstanceBuilder::new("ScreenGui").with_name(name).with_property("ResetOnSpawn", reset),
+            );
+            game.doc.dom.insert(
+                g,
+                InstanceBuilder::new("LocalScript").with_name("Bind").with_property("Source", script(name)),
+            );
+        }
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 60);
+        assert_eq!(
+            game.run_luau(Side::Client, "local pg = game:GetService('Players').LocalPlayer.PlayerGui
+                assert(pg.Reset:GetAttribute('hp') == 100, 'first hp ' .. tostring(pg.Reset:GetAttribute('hp')))
+                _G.keepGui = pg.Keep"),
+            None
+        );
+        // Dies (Health 0), then respawns.
+        assert_eq!(
+            game.run_luau(Side::Server, "game:GetService('Players'):GetPlayers()[1].Character.Humanoid.Health = 0"),
+            None
+        );
+        tick(&mut game, 10);
+        assert_eq!(game.run_luau(Side::Server, "game:GetService('Players'):GetPlayers()[1]:LoadCharacter()"), None);
+        tick(&mut game, 60);
+        assert_eq!(
+            game.run_luau(Side::Client, "local pg = game:GetService('Players').LocalPlayer.PlayerGui
+                local n = 0
+                for _, g in pg:GetChildren() do if g.Name == 'Reset' then n += 1 end end
+                assert(n == 1, n .. ' Reset guis')
+                assert(_G.Reset == 2, 'Reset ran ' .. tostring(_G.Reset))
+                assert(pg.Reset:GetAttribute('hp') == 100, 'hp after respawn ' .. tostring(pg.Reset:GetAttribute('hp')))
+                assert(_G.Keep == 1, 'Keep ran ' .. tostring(_G.Keep))
+                assert(pg.Keep == _G.keepGui, 'Keep was replaced')"),
+            None
+        );
     }
 }

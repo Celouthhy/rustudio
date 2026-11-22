@@ -172,7 +172,7 @@ impl LiveModel {
                     }
                 }
             }
-            RepOp::Presence { .. } | RepOp::Event { .. } | RepOp::Unhandled { .. } => {}
+            RepOp::Presence { .. } | RepOp::Event { .. } | RepOp::Unhandled { .. } | RepOp::Terrain { .. } => {}
         }
     }
 
@@ -232,7 +232,9 @@ impl LiveModel {
                 }
                 self.dom.root_ref()
             }
-            Some(pid) => match self.refs.get(pid) {
+            // (A referent whose instance was deleted since counts as not here:
+            // inserting under it panicked the editor in a live join.)
+            Some(pid) => match self.refs.get(pid).filter(|r| self.dom.get_by_ref(*r).is_some()) {
                 Some(r) => r,
                 // The wire never sends the DataModel itself: services arrive
                 // with its referent as their parent (13 in the captured join).
@@ -687,6 +689,20 @@ fn to_variant(v: &PropValue, name: &str) -> Option<Variant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A collaborator's new instance naming a parent this client already
+    /// deleted is parked, not inserted (inserting under the stale referent
+    /// panicked the editor in a live join).
+    #[test]
+    fn new_instance_under_a_deleted_parent_does_not_panic() {
+        let mut m = LiveModel::new();
+        m.apply(RepOp::NewInstance { id: 1, class: "DataModel".into(), parent: None, props: vec![] });
+        m.apply(RepOp::NewInstance { id: 2, class: "Workspace".into(), parent: Some(1), props: vec![] });
+        m.apply(RepOp::NewInstance { id: 3, class: "Folder".into(), parent: Some(2), props: vec![] });
+        m.apply(RepOp::DeleteInstance { id: 3 });
+        m.apply(RepOp::NewInstance { id: 4, class: "Part".into(), parent: Some(3), props: vec![] });
+        assert!(m.dom.descendants().all(|i| i.class.as_str() != "Part"));
+    }
 
     #[test]
     fn omitted_names_use_constructor_defaults_and_explicit_names_win() {

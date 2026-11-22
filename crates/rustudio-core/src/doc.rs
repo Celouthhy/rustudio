@@ -122,9 +122,11 @@ pub enum Reader {
     Npcs = 20,
     /// The Play worker's presentation document (rustudio-render/src/snapshot.rs).
     RenderSnapshot = 21,
+    /// Animator bindings to joints and bones in a rig.
+    AnimatorBindings = 22,
 }
 
-const JOURNAL_READERS: usize = Reader::RenderSnapshot as usize + 1;
+const JOURNAL_READERS: usize = Reader::AnimatorBindings as usize + 1;
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
 pub enum Marks {

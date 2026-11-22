@@ -99,6 +99,73 @@ impl Paragraph {
 /// In most cases you should use [`crate::FontsView::layout_job`] instead
 /// since that memoizes the input, making subsequent layouting of the same text much faster.
 pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>) -> Galley {
+    layout_shaped(fonts, pixels_per_point, job, None)
+}
+
+/// rustudio: the sections of a job as shaped into paragraphs (before any
+/// wrapping), kept between layouts of the same text in the same fonts.
+/// Shaping reads the text, its sections, `break_on_newline` and the pixels
+/// per point, never the wrap: a TextScaled size search, or a canvas whose
+/// width changed, lays the same text out again at a new width.
+#[derive(Default)]
+pub(crate) struct ShapedCache {
+    generation: u32,
+    map: nohash_hasher::IntMap<u64, ShapedEntry>,
+}
+
+struct ShapedEntry {
+    last_used: u32,
+    text: String,
+    sections: Vec<LayoutSection>,
+    break_on_newline: bool,
+    pixels_per_point: u32,
+    paragraphs: Arc<Vec<Paragraph>>,
+}
+
+impl ShapedCache {
+    /// Kept this many generations (frames) unused, at most `MAX` entries.
+    const KEEP: u32 = 300;
+    const MAX: usize = 8192;
+
+    pub(crate) fn flush(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        // (swept every 64 frames: a sweep visits every entry)
+        if self.generation % 64 != 0 && self.map.len() <= Self::MAX {
+            return;
+        }
+        let now = self.generation;
+        self.map.retain(|_, e| now.wrapping_sub(e.last_used) < Self::KEEP);
+        if self.map.len() > Self::MAX {
+            self.map.clear();
+        }
+    }
+}
+
+fn shape_sections(fonts: &mut FontsImpl, pixels_per_point: f32, job: &LayoutJob) -> Vec<Paragraph> {
+    let mut paragraphs = vec![Paragraph::from_section_index(0)];
+    let mut shape_buffer = fonts.take_shape_buffer();
+    for (section_index, section) in job.sections.iter().enumerate() {
+        let mut font = fonts.font(&section.format.font_id.family);
+        shape_buffer = layout_section(
+            &mut font,
+            shape_buffer,
+            pixels_per_point,
+            job,
+            section_index as u32,
+            section,
+            &mut paragraphs,
+        );
+    }
+    fonts.return_shape_buffer(shape_buffer);
+    paragraphs
+}
+
+pub(crate) fn layout_shaped(
+    fonts: &mut FontsImpl,
+    pixels_per_point: f32,
+    job: Arc<LayoutJob>,
+    shaped: Option<&mut ShapedCache>,
+) -> Galley {
     profiling::function_scope!();
 
     job.debug_sanity_check();
@@ -120,23 +187,37 @@ pub fn layout(fonts: &mut FontsImpl, pixels_per_point: f32, job: Arc<LayoutJob>)
 
     // For most of this we ignore the y coordinate:
 
-    let mut paragraphs = vec![Paragraph::from_section_index(0)];
-    {
-        let mut shape_buffer = fonts.take_shape_buffer();
-        for (section_index, section) in job.sections.iter().enumerate() {
-            let mut font = fonts.font(&section.format.font_id.family);
-            shape_buffer = layout_section(
-                &mut font,
-                shape_buffer,
-                pixels_per_point,
-                &job,
-                section_index as u32,
-                section,
-                &mut paragraphs,
-            );
+    let paragraphs = match shaped {
+        None => shape_sections(fonts, pixels_per_point, &job),
+        Some(cache) => {
+            let key = crate::util::hash((&job.text, &job.sections, job.break_on_newline, pixels_per_point.to_bits()));
+            let generation = cache.generation;
+            let same = |e: &ShapedEntry| {
+                e.text == job.text
+                    && e.sections == job.sections
+                    && e.break_on_newline == job.break_on_newline
+                    && e.pixels_per_point == pixels_per_point.to_bits()
+            };
+            match cache.map.get_mut(&key).filter(|e| same(e)) {
+                Some(e) => {
+                    e.last_used = generation;
+                    (*e.paragraphs).clone()
+                }
+                None => {
+                    let paragraphs = shape_sections(fonts, pixels_per_point, &job);
+                    cache.map.insert(key, ShapedEntry {
+                        last_used: generation,
+                        text: job.text.clone(),
+                        sections: job.sections.clone(),
+                        break_on_newline: job.break_on_newline,
+                        pixels_per_point: pixels_per_point.to_bits(),
+                        paragraphs: Arc::new(paragraphs.clone()),
+                    });
+                    paragraphs
+                }
+            }
         }
-        fonts.return_shape_buffer(shape_buffer);
-    }
+    };
 
     let point_scale = PointScale::new(pixels_per_point);
 
@@ -1430,7 +1511,9 @@ fn shape_text(
     buffer.push_str(text);
     buffer.guess_segment_properties();
 
-    shaper.shape(buffer, harfrust::ShapeOptions::new())
+    // (the plan `shape` would build, kept on the face: rustudio)
+    let plan = font_face.shape_plan(&shaper, instance.as_ref(), &buffer);
+    shaper.shape(buffer, harfrust::ShapeOptions::new().plan(plan.as_deref()))
 }
 
 // ----------------------------------------------------------------------------

@@ -73,18 +73,7 @@ fn thumb(ctx: &egui::Context, material: u32, use2022: bool) -> Option<egui::Text
 impl Editor {
     /// The selection's material, when every selected part shares one.
     fn selection_material(&self) -> Option<u32> {
-        let mut out = None;
-        for r in self.selected_parts() {
-            let m = match self.game.doc.prop(r, "Material") {
-                Some(Variant::Enum(e)) => e.to_u32(),
-                _ => 256,
-            };
-            if out.is_some_and(|o| o != m) {
-                return None;
-            }
-            out = Some(m);
-        }
-        out
+        self.selected_parts_material()
     }
 
     /// Ribbon "Material": a drop-down grid of the part materials.

@@ -172,6 +172,7 @@ impl Gui {
                             self.adorn_pg_order = None;
                         }
                         self.surface_specs.remove(&r);
+                        self.root_props.remove(&r);
                         let keep = layer(d, r);
                         let has = self.world_roots_set.contains(&r);
                         if keep && !has {
@@ -188,6 +189,8 @@ impl Gui {
             _ => {
                 self.roots_doc = d.id;
                 self.surface_specs.clear();
+                self.root_props.clear();
+                self.surface_geo.clear();
                 self.world_roots = match ws {
                     Some(ws) => d
                         .dom
@@ -243,6 +246,7 @@ impl Gui {
                             self.adorn_roots.remove(&r);
                         }
                         self.surface_specs.remove(&r);
+                        self.root_props.remove(&r);
                         let keep = layer(r);
                         let has = self.world_roots_set.contains(&r);
                         if keep && !has {
@@ -264,6 +268,8 @@ impl Gui {
             _ => {
                 self.roots_doc = d.id;
                 self.surface_specs.clear();
+                self.root_props.clear();
+                self.surface_geo.clear();
                 let scan = |top: Option<Ref>| -> Vec<Ref> {
                     top.map(|t| d.dom.descendants_of(t).map(|i| i.referent()).collect()).unwrap_or_default()
                 };
@@ -290,16 +296,22 @@ impl Gui {
         // A SurfaceGui's own placement properties (`SurfaceSpec`): any of
         // its properties written drops its entry; reparenting drops it in
         // `sync_roots` / `sync_plugin` (Tree marks).
-        if !self.surface_specs.is_empty() {
+        // (and a root's own RootProps the same way)
+        if !self.surface_specs.is_empty() || !self.root_props.is_empty() {
             match marks {
                 doc::Marks::Some(marks) if d.id == self.roots_doc => {
                     for mark in marks {
                         if let doc::Mark::Prop(r, _) = mark {
                             self.surface_specs.remove(r);
+                            self.root_props.remove(r);
                         }
                     }
                 }
-                _ => self.surface_specs.clear(),
+                _ => {
+                    self.surface_specs.clear();
+                    self.root_props.clear();
+                    self.surface_geo.clear();
+                }
             }
         }
         if !self.billboard_model_centers.is_empty() {
@@ -471,6 +483,50 @@ impl Gui {
         self.cache_owned.insert(g, (reads, kids));
     }
 
+    /// Scales the V of every kept font-atlas triangle by `s` (a power of
+    /// two: exact). Memos whose triangles are shared elsewhere are dropped.
+    fn rescale_font_uvs(&mut self, s: f32) {
+        fn mesh(m: &mut Arc<Mesh>, s: f32) {
+            if m.texture_id == egui::TextureId::default() {
+                for v in &mut Arc::make_mut(m).vertices {
+                    v.uv.y *= s;
+                }
+            }
+        }
+        fn root(c: &mut RootCache, s: f32) {
+            for shape in &mut c.shapes {
+                if let Shape::Mesh(m) = shape {
+                    mesh(m, s);
+                }
+            }
+            for (_, m) in &mut c.citems {
+                mesh(m, s);
+            }
+        }
+        for c in self.cache.values_mut() {
+            root(c, s);
+        }
+        for archive in self.billboard_canvases.values_mut() {
+            for canvas in &mut archive.canvases {
+                root(&mut canvas.output, s);
+            }
+        }
+        self.memo.retain(|_, memo| {
+            memo.segs.iter_mut().all(|seg| {
+                let walk::Seg::Own { items, .. } = seg else { return true };
+                items.iter_mut().all(|it| match Arc::get_mut(&mut it.tess) {
+                    Some(lock) => {
+                        if let Some(Some((_, m))) = lock.get_mut() {
+                            mesh(m, s);
+                        }
+                        true
+                    }
+                    None => false,
+                })
+            })
+        });
+    }
+
     fn clear_billboard_canvases(&mut self) {
         self.billboard_canvases.clear();
         self.billboard_archive_owner.clear();
@@ -558,7 +614,7 @@ impl Gui {
 
     /// The outside state cached GUIs were drawn with changed: drop those it
     /// touches (hover / press / focus / selection), or all (font atlas).
-    fn cache_check(&mut self, ctx: &egui::Context, d: &Document) {
+    fn cache_check(&mut self, ctx: &egui::Context, d: &Document, render_state: Option<&egui_wgpu::RenderState>) {
         let ppp = ctx.pixels_per_point();
         let (atlas, fill, fonts) = ctx.fonts(|f| {
             let defs = f.definitions();
@@ -581,13 +637,63 @@ impl Gui {
             ppp,
         };
         let was = std::mem::replace(&mut self.cache_with, now);
+        // egui's atlas doubles its height when it fills: its next textures
+        // (egui's, and the world GUI pass's mip copy) are made on another
+        // thread ahead of time, so the growth frame only copies. Making them
+        // stalls this thread too (wgpu holds the queue while the driver
+        // allocates them), so: the first growth's at load, where the frames
+        // are slow anyway; a later one's only once the atlas is three
+        // quarters full.
+        if let Some(rs) = render_state {
+            // (and the world GUI pass's copy of the atlas as it is, for its
+            // first world GUI text)
+            if atlas[0] > 0 && atlas[1] > 0 {
+                let key = rustudio_render::world_gui::mip_copy_key(atlas[0] as u32, atlas[1] as u32);
+                egui_wgpu::prewarm::prewarm_once(&rs.device, &rs.queue, key);
+            }
+            let used = fill * atlas[0].max(atlas[1]) as f32;
+            let first = atlas[1] <= FIRST_ATLAS_ROWS;
+            if atlas[1] > 0 && atlas[1] < atlas[0] && (first || used * 4.0 > atlas[1] as f32 * 3.0) {
+                let (w, h) = (atlas[0] as u32, atlas[1] as u32 * 2);
+                let keys = [rustudio_render::world_gui::font_atlas_key(w, h), rustudio_render::world_gui::mip_copy_key(w, h)];
+                for key in keys {
+                    egui_wgpu::prewarm::prewarm(&rs.device, &rs.queue, key);
+                }
+            }
+        }
         // Memos of objects that are gone (now and then).
         self.memo_frames += 1;
         if self.memo_frames % 600 == 0 {
             self.memo.retain(|r, _| d.exists(*r));
         }
-        // (egui's atlas grew, or started over: glyph UVs moved)
-        if atlas != was.atlas || fill < was.fill || fonts != was.fonts || ppp != was.ppp {
+        // egui's atlas only grew taller (it doubles): the kept triangles'
+        // font UVs are texel × (1 / height), so scaling their V by the
+        // power-of-two ratio gives, bit for bit, what tessellating again
+        // would. Everything else stays kept.
+        let grew = was.atlas[0] != 0
+            && atlas[0] == was.atlas[0]
+            && atlas[1] > was.atlas[1]
+            && (atlas[1] / was.atlas[1].max(1)).is_power_of_two()
+            && atlas[1] % was.atlas[1].max(1) == 0
+            && fill >= was.fill
+            && fonts == was.fonts
+            && ppp == was.ppp;
+        if grew {
+            rustudio_core::bench::add("gui_atlas_grow", 0.0, 1);
+            if std::env::var_os("RUSTUDIO_ATLAS_TRACE").is_some() {
+                eprintln!("[atlas] grew {:?} -> {:?}: kept GUIs rescaled", was.atlas, atlas);
+            }
+            self.rescale_font_uvs(was.atlas[1] as f32 / atlas[1] as f32);
+        }
+        if atlas != was.atlas {
+            // (textures made ahead for sizes the atlas has passed go; the
+            // current size's may still be waiting to be taken this frame)
+            let (w, h) = (atlas[0] as u32, atlas[1] as u32);
+            use rustudio_render::world_gui::{font_atlas_key, mip_copy_key};
+            egui_wgpu::prewarm::drop_except(&[font_atlas_key(w, h), mip_copy_key(w, h), font_atlas_key(w, h * 2), mip_copy_key(w, h * 2)]);
+        }
+        // (egui's atlas grew wider, or started over: glyph UVs moved)
+        if !grew && (atlas != was.atlas || fill < was.fill || fonts != was.fonts || ppp != was.ppp) {
             rustudio_core::bench::add("gui_atlas_reset", 0.0, 1);
             if std::env::var_os("RUSTUDIO_ATLAS_TRACE").is_some() {
                 eprintln!("[atlas] {:?} -> {:?} fill {} -> {} fonts {:?} -> {:?}", was.atlas, atlas, was.fill, fill, was.fonts, fonts);
@@ -627,7 +733,8 @@ impl Gui {
         self.vf_live.clear();
         self.hits.clear();
         self.world_batches.clear();
-        self.cache_check(ctx, inp.doc);
+        self.poll_images(ctx);
+        self.cache_check(ctx, inp.doc, inp.render_state);
         let verify = debug_env(DebugEnv::Verify);
         self.text_fit.begin_frame(ctx, !verify && !inp.fixed_step);
         if self.retry_missing_faces(inp.store) {
@@ -757,6 +864,8 @@ impl Gui {
         let specs_ok = d.id == self.roots_doc;
         if !specs_ok {
             self.surface_specs.clear();
+            self.root_props.clear();
+            self.surface_geo.clear();
         }
         let first_world = layered.len();
         layered.extend(self.world_roots.iter().copied().filter(|g| {
@@ -785,7 +894,10 @@ impl Gui {
                 })
                 .flatten();
             let placed = match spec {
-                Some(spec) => spec.place(d, inp.cam).map(|p| (p, spec.on_top, spec.light_props, spec.z_offset)),
+                Some(spec) => {
+                    let geo = self.surface_geo.entry(g).or_default();
+                    spec.place_kept(d, inp.cam, geo).map(|p| (p, spec.on_top, spec.light_props, spec.z_offset))
+                }
                 None => place_3d(d, inp.cam, &view_proj, rect, g, &mut self.billboard_model_centers).map(|p| {
                     let on_top = boolp(d, g, "AlwaysOnTop", false);
                     let light_props = if on_top { [0.0; 2] } else { light_props(d, g) };
@@ -819,7 +931,13 @@ impl Gui {
         // Back to front: 3D GUIs (far first, AlwaysOnTop after), then ScreenGuis by DisplayOrder.
         {
             let _sort = rustudio_core::bench::scope("gui_z_sort");
-            roots.sort_by(|a, b| a.order.cmp(&b.order).then(b.dist.total_cmp(&a.dist)));
+            // (stably by order, then far to near: the same order as a
+            // stable sort of the roots, sorting small keys instead)
+            let mut keys: Vec<(i64, f32, u32)> =
+                roots.iter().enumerate().map(|(i, r)| (r.order, r.dist, i as u32)).collect();
+            keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+            let mut slots: Vec<Option<Root>> = roots.drain(..).map(Some).collect();
+            roots.extend(keys.iter().map(|k| slots[k.2 as usize].take().expect("each root once")));
         }
         drop(place);
 
@@ -834,6 +952,18 @@ impl Gui {
             Vec::new(),
         );
         let mut out: Vec<Shape> = Vec::new();
+        // World GUI triangles in root order: each world root's own batches,
+        // or a SurfaceGui reprojection job run after the loop (on several
+        // threads when there are many vertices), appended in this order.
+        let mut world_parts: Vec<WorldPart> = Vec::new();
+        let mut surface_jobs: Vec<SurfaceJob> = Vec::new();
+        let surface_view = SurfaceView {
+            view_proj,
+            view_proj_rz,
+            cam_pos: inp.cam.pos,
+            rect,
+            ppp: ctx.pixels_per_point(),
+        };
         let mut cached_roots = 0;
         let mut triangle_counts = [0, 0, 0];
         let mut drawn_roots: Vec<Ref> = Vec::with_capacity(roots.len());
@@ -841,17 +971,26 @@ impl Gui {
         let why_on = debug_env(DebugEnv::Why);
         for root in roots {
             let g = root.gui;
-            let class = d.class_of(g).map(|c| c.to_string()).unwrap_or_default();
-            // ZIndexBehavior: Global 0, Sibling 1.
-            let global_z = enum_u32(d.prop(g, "ZIndexBehavior")).unwrap_or(0) == 0;
+            let read_props = || {
+                let class = d.class_of(g).unwrap_or_default();
+                let class = class.as_str();
+                RootProps {
+                    // ZIndexBehavior: Global 0, Sibling 1.
+                    global_z: enum_u32(d.prop(g, "ZIndexBehavior")).unwrap_or(0) == 0,
+                    clips: class == "ScreenGui"
+                        || doc::is_a(class, "PluginGui")
+                        || boolp(d, g, "ClipsDescendants", class == "SurfaceGui"),
+                }
+            };
+            // (kept while the journal is this document's: see cache_marks)
+            let RootProps { global_z, clips } = if specs_ok {
+                *self.root_props.entry(g).or_insert_with(read_props)
+            } else {
+                read_props()
+            };
             let canvas_rect =
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(root.canvas[0], root.canvas[1]));
-            let clip =
-                if class == "ScreenGui" || doc::is_a(&class, "PluginGui") || boolp(d, g, "ClipsDescendants", class == "SurfaceGui") {
-                    canvas_rect
-                } else {
-                    Rect::EVERYTHING
-                };
+            let clip = if clips { canvas_rect } else { Rect::EVERYTHING };
             let root_box = GuiBox {
                 pos: root.abs_offset,
                 size: root.canvas,
@@ -950,18 +1089,27 @@ impl Gui {
             // A canvas point's reverse-Z depth (SurfaceGui: its world point;
             // BillboardGui: its anchor's).
             // (and its distance from the camera, for fog).
-            let depth_of = |p: Pos2| -> (f32, f32) {
-                let w = match target {
-                    Target::Surface { tl, tr, bl } => {
-                        let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
-                        tl + (tr - tl) * u + (bl - tl) * v
-                    }
-                    Target::Billboard(_, at) => at,
-                    Target::Screen(_) => return (1.0, 0.0),
-                };
+            // (a world point's)
+            let depth_at = |w: Vec3| -> (f32, f32) {
                 let c = view_proj_rz * w.extend(1.0);
                 let dist = (w - inp.cam.pos).length();
                 (if c.w <= 1e-6 { 1.0 } else { c.z / c.w }, dist)
+            };
+            // A SurfaceGui canvas point's world point.
+            let surface_point = |p: Pos2| -> Option<Vec3> {
+                let Target::Surface { tl, tr, bl } = target else {
+                    return None;
+                };
+                let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
+                Some(tl + (tr - tl) * u + (bl - tl) * v)
+            };
+            let depth_of = |p: Pos2| -> (f32, f32) {
+                let w = match target {
+                    Target::Surface { .. } => surface_point(p).expect("a surface"),
+                    Target::Billboard(_, at) => at,
+                    Target::Screen(_) => return (1.0, 0.0),
+                };
+                depth_at(w)
             };
             // A world point's screen position and clip-space w.
             let project_w = |world: Vec3| -> Option<(Pos2, f32)> {
@@ -980,13 +1128,7 @@ impl Gui {
             };
             let project = |world: Vec3| project_w(world).map(|(p, _)| p);
             // SurfaceGuis: a canvas point's screen position and w.
-            let surface = |p: Pos2| -> Option<(Pos2, f32)> {
-                let Target::Surface { tl, tr, bl } = target else {
-                    return None;
-                };
-                let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
-                project_w(tl + (tr - tl) * u + (bl - tl) * v)
-            };
+            let surface = |p: Pos2| -> Option<(Pos2, f32)> { project_w(surface_point(p)?) };
             let billboard_origin = match target {
                 Target::Billboard(center, _) => center - egui::vec2(canvas[0] * 0.5, canvas[1] * 0.5),
                 _ => Pos2::ZERO,
@@ -995,10 +1137,7 @@ impl Gui {
                 match target {
                     Target::Screen(o) => Some(o + p.to_vec2()),
                     Target::Billboard(..) => Some(billboard_origin + p.to_vec2()),
-                    Target::Surface { tl, tr, bl } => {
-                        let (u, v) = (p.x / canvas[0].max(1.0), p.y / canvas[1].max(1.0));
-                        project(tl + (tr - tl) * u + (bl - tl) * v)
-                    }
+                    Target::Surface { .. } => project(surface_point(p)?),
                 }
             };
             let perspective = matches!(target, Target::Surface { .. });
@@ -1224,7 +1363,17 @@ impl Gui {
                 _ => None,
             };
             let mut projected: Vec<Pos2> = Vec::new();
-            for (bounds, retained) in &citems {
+            let mut world_part: Vec<rustudio_render::world_gui::GuiBatch> = Vec::new();
+            // (world SurfaceGuis: reprojected by `SurfaceView::project`
+            // after the loop, the same arithmetic)
+            let surface_items: &[(Rect, Arc<Mesh>)] = if let (true, true, Target::Surface { tl, tr, bl }) = (perspective, world, target) {
+                world_parts.push(WorldPart::Job(surface_jobs.len()));
+                surface_jobs.push(SurfaceJob { tl, tr, bl, canvas, light, items: citems.clone() });
+                &[]
+            } else {
+                &citems
+            };
+            for (bounds, retained) in surface_items {
                 if !screen_root && !on_screen(*bounds) {
                     continue;
                 }
@@ -1265,7 +1414,7 @@ impl Gui {
                         let verts = mesh.vertices.iter().map(|v| {
                             vertex(v, billboard_origin + v.pos.to_vec2(), depth)
                         });
-                        rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
+                        rustudio_render::world_gui::push(&mut world_part, mesh.texture_id, verts, &mesh.indices);
                     } else {
                         let verts: Option<Vec<_>> = mesh.vertices.iter().enumerate().map(|(i, v)| {
                             let p = match projected {
@@ -1275,7 +1424,7 @@ impl Gui {
                             Some(vertex(v, p, depth_of(v.pos)))
                         }).collect();
                         if let Some(verts) = verts {
-                            rustudio_render::world_gui::push(&mut self.world_batches, mesh.texture_id, verts, &mesh.indices);
+                            rustudio_render::world_gui::push(&mut world_part, mesh.texture_id, verts, &mesh.indices);
                         }
                     }
                 } else {
@@ -1316,6 +1465,9 @@ impl Gui {
             }
             if ui2d.0 > 0 {
                 crate::runtime::domains::services::perf::draw(crate::runtime::domains::services::perf::UI2D, ui2d.0, ui2d.1);
+            }
+            if !world_part.is_empty() {
+                world_parts.push(WorldPart::Batches(world_part));
             }
             triangle_counts[perspective as usize] += n_in;
             triangle_counts[2] += n_out;
@@ -1391,6 +1543,43 @@ impl Gui {
                 );
             }
         }
+        // The world SurfaceGuis' triangles, then every world root's in order.
+        {
+            let _p = (!surface_jobs.is_empty()).then(|| rustudio_core::bench::scope("gui_project_surfaces"));
+            let mut done = surface_view.project_all(&surface_jobs);
+            for o in &done {
+                triangle_counts[1] += o.n_in;
+                triangle_counts[2] += o.n_out;
+            }
+            for part in world_parts {
+                let batches = match part {
+                    WorldPart::Batches(b) => b,
+                    WorldPart::Job(i) => std::mem::take(&mut done[i].batches),
+                };
+                for b in batches {
+                    let Some(texture) = b.texture else { continue };
+                    rustudio_render::world_gui::push(&mut self.world_batches, texture, b.vertices, &b.indices);
+                }
+            }
+        }
+        // (RUSTUDIO_GUI_BATCH_HASH: print a hash of the frame's world GUI
+        // triangles, to compare builds frame by frame without the 3D view)
+        static BATCH_HASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BATCH_HASH.get_or_init(|| std::env::var_os("RUSTUDIO_GUI_BATCH_HASH").is_some()) {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for b in &self.world_batches {
+                b.texture.hash(&mut h);
+                for v in &b.vertices {
+                    for f in v.ndc.iter().chain([&v.depth]).chain(&v.uv).chain(&v.light).chain([&v.dist]) {
+                        f.to_bits().hash(&mut h);
+                    }
+                    v.color.hash(&mut h);
+                }
+                b.indices.hash(&mut h);
+            }
+            eprintln!("[guihash] {} {}", self.world_batches.iter().map(|b| b.indices.len()).sum::<usize>(), h.finish());
+        }
         let deferred = self.text_fit.take_deferred();
         if deferred > 0 {
             rustudio_core::bench::add("gui_text_deferred", 0.0, deferred);
@@ -1401,9 +1590,10 @@ impl Gui {
             rustudio_core::bench::add(name, 0.0, count);
         }
         // GUIs drawn last frame and not now: their entries go.
-        let was: HashSet<Ref> = std::mem::take(&mut self.layout_roots).into_iter().collect();
-        let now: HashSet<Ref> = drawn_roots.iter().copied().collect();
-        for g in was.difference(&now) {
+        let was = std::mem::take(&mut self.layout_roots);
+        let now: rustc_hash::FxHashSet<Ref> = drawn_roots.iter().copied().collect();
+        let mut gone: rustc_hash::FxHashSet<Ref> = Default::default();
+        for g in was.iter().filter(|g| !now.contains(*g) && gone.insert(**g)) {
             for r in self.layout_from.remove(g).unwrap_or_default() {
                 self.layout.remove(&r);
             }
@@ -2162,6 +2352,306 @@ impl SurfaceSpec {
         let bl = xf.apply(centre - right * wr - up * hu);
         Some((Target::Surface { tl, tr, bl }, canvas, dist))
     }
+
+    /// `place`, from `geo` while the host part's CFrame and Size are the
+    /// same bit for bit as when it was worked out (only the camera tests
+    /// run again; the same arithmetic, so the same result).
+    fn place_kept(&self, d: &Document, cam: &Camera, geo: &mut Option<SurfaceGeo>) -> Option<(Target, [f32; 2], f32)> {
+        thread_local! {
+            static KEYS: (rbx_dom_weak::Ustr, rbx_dom_weak::Ustr) =
+                (rbx_dom_weak::ustr("CFrame"), rbx_dom_weak::ustr("Size"));
+        }
+        let (kc, ks) = KEYS.with(|k| *k);
+        let inst = d.dom.get_by_ref(self.host)?;
+        let (Some(Variant::CFrame(cf)), Some(Variant::Vector3(size))) = (inst.properties.get(&kc), inst.properties.get(&ks)) else {
+            *geo = None;
+            return self.place(d, cam);
+        };
+        let o = &cf.orientation;
+        let key = SurfaceGeoKey {
+            cframe: [
+                cf.position.x, cf.position.y, cf.position.z,
+                o.x.x, o.x.y, o.x.z, o.y.x, o.y.y, o.y.z, o.z.x, o.z.y, o.z.z,
+            ].map(f32::to_bits),
+            size: [size.x, size.y, size.z].map(f32::to_bits),
+            spec: *self,
+        };
+        if geo.as_ref().is_none_or(|g| g.key != key) {
+            *geo = SurfaceGeo::new(self, d, key);
+        }
+        let g = geo.as_ref()?;
+        // Only seen from in front of the face.
+        if g.facing.dot(cam.pos - g.mid) <= 0.0 {
+            return None;
+        }
+        let max = self.max_distance;
+        let dist = (g.mid - cam.pos).length();
+        if max > 0.0 && dist > max {
+            return None;
+        }
+        Some((Target::Surface { tl: g.tl, tr: g.tr, bl: g.bl }, g.canvas, dist))
+    }
+}
+
+/// The rows egui's font atlas starts with on an 8192-wide device (vendored
+/// epaint: about 8M texels): its first growth is prepared at load.
+const FIRST_ATLAS_ROWS: usize = 1024;
+
+/// A world root's place in the frame's world GUI triangles (`Gui::draw`).
+enum WorldPart {
+    Batches(Vec<rustudio_render::world_gui::GuiBatch>),
+    Job(usize),
+}
+
+/// A world SurfaceGui's kept canvas triangles to project this frame.
+struct SurfaceJob {
+    tl: Vec3,
+    tr: Vec3,
+    bl: Vec3,
+    canvas: [f32; 2],
+    light: f32,
+    items: Vec<(Rect, Arc<Mesh>)>,
+}
+
+#[derive(Default)]
+struct SurfaceOut {
+    batches: Vec<rustudio_render::world_gui::GuiBatch>,
+    n_in: u64,
+    n_out: u64,
+}
+
+/// What projecting a world SurfaceGui reads from the frame (the same
+/// arithmetic `Gui::draw`'s closures use for every other root).
+struct SurfaceView {
+    view_proj: glam::Mat4,
+    view_proj_rz: glam::Mat4,
+    cam_pos: Vec3,
+    rect: Rect,
+    ppp: f32,
+}
+
+impl SurfaceView {
+    /// A canvas point's world point.
+    fn point(&self, j: &SurfaceJob, p: Pos2) -> Vec3 {
+        let (u, v) = (p.x / j.canvas[0].max(1.0), p.y / j.canvas[1].max(1.0));
+        j.tl + (j.tr - j.tl) * u + (j.bl - j.tl) * v
+    }
+
+    /// A world point's screen position and clip-space w.
+    fn project_w(&self, world: Vec3) -> Option<(Pos2, f32)> {
+        let rect = self.rect;
+        let clip = self.view_proj * world.extend(1.0);
+        if clip.w <= 1e-4 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some((
+            Pos2::new(
+                rect.min.x + (ndc.x + 1.0) * 0.5 * rect.width(),
+                rect.min.y + (1.0 - ndc.y) * 0.5 * rect.height(),
+            ),
+            clip.w,
+        ))
+    }
+
+    /// A world point's reverse-Z depth and distance from the camera.
+    fn depth_at(&self, w: Vec3) -> (f32, f32) {
+        let c = self.view_proj_rz * w.extend(1.0);
+        let dist = (w - self.cam_pos).length();
+        (if c.w <= 1e-6 { 1.0 } else { c.z / c.w }, dist)
+    }
+
+    /// Whether canvas bounds `b` can colour a pixel of the view (unknown,
+    /// behind the camera, counts as yes).
+    fn on_screen(&self, j: &SurfaceJob, b: Rect) -> bool {
+        let mut s = Rect::NOTHING;
+        for p in [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()] {
+            match self.project_w(self.point(j, p)) {
+                Some((q, _)) => s.extend_with(q),
+                None => return true,
+            }
+        }
+        let s = s.intersect(self.rect);
+        s.is_positive() && contains_pixel_center(s.min.x, s.max.x, self.ppp)
+            && contains_pixel_center(s.min.y, s.max.y, self.ppp)
+    }
+
+    /// One SurfaceGui's triangles in the view (split where perspective
+    /// would bend them: `subdivide_known`), as world GUI vertices.
+    fn project(&self, j: &SurfaceJob) -> SurfaceOut {
+        let mut out = SurfaceOut::default();
+        let rect = self.rect;
+        let mut known: Vec<(Pos2, Vec3)> = Vec::new();
+        let mut seen: Vec<Option<(Pos2, Vec3)>> = Vec::new();
+        let seen_at = |p: Pos2| -> Option<(Pos2, f32, Vec3)> {
+            let w = self.point(j, p);
+            let (p, cw) = self.project_w(w)?;
+            Some((p, cw, w))
+        };
+        let width = rect.width().max(1.0);
+        let height = rect.height().max(1.0);
+        let vertex = |v: &Vertex, p: Pos2, (depth, dist): (f32, f32)| rustudio_render::world_gui::GuiVertex {
+            ndc: [
+                (p.x - rect.min.x) / width * 2.0 - 1.0,
+                1.0 - (p.y - rect.min.y) / height * 2.0,
+            ],
+            depth,
+            uv: [v.uv.x, v.uv.y],
+            color: v.color.to_array(),
+            light: [j.light; 3],
+            dist,
+            alpha_mul: 1.0,
+            ..Default::default()
+        };
+        for (bounds, retained) in &j.items {
+            if !self.on_screen(j, *bounds) {
+                continue;
+            }
+            out.n_in += retained.indices.len() as u64 / 3;
+            known.clear();
+            let (mut b, mut wlo, mut whi) = (Rect::NOTHING, f32::INFINITY, 0.0f32);
+            let all = retained.vertices.iter().all(|v| {
+                let w = self.point(j, v.pos);
+                let Some((p, cw)) = self.project_w(w) else { return false };
+                known.push((p, w));
+                b.extend_with(p);
+                wlo = wlo.min(cw);
+                whi = whi.max(cw);
+                true
+            });
+            let split = if all {
+                subdivide_known(retained.as_ref(), mech::GUI_SURFACE_AFFINE_ERR_PX, rect, seen_at, b, wlo, whi, &mut seen)
+            } else {
+                // (behind the camera in part: drawn as nothing)
+                None
+            };
+            let mesh = split.as_ref().unwrap_or(retained.as_ref());
+            out.n_out += mesh.indices.len() as u64 / 3;
+            if mesh.is_empty() || !all {
+                continue;
+            }
+            match &split {
+                None => {
+                    let verts = mesh.vertices.iter().zip(&known).map(|(v, (p, w))| vertex(v, *p, self.depth_at(*w)));
+                    rustudio_render::world_gui::push(&mut out.batches, mesh.texture_id, verts, &mesh.indices);
+                }
+                // (split: each new vertex as `subdivide_known` projected it;
+                // one behind the camera drops the mesh)
+                Some(mesh) => {
+                    if seen.iter().all(Option::is_some) {
+                        let verts = mesh.vertices.iter().zip(&seen).map(|(v, s)| {
+                            let (p, w) = s.expect("all seen");
+                            vertex(v, p, self.depth_at(w))
+                        });
+                        rustudio_render::world_gui::push(&mut out.batches, mesh.texture_id, verts, &mesh.indices);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every job's triangles, in job order: on this thread, or split into
+    /// runs of about equal vertex counts over a few threads when the frame
+    /// has many (each job's output is the same either way).
+    fn project_all(&self, jobs: &[SurfaceJob]) -> Vec<SurfaceOut> {
+        // (RUSTUDIO_GUI_THREAD_VERTS: another share per thread, for tests)
+        static PER_THREAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let per_thread = *PER_THREAD.get_or_init(|| {
+            std::env::var("RUSTUDIO_GUI_THREAD_VERTS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(8192)
+        });
+        let verts: Vec<usize> = jobs.iter().map(|j| j.items.iter().map(|(_, m)| m.vertices.len()).sum()).collect();
+        let total: usize = verts.iter().sum();
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).clamp(1, 4);
+        let parts = (total / per_thread).clamp(1, threads);
+        if parts == 1 || std::env::var_os("RUSTUDIO_GUI_ONE_THREAD").is_some() {
+            return jobs.iter().map(|j| self.project(j)).collect();
+        }
+        // Contiguous runs of jobs, cut where the running vertex count passes
+        // each share.
+        let mut cuts = vec![0];
+        let mut acc = 0;
+        for (i, v) in verts.iter().enumerate() {
+            acc += v;
+            if acc * parts >= total * cuts.len() && cuts.len() < parts && i + 1 < jobs.len() {
+                cuts.push(i + 1);
+            }
+        }
+        cuts.push(jobs.len());
+        let runs: Vec<&[SurfaceJob]> = cuts.windows(2).map(|w| &jobs[w[0]..w[1]]).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = runs[1..]
+                .iter()
+                .map(|run| scope.spawn(move || run.iter().map(|j| self.project(j)).collect::<Vec<_>>()))
+                .collect();
+            let mut out: Vec<SurfaceOut> = runs[0].iter().map(|j| self.project(j)).collect();
+            for h in handles {
+                out.extend(h.join().expect("GUI projection thread"));
+            }
+            out
+        })
+    }
+}
+
+/// A drawn root's own properties the draw reads (gui.rs `root_props`).
+#[derive(Clone, Copy)]
+pub(crate) struct RootProps {
+    global_z: bool,
+    clips: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct SurfaceGeoKey {
+    cframe: [u32; 12],
+    size: [u32; 3],
+    spec: SurfaceSpec,
+}
+
+/// What `SurfaceSpec::place` works out from the part alone (gui.rs
+/// `surface_geo`): the face's outward normal and middle, the canvas
+/// corners and size.
+#[derive(Clone, Copy)]
+pub(crate) struct SurfaceGeo {
+    key: SurfaceGeoKey,
+    facing: Vec3,
+    mid: Vec3,
+    tl: Vec3,
+    tr: Vec3,
+    bl: Vec3,
+    canvas: [f32; 2],
+}
+
+impl SurfaceGeo {
+    /// `SurfaceSpec::place`'s camera-free part, line for line.
+    fn new(spec: &SurfaceSpec, d: &Document, key: SurfaceGeoKey) -> Option<SurfaceGeo> {
+        let host = spec.host;
+        let xf = xform_of(d, host)?;
+        let h = vec3_of(d.prop(host, "Size")).unwrap_or(Vec3::ONE) * 0.5;
+        let (n, right, up) = match spec.face {
+            0 => (Vec3::X, -Vec3::Z, Vec3::Y),
+            1 => (Vec3::Y, Vec3::X, -Vec3::Z),
+            2 => (Vec3::Z, Vec3::X, Vec3::Y),
+            3 => (-Vec3::X, Vec3::Z, Vec3::Y),
+            4 => (-Vec3::Y, Vec3::X, Vec3::Z),
+            _ => (-Vec3::Z, -Vec3::X, Vec3::Y),
+        };
+        let (wr, hu) = ((right * h).length(), (up * h).length());
+        let centre = n * (n * h).length() + n * mech::GUI_SURFACE_LIFT;
+        let mid = xf.apply(centre);
+        let canvas = match spec.pixels_per_stud {
+            Some(pps) => [wr * 2.0 * pps, hu * 2.0 * pps],
+            None => spec.canvas_size,
+        };
+        Some(SurfaceGeo {
+            key,
+            facing: xf.rot * n,
+            mid,
+            tl: xf.apply(centre - right * wr + up * hu),
+            tr: xf.apply(centre + right * wr + up * hu),
+            bl: xf.apply(centre - right * wr - up * hu),
+            canvas,
+        })
+    }
 }
 
 /// The light `world_gui_light` mixes in: Ambient, OutdoorAmbient and the sun
@@ -2266,6 +2756,30 @@ mod surface_spec_tests {
         assert_eq!(gui.surface_specs.get(&sg), Some(&spec));
         let moved = spec.place(&d, &cam).unwrap();
         assert!(matches!(moved.0, Target::Surface { tl, .. } if (tl.x - 3.0).abs() < 1e-4));
+        // `place_kept` gives `place`'s result bit for bit, its kept corners
+        // following the part's CFrame and Size.
+        let bits = |p: Option<(Target, [f32; 2], f32)>| p.map(|(t, c, dist)| {
+            let Target::Surface { tl, tr, bl } = t else { panic!() };
+            ([tl, tr, bl].map(|v| v.to_array().map(f32::to_bits)), c.map(f32::to_bits), dist.to_bits())
+        });
+        let mut geo = None;
+        let turned = Xform { pos: Vec3::new(1.5, -2.25, 0.3), rot: Mat3::from_euler(glam::EulerRot::XYZ, 0.3, -1.1, 0.7) }.to_cframe();
+        for (cf, size, eye) in [
+            (at(1.0), Vector3::new(4.0, 2.0, 1.0), Vec3::new(0.0, 0.0, -10.0)),
+            (at(1.0), Vector3::new(4.0, 2.0, 1.0), Vec3::new(0.3, 1.7, -7.1)),
+            (at(1.0), Vector3::new(4.0, 2.0, 1.0), Vec3::new(0.0, 0.0, 10.0)),
+            (turned, Vector3::new(4.0, 2.0, 1.0), Vec3::new(0.3, 1.7, -7.1)),
+            (turned, Vector3::new(3.0, 5.5, 0.2), Vec3::new(-6.0, 2.0, -3.0)),
+            (turned, Vector3::new(3.0, 5.5, 0.2), Vec3::new(6.0, -2.0, 3.0)),
+        ] {
+            d.set_prop_live(part, ustr("CFrame"), Variant::CFrame(cf));
+            d.set_prop_live(part, ustr("Size"), Variant::Vector3(size));
+            cam.pos = eye;
+            assert_eq!(bits(spec.place_kept(&d, &cam, &mut geo)), bits(spec.place(&d, &cam)), "{eye}");
+        }
+        cam.pos = Vec3::new(0.0, 0.0, -10.0);
+        d.set_prop_live(part, ustr("CFrame"), Variant::CFrame(at(1.0)));
+        d.set_prop_live(part, ustr("Size"), Variant::Vector3(Vector3::new(4.0, 2.0, 1.0)));
         d.reparent(&[sg], other);
         gui.sync_roots(&mut d);
         assert!(!gui.surface_specs.contains_key(&sg));
@@ -2281,6 +2795,81 @@ mod surface_spec_tests {
         d.dom.destroy(part);
         assert!(!spec.current(&d));
         assert_eq!(SurfaceSpec::read(&d, sg).map(|s| s.host), Some(other));
+    }
+}
+
+#[cfg(test)]
+mod surface_job_tests {
+    use super::*;
+
+    /// Splitting the frame's SurfaceGui jobs over threads returns, job for
+    /// job and bit for bit, what projecting them in order on one thread does.
+    #[test]
+    fn threaded_surface_projection_matches_one_thread() {
+        let mut cam = Camera::default();
+        cam.pos = Vec3::new(3.0, 2.0, -12.0);
+        let rect = Rect::from_min_size(Pos2::new(10.0, 20.0), egui::vec2(1280.0, 720.0));
+        let view = SurfaceView {
+            view_proj: cam.view_proj(rect),
+            view_proj_rz: cam.view_proj_reverse_z(rect),
+            cam_pos: cam.pos,
+            rect,
+            ppp: 1.0,
+        };
+        let mut seed = 7u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let jobs: Vec<SurfaceJob> = (0..60)
+            .map(|k| {
+                let o = cam.pos + cam.forward() * (6.0 + rnd() * 30.0) + cam.right() * (rnd() * 30.0 - 15.0) + cam.up() * (rnd() * 10.0 - 5.0);
+                let items = (0..1 + k % 5)
+                    .map(|_| {
+                        let mut m = Mesh::default();
+                        for q in 0..400 {
+                            let (x, y) = (rnd() * 760.0, rnd() * 560.0);
+                            let e = if q % 50 == 0 { 400.0 } else { 30.0 };
+                            let base = m.vertices.len() as u32;
+                            for (dx, dy) in [(0.0, 0.0), (e, 0.0), (e, e), (0.0, e)] {
+                                m.vertices.push(Vertex {
+                                    pos: Pos2::new(x + dx, y + dy),
+                                    uv: Pos2::new(rnd(), rnd()),
+                                    color: Color32::from_rgba_premultiplied(q as u8, 200, 30, 255),
+                                });
+                            }
+                            m.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+                        }
+                        (Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)), Arc::new(m))
+                    })
+                    .collect();
+                SurfaceJob {
+                    tl: o,
+                    tr: o + cam.right() * 8.0 + cam.forward() * (6.0 * rnd() - 3.0),
+                    bl: o - cam.up() * 6.0 + cam.forward() * (30.0 * rnd()),
+                    canvas: [800.0, 600.0],
+                    light: 0.5 + rnd(),
+                    items,
+                }
+            })
+            .collect();
+        let one: Vec<SurfaceOut> = jobs.iter().map(|j| view.project(j)).collect();
+        let many = view.project_all(&jobs);
+        assert_eq!(one.len(), many.len());
+        let bytes = |o: &SurfaceOut| {
+            o.batches
+                .iter()
+                .map(|b| (b.texture, format!("{:?}", b.vertices), b.indices.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut drawn = 0;
+        for (a, b) in one.iter().zip(&many) {
+            assert_eq!((a.n_in, a.n_out), (b.n_in, b.n_out));
+            assert_eq!(bytes(a), bytes(b));
+            drawn += a.batches.iter().map(|b| b.indices.len()).sum::<usize>();
+        }
+        assert!(drawn > 100_000, "{drawn}");
+        assert!(one.iter().any(|o| o.n_out > o.n_in), "some meshes split");
     }
 }
 

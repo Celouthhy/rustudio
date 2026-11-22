@@ -205,6 +205,7 @@ impl Renderer {
     /// not asked for in 30 s. After the frame's `render` (skinned vertices
     /// and the world's globals are this frame's).
     pub fn render_viewport_frames(&mut self, rs: &egui_wgpu::RenderState, reqs: &HashMap<Ref, Request>) {
+        self.pool.flush();
         self.vf.drawn = 0;
         let now = Instant::now();
         let mut gone = Vec::new();

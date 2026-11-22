@@ -384,6 +384,29 @@ fn write_json(
     Ok(text)
 }
 
+/// How many group requests go out at once: enough that ~90 groups load
+/// in a couple of seconds, few enough to stay clear of Roblox's limits.
+pub const GROUP_FANOUT: usize = 8;
+
+/// `f` over `items` on up to [`GROUP_FANOUT`] threads, results in order.
+pub fn fan_out<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<Option<R>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..GROUP_FANOUT.min(items.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = f(item);
+                *out[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
+        }
+    });
+    out.into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every item ran"))
+        .collect()
+}
+
 impl CloudApi {
     /// The third argument is retained for existing callers.
     pub fn new(session: Session, ep: Endpoints, _publish_key: Option<String>) -> CloudApi {
@@ -391,7 +414,17 @@ impl CloudApi {
     }
 
     fn get_json(&self, url: &str, what: &str) -> Result<serde_json::Value> {
-        let (status, text) = self.session.get(url)?;
+        // A 429 (rate limited) is retried after 1, 2 and 4 s: the Start Page
+        // asks for many group lists at once.
+        let mut wait = 1;
+        let (status, text) = loop {
+            let (status, text) = self.session.get(url)?;
+            if status != 429 || wait > 4 {
+                break (status, text);
+            }
+            std::thread::sleep(Duration::from_secs(wait));
+            wait *= 2;
+        };
         if status != 200 {
             let why = error_message(&text).map(|m| format!(": {m}")).unwrap_or_default();
             return Err(Error(format!("{what} answered HTTP {status}{why}")));
@@ -453,19 +486,18 @@ impl CloudApi {
         Ok((rows, more))
     }
 
-    /// The account's groups (groups `v2/users/{id}/groups/roles`), each
-    /// with whether its role may edit the group's experiences: the role's
-    /// `manageGroupGames` from groups `v1/groups/{id}/membership` (None
-    /// when Roblox doesn't say). Groups whose role can't are kept, so the
-    /// picker can say why their experiences don't open.
+    /// The account's groups (groups `v2/users/{id}/groups/roles`), in
+    /// Roblox's order. One request: `can_edit` is None here (see
+    /// [`Self::groups_with_roles`]). The Start Page lists a group whenever
+    /// its search ([`Self::experiences_page`]) returns experiences, so it
+    /// needs nothing more.
     pub fn groups(&self) -> Result<Vec<GroupInfo>> {
         let uid = self.session.profile.id;
         let v = self.get_json(
             &format!("{}/v2/users/{uid}/groups/roles", self.ep.groups),
             "groups.roblox.com/v2/users/{id}/groups/roles",
         )?;
-        let mut groups: Vec<GroupInfo> = v
-            .get("data")
+        Ok(v.get("data")
             .and_then(|d| d.as_array())
             .into_iter()
             .flatten()
@@ -477,19 +509,59 @@ impl CloudApi {
                     can_edit: None,
                 })
             })
-            .collect();
-        for g in &mut groups {
-            if let Ok(m) = self.get_json(
-                &format!("{}/v1/groups/{}/membership", self.ep.groups, g.id),
-                "group membership",
-            ) {
-                let p = |k: &str| m.pointer(&format!("/permissions/groupEconomyPermissions/{k}")).and_then(|b| b.as_bool());
-                g.can_edit = p("manageGroupGames");
-            }
+            .collect())
+    }
+
+    /// [`Self::groups`], each with whether its role may edit the group's
+    /// experiences: the role's `manageGroupGames` from groups
+    /// `v1/groups/{id}/membership` (None when Roblox doesn't say), asked
+    /// for [`GROUP_FANOUT`] groups at a time. Editable first, as Studio's
+    /// group menu.
+    pub fn groups_with_roles(&self) -> Result<Vec<GroupInfo>> {
+        let mut groups = self.groups()?;
+        let flags = fan_out(&groups, |g| {
+            let m = self
+                .get_json(&format!("{}/v1/groups/{}/membership", self.ep.groups, g.id), "group membership")
+                .ok()?;
+            m.pointer("/permissions/groupEconomyPermissions/manageGroupGames").and_then(|b| b.as_bool())
+        });
+        for (g, f) in groups.iter_mut().zip(flags) {
+            g.can_edit = f;
         }
-        // Editable first, as Studio's group menu.
         groups.sort_by_key(|g| g.can_edit != Some(true));
         Ok(groups)
+    }
+
+    /// The groups a place can be published into: those whose Start Page
+    /// search returns an experience (Roblox grants edit per experience,
+    /// so a role without `manageGroupGames` can still have one), and those
+    /// whose role may manage the group's experiences (a new experience).
+    pub fn publish_groups(&self) -> Result<Vec<GroupInfo>> {
+        let groups = self.groups_with_roles()?;
+        let has = fan_out(&groups, |g| {
+            g.can_edit == Some(true)
+                || self
+                    .experiences_page(ExperienceSource::Group(g.id), 0, 1)
+                    .is_ok_and(|(rows, _)| !rows.is_empty())
+        });
+        Ok(groups.into_iter().zip(has).filter(|(_, h)| *h).map(|(g, _)| g).collect())
+    }
+
+    /// Every experience of a group this account can open, most recently
+    /// updated first, as Studio's Start Page finds them (apis
+    /// `universes/v1/search`, creatorType Group). Unlike develop
+    /// `v1/groups/{id}/universes` it works for a role without
+    /// `manageGroupGames` that was given edit on single experiences.
+    pub fn group_search_experiences(&self, group_id: u64) -> Result<Vec<Experience>> {
+        let mut out = Vec::new();
+        for page in 0..20 {
+            let (rows, more) = self.experiences_page(ExperienceSource::Group(group_id), page, 50)?;
+            out.extend(rows);
+            if !more {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// A group's experiences: develop `v1/groups/{groupId}/universes`.
@@ -1269,14 +1341,20 @@ mod tests {
             if p.ends_with("/v1/universes/12345/teamcreate") {
                 return MockReply::json(200, r#"{"isEnabled":true}"#);
             }
+            if p.starts_with("/apis/universes/v1/search") && r.path.contains("creatorType=Group&creatorTargetId=11&") {
+                return MockReply::json(200, r#"{"data":[],"totalResults":0}"#);
+            }
             if p.starts_with("/apis/universes/v1/search") {
                 return MockReply::json(200, r#"{"data":[{"id":5,"name":"Shared One","rootPlaceId":6,"creatorType":"User","creatorTargetId":7,"creatorName":"friend","updated":"2026-01-01T00:00:00Z","isTeamCreateEnabled":true}],"totalResults":1}"#);
             }
             if p.starts_with("/groups/v2/users/1/groups/roles") {
-                return MockReply::json(200, r#"{"data":[{"group":{"id":10,"name":"Builders"},"role":{"name":"Dev","rank":200}},{"group":{"id":11,"name":"Fans"},"role":{"name":"Member","rank":1}}]}"#);
+                return MockReply::json(200, r#"{"data":[{"group":{"id":10,"name":"Builders"},"role":{"name":"Dev","rank":200}},{"group":{"id":11,"name":"Fans"},"role":{"name":"Member","rank":1}},{"group":{"id":12,"name":"Seal"},"role":{"name":"Member","rank":1}}]}"#);
             }
             if p == "/groups/v1/groups/10/membership" {
                 return MockReply::json(200, r#"{"permissions":{"groupEconomyPermissions":{"manageGroupGames":true}}}"#);
+            }
+            if p == "/groups/v1/groups/12/membership" {
+                return MockReply::json(200, r#"{"permissions":{"groupEconomyPermissions":{"manageGroupGames":false}}}"#);
             }
             if p == "/groups/v1/groups/11/membership" {
                 return MockReply::json(200, r#"{"permissions":{"groupEconomyPermissions":{"manageGroupGames":false}}}"#);
@@ -1368,7 +1446,16 @@ mod tests {
         let shared = a.shared_experiences().unwrap();
         assert_eq!((shared[0].id, shared[0].name.as_str(), shared[0].team_create), (5, "Shared One", Some(true)));
         let groups = a.groups().unwrap();
-        assert_eq!(groups.iter().map(|g| (g.id, g.can_edit)).collect::<Vec<_>>(), vec![(10, Some(true)), (11, Some(false))]);
+        assert_eq!(groups.iter().map(|g| (g.id, g.can_edit)).collect::<Vec<_>>(), vec![(10, None), (11, None), (12, None)]);
+        let groups = a.groups_with_roles().unwrap();
+        assert_eq!(groups.iter().map(|g| (g.id, g.can_edit)).collect::<Vec<_>>(), vec![(10, Some(true)), (11, Some(false)), (12, Some(false))]);
+        // Group 12's role can't manage games, but the search finds an
+        // experience it may edit; group 11 has neither.
+        let publish = a.publish_groups().unwrap();
+        assert_eq!(publish.iter().map(|g| g.id).collect::<Vec<_>>(), vec![10, 12]);
+        let in_group = a.group_search_experiences(12).unwrap();
+        assert_eq!(in_group.iter().map(|e| e.id).collect::<Vec<_>>(), vec![5]);
+        assert!(s.requests().iter().any(|r| r.path.contains("creatorType=Group&creatorTargetId=12&") && r.path.contains("surface=StudioStartPage")));
         // The shared search asks as Studio's Start Page does.
         assert!(s.requests().iter().any(|r| r.path.contains("creatorType=Team&creatorTargetId=1&")));
     }

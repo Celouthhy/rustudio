@@ -593,9 +593,22 @@ unsafe fn push_instances(
         // For the usual unrestricted array, check the whole list together.
         let has_cache = ffi::lua_type(l, weak_table) == ffi::LUA_TTABLE
             && !domains::assets_cloud::scene::any_access_blocked(lua, refs);
+        // Every child's slot under one borrow of the cache (in list order:
+        // the same slots a borrow per child assigned), and the new wrappers
+        // recorded together after the loop. A Workspace walk of GetChildren
+        // (a test place's HumanoidList, ~17k instances every 3 s) spent ~4% of
+        // its time re-borrowing the cache per child.
+        let slots: Vec<i64> = if has_cache {
+            let mut c = cache(lua)?;
+            refs.iter().map(|&r| c.instance_slot(r)).collect()
+        } else {
+            Vec::new()
+        };
+        let mut fresh: Vec<Ref> = Vec::new();
+        let mut ok = true;
         for (i, &r) in refs.iter().enumerate() {
             if has_cache {
-                let id = cache(lua)?.instance_slot(r) as _;
+                let id = slots[i] as _;
                 if ffi::lua_rawgeti(l, weak_table, id) == ffi::LUA_TUSERDATA {
                     ffi::lua_rawseti(l, -2, (i + 1) as _);
                     continue;
@@ -604,24 +617,41 @@ unsafe fn push_instances(
                 // Create the same userdata as inst_value on the caller's
                 // stack and update the weak table and orphan collector.
                 let pushed = if instance_is_object(lua, r) {
-                    lua.push_userdata_unref(l, LObj(r))?
+                    lua.push_userdata_unref(l, LObj(r))
                 } else {
-                    lua.push_userdata_unref(l, LInst(r))?
+                    lua.push_userdata_unref(l, LInst(r))
+                };
+                let pushed = match pushed {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if !fresh.is_empty() {
+                            cache(lua)?.fresh.extend(fresh);
+                        }
+                        return Err(e);
+                    }
                 };
                 if pushed {
-                    cache(lua)?.fresh.push(r);
+                    fresh.push(r);
                     ffi::lua_pushvalue(l, -1);
                     ffi::lua_rawseti(l, weak_table, id);
                     ffi::lua_rawseti(l, -2, (i + 1) as _);
                     continue;
                 }
             }
+            if !fresh.is_empty() {
+                // (inst_value records its own wrapper: keep the order)
+                cache(lua)?.fresh.extend(fresh.drain(..));
+            }
             if !push_value(lua, l, key, inst_value(lua, r)?) {
-                return Ok(false);
+                ok = false;
+                break;
             }
             ffi::lua_rawseti(l, -2, (i + 1) as _);
         }
-        Ok(true)
+        if !fresh.is_empty() {
+            cache(lua)?.fresh.extend(fresh);
+        }
+        Ok(ok)
     }
 }
 

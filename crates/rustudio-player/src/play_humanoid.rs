@@ -63,6 +63,12 @@ pub(crate) struct HumDyn {
     /// The seat this character left last (it alone is refused during the
     /// re-sit cooldown).
     pub seat_left: Option<Ref>,
+    /// The root's CFrame on the server and on the client as the world's step
+    /// starts (`hum_roots_seen`): a side that differs at the publish (`hum_post`)
+    /// had a script move it while the world stepped.
+    roots_seen: Option<(Option<Xform>, Option<Xform>)>,
+    /// Where a script put the root while the batch ran (`hum_script_moves`).
+    script_root: Option<Xform>,
 }
 
 /// Frames from a character part entering a Seat to the Humanoid being
@@ -77,7 +83,7 @@ impl Default for HumDyn {
     /// A new character is in the air (it spawns above its SpawnLocation).
     fn default() -> Self {
         let hum = Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() };
-        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None }
+        HumDyn { hum, had_floor: false, floor_part: None, transforms: HashMap::new(), swim_vy: None, seat_wait: None, seat_left: None, roots_seen: None, script_root: None }
     }
 }
 
@@ -345,7 +351,9 @@ impl Game {
             if let Some(last) = ch.last_root {
                 let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
                 let server = rustudio_render::scene::xform_of(&self.doc, root);
-                if let Some(xf) = [client, server].into_iter().flatten().find(|xf| (xf.pos - last.pos).length() > 1e-4 || (xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) == false) {
+                // (Both moved: the server's write wins, as Studio's server drops the
+                // owner's poses older than its CFrame until the client acks it.)
+                if let Some(xf) = [server, client].into_iter().flatten().find(|xf| (xf.pos - last.pos).length() > 1e-4 || (xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) == false) {
                     if rustudio_physics::physics::hum_debug() {
                         eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})", last.pos, xf.pos, client.map(|c| c.pos), server.map(|c| c.pos));
                     }
@@ -828,6 +836,40 @@ impl Game {
         }
     }
 
+    /// Just before the world steps (after Stepped / PreSimulation's writes reached
+    /// it): each side's root as the step starts from. `hum_post` honours a script
+    /// write made after this, while the batch is in flight.
+    pub(super) fn hum_roots_seen(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(ch) = s.character.as_mut() else { return };
+        let root = ch.rig.root;
+        let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
+        let server = rustudio_render::scene::xform_of(&self.doc, root);
+        ch.dynamic.roots_seen = Some((server, client));
+    }
+
+    /// A frame's batch ran on the solver's workers (scripts and the harness ran
+    /// meanwhile) and is about to land: a side whose root differs from what the
+    /// step started from (`hum_roots_seen`) had a script move it; `hum_post` puts
+    /// the body there. (Before the batch's own poses are written: a character
+    /// welded to a seat is moved by the world itself. A step on the calling thread
+    /// leaves no such window and never gets here.)
+    pub(super) fn hum_script_moves(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let Some(ch) = s.character.as_mut() else { return };
+        let Some((server_was, client_was)) = ch.dynamic.roots_seen.take() else { return };
+        let root = ch.rig.root;
+        let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
+        let server = rustudio_render::scene::xform_of(&self.doc, root);
+        let moved = |now: Option<Xform>, was: Option<Xform>| match (now, was) {
+            (Some(n), Some(w)) => ((n.pos - w.pos).length() > 1e-4 || !(n.rot - w.rot).abs_diff_eq(Mat3::ZERO, 1e-4)).then_some(n),
+            _ => None,
+        };
+        // (The body may have just moved to a server write the client copy hasn't
+        // had yet: each side against its own value; the server's write first.)
+        ch.dynamic.script_root = moved(server, server_was).or_else(|| moved(client, client_was));
+    }
+
     /// After the Animator and Stepped: the colliders follow the animated
     /// pose (no sweep, no velocity: SPEC §1.4).
     pub(super) fn hum_pose(&mut self) {
@@ -860,7 +902,17 @@ impl Game {
         if let Some(c) = s.physics.humanoid_ctl(model) {
             ch.dynamic.hum = c.hum.clone();
         }
-        let Some((root_xf, v, _w)) = s.physics.humanoid_root(model) else { return };
+        let Some((mut root_xf, v, _w)) = s.physics.humanoid_root(model) else { return };
+        // A script moved the root while the world stepped (a server Script or
+        // LocalScript resumed between stepHumanoid and the publish, the
+        // harness's --luau): its CFrame wins and the body goes there instead of
+        // the stepped pose being written over it. Studio keeps a server CFrame /
+        // PivotTo of the player's character on both sides: the server tracks the        // CFrame revision it sent, the client acks it and owner poses older than        // the ack are dropped before they reach the body. The server's write is checked first for the same reason.
+        ch.dynamic.roots_seen = None;
+        if let Some(xf) = ch.dynamic.script_root.take() {
+            s.physics.teleport_humanoid(model, &xf);
+            root_xf = xf;
+        }
         let pose = ch.rig.solve(root_xf, &ch.dynamic.transforms);
         ch.last_root = Some(root_xf);
         ch.body.pos = root_xf.pos - Vec3::Y * ch.root_lift;
@@ -1069,5 +1121,152 @@ mod presim_mover_tests {
             "#),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod script_moves_player_character_tests {
+    use crate::game::Game;
+    use rustudio_engine::runtime::{RunMode, Side};
+
+    fn playing() -> (Game, egui::Context) {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        (game, ctx)
+    }
+
+    fn tick(game: &mut Game, ctx: &egui::Context, n: usize) {
+        for _ in 0..n {
+            game.play_tick(ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+    }
+
+    /// Studio 0.748 (a test place): a server `HumanoidRootPart.CFrame =`
+    /// on the player's character stays where it was put on the server and the
+    /// owning client. A write that landed
+    /// while the world's batch was in flight was overwritten by the stepped pose
+    /// (`hum_post`): the character snapped back to where it stood.
+    #[test]
+    fn server_cframe_of_the_player_character_sticks() {
+        let (mut game, ctx) = playing();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                assert(plr, "no player")
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        // Enough falling loose parts that the world steps on the solver's workers
+        // (`Physics::step_pool`): the write below lands while that batch is in flight.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                for i = 0, 99 do
+                    local p = Instance.new("Part")
+                    p.Size = Vector3.new(1, 1, 1)
+                    p.Position = Vector3.new(-200 + (i % 10) * 8, 300, -200 + (i // 10) * 8)
+                    p.Parent = workspace
+                end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 5);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                _G.tp = Vector3.new(40, root.Position.Y, 40)
+                root.CFrame = CFrame.new(_G.tp)
+            "#),
+            None
+        );
+        // The server keeps it every frame; the client copy has it once the frame
+        // in flight is published (an idle direct step skips a display while its
+        // batch runs, so how many ticks that takes depends on the machine), and
+        // keeps it from then on.
+        let mut client_since = None;
+        for n in 1..=120 {
+            tick(&mut game, &ctx, 1);
+            assert_eq!(
+                game.run_luau(Side::Server, r#"
+                    local p = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart.Position
+                    local d = (p - _G.tp) * Vector3.new(1, 0, 1)
+                    assert(d.Magnitude < 0.5, "server root at " .. tostring(p) .. ", put at " .. tostring(_G.tp))
+                "#),
+                None,
+                "server after {n} frames"
+            );
+            let client = game.run_luau(Side::Client, r#"
+                local p = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart.Position
+                local d = (p - Vector3.new(40, 0, 40)) * Vector3.new(1, 0, 1)
+                assert(d.Magnitude < 0.5, "client root at " .. tostring(p))
+            "#);
+            match (client, client_since) {
+                (None, None) => client_since = Some(n),
+                (Some(e), Some(since)) => panic!("client lost it after {n} frames (had it from {since}): {e}"),
+                _ => {}
+            }
+        }
+        assert!(client_since.is_some(), "the client never had the server's CFrame");
+    }
+
+    /// Studio 0.748 (a test place's dungeon door: the server fires a RemoteEvent and
+    /// the player's LocalScript sets the door's CanCollide false for 2 s): the
+    /// player walks through the door, which the server still has solid. The owning
+    /// client simulates its character against its own copy of the world.
+    /// rustudio's character stopped against the server's door.
+    #[test]
+    fn client_cancollide_false_lets_the_player_through() {
+        let (mut game, ctx) = playing();
+        tick(&mut game, &ctx, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 120);
+        // A wall 12 studs ahead (+X), solid on the server.
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                local wall = Instance.new("Part")
+                wall.Name = "Door"
+                wall.Anchored = true
+                wall.Size = Vector3.new(1, 20, 30)
+                wall.CFrame = CFrame.new(root.Position + Vector3.new(12, 5, 0))
+                wall.Parent = workspace
+            "#),
+            None
+        );
+        tick(&mut game, &ctx, 10);
+        let walk = r#"
+            local ch = game:GetService("Players").LocalPlayer.Character
+            ch.Humanoid:MoveTo(workspace.Door.Position * Vector3.new(1, 0, 1) + Vector3.new(15, ch.HumanoidRootPart.Position.Y, 0))
+        "#;
+        let past = r#"
+            local x = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart.Position.X
+            return x > workspace.Door.Position.X + 1
+        "#;
+        // Solid on both sides: it stops at the wall.
+        assert_eq!(game.run_luau(Side::Client, walk), None);
+        tick(&mut game, &ctx, 90);
+        assert_eq!(
+            game.run_luau(Side::Client, &format!("assert(not (function() {past} end)(), 'walked through a solid wall')")),
+            None
+        );
+        // The client opens it: through.
+        assert_eq!(game.run_luau(Side::Client, &format!("workspace.Door.CanCollide = false {walk}")), None);
+        tick(&mut game, &ctx, 90);
+        assert_eq!(
+            game.run_luau(Side::Client, &format!("assert((function() {past} end)(), 'stopped at the door the client opened')")),
+            None
+        );
+        // The server still has it solid.
+        assert_eq!(game.run_luau(Side::Server, "assert(workspace.Door.CanCollide)"), None);
     }
 }

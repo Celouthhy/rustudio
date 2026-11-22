@@ -249,7 +249,8 @@ impl Sampler<'_> {
 }
 
 pub struct Voxels {
-    chunks: HashMap<[i32; 3], Chunk>,
+    // (FxHash: a ray asks `chunk_near` 27 lookups for every chunk it crosses.)
+    chunks: rustc_hash::FxHashMap<[i32; 3], Chunk>,
     count: usize,
 }
 
@@ -290,7 +291,7 @@ impl<'a> Reader<'a> {
 impl Voxels {
     pub fn empty() -> Self {
         Voxels {
-            chunks: HashMap::new(),
+            chunks: Default::default(),
             count: 0,
         }
     }
@@ -576,6 +577,12 @@ impl Voxels {
 
     /// Whether the 32³ storage chunk holding voxel `v` exists (it may still
     /// be all Air).
+    /// A stored chunk's material and raw occupancy bytes (32³: X fastest,
+    /// then Z, then Y), by chunk key (voxel coordinates >> 5).
+    pub fn chunk_bytes(&self, key: [i32; 3]) -> Option<(&[u8], &[u8])> {
+        self.chunks.get(&key).map(|c| (&c.mat[..], &c.occ[..]))
+    }
+
     pub fn chunk_has_voxels(&self, v: [i32; 3]) -> bool {
         self.chunks.contains_key(&chunk_key(v))
     }
@@ -1316,6 +1323,14 @@ pub fn build_water_meshes(v: &Voxels) -> Vec<MaterialMesh> {
 }
 
 fn build_fields(v: &Voxels, fields: [bool; 2]) -> Vec<MaterialMesh> {
+    build_fields_impl(v, fields, true)
+}
+
+/// `skip_dry`: for the water alone, a key with no water in it or the chunks
+/// beside it (has_water_near: what `fill` reads water from) is skipped
+/// before filling its grid; it would make no water surface. a large test place's open
+/// spent 0.85 s filling the grids of its dry chunks.
+fn build_fields_impl(v: &Voxels, fields: [bool; 2], skip_dry: bool) -> Vec<MaterialMesh> {
     if v.chunks.is_empty() {
         return Vec::new();
     }
@@ -1336,6 +1351,9 @@ fn build_fields(v: &Voxels, fields: [bool; 2]) -> Vec<MaterialMesh> {
     let mut g = Grid::new();
     let mut st = State::new();
     for key in keys {
+        if skip_dry && !fields[0] && !v.has_water_near(key) {
+            continue;
+        }
         let (any_s, all_s, any_w) = g.fill(v, key);
         if !any_w && (!any_s || all_s) {
             continue;
@@ -1580,6 +1598,47 @@ fn decoration_owner(raw: [(u8, u8); 8]) -> u8 {
 /// collision shape). `cube(material)` says which materials map as a cube.
 pub fn chunk_triangles(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool) -> Vec<TerrainVertex> {
     chunk_triangles_impl(v, key, cube, false)
+}
+
+/// `chunk_triangles` for each of `keys`, in that order, meshed on up to
+/// eight threads (a place's first remesh is thousands of chunks: a large test place's
+/// took 8 s on one low-end laptop core). Each chunk's mesh depends only on the
+/// voxels, so the meshes are the same as one at a time.
+pub fn chunk_triangles_many(v: &Voxels, keys: &[[i32; 3]], cube: &(dyn Fn(u8) -> bool + Sync)) -> Vec<Vec<TerrainVertex>> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8).min(keys.len());
+    if threads <= 1 {
+        return keys.iter().map(|k| chunk_triangles(v, *k, cube)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut out: Vec<Vec<TerrainVertex>> = Vec::new();
+    out.resize_with(keys.len(), Vec::new);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(key) = keys.get(i) else { break };
+                        done.push((i, chunk_triangles(v, *key, cube)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok(done) => {
+                    for (i, verts) in done {
+                        out[i] = verts;
+                    }
+                }
+                Err(e) => std::panic::resume_unwind(e),
+            }
+        }
+    });
+    out
 }
 
 fn chunk_triangles_impl(v: &Voxels, key: [i32; 3], cube: &dyn Fn(u8) -> bool, grass_domains: bool) -> Vec<TerrainVertex> {
@@ -2094,6 +2153,75 @@ pub fn collision_mesh(meshes: &[MaterialMesh]) -> (Vec<[f32; 3]>, Vec<u32>) {
 
 #[cfg(test)]
 mod tests {
+    // The water mesh skips dry chunks without changing a byte of it.
+    #[test]
+    fn water_mesh_skips_dry_chunks_exactly() {
+        let mut v = Voxels::empty();
+        for x in -60..60 {
+            for z in -60..60 {
+                let h = 4.0 + 3.0 * ((x as f32) * 0.13).sin() + 2.0 * ((z as f32) * 0.11).cos();
+                for y in -4..(h as i32 + 1) {
+                    v.set([x, y, z], 2, 1.0);
+                }
+                // A lake in one corner, a pond in another.
+                if (x < -30 && z < -30) || (x > 40 && z > 40 && x < 50 && z < 50) {
+                    for y in (h as i32 + 1)..8 {
+                        v.set([x, y, z], WATER, 1.0);
+                    }
+                }
+            }
+        }
+        let bytes = |ms: Vec<MaterialMesh>| -> Vec<u8> {
+            let mut out = Vec::new();
+            for m in ms {
+                out.push(m.material);
+                out.extend(bytemuck::cast_slice::<_, u8>(&m.positions));
+                out.extend(bytemuck::cast_slice::<_, u8>(&m.normals));
+                out.extend(&m.rand);
+                out.extend(bytemuck::cast_slice::<_, u8>(&m.indices));
+            }
+            out
+        };
+        let fast = bytes(build_fields_impl(&v, [false, true], true));
+        let full = bytes(build_fields_impl(&v, [false, true], false));
+        assert!(fast.len() > 1000, "the lakes have a surface ({})", fast.len());
+        assert_eq!(fast, full);
+    }
+
+    // Meshing many chunks on several threads gives each chunk the mesh it
+    // gets on its own, in the order asked.
+    #[test]
+    fn chunk_triangles_many_matches_one_at_a_time() {
+        let mut v = Voxels::empty();
+        let mut seed = 3u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (1u64 << 31) as f32
+        };
+        for x in -40..40 {
+            for z in -40..40 {
+                let h = 6.0 + 4.0 * ((x as f32) * 0.21).sin() + 3.0 * ((z as f32) * 0.17).cos() + rnd();
+                for y in -4..(h as i32 + 1) {
+                    let occ = if y as f32 > h - 1.0 { h - y as f32 } else { 1.0 };
+                    let mat = [1u8, 2, 5, 8][((x + z) as i32).rem_euclid(4) as usize];
+                    v.set([x, y, z], mat, occ.clamp(0.05, 1.0));
+                }
+            }
+        }
+        let keys = dirty_chunks(None, &v);
+        assert!(keys.len() > 8, "several chunks ({})", keys.len());
+        let cube = |m: u8| m == 5;
+        let many = chunk_triangles_many(&v, &keys, &cube);
+        assert_eq!(many.len(), keys.len());
+        let mut nonempty = 0;
+        for (key, mesh) in keys.iter().zip(&many) {
+            let one = chunk_triangles(&v, *key, &cube);
+            assert_eq!(bytemuck::cast_slice::<_, u8>(&one), bytemuck::cast_slice::<_, u8>(mesh), "chunk {key:?}");
+            nonempty += usize::from(!one.is_empty());
+        }
+        assert!(nonempty > 4, "meshes were made ({nonempty})");
+    }
+
     #[test]
     #[ignore = "requires checks/water-full-re native GPU evidence"]
     fn water_matches_native_gpu_positions() {

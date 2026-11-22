@@ -109,16 +109,18 @@ fn sorted_children(doc: &Document, r: Ref) -> Vec<Ref> {
     let Some(inst) = doc.dom.get_by_ref(r) else {
         return Vec::new();
     };
+    // DataModel children: only the services Studio's Explorer lists
+    // (crate::service_visibility); the rest stay in the DataModel.
+    let listed: Option<HashSet<Ref>> = (r == doc.dom.root_ref()).then(|| {
+        crate::service_visibility::listed_root_children(doc, crate::service_visibility::Prefs::current())
+            .into_iter()
+            .collect()
+    });
     let mut kids: Vec<(i32, String, Ref)> = inst
         .children()
         .iter()
+        .filter(|c| listed.as_ref().is_none_or(|l| l.contains(c)))
         .filter_map(|c| doc.dom.get_by_ref(*c))
-        // CoreGui / PluginGuiService (what plugins draw) aren't listed, as
-        // with Studio's defaults "Show Core GUI in Explorer while Playing" /
-        // "Show Plugin GUI Service in Explorer" off (Studio 0.747, slot 3,
-        // 2026-11-15: the Explorer of an edit place with plugin widgets and
-        // CoreGui ScreenGuis lists neither).
-        .filter(|i| r != doc.dom.root_ref() || !matches!(i.class.as_str(), "CoreGui" | "PluginGuiService" | "PluginDebugService" | "StudioService"))
         .map(|i| (crate::studio_panels::explorer_order(i.class.as_str()), i.name.to_lowercase(), i.referent()))
         .collect();
     kids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));

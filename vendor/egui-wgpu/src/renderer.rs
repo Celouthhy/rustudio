@@ -624,6 +624,17 @@ impl Renderer {
         image_delta: &epaint::ImageDelta,
     ) {
         profiling::function_scope!();
+        // (rustudio: RUSTUDIO_ATLAS_TRACE reports slow texture updates)
+        struct Slow(std::time::Instant, [usize; 2], bool, bool);
+        impl Drop for Slow {
+            fn drop(&mut self) {
+                let ms = self.0.elapsed().as_secs_f64() * 1000.0;
+                if ms > 2.0 && std::env::var_os("RUSTUDIO_ATLAS_TRACE").is_some() {
+                    eprintln!("[egui-tex] {:?} whole {} grown {} took {ms:.1} ms", self.1, self.2, self.3, );
+                }
+            }
+        }
+        let _slow = Slow(std::time::Instant::now(), image_delta.image.size(), image_delta.pos.is_none(), image_delta.grown.is_some());
 
         let width = image_delta.image.width() as u32;
         let height = image_delta.image.height() as u32;
@@ -669,6 +680,103 @@ impl Renderer {
         let label_str = format!("egui_texid_{id:?}");
         let label = Some(label_str.as_str());
 
+        // rustudio: a font atlas that only grew taller keeps its old rows on
+        // the GPU (copied into the taller texture) and uploads just what
+        // changed, instead of the whole atlas from the CPU (an 8192-wide
+        // atlas is 32 MB per 1024 rows).
+        if let (None, Some(grown)) = (image_delta.pos, image_delta.grown) {
+            let old = self.textures.get(&id).and_then(|t| Some((t.texture.as_ref()?, t.options?)));
+            if let Some((old, options)) = old.filter(|(old, options)| {
+                old.width() == width
+                    && old.height() as usize == grown.old_height
+                    && grown.old_height <= height as usize
+                    && *options == image_delta.options
+                    && old.usage().contains(wgpu::TextureUsages::COPY_SRC)
+            }) {
+                let _ = options;
+                let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC;
+                // (made and cleared ahead of time when rustudio saw the atlas
+                // filling: crate::prewarm)
+                let prewarmed = crate::prewarm::take(crate::prewarm::Key {
+                    width,
+                    height,
+                    mip_levels: 1,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage,
+                });
+                let texture = prewarmed.unwrap_or_else(|| device.create_texture(&wgpu::TextureDescriptor {
+                    label,
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage,
+                    view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                }));
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label });
+                encoder.copy_texture_to_texture(
+                    old.as_image_copy(),
+                    texture.as_image_copy(),
+                    wgpu::Extent3d { width, height: grown.old_height as u32, depth_or_array_layers: 1 },
+                );
+                // (writes queued before this submit land first; the changed
+                // texels written below land after the copy)
+                queue.submit([encoder.finish()]);
+                let [x, y, w, h] = grown.changed.map(|v| v as u32);
+                if w > 0 && h > 0 {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        data_bytes,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 4 * (y as u64 * width as u64 + x as u64),
+                            bytes_per_row: Some(4 * width),
+                            rows_per_image: Some(h),
+                        },
+                        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    );
+                }
+                let sampler = self
+                    .samplers
+                    .entry(image_delta.options)
+                    .or_insert_with(|| create_sampler(image_delta.options, device));
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label,
+                    layout: &self.texture_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                    ],
+                });
+                let old = self.textures.insert(
+                    id,
+                    Texture {
+                        texture: Some(texture),
+                        bind_group,
+                        options: Some(image_delta.options),
+                    },
+                );
+                // (the shorter atlas is freed on another thread; this frame's
+                // earlier passes using it are submitted, and wgpu waits for them)
+                let shorter: Vec<wgpu::Texture> = old.as_ref().and_then(|t| t.texture.clone()).into_iter().collect();
+                crate::prewarm::destroy_later(shorter, old);
+                return;
+            }
+        }
+
         let (texture, origin, bind_group) = if let Some(pos) = image_delta.pos {
             // update the existing texture
             let Texture {
@@ -709,7 +817,8 @@ impl Renderer {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    // (COPY_SRC: rustudio keeps a grown font atlas's rows on the GPU)
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
                 })
             };

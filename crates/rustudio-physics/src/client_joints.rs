@@ -15,7 +15,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rbx_dom_weak::types::{Ref, Variant};
-use rbx_dom_weak::ustr;
+use rbx_dom_weak::Ustr;
+use rustudio_core::ukey;
 
 use rustudio_core::doc::{self, Document};
 use rustudio_core::math::Xform;
@@ -45,6 +46,16 @@ struct RigPoseScratch {
     placed: rustc_hash::FxHashSet<Ref>,
     queue: VecDeque<(Ref, Xform)>,
     writes: Vec<(Ref, Xform)>,
+    /// Per write: from a rig kept as posed (RUSTUDIO_CJ_CHECK only).
+    kept: Vec<bool>,
+}
+
+/// RUSTUDIO_CJ_CHECK=1: rigs kept as posed are posed anyway and every part
+/// that would have moved is counted (`cj_check_moved`) and printed; the
+/// kept rigs' writes are still not applied.
+fn check_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTUDIO_CJ_CHECK").is_some())
 }
 
 #[derive(Default)]
@@ -68,6 +79,33 @@ pub struct ClientJoints {
     rig_joints: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
     joint_rig: rustc_hash::FxHashMap<Ref, Ref>,
     pose_scratch: RigPoseScratch,
+    /// Rigs whose parts hold the pose `pose_rigs` last computed for them
+    /// (model → root it was posed from): nothing it read has changed since,
+    /// so posing them again would only find every part where it is. A large test place
+    /// had ~1,400 rig joints re-read every frame for ~240 parts that moved.
+    posed: rustc_hash::FxHashMap<Ref, Ref>,
+    /// Everything a posed rig's pose was read from (its root, joints, their
+    /// parts and attachments) → the rigs read from it; a journal mark on
+    /// any of them poses those rigs again.
+    read_by: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
+    reads_of: rustc_hash::FxHashMap<Ref, Vec<Ref>>,
+    /// `rig_controllers` as last walked, and whether a tree change since
+    /// then had a Humanoid / AnimationController in it.
+    controllers: Vec<Ref>,
+    controllers_dirty: bool,
+    /// Per rig: whether its reads are tracked (`posed`), and how often it was
+    /// dirty again by its next pose. A rig animating every frame (a test place's
+    /// NPCs) gains nothing from tracking and pays for it; after a few dirty
+    /// poses in a row it is posed untracked (every frame, as before) for a
+    /// while, then tried again.
+    tracks: rustc_hash::FxHashMap<Ref, RigTrack>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct RigTrack {
+    tracked: bool,
+    dirty_streak: u8,
+    untracked_until: u64,
 }
 
 fn is_joint(cd: &Document, r: Ref) -> bool {
@@ -83,33 +121,77 @@ fn compose(a: &Xform, b: &Xform) -> Xform {
     }
 }
 
-fn cframe(d: &Document, r: Ref, k: &str) -> Option<Xform> {
-    match d.dom.get_by_ref(r)?.properties.get(&ustr(k)) {
+fn cframe(d: &Document, r: Ref, k: Ustr) -> Option<Xform> {
+    match d.dom.get_by_ref(r)?.properties.get(&k) {
         Some(Variant::CFrame(c)) => Some(Xform::from_cframe(c)),
         _ => None,
     }
 }
 
-fn part_ref(d: &Document, j: Ref, k: &str) -> Option<Ref> {
-    match d.dom.get_by_ref(j)?.properties.get(&ustr(k)) {
+fn part_ref(d: &Document, j: Ref, k: Ustr) -> Option<Ref> {
+    match d.dom.get_by_ref(j)?.properties.get(&k) {
         Some(Variant::Ref(r)) if r.is_some() && d.dom.get_by_ref(*r).is_some() => Some(*r),
         _ => None,
     }
 }
 
 fn anchored(d: &Document, p: Ref) -> bool {
-    matches!(d.prop(p, "Anchored"), Some(Variant::Bool(true)))
+    matches!(d.prop_key(p, ukey!("Anchored")), Some(Variant::Bool(true)))
 }
 
 impl ClientJoints {
     /// Places the client-only parts of `cd` (the client's DataModel) from
     /// their joints. `c2s` maps client instances the server also has.
-    pub fn solve(&mut self, cd: &mut Document, c2s: &HashMap<Ref, Ref>) {
+    pub fn solve(&mut self, cd: &mut Document, c2s: &rustudio_core::RefMap) {
         // (Read first: pose_rigs keeps its rigs' joint lists by it. Its own
         // writes are CFrames, which only matter here as tree changes.)
         let marks = cd.marks_for(doc::Reader::ClientJoints);
+        self.note_rig_trees(cd, &marks);
         self.rig_marks(cd, &marks);
         self.pose_rigs(cd, c2s);
+        self.solve_rest(cd, c2s, marks);
+        // What this solve wrote is its own output, not news to it: only the
+        // CFrames of the parts it placed (no tree changes), all already in
+        // the poses it keeps (`posed`).
+        let _ = cd.marks_for(doc::Reader::ClientJoints);
+    }
+
+    fn note_rig_trees(&mut self, cd: &Document, marks: &doc::Marks) {
+        if self.controllers_dirty {
+            return;
+        }
+        match marks {
+            doc::Marks::Some(list) => {
+                for m in list {
+                    if let doc::Mark::Tree(t) = *m {
+                        // (A removed subtree is read from limbo.)
+                        if cd.subtree(t).into_iter().any(|r| cd.class_any(r).is_some_and(|c| is_rig_controller(c.as_str()))) {
+                            self.controllers_dirty = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            doc::Marks::All => self.controllers_dirty = true,
+        }
+    }
+
+    /// Drops a posed rig: its next frame poses it again.
+    fn unpose(&mut self, model: Ref) {
+        self.posed.remove(&model);
+        if let Some(reads) = self.reads_of.remove(&model) {
+            for r in reads {
+                if let Some(v) = self.read_by.get_mut(&r) {
+                    v.retain(|m| *m != model);
+                    if v.is_empty() {
+                        self.read_by.remove(&r);
+                    }
+                }
+            }
+        }
+    }
+
+    fn solve_rest(&mut self, cd: &mut Document, c2s: &rustudio_core::RefMap, marks: doc::Marks) {
         let ws = cd.find_child(cd.dom.root_ref(), "Workspace");
         // Under Workspace, or under a WorldModel (a ViewportFrame's world:
         // Studio solves joints and plays animations there, not elsewhere
@@ -159,6 +241,7 @@ impl ClientJoints {
         let mut edges: Vec<(Ref, Ref, Xform, Xform)> = Vec::new();
         let mut by_part: HashMap<Ref, Vec<usize>> = HashMap::new();
         let joints: Vec<Ref> = self.joints.iter().copied().collect();
+        rustudio_core::bench::add("cj_joints", 0.0, joints.len() as u64);
         for j in joints {
             let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                 continue;
@@ -172,7 +255,7 @@ impl ClientJoints {
                 continue;
             }
             let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
-            let t = cframe(cd, j, "Transform").unwrap_or(ident);
+            let t = cframe(cd, j, ukey!("Transform")).unwrap_or(ident);
             let i = edges.len();
             edges.push((p0, p1, compose(&c0, &t), c1));
             by_part.entry(p0).or_default().push(i);
@@ -184,7 +267,7 @@ impl ClientJoints {
         let mut queue: VecDeque<Ref> = VecDeque::new();
         for &p in by_part.keys() {
             if anchored(cd, p) {
-                if let Some(xf) = cframe(cd, p, "CFrame") {
+                if let Some(xf) = cframe(cd, p, ukey!("CFrame")) {
                     placed.insert(p, xf);
                     queue.push_back(p);
                 }
@@ -212,7 +295,7 @@ impl ClientJoints {
         }
         for p in moved {
             let xf = placed[&p];
-            let old = cframe(cd, p, "CFrame");
+            let old = cframe(cd, p, ukey!("CFrame"));
             let same = old.is_some_and(|o| {
                 (o.pos - xf.pos).length() < 1e-4 && o.rot.abs_diff_eq(xf.rot, 1e-5)
             });
@@ -221,9 +304,9 @@ impl ClientJoints {
             }
             if let Some(inst) = cd.dom.get_by_ref_mut(p) {
                 inst.properties
-                    .insert(ustr("CFrame"), Variant::CFrame(xf.to_cframe()));
+                    .insert(ukey!("CFrame"), Variant::CFrame(xf.to_cframe()));
             }
-            cd.mark_prop(p, ustr("CFrame"));
+            cd.mark_prop(p, ukey!("CFrame"));
         }
     }
 }
@@ -234,7 +317,7 @@ impl ClientJoints {
     fn frames(&mut self, cd: &Document, j: Ref) -> Option<(Ref, Ref, Xform, Xform)> {
         let class = cd.class_of(j)?;
         if !RIGID.contains(&class.as_str()) {
-            if matches!(cd.prop(j, "Enabled"), Some(Variant::Bool(false))) {
+            if matches!(cd.prop_key(j, ukey!("Enabled")), Some(Variant::Bool(false))) {
                 return None;
             }
             return rustudio_core::body::joint_frames(cd, j);
@@ -245,13 +328,13 @@ impl ClientJoints {
         let (p0, p1) = rustudio_core::body::joint_parts(cd, j)?;
         let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
         if class == "RigidConstraint" {
-            let a = |k: &str| part_ref(cd, j, k).and_then(|a| cframe(cd, a, "CFrame")).unwrap_or(ident);
-            return Some((p0, p1, a("Attachment0"), a("Attachment1")));
+            let a = |k: Ustr| part_ref(cd, j, k).and_then(|a| cframe(cd, a, ukey!("CFrame"))).unwrap_or(ident);
+            return Some((p0, p1, a(ukey!("Attachment0")), a(ukey!("Attachment1"))));
         }
         match self.welds.get(&j) {
             Some(&(a, b, rel)) if a == p0 && b == p1 => Some((p0, p1, rel, ident)),
             _ => {
-                let rel = compose(&cframe(cd, p0, "CFrame")?.inverse(), &cframe(cd, p1, "CFrame")?);
+                let rel = compose(&cframe(cd, p0, ukey!("CFrame"))?.inverse(), &cframe(cd, p1, ukey!("CFrame"))?);
                 self.welds.insert(j, (p0, p1, rel));
                 Some((p0, p1, rel, ident))
             }
@@ -267,13 +350,27 @@ impl ClientJoints {
             _ => {
                 self.rig_joints.clear();
                 self.joint_rig.clear();
+                self.posed.clear();
+                self.read_by.clear();
+                self.reads_of.clear();
                 return;
             }
         };
         if self.rig_joints.is_empty() {
             return;
         }
+        if !self.posed.is_empty() {
+            for m in list {
+                let (doc::Mark::Prop(r, _) | doc::Mark::Tree(r)) = *m;
+                if let Some(models) = self.read_by.get(&r) {
+                    for model in models.clone() {
+                        self.unpose(model);
+                    }
+                }
+            }
+        }
         let drop_rig = |me: &mut Self, model: Ref| {
+            me.unpose(model);
             if let Some(js) = me.rig_joints.remove(&model) {
                 for j in js {
                     me.joint_rig.remove(&j);
@@ -308,15 +405,33 @@ impl ClientJoints {
     /// simulation poses them from their Motor6D.Transform (what the
     /// Animator wrote, replicated), outward from the root part the server
     /// moves. Studio animates NPCs on every peer; without this a server
-    /// NPC's limbs stayed in the rest pose on the client (Place A's enemies).
-    fn pose_rigs(&mut self, cd: &mut Document, c2s: &HashMap<Ref, Ref>) {
+    /// NPC's limbs stayed in the rest pose on the client (a test place's enemies).
+    fn pose_rigs(&mut self, cd: &mut Document, c2s: &rustudio_core::RefMap) {
         if self.frame % 60 == 0 || cd.id != self.doc_id {
-            self.rigs = find_rigs(cd);
+            // The controllers in document order move only by a tree change
+            // that has one in it (`note_rig_trees`); otherwise only the roots
+            // are looked up again (a full walk of a large test place's client Workspace
+            // every 60 frames was ~2% of the Play step).
+            if self.controllers_dirty || cd.id != self.doc_id {
+                self.controllers = rig_controllers(cd);
+                self.controllers_dirty = false;
+            } else if check_kept() {
+                let live: Vec<Ref> = self.controllers.iter().copied().filter(|c| cd.dom.get_by_ref(*c).is_some()).collect();
+                if live != rig_controllers(cd) {
+                    rustudio_core::bench::add("cj_check_controllers", 0.0, 1);
+                    eprintln!("CJ_CHECK rig controllers differ from a walk at frame {}", self.frame);
+                }
+            }
+            self.rigs = rig_roots(cd, &self.controllers);
+            if self.tracks.len() > self.rigs.len() * 2 + 64 {
+                self.tracks.clear();
+            }
         }
         self.frame += 1;
         let ident = Xform::from_cframe(&rbx_dom_weak::types::CFrame::identity());
         let mut scratch = std::mem::take(&mut self.pose_scratch);
         let rigs = std::mem::take(&mut self.rigs);
+        let (mut kept_count, mut joint_count) = (0u64, 0u64);
         for &root in &rigs {
             if !c2s.contains_key(&root) {
                 continue;
@@ -329,7 +444,37 @@ impl ClientJoints {
             if cd.dom.get_by_ref(model).is_none() {
                 continue;
             }
-            let Some(at) = cframe(cd, root, "CFrame") else { continue };
+            let Some(at) = cframe(cd, root, ukey!("CFrame")) else { continue };
+            let kept = self.posed.get(&model) == Some(&root);
+            if kept {
+                kept_count += 1;
+                if let Some(t) = self.tracks.get_mut(&model) {
+                    t.dirty_streak = 0;
+                }
+                if !check_kept() {
+                    continue;
+                }
+            } else {
+                self.unpose(model);
+            }
+            let track = !kept && {
+                let frame = self.frame;
+                let t = self.tracks.entry(model).or_default();
+                if frame < t.untracked_until {
+                    false
+                } else {
+                    if t.tracked {
+                        t.dirty_streak = t.dirty_streak.saturating_add(1);
+                    }
+                    if t.dirty_streak >= 4 {
+                        *t = RigTrack { tracked: false, dirty_streak: 0, untracked_until: frame + 64 };
+                        false
+                    } else {
+                        t.tracked = true;
+                        true
+                    }
+                }
+            };
             scratch.joints.clear();
             if let Some(list) = self.rig_joints.get(&model) {
                 scratch.joints.extend_from_slice(list);
@@ -347,11 +492,31 @@ impl ClientJoints {
                 self.rig_joints.insert(model, list);
             }
             scratch.edges.clear();
+            joint_count += scratch.joints.len() as u64;
+            let mut reads: Vec<Ref> = Vec::with_capacity(if track { scratch.joints.len() * 3 + 1 } else { 0 });
+            if track {
+                reads.push(root);
+            }
             for &j in &scratch.joints {
+                if track {
+                    reads.push(j);
+                }
+                if let Some(i) = cd.dom.get_by_ref(j).filter(|_| track) {
+                    for k in [ukey!("Part0"), ukey!("Part1"), ukey!("Attachment0"), ukey!("Attachment1")] {
+                        if let Some(Variant::Ref(r)) = i.properties.get(&k) {
+                            if r.is_some() {
+                                reads.push(*r);
+                            }
+                        }
+                    }
+                }
                 let Some((p0, p1, c0, c1)) = self.frames(cd, j) else {
                     continue;
                 };
-                let t = cframe(cd, j, "Transform").unwrap_or(ident);
+                if track {
+                    reads.extend([p0, p1]);
+                }
+                let t = cframe(cd, j, ukey!("Transform")).unwrap_or(ident);
                 scratch.edges.push(RigEdge {
                     parts: [p0, p1],
                     frames: [compose(&c0, &t), c1],
@@ -367,6 +532,13 @@ impl ClientJoints {
                         .insert(edge.parts[side], edge_index * 2 + side)
                         .unwrap_or(usize::MAX);
                 }
+            }
+            if track {
+                for &r in &reads {
+                    self.read_by.entry(r).or_default().push(model);
+                }
+                self.reads_of.insert(model, reads);
+                self.posed.insert(model, root);
             }
             scratch.placed.clear();
             scratch.placed.insert(root);
@@ -386,20 +558,35 @@ impl ClientJoints {
                     scratch.placed.insert(other);
                     scratch.queue.push_back((other, xf));
                     scratch.writes.push((other, xf));
+                    if check_kept() {
+                        scratch.kept.push(kept);
+                    }
                 }
             }
         }
+        rustudio_core::bench::add("cj_rigs_kept", 0.0, kept_count);
+        rustudio_core::bench::add("cj_rig_joints", 0.0, joint_count);
+        rustudio_core::bench::add("cj_rig_writes", 0.0, scratch.writes.len() as u64);
+        let mut kept = std::mem::take(&mut scratch.kept).into_iter();
         for (p, xf) in scratch.writes.drain(..) {
-            let same = cframe(cd, p, "CFrame").is_some_and(|o| {
+            let same = cframe(cd, p, ukey!("CFrame")).is_some_and(|o| {
                 (o.pos - xf.pos).length() < 1e-4 && o.rot.abs_diff_eq(xf.rot, 1e-5)
             });
+            if kept.next() == Some(true) {
+                if !same {
+                    rustudio_core::bench::add("cj_check_moved", 0.0, 1);
+                    let name = cd.dom.get_by_ref(p).map(|i| i.name.clone()).unwrap_or_default();
+                    eprintln!("CJ_CHECK kept rig part would move: {name} {p:?} frame {}", self.frame);
+                }
+                continue;
+            }
             if same {
                 continue;
             }
             if let Some(inst) = cd.dom.get_by_ref_mut(p) {
-                inst.properties.insert(ustr("CFrame"), Variant::CFrame(xf.to_cframe()));
+                inst.properties.insert(ukey!("CFrame"), Variant::CFrame(xf.to_cframe()));
             }
-            cd.mark_prop(p, ustr("CFrame"));
+            cd.mark_prop(p, ukey!("CFrame"));
         }
         self.pose_scratch = scratch;
         self.rigs = rigs;
@@ -408,19 +595,32 @@ impl ClientJoints {
 
 /// Root parts of the animated rigs under Workspace.
 fn find_rigs(cd: &Document) -> Vec<Ref> {
+    rig_roots(cd, &rig_controllers(cd))
+}
+
+fn is_rig_controller(class: &str) -> bool {
+    class == "Humanoid" || class == "AnimationController"
+}
+
+/// The Humanoids and AnimationControllers under Workspace, in document order.
+fn rig_controllers(cd: &Document) -> Vec<Ref> {
     let Some(ws) = cd.find_child(cd.dom.root_ref(), "Workspace") else {
         return Vec::new();
     };
+    cd.dom.descendants_of(ws).filter(|i| is_rig_controller(i.class.as_str())).map(|i| i.referent()).collect()
+}
+
+/// Each controller's rig root (its model's HumanoidRootPart child, else the
+/// model's PrimaryPart), once each, in the controllers' order.
+fn rig_roots(cd: &Document, controllers: &[Ref]) -> Vec<Ref> {
     let mut out = Vec::new();
-    for i in cd.dom.descendants_of(ws) {
-        if i.class != "Humanoid" && i.class != "AnimationController" {
-            continue;
-        }
+    for &c in controllers {
+        let Some(i) = cd.dom.get_by_ref(c) else { continue };
         let model = i.parent();
         let root = cd.find_named(model, "HumanoidRootPart").filter(|r| {
             cd.dom.get_by_ref(*r).is_some_and(|p| p.parent() == model)
         });
-        let root = root.or_else(|| part_ref(cd, model, "PrimaryPart"));
+        let root = root.or_else(|| part_ref(cd, model, ukey!("PrimaryPart")));
         if let Some(r) = root {
             if !out.contains(&r) {
                 out.push(r);
@@ -435,7 +635,7 @@ mod tests {
     use super::*;
     use glam::Vec3;
     use rbx_dom_weak::types::{CFrame, Matrix3, Vector3};
-    use rbx_dom_weak::InstanceBuilder;
+    use rbx_dom_weak::{ustr, InstanceBuilder};
 
     fn at(x: f32, y: f32, z: f32) -> CFrame {
         CFrame::new(Vector3::new(x, y, z), Matrix3::identity())
@@ -482,8 +682,8 @@ mod tests {
         );
         d.mark_all();
         let mut cj = ClientJoints::default();
-        cj.solve(&mut d, &HashMap::new());
-        let pos = |p| cframe(&d, p, "CFrame").unwrap().pos;
+        cj.solve(&mut d, &Default::default());
+        let pos = |p| cframe(&d, p, ukey!("CFrame")).unwrap().pos;
         assert!((pos(body) - Vec3::new(0.0, 10.0, -1.0)).length() < 1e-4, "{:?}", pos(body));
         // Body's local +Y is world +Z after the quarter turn.
         assert!((pos(trim) - Vec3::new(0.0, 10.0, 0.0)).length() < 1e-4, "{:?}", pos(trim));
@@ -514,12 +714,12 @@ mod tests {
         d.mark_all();
         let mut joints = ClientJoints::default();
         joints.solve(&mut d, &replicated);
-        assert_eq!(cframe(&d, limb, "CFrame").unwrap().pos, Vec3::new(1.0, 5.0, 0.0));
+        assert_eq!(cframe(&d, limb, ukey!("CFrame")).unwrap().pos, Vec3::new(1.0, 5.0, 0.0));
 
         d.dom.get_by_ref_mut(joint).unwrap().properties.insert(ustr("Transform"), Variant::CFrame(at(-2.0, 0.0, 0.0)));
         d.mark_prop(joint, ustr("Transform"));
         joints.solve(&mut d, &replicated);
-        assert_eq!(cframe(&d, limb, "CFrame").unwrap().pos, Vec3::new(2.0, 5.0, 0.0));
+        assert_eq!(cframe(&d, limb, ukey!("CFrame")).unwrap().pos, Vec3::new(2.0, 5.0, 0.0));
     }
 
     /// An anchored root moved by script carries a client-made limb with it.
@@ -562,8 +762,8 @@ mod tests {
         );
         d.mark_all();
         let mut cj = ClientJoints::default();
-        cj.solve(&mut d, &HashMap::new());
-        let pos = |p| cframe(&d, p, "CFrame").unwrap().pos;
+        cj.solve(&mut d, &Default::default());
+        let pos = |p| cframe(&d, p, ukey!("CFrame")).unwrap().pos;
         assert!((pos(torso) - Vec3::new(10.0, 4.0, 9000.0)).length() < 1e-4);
         assert!((pos(arm) - Vec3::new(11.5, 3.5, 9000.0)).length() < 1e-4);
         assert!((pos(hrp) - Vec3::new(10.0, 3.0, 9000.0)).length() < 1e-4);

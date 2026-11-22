@@ -360,6 +360,12 @@ pub struct FontFace {
     /// `ShaperData` is `Copy` — lives outside the `self_cell`.
     shaper_data: harfrust::ShaperData,
 
+    /// Shape plans built for this face (rustudio): `harfrust::Shaper::shape`
+    /// without a plan compiles one per call, the same each time for a given
+    /// script, direction, language and variation instance. Found with
+    /// `harfrust::ShapePlanKey::matches`, the key harfrust provides for this.
+    shape_plans: std::sync::Mutex<Vec<std::sync::Arc<harfrust::ShapePlan>>>,
+
     /// Location-independent: `char → GlyphId | Invisible`.
     ///
     /// Only depends on the font's charmap + `FontTweak`. A miss means the char
@@ -433,6 +439,7 @@ impl FontFace {
             tweak,
             subpixel_binning,
             shaper_data,
+            shape_plans: Default::default(),
             glyph_id_cache: Default::default(),
             advance_width_cache: Default::default(),
             glyph_alloc_cache: Default::default(),
@@ -600,6 +607,38 @@ impl FontFace {
 
     pub(crate) fn shaper_data(&self) -> &harfrust::ShaperData {
         &self.shaper_data
+    }
+
+    /// The plan `shaper.shape` would build for `buffer` (see `shape_plans`),
+    /// built once. None when the buffer has no known script (harfrust's
+    /// buffer can't tell "none" from "unknown" apart through its API, and
+    /// the two plan differently): shape without a plan then.
+    pub(crate) fn shape_plan(
+        &self,
+        shaper: &harfrust::Shaper<'_>,
+        instance: Option<&harfrust::ShaperInstance>,
+        buffer: &harfrust::UnicodeBuffer,
+    ) -> Option<std::sync::Arc<harfrust::ShapePlan>> {
+        let script = buffer.script();
+        if script == harfrust::script::UNKNOWN {
+            return None;
+        }
+        let direction = buffer.direction();
+        let language = buffer.language();
+        let key = harfrust::ShapePlanKey::new(Some(script), direction)
+            .language(language.as_ref())
+            .instance(instance);
+        let mut plans = self.shape_plans.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(plan) = plans.iter().find(|p| key.matches(p)) {
+            return Some(plan.clone());
+        }
+        let plan = std::sync::Arc::new(harfrust::ShapePlan::new(shaper, direction, Some(script), language.as_ref(), &[]));
+        // (a face sees few scripts; bounded all the same)
+        if plans.len() >= 64 {
+            plans.clear();
+        }
+        plans.push(plan.clone());
+        Some(plan)
     }
 
     pub fn allocate_glyph(

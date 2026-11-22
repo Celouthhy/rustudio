@@ -17,6 +17,9 @@ pub(super) struct TextFitCache {
     wrapped: TextMemo<(LayoutJob, egui::Vec2), 4096>,
     unwrapped: rustc_hash::FxHashMap<u64, UnwrappedProbes>,
     probe_fonts: Option<Fonts>,
+    /// The probe fonts being made on another thread (live runs: parsing every
+    /// face is tens of millions of instructions, after each font change).
+    probe_building: Option<std::sync::mpsc::Receiver<Fonts>>,
     probe_frame: Option<u64>,
     galleys: TextMemo<Arc<egui::Galley>, 1024>,
     frame: Option<u64>,
@@ -135,15 +138,51 @@ impl TextFitCache {
         let start = self.can_start_work().then(Instant::now)?;
         // TextScaled tries fractional sizes that never get painted. Keep
         // their glyphs away from the uploaded atlas and its world-GUI mips.
-        let fonts = self.probe_fonts.get_or_insert_with(|| {
-            let _p = rustudio_core::bench::scope("gui_text_probe_init");
-            let mut probe = ctx.fonts(|fonts| {
-                Fonts::new(fonts.options().clone(), probe_font_definitions(fonts.definitions().clone()))
-            });
-            // Only their sizes are read: no glyphs are rasterized.
-            probe.set_measure_only(true);
-            probe
-        });
+        if self.probe_fonts.is_none() {
+            let make = |options, definitions| {
+                let mut probe = Fonts::new(options, probe_font_definitions(definitions));
+                // Only their sizes are read: no glyphs are rasterized.
+                probe.set_measure_only(true);
+                probe
+            };
+            if let Some(rx) = &self.probe_building {
+                match rx.try_recv() {
+                    Ok(fonts) => self.probe_fonts = Some(fonts),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => self.probe_building = None,
+                    Err(std::sync::mpsc::TryRecvError::Empty) if self.budgeted => {
+                        self.deferred += 1;
+                        return None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        let _p = rustudio_core::bench::scope("gui_text_probe_wait");
+                        self.probe_fonts = rx.recv().ok();
+                    }
+                }
+                if self.probe_fonts.is_some() {
+                    self.probe_building = None;
+                }
+            } else if self.budgeted {
+                // (made off the main thread; fitting waits for it like text
+                // over the frame's budget does)
+                let (options, definitions) = ctx.fonts(|f| (f.options().clone(), f.definitions().clone()));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let repaint = ctx.clone();
+                let spawned = std::thread::Builder::new().name("gui-probe-fonts".into()).spawn(move || {
+                    let _ = tx.send(make(options, definitions));
+                    repaint.request_repaint();
+                });
+                if spawned.is_ok() {
+                    self.probe_building = Some(rx);
+                    self.deferred += 1;
+                    return None;
+                }
+            }
+            if self.probe_fonts.is_none() {
+                let _p = rustudio_core::bench::scope("gui_text_probe_init");
+                self.probe_fonts = Some(ctx.fonts(|f| make(f.options().clone(), f.definitions().clone())));
+            }
+        }
+        let fonts = self.probe_fonts.as_mut().expect("probe fonts");
         if self.probe_frame != self.frame || fonts.font_atlas_fill_ratio() > 0.8 {
             let _p = rustudio_core::bench::scope("gui_text_probe_pass");
             fonts.begin_pass(fonts.options().clone());
@@ -392,7 +431,7 @@ pub(super) struct LocalHit {
 /// LayoutDirty / ViewportDirty bits going up the LayoutNode tree).
 pub(super) struct Memo {
     key: [u32; 28],
-    segs: Vec<Seg>,
+    pub(super) segs: Vec<Seg>,
 }
 
 pub(super) enum Seg {
@@ -2057,6 +2096,47 @@ mod tests {
             }
         }
         assert!(measured.font_atlas_fill_ratio() < painted.font_atlas_fill_ratio());
+    }
+
+    /// The fonts keep text shaped across wrap widths (vendored epaint's
+    /// ShapedCache) and shape plans per face: laying the same text out again
+    /// at other widths, sizes and pixel densities gives what fresh fonts do.
+    #[test]
+    fn text_laid_out_again_at_new_widths_matches_fresh_fonts() {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let new = || ctx.fonts(|f| Fonts::new(f.options().clone(), probe_font_definitions(f.definitions().clone())));
+        let mut warm = new();
+        let fallback: String = [0x6f22, 0x5b57, 0x20, 0x1f642].into_iter().filter_map(char::from_u32).collect();
+        let mixed = format!("é W {fallback}");
+        for pass in 0..3 {
+            for text in ["CAUTION\nWET FLOOR", "Temple Guardian Lv. 5", mixed.as_str(), "longwordwithoutbreaks", "a b c d e f g"] {
+                for size in [7.3, 13.77, 31.5] {
+                    for ppp in [1.0, 1.25] {
+                        for wrap in [300.0, 57.0, 140.0, 33.0, f32::INFINITY, 58.0] {
+                            let mut job = LayoutJob::simple(text.into(), FontId::proportional(size), Color32::WHITE, wrap);
+                            job.sections[0].format.line_height = Some(size * 1.1);
+                            job.halign = egui::Align::Center;
+                            job.round_output_to_gui = false;
+                            let a = warm.with_pixels_per_point(ppp).layout_job(job.clone());
+                            let b = new().with_pixels_per_point(ppp).layout_job(job);
+                            let what = format!("pass {pass} {text:?} {size} {wrap} {ppp}");
+                            assert_eq!(a.size(), b.size(), "{what}");
+                            assert_eq!(a.intrinsic_size(), b.intrinsic_size(), "{what}");
+                            assert_eq!(a.rows.len(), b.rows.len(), "{what}");
+                            for (ra, rb) in a.rows.iter().zip(&b.rows) {
+                                assert_eq!((ra.pos, ra.size), (rb.pos, rb.size), "{what}");
+                                let ga: Vec<_> = ra.glyphs.iter().map(|g| (g.chr, g.pos, g.advance_width, g.line_height, g.font_ascent)).collect();
+                                let gb: Vec<_> = rb.glyphs.iter().map(|g| (g.chr, g.pos, g.advance_width, g.line_height, g.font_ascent)).collect();
+                                assert_eq!(ga, gb, "{what}");
+                            }
+                        }
+                    }
+                }
+            }
+            // (the caches drop entries a while after their last use)
+            warm.begin_pass(warm.options().clone());
+        }
     }
 
     #[test]

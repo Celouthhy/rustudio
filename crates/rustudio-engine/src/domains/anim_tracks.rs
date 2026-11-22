@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use rustc_hash::FxHashSet;
+use rustudio_core::doc::{Mark, Marks, Reader};
 
 use glam::{Mat3, Quat, Vec3};
 use mlua::{Function, Lua, Table, Value};
@@ -105,9 +107,8 @@ pub struct Tracks {
     order: Vec<Ref>,
     all: HashMap<Ref, Track>,
     seqs: HashMap<String, Rc<Seq>>,
-    /// rig → (Part1 name, joint): the joints a rig's tracks animate, found
-    /// when it starts animating and kept while it does.
-    animated: rustc_hash::FxHashMap<Ref, Rc<Vec<(String, Ref)>>>,
+    /// Rig → cached animation bindings, refreshed when its topology changes.
+    animated: rustc_hash::FxHashMap<Ref, RigBindings>,
     /// The order in which rigs began posing, also used for rest-pose writes.
     animated_order: Vec<Ref>,
     /// rig → the rig Studio builds from it for retargeting (None: not an R15
@@ -118,10 +119,21 @@ pub struct Tracks {
     steps: u64,
 }
 
+struct RigBindings {
+    joints: Rc<Vec<(String, Ref)>>,
+    /// Joint and Bone references, their ancestors inside the rig, and the
+    /// endpoints that determine the binding names. A move out of the rig
+    /// leaves no ancestry path back to it in the current document.
+    dependencies: FxHashSet<Ref>,
+}
+
 fn tracks(lua: &Lua) -> mlua::AppDataRefMut<'_, Tracks> {
-    if lua.app_data_ref::<Tracks>().is_none() {
-        lua.set_app_data(Tracks::default());
+    // (One app-data lookup in the common case: this runs several times per
+    // track per frame.)
+    if let Some(t) = lua.app_data_mut::<Tracks>() {
+        return t;
     }
+    lua.set_app_data(Tracks::default());
     lua.app_data_mut::<Tracks>().expect("track state")
 }
 
@@ -617,17 +629,32 @@ fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<
     Ok(Some(r))
 }
 
-fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
+fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<RigBindings> {
     let w = world(lua)?;
     let d = w.d();
     let mut out: Vec<(String, Ref)> = Vec::new();
+    let mut dependencies = FxHashSet::default();
+    let note_hierarchy = |mut node, dependencies: &mut FxHashSet<Ref>| {
+        while node != rig && dependencies.insert(node) {
+            let Some(i) = d.dom.get_by_ref(node) else { break };
+            node = i.parent();
+        }
+    };
     for i in d.dom.descendants_of(rig) {
         // AnimationConstraint: Studio's upgraded avatar joint (anim domain).
         if i.class != "Motor6D" && i.class != "AnimationConstraint" {
             continue;
         }
+        note_hierarchy(i.referent(), &mut dependencies);
         // An AnimationConstraint's parts come from its attachments (its
         // Part0 / Part1 getters, anim.rs prop_get).
+        if i.class == "AnimationConstraint" {
+            for key in ["Attachment0", "Attachment1"] {
+                if let Some(Variant::Ref(a)) = d.prop(i.referent(), key) {
+                    dependencies.insert(a);
+                }
+            }
+        }
         let stored = match d.prop(i.referent(), "Part1") {
             Some(Variant::Ref(p)) if p.is_some() => Some(p),
             _ => None,
@@ -638,6 +665,7 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
         };
         let p1 = if i.class == "AnimationConstraint" { derived().or(stored) } else { stored };
         let Some(p1) = p1.filter(|p| p.is_some()) else { continue };
+        dependencies.insert(p1);
         let Some(name) = d.dom.get_by_ref(p1).map(|p| p.name.clone()) else { continue };
         // The last one found for a name wins (a table keyed by name).
         if let Some(e) = out.iter_mut().find(|e| e.0 == name) {
@@ -650,7 +678,11 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
     // Bones); a joint already posed through a Motor6D's Part1 keeps that.
     let joints = out.len();
     for i in d.dom.descendants_of(rig) {
-        if i.class != "Bone" || out[..joints].iter().any(|e| e.0 == i.name) {
+        if i.class != "Bone" {
+            continue;
+        }
+        note_hierarchy(i.referent(), &mut dependencies);
+        if out[..joints].iter().any(|e| e.0 == i.name) {
             continue;
         }
         if let Some(e) = out[joints..].iter_mut().find(|e| e.0 == i.name) {
@@ -659,7 +691,47 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<Vec<(String, Ref)>> {
             out.push((i.name.clone(), i.referent()));
         }
     }
-    Ok(out)
+    Ok(RigBindings { joints: Rc::new(out), dependencies })
+}
+
+fn dirty_bindings(lua: &Lua) -> mlua::Result<FxHashSet<Ref>> {
+    let mut w = world(lua)?;
+    let t = tracks(lua);
+    if t.animated.is_empty() {
+        // Establish a journal position before recording the first bindings.
+        w.dm().marks_for(Reader::AnimatorBindings);
+        return Ok(FxHashSet::default());
+    }
+    let Marks::Some(marks) = w.dm().marks_for(Reader::AnimatorBindings) else {
+        return Ok(t.animated.keys().copied().collect());
+    };
+    let d = w.d();
+    let mut changed = FxHashSet::default();
+    let mut dirty = FxHashSet::default();
+    for mark in marks {
+        match mark {
+            Mark::Tree(r) => {
+                changed.insert(r);
+                let mut node = r;
+                while let Some(i) = d.dom.get_by_ref(node) {
+                    if t.animated.contains_key(&node) {
+                        dirty.insert(node);
+                    }
+                    node = i.parent();
+                }
+            }
+            Mark::Prop(r, key) if matches!(key.as_str(), "Part0" | "Part1" | "Attachment0" | "Attachment1") => {
+                changed.insert(r);
+            }
+            _ => {}
+        }
+    }
+    if !changed.is_empty() {
+        dirty.extend(t.animated.iter().filter_map(|(rig, bindings)| {
+            bindings.dependencies.iter().any(|r| changed.contains(r)).then_some(*rig)
+        }));
+    }
+    Ok(dirty)
 }
 
 fn write_transforms(lua: &Lua, pose: impl IntoIterator<Item = (Ref, Xform)>) -> mlua::Result<()> {
@@ -804,21 +876,34 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     }
     drop(advance);
     let _pose = rustudio_core::bench::scope("anim_tracks_pose");
+    let dirty = if by_rig.is_empty() {
+        FxHashSet::default()
+    } else {
+        dirty_bindings(lua)?
+    };
+    if !dirty.is_empty() {
+        let mut t = tracks(lua);
+        t.char_rigs.retain(|r, _| !dirty.contains(r));
+        t.retargeters.retain(|(_, r), _| !dirty.contains(r));
+    }
     let mut retarget_on: Option<bool> = None;
     let mut rigs = Vec::with_capacity(by_rig.len());
     for (rig, list) in &by_rig {
         let joints = {
             let t = tracks(lua);
-            t.animated.get(rig).cloned()
+            t.animated.get(rig).map(|bindings| bindings.joints.clone())
         };
         let joints = match joints {
-            Some(j) => j,
-            None => {
-                let j = Rc::new(joints_of(lua, *rig)?);
+            Some(j) if !dirty.contains(rig) => j,
+            previous => {
+                let bindings = joints_of(lua, *rig)?;
+                let joints = bindings.joints.clone();
                 let mut state = tracks(lua);
-                state.animated.insert(*rig, j.clone());
-                state.animated_order.push(*rig);
-                j
+                state.animated.insert(*rig, bindings);
+                if previous.is_none() {
+                    state.animated_order.push(*rig);
+                }
+                joints
             }
         };
         let mut posing: Vec<PoseTrack> = {
@@ -915,8 +1000,8 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
             if rig_at.contains_key(r) {
                 return true;
             }
-            if let Some(joints) = t.animated.remove(r) {
-                gone.push(joints);
+            if let Some(bindings) = t.animated.remove(r) {
+                gone.push(bindings.joints);
             }
             t.char_rigs.remove(r);
             t.retargeters.retain(|k, _| k.1 != *r);

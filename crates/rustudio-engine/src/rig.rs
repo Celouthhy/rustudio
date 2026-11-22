@@ -1420,7 +1420,7 @@ impl Rig {
 
     /// World CFrames of every part for a root placement and each joint's
     /// Motor6D.Transform, keyed by the motor (Part1 = Part0 · C0 · Transform · C1⁻¹).
-    pub fn solve(&self, root: Xform, transforms: &HashMap<Ref, Xform>) -> Vec<(Ref, Xform)> {
+    pub fn solve<S: std::hash::BuildHasher>(&self, root: Xform, transforms: &HashMap<Ref, Xform, S>) -> Vec<(Ref, Xform)> {
         let mut world = rustc_hash::FxHashMap::with_capacity_and_hasher(self.joints.len() + 1, Default::default());
         world.insert(self.root, root);
         let mut out = Vec::with_capacity(self.joints.len() + self.attached.len() + 1);
@@ -1467,7 +1467,7 @@ pub fn character_pool(rigs: usize) -> Option<&'static rapier3d::rayon::ThreadPoo
 }
 
 /// Writes solved part CFrames into a document.
-pub fn write_pose(doc: &mut Document, pose: &[(Ref, Xform)], map: Option<&HashMap<Ref, Ref>>) {
+pub fn write_pose(doc: &mut Document, pose: &[(Ref, Xform)], map: Option<&rustudio_core::RefMap>) {
     let key = ustr("CFrame");
     for (r, xf) in pose {
         let target = match map {
@@ -1778,6 +1778,70 @@ mod hip_tests {
 /// Humanoid.Touched(otherPart, limb): fired with a touch that starts
 /// between a character's body part (a direct child of the Humanoid's
 /// model) and anything else, for each side that is one.
+/// `find_child(model, "Humanoid")`, remembered per model until the next tree
+/// change in the document (`tree_revision`). A touch reaches here for both
+/// parts of every touching pair, and a map's parts sit in Models with
+/// thousands of children: scanning them was ~6% of a large test place's Play step.
+/// (The child count guards against an edit that skipped the journal.)
+fn humanoid_child(d: &Document, model: Ref) -> Option<Ref> {
+    #[derive(Default)]
+    struct Memo {
+        doc: u64,
+        tree_revision: u64,
+        journal_pos: u64,
+        map: rustc_hash::FxHashMap<Ref, (Option<Ref>, usize)>,
+    }
+    thread_local! {
+        static MEMO: std::cell::RefCell<Memo> = Default::default();
+    }
+    let children = d.dom.get_by_ref(model)?.children().len();
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.doc != d.id || m.map.len() > 4096 {
+            m.doc = d.id;
+            m.map.clear();
+        } else if m.tree_revision != d.tree_revision {
+            // A tree change can only change the answer for the parent it
+            // lands under (a child added there, or the remembered Humanoid
+            // moved / removed: the parent check below). Without the marks
+            // (dropped already), start over.
+            match d.marks_since(m.journal_pos) {
+                Some(marks) => {
+                    for mark in marks {
+                        if let doc::Mark::Tree(t) = *mark {
+                            if let Some(i) = d.dom.get_by_ref(t) {
+                                // A child that isn't a Humanoid can't become the
+                                // first Humanoid child: only the count moves.
+                                let parent = i.parent();
+                                if i.class == "Humanoid" {
+                                    m.map.remove(&parent);
+                                } else if let Some(e) = m.map.get_mut(&parent) {
+                                    e.1 = d.dom.get_by_ref(parent).map_or(0, |p| p.children().len());
+                                }
+                            }
+                        }
+                    }
+                }
+                None => m.map.clear(),
+            }
+        }
+        m.tree_revision = d.tree_revision;
+        m.journal_pos = d.journal_end();
+        if let Some(&(h, n)) = m.map.get(&model) {
+            let still = match h {
+                Some(h) => d.dom.get_by_ref(h).is_some_and(|i| i.parent() == model && i.class == "Humanoid"),
+                None => true,
+            };
+            if n == children && still {
+                return h;
+            }
+        }
+        let h = d.find_child(model, "Humanoid");
+        m.map.insert(model, (h, children));
+        h
+    })
+}
+
 pub fn fire_humanoid_touched(rt: &crate::runtime::Runtime, a: Ref, b: Ref) {
     for (limb, other) in [(a, b), (b, a)] {
         let h = rt.world_mut().and_then(|w| {
@@ -1786,7 +1850,7 @@ pub fn fire_humanoid_touched(rt: &crate::runtime::Runtime, a: Ref, b: Ref) {
             if model.is_none() || d.dom.get_by_ref(model)?.class != "Model" {
                 return None;
             }
-            d.find_child(model, "Humanoid")
+            humanoid_child(d, model)
         });
         if let Some(h) = h {
             rt.fire(h, "Touched", vec![rt.inst(other), rt.inst(limb)]);

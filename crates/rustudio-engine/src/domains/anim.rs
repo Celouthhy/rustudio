@@ -692,6 +692,12 @@ print("anim-pass")
     }
 
     #[test]
+    fn animator_rebinds_while_a_track_keeps_playing() {
+        let probe = include_str!("../../../../tools/parity_probe/joint_offsets/rebind_motor.luau");
+        run(&format!("{probe}\nprint(\"anim-pass\")"), 80);
+    }
+
+    #[test]
     fn curve_animation_from_script_keys_plays() {
         run(r#"
 local model = Instance.new("Model", workspace)

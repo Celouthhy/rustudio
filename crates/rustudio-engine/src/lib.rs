@@ -31,6 +31,7 @@ pub mod anim_replicate;
 pub mod rig;
 pub mod runtime;
 pub mod play_teleport;
+pub mod tool_grip;
 pub mod script_profiler;
 pub mod globals_parity;
 pub mod sharedtable;

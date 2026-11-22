@@ -83,6 +83,7 @@ pub fn base(id: &str, bytes: &[u8]) -> Option<Arc<Base>> {
     if let Ok(mut g) = BASES.lock() {
         g.insert(id.to_string(), b.clone());
     }
+    rustudio_core::assets::bump_mesh_generation();
     b
 }
 
@@ -92,6 +93,7 @@ pub fn forget_base(id: &str) {
     if let Ok(mut b) = BASES.lock() {
         b.remove(id);
     }
+    rustudio_core::assets::bump_mesh_generation();
     rig_changed();
 }
 
@@ -326,6 +328,13 @@ static RIG_INDEX: std::sync::LazyLock<Mutex<HashMap<u64, RigIndex>>> =
 pub fn deps_of(doc: &Document, part: Ref, mesh: Option<&str>) -> Vec<Ref> {
     if let Some(base) = mesh.and_then(cached_base) {
         return lookup(doc, part, &base).deps.clone();
+    }
+    // No FaceControls below the part and no Bone in its jointed assembly
+    // (has_bones, from the rig index built once per model): nothing to
+    // find. Walking the whole model for joints for every mesh part made
+    // opening a large test place (50k parts) spend 10 s here.
+    if !has_bones(doc, part) {
+        return Vec::new();
     }
     let mut out = face_controls(doc, part);
     out.extend(bones_of(doc, part));
@@ -879,6 +888,47 @@ mod tests {
         // (0,0,0.25) relative to the jaw turned 90° about X → (0,-0.25,0).
         assert!(p[1].abs_diff_eq(Vec3::new(0.0, -0.75, 0.0), 1e-5), "{:?}", p[1]);
         let _ = b;
+    }
+
+    // deps_of's early out (has_bones) gives what the full walk gives: a
+    // Bone or FaceControls on the part, on a welded part of its model, on
+    // an unjointed part of that model, or nowhere.
+    #[test]
+    fn deps_of_early_out_matches_the_walk() {
+        use rbx_dom_weak::InstanceBuilder;
+        let walk = |doc: &rustudio_core::doc::Document, part: Ref| {
+            let mut out = face_controls(doc, part);
+            out.extend(bones_of(doc, part));
+            out
+        };
+        for case in 0..5 {
+            let mut doc = rustudio_core::doc::Document::new_place();
+            let ws = doc.workspace().unwrap();
+            let model = doc.dom.insert(ws, InstanceBuilder::new("Model"));
+            let parts: Vec<Ref> = (0..6)
+                .map(|i| doc.dom.insert(model, InstanceBuilder::new("MeshPart").with_name(format!("P{i}"))))
+                .collect();
+            let loose = doc.dom.insert(ws, InstanceBuilder::new("MeshPart").with_name("Loose"));
+            // P0-P1-P2 welded; P3-P4 welded; P5 alone.
+            for (a, b) in [(0, 1), (1, 2), (3, 4)] {
+                doc.dom.insert(model, InstanceBuilder::new("Weld")
+                    .with_property("Part0", parts[a])
+                    .with_property("Part1", parts[b]));
+            }
+            match case {
+                1 => { doc.dom.insert(parts[2], InstanceBuilder::new("Bone").with_name("B")); }
+                2 => { doc.dom.insert(parts[4], InstanceBuilder::new("FaceControls")); }
+                3 => { doc.dom.insert(parts[5], InstanceBuilder::new("Bone").with_name("C")); }
+                4 => { doc.dom.insert(loose, InstanceBuilder::new("Bone").with_name("D")); }
+                _ => {}
+            }
+            rig_changed();
+            for &p in parts.iter().chain([&loose]) {
+                assert_eq!(deps_of(&doc, p, None), walk(&doc, p), "case {case}");
+            }
+            // (the welded group finds its Bone through the joints)
+            assert_eq!(!deps_of(&doc, parts[0], None).is_empty(), case == 1, "case {case}");
+        }
     }
 
     #[test]

@@ -446,8 +446,14 @@ pub fn parse_shortcut(s: &str) -> Option<KeyboardShortcut> {
 }
 
 /// Every (shortcut, action) in the menus, most modifiers first (so
-/// Ctrl+Shift+V is taken before Ctrl+V).
-pub fn menu_shortcuts() -> Vec<(KeyboardShortcut, &'static str)> {
+/// Ctrl+Shift+V is taken before Ctrl+V). The menus are a static table, so
+/// this is worked out once (it was parsed every frame).
+pub fn menu_shortcuts() -> &'static [(KeyboardShortcut, &'static str)] {
+    static ALL: std::sync::OnceLock<Vec<(KeyboardShortcut, &'static str)>> = std::sync::OnceLock::new();
+    ALL.get_or_init(build_menu_shortcuts)
+}
+
+fn build_menu_shortcuts() -> Vec<(KeyboardShortcut, &'static str)> {
     fn walk(items: &'static [M], out: &mut Vec<(KeyboardShortcut, &'static str)>) {
         for m in items {
             match m {

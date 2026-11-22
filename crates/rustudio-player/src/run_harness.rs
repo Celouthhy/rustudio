@@ -659,6 +659,17 @@ impl HarnessAction {
         Some(v)
     }
 
+    /// `--rhold S:HOLD`: the right button held from S for HOLD seconds, the
+    /// mouse still (a game's hold-to-aim).
+    pub fn parse_rhold(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (at, hold) = s.split_once(':')?;
+        let (at, hold): (f32, f32) = (at.trim().parse().ok()?, hold.trim().parse().ok()?);
+        Some(vec![
+            (at, HarnessAction::RightButton(true)),
+            (at + hold, HarnessAction::RightButton(false)),
+        ])
+    }
+
     /// `--rdrag DX,DY@S`: right-drag over the view: press at S, move DX,DY
     /// pixels in 10 steps over 0.5 s, let go at S + 0.6.
     pub fn parse_rdrag(s: &str) -> Option<Vec<(f32, HarnessAction)>> {

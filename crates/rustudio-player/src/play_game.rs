@@ -2494,17 +2494,17 @@ impl Game {
     /// with its own ClickDetector is still clicked).
     fn click_pick(&mut self, side: Side, ray: &rustudio_core::math::Ray, first: Option<(Ref, Vec3)>) -> Option<(Ref, Vec3)> {
         let mut hit = first;
-        let mut skip: Vec<Ref> = self.own_parts().into_iter().collect();
+        let mut skip = self.own_parts();
         for _ in 0..32 {
             let (r, _) = hit?;
             if !self.click_passes(side, r) {
                 return hit;
             }
-            skip.push(r);
+            skip.insert(r);
             let (o, d) = (ray.origin, ray.dir);
             self.server_front();
             let next = self.with_side(side, |rt, _, _| {
-                rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, &skip)
+                rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, skip.clone())
             });
             self.shown_front();
             hit = next.flatten().map(|(r, t)| (r, ray.at(t)));
@@ -2527,12 +2527,12 @@ impl Game {
     /// workspace:Raycast meets it; the drawn boxes only when that side has no
     /// runtime.
     fn mouse_pick(&mut self, side: Side, ray: &rustudio_core::math::Ray) -> Option<(Ref, f32)> {
-        let skip: Vec<Ref> = self.own_parts().into_iter().collect();
+        let skip = self.own_parts();
         let (o, d) = (ray.origin, ray.dir);
         // (with_side wants the server in front; the viewport has the shown side there)
         self.server_front();
         let hit = self.with_side(side, |rt, _, _| {
-            rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, &skip)
+            rustudio_engine::runtime::ext::mouse_part_hit(&rt.lua, o, d, rustudio_core::mech::MOUSE_RAY_LENGTH, skip)
         });
         self.shown_front();
         match hit {
@@ -2542,18 +2542,37 @@ impl Game {
     }
 
     /// The player's own character and tool on the shown side (they don't
-    /// block the mouse).
-    fn own_parts(&self) -> HashSet<Ref> {
+    /// block the mouse). (Fx-hashed and copied whole on the server side:
+    /// the set holds every simulated character part, and rebuilding it as a
+    /// SipHash set twice per frame was ~2% of the gameplay worker.)
+    fn own_parts(&self) -> rustc_hash::FxHashSet<Ref> {
         self
             .play
             .as_ref()
             .map(|s| match s.showing {
-                Side::Server => s.physics_skip().iter().copied().collect(),
-                Side::Client => s
-                    .physics_skip()
-                    .iter()
-                    .filter_map(|r| s.map.s2c.get(r).copied())
-                    .collect(),
+                Side::Server => s.physics_skip().clone(),
+                Side::Client => {
+                    // (Mapped again only when the set or the map changed:
+                    // ~1,600 SipHash map lookups a frame on a test place.)
+                    use std::hash::{BuildHasher, Hash, Hasher};
+                    let skip = s.physics_skip();
+                    let build = rustc_hash::FxBuildHasher;
+                    let print = skip.iter().fold(0u64, |acc, r| {
+                        let mut h = build.build_hasher();
+                        r.hash(&mut h);
+                        acc.wrapping_add(h.finish())
+                    });
+                    let key = (print, skip.len(), s.map.revision());
+                    let mut cache = s.own_client.borrow_mut();
+                    match cache.as_ref() {
+                        Some((k, set)) if *k == key => set.clone(),
+                        _ => {
+                            let set: rustc_hash::FxHashSet<Ref> = skip.iter().filter_map(|r| s.map.s2c.get(r).copied()).collect();
+                            *cache = Some((key, set.clone()));
+                            set
+                        }
+                    }
+                }
             })
             .unwrap_or_default()
     }

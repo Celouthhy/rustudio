@@ -108,9 +108,9 @@ impl Editor {
                 None,
             ),
             "lock" | "anchor" => {
-                let parts = self.selected_parts();
+                let any = !self.selected_parts_shared().is_empty();
                 let prop = if a == "lock" { "Locked" } else { "Anchored" };
-                (edit && !parts.is_empty(), Some(!parts.is_empty() && self.parts_have(&parts, prop)))
+                (edit && any, Some(any && self.selected_parts_all(prop)))
             }
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
@@ -148,7 +148,7 @@ impl Editor {
             "part" | "part_block" | "part_sphere" | "part_wedge" | "part_corner" | "part_cylinder" => (edit, None),
             "gui" | "script" => (edit, None),
             "effect" | "attachment" | "material" | "color" => (edit && self.has_selected_parts(), None),
-            "weld" => (edit && self.selected_parts().len() >= 2, None),
+            "weld" => (edit && self.selected_parts_shared().len() >= 2, None),
             "ui_frame" | "ui_label" | "ui_input" | "ui_appearance" | "ui_layout" | "ui_constraint" => {
                 (edit && self.gui_target().is_some(), None)
             }
@@ -618,7 +618,11 @@ impl Editor {
     pub fn menu_shortcut_actions(&mut self, ctx: &egui::Context) -> Vec<&'static str> {
         let mut out = Vec::new();
         ctx.input_mut(|i| {
-            for (k, a) in menu_shortcuts() {
+            // (only a key press can match a shortcut)
+            if !i.events.iter().any(|e| matches!(e, egui::Event::Key { .. })) {
+                return;
+            }
+            for &(k, a) in menu_shortcuts() {
                 // Clipboard keys come as egui events; Del, F5, F8 and
                 // Shift+F5 go through the editor's own paths.
                 if matches!(a, "cut" | "copy" | "paste" | "test" | "run" | "stop" | "delete") {

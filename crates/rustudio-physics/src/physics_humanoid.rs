@@ -1178,7 +1178,7 @@ impl Physics {
     /// root's frame while it idles, walks, runs and presses against a wall
     /// (hands up to 1.6 studs ahead, UpperTorso 0.26). A part outside the
     /// rig counts where its collider is.
-    fn humanoid_rest_mass(&mut self, model: Ref, rest: &std::collections::HashMap<Ref, Xform>) {
+    fn humanoid_rest_mass<S: std::hash::BuildHasher>(&mut self, model: Ref, rest: &std::collections::HashMap<Ref, Xform, S>) {
         let Some(h) = self.hums.by_model.get(&model) else { return };
         let total = h
             .parts
@@ -1213,7 +1213,7 @@ impl Physics {
     /// set it from the same rest pose on this same body already: the mass
     /// depends only on the rest pose and the colliders outside the rig,
     /// which no pose moves).
-    pub fn set_humanoid_pose_with(&mut self, model: Ref, local: &std::collections::HashMap<Ref, Xform>, rest: Option<&std::collections::HashMap<Ref, Xform>>) {
+    pub fn set_humanoid_pose_with<S: std::hash::BuildHasher, T: std::hash::BuildHasher>(&mut self, model: Ref, local: &std::collections::HashMap<Ref, Xform, S>, rest: Option<&std::collections::HashMap<Ref, Xform, T>>) {
         if let Some(rest) = rest {
             self.humanoid_rest_mass(model, rest);
         }
@@ -1708,7 +1708,7 @@ impl Physics {
 
     /// The owning client's movers on its character (read each frame from
     /// the client document; replicated ones are the server's already).
-    pub fn set_client_movers(&mut self, cd: &Document, c2s: &std::collections::HashMap<Ref, Ref>, client_model: Ref) {
+    pub fn set_client_movers(&mut self, cd: &Document, c2s: &rustudio_core::RefMap, client_model: Ref) {
         self.hums.foreign.clear();
         self.hums.foreign_descs.clear();
         self.hums.foreign_att.clear();
@@ -1765,7 +1765,7 @@ impl Physics {
     /// has, as in Studio, where the owner's own DataModel drives them (probe
     /// T13: the LocalScript sets the vehicle's VectorForce.Force; the server
     /// never sees it, and the vehicle accelerates at F / m all the same).
-    pub fn set_owned_movers(&mut self, cd: &Document, s2c: &std::collections::HashMap<Ref, Ref>, c2s: &std::collections::HashMap<Ref, Ref>, owned: &[Ref]) {
+    pub fn set_owned_movers(&mut self, cd: &Document, s2c: &rustudio_core::RefMap, c2s: &rustudio_core::RefMap, owned: &[Ref]) {
         self.hums.owned_movers.clear();
         if owned.is_empty() {
             return;

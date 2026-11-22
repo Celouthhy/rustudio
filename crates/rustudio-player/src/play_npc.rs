@@ -32,7 +32,7 @@ pub(crate) struct Npc {
     hum: Humanoid,
     had_floor: bool,
     floor_part: Option<Ref>,
-    transforms: HashMap<Ref, Xform>,
+    transforms: rustc_hash::FxHashMap<Ref, Xform>,
     last_speed: f32,
     last_root: Option<Xform>,
     floor_material: u32,
@@ -45,7 +45,7 @@ pub(crate) struct Npc {
     view: Option<NpcView>,
     /// The rig's own pose (no Transforms), relative to the root: fixed for
     /// the rig read at the start.
-    rest: Option<HashMap<Ref, Xform>>,
+    rest: Option<rustc_hash::FxHashMap<Ref, Xform>>,
     /// The body `transforms` were last put on (`npc_pose`): the same
     /// Transforms on the same body put every collider where it already is.
     posed_on: Option<rapier3d::prelude::RigidBodyHandle>,
@@ -91,6 +91,13 @@ pub(crate) struct Npcs {
     pub(super) events: Vec<NpcEvent>,
     /// Descendant of a driven model → (the model, whether it is a BasePart).
     member_of: rustc_hash::FxHashMap<Ref, (Ref, bool)>,
+    /// Every Humanoid seen under Workspace since the last full scan (some may
+    /// have left since), kept from the journal's tree changes up to
+    /// `cands_pos`: a scan reads these instead of walking the whole
+    /// Workspace (a large test place: ~116k instances every 30 frames, ~2.5% of the
+    /// Play step). None: walk it again.
+    cands: Option<rustc_hash::FxHashSet<Ref>>,
+    cands_pos: u64,
 }
 
 impl Npcs {
@@ -122,29 +129,79 @@ impl Game {
     fn npc_scan(&mut self) {
         let Some(ws) = self.doc.workspace() else { return };
         let mine = self.play.as_ref().and_then(|s| s.character.as_ref()).map(|c| c.model);
-        let mut found: Vec<(Ref, Ref, Ref)> = Vec::new();
-        for i in self.doc.dom.descendants_of(ws) {
-            if i.class != "Humanoid" {
-                continue;
+        let doc = &self.doc;
+        let drivable = |h: Ref| -> Option<(Ref, Ref, Ref)> {
+            let model = doc.dom.get_by_ref(h)?.parent();
+            if Some(model) == mine || !doc.class_of(model).is_some_and(|c| c == "Model") {
+                return None;
             }
-            let model = i.parent();
-            if Some(model) == mine || !self.doc.class_of(model).is_some_and(|c| c == "Model") {
-                continue;
+            let root = doc.find_named(model, "HumanoidRootPart")?;
+            if !doc.class_of(root).is_some_and(|c| doc::is_a(&c, "BasePart")) {
+                return None;
             }
-            let Some(root) = self.doc.find_named(model, "HumanoidRootPart") else { continue };
-            if !self.doc.class_of(root).is_some_and(|c| doc::is_a(&c, "BasePart")) {
-                continue;
-            }
-            let health = match self.doc.prop(i.referent(), "Health") {
+            let health = match doc.prop(h, "Health") {
                 Some(Variant::Float32(h)) => h,
                 _ => 100.0,
             };
             // (Health_XML is how files store it.)
-            let anchored = matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true)));
+            let anchored = matches!(doc.prop(root, "Anchored"), Some(Variant::Bool(true)));
             if health <= 0.0 || anchored {
-                continue;
+                return None;
             }
-            found.push((model, i.referent(), root));
+            Some((model, h, root))
+        };
+        // The known Humanoids, brought up to date with the tree changes the
+        // journal (npc_journal) hasn't handed over yet, still under Workspace.
+        let known = self.play.as_mut().and_then(|s| s.npcs.cands.take()).and_then(|mut cands| {
+            for m in doc.marks_since(self.play.as_ref()?.npcs.cands_pos)? {
+                if let doc::Mark::Tree(t) = *m {
+                    cands.extend(doc.subtree(t).into_iter().filter(|r| doc.class_of(*r).is_some_and(|c| c == "Humanoid")));
+                }
+            }
+            cands.retain(|&h| doc.class_of(h).is_some_and(|c| c == "Humanoid") && doc.is_ancestor(ws, h));
+            Some(cands)
+        });
+        let by_model = self.play.as_ref().map(|s| &s.npcs.by_model);
+        let quick = known.as_ref().and_then(|cands| {
+            let found: Vec<(Ref, Ref, Ref)> = cands.iter().filter_map(|&h| drivable(h)).collect();
+            // A new character's place in the scan order decides when it is
+            // added: with more than one new, walk in document order.
+            let new = found.iter().filter(|f| by_model.is_none_or(|m| !m.contains_key(&f.0))).count();
+            (new <= 1).then_some(found)
+        });
+        // RUSTUDIO_NPC_SCAN_CHECK=1: the full walk as well, compared.
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if let (Some(q), true) = (&quick, *CHECK.get_or_init(|| std::env::var_os("RUSTUDIO_NPC_SCAN_CHECK").is_some())) {
+            let full: Vec<(Ref, Ref, Ref)> =
+                doc.dom.descendants_of(ws).filter(|i| i.class == "Humanoid").filter_map(|i| drivable(i.referent())).collect();
+            let key = |v: &[(Ref, Ref, Ref)]| {
+                let mut k: Vec<String> = v.iter().map(|f| format!("{:?}", f)).collect();
+                k.sort();
+                k
+            };
+            rustudio_core::bench::add("npc_scan_checked", 0.0, 1);
+            if key(q) != key(&full) {
+                rustudio_core::bench::add("npc_scan_mismatch", 0.0, 1);
+                eprintln!("NPC_SCAN_CHECK mismatch: quick {} full {}", q.len(), full.len());
+            }
+        }
+        let (found, cands) = match quick {
+            Some(found) => (found, known.unwrap_or_default()),
+            None => {
+                let mut found: Vec<(Ref, Ref, Ref)> = Vec::new();
+                let mut cands = rustc_hash::FxHashSet::default();
+                for i in doc.dom.descendants_of(ws) {
+                    if i.class != "Humanoid" {
+                        continue;
+                    }
+                    cands.insert(i.referent());
+                    found.extend(drivable(i.referent()));
+                }
+                (found, cands)
+            }
+        };
+        if let Some(s) = self.play.as_mut() {
+            s.npcs.cands = Some(cands);
         }
         let keep: HashSet<Ref> = found.iter().map(|f| f.0).collect();
         let gone: Vec<Ref> = self
@@ -183,7 +240,7 @@ impl Game {
                 hum: Humanoid { state: State::Freefall, bal_p: rustudio_physics::humanoid::BAL_P_FREEFALL, ..Default::default() },
                 had_floor: false,
                 floor_part: None,
-                transforms: HashMap::new(),
+                transforms: Default::default(),
                 last_speed: -1.0,
                 last_root: None,
                 floor_material: mech::MATERIAL_AIR,
@@ -264,12 +321,12 @@ impl Game {
                 self.npc_remove(model);
                 continue;
             }
-            let health = match self.doc.prop(humanoid, "Health") {
+            let health = match self.doc.prop_key(humanoid, rustudio_core::ukey!("Health")) {
                 Some(Variant::Float32(v)) => v,
                 Some(Variant::Float64(v)) => v as f32,
                 _ => 100.0,
             };
-            if health <= 0.0 || matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true))) {
+            if health <= 0.0 || matches!(self.doc.prop_key(root, rustudio_core::ukey!("Anchored")), Some(Variant::Bool(true))) {
                 self.npc_remove(model);
                 continue;
             }
@@ -357,29 +414,29 @@ impl Game {
         // Humanoids whose Jump latch the state machine used up this frame.
         let mut jump_spent: Vec<Ref> = Vec::new();
         for (model, humanoid, root, root_xf, root_v, root_w, floor) in sensed.into_iter().flatten() {
-            let f = |name: &str, d: f32| match self.doc.prop(humanoid, name) {
+            let f = |name: rbx_dom_weak::Ustr, d: f32| match self.doc.prop_key(humanoid, name) {
                 Some(Variant::Float32(v)) => v,
                 Some(Variant::Float64(v)) => v as f32,
                 _ => d,
             };
-            let b = |name: &str, d: bool| match self.doc.prop(humanoid, name) {
+            let b = |name: rbx_dom_weak::Ustr, d: bool| match self.doc.prop_key(humanoid, name) {
                 Some(Variant::Bool(v)) => v,
                 _ => d,
             };
             // The Humanoid's values (the server's).
-            let speed = f("WalkSpeed", mech::WALK_SPEED);
-            let jump_velocity = if b("UseJumpPower", true) {
-                f("JumpPower", mech::JUMP_POWER)
+            let speed = f(rustudio_core::ukey!("WalkSpeed"), mech::WALK_SPEED);
+            let jump_velocity = if b(rustudio_core::ukey!("UseJumpPower"), true) {
+                f(rustudio_core::ukey!("JumpPower"), mech::JUMP_POWER)
             } else {
-                ((2.0 * gravity * f("JumpHeight", mech::JUMP_HEIGHT)).max(0.0).sqrt() / mech::JUMP_TAKEOFF_FACTOR).clamp(0.0, mech::JUMP_SPEED_MAX)
+                ((2.0 * gravity * f(rustudio_core::ukey!("JumpHeight"), mech::JUMP_HEIGHT)).max(0.0).sqrt() / mech::JUMP_TAKEOFF_FACTOR).clamp(0.0, mech::JUMP_SPEED_MAX)
             };
-            let max_slope = f("MaxSlopeAngle", mech::MAX_SLOPE_DEG);
-            let hip_height = f("HipHeight", 0.0);
-            let auto_rotate = b("AutoRotate", true);
-            let sit = b("Sit", false);
-            let platform = b("PlatformStand", false);
-            let jump_prop = b("Jump", false);
-            let move_dir = match self.doc.prop(humanoid, "MoveDirection") {
+            let max_slope = f(rustudio_core::ukey!("MaxSlopeAngle"), mech::MAX_SLOPE_DEG);
+            let hip_height = f(rustudio_core::ukey!("HipHeight"), 0.0);
+            let auto_rotate = b(rustudio_core::ukey!("AutoRotate"), true);
+            let sit = b(rustudio_core::ukey!("Sit"), false);
+            let platform = b(rustudio_core::ukey!("PlatformStand"), false);
+            let jump_prop = b(rustudio_core::ukey!("Jump"), false);
+            let move_dir = match self.doc.prop_key(humanoid, rustudio_core::ukey!("MoveDirection")) {
                 Some(Variant::Vector3(v)) => Vec3::new(v.x, v.y, v.z),
                 _ => Vec3::ZERO,
             };
@@ -502,6 +559,19 @@ impl Game {
         let marks = self.doc.marks_for(doc::Reader::Npcs);
         let Some(s) = self.play.as_mut() else { return };
         let npcs = &mut s.npcs;
+        // The scan's Humanoids: new ones arrive by tree changes.
+        npcs.cands_pos = self.doc.journal_end();
+        match (&marks, npcs.cands.as_mut()) {
+            (doc::Marks::All, _) => npcs.cands = None,
+            (doc::Marks::Some(list), Some(cands)) => {
+                for m in list {
+                    if let doc::Mark::Tree(t) = *m {
+                        cands.extend(self.doc.subtree(t).into_iter().filter(|r| self.doc.class_of(*r).is_some_and(|c| c == "Humanoid")));
+                    }
+                }
+            }
+            _ => {}
+        }
         let mut dirty: Vec<Ref> = Vec::new();
         // The player's character: something put in it (a part welded on, an
         // accessory) gets carried by its rig too (Rig::refresh_attached).
@@ -555,6 +625,35 @@ impl Game {
         if mine_dirty {
             if let Some(ch) = s.character.as_mut().filter(|c| self.doc.exists(c.model)) {
                 ch.rig.refresh_attached(&self.doc, ch.model);
+                // A part welded on since spawn joins the character's assembly
+                // (Roblox moves it as one body with it): out of the loose
+                // simulation, as the spawn's parts are. Left there, it was
+                // simulated on its own as well and fell away from the body (an
+                // accessory's welded copy was destroyed below
+                // FallenPartsDestroyHeight while its original stayed hidden).
+                // One unwelded again goes back to the loose simulation.
+                if !ch.dead {
+                    let now: HashSet<Ref> = ch.rig.attached.iter().map(|a| a.handle).collect();
+                    let mut changed: Vec<Ref> = Vec::new();
+                    for r in &now {
+                        if !s.physics.skip.contains(r) {
+                            s.physics.skip.insert(*r);
+                            ch.carried.insert(*r);
+                            changed.push(*r);
+                        }
+                    }
+                    let gone: Vec<Ref> = ch.carried.iter().copied().filter(|r| !now.contains(r)).collect();
+                    for r in gone {
+                        ch.carried.remove(&r);
+                        s.physics.skip.remove(&r);
+                        if self.doc.exists(r) {
+                            changed.push(r);
+                        }
+                    }
+                    if !changed.is_empty() {
+                        s.physics.refresh(changed);
+                    }
+                }
             }
         }
         for m in dirty {
@@ -572,7 +671,7 @@ impl Game {
         let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
         let key = ustr("Transform");
         for (model, n) in s.npcs.by_model.iter_mut() {
-            let mut transforms = HashMap::new();
+            let mut transforms = rustc_hash::FxHashMap::with_capacity_and_hasher(n.rig.joints.len(), Default::default());
             for j in &n.rig.joints {
                 if let Some(Variant::CFrame(cf)) = self.doc.dom.get_by_ref(j.motor).and_then(|i| i.properties.get(&key)) {
                     transforms.insert(j.motor, Xform::from_cframe(cf));
@@ -584,8 +683,8 @@ impl Game {
             if body.is_some() && n.posed_on == body && transforms == n.transforms {
                 continue;
             }
-            let local: HashMap<Ref, Xform> = n.rig.solve(ident, &transforms).into_iter().collect();
-            let rest = n.rest.get_or_insert_with(|| n.rig.solve(ident, &HashMap::new()).into_iter().collect());
+            let local: rustc_hash::FxHashMap<Ref, Xform> = n.rig.solve(ident, &transforms).into_iter().collect();
+            let rest = n.rest.get_or_insert_with(|| n.rig.solve(ident, &rustc_hash::FxHashMap::default()).into_iter().collect());
             // (The rest mass once per body.)
             s.physics.set_humanoid_pose_with(*model, &local, (n.posed_on != body || body.is_none()).then_some(&*rest));
             n.posed_on = body;
@@ -603,7 +702,7 @@ impl Game {
                 let (root, _, _) = s.physics.humanoid_root(model)?;
                 Some((model, root, &npc.rig, &npc.transforms))
             }).collect();
-            let solve = |(model, root, rig, transforms): (Ref, Xform, &rig::Rig, &HashMap<Ref, Xform>)| {
+            let solve = |(model, root, rig, transforms): (Ref, Xform, &rig::Rig, &rustc_hash::FxHashMap<Ref, Xform>)| {
                 (model, root, rig.solve(root, transforms))
             };
             // A rig solve is pure. Batch large crowds across a bounded pool

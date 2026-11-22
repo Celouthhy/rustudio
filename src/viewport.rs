@@ -787,6 +787,7 @@ impl Editor {
         let _overlays = rustudio_core::bench::scope("viewport_overlays");
         // Comparison captures show the scene alone (clean_view).
         if !self.clean_view {
+            let _s = rustudio_core::bench::scope("vp_selection_outline");
             self.draw_selection(&painter, rect);
         }
         // Studio's hover outline (DraggerService.HoverThickness); none while
@@ -795,6 +796,7 @@ impl Editor {
         // Hover Line Thickness.
         let show_hover = crate::studio_settings::flag("Studio", "Show Hover Over", true);
         if let Some(h) = self.hover.filter(|_| show_hover && !self.clean_view && self.part_drag.is_none() && self.drag.is_none()) {
+            let _s = rustudio_core::bench::scope("vp_hover_outline");
             self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);
             self.draw_outline_union(&painter, rect, &refs,
@@ -896,6 +898,7 @@ impl Editor {
         // Studio's Play view shows the game alone: no tool readout, axis
         // compass or border (tools/fidelity side-by-side shots).
         if !self.game.is_playing() && !self.clean_view {
+            let _s = rustudio_core::bench::scope("vp_view_selector");
             self.draw_viewport_hud(ui, rect);
             self.draw_drag_hotkeys(&painter, rect);
         }
@@ -933,6 +936,21 @@ impl Editor {
             return;
         }
         let vp = self.game.cam.view_proj(rect);
+        let reuse = !self.game.is_playing();
+        // Nothing the per-part key reads has changed since a cached outline
+        // of these parts (QuickKey): replay it without walking the parts.
+        if reuse {
+            let quick = self.outline_quick_key(rect, vp);
+            let mut cache = self.outline_cache.borrow_mut();
+            if let Some(i) = cache.entries.iter().position(|e| e.2 == Some(quick) && e.0.refs == refs) {
+                let _s = rustudio_core::bench::scope("ol_quick_replay");
+                let e = cache.entries.remove(i);
+                painter.extend(e.1.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
+                cache.entries.push(e);
+                return;
+            }
+        }
+        let _key_scope = rustudio_core::bench::scope("ol_key");
         // What the outline is made from (OutlineKey): the view, the parts and
         // their drawn transforms, sizes, shapes and loaded meshes, and the
         // document's change journal (Bone, Motor6D and property edits). A
@@ -940,6 +958,12 @@ impl Editor {
         // poses move without journal marks: no reuse then.
         let mut parts = Vec::with_capacity(refs.len());
         let mut sources = Vec::with_capacity(refs.len());
+        // (each mesh looked up once per outline, by its id's address: many
+        // parts share a mesh, and one not parsed yet is read from disk again
+        // on every lookup; equal ids at two addresses are just looked up twice)
+        #[allow(clippy::type_complexity)]
+        let mut meshes: rustc_hash::FxHashMap<(usize, usize), (Option<std::sync::Arc<Vec<[Vec3; 3]>>>, Option<std::sync::Arc<rustudio_render::skin::Base>>)> =
+            rustc_hash::FxHashMap::default();
         for r in refs {
             let Some(sp) = self.game.scene.get(*r) else {
                 parts.push(None);
@@ -947,8 +971,13 @@ impl Editor {
             };
             let d = self.game.renderer.as_ref().and_then(|renderer| renderer.item_draws(*r))
                 .and_then(|draws| draws.first()).unwrap_or(&sp.draw);
-            let asset = sp.mesh_asset.as_ref().and_then(|asset| rustudio_core::assets::mesh_triangles(&asset.id));
-            let skin = sp.mesh_asset.as_ref().and_then(|asset| rustudio_render::skin::cached_base(&asset.id));
+            let (asset, skin) = match &sp.mesh_asset {
+                Some(a) => meshes
+                    .entry((a.id.as_ptr() as usize, a.id.len()))
+                    .or_insert_with(|| (rustudio_core::assets::mesh_triangles(&a.id), rustudio_render::skin::cached_base(&a.id)))
+                    .clone(),
+                None => (None, None),
+            };
             let bits = |v: Vec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
             parts.push(Some(PartSig {
                 pos: bits(d.xf.pos),
@@ -958,7 +987,7 @@ impl Editor {
                 asset: asset.as_ref().map_or(0, |a| std::sync::Arc::as_ptr(a) as usize),
                 skin: skin.as_ref().map_or(0, |b| std::sync::Arc::as_ptr(b) as usize),
             }));
-            sources.push((*r, sp, *d, asset));
+            sources.push((*r, sp, d, asset, skin.is_some()));
         }
         let key = OutlineKey {
             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y],
@@ -967,30 +996,64 @@ impl Editor {
             parts,
             journal: self.game.doc.journal_end(),
         };
-        let reuse = !self.game.is_playing();
+        drop(_key_scope);
+        // (after the key: reading it can parse a mesh, which bumps the
+        // generation, and the key saw that mesh)
+        let quick = reuse.then(|| self.outline_quick_key(rect, vp));
         let mut cache = self.outline_cache.borrow_mut();
         let cache = &mut *cache;
         if reuse {
+            let _hit_scope = rustudio_core::bench::scope("ol_hit_lookup");
             if let Some(i) = cache.entries.iter().position(|e| e.0 == key) {
-                let e = cache.entries.remove(i);
+                drop(_hit_scope);
+                let _s = rustudio_core::bench::scope("ol_hit_replay");
+                let mut e = cache.entries.remove(i);
                 painter.extend(e.1.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
+                e.2 = quick;
                 cache.entries.push(e);
                 return;
             }
         }
-        let mut mask = SilhouetteMask::new(rect, &mut cache.scratch);
-        for (r, sp, d, asset) in &sources {
+        let _mask_scope = rustudio_core::bench::scope("ol_mask");
+        // What gets rasterized: each part's triangles, skipping parts wholly
+        // outside the view (every triangle would be rejected on its own).
+        let mut jobs: Vec<OutlineJob> = Vec::with_capacity(sources.len());
+        for (r, sp, d, asset, skinned) in &sources {
             // A skinned mesh: its deformed triangles (Studio's selection
-            // box and Highlight trace the drawn shape).
-            let posed = sp.mesh_asset.as_ref().and_then(|a| rustudio_render::skin::posed_triangles(&self.game.doc, *r, &a.id));
-            let triangles = posed.as_deref()
-                .or(asset.as_deref().map(Vec::as_slice))
-                .unwrap_or_else(|| rustudio_render::render::outline_triangles(d.mesh));
-            for triangle in triangles {
-                mask.triangle(triangle.map(|p| vp * (d.xf.pos + d.xf.rot * (p * d.size)).extend(1.0)));
+            // box and Highlight trace the drawn shape). Only a mesh with a
+            // parsed skinning base can have them (posed_triangles).
+            let posed = sp.mesh_asset.as_ref().filter(|_| *skinned).and_then(|a| rustudio_render::skin::posed_triangles(&self.game.doc, *r, &a.id));
+            let (bounds, tris) = match posed {
+                Some(v) => (triangle_bounds(&v), std::sync::Arc::new(IndexedTris::unshared(&v))),
+                None => {
+                    let t = asset.as_deref().map(Vec::as_slice).unwrap_or_else(|| rustudio_render::render::outline_triangles(d.mesh));
+                    let e = cache.bounds
+                        .entry((t.as_ptr() as usize, t.len()))
+                        .or_insert_with(|| (triangle_bounds(t), std::sync::Arc::new(IndexedTris::new(t)), asset.clone()));
+                    (e.0, e.1.clone())
+                }
+            };
+            if bounds.is_some_and(|(lo, hi)| part_outside_frustum(vp, d.xf, d.size, lo, hi)) {
+                continue;
             }
+            jobs.push((tris, d.xf, d.size));
         }
-        let edges = mask.edges();
+        // Big, near parts first: the union doesn't depend on the order, and
+        // covering more of the view early lets more parts be skipped.
+        let eye = self.game.cam.pos;
+        jobs.sort_by_cached_key(|(_, xf, size)| {
+            let reach = size.x * size.y + size.y * size.z + size.x * size.z;
+            std::cmp::Reverse((reach / (xf.pos - eye).length_squared().max(1e-3)).to_bits())
+        });
+        let total: usize = jobs.iter().map(|j| j.0.corners.len()).sum();
+        let threads = if total < OUTLINE_PARALLEL_TRIANGLES {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, outline_threads())
+        };
+        drop(_mask_scope);
+        let edges = union_edges(rect, vp, &jobs, &mut cache.scratch, &mut cache.extra, threads);
+
         painter.extend(edges.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
         if reuse {
             // The selection's and a few hovered parts' (moving the mouse
@@ -998,7 +1061,7 @@ impl Editor {
             if cache.entries.len() >= OUTLINE_CACHE_ENTRIES {
                 cache.entries.remove(0);
             }
-            cache.entries.push((key, edges));
+            cache.entries.push((key, edges, quick));
         }
     }
 
@@ -1164,16 +1227,17 @@ impl Editor {
         {
             let cache = &mut self.selector_cache;
             if cache.body.as_ref().is_none_or(|b| b.0 != view_key) {
+                // Only the projection and the facing test follow the view;
+                // the lit colours and model positions are fixed (SelectorPrep).
+                let prep = selector_prep(geometry);
                 let mut mesh = egui::Mesh::default();
-                for (tri, normals) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
-                    if view.transform_vector3((normals[0]+normals[1]+normals[2])/3.0).z <= 0.0 { continue; }
+                mesh.vertices.reserve(prep.body.len() * 3);
+                mesh.indices.reserve(prep.body.len() * 3);
+                for t in &prep.body {
+                    if view.transform_vector3(t.facing).z <= 0.0 { continue; }
                     let start = mesh.vertices.len() as u32;
-                    for (pos,n) in tri.iter().zip(normals) {
-                        // Model: color (181,187,199), transparency .5; viewport
-                        // ambient 200/255, directional 140/255 along (-1,-1,-1).
-                        let light = (200.0/255.0 + 140.0/255.0*n.dot(Vec3::ONE.normalize()).max(0.0)).min(1.0);
-                        mesh.colored_vertex(project(*pos/25.0), Color32::from_rgba_unmultiplied(
-                            (181.0*light) as u8,(187.0*light) as u8,(199.0*light) as u8,128));
+                    for (q, c) in t.q.iter().zip(t.color) {
+                        mesh.colored_vertex(project(*q), c);
                     }
                     mesh.add_triangle(start,start+1,start+2);
                 }
@@ -1184,22 +1248,15 @@ impl Editor {
             }
         }
         let mut faces = Vec::new();
-        for (label, key, normal, u, v) in [
-            ("Right", "view.right", Vec3::X, -Vec3::Z, Vec3::Y),
-            ("Left", "view.left", -Vec3::X, Vec3::Z, Vec3::Y),
-            ("Top", "view.top", Vec3::Y, -Vec3::X, -Vec3::Z),
-            ("Bottom", "view.bottom", -Vec3::Y, -Vec3::X, -Vec3::Z),
-            ("Back", "view.back", Vec3::Z, Vec3::X, Vec3::Y),
-            ("Front", "view.front", -Vec3::Z, -Vec3::X, Vec3::Y),
-        ] {
+        for (face_index, &(label, key, normal, u, v)) in SELECTOR_FACES.iter().enumerate() {
             let depth = view.transform_vector3(normal).z;
             if depth <= 0.001 { continue; }
 
             let points = [normal-u-v*0.65, normal-u*0.65-v, normal+u*0.65-v, normal+u-v*0.65, normal+u+v*0.65, normal+u*0.65+v, normal-u*0.65+v, normal-u+v*0.65].map(project);
-            faces.push((depth, label, key, normal, u, v, points));
+            faces.push((depth, face_index, label, key, normal, u, v, points));
         }
         faces.sort_by(|a,b| a.0.total_cmp(&b.0));
-        for (_depth, label, key, normal, u, v, points) in faces {
+        for (_depth, face_index, label, key, normal, u, v, points) in faces {
             let bounds = Rect::from_points(&points);
             self.ui_rects.insert(key, bounds);
             let response = ui.interact(bounds, egui::Id::new(key), Sense::click());
@@ -1232,14 +1289,16 @@ impl Editor {
                 } else {
                 let mut mesh = egui::Mesh::with_texture(texture.id());
                 {
-                    for (tri, ns) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
-                        let n = (ns[0]+ns[1]+ns[2]).normalize_or_zero();
-                        if n.dot(normal) < n.abs().max_element()-0.0001 || view.transform_vector3(n).z <= 0.0 { continue; }
+                    // This face's triangles and lettering UVs are fixed
+                    // (SelectorPrep); the view decides which face the camera.
+                    let _ = (u, v);
+                    let prep = selector_prep(geometry);
+                    for t in &prep.faces[face_index] {
+                        if view.transform_vector3(t.n).z <= 0.0 { continue; }
                         let start = mesh.vertices.len() as u32;
-                        for pos in tri {
-                            let q = *pos/25.0;
-                            mesh.vertices.push(egui::epaint::Vertex { pos: project(q),
-                                uv: egui::pos2((q.dot(u)+1.0)*0.5,(1.0-q.dot(v))*0.5),
+                        for (q, uv) in t.q.iter().zip(t.uv) {
+                            mesh.vertices.push(egui::epaint::Vertex { pos: project(*q),
+                                uv,
                                 color: Color32::from_white_alpha(204) });
                         }
                         mesh.add_triangle(start,start+1,start+2);
@@ -1344,6 +1403,66 @@ fn gizmo_updates(drag: &GizmoDrag, dir: Vec3, d: f32, symmetric: bool, uniform: 
     updates
 }
 
+/// The view selector's faces: label, hit key, outward normal and the
+/// lettering's u / v axes.
+const SELECTOR_FACES: [(&str, &str, Vec3, Vec3, Vec3); 6] = [
+    ("Right", "view.right", Vec3::X, Vec3::NEG_Z, Vec3::Y),
+    ("Left", "view.left", Vec3::NEG_X, Vec3::Z, Vec3::Y),
+    ("Top", "view.top", Vec3::Y, Vec3::NEG_X, Vec3::NEG_Z),
+    ("Bottom", "view.bottom", Vec3::NEG_Y, Vec3::NEG_X, Vec3::NEG_Z),
+    ("Back", "view.back", Vec3::Z, Vec3::X, Vec3::Y),
+    ("Front", "view.front", Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y),
+];
+
+/// One body triangle of the view selector: model positions (/25), the
+/// vertex colours and the normal its facing test uses.
+struct SelectorBodyTri {
+    facing: Vec3,
+    q: [Vec3; 3],
+    color: [Color32; 3],
+}
+
+/// One lettering triangle of a selector face.
+struct SelectorFaceTri {
+    n: Vec3,
+    q: [Vec3; 3],
+    uv: [Pos2; 3],
+}
+
+/// What the view selector draws that doesn't depend on the view, worked
+/// out once from Basic.mesh (the camera turning used to redo the lighting,
+/// face membership and UVs of every triangle each frame). Same arithmetic
+/// as before, so the meshes are bit-identical.
+struct SelectorPrep {
+    body: Vec<SelectorBodyTri>,
+    faces: [Vec<SelectorFaceTri>; 6],
+}
+
+fn selector_prep(geometry: &'static rustudio_core::mesh::MeshData) -> &'static SelectorPrep {
+    static PREP: std::sync::OnceLock<SelectorPrep> = std::sync::OnceLock::new();
+    PREP.get_or_init(|| {
+        let mut body = Vec::new();
+        let mut faces: [Vec<SelectorFaceTri>; 6] = Default::default();
+        for (tri, ns) in geometry.positions.chunks_exact(3).zip(geometry.normals.chunks_exact(3)) {
+            let q = [tri[0] / 25.0, tri[1] / 25.0, tri[2] / 25.0];
+            // Model: color (181,187,199), transparency .5; viewport
+            // ambient 200/255, directional 140/255 along (-1,-1,-1).
+            let color = [0, 1, 2].map(|i| {
+                let light = (200.0/255.0 + 140.0/255.0*ns[i].dot(Vec3::ONE.normalize()).max(0.0)).min(1.0);
+                Color32::from_rgba_unmultiplied((181.0*light) as u8,(187.0*light) as u8,(199.0*light) as u8,128)
+            });
+            body.push(SelectorBodyTri { facing: (ns[0]+ns[1]+ns[2])/3.0, q, color });
+            let n = (ns[0]+ns[1]+ns[2]).normalize_or_zero();
+            for (i, &(_, _, normal, u, v)) in SELECTOR_FACES.iter().enumerate() {
+                if n.dot(normal) < n.abs().max_element()-0.0001 { continue; }
+                let uv = q.map(|q| egui::pos2((q.dot(u)+1.0)*0.5,(1.0-q.dot(v))*0.5));
+                faces[i].push(SelectorFaceTri { n, q, uv });
+            }
+        }
+        SelectorPrep { body, faces }
+    })
+}
+
 /// The view selector's projected meshes (draw_viewport_hud), for one view
 /// rotation and position: the body, and each face's lettering by (label,
 /// texture).
@@ -1369,6 +1488,35 @@ struct PartSig {
     skin: usize,
 }
 
+/// What can change an outline's OutlineKey without walking its parts: the
+/// view (bits), the document journal (scene membership and properties),
+/// the scene, the renderer's draws (items_generation) and the meshes,
+/// outline triangles and skinning bases (assets::mesh_generation). Equal
+/// to an entry's (with the same parts) means its OutlineKey would match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct QuickKey {
+    rect: [u32; 4],
+    vp: [u32; 16],
+    journal: u64,
+    scene: (u64, usize),
+    items: u64,
+    meshes: u64,
+}
+
+impl Editor {
+    fn outline_quick_key(&self, rect: Rect, vp: Mat4) -> QuickKey {
+        QuickKey {
+            rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(f32::to_bits),
+            vp: vp.to_cols_array().map(f32::to_bits),
+            journal: self.game.doc.journal_end(),
+            scene: (self.game.scene.doc_id, self.game.scene.parts.len()),
+            // (no renderer: no draws to differ)
+            items: self.game.renderer.as_ref().map_or(u64::MAX, |r| r.items_generation()),
+            meshes: rustudio_core::assets::mesh_generation(),
+        }
+    }
+}
+
 /// Everything a union outline's edges depend on.
 #[derive(PartialEq)]
 struct OutlineKey {
@@ -1383,8 +1531,233 @@ struct OutlineKey {
 /// recompute neither allocates nor clears a whole view-sized buffer).
 #[derive(Default)]
 pub struct OutlineCache {
-    entries: Vec<(OutlineKey, Vec<[Pos2; 2]>)>,
+    #[allow(clippy::type_complexity)]
+    entries: Vec<(OutlineKey, Vec<[Pos2; 2]>, Option<QuickKey>)>,
     scratch: MaskScratch,
+    /// Model-space bounds and shared-corner form of each triangle list the outline has drawn, by
+    /// (address, length). Primitives are static; a loaded mesh's Arc is
+    /// held here, so its address can't be reused by another mesh.
+    #[allow(clippy::type_complexity)]
+    bounds: rustc_hash::FxHashMap<(usize, usize), (Option<(Vec3, Vec3)>, std::sync::Arc<IndexedTris>, Option<std::sync::Arc<Vec<[Vec3; 3]>>>)>,
+    /// The other rasterizing threads' buffers (each all zeros between uses).
+    extra: Vec<MaskScratch>,
+}
+
+/// One part's triangles (model space) and how it's drawn.
+type OutlineJob = (std::sync::Arc<IndexedTris>, Xform, Vec3);
+
+/// A triangle list with its corners shared: each distinct point (by its
+/// exact bits) once, and the triangles as indices into them. The outline
+/// projects each point once instead of once per triangle using it, with the
+/// same arithmetic, so the projected corners are bit-identical.
+pub struct IndexedTris {
+    points: Vec<Vec3>,
+    corners: Vec<[u32; 3]>,
+    /// The box around the points (None: empty or not finite).
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+impl IndexedTris {
+    fn new(triangles: &[[Vec3; 3]]) -> Self {
+        let mut index: std::collections::HashMap<[u32; 3], u32> = std::collections::HashMap::new();
+        let mut points = Vec::new();
+        let corners = triangles
+            .iter()
+            .map(|t| {
+                t.map(|p| {
+                    *index.entry([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]).or_insert_with(|| {
+                        points.push(p);
+                        points.len() as u32 - 1
+                    })
+                })
+            })
+            .collect();
+        Self { bounds: triangle_bounds(triangles), points, corners }
+    }
+
+    /// Without looking for shared corners (a skinned pose, made each frame).
+    fn unshared(triangles: &[[Vec3; 3]]) -> Self {
+        Self {
+            points: triangles.iter().flatten().copied().collect(),
+            corners: (0..triangles.len() as u32).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect(),
+            bounds: triangle_bounds(triangles),
+        }
+    }
+}
+
+/// The union outline of `jobs` seen through `vp` (SilhouetteMask). Big
+/// outlines rasterize on `threads` threads, each into its own coverage
+/// deltas, summed after: the union (coverage > 0), and so the edges and
+/// their order, are the same as on one thread.
+fn union_edges(rect: Rect, vp: Mat4, jobs: &[OutlineJob], main: &mut MaskScratch, extra: &mut Vec<MaskScratch>, threads: usize) -> Vec<[Pos2; 2]> {
+    let _mask_scope = rustudio_core::bench::scope("ol_raster");
+    // One job: its triangles, unless every row it could touch is covered
+    // already (its triangles would each skip those rows: SilhouetteMask::triangle).
+    let draw = |mask: &mut SilhouetteMask<'_>, clip: &mut Vec<glam::Vec4>, (tris, xf, size): &OutlineJob| {
+        if let Some((lo, hi)) = tris.bounds {
+            if mask.rows_covered(vp, *xf, *size, lo, hi) {
+                return;
+            }
+        }
+        clip.clear();
+        clip.extend(tris.points.iter().map(|p| vp * (xf.pos + xf.rot * (*p * *size)).extend(1.0)));
+        for c in &tris.corners {
+            mask.triangle([clip[c[0] as usize], clip[c[1] as usize], clip[c[2] as usize]]);
+        }
+    };
+    // Threads take the jobs (biggest first) one at a time from a shared
+    // counter, so each fills its own rows early and skips more.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let raster = |mask: &mut SilhouetteMask<'_>| {
+        let mut clip: Vec<glam::Vec4> = Vec::new();
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(job) = jobs.get(i) else { break };
+            draw(mask, &mut clip, job);
+        }
+    };
+    let shared: Vec<std::sync::atomic::AtomicBool> = if threads > 1 {
+        (0..SilhouetteMask::rows_for(rect)).map(|_| std::sync::atomic::AtomicBool::new(false)).collect()
+    } else {
+        Vec::new()
+    };
+    let shared = &shared[..];
+    let mask = if threads <= 1 {
+        let mut mask = SilhouetteMask::new(rect, main);
+        raster(&mut mask);
+        mask
+    } else {
+        let others = threads - 1;
+        if extra.len() < others {
+            extra.resize_with(others, Default::default);
+        }
+        let (mut mask, boxes) = std::thread::scope(|sc| {
+            let handles: Vec<_> = extra[..others]
+                .iter_mut()
+                .map(|scratch| {
+                    let raster = &raster;
+                    sc.spawn(move || {
+                        let mut m = SilhouetteMask::new(rect, scratch);
+                        m.shared = Some(shared);
+                        raster(&mut m);
+                        (m.x0, m.x1, m.y0, m.y1)
+                    })
+                })
+                .collect();
+            let mut m = SilhouetteMask::new(rect, main);
+            m.shared = Some(shared);
+            raster(&mut m);
+            let boxes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap_or((usize::MAX, 0, usize::MAX, 0))).collect();
+            (m, boxes)
+        });
+        let _merge = rustudio_core::bench::scope("ol_merge");
+        let stride = mask.width + 1;
+        for (scratch, &(x0, x1, y0, y1)) in extra.iter_mut().zip(&boxes) {
+            if x0 > x1 || y0 >= y1 {
+                continue;
+            }
+            for y in y0..y1 {
+                let (a, b) = (y * stride + x0, y * stride + x1 + 1);
+                let src = &mut scratch.delta[a..b];
+                for (d, s) in mask.s.delta[a..b].iter_mut().zip(src.iter()) {
+                    *d += *s;
+                }
+                src.fill(0);
+            }
+            mask.x0 = mask.x0.min(x0);
+            mask.x1 = mask.x1.max(x1);
+            mask.y0 = mask.y0.min(y0);
+            mask.y1 = mask.y1.max(y1);
+        }
+        mask
+    };
+    drop(_mask_scope);
+    let _edges_scope = rustudio_core::bench::scope("ol_edges");
+    mask.edges()
+}
+
+/// The first and last index where two equally long rows differ (None:
+/// equal), comparing eight cells at a time.
+fn differing_span(a: &[bool], b: &[bool]) -> Option<(usize, usize)> {
+    // SAFETY: bool is one byte (0 or 1); the rows are only read.
+    let (a, b): (&[u8], &[u8]) = unsafe {
+        (std::slice::from_raw_parts(a.as_ptr().cast(), a.len()), std::slice::from_raw_parts(b.as_ptr().cast(), b.len()))
+    };
+    let n = a.len().min(b.len());
+    let word = |s: &[u8], i: usize| u64::from_ne_bytes(s[i..i + 8].try_into().unwrap_or_default());
+    let mut i = 0;
+    let first = loop {
+        if i + 8 <= n {
+            if word(a, i) != word(b, i) {
+                break (i..i + 8).find(|&k| a[k] != b[k])?;
+            }
+            i += 8;
+        } else {
+            break (i..n).find(|&k| a[k] != b[k])?;
+        }
+    };
+    let mut j = n;
+    let last = loop {
+        if j >= first + 8 {
+            if word(a, j - 8) != word(b, j - 8) {
+                break (j - 8..j).rev().find(|&k| a[k] != b[k]).unwrap_or(first);
+            }
+            j -= 8;
+        } else {
+            break (first..j).rev().find(|&k| a[k] != b[k]).unwrap_or(first);
+        }
+    };
+    Some((first, last))
+}
+
+/// Outlines of at least this many triangles rasterize on several threads.
+const OUTLINE_PARALLEL_TRIANGLES: usize = 20_000;
+/// At most this many (a low-end laptop has four cores; the main thread is one).
+const OUTLINE_THREADS: usize = 4;
+
+/// OUTLINE_THREADS, or RUSTUDIO_OUTLINE_THREADS (1..=16, for measuring).
+fn outline_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("RUSTUDIO_OUTLINE_THREADS").ok().and_then(|v| v.parse().ok()).map_or(OUTLINE_THREADS, |n: usize| n.clamp(1, 16))
+    })
+}
+
+/// The box around a triangle list's corners (None: empty or not finite).
+fn triangle_bounds(triangles: &[[Vec3; 3]]) -> Option<(Vec3, Vec3)> {
+    let mut lo = Vec3::splat(f32::INFINITY);
+    let mut hi = Vec3::splat(f32::NEG_INFINITY);
+    for t in triangles {
+        for p in t {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+    }
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
+/// Whether a part's triangles (inside lo..hi in model space) all lie
+/// clearly outside one plane of the clip-space frustum. The plane distance
+/// is affine in the model-space point, so all eight box corners outside a
+/// plane put every point of the box outside it; the margin keeps rounding
+/// in the per-triangle test from ever disagreeing.
+fn part_outside_frustum(vp: glam::Mat4, xf: Xform, size: Vec3, lo: Vec3, hi: Vec3) -> bool {
+    let corners: [glam::Vec4; 8] = std::array::from_fn(|i| {
+        let c = Vec3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+        vp * (xf.pos + xf.rot * (c * size)).extend(1.0)
+    });
+    if corners.iter().any(|p| !p.is_finite()) {
+        return false;
+    }
+    let distance = |plane: usize, p: glam::Vec4| match plane {
+        0 => p.x + p.w, 1 => p.w - p.x, 2 => p.y + p.w,
+        3 => p.w - p.y, 4 => p.z, _ => p.w - p.z,
+    };
+    (0..6).any(|plane| corners.iter().all(|p| distance(plane, *p) < -1e-3 * (1.0 + p.w.abs())))
 }
 
 /// SilhouetteMask's buffers. `delta` is all zeros between uses (each use
@@ -1405,6 +1778,9 @@ struct MaskScratch {
 struct SilhouetteMask<'a> {
     rect: Rect, width: usize, height: usize, remaining_rows: usize,
     s: &'a mut MaskScratch,
+    /// Rows another rasterizing thread has found full (they are full in
+    /// the union too, so this one needn't add to them). Only ever set.
+    shared: Option<&'a [std::sync::atomic::AtomicBool]>,
     /// The covered box (empty: no edges; all of them off screen, or no
     /// triangles at all): columns x0..x1, rows y0..y1.
     x0: usize, x1: usize, y0: usize, y1: usize,
@@ -1423,8 +1799,54 @@ impl<'a> SilhouetteMask<'a> {
         s.full_rows.resize(height, false);
         s.covered_span.clear();
         s.covered_span.resize(height, (0, 0));
-        Self { rect, width, height, remaining_rows: height, s, x0: usize::MAX, x1: 0, y0: usize::MAX, y1: 0 }
+        Self { rect, width, height, remaining_rows: height, s, shared: None, x0: usize::MAX, x1: 0, y0: usize::MAX, y1: 0 }
     }
+
+    /// The mask's height in rows for `rect` (as `new` sizes it).
+    fn rows_for(rect: Rect) -> usize {
+        let scale = (1024.0 / rect.width().max(rect.height()).max(1.0)).min(2.0);
+        (rect.height() * scale).ceil().max(1.0) as usize
+    }
+
+    fn row_full(&self, y: usize) -> bool {
+        self.s.full_rows[y] || self.shared.is_some_and(|s| s[y].load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Whether everything a part inside lo..hi (model space) could cover is
+    /// covered already: on each row its projected box spans, the row is
+    /// full or its covered interval holds the box's columns. Only for a
+    /// part wholly in front of the camera: then its points project inside
+    /// the hull of its box's projected corners, and a pixel of margin on
+    /// every side keeps rounding on the safe side. Its triangles would add
+    /// nothing to the union (coverage > 0) the edges come from.
+    fn rows_covered(&self, vp: Mat4, xf: Xform, size: Vec3, lo: Vec3, hi: Vec3) -> bool {
+        if self.remaining_rows == 0 {
+            return true;
+        }
+        let (mut min, mut max) = (glam::Vec2::splat(f32::INFINITY), glam::Vec2::splat(f32::NEG_INFINITY));
+        for i in 0..8 {
+            let c = Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            );
+            let p = vp * (xf.pos + xf.rot * (c * size)).extend(1.0);
+            if !p.is_finite() || p.w <= 1e-4 {
+                return false;
+            }
+            let q = glam::Vec2::new((p.x / p.w + 1.0) * 0.5 * self.width as f32, (1.0 - p.y / p.w) * 0.5 * self.height as f32);
+            min = min.min(q);
+            max = max.max(q);
+        }
+        let from = (min.y.floor() - 1.0).max(0.0) as usize;
+        let to = ((max.y.ceil() + 1.0).max(0.0) as usize).min(self.height);
+        let x0 = (min.x.floor() - 1.0).max(0.0) as usize;
+        let x1 = ((max.x.ceil() + 1.0).max(0.0) as usize).min(self.width);
+        (from..to).all(|y| {
+            let span = self.s.covered_span[y];
+            self.row_full(y) || (span.0 != span.1 && span.0 <= x0 && span.1 >= x1)
+        })
+    }
+
     fn triangle(&mut self, tri: [glam::Vec4; 3]) {
         if self.remaining_rows == 0 || tri.iter().any(|p| !p.is_finite()) { return; }
         let distance = |plane: usize, p: glam::Vec4| match plane {
@@ -1461,6 +1883,7 @@ impl<'a> SilhouetteMask<'a> {
         if hi <= lo { return; }
         // Each convex polygon edge contributes a linear x intersection. Compute
         // slopes once, and step them rather than divide for every row.
+        let shared = self.shared;
         let spans = &mut self.s.spans;
         spans.clear();
         spans.resize(hi-lo, (f32::INFINITY, f32::NEG_INFINITY));
@@ -1472,14 +1895,14 @@ impl<'a> SilhouetteMask<'a> {
             let end=(b.y-0.5).ceil().clamp(lo as f32,hi as f32) as usize;
             let slope=(b.x-a.x)/(b.y-a.y);
             for y in start..end {
-                if self.s.full_rows[y] { continue; }
+                if self.s.full_rows[y] || shared.is_some_and(|s| s[y].load(std::sync::atomic::Ordering::Relaxed)) { continue; }
                 let x=a.x+slope*(y as f32+0.5-a.y);
                 spans[y-lo].0=spans[y-lo].0.min(x);
                 spans[y-lo].1=spans[y-lo].1.max(x);
             }
         }
         for y in lo..hi {
-            if self.s.full_rows[y] { continue; }
+            if self.row_full(y) { continue; }
             let (left,right)=self.s.spans[y-lo];
             if left <= right {
                 let start=(left-0.5).ceil().clamp(0.0,self.width as f32) as usize;
@@ -1499,6 +1922,9 @@ impl<'a> SilhouetteMask<'a> {
                 if span.0 == 0 && span.1 == self.width {
                     self.s.full_rows[y]=true;
                     self.remaining_rows-=1;
+                    if let Some(s) = self.shared {
+                        s[y].store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -1531,15 +1957,22 @@ impl<'a> SilhouetteMask<'a> {
             } else {
                 s.cur.fill(false);
             }
+            // Only columns where row y differs from row y-1 can start or end
+            // a boundary: elsewhere both rows, and so the horizontal (none)
+            // and vertical boundaries (as last row), are the same.
+            let Some((first, last)) = differing_span(&s.prev, &s.cur) else {
+                std::mem::swap(&mut s.prev, &mut s.cur);
+                continue;
+            };
             // Horizontal boundaries on line y: row y-1 against row y.
             let mut start = None;
-            for x in 0..=bw {
+            for x in first..=last + 1 {
                 let boundary = x < bw && s.prev[x] != s.cur[x];
                 if boundary { start.get_or_insert(x); }
                 else if let Some(a) = start.take() { horizontal.push([point(x0 + a, y), point(x0 + x, y)]); }
             }
             // Vertical boundaries on column x within row y: x-1 against x.
-            for x in 0..=bw {
+            for x in first..=last + 1 {
                 let boundary = y < y1 && (x > 0 && s.cur[x-1]) != (x < bw && s.cur[x]);
                 if boundary {
                     if s.vstart[x] == usize::MAX { s.vstart[x] = y; }
@@ -1713,5 +2146,144 @@ mod outline_tests {
         }
         assert!(with_edges > 150, "most cases draw an outline ({with_edges})");
         assert!(scratch.delta.iter().all(|d| *d == 0), "the scratch buffer is left clear");
+    }
+
+    // A part the frustum test skips draws nothing on its own: skipping it
+    // can't change an outline.
+    #[test]
+    fn skipped_parts_draw_nothing() {
+        let mut seed = 5u64;
+        let (mut scratch, mut extra) = (MaskScratch::default(), Vec::new());
+        let cube = rustudio_render::render::outline_triangles(rustudio_render::render::MeshKind::Block);
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(952.0, 569.0));
+        let (mut skipped, mut drawn) = (0, 0);
+        for _ in 0..4000 {
+            let eye = Vec3::new(rng(&mut seed) * 40.0 - 20.0, rng(&mut seed) * 20.0, 30.0);
+            let view = Mat4::look_at_rh(eye, Vec3::new(rng(&mut seed) * 20.0 - 10.0, 0.0, 0.0), Vec3::Y);
+            let vp = Mat4::perspective_rh(1.2, rect.width() / rect.height(), 0.1, 300.0) * view;
+            let pos = Vec3::new(rng(&mut seed) * 400.0 - 200.0, rng(&mut seed) * 100.0 - 50.0, rng(&mut seed) * 400.0 - 200.0);
+            let rot = Mat3::from_euler(glam::EulerRot::YXZ, rng(&mut seed) * 6.0, rng(&mut seed) * 6.0, rng(&mut seed) * 6.0);
+            let size = Vec3::new(rng(&mut seed) * 30.0 + 0.1, rng(&mut seed) * 30.0 + 0.1, rng(&mut seed) * 30.0 + 0.1);
+            let xf = Xform { pos, rot };
+            let (lo, hi) = triangle_bounds(cube).unwrap();
+            let edges = union_edges(rect, vp, &[(std::sync::Arc::new(IndexedTris::new(cube)), xf, size)], &mut scratch, &mut extra, 1);
+            if part_outside_frustum(vp, xf, size, lo, hi) {
+                skipped += 1;
+                assert!(edges.is_empty(), "a skipped part drew {} edges", edges.len());
+            } else {
+                drawn += usize::from(!edges.is_empty());
+            }
+        }
+        assert!(skipped > 500 && drawn > 200, "both kinds happen ({skipped} skipped, {drawn} drawn)");
+    }
+
+    #[test]
+    fn differing_span_matches_a_plain_scan() {
+        let mut seed = 9u64;
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 300] {
+            for _ in 0..200 {
+                let a: Vec<bool> = (0..n).map(|_| rng(&mut seed) < 0.5).collect();
+                let mut b = a.clone();
+                let flips = (rng(&mut seed) * 4.0) as usize;
+                for _ in 0..flips {
+                    if n > 0 {
+                        let k = ((rng(&mut seed) * n as f32) as usize).min(n - 1);
+                        b[k] = !b[k];
+                    }
+                }
+                let first = a.iter().zip(&b).position(|(x, y)| x != y);
+                let want = first.map(|f| (f, n - 1 - a.iter().zip(&b).rev().position(|(x, y)| x != y).unwrap()));
+                assert_eq!(differing_span(&a, &b), want, "n {n}");
+            }
+        }
+    }
+
+    // Behind a covering ground and wall, a small part's rows are all full
+    // (and it is skipped), while one reaching into the sky's rows is not.
+    #[test]
+    fn covered_rows_skip_parts() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(952.0, 569.0));
+        let vp = Mat4::perspective_rh(1.2, rect.width() / rect.height(), 0.1, 1000.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 5.0, 60.0), Vec3::new(0.0, -10.0, 0.0), Vec3::Y);
+        let cube = rustudio_render::render::outline_triangles(rustudio_render::render::MeshKind::Block);
+        let ground = IndexedTris::new(cube);
+        let mut scratch = MaskScratch::default();
+        let mut mask = SilhouetteMask::new(rect, &mut scratch);
+        for t in &ground.corners {
+            let xf = Xform { pos: Vec3::new(0.0, -12.0, 0.0), rot: Mat3::IDENTITY };
+            mask.triangle(t.map(|i| vp * (xf.pos + xf.rot * (ground.points[i as usize] * Vec3::new(4000.0, 1.0, 4000.0))).extend(1.0)));
+        }
+        let (lo, hi) = ground.bounds.unwrap();
+        let near_ground = Xform { pos: Vec3::new(3.0, -10.0, 20.0), rot: Mat3::IDENTITY };
+        assert!(mask.rows_covered(vp, near_ground, Vec3::ONE, lo, hi), "a small part low in the view");
+        let tower = Xform { pos: Vec3::new(3.0, 40.0, 0.0), rot: Mat3::IDENTITY };
+        assert!(!mask.rows_covered(vp, tower, Vec3::new(1.0, 100.0, 1.0), lo, hi), "a tower into the sky");
+        let behind = Xform { pos: Vec3::new(0.0, 5.0, 80.0), rot: Mat3::IDENTITY };
+        assert!(!mask.rows_covered(vp, behind, Vec3::splat(4.0), lo, hi), "a part behind the camera is never judged");
+        let _ = mask.edges();
+    }
+
+    // Rasterizing a big outline on several threads gives the same edges, in
+    // the same order, as one thread, and leaves every buffer clear.
+    #[test]
+    fn threaded_union_matches_one_thread() {
+        let mut seed = 11u64;
+        let (mut one, mut one_extra) = (MaskScratch::default(), Vec::new());
+        let (mut many, mut many_extra) = (MaskScratch::default(), Vec::new());
+        let cube = rustudio_render::render::outline_triangles(rustudio_render::render::MeshKind::Block);
+        let mut with_edges = 0;
+        for case in 0..40 {
+            let rect = match case % 3 {
+                0 => Rect::from_min_size(egui::pos2(10.0, 50.0), egui::vec2(952.0, 569.0)),
+                1 => Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1930.0, 1010.0)),
+                _ => Rect::from_min_size(egui::pos2(3.0, 7.0), egui::vec2(300.0, 700.0)),
+            };
+            let eye = Vec3::new(rng(&mut seed) * 40.0 - 20.0, rng(&mut seed) * 20.0, 60.0);
+            let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+            let proj = Mat4::perspective_rh(1.2, rect.width() / rect.height(), 0.1, 1000.0);
+            let vp = proj * view;
+            let n = 1 + (rng(&mut seed) * 400.0) as usize;
+            let mut jobs: Vec<OutlineJob> = (0..n)
+                .map(|i| {
+                    let pos = Vec3::new(rng(&mut seed) * 120.0 - 60.0, rng(&mut seed) * 30.0 - 10.0, rng(&mut seed) * 120.0 - 80.0);
+                    let rot = Mat3::from_euler(glam::EulerRot::YXZ, rng(&mut seed) * 6.0, rng(&mut seed) * 6.0, rng(&mut seed) * 6.0);
+                    let size = Vec3::new(rng(&mut seed) * 8.0 + 0.2, rng(&mut seed) * 8.0 + 0.2, rng(&mut seed) * 8.0 + 0.2);
+                    // Some free triangles too (open shapes, overlapping).
+                    let tris: Vec<[Vec3; 3]> = if i % 5 == 0 {
+                        (0..8).map(|_| [0, 1, 2].map(|_| Vec3::new(rng(&mut seed) - 0.5, rng(&mut seed) - 0.5, rng(&mut seed) - 0.5))).collect()
+                    } else {
+                        cube.to_vec()
+                    };
+                    let tris = if i % 2 == 0 { IndexedTris::new(&tris) } else { IndexedTris::unshared(&tris) };
+                    (std::sync::Arc::new(tris), Xform { pos, rot }, size)
+                })
+                .collect();
+            // Often a big ground and wall first, so whole rows fill up and
+            // later parts are skipped (rows_covered).
+            if case % 2 == 0 {
+                for (pos, size) in [(Vec3::new(0.0, -12.0, 0.0), Vec3::new(4000.0, 1.0, 4000.0)), (Vec3::new(0.0, 0.0, -150.0), Vec3::new(4000.0, 300.0, 1.0))] {
+                    jobs.insert(0, (std::sync::Arc::new(IndexedTris::new(cube)), Xform { pos, rot: Mat3::IDENTITY }, size));
+                }
+            }
+            let a = union_edges(rect, vp, &jobs, &mut one, &mut one_extra, 1);
+            // The way it was drawn before: each triangle's corners projected on their own.
+            let mut plain = SilhouetteMask::new(rect, &mut many);
+            for (tris, xf, size) in &jobs {
+                for c in &tris.corners {
+                    let t = c.map(|i| tris.points[i as usize]);
+                    plain.triangle(t.map(|p| vp * (xf.pos + xf.rot * (p * *size)).extend(1.0)));
+                }
+            }
+            assert_eq!(a, plain.edges(), "case {case}: shared corners");
+            for threads in [2, 3, 4] {
+                let b = union_edges(rect, vp, &jobs, &mut many, &mut many_extra, threads);
+                assert_eq!(a, b, "case {case}, {threads} threads");
+            }
+            with_edges += usize::from(!a.is_empty());
+        }
+        assert!(with_edges > 30, "most cases draw an outline ({with_edges})");
+        for s in std::iter::once(&many).chain(&many_extra).chain(std::iter::once(&one)) {
+            assert!(s.delta.iter().all(|d| *d == 0), "buffers are left clear");
+        }
     }
 }

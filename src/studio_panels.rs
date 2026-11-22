@@ -21,6 +21,8 @@ use rustudio_engine::theme;
 pub struct ClassMeta {
     pub category: String,
     pub explorer_order: Option<i32>,
+    /// ServiceVisibility (Always 0, Off 1, WithChildren 2), when set.
+    pub service_visibility: Option<i32>,
 }
 
 /// Studio's ReflectionMetadata.xml, by class (empty when not found).
@@ -40,6 +42,12 @@ pub fn class_meta() -> &'static HashMap<String, ClassMeta> {
             let j = chunk[i..].find("</string>")? + i;
             Some(chunk[i..j].to_string())
         };
+        let field_tok = |chunk: &str, name: &str| -> Option<String> {
+            let key = format!("<token name=\"{name}\">");
+            let i = chunk.find(&key)? + key.len();
+            let j = chunk[i..].find("</token>")? + i;
+            Some(chunk[i..j].to_string())
+        };
         for chunk in text.split("<Item class=\"ReflectionMetadataClass\"").skip(1) {
             let head = chunk.split("</Properties>").next().unwrap_or("");
             let Some(name) = field(head, "Name") else {
@@ -50,6 +58,7 @@ pub fn class_meta() -> &'static HashMap<String, ClassMeta> {
                 ClassMeta {
                     category: field(head, "ClassCategory").unwrap_or_default(),
                     explorer_order: field(head, "ExplorerOrder").and_then(|v| v.trim().parse().ok()),
+                    service_visibility: field_tok(head, "ServiceVisibility").and_then(|v| v.trim().parse().ok()),
                 },
             );
         }

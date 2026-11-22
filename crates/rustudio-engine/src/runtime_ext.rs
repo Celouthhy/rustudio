@@ -2632,8 +2632,8 @@ fn terrain_tri_index(lua: &Lua, key: [i32; 3], tris: &[([Vec3; 3], [u8; 3])]) ->
 /// a union's doorway or a mesh's gaps let the ray through; invisible parts
 /// still catch it, as Roblox's Mouse does), passing `skip` (the player's own
 /// character and held tool).
-pub fn mouse_part_hit(lua: &Lua, origin: Vec3, dir: Vec3, len: f32, skip: &[Ref]) -> Option<(Ref, f32)> {
-    let filter = Filter { list: skip.iter().copied().collect(), ..Filter::none() };
+pub fn mouse_part_hit(lua: &Lua, origin: Vec3, dir: Vec3, len: f32, skip: rustc_hash::FxHashSet<Ref>) -> Option<(Ref, f32)> {
+    let filter = Filter { list: skip, ..Filter::none() };
     cast(lua, origin, dir.normalize_or_zero() * len, &filter).ok().flatten().map(|(r, _, _, t)| (r, t))
 }
 
@@ -2782,57 +2782,156 @@ fn remove_tag(lua: &Lua, r: Ref, tag: &str) -> mlua::Result<()> {
 
 // --------------------------------------------------------------------- json
 
-fn to_json(v: &Value, depth: usize) -> mlua::Result<serde_json::Value> {
-    if depth > 64 {
-        return Err(rt_err("Can't convert to JSON: nesting too deep"));
+/// HttpService:JSONEncode as Studio writes it (measured in Studio 0.748):
+/// values JSON can't hold (Vector3, CFrame, Instances, functions, threads,
+/// EnumItems, …) encode as `null` instead of failing; NaN/±inf and buffers
+/// become tagged objects (`{"m":null,"t":"numeric","v":"nan"}`,
+/// `{"m":null,"t":"buffer","base64":…}`) that JSONDecode turns back; a table
+/// with a border (`#t > 0`) is an array of 1..#t (other keys dropped, holes
+/// `null`), else an object whose number keys are truncated to integers and
+/// whose other keys are `"<Type> (tostring)"`; boolean keys error with
+/// "Invalid table key type used", and a table met again on its own path
+/// errors with "tables cannot be cyclic". Numbers are written like
+/// JavaScript's Number#toString without the exponent's `+`.
+pub(crate) fn json_encode(lua: &Lua, v: &Value) -> mlua::Result<String> {
+    let mut out = String::new();
+    let mut path = Vec::new();
+    json_write(lua, v, &mut out, &mut path)?;
+    Ok(out)
+}
+
+fn json_number(n: f64, out: &mut String) {
+    if n.is_nan() {
+        out.push_str(r#"{"m":null,"t":"numeric","v":"nan"}"#);
+        return;
     }
-    Ok(match v {
-        Value::Nil => serde_json::Value::Null,
-        Value::Boolean(b) => serde_json::Value::Bool(*b),
-        Value::Integer(i) => serde_json::json!(*i),
-        Value::Number(n) => {
-            if n.fract() == 0.0 && n.abs() < 1e15 {
-                serde_json::json!(*n as i64)
-            } else {
-                serde_json::json!(*n)
-            }
+    if n.is_infinite() {
+        out.push_str(if n > 0.0 {
+            r#"{"m":null,"t":"numeric","v":"inf"}"#
+        } else {
+            r#"{"m":null,"t":"numeric","v":"-inf"}"#
+        });
+        return;
+    }
+    out.push_str(&js_number(n));
+}
+
+/// JavaScript's Number#toString (ECMA-262 Number::toString, radix 10) with
+/// the shortest round-trip digits; Studio leaves out the `+` of a positive
+/// exponent (`1e21`, not `1e+21`).
+pub(crate) fn js_number(n: f64) -> String {
+    if n == 0.0 {
+        return if n.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let sci = format!("{:e}", n.abs()); // shortest digits: "d.ddde±x"
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let k = digits.len() as i32;
+    let e: i32 = exp.parse().unwrap_or(0);
+    let nexp = e + 1; // value = 0.digits × 10^nexp
+    let mut s = String::new();
+    if n < 0.0 {
+        s.push('-');
+    }
+    if k <= nexp && nexp <= 21 {
+        s.push_str(&digits);
+        s.extend(std::iter::repeat('0').take((nexp - k) as usize));
+    } else if 0 < nexp && nexp <= 21 {
+        s.push_str(&digits[..nexp as usize]);
+        s.push('.');
+        s.push_str(&digits[nexp as usize..]);
+    } else if -6 < nexp && nexp <= 0 {
+        s.push_str("0.");
+        s.extend(std::iter::repeat('0').take((-nexp) as usize));
+        s.push_str(&digits);
+    } else {
+        s.push_str(&digits[..1]);
+        if k > 1 {
+            s.push('.');
+            s.push_str(&digits[1..]);
         }
-        Value::String(s) => serde_json::Value::String(s.to_str()?.to_string()),
+        s.push('e');
+        s.push_str(&(nexp - 1).to_string());
+    }
+    s
+}
+
+fn json_string(s: &[u8], out: &mut String) {
+    let s = String::from_utf8_lossy(s);
+    out.push_str(&serde_json::to_string(s.as_ref()).unwrap_or_else(|_| "\"\"".into()));
+}
+
+fn json_write(
+    lua: &Lua,
+    v: &Value,
+    out: &mut String,
+    path: &mut Vec<*const std::ffi::c_void>,
+) -> mlua::Result<()> {
+    match v {
+        Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Integer(i) => json_number(*i as f64, out),
+        Value::Number(n) => json_number(*n, out),
+        Value::String(s) => json_string(&s.as_bytes(), out),
+        Value::Buffer(b) => {
+            out.push_str(r#"{"m":null,"t":"buffer","base64":"#);
+            let enc = crate::runtime::domains::services::encoding::base64_encode(&b.to_vec());
+            json_string(&enc, out);
+            out.push('}');
+        }
         Value::Table(t) => {
+            let p = t.to_pointer();
+            if path.contains(&p) {
+                return Err(rt_err("tables cannot be cyclic"));
+            }
+            path.push(p);
             let n = t.raw_len();
             if n > 0 {
-                let mut arr = Vec::with_capacity(n);
+                out.push('[');
                 for i in 1..=n {
-                    arr.push(to_json(&t.raw_get::<Value>(i)?, depth + 1)?);
+                    if i > 1 {
+                        out.push(',');
+                    }
+                    json_write(lua, &t.raw_get::<Value>(i)?, out, path)?;
                 }
-                serde_json::Value::Array(arr)
+                out.push(']');
             } else {
-                let mut map = serde_json::Map::new();
+                let mut first = true;
                 for pair in t.pairs::<Value, Value>() {
                     let (k, v) = pair?;
                     let key = match &k {
-                        Value::String(s) => s.to_str()?.to_string(),
-                        Value::Number(n) => n.to_string(),
+                        Value::String(s) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
+                        Value::Number(n) => format!("{}", n.trunc() as i64),
                         Value::Integer(i) => i.to_string(),
-                        _ => continue,
+                        Value::Boolean(_) | Value::Nil | Value::LightUserData(_) | Value::Error(_) | Value::Other(..) => {
+                            return Err(rt_err("Invalid table key type used"))
+                        }
+                        // "<Table> (table: 0x…)", "<Vector3> (1, 2, 3)",
+                        // "<Instance> (Workspace)", "<Function> (function: 0x…)".
+                        _ => {
+                            let g = lua.globals();
+                            let ty = g.get::<mlua::Function>("typeof")?.call::<String>(k.clone())?;
+                            let text = g.get::<mlua::Function>("tostring")?.call::<String>(k.clone())?;
+                            let mut ty = ty.chars();
+                            let cap: String = ty.next().map(|c| c.to_uppercase().chain(ty).collect()).unwrap_or_default();
+                            format!("<{cap}> ({text})")
+                        }
                     };
-                    map.insert(key, to_json(&v, depth + 1)?);
+                    out.push(if first { '{' } else { ',' });
+                    first = false;
+                    json_string(key.as_bytes(), out);
+                    out.push(':');
+                    json_write(lua, &v, out, path)?;
                 }
                 // An empty table is "[]" in Roblox's JSONEncode.
-                if map.is_empty() {
-                    serde_json::Value::Array(Vec::new())
-                } else {
-                    serde_json::Value::Object(map)
-                }
+                out.push_str(if first { "[]" } else { "}" });
             }
+            path.pop();
         }
-        _ => {
-            return Err(rt_err(format!(
-                "Can't convert to JSON: {} is not supported",
-                v.type_name()
-            )))
-        }
-    })
+        // nil, functions, threads, userdata (Vector3, CFrame, Instances,
+        // EnumItems…), native vectors: Studio writes null.
+        _ => out.push_str("null"),
+    }
+    Ok(())
 }
 
 pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value> {
@@ -2849,6 +2948,25 @@ pub(crate) fn from_json(lua: &Lua, v: &serde_json::Value) -> mlua::Result<Value>
             Value::Table(t)
         }
         serde_json::Value::Object(m) => {
+            // JSONEncode's tagged values come back as what they stood for.
+            if m.get("m").is_some_and(|x| x.is_null()) {
+                match m.get("t").and_then(|t| t.as_str()) {
+                    Some("numeric") => match m.get("v").and_then(|v| v.as_str()) {
+                        Some("nan") => return Ok(Value::Number(f64::NAN)),
+                        Some("inf") => return Ok(Value::Number(f64::INFINITY)),
+                        Some("-inf") => return Ok(Value::Number(f64::NEG_INFINITY)),
+                        _ => {}
+                    },
+                    Some("buffer") => {
+                        if let Some(b) = m.get("base64").and_then(|b| b.as_str()).and_then(|b| {
+                            crate::runtime::domains::services::encoding::base64_decode(b.as_bytes())
+                        }) {
+                            return Ok(Value::Buffer(lua.create_buffer(b)?));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             let t = lua.create_table()?;
             for (k, x) in m {
                 t.raw_set(k.as_str(), from_json(lua, x)?)?;
@@ -5427,15 +5545,12 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             ))
         }
         "JSONEncode" => {
-            let j = to_json(&arg(args, 1), 0)?;
-            one(Value::String(lua.create_string(
-                serde_json::to_string(&j).map_err(|e| rt_err(e.to_string()))?,
-            )?))
+            one(Value::String(lua.create_string(json_encode(lua, &arg(args, 1))?)?))
         }
         "JSONDecode" => {
             let s = arg_str(args, 1, "string")?;
             let j: serde_json::Value =
-                serde_json::from_str(&s).map_err(|e| rt_err(format!("Can't parse JSON: {e}")))?;
+                serde_json::from_str(&s).map_err(|_| rt_err("Can't parse JSON"))?;
             one(from_json(lua, &j)?)
         }
         "GenerateGUID" => {
@@ -5802,6 +5917,210 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The native GetDescendants gives the same Instances, in the same
+    // breadth-first order, as walking GetChildren; empty and one-element
+    // lists too, and a fresh table each call.
+    // HttpService:JSONEncode/JSONDecode as Studio 0.748 answers them (each
+    // expected string was read back from Studio's execute_luau). An FPS
+    // framework JSON-encodes weapon stats holding Vector3s/CFrames on every
+    // equip: Studio writes null there, an error aborted the equip.
+    #[test]
+    fn json_encode_matches_studio() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local H = game:GetService("HttpService")
+            local function e(v) return H:JSONEncode(v) end
+            local function eq(a, b) assert(a == b, tostring(a) .. " ~= " .. tostring(b)) end
+            eq(e({Vector3.new(1, 2, 3)}), "[null]")
+            eq(e({a = Vector3.new(1, 2, 3), b = 1}), '{"a":null,"b":1}')
+            eq(e({a = CFrame.new()}), '{"a":null}')
+            eq(e({a = Color3.new(1, 0, 0)}), '{"a":null}')
+            eq(e({a = Enum.Material.Plastic}), '{"a":null}')
+            eq(e({a = workspace}), '{"a":null}')
+            eq(e({a = print}), '{"a":null}')
+            eq(e({a = coroutine.create(print)}), '{"a":null}')
+            eq(e({a = vector.create(1, 2, 3)}), '{"a":null}')
+            eq(e(Vector3.new(1, 2, 3)), "null")
+            eq(e(nil), "null")
+            eq(e({a = 0/0}), '{"a":{"m":null,"t":"numeric","v":"nan"}}')
+            eq(e({math.huge, -math.huge}),
+                '[{"m":null,"t":"numeric","v":"inf"},{"m":null,"t":"numeric","v":"-inf"}]')
+            eq(e({a = buffer.create(2)}), '{"a":{"m":null,"t":"buffer","base64":"AAA="}}')
+            eq(e({1, 2, a = 3}), "[1,2]")
+            eq(e({1, nil, 3}), "[1,null,3]")
+            eq(e({[1.5] = 1}), '{"1":1}')
+            eq(e({[2.7] = 1}), '{"2":1}')
+            eq(e({}), "[]")
+            eq(e({a = {}}), '{"a":[]}')
+            eq(e("hi\n\"/é"), '"hi\\n\\"/é"')
+            eq(e({1e15, 1e16, 123456789012, 0.1, -0}), "[1000000000000000,10000000000000000,123456789012,0.1,-0]")
+            eq(e({1/3, 1e300, 1e-7, 2^53, 2^63, -1.5, 123.456, 1e20, 1e21, 5e-324}),
+                "[0.3333333333333333,1e300,1e-7,9007199254740992,9223372036854776000,-1.5,123.456,100000000000000000000,1e21,5e-324]")
+            local k = {}
+            eq(e({[k] = 1}), '{"<Table> (' .. tostring(k) .. ')":1}')
+            eq(e({[Vector3.new(1, 2, 3)] = 1}), '{"<Vector3> (1, 2, 3)":1}')
+            eq(e({[workspace] = 1}), '{"<Instance> (Workspace)":1}')
+            eq(e({[print] = 1}), '{"<Function> (' .. tostring(print) .. ')":1}')
+            local s2 = {x = 1}
+            eq(e({s2, s2}), '[{"x":1},{"x":1}]')
+            local ok, err = pcall(e, {[true] = 1, x = 2})
+            assert(not ok and string.find(err, "Invalid table key type used", 1, true), err)
+            local c = {} c.self = c
+            ok, err = pcall(e, c)
+            assert(not ok and string.find(err, "tables cannot be cyclic", 1, true), err)
+            local shared = {1}
+            eq(e({a = shared, b = shared}), '{"a":[1],"b":[1]}')
+            -- tagged values decode back
+            local d = H:JSONDecode('{"a":{"m":null,"t":"numeric","v":"nan"},"b":{"m":null,"t":"numeric","v":"-inf"}}')
+            assert(d.a ~= d.a and d.b == -math.huge)
+            local b = H:JSONDecode('{"m":null,"t":"buffer","base64":"AAA="}')
+            assert(typeof(b) == "buffer" and buffer.len(b) == 2)
+            local arr = H:JSONDecode("[1,null,3]")
+            assert(arr[1] == 1 and arr[2] == nil and arr[3] == 3)
+            ok, err = pcall(H.JSONDecode, H, "{a:1}")
+            assert(not ok and string.find(err, "Can't parse JSON", 1, true), err)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn cached_joint_assembly_poses_before_luau_reads_it() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.lua.load(include_str!("../../../tools/parity_probe/joint_offsets/cached_assembly.luau"))
+            .exec().unwrap();
+    }
+
+    // A script's CFrame write moves the part's whole assembly at once, as
+    // Studio 0.748's Play does (each expected position read back from
+    // Studio's execute_luau on a client). An FPS view model sets its
+    // AnimBase from the camera and reads the Grip / AimPart it carries in
+    // the same frame to aim down the sights.
+    #[test]
+    fn cframe_write_carries_the_assembly_like_studio() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local f = Instance.new("Folder") f.Parent = workspace
+            local function mk(anch, parent)
+                local p = Instance.new("Part") p.Anchored = anch p.Size = Vector3.one p.Parent = parent or f
+                return p
+            end
+            local function weld(a, b, cls)
+                local w = Instance.new(cls or "Weld") w.Part0 = a w.Part1 = b
+                if w:IsA("JointInstance") then w.C0 = CFrame.new(0, 0, -2) end
+                w.Parent = a
+                return w
+            end
+            local function near(p, x, y, z, what)
+                local v = p.Position
+                assert((v - Vector3.new(x, y, z)).Magnitude < 1e-3, what .. ": " .. tostring(v))
+            end
+            -- anchored root, welded child: the child follows a move and a turn
+            local a = mk(true) a.CFrame = CFrame.new(0, 100, 0)
+            local b = mk(false) b.CFrame = CFrame.new(0, 100, -2) weld(a, b)
+            a.CFrame = CFrame.new(10, 100, 0)
+            near(b, 10, 100, -2, "weld follows")
+            a.CFrame = CFrame.new(10, 100, 0) * CFrame.Angles(0, math.rad(90), 0)
+            near(b, 8, 100, 0, "weld turns")
+            -- a chain through a Motor6D and a Weld
+            local e = mk(true) e.CFrame = CFrame.new(0, 300, 0)
+            local g = mk(false) g.CFrame = CFrame.new(1, 300, 0)
+            local h = mk(false) h.CFrame = CFrame.new(1, 300, -3)
+            local m1 = Instance.new("Motor6D") m1.Part0 = e m1.Part1 = g m1.C0 = CFrame.new(1, 0, 0) m1.Parent = e
+            local m2 = Instance.new("Weld") m2.Part0 = g m2.Part1 = h m2.C0 = CFrame.new(0, 0, -3) m2.Parent = g
+            e.CFrame = CFrame.new(0, 300, 0) * CFrame.Angles(0, math.rad(90), 0)
+            near(h, -3, 300, -1, "chain")
+            -- two Anchored parts welded: separate assemblies
+            local a1 = mk(true) a1.CFrame = CFrame.new(0, 110, 0)
+            local b1 = mk(true) b1.CFrame = CFrame.new(0, 110, -2) weld(a1, b1)
+            a1.CFrame = CFrame.new(10, 110, 0)
+            near(b1, 0, 110, -2, "anchored pair")
+            -- moving the unanchored child moves the anchored root too
+            local a2 = mk(true) a2.CFrame = CFrame.new(0, 120, 0)
+            local b2 = mk(false) b2.CFrame = CFrame.new(0, 120, -2) weld(a2, b2, "Motor6D")
+            b2.CFrame = CFrame.new(9, 120, -2)
+            near(a2, 9, 120, 0, "root follows the child")
+            -- a disabled weld joins nothing
+            local a3 = mk(true) a3.CFrame = CFrame.new(0, 130, 0)
+            local b3 = mk(false) b3.CFrame = CFrame.new(0, 130, -2)
+            weld(a3, b3).Enabled = false
+            a3.CFrame = CFrame.new(10, 130, 0)
+            near(b3, 0, 130, -2, "disabled")
+            -- Position and Orientation move only the part itself
+            local a4 = mk(true) a4.CFrame = CFrame.new(0, 140, 0)
+            local b4 = mk(false) b4.CFrame = CFrame.new(0, 140, -2) weld(a4, b4)
+            a4.Position = Vector3.new(7, 140, 0)
+            a4.Orientation = Vector3.new(0, 90, 0)
+            near(b4, 0, 140, -2, "Position / Orientation")
+            -- a WeldConstraint carries too
+            local a6 = mk(true) a6.CFrame = CFrame.new(0, 150, 0)
+            local b6 = mk(false) b6.CFrame = CFrame.new(0, 150, -3) weld(a6, b6, "WeldConstraint")
+            a6.CFrame = CFrame.new(4, 150, 0)
+            near(b6, 4, 150, -3, "WeldConstraint")
+            -- an unanchored part between two Anchored ones stays
+            local a10 = mk(true) a10.CFrame = CFrame.new(0, 190, 0)
+            local b10 = mk(false) b10.CFrame = CFrame.new(0, 190, -2) weld(a10, b10)
+            local c10 = mk(true) c10.CFrame = CFrame.new(0, 190, -4) weld(b10, c10)
+            a10.CFrame = CFrame.new(1, 190, 0)
+            near(b10, 0, 190, -2, "two anchors") near(c10, 0, 190, -4, "two anchors")
+            -- outside Workspace nothing is joined
+            local m = Instance.new("Model")
+            local a8 = mk(true, m) a8.CFrame = CFrame.new(0, 170, 0)
+            local b8 = mk(false, m) weld(a8, b8)
+            a8.CFrame = CFrame.new(3, 170, 0)
+            near(b8, 0, 0, 0, "outside Workspace")
+            -- a part's PivotTo carries like its CFrame
+            local a9 = mk(true) a9.CFrame = CFrame.new(0, 180, 0)
+            local b9 = mk(false) b9.CFrame = CFrame.new(0, 180, -2) weld(a9, b9)
+            a9:PivotTo(CFrame.new(2, 180, 0))
+            near(b9, 2, 180, -2, "PivotTo")
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn get_descendants_matches_a_children_walk() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local root = Instance.new("Model", workspace)
+            local function grow(p, depth)
+                for i = 1, 3 do
+                    local c = Instance.new(i == 2 and "Part" or "Folder", p)
+                    c.Name = p.Name .. "." .. i
+                    if depth > 0 then grow(c, depth - 1) end
+                end
+            end
+            grow(root, 3)
+            local function walk(p)
+                local out, queue = {}, { p }
+                local at = 1
+                while queue[at] do
+                    for _, c in ipairs(queue[at]:GetChildren()) do
+                        out[#out + 1] = c
+                        queue[#queue + 1] = c
+                    end
+                    at += 1
+                end
+                return out
+            end
+            local d, w = root:GetDescendants(), walk(root)
+            assert(#d == #w and #d == 120, "count " .. #d .. " vs " .. #w)
+            for i = 1, #d do assert(rawequal(d[i], w[i]), "element " .. i) end
+            local leaf = Instance.new("Folder", workspace)
+            assert(#leaf:GetDescendants() == 0)
+            local one = Instance.new("Part", leaf)
+            local d1 = leaf:GetDescendants()
+            assert(#d1 == 1 and rawequal(d1[1], one))
+            d1[1] = nil
+            assert(rawequal(leaf:GetDescendants()[1], one), "a fresh table each call")
+        "#).exec().unwrap();
+    }
 
     #[test]
     fn layout_signals_follow_live_connections_and_waiters() {

@@ -100,6 +100,11 @@ pub struct Link {
     /// Server parts the client took out of its Workspace → the client instance taken out
     /// (the part's own copy, or an ancestor's).
     hidden: HashMap<Ref, Ref>,
+    /// Server parts that collide on the server but that the client made
+    /// CanCollide=false (a LocalScript opening a door for its own player):
+    /// the client simulates its character against its own copy, so the
+    /// player's character passes through them; everything else still meets them.
+    pub(super) nocollide: HashSet<Ref>,
     /// The player's character body (the only thing a stand-in touches).
     pub(super) player: Option<rp::RigidBodyHandle>,
     /// Its HumanoidRootPart (a query by the character has it in `own`).
@@ -118,7 +123,7 @@ impl Link {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty()
+        self.proxies.is_empty() && self.hidden.is_empty() && self.statics.is_empty() && self.nocollide.is_empty()
     }
 
     pub(super) fn body_of(&self, r: Ref) -> Option<rp::RigidBodyHandle> {
@@ -141,7 +146,7 @@ impl Link {
         }
         let player = self.player_root.is_some_and(|r| own.contains(&r));
         if player {
-            !self.hidden.is_empty() && by_collider.get(&h).is_some_and(|r| self.hidden.contains_key(r))
+            by_collider.get(&h).is_some_and(|r| self.hidden.contains_key(r) || self.nocollide.contains(r))
         } else {
             self.proxy_colliders.contains(&h)
         }
@@ -158,9 +163,9 @@ impl Link {
             let ok = !(p1 && p2) && if p1 { me(c.rigid_body2) } else { me(c.rigid_body1) };
             return Some(ok.then_some(rp::SolverFlags::COMPUTE_RIGID_IMPULSES));
         }
-        if !self.hidden.is_empty() && (me(c.rigid_body1) || me(c.rigid_body2)) {
+        if !(self.hidden.is_empty() && self.nocollide.is_empty()) && (me(c.rigid_body1) || me(c.rigid_body2)) {
             let other = if me(c.rigid_body1) { c.collider2 } else { c.collider1 };
-            if by_collider.get(&other).is_some_and(|r| self.hidden.contains_key(r)) {
+            if by_collider.get(&other).is_some_and(|r| self.hidden.contains_key(r) || self.nocollide.contains(r)) {
                 return Some(None);
             }
         }
@@ -169,10 +174,23 @@ impl Link {
 }
 
 impl Physics {
+    /// A replicated part whose CanCollide the client changed: off on the client while
+    /// the server's collides → the player's character passes through it (`nocollide`);
+    /// the same on both sides again (the client turned it back on, or the server's
+    /// value replicated over it) → it meets it again. (Studio path only.)
+    pub(super) fn link_note_collide(&mut self, server: &Document, client: &Document, c: Ref, s: Ref) {
+        let off = |d: &Document, r: Ref| matches!(d.prop(r, "CanCollide"), Some(Variant::Bool(false)));
+        if self.parts.contains_key(&s) && off(client, c) && !off(server, s) {
+            self.link.nocollide.insert(s);
+        } else {
+            self.link.nocollide.remove(&s);
+        }
+    }
+
     /// The replicated parts under `trees` (client refs whose parent changed, or every
     /// replicated part) that the client has out of its Workspace now: hidden from the
     /// player's character; back in, shown again. (Studio path only.)
-    pub(super) fn link_note_trees(&mut self, server: &Document, client: &Document, c2s: &std::collections::HashMap<Ref, Ref>, trees: &[Ref], all: bool) {
+    pub(super) fn link_note_trees(&mut self, server: &Document, client: &Document, c2s: &rustudio_core::RefMap, trees: &[Ref], all: bool) {
         let ws = client.workspace();
         let inside = |c: Ref| ws.is_some_and(|w| client.dom.get_by_ref(c).is_some() && client.is_ancestor(w, c));
         if all {
@@ -207,7 +225,7 @@ impl Physics {
 
     /// Once a frame before the character's step (studio path): the stand-ins of the
     /// client's own bodies near the player's character, where and how fast those are.
-    pub fn link_client_bodies(&mut self, cs: &client::ClientSim, c2s: &std::collections::HashMap<Ref, Ref>, player_model: Option<Ref>) {
+    pub fn link_client_bodies(&mut self, cs: &client::ClientSim, c2s: &rustudio_core::RefMap, player_model: Option<Ref>) {
         if self.studio.is_none() || off() {
             return;
         }
@@ -323,7 +341,7 @@ impl Physics {
     /// The client's own anchored parts near the player's character, as fixed
     /// copies only it meets (see the module notes). `region`: the character's box
     /// and speed (None: no character, every copy goes).
-    fn link_client_statics(&mut self, cp: &Physics, c2s: &std::collections::HashMap<Ref, Ref>, region: Option<(rp::Aabb, f32)>) {
+    fn link_client_statics(&mut self, cp: &Physics, c2s: &rustudio_core::RefMap, region: Option<(rp::Aabb, f32)>) {
         self.link.frames += 1;
         let frame = self.link.frames;
         let Some((pbb, pspeed)) = region else {

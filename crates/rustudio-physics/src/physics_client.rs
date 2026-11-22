@@ -96,7 +96,7 @@ impl ClientSim {
     /// (linear velocity, angular velocity, assembly centre of mass). Client
     /// scripts read these (AssemblyLinearVelocity / AssemblyAngularVelocity),
     /// the replicated parts' come from the server, as in Studio.
-    pub fn own_motion(&self, c2s: &std::collections::HashMap<Ref, Ref>) -> std::collections::HashMap<Ref, (Vec3, Vec3, Vec3)> {
+    pub fn own_motion(&self, c2s: &rustudio_core::RefMap) -> std::collections::HashMap<Ref, (Vec3, Vec3, Vec3)> {
         let mut out = std::collections::HashMap::new();
         let Some(p) = self.physics.as_ref() else { return out };
         for a in p.asms.values() {
@@ -122,8 +122,8 @@ impl ClientSim {
         &mut self,
         server: &Physics,
         cd: &mut Document,
-        s2c: &std::collections::HashMap<Ref, Ref>,
-        c2s: &std::collections::HashMap<Ref, Ref>,
+        s2c: &rustudio_core::RefMap,
+        c2s: &rustudio_core::RefMap,
         vel: &[(Ref, Vec3)],
         dt: f32,
     ) -> StepResult {

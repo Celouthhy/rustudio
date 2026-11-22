@@ -18,8 +18,8 @@ pub const SERVER_ONLY: &[&str] = &["ServerStorage", "ServerScriptService"];
 /// Server ↔ client instance pairs, and the changes on their way over.
 #[derive(Default)]
 pub struct RepMap {
-    pub s2c: HashMap<Ref, Ref>,
-    pub c2s: HashMap<Ref, Ref>,
+    pub s2c: rustudio_core::RefMap,
+    pub c2s: rustudio_core::RefMap,
     /// Server changes not yet applied to the client, oldest first.
     queue: VecDeque<Pending>,
     /// Ops enqueued so far (each op's sequence number).
@@ -45,6 +45,8 @@ pub struct RepMap {
     frame_used: Duration,
     frame_items: u32,
     frame_budget: Option<Duration>,
+    /// Bumped by every link / unlink (readers caching a mapped set).
+    revision: u64,
 }
 
 /// One unit of replication work.
@@ -84,7 +86,13 @@ const PIECE: usize = 128;
 const MOVE_BATCH: usize = 32;
 
 impl RepMap {
+    /// Changes each time a server ↔ client pair is made or dropped.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn link(&mut self, s: Ref, c: Ref) {
+        self.revision += 1;
         self.s2c.insert(s, c);
         self.c2s.insert(c, s);
         if self.pending_refs.contains_key(&s) {
@@ -93,6 +101,7 @@ impl RepMap {
     }
 
     fn unlink_client(&mut self, c: Ref) {
+        self.revision += 1;
         if let Some(s) = self.c2s.remove(&c) {
             self.s2c.remove(&s);
         }
@@ -363,6 +372,9 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
             // Consecutive physics updates have no property callbacks. Keep
             // their place in the ordered queue and reuse one document borrow.
             let before = map.frame_items;
+            // (Net stats once per batch: a lock and a clock read per part
+            // were most of a moved part's cost.)
+            let mut net_bytes = 0u64;
             for _ in 0..MOVE_BATCH {
                 let Some(Pending { kind: PendingKind::Op(RepOp::Moved(r)), .. }) = map.queue.front() else {
                     break;
@@ -380,7 +392,7 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
                 ) else {
                     continue;
                 };
-                crate::runtime::domains::services::perf::net(true, true, 4 + 12 + 6 + 12 + 12);
+                net_bytes += 4 + 12 + 6 + 12 + 12;
                 if let Some(w) = &mut world {
                     let d = w.dm();
                     if let Some(i) = d.dom.get_by_ref_mut(target) {
@@ -391,6 +403,7 @@ fn drain(server: &Document, client: &Runtime, map: &mut RepMap, budgeted: bool) 
                     }
                 }
             }
+            crate::runtime::domains::services::perf::net(true, true, net_bytes);
             rustudio_core::bench::add("rep_moved_parts", 0.0, u64::from(map.frame_items - before));
             continue;
         }

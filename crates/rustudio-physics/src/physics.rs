@@ -1999,11 +1999,13 @@ impl Physics {
     /// part at the spawn into a 2048×1×2048 void catcher under the map). A
     /// journal read that comes back All (the client's start-up flood)
     /// compares every part instead of dropping the batch.
-    pub fn follow_client(&mut self, server: &Document, client: &mut Document, c2s: &std::collections::HashMap<Ref, Ref>) {
+    pub fn follow_client(&mut self, server: &Document, client: &mut Document, c2s: &rustudio_core::RefMap) {
         let _b = rustudio_core::bench::scope("ps_follow_client");
         let cframe = ustr("CFrame");
         let size = ustr("Size");
+        let can_collide = ustr("CanCollide");
         let mut trees: Vec<Ref> = Vec::new();
+        let mut collide: Vec<Ref> = Vec::new();
         let mut all = false;
         let changed: Vec<Ref> = match client.marks_for(doc::Reader::ClientPhysics) {
             doc::Marks::All => {
@@ -2014,6 +2016,10 @@ impl Physics {
                 .into_iter()
                 .filter_map(|m| match m {
                     doc::Mark::Prop(c, name) if name == cframe || name == size => Some(c),
+                    doc::Mark::Prop(c, name) if name == can_collide => {
+                        collide.push(c);
+                        None
+                    }
                     doc::Mark::Tree(c) => {
                         trees.push(c);
                         None
@@ -2027,6 +2033,18 @@ impl Physics {
         if self.studio.is_some() && !client_link::off() && (all || !trees.is_empty()) {
             let _l = rustudio_core::bench::scope("ps_link_trees");
             self.link_note_trees(server, client, c2s, &trees, all);
+        }
+        // RUSTUDIO_SOLVER=studio: CanCollide the client changed on a replicated part
+        // (physics_client_link.rs `nocollide`).
+        if self.studio.is_some() && !client_link::off() {
+            if all {
+                self.link.nocollide.clear();
+            }
+            for c in collide {
+                if let Some(&s) = c2s.get(&c) {
+                    self.link_note_collide(server, client, c, s);
+                }
+            }
         }
         let mut seen: HashSet<Ref> = HashSet::default();
         let mut resized: HashSet<Ref> = HashSet::default();
@@ -3209,7 +3227,7 @@ impl Physics {
     }
 
     /// Linear velocities of the parts on moving assemblies.
-    pub fn velocities(&self) -> HashMap<Ref, Vec3> {
+    pub fn velocities(&self) -> rustc_hash::FxHashMap<Ref, Vec3> {
         let mut out = HashMap::default();
         for a in self.asms.values() {
             let Some(b) = self.world.bodies.get(a.body) else {
@@ -3346,6 +3364,7 @@ impl Physics {
             }
         };
         if std::mem::take(&mut self.touch_refresh) {
+            rustudio_core::bench::add("ph_touch_refresh", 0.0, self.by_collider.len() as u64);
             for (&c, &r) in &self.by_collider {
                 update(c, r);
             }
@@ -3532,17 +3551,49 @@ impl Physics {
         // for the next sync and give them precedence over that step's poses.
         let edits = doc.marks_since(frame.journal_pos).map(<[_]>::to_vec);
         let Some(edits) = edits else { return out };
-        for a in self.asms.values() {
-            if edits.iter().any(|mark| a.parts.iter().any(|r| match *mark {
-                doc::Mark::Prop(part, _) => *r == part,
-                doc::Mark::Tree(root) => *r == root || doc.is_ancestor(root, *r),
-            })) {
-                continue;
+        // (Sets, not a scan of every edit for every part of every assembly:
+        // A large test place has ~700 awake assemblies against a frame's edits.)
+        let mut edited: rustc_hash::FxHashSet<Ref> = Default::default();
+        let mut edited_trees: rustc_hash::FxHashSet<Ref> = Default::default();
+        for mark in &edits {
+            match *mark {
+                doc::Mark::Prop(part, _) => edited.insert(part),
+                doc::Mark::Tree(root) => edited_trees.insert(root),
+            };
+        }
+        let touched = |r: Ref| {
+            if edited.contains(&r) || edited_trees.contains(&r) {
+                return true;
             }
+            if edited_trees.is_empty() {
+                return false;
+            }
+            let mut cur = doc.dom.get_by_ref(r).map(|i| i.parent());
+            while let Some(p) = cur.filter(|p| p.is_some()) {
+                if edited_trees.contains(&p) {
+                    return true;
+                }
+                cur = doc.dom.get_by_ref(p).map(|i| i.parent());
+            }
+            false
+        };
+        let skip: rustc_hash::FxHashSet<rp::RigidBodyHandle> = if edits.is_empty() {
+            Default::default()
+        } else {
+            self.asms
+                .values()
+                .filter(|a| self.world.bodies.get(a.body).is_some_and(|b| !b.is_sleeping()))
+                .filter(|a| a.parts.iter().any(|r| touched(*r)))
+                .map(|a| a.body)
+                .collect()
+        };
+        drop(touched);
+        let mut same = 0u64;
+        for a in self.asms.values() {
             let Some(b) = self.world.bodies.get(a.body) else {
                 continue;
             };
-            if b.is_sleeping() {
+            if b.is_sleeping() || skip.contains(&a.body) {
                 continue;
             }
             let body_pose = *b.position();
@@ -3565,14 +3616,31 @@ impl Physics {
                 if xf.pos.y < self.fallen_height {
                     out.fallen.push(*r);
                 }
-                if let Some(inst) = doc.dom.get_by_ref_mut(*r) {
-                    inst.properties
-                        .insert(cframe, Variant::CFrame(xf.to_cframe()));
+                // An awake assembly between its solve ticks (or held by the
+                // throttle) publishes the CFrame its parts already have: the
+                // value and the journal stay as they are (a large test place: ~45% of
+                // ~700 parts a frame, each a mark every reader went through).
+                let changed = match doc.dom.get_by_ref_mut(*r) {
+                    Some(inst) => {
+                        let cf = xf.to_cframe();
+                        if matches!(inst.properties.get(&cframe), Some(Variant::CFrame(old)) if same_bits(old, &cf)) {
+                            false
+                        } else {
+                            inst.properties.insert(cframe, Variant::CFrame(cf));
+                            true
+                        }
+                    }
+                    None => true,
+                };
+                if changed {
+                    doc.mark_prop(*r, cframe);
+                } else {
+                    same += 1;
                 }
-                doc.mark_prop(*r, cframe);
                 out.moved.push((*r, xf));
             }
         }
+        rustudio_core::bench::add("ph_publish_unchanged", 0.0, same);
         // Our own CFrame writes aren't news to us.
         if edits.is_empty() && !out.moved.is_empty() {
             if let doc::Marks::Some(rest) = doc.marks_for(doc::Reader::Physics) {
@@ -4235,7 +4303,7 @@ pub mod live {
 
     /// The client's copy of the server's stats (Play): parts mapped to the
     /// client's refs, so its scripts read angular velocities and awake counts.
-    pub fn mirror(from: u64, to: u64, s2c: &std::collections::HashMap<Ref, Ref>) {
+    pub fn mirror(from: u64, to: u64, s2c: &rustudio_core::RefMap) {
         let mut sh = shared();
         let Some(st) = sh.stats.get(&from) else { return };
         let copy = Stats {
@@ -5466,7 +5534,7 @@ mod tests {
         let mut client = Document::new_place();
         let cws = client.workspace().unwrap();
         let c = client.dom.insert(cws, part("Teleporter", Vec3::new(0.0, 150.0, 0.0), true));
-        let c2s: std::collections::HashMap<Ref, Ref> = [(c, s)].into();
+        let c2s: rustudio_core::RefMap = [(c, s)].into_iter().collect();
         let mut p = Physics::new(&mut server);
         let aabb = |p: &Physics| {
             let col = &p.world.colliders[p.parts[&s].collider];
@@ -6155,4 +6223,14 @@ fn par_pool() -> Option<&'static rapier3d::rayon::ThreadPool> {
             .build()
             .ok()
     }).as_ref()
+}
+
+/// The same twelve floats, bit for bit (-0.0 and 0.0 differ, as a script
+/// printing them would see).
+fn same_bits(a: &rbx_dom_weak::types::CFrame, b: &rbx_dom_weak::types::CFrame) -> bool {
+    let f = |c: &rbx_dom_weak::types::CFrame| {
+        let (p, o) = (c.position, c.orientation);
+        [p.x, p.y, p.z, o.x.x, o.x.y, o.x.z, o.y.x, o.y.y, o.y.z, o.z.x, o.z.y, o.z.z].map(f32::to_bits)
+    };
+    f(a) == f(b)
 }

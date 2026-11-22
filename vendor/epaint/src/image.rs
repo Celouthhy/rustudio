@@ -467,6 +467,21 @@ pub struct ImageDelta {
     ///
     /// If `Some(pos)`, update a sub-region of an already allocated texture with the patch in [`Self::image`].
     pub pos: Option<[usize; 2]>,
+
+    /// rustudio: a whole-texture delta of a font atlas that only grew taller.
+    /// Its top `old_height` rows hold what the texture held before, except in
+    /// the `changed` texel rectangle (x, y, width, height); the rows below are
+    /// transparent outside it. A backend may keep the old rows on the GPU and
+    /// upload only `changed`; ignoring this, the delta is still a full image.
+    pub grown: Option<GrownAtlas>,
+}
+
+/// See [`ImageDelta::grown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct GrownAtlas {
+    pub old_height: usize,
+    pub changed: [usize; 4],
 }
 
 impl ImageDelta {
@@ -476,6 +491,7 @@ impl ImageDelta {
             image: image.into(),
             options,
             pos: None,
+            grown: None,
         }
     }
 
@@ -485,6 +501,7 @@ impl ImageDelta {
             image: image.into(),
             options,
             pos: Some(pos),
+            grown: None,
         }
     }
 

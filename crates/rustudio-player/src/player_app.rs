@@ -314,6 +314,13 @@ pub fn run() -> eframe::Result<()> {
                     None => eprintln!("--lhold: can't read {v:?} (X,Y@SECONDS:HOLD)"),
                 }
             }
+            "--rhold" => {
+                let v = args.next().unwrap_or_default();
+                match HarnessAction::parse_rhold(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--rhold: can't read {v:?} (SECONDS:HOLD)"),
+                }
+            }
             "--rdrag" => {
                 let v = args.next().unwrap_or_default();
                 match HarnessAction::parse_rdrag(&v) {

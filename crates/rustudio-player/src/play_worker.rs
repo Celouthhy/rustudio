@@ -25,7 +25,25 @@ impl PlayWorker {
             let mut game = Game::new(None);
             let mut host = WorkerHost { hooks, end_test: None };
             init(&mut game, &mut host);
-            while let Ok(job) = queue.recv() {
+            loop {
+                // While the world's physics batch runs, look in on it between
+                // jobs: its tick's server half can run before the next step
+                // arrives (Game::play_worker_idle).
+                let job = if game.play_worker_idle_due() {
+                    match queue.recv_timeout(std::time::Duration::from_micros(250)) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            game.play_worker_idle();
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match queue.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    }
+                };
                 job(&mut game, &mut host);
             }
             game.stop_play(&mut host);
@@ -686,8 +704,10 @@ impl Game {
                 let keyboard = input.apply(game);
                 game.step_play(dt, worker_host, &keyboard, true)
             };
+            let _capture = rustudio_core::bench::scope("gameplay_capture");
             let ui = updated.then(|| worker_host.hooks.capture_play_ui(game)).flatten();
             let frame = Publication::capture(game, &mut source, worker_host.end_test.take(), updated, ui);
+            drop(_capture);
             (frame, source)
         });
         match pending {

@@ -1677,8 +1677,11 @@ impl Game {
             Some((d, _)) => d.clone(),
             None => rustudio_core::terrain::dirty_chunks(old.as_ref(), &voxels),
         };
-        for key in &dirty {
-            let verts = rustudio_core::terrain::chunk_triangles(&voxels, *key, &cube);
+        // Meshed a batch at a time on several threads, applied in order.
+        let meshed = dirty
+            .chunks(256)
+            .flat_map(|batch| batch.iter().zip(rustudio_core::terrain::chunk_triangles_many(&voxels, batch, &cube)));
+        for (key, verts) in meshed {
             if rustudio_core::terrain::chunk_has_grass_top(&verts) {
                 self.terrain_grass_chunks.insert(*key);
             } else {
@@ -2350,9 +2353,15 @@ pub struct LightingState {
     /// Hull bounds per (mesh id, CollisionFidelity) at unit size.
     lightgrid_hull_boxes: std::collections::HashMap<(String, u32), Vec<(Vec3, Vec3)>>,
     lightgrid_terrain: Option<([i32; 3], Option<std::sync::Arc<Vec<u8>>>)>,
+    /// The last full build's inputs (its key and terrain plane), to skip a
+    /// rebuild that would come out the same.
+    lightgrid_inputs: Option<(Vec<u32>, Option<std::sync::Arc<Vec<u8>>>)>,
     lightgrid_lights: Vec<rustudio_render::render::LightRaw>,
     #[allow(clippy::type_complexity)]
-    lightgrid_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::LightGrid, std::sync::Arc<rustudio_render::lightgrid::Occupancy>, rustudio_render::lightgrid::LocalLights)>>,
+    lightgrid_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::GridBuild, f64, Vec<((String, u32), Vec<(Vec3, Vec3)>)>, bool)>>,
+    /// The last full build's state (lightgrid::GridState): the next build
+    /// redoes only what changed parts touch.
+    lightgrid_state: Option<rustudio_render::lightgrid::GridState>,
     /// The shown grid's voxels and its local channel as kept
     /// (lightgrid::LocalLights): a change of lights alone (a muzzle flash's
     /// PointLight flicked on for 35 ms, moving with the camera) re-lights
@@ -2368,7 +2377,7 @@ pub struct LightingState {
     lightgrid_locals: Option<rustudio_render::lightgrid::LocalLights>,
     lightgrid_local_dirty: bool,
     #[allow(clippy::type_complexity)]
-    lightgrid_local_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::LocalLights, Vec<u8>)>>,
+    lightgrid_local_job: Option<std::sync::mpsc::Receiver<(rustudio_render::lightgrid::LocalLights, Vec<rustudio_render::lightgrid::LocalPatch>, f64)>>,
     /// Parts blocking local lights (lightocc.rs): the grid last asked for
     /// (first voxel, studs per voxel, document) and the one on the GPU,
     /// last rebuild, parts changed since, and the worker filling the next.
@@ -2544,7 +2553,7 @@ impl Game {
             // With the voxels at hand only the local channel needs redoing
             // (a full build running brings its own lights; the ones after
             // are caught up when it lands).
-            if st.lightgrid_occ.is_some() {
+            if st.lightgrid_occ.is_some() || st.lightgrid_job.is_some() {
                 st.lightgrid_local_dirty = true;
             } else {
                 st.lightgrid_dirty = true;
@@ -2552,25 +2561,48 @@ impl Game {
         }
         if let Some(rx) = &st.lightgrid_local_job {
             match rx.try_recv() {
-                Ok((locals, local)) => {
-                    if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                        // Only if the grid it re-lit is still the one shown.
-                        if st.lightgrid_shown == Some(locals.origin) {
-                            renderer.set_localgrid(&rs.queue, &local);
-                            st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
-                            st.lightgrid_locals = Some(locals);
+                Ok((locals, patches, ms)) => {
+                    // (the worker's own time, in the bench as a call per job)
+                    rustudio_core::bench::add("lightgrid_local_job", ms, 1);
+                    // (no full build starts while this runs, so the grid it
+                    // re-lit is still the one shown; if not, rebuild)
+                    if st.lightgrid_shown == Some(locals.origin) {
+                        if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                            for p in &patches {
+                                renderer.set_localgrid_region(&rs.queue, p);
+                            }
                         }
+                        st.lightgrid_local_dirty = !locals.matches_lights(&st.lightgrid_lights);
+                        st.lightgrid_locals = Some(locals);
+                    } else {
+                        st.lightgrid_dirty = true;
                     }
                     st.lightgrid_local_job = None;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => st.lightgrid_local_job = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    st.lightgrid_local_job = None;
+                    st.lightgrid_dirty = true;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(rx) = &st.lightgrid_job {
             match rustudio_core::sim_clock::job_recv(rx) {
-                Ok((mut grid, occ, locals)) => {
+                Ok((build, ms, learnt, pending)) => {
+                    let _apply = rustudio_core::bench::scope("lt_grid_apply");
+                    rustudio_core::bench::add("lightgrid_job", ms, 1);
+                    // (hulls the job worked out; one still computing on the
+                    // physics workers asks for another build later)
+                    st.lightgrid_hull_boxes.extend(learnt);
+                    if pending {
+                        st.lightgrid_dirty = true;
+                    }
+                    if build.incremental {
+                        rustudio_core::bench::add("lightgrid_job_incremental", 0.0, 1);
+                    }
+                    let rustudio_render::lightgrid::GridBuild { mut grid, patches, occ, locals, state, incremental, changed } = build;
                     st.lightgrid_occ = Some(occ);
+                    st.lightgrid_state = Some(state);
                     if let Ok(points) = std::env::var("RUSTUDIO_LIGHTGRID_DEBUG") {
                         for point in points.split(';') {
                             let p: Vec<f32> = point.split(',').filter_map(|x| x.parse().ok()).collect();
@@ -2581,8 +2613,22 @@ impl Game {
                         }
                     }
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
-                        renderer.set_lightgrid(&rs.queue, &grid.data);
-                        renderer.set_localgrid(&rs.queue, &grid.local);
+                        if !incremental {
+                            renderer.set_lightgrid(&rs.queue, &grid.data);
+                        } else if let Some((lo, hi)) = changed {
+                            // (only the voxels this build changed: the rest
+                            // of the texture is the last build's already)
+                            renderer.set_lightgrid_region(&rs.queue, &grid.data, lo, hi);
+                        }
+                        if incremental {
+                            // (over the channel the last build left there:
+                            // the same grid, kept up by the local path since)
+                            for p in &patches {
+                                renderer.set_localgrid_region(&rs.queue, p);
+                            }
+                        } else {
+                            renderer.set_localgrid(&rs.queue, &grid.local);
+                        }
                         st.lightgrid_shown = Some(grid.origin);
                         // (the GPU has the channel; it's kept as `locals`)
                         grid.local = Vec::new();
@@ -2592,7 +2638,10 @@ impl Game {
                     }
                     st.lightgrid_job = None;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => st.lightgrid_job = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    st.lightgrid_job = None;
+                    st.lightgrid_state = None;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -2618,6 +2667,7 @@ impl Game {
             let _b = rustudio_core::bench::scope("lightgrid");
             // The terrain's share, read again only when the grid moved or
             // the terrain changed.
+            let scope = rustudio_core::bench::scope("lg_terrain");
             if st.lightgrid_terrain.as_ref().is_none_or(|(o, _)| *o != origin) {
                 let plane = self
                     .terrain_drawn
@@ -2627,11 +2677,19 @@ impl Game {
                 st.lightgrid_terrain = Some((origin, plane));
             }
             let terrain = st.lightgrid_terrain.as_ref().and_then(|(_, p)| p.clone());
+            drop(scope);
+            let scope = rustudio_core::bench::scope("lg_gather");
             let [nx, ny, nz] = rustudio_render::lightgrid::dims();
             let lo = Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32) * 4.0;
             let hi = lo + Vec3::new(nx as f32, ny as f32, nz as f32) * 4.0;
-            let mut pending_meshes = false;
-            let hull_boxes = &mut st.lightgrid_hull_boxes;
+            let pending_meshes = false;
+            let hull_boxes = &st.lightgrid_hull_boxes;
+            // Meshes whose hull boxes aren't known yet: (prim index, mesh,
+            // fidelity, size). The worker works them out (a hull is computed
+            // on the spot, which held the frame when the grid moved on to
+            // many new meshes) before it builds, so the grid is the same.
+            let mut unresolved: Vec<(usize, String, u32, Vec3)> = Vec::new();
+            let mut index = 0usize;
             let prims: Vec<_> = self
                 .scene
                 .parts
@@ -2662,48 +2720,110 @@ impl Game {
                                     boxes = Some(scale(unit));
                                 // Don't poison the physics cache with a missing download.
                                 } else if self.meshes.state(&mesh.id).is_some_and(|s| s.is_ok()) {
-                                    match rustudio_physics::collision::hulls(&mesh.id, fid) {
-                                        rustudio_physics::collision::Lookup::Ready(hulls) => {
-                                            let unit: Vec<(Vec3, Vec3)> = hulls.iter().filter_map(|h| {
-                                                let first = *h.first()?;
-                                                Some(h.iter().fold((first, first), |(lo, hi), v| (lo.min(*v), hi.max(*v))))
-                                            }).collect();
-                                            boxes = Some(scale(&unit));
-                                            hull_boxes.insert((mesh.id.clone(), fid), unit);
-                                        }
-                                        rustudio_physics::collision::Lookup::Pending => pending_meshes = true,
-                                        rustudio_physics::collision::Lookup::Unavailable => {}
-                                    }
+                                    unresolved.push((index, mesh.id.clone(), fid, sp.size));
                                 }
                             }
                         }
                     }
+                    index += 1;
                     Some((p, boxes))
                 })
                 .collect();
+            // Everything the build below reads, bit for bit: the same inputs
+            // give the same grid, so a part change that left them alone (a
+            // recolour, a script touching a lamp) rebuilds nothing. The
+            // local lights are kept up by their own path either way.
+            drop(scope);
+            let scope = rustudio_core::bench::scope("lg_inputs");
+            let mut inputs: Vec<u32> = Vec::with_capacity(prims.len() * 18 + 8);
+            inputs.extend(origin.map(|v| v as u32));
+            inputs.push(u32::from(shadows));
+            inputs.extend(sun.to_array().map(f32::to_bits));
+            for (i, (p, boxes)) in prims.iter().enumerate() {
+                if unresolved.binary_search_by_key(&i, |u| u.0).is_ok() {
+                    // (not known yet: never the same as a build that knew it)
+                    inputs.push(u32::MAX - 1);
+                }
+                inputs.push(p.kind as u32);
+                inputs.extend(p.size.to_array().map(f32::to_bits));
+                inputs.extend(p.rot.map(f32::to_bits));
+                inputs.extend(p.pos.to_array().map(f32::to_bits));
+                inputs.push(p.transparency.to_bits());
+                match boxes {
+                    None => inputs.push(u32::MAX),
+                    Some(b) => {
+                        inputs.push(b.len() as u32);
+                        for (lo, hi) in b {
+                            inputs.extend(lo.to_array().into_iter().chain(hi.to_array()).map(f32::to_bits));
+                        }
+                    }
+                }
+            }
+            let same_terrain = match (&terrain, &st.lightgrid_inputs) {
+                (None, Some((_, None))) => true,
+                (Some(a), Some((_, Some(b)))) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            drop(scope);
+            'build: {
+            if unresolved.is_empty() && same_terrain && st.lightgrid_inputs.as_ref().is_some_and(|(k, _)| *k == inputs) && st.lightgrid_shown == Some(origin) {
+                rustudio_core::bench::add("lightgrid_unchanged", 0.0, 1);
+                st.lightgrid_key = Some(key);
+                st.lightgrid_at = Some(rustudio_core::sim_clock::now());
+                st.lightgrid_dirty = pending_meshes;
+                st.lightgrid_moves = false;
+                break 'build;
+            }
+            st.lightgrid_inputs = Some((inputs, terrain.clone()));
             let local_lights = lights.to_vec();
+            // The last build's state, occupancy and local lights go to the
+            // job (no local job runs alongside one, so nothing else needs
+            // them meanwhile); it builds on them when only parts changed.
+            let kept = match (st.lightgrid_state.take(), st.lightgrid_occ.take(), st.lightgrid_locals.take()) {
+                (Some(s), Some(o), Some(l)) if st.lightgrid_shown == Some(origin) => Some((s, o, l)),
+                _ => None,
+            };
             let (tx, rx) = std::sync::mpsc::channel();
+            let mut prims = prims;
             std::thread::spawn(move || {
-                let mut occ = rustudio_render::lightgrid::Occupancy::new(origin);
-                for (p, boxes) in &prims {
-                    occ.add_prim_boxes(p, boxes.as_deref());
+                let t0 = std::time::Instant::now();
+                // The hull boxes the gather didn't know, as it worked them out.
+                let mut pending = false;
+                let mut learnt: Vec<((String, u32), Vec<(Vec3, Vec3)>)> = Vec::new();
+                for (i, id, fid, size) in unresolved {
+                    let unit = match learnt.iter().find(|l| l.0 .0 == id && l.0 .1 == fid) {
+                        Some(l) => Some(l.1.clone()),
+                        None => match rustudio_physics::collision::hulls(&id, fid) {
+                            rustudio_physics::collision::Lookup::Ready(hulls) => {
+                                let unit: Vec<(Vec3, Vec3)> = hulls.iter().filter_map(|h| {
+                                    let first = *h.first()?;
+                                    Some(h.iter().fold((first, first), |(lo, hi), v| (lo.min(*v), hi.max(*v))))
+                                }).collect();
+                                learnt.push(((id.clone(), fid), unit.clone()));
+                                Some(unit)
+                            }
+                            rustudio_physics::collision::Lookup::Pending => {
+                                pending = true;
+                                None
+                            }
+                            rustudio_physics::collision::Lookup::Unavailable => None,
+                        },
+                    };
+                    if let Some(unit) = unit {
+                        // Hull points scale per axis by Size, so their
+                        // unit-size bounds do too (Size is positive).
+                        prims[i].1 = Some(unit.iter().map(|(lo, hi)| (*lo * size, *hi * size)).collect());
+                    }
                 }
-                if let Some(t) = terrain {
-                    occ.add_plane(&t);
-                }
-                let mut grid = rustudio_render::lightgrid::skylight(&occ);
-                if shadows {
-                    rustudio_render::lightgrid::sunlight(&occ, &mut grid, sun);
-                }
-                let (locals, local) = rustudio_render::lightgrid::LocalLights::build(&occ, &local_lights);
-                grid.local = local;
-                let _ = tx.send((grid, std::sync::Arc::new(occ), locals));
+                let build = rustudio_render::lightgrid::build_grid(origin, &prims, terrain, shadows, sun, &local_lights, kept);
+                let _ = tx.send((build, t0.elapsed().as_secs_f64() * 1e3, learnt, pending));
             });
             st.lightgrid_job = Some(rx);
             st.lightgrid_key = Some(key);
             st.lightgrid_at = Some(rustudio_core::sim_clock::now());
             st.lightgrid_dirty = pending_meshes;
             st.lightgrid_moves = false;
+            }
         }
         // Lights changed, voxels didn't: re-light the boxes of the lights
         // that changed now, or the whole channel on a worker when they're big.
@@ -2713,17 +2833,24 @@ impl Game {
                 if Some(locals.origin) == st.lightgrid_shown {
                     let _b = rustudio_core::bench::scope("lightgrid_local");
                     match locals.update(&occ, &st.lightgrid_lights, mech::LIGHTGRID_LOCAL_PATCH_MAX) {
-                        Ok(patch) => {
-                            if let (Some(p), Some(renderer), Some(rs)) = (patch, self.renderer.as_mut(), self.render_state.as_ref()) {
-                                renderer.set_localgrid_region(&rs.queue, &p);
+                        Ok(patches) => {
+                            if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+                                for p in &patches {
+                                    renderer.set_localgrid_region(&rs.queue, p);
+                                }
                             }
                             st.lightgrid_local_dirty = false;
                         }
                         Err(()) => {
+                            // The same update on a worker (it keeps the
+                            // lights' fields), handed back with its patches.
                             let lights = st.lightgrid_lights.clone();
+                            let mut locals = st.lightgrid_locals.take().expect("locals");
                             let (tx, rx) = std::sync::mpsc::channel();
                             std::thread::spawn(move || {
-                                let _ = tx.send(rustudio_render::lightgrid::LocalLights::build(&occ, &lights));
+                                let t0 = std::time::Instant::now();
+                                let patches = locals.update(&occ, &lights, usize::MAX).unwrap_or_default();
+                                let _ = tx.send((locals, patches, t0.elapsed().as_secs_f64() * 1e3));
                             });
                             st.lightgrid_local_job = Some(rx);
                             st.lightgrid_local_dirty = false;
@@ -2752,6 +2879,7 @@ impl Game {
         if let Some(rx) = &st.lightocc_job {
             match rustudio_core::sim_clock::job_recv(rx) {
                 Ok(grid) => {
+                    let _apply = rustudio_core::bench::scope("lt_occ_apply");
                     if let (Some(renderer), Some(rs)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
                         renderer.set_lightocc(&rs.queue, &grid.data);
                         st.lightocc_shown = Some((grid.origin, grid.voxel));

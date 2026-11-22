@@ -89,7 +89,7 @@ pub struct Tween {
 
 #[derive(Default)]
 pub struct Tweens {
-    pub all: HashMap<Ref, Tween>,
+    pub all: rustc_hash::FxHashMap<Ref, Tween>,
     active: Vec<Ref>,
     to_add: Vec<Ref>,
     steps: u64,
@@ -515,14 +515,28 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         std::mem::take(&mut t.to_add)
     };
     // New tweens take over the properties they share with older ones.
+    // (Only an older tween of the same instance can lose properties: the
+    // active list by instance, in its order, instead of a scan of every
+    // active tween for every new one. a large test place's rain scripts create tweens
+    // for many parts every frame.)
+    let mut by_inst: Option<rustc_hash::FxHashMap<Ref, Vec<Ref>>> = None;
     for r in adding {
         let cancelled: Vec<Ref> = {
             let mut t = tweens(lua);
             let Some(new) = t.all.get(&r) else { continue };
             let (inst, keys): (Ref, Vec<String>) = (new.inst, new.goals.iter().map(|g| g.0.clone()).collect());
-            let active = t.active.clone();
+            let by_inst = by_inst.get_or_insert_with(|| {
+                let mut m: rustc_hash::FxHashMap<Ref, Vec<Ref>> = Default::default();
+                for &o in &t.active {
+                    if let Some(tw) = t.all.get(&o) {
+                        m.entry(tw.inst).or_default().push(o);
+                    }
+                }
+                m
+            });
+            let same: Vec<Ref> = by_inst.get(&inst).cloned().unwrap_or_default();
             let mut out = Vec::new();
-            for o in active {
+            for o in same {
                 if o == r {
                     continue;
                 }
@@ -550,6 +564,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 }
             }
             t.active.push(r);
+            by_inst.entry(inst).or_default().push(r);
             out
         };
         for o in cancelled {

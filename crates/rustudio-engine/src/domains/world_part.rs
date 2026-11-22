@@ -25,7 +25,7 @@
 //! player within its simulation radius (`auto_owner`).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::{Mat3, Vec3};
 use mlua::{Lua, MultiValue, Value};
@@ -570,6 +570,178 @@ impl Graph {
     pub fn joints_of(&self, r: Ref) -> Vec<Ref> {
         self.joints.get(&r).cloned().unwrap_or_default()
     }
+
+    /// The other parts a script's CFrame write on `r` carries along: `r`'s
+    /// assembly as Studio 0.748 keeps it during Play (measured with
+    /// execute_luau on a client, tools/parity_probe/assembly_move):
+    /// enabled rigid joints under Workspace join parts, a joint between
+    /// two Anchored parts does not (each Anchored part roots its own
+    /// assembly), and moving a non-root part moves the Anchored root too.
+    /// An unanchored part joined to two Anchored parts stays with the other
+    /// one, so a group holding a second Anchored part carries nothing.
+    pub fn carried_by_move(&self, d: &Document, r: Ref) -> Vec<Ref> {
+        if !self.rigid.contains_key(&r) {
+            return Vec::new();
+        }
+        let mut seen: rustc_hash::FxHashSet<Ref> = Default::default();
+        seen.insert(r);
+        let mut queue = vec![r];
+        let mut out = Vec::new();
+        let mut anchors = usize::from(anchored(d, r));
+        while let Some(p) = queue.pop() {
+            let pa = anchored(d, p);
+            for &q in self.rigid.get(&p).map(Vec::as_slice).unwrap_or(&[]) {
+                if seen.contains(&q) {
+                    continue;
+                }
+                let qa = anchored(d, q);
+                if pa && qa {
+                    continue;
+                }
+                seen.insert(q);
+                if qa {
+                    anchors += 1;
+                    if anchors > 1 {
+                        return Vec::new();
+                    }
+                }
+                out.push(q);
+                queue.push(q);
+            }
+        }
+        out
+    }
+}
+
+/// Offset-bearing rigid joints whose pose changes synchronously in Play.
+pub(crate) fn poses_immediately(class: &str) -> bool {
+    rigid_joint(class) && doc::is_a(class, "JointInstance")
+}
+
+#[derive(Clone, Copy)]
+enum JointPoseEdit {
+    Activate,
+    C0(Xform),
+    C1(Xform),
+}
+
+/// Pose the affected side of an assembly, keeping the root fixed. A newly
+/// active joint supplies its stored rest offset. An offset edit replaces just
+/// that factor in the current pose, preserving the motor's last stepped pose.
+fn joint_pose_moves(d: &Document, g: &Graph, edits: &HashMap<Ref, JointPoseEdit>) -> Vec<(Ref, Xform)> {
+    use rustudio_core::body::joint_frames;
+    let mut posed = HashSet::new();
+    let mut writes = Vec::new();
+    for joint in edits.keys() {
+        let Some((a, b)) = g.recs.get(joint).and_then(|rec| rec.edge) else { continue };
+        if posed.contains(&a) || posed.contains(&b) || anchored(d, a) && anchored(d, b) {
+            continue;
+        }
+        let members = g.assembly(a);
+        let mut roots: Vec<_> = members.iter().copied().filter(|p| anchored(d, *p)).collect();
+        if roots.is_empty() {
+            roots.push(g.root(d, a));
+        } else if roots.len() > 1 {
+            roots.sort_by_cached_key(|p| std::cmp::Reverse(bfs_key(d, *p)));
+        }
+        let mut queue = VecDeque::new();
+        for root in roots {
+            posed.insert(root);
+            if let Some(frame) = xf(d, root, "CFrame") {
+                queue.push_back((root, frame, frame));
+            }
+        }
+        while let Some((part, before, after)) = queue.pop_front() {
+            let Some(joints) = g.joints.get(&part) else { continue };
+            for j in joints {
+                let Some((p0, p1)) = g.recs.get(j).and_then(|rec| rec.edge) else { continue };
+                let forward = part == p0;
+                let child = if forward { p1 } else { p0 };
+                if !posed.insert(child) {
+                    continue;
+                }
+                let Some(child_before) = xf(d, child, "CFrame") else { continue };
+                let mut child_after = child_before;
+                if let Some((edit, (_, _, c0, c1))) = edits.get(j).zip(joint_frames(d, *j)) {
+                    let (a, b) = if forward { (before, child_before) } else { (child_before, before) };
+                    let relative = |a: Xform, b: Xform| Xform {
+                        pos: a.rot.transpose() * (b.pos - a.pos),
+                        rot: a.rot.transpose() * b.rot,
+                    };
+                    let offset = match edit {
+                        JointPoseEdit::Activate => cf_mul(&c0, &cf_inv(&c1)),
+                        JointPoseEdit::C0(old) => cf_mul(&cf_mul(&c0, &cf_inv(old)), &relative(a, b)),
+                        JointPoseEdit::C1(old) => cf_mul(&relative(a, b), &cf_mul(old, &cf_inv(&c1))),
+                    };
+                    child_after = cf_mul(&after, &if forward { offset } else { cf_inv(&offset) });
+                } else if before != after {
+                    child_after = Xform {
+                        pos: after.apply(before.rot.transpose() * (child_before.pos - before.pos)),
+                        rot: after.rot * before.rot.transpose() * child_before.rot,
+                    };
+                }
+                if child_before != child_after {
+                    child_after = child_after.orthonormalized();
+                    writes.push((child, child_after));
+                }
+                queue.push_back((child, child_before, child_after));
+            }
+        }
+    }
+    writes
+}
+
+pub(crate) fn joint_property_moves(
+    d: &Document,
+    r: Ref,
+    name: &str,
+    old: Option<&Variant>,
+) -> Vec<(Ref, Xform)> {
+    if !in_workspace(d, r) || name == "Anchored" && anchored(d, r) {
+        return Vec::new();
+    }
+    with_graph(d, |g| {
+        let edits = if name == "Anchored" {
+            if !g.grounded(d, r) {
+                return Vec::new();
+            }
+            let Some(joints) = g.joints.get(&r) else { return Vec::new() };
+            joints.iter().filter(|j| d.class_of(**j).is_some_and(|c| poses_immediately(c.as_str())))
+                .map(|j| (*j, JointPoseEdit::Activate)).collect()
+        } else {
+            let edit = match (name, old) {
+                ("C0", Some(Variant::CFrame(old))) => JointPoseEdit::C0(Xform::from_cframe(old)),
+                ("C1", Some(Variant::CFrame(old))) => JointPoseEdit::C1(Xform::from_cframe(old)),
+                _ => JointPoseEdit::Activate,
+            };
+            HashMap::from([(r, edit)])
+        };
+        joint_pose_moves(d, g, &edits)
+    })
+}
+
+pub(crate) fn entering_joint_moves(d: &Document, tree: &[Ref]) -> Vec<(Ref, Xform)> {
+    if !tree.iter().any(|r| d.class_of(*r).is_some_and(|class| {
+        doc::is_a(&class, "BasePart") || poses_immediately(class.as_str())
+    })) {
+        return Vec::new();
+    }
+    with_graph(d, |g| {
+        let mut joints = HashSet::new();
+        for &r in tree {
+            if g.recs.contains_key(&r) {
+                joints.insert(r);
+            }
+            if let Some(incident) = g.joints.get(&r) {
+                joints.extend(incident.iter().copied());
+            }
+        }
+        let edits = joints.into_iter()
+            .filter(|j| d.class_of(*j).is_some_and(|c| poses_immediately(c.as_str())))
+            .map(|j| (j, JointPoseEdit::Activate))
+            .collect();
+        joint_pose_moves(d, g, &edits)
+    })
 }
 
 /// A part's effective mass (0 for a Massless part that isn't the root).

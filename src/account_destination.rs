@@ -70,7 +70,10 @@ impl Request {
                         api.shared_experiences().map(Reply::Experiences)
                     }
                     Self::Experiences(ExperienceSource::Group(id)) => {
-                        api.group_experiences(id).map(Reply::Experiences)
+                        // The Start Page's search: develop's group list refuses
+                        // a role without manageGroupGames even where an
+                        // experience gives this account edit.
+                        api.group_search_experiences(id).map(Reply::Experiences)
                     }
                     Self::Places(id) => api.places(id).map(Reply::Places),
                     Self::CreateExperience(..) | Self::CreatePlace(..) => unreachable!(),
@@ -348,7 +351,7 @@ impl Editor {
         if let Some(client) = &client {
             if picker.groups.is_none() && picker.group_worker.is_none() {
                 picker.group_worker = Some(picker.fetch(ctx, client.clone(), |client| {
-                    CloudApi::new(client.session, Default::default(), None).groups()
+                    CloudApi::new(client.session, Default::default(), None).publish_groups()
                 }));
             }
             if matches!(picker.page, Page::Experiences)
@@ -359,6 +362,9 @@ impl Editor {
             {
                 picker.load_page(ctx, client.clone());
             }
+        }
+        if let Some(Ok(groups)) = &picker.groups {
+            crate::group_icons::request(ctx, &self.cloud.endpoints.thumbnails, groups.iter().map(|g| g.id));
         }
         let uploading = self.cloud_upload_pending();
         let blocked = picker.creating || uploading || created_target.is_some();
@@ -568,7 +574,7 @@ impl Picker {
                             // new height when the asynchronous membership list arrives.
                             let group_count = match &self.groups {
                                 Some(Ok(groups)) => {
-                                    groups.iter().filter(|g| g.can_edit != Some(false)).count()
+                                    groups.len()
                                 }
                                 _ => 1,
                             };
@@ -600,16 +606,19 @@ impl Picker {
                                         }
                                     }
                                     if let Some(Ok(groups)) = &self.groups {
-                                        for group in
-                                            groups.iter().filter(|g| g.can_edit != Some(false))
-                                        {
+                                        // publish_groups: groups with an experience this
+                                        // account can edit, or whose role may make one.
+                                        for group in groups {
                                             let source = ExperienceSource::Group(group.id);
                                             if ui
                                                 .add_enabled(
                                                     available,
                                                     Button::selectable(
                                                         self.source == source,
-                                                        &group.name,
+                                                        (
+                                                            crate::group_icons::image(ui.ctx(), group.id, 16.0),
+                                                            group.name.as_str(),
+                                                        ),
                                                     )
                                                     .wrap()
                                                     .min_size(row_size),

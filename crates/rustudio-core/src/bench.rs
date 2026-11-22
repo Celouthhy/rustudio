@@ -523,7 +523,10 @@ impl Bench {
             gpu_take();
             take_lua();
             take_api();
-            LUA_ON.with(|c| c.set(true));
+            // RUSTUDIO_BENCH_LUA=0: no per-call Lua API timing (two clock
+            // reads and a map update on every Lua→engine call) while
+            // measuring, so Lua-heavy benches cost what a session does.
+            LUA_ON.with(|c| c.set(std::env::var_os("RUSTUDIO_BENCH_LUA").is_none_or(|v| v != "0")));
             self.cpu0 = thread_cpu_ms();
             if let Some(note) = instr_note() {
                 eprintln!("RUSTUDIO_BENCH_INSTR: sections are in {note}");
@@ -570,7 +573,12 @@ impl Bench {
             let mut keep: Vec<(&'static str, f64)> =
                 frame_sections.iter().filter(|e| e.1 > 0.0).map(|(n, t, _)| (*n, *t)).collect();
             keep.sort_by(|a, b| b.1.total_cmp(&a.1));
-            keep.truncate(8);
+            // (RUSTUDIO_BENCH_FRAME_SECTIONS=N keeps more per frame, to
+            // take slow frames apart)
+            static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            keep.truncate(*KEEP.get_or_init(|| {
+                std::env::var("RUSTUDIO_BENCH_FRAME_SECTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+            }));
             self.per_frame.push((mi, ms, keep));
             for (n, t, c) in &frame_sections {
                 match self.totals.iter_mut().find(|e| e.0 == *n) {

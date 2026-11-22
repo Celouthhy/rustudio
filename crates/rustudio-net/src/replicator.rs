@@ -25,6 +25,8 @@ pub mod packet_id {
     pub const DATA: u8 = 0x83;
     /// Top-level marker after the schema, before the initial place data.
     pub const MARKER: u8 = 0x84;
+    /// Streamed terrain chunks.
+    pub const TERRAIN: u8 = 0x8d;
     /// Flag/protocol sync: u8, u16 LE count, (u16-LE-len key, u16-LE-len value)* [verified: capture].
     pub const PROTOCOL_SYNC: u8 = 0x93;
     /// The replication schema [verified: capture].
@@ -54,6 +56,25 @@ pub enum ItemKind {
     ResolveNewInstanceAtomicTree,
     SharedReferencePropertyChanged,
     Stats,
+}
+
+/// One terrain box in voxel coordinates. An empty payload clears the box.
+#[derive(Debug, Clone)]
+pub struct TerrainChunk {
+    pub origin: [i32; 3],
+    pub size_log2: u8,
+    pub lod: u8,
+    pub runs: Vec<TerrainRun>,
+    /// Offset and extent within the chunk, in voxels.
+    pub boxes: Vec<([u8; 3], [u8; 3])>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerrainRun {
+    pub length: u16,
+    pub material: u8,
+    pub occupancy: u8,
+    pub water: u16,
 }
 
 /// A decoded replicator op in rustudio's own terms: what to do to the live
@@ -95,6 +116,8 @@ pub enum RepOp {
     /// A net asset (a union's SolidMeshHolder contents) from the 0xa5
     /// channel, keyed by the id a holder property refers to.
     NetAsset { key: NetAssetId, data: Vec<u8> },
+    /// Authoritative voxel updates for a Terrain instance.
+    Terrain { id: u64, chunks: Vec<TerrainChunk> },
     /// SET_GLOBALS' top-level service table: (server referent, class). Some
     /// services (ReplicatedFirst) are never sent as NewInstance, only listed
     /// here, while their children arrive with the listed referent as parent.
@@ -631,6 +654,92 @@ fn unzstd(d: &[u8], size: usize) -> R<Vec<u8>> {
     Ok(out)
 }
 
+/// Studio 0.748 terrain records. Mode 3 is the independent
+/// zstd block seen on the primary reliable stream in Team Create.
+fn terrain_packet(body: &[u8]) -> R<RepOp> {
+    let mut c = Cur::new(body);
+    let id = c.reference()?.ok_or(DecodeError::Bad("nil Terrain reference".into()))?;
+    if c.u8()? != 3 {
+        return bad("unsupported terrain packet mode");
+    }
+    let compressed = c.u32()? as usize;
+    let expanded = c.u32()? as usize;
+    if expanded > 4 << 20 {
+        return bad("terrain block exceeds size limit");
+    }
+    let data = unzstd(c.take(compressed)?, expanded)?;
+    if c.left() != 0 {
+        return bad("trailing bytes in terrain packet");
+    }
+    let mut c = Cur::new(&data);
+    let mut previous = [0i32; 3];
+    let mut chunks = Vec::new();
+    while c.left() != 0 {
+        if chunks.len() == 4096 {
+            return bad("too many terrain chunks in one block");
+        }
+        let header = c.u8()?;
+        let size_log2 = header & 15;
+        let lod = header >> 6;
+        if size_log2 + lod != 4 {
+            return bad("unsupported terrain chunk size");
+        }
+        let mut origin = [0; 3];
+        for (pos, prev) in origin.iter_mut().zip(&mut previous) {
+            let delta = match header & 0x30 {
+                0 => i32::from(c.u8()? as i8),
+                0x10 => i32::from(c.u16()? as i16),
+                0x20 => c.u32()? as i32,
+                _ => return bad("invalid terrain coordinate width"),
+            };
+            *prev = prev.checked_add(delta).ok_or(DecodeError::Bad("terrain coordinate overflow".into()))?;
+            if !(-((1 << 25) - 1)..(1 << 25)).contains(prev) {
+                return bad("terrain coordinate out of range");
+            }
+            *pos = *prev * 16;
+        }
+        let mut runs = Vec::new();
+        match c.u8()? {
+            0 => {
+                let mut remaining = 1usize << (size_log2 * 3);
+                while remaining != 0 {
+                    let flags = c.u8()?;
+                    let material = flags & 0x3f;
+                    let occupancy = if flags & 0x40 != 0 { c.u8()? } else { 255 };
+                    let mut length = 1;
+                    let mut water = 0;
+                    if flags & 0x80 != 0 {
+                        let count = c.u8()?;
+                        if count == 0 {
+                            water = u16::from(c.u8()?) + 1;
+                        } else {
+                            length = u16::from(count) + 1;
+                        }
+                    }
+                    remaining = remaining.checked_sub(usize::from(length))
+                        .ok_or(DecodeError::Bad("terrain run exceeds chunk".into()))?;
+                    runs.push(TerrainRun { length, material, occupancy, water });
+                }
+            }
+            1 => {}
+            _ => return bad("invalid terrain empty flag"),
+        }
+        let count = c.u8()?;
+        let mut boxes = Vec::new();
+        for _ in 0..count {
+            let axes: [u8; 3] = c.take(3)?.try_into().unwrap();
+            let offset = axes.map(|b| b & 15);
+            let extent = axes.map(|b| (b >> 4) + 1);
+            if (0..3).any(|axis| offset[axis] + extent[axis] > 16) {
+                return bad("terrain update box exceeds chunk");
+            }
+            boxes.push((offset, extent));
+        }
+        chunks.push(TerrainChunk { origin, size_log2, lod, runs, boxes });
+    }
+    Ok(RepOp::Terrain { id, chunks })
+}
+
 /// SET_GLOBALS assigns the client's GUID namespace after seven flags.
 /// Native client parser:...
 /// The second flag enables an optional terrain block, not supported here.
@@ -706,6 +815,7 @@ impl Decoder {
             packet_id::NEW_SCHEMA => self.schema_msg(body),
             packet_id::DATA => self.data_msg(body, &mut ops),
             packet_id::SOLID_MESH => self.net_asset_msg(body, &mut ops),
+            packet_id::TERRAIN => terrain_packet(body).map(|op| ops.push(op)),
             packet_id::SET_GLOBALS if self.schema.is_some() => {
                 match top_services(self.schema.as_ref().unwrap(), body) {
                     Ok(services) => ops.push(RepOp::Services(services)),
@@ -1195,6 +1305,27 @@ impl RefMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_terrain_packet_decodes_and_checks_its_size() {
+        // The first server terrain packet from the Studio 0.748 scratch join.
+        let frame = [
+            0x8d, 1, 0x81, 0x2f, 0, 0, 3, 15, 0, 0, 0, 6, 0, 0, 0,
+            0x28, 0xb5, 0x2f, 0xfd, 0x20, 6, 0x31, 0, 0, 0xc1, 0xfc, 0xfe, 0xfc, 1, 0,
+        ];
+        let mut decoder = Decoder::new();
+        let ops = decoder.decode_frame(frame[0], &frame[1..]);
+        let [RepOp::Terrain { id, chunks }] = ops.as_slice() else { panic!("{ops:?}") };
+        assert_eq!(*id, 0x2f81);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].origin, [-64, -32, -64]);
+        assert_eq!((chunks[0].size_log2, chunks[0].lod), (1, 3));
+        assert!(chunks[0].runs.is_empty());
+        assert!(decoder.errors.is_empty());
+
+        assert!(decoder.decode_frame(frame[0], &frame[1..frame.len() - 1]).is_empty());
+        assert_eq!(decoder.errors.len(), 1);
+    }
 
     #[test]
     fn globals_assign_the_client_namespace_after_flags() {

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui::{Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Vec2};
-use rustudio_account::cloud::GroupInfo;
+use rustudio_account::cloud::{fan_out, GroupInfo};
 use rustudio_account::{parse_place_ref, CloudApi, CreatorKind, Experience, ExperienceSource};
 
 use crate::app::{Editor, PendingAction};
@@ -26,15 +26,18 @@ use rustudio_engine::theme;
 use templates::{Kind, Source, TemplateInfo};
 
 mod builtin;
+mod group_cache;
 #[cfg(test)]
 mod studio_diff;
 pub mod templates;
 
 type Listing = Option<Result<Vec<Experience>, String>>;
 
+/// Lists carry the load generation they were asked in ([`StartPage::gen`]):
+/// one from before a Refresh or account switch is dropped.
 enum Msg {
-    Page(ExperienceSource, u32, Result<(Vec<Experience>, bool), String>),
-    Groups(Result<Vec<GroupInfo>, String>),
+    Page(u64, ExperienceSource, u32, Result<(Vec<Experience>, bool), String>),
+    Groups(u64, Result<Vec<GroupInfo>, String>),
     Icon(u64, egui::ColorImage),
     /// Studio's template list (develop `v1/gametemplates`).
     Templates(Result<Vec<TemplateInfo>, String>),
@@ -61,6 +64,8 @@ pub struct StartPage {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     jobs: usize,
+    /// Bumped by every (re)load of the lists.
+    gen: u64,
     lists: HashMap<ExperienceSource, Paged>,
     groups: Option<Result<Vec<GroupInfo>, String>>,
     icons: HashMap<u64, egui::TextureHandle>,
@@ -86,6 +91,7 @@ impl StartPage {
         self.lists.clear();
         self.groups = None;
         self.loaded_signed_in = false;
+        self.gen += 1;
     }
 }
 
@@ -104,6 +110,7 @@ impl Default for StartPage {
             tx,
             rx,
             jobs: 0,
+            gen: 0,
             lists: HashMap::new(),
             groups: None,
             icons: HashMap::new(),
@@ -167,12 +174,19 @@ impl StartPage {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Page(src, page, r) => {
+                Msg::Page(gen, src, page, r) => {
+                    if gen != self.gen {
+                        continue;
+                    }
                     if let Some(p) = self.lists.get_mut(&src) {
                         p.arrived(page, r);
                     }
                 }
-                Msg::Groups(r) => self.groups = Some(r),
+                Msg::Groups(gen, r) => {
+                    if gen == self.gen {
+                        self.groups_arrived(r);
+                    }
+                }
                 Msg::Icon(u, img) => {
                     let t = ctx.load_texture(format!("start_icon_{u}"), img, egui::TextureOptions::LINEAR);
                     self.icons.insert(u, t);
@@ -188,6 +202,38 @@ impl StartPage {
         }
     }
 
+    /// The account's groups: each one's first page is already on its way
+    /// (the same job asks for them, [`Editor::start_load_all`]).
+    fn groups_arrived(&mut self, r: Result<Vec<GroupInfo>, String>) {
+        match r {
+            Ok(groups) => {
+                let ids: HashSet<u64> = groups.iter().map(|g| g.id).collect();
+                self.lists.retain(|s, _| !matches!(s, ExperienceSource::Group(g) if !ids.contains(g)));
+                for g in &groups {
+                    // A cached list stays until its page 0 replaces it.
+                    self.lists.entry(ExperienceSource::Group(g.id)).or_insert_with(|| {
+                        let mut p = Paged::fresh();
+                        p.next_page();
+                        p
+                    });
+                }
+                self.groups = Some(Ok(groups));
+            }
+            Err(e) => {
+                // Offline or refused: the last session's lists stay.
+                let cached = self.lists.iter_mut().filter(|(s, _)| matches!(s, ExperienceSource::Group(_)));
+                let mut any = false;
+                for (_, p) in cached {
+                    any = true;
+                    p.arrived(0, Err(e.clone()));
+                }
+                if !any {
+                    self.groups = Some(Err(e));
+                }
+            }
+        }
+    }
+
     fn busy(&self) -> bool {
         self.jobs > 0
     }
@@ -199,9 +245,10 @@ impl StartPage {
         find(&self.templates).or_else(|| find(&templates::measured())).expect("Baseplate is in the measured list")
     }
 
-    /// RUSTUDIO_START_PAGE=recent|mine|shared|files: start scrolled there.
+    /// RUSTUDIO_START_PAGE=recent|mine|shared|files|group:<id>: start
+    /// scrolled there.
     pub fn open_page(&mut self, name: &str) {
-        if matches!(name, "recent" | "mine" | "shared" | "files") {
+        if matches!(name, "recent" | "mine" | "shared" | "files") || group_id(name).is_some() {
             self.jump = Some(name.to_string());
         }
     }
@@ -223,17 +270,50 @@ impl Editor {
         (self.game.account.shared_client(), self.cloud.endpoints.clone())
     }
 
-    /// (Re)loads every list: My Experiences, Shared with Me, the groups
-    /// (each group's experiences follow once the groups arrive).
+    /// (Re)loads every list: My Experiences, Shared with Me, the groups.
+    /// The groups and their lists from the last session show at once (a
+    /// disk cache), then one job asks for the groups and each group's first
+    /// page, GROUP_FANOUT at a time, each list showing as it arrives.
     fn start_load_all(&mut self) {
         let (client, ep) = self.start_client();
+        let uid = self.game.account.user_id();
         let sp = &mut self.start;
+        sp.gen += 1;
+        let gen = sp.gen;
         sp.icons_asked.clear();
         sp.lists.clear();
         sp.groups = Some(Ok(Vec::new()));
-        sp.spawn(client, ep, |a, tx| {
-            let r = a.ok_or_else(signed_out).and_then(|a| a.groups().map_err(|e| e.0));
-            let _ = tx.send(Msg::Groups(r));
+        if let Some(cached) = uid.and_then(group_cache::load) {
+            for g in &cached {
+                sp.lists.insert(ExperienceSource::Group(g.id), Paged {
+                    list: Some(Ok(g.experiences.clone())),
+                    page: 0,
+                    more: g.more,
+                    loading: true,
+                    refreshing: true,
+                });
+            }
+            sp.groups = Some(Ok(cached.into_iter().map(|g| g.info()).collect()));
+        }
+        sp.spawn(client, ep, move |a, tx| {
+            let groups = match a.ok_or_else(signed_out).and_then(|a| a.groups().map(|g| (a, g)).map_err(|e| e.0)) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(Msg::Groups(gen, Err(e)));
+                    return;
+                }
+            };
+            let (a, groups) = groups;
+            let _ = tx.send(Msg::Groups(gen, Ok(groups.clone())));
+            let pages = fan_out(&groups, |g| {
+                let src = ExperienceSource::Group(g.id);
+                let r = a.experiences_page(src, 0, 25).map_err(|e| e.0);
+                let _ = tx.send(Msg::Page(gen, src, 0, r.clone()));
+                r
+            });
+            if let Some(uid) = uid {
+                group_cache::save(uid, &groups, &pages);
+            }
         });
         self.start_reset_list(ExperienceSource::Mine);
         self.start_reset_list(ExperienceSource::Shared);
@@ -247,9 +327,10 @@ impl Editor {
     fn start_load_page(&mut self, src: ExperienceSource) {
         let Some(page) = self.start.lists.get_mut(&src).and_then(Paged::next_page) else { return };
         let (client, ep) = self.start_client();
+        let gen = self.start.gen;
         self.start.spawn(client, ep, move |a, tx| {
             let r = a.ok_or_else(signed_out).and_then(|a| a.experiences_page(src, page, 25).map_err(|e| e.0));
-            let _ = tx.send(Msg::Page(src, page, r));
+            let _ = tx.send(Msg::Page(gen, src, page, r));
         });
     }
 
@@ -349,6 +430,14 @@ impl Editor {
         let ctx = ui.ctx().clone();
         self.game.account.restore();
         self.start.poll(&ctx);
+        if let Some(Ok(groups)) = &self.start.groups {
+            // Only groups that list something (the others stay hidden).
+            let shown = groups.iter().map(|g| g.id).filter(|id| {
+                !matches!(self.start.lists.get(&ExperienceSource::Group(*id)).and_then(|p| p.list.as_ref()), None | Some(Err(_)))
+                    && !matches!(self.start.lists.get(&ExperienceSource::Group(*id)).and_then(|p| p.list.as_ref()), Some(Ok(v)) if v.is_empty())
+            });
+            crate::group_icons::request(&ctx, &self.cloud.endpoints.thumbnails, shown);
+        }
         if !self.start.templates_asked {
             self.start_templates();
         }
@@ -364,17 +453,6 @@ impl Editor {
         if signed && !self.start.loaded_signed_in {
             self.start.loaded_signed_in = true;
             self.start_load_all();
-        }
-        // Each group's experiences, as soon as the groups are known.
-        if let Some(Ok(groups)) = &self.start.groups {
-            let missing: Vec<ExperienceSource> = groups
-                .iter()
-                .map(|g| ExperienceSource::Group(g.id))
-                .filter(|s| !self.start.lists.contains_key(s))
-                .collect();
-            for src in missing {
-                self.start_reset_list(src);
-            }
         }
         let mut todo: Vec<Do> = Vec::new();
         // Ctrl+N / Ctrl+O / Ctrl+Shift+O, as in Studio's start page.
@@ -515,7 +593,12 @@ impl Editor {
                     .get(&ExperienceSource::Group(g.id))
                     .map(|p| &p.list)
                     .is_none_or(|l| matches!(l, None | Some(Ok(_))) && !matches!(l, Some(Ok(v)) if v.is_empty()));
-                if has && g.can_edit != Some(false) {
+                // Not filtered by the group role's manageGroupGames: Roblox
+                // also grants edit per experience (a role or member can
+                // have canCloudEdit on one experience while the role flag
+                // says false), and the Start Page search only returns
+                // experiences this account can open. Empty lists stay hidden.
+                if has {
                     entries.push((format!("group:{}", g.id), g.name.clone(), true));
                 }
             }
@@ -535,7 +618,12 @@ impl Editor {
                 if resp.hovered() {
                     ui.painter().rect_filled(r, CornerRadius::same(4), theme::HOVER_BG);
                 }
-                let x = r.min.x + if indent { 26.0 } else { 12.0 };
+                let mut x = r.min.x + if indent { 26.0 } else { 12.0 };
+                if let Some(id) = group_id(&key) {
+                    let side = 18.0;
+                    crate::group_icons::paint(ui, Rect::from_min_size(Pos2::new(x, r.center().y - side / 2.0), Vec2::splat(side)), id);
+                    x += side + 8.0;
+                }
                 let font = egui::FontId::proportional(if indent { 13.0 } else { 14.0 });
                 let text = elide(ui.painter(), &label, &font, r.max.x - x - 6.0);
                 ui.painter().text(
@@ -635,8 +723,15 @@ impl Editor {
             vec![c + Vec2::new(-3.0, -5.0), c + Vec2::new(4.0, 0.0), c + Vec2::new(-3.0, 5.0)]
         };
         p.add(egui::Shape::convex_polygon(tri, theme::TEXT_DIM, Stroke::NONE));
+        let mut x = r.min.x + 24.0;
+        if let Some(id) = group_id(key) {
+            let side = 22.0;
+            crate::group_icons::paint(ui, Rect::from_min_size(Pos2::new(x, r.center().y - side / 2.0), Vec2::splat(side)), id);
+            x += side + 8.0;
+        }
+        let p = ui.painter();
         let font = egui::FontId::proportional(16.0);
-        let tr = p.text(Pos2::new(r.min.x + 24.0, r.center().y), egui::Align2::LEFT_CENTER, title, font, theme::TEXT);
+        let tr = p.text(Pos2::new(x, r.center().y), egui::Align2::LEFT_CENTER, title, font, theme::TEXT);
         if let Some(n) = count {
             p.text(
                 Pos2::new(tr.max.x + 8.0, r.center().y + 1.0),
@@ -757,12 +852,13 @@ impl Editor {
         for g in &groups {
             let src = ExperienceSource::Group(g.id);
             let l = self.start.lists.get(&src).and_then(|p| p.list.as_ref());
-            // Groups with nothing in them, or that this account can't
-            // edit / list, stay out of the way.
-            if matches!(l, Some(Ok(v)) if v.is_empty()) && !self.start.busy() {
+            // Groups with nothing this account can open (or whose first
+            // page hasn't come yet), or whose list failed, stay out of the
+            // way (see the nav note on can_edit).
+            if matches!(l, Some(Ok(v)) if v.is_empty()) {
                 continue;
             }
-            if g.can_edit == Some(false) || matches!(l, Some(Err(_))) {
+            if matches!(l, Some(Err(_))) {
                 continue;
             }
             lists.push((format!("group:{}", g.id), g.name.clone(), src, "This group has no experiences.".into()));
@@ -1164,6 +1260,11 @@ fn elide(p: &egui::Painter, s: &str, font: &egui::FontId, max: f32) -> String {
     format!("{out}…")
 }
 
+/// The group of a "group:<id>" list key.
+fn group_id(key: &str) -> Option<u64> {
+    key.strip_prefix("group:")?.parse().ok()
+}
+
 /// The experience's icon, centred on a blurred-looking fill; a letter tile
 /// until it loads.
 fn icon_thumb(p: &egui::Painter, r: Rect, icon: Option<egui::TextureId>, name: &str) {
@@ -1197,6 +1298,66 @@ mod tests {
 
     fn builtin(place_id: u64) -> Document {
         templates::new_place(&info(place_id), None).unwrap()
+    }
+
+    fn exp(id: u64) -> Experience {
+        Experience {
+            id,
+            name: format!("e{id}"),
+            root_place_id: Some(id + 1),
+            creator_type: CreatorKind::Group,
+            creator_id: 9,
+            creator_name: "g".into(),
+            updated: String::new(),
+            team_create: None,
+        }
+    }
+
+    fn group(id: u64) -> GroupInfo {
+        GroupInfo { id, name: format!("g{id}"), role: "r".into(), can_edit: None }
+    }
+
+    fn rows(sp: &StartPage, g: u64) -> Option<Vec<u64>> {
+        match &sp.lists.get(&ExperienceSource::Group(g))?.list {
+            Some(Ok(v)) => Some(v.iter().map(|e| e.id).collect()),
+            _ => None,
+        }
+    }
+
+    /// The groups come first, then each group's page as it arrives; a
+    /// cached list shows until its page replaces it; replies from an older
+    /// load are dropped.
+    #[test]
+    fn group_lists_fill_as_pages_arrive() {
+        let mut sp = StartPage { gen: 2, ..Default::default() };
+        // Group 1 from the disk cache.
+        sp.lists.insert(
+            ExperienceSource::Group(1),
+            Paged { list: Some(Ok(vec![exp(10)])), page: 0, more: false, loading: true, refreshing: true },
+        );
+        sp.groups = Some(Ok(vec![group(1)]));
+        sp.groups_arrived(Ok(vec![group(1), group(2), group(3)]));
+        assert_eq!(rows(&sp, 1), Some(vec![10]));
+        assert_eq!(rows(&sp, 2), Some(vec![]));
+        assert!(sp.lists[&ExperienceSource::Group(2)].loading);
+        let ctx = egui::Context::default();
+        sp.tx.send(Msg::Page(1, ExperienceSource::Group(2), 0, Ok((vec![exp(99)], false)))).unwrap();
+        sp.tx.send(Msg::Page(2, ExperienceSource::Group(2), 0, Ok((vec![exp(20)], true)))).unwrap();
+        sp.tx.send(Msg::Page(2, ExperienceSource::Group(1), 0, Ok((vec![exp(11), exp(12)], false)))).unwrap();
+        sp.poll(&ctx);
+        assert_eq!(rows(&sp, 1), Some(vec![11, 12]));
+        assert_eq!(rows(&sp, 2), Some(vec![20]));
+        let p = &sp.lists[&ExperienceSource::Group(2)];
+        assert!(!p.loading && p.more && p.page == 1);
+        // A group the account left goes; a failed refresh keeps the cache.
+        sp.lists.get_mut(&ExperienceSource::Group(1)).unwrap().refreshing = true;
+        sp.lists.get_mut(&ExperienceSource::Group(1)).unwrap().loading = true;
+        sp.lists.get_mut(&ExperienceSource::Group(1)).unwrap().page = 0;
+        sp.groups_arrived(Ok(vec![group(1), group(3)]));
+        assert_eq!(rows(&sp, 2), None);
+        sp.tx.send(Msg::Page(2, ExperienceSource::Group(1), 0, Err("HTTP 429".into()))).unwrap();
+        sp.poll(&ctx);
+        assert_eq!(rows(&sp, 1), Some(vec![11, 12]));
     }
 
     /// Checks `doc` against values read from Studio's DataModel after it

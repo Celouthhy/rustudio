@@ -73,8 +73,10 @@ pub mod studio_ui;
 pub mod studio_actions;
 pub mod studio_hooks;
 pub mod studio_ribbon;
+pub mod service_visibility;
 pub mod studio_panels;
 pub mod start_page;
+pub mod group_icons;
 pub mod ui_shots;
 pub mod viewport;
 pub mod viewport_menu;
@@ -169,6 +171,7 @@ usage: rustudio [FILE] [--demo] [--play] [--screenshot OUT.png] [--self-test OUT
                        (or at view position X,Y)
   --type TEXT@S        type TEXT at S seconds (into a focused TextBox)
   --rdrag DX,DY@S      right-drag over the 3D view by DX,DY pixels
+  --rhold S:HOLD       hold the right mouse button from S seconds for HOLD seconds
   --ldrag X1,Y1>X2,Y2@S  left-drag in the 3D view between view positions
   --lhold X,Y@S:HOLD   press the left button at X,Y at S seconds, let go HOLD seconds later
   --click X,Y@S        click the 3D view at X,Y (pixels) S seconds after start
@@ -777,6 +780,13 @@ pub fn run() -> eframe::Result<()> {
                 match app::HarnessAction::parse_lhold(&v) {
                     Some(list) => actions.extend(list),
                     None => eprintln!("--lhold: can't read {v:?} (X,Y@SECONDS:HOLD)"),
+                }
+            }
+            "--rhold" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_rhold(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--rhold: can't read {v:?} (SECONDS:HOLD)"),
                 }
             }
             "--rdrag" => {

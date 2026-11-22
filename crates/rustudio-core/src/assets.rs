@@ -1282,14 +1282,18 @@ impl MeshCache {
         let mut dropped = |p: &[Vec3], n: &[Vec3], u: &[Vec2], _c: &[glam::Vec4], planes: &[glam::Vec4]| upload(p, n, u, &[], planes);
         // (loaded apart from a MeshPart's coloured copy of the same mesh)
         let had = self.entries.remove(id);
+        bump_mesh_generation();
         let got = self.get(id, doc_dir, store, &mut dropped);
         let failed = self.entries.contains_key(id);
         self.entries.remove(id);
+        bump_mesh_generation();
         if let Some(h) = had {
             self.entries.insert(id.to_string(), h);
+            bump_mesh_generation();
         }
         if got.is_some() || failed {
             self.entries.insert(key, got);
+            bump_mesh_generation();
         }
         got
     }
@@ -1313,6 +1317,7 @@ impl MeshCache {
             let (p, n, uv) = crate::truss::generate(size, fields[3].parse().ok()?);
             let mesh = LoadedMesh { index: upload(&p, &n, &uv, &[], &[]), extent: size, center: Vec3::ZERO };
             self.entries.insert(id.to_owned(), Some(mesh));
+            bump_mesh_generation();
             return Some(mesh);
         }
         if !store.allows(id) {
@@ -1356,6 +1361,7 @@ impl MeshCache {
             },
         };
         self.entries.insert(id.to_string(), loaded);
+        bump_mesh_generation();
         loaded
     }
 
@@ -1375,6 +1381,7 @@ impl MeshCache {
         }
         let m = LoadedMesh { index: upload(&verts), extent, center: Vec3::ZERO };
         self.entries.insert(id.to_string(), Some(m));
+        bump_mesh_generation();
         Some(m)
     }
 
@@ -1396,6 +1403,7 @@ impl MeshCache {
     /// Drops `id` so it loads again.
     pub fn forget(&mut self, id: &str) {
         self.entries.remove(id);
+        bump_mesh_generation();
         self.uvless.remove(id);
     }
 
@@ -1403,6 +1411,7 @@ impl MeshCache {
     pub fn retry(&mut self, done: &[AssetRef]) {
         self.entries
             .retain(|id, _| asset_ref(id).is_none_or(|a| !done.contains(&a)));
+        bump_mesh_generation();
     }
 
     /// Loaded (Ok), failed (Err with why), or never asked for (None).
@@ -2778,6 +2787,19 @@ pub fn mesh_extent(id: &str) -> Option<Vec3> {
     Some(ext)
 }
 
+static MESH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Bumped whenever a loaded mesh, a mesh's outline triangles or a skinning
+/// base appears, changes or is forgotten: what an outline drawn from them
+/// depends on beyond the document and the renderer's draws.
+pub fn mesh_generation() -> u64 {
+    MESH_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn bump_mesh_generation() {
+    MESH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 pub fn mesh_triangles(id: &str) -> Option<Arc<Vec<[Vec3; 3]>>> {
     static CACHE: Mutex<Option<HashMap<String, Option<Arc<Vec<[Vec3; 3]>>>>>> = Mutex::new(None);
     if !place_content_ok(id) {
@@ -2811,6 +2833,7 @@ pub fn mesh_triangles(id: &str) -> Option<Arc<Vec<[Vec3; 3]>>> {
             g.get_or_insert_with(HashMap::new)
                 .insert(id.to_string(), tris.clone());
         }
+        bump_mesh_generation();
     }
     tris
 }

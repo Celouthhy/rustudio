@@ -79,6 +79,7 @@ const HAS_EFFECT: &[(&str, &str)] = &[
     ("Studio", "Maximum Output Lines"),
     ("Studio", "ScriptTimeoutLength"),
     ("Studio", "Main Volume"),
+    ("Studio", "Show Hidden Objects in Explorer"),
     ("Studio", "Show Core GUI in Explorer while Playing"),
     ("Studio", "Show Plugin GUI Service in Explorer"),
     ("Studio", "DraggerSoftSnapMarginFactor"),

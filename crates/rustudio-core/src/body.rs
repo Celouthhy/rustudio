@@ -5,7 +5,6 @@
 
 use glam::{Mat3, Vec3};
 use rbx_dom_weak::types::{Ref, Variant};
-use rbx_dom_weak::ustr;
 
 use crate::doc::{self, Document};
 use crate::math::Xform;
@@ -63,11 +62,11 @@ pub fn is_rigid_joint(class: &str) -> bool {
 /// wire sends 1), so bit 0 is Enabled. A script's write lands in `Enabled`.
 pub fn joint_enabled(doc: &Document, j: Ref) -> bool {
     let Some(i) = doc.dom.get_by_ref(j) else { return false };
-    match i.properties.get(&ustr("Enabled")) {
+    match i.properties.get(&crate::ukey!("Enabled")) {
         Some(Variant::Bool(b)) => return *b,
         _ => {}
     }
-    match i.properties.get(&ustr("State")) {
+    match i.properties.get(&crate::ukey!("State")) {
         Some(Variant::Int32(s)) if i.class == "WeldConstraint" => s & 1 != 0,
         _ => !matches!(doc.prop(j, "Enabled"), Some(Variant::Bool(false))),
     }
@@ -90,17 +89,17 @@ pub fn attachment_part(doc: &Document, a: Ref) -> Option<Ref> {
 /// or a RigidConstraint's attachments' parts.
 pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
     let class = doc.class_of(j)?;
-    let pr = |k: &str| match doc.prop(j, k) {
+    let pr = |k: rbx_dom_weak::Ustr| match doc.prop_key(j, k) {
         Some(Variant::Ref(x)) if x.is_some() => Some(x),
         _ => None,
     };
     if class == "RigidConstraint" {
         return Some((
-            attachment_part(doc, pr("Attachment0")?)?,
-            attachment_part(doc, pr("Attachment1")?)?,
+            attachment_part(doc, pr(crate::ukey!("Attachment0"))?)?,
+            attachment_part(doc, pr(crate::ukey!("Attachment1"))?)?,
         ));
     }
-    Some((pr("Part0")?, pr("Part1")?))
+    Some((pr(crate::ukey!("Part0"))?, pr(crate::ukey!("Part1"))?))
 }
 
 /// A joint's two parts and frames, for every class that holds parts by a
@@ -109,26 +108,27 @@ pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
 /// Part1 / C0 / C1 from them).
 pub fn joint_frames(doc: &Document, r: Ref) -> Option<(Ref, Ref, Xform, Xform)> {
     let i = doc.dom.get_by_ref(r)?;
-    let refp = |k: &str| match i.properties.get(&ustr(k)) {
+    let refp = |k: rbx_dom_weak::Ustr| match i.properties.get(&k) {
         Some(Variant::Ref(x)) if x.is_some() && doc.dom.get_by_ref(*x).is_some() => Some(*x),
         _ => None,
     };
-    let cf = |x: Ref, k: &str| match doc.dom.get_by_ref(x).and_then(|i| i.properties.get(&ustr(k))) {
+    let cf_of = |x: &rbx_dom_weak::Instance, k: rbx_dom_weak::Ustr| match x.properties.get(&k) {
         Some(Variant::CFrame(c)) => Xform::from_cframe(c),
         _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
     };
     if i.class == "AnimationConstraint" {
-        if let (Some(a0), Some(a1)) = (refp("Attachment0"), refp("Attachment1")) {
-            let p0 = doc.dom.get_by_ref(a0)?.parent();
-            let p1 = doc.dom.get_by_ref(a1)?.parent();
+        if let (Some(a0), Some(a1)) = (refp(crate::ukey!("Attachment0")), refp(crate::ukey!("Attachment1"))) {
+            let (i0, i1) = (doc.dom.get_by_ref(a0)?, doc.dom.get_by_ref(a1)?);
+            let (p0, p1) = (i0.parent(), i1.parent());
             let part = |p: Ref| doc.class_of(p).is_some_and(|k| doc::is_a(&k, "BasePart"));
             if part(p0) && part(p1) {
-                return Some((p0, p1, cf(a0, "CFrame"), cf(a1, "CFrame")));
+                let cframe = crate::ukey!("CFrame");
+                return Some((p0, p1, cf_of(i0, cframe), cf_of(i1, cframe)));
             }
             return None;
         }
     }
-    Some((refp("Part0")?, refp("Part1")?, cf(r, "C0"), cf(r, "C1")))
+    Some((refp(crate::ukey!("Part0"))?, refp(crate::ukey!("Part1"))?, cf_of(i, crate::ukey!("C0")), cf_of(i, crate::ukey!("C1"))))
 }
 
 /// Humanoid states this simulation produces (Enum.HumanoidStateType names).

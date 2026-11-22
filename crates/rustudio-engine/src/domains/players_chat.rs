@@ -1055,14 +1055,22 @@ pub fn chat_view(lua: &Lua) -> Option<ChatView> {
         };
         (tcs, kid("ChatWindowConfiguration"), kid("BubbleChatConfiguration"), kid("ChatInputBarConfiguration"))
     };
+    // (The protected getter is compiled once per Luau state: compiling it
+    // for each of the ~20 reads was ~4% of the gameplay worker per
+    // published frame on a test place.)
+    const GETTER: &str = "__rs_pc_view_get";
+    let getter: Option<Function> = lua.named_registry_value::<Option<Function>>(GETTER).ok().flatten().or_else(|| {
+        let f = lua
+            .load("return function(i, k) local ok, v = pcall(function() return i[k] end) if ok then return v end end")
+            .eval::<Function>()
+            .ok()?;
+        lua.set_named_registry_value(GETTER, &f).ok()?;
+        Some(f)
+    });
     let get = |r: Option<Ref>, k: &str| -> Value {
         r.and_then(|r| inst_value(lua, r).ok())
             .and_then(|i| match i {
-                Value::UserData(u) => lua
-                    .load("return function(i, k) local ok, v = pcall(function() return i[k] end) if ok then return v end end")
-                    .eval::<Function>()
-                    .ok()
-                    .and_then(|f| f.call::<Value>((Value::UserData(u), k)).ok()),
+                Value::UserData(u) => getter.as_ref().and_then(|f| f.call::<Value>((Value::UserData(u), k)).ok()),
                 _ => None,
             })
             .unwrap_or(Value::Nil)

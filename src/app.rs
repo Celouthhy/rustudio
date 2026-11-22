@@ -224,6 +224,9 @@ pub struct Editor {
     /// The hovered instance's outline parts, for (hover, journal end).
     /// The selection's outline parts, for (journal end, selection).
     pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
+    /// The selected parts and what the ribbon asks of them, for one
+    /// document state and selection (SelectionInfo).
+    pub selection_info: std::cell::RefCell<SelectionInfo>,
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
     pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64, u64)>, Vec<rbx_dom_weak::types::Ref>),
@@ -313,6 +316,7 @@ impl RustudioApp {
         let wayland = cc.window_handle().ok().map(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
         let mut app = Self::new_in(&cc.egui_ctx, cc.wgpu_render_state.clone(), wayland, open, harness, demo);
         app.ed.plugins.set_repaint_context(cc.egui_ctx.clone());
+        rustudio_core::load_trace::mark("app created");
         app
     }
 
@@ -383,6 +387,7 @@ impl RustudioApp {
             hover_outline_refs: (None, Vec::new()),
             selector_cache: Default::default(),
             selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
+            selection_info: Default::default(),
             harness,
             last_frame: Instant::now(),
             fps: 0.0,
@@ -1177,13 +1182,71 @@ impl Editor {
     }
 
     pub(crate) fn has_selected_parts(&self) -> bool {
-        self.game.doc.selection.iter().any(|&r| {
-            self.game.scene.get(r).is_some()
-                || self.game.doc.dom.descendants_of(r).any(|d| self.game.scene.get(d.referent()).is_some())
-        })
+        !self.selected_parts_shared().is_empty()
+    }
+
+    /// The selection info, brought up to date with the document, the scene
+    /// and the selection first.
+    fn selection_info_mut(&self) -> std::cell::RefMut<'_, SelectionInfo> {
+        let key = (self.game.doc.id, self.game.doc.journal_end(), self.game.scene.doc_id, self.game.scene.parts.len());
+        let mut info = self.selection_info.borrow_mut();
+        if info.key != Some(key) || info.selection != self.game.doc.selection {
+            *info = SelectionInfo {
+                key: Some(key),
+                selection: self.game.doc.selection.clone(),
+                parts: std::rc::Rc::new(self.walk_selected_parts()),
+                ..Default::default()
+            };
+        }
+        info
+    }
+
+    /// The selected parts (selected_parts) without copying them: the menu,
+    /// ribbon and outline ask several times a frame, and walking a big
+    /// selection's descendants each time cost ~60M instructions a frame on
+    /// a select-all of 5 000 parts.
+    pub(crate) fn selected_parts_shared(&self) -> std::rc::Rc<Vec<Ref>> {
+        self.selection_info_mut().parts.clone()
+    }
+
+    /// Whether every selected part has `prop` true (Lock / Anchor's checks).
+    pub(crate) fn selected_parts_all(&self, prop: &'static str) -> bool {
+        let mut info = self.selection_info_mut();
+        if let Some(&(_, v)) = info.all_true.iter().find(|(p, _)| *p == prop) {
+            return v;
+        }
+        let v = info.parts.iter().all(|r| matches!(self.game.doc.prop(*r, prop), Some(rbx_dom_weak::types::Variant::Bool(true))));
+        info.all_true.push((prop, v));
+        v
+    }
+
+    /// The selection's material when every selected part shares one.
+    pub(crate) fn selected_parts_material(&self) -> Option<u32> {
+        let mut info = self.selection_info_mut();
+        if let Some(m) = info.material {
+            return m;
+        }
+        let mut out = None;
+        for r in info.parts.iter() {
+            let m = match self.game.doc.prop(*r, "Material") {
+                Some(rbx_dom_weak::types::Variant::Enum(e)) => e.to_u32(),
+                _ => 256,
+            };
+            if out.is_some_and(|o| o != m) {
+                out = None;
+                break;
+            }
+            out = Some(m);
+        }
+        info.material = Some(out);
+        out
     }
 
     pub fn selected_parts(&self) -> Vec<Ref> {
+        (*self.selected_parts_shared()).clone()
+    }
+
+    fn walk_selected_parts(&self) -> Vec<Ref> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for &r in &self.game.doc.selection {
@@ -1930,6 +1993,7 @@ impl eframe::App for RustudioApp {
         rustudio_render::gpu_health::check();
         self.last_ui_frame = Some(Instant::now());
         if self.egui_ctx.is_none() {
+            rustudio_core::load_trace::mark("first ui pass");
             self.egui_ctx = Some(ui.ctx().clone());
         }
         self.frame(ui);
@@ -2583,4 +2647,17 @@ pub fn view_pixels(r: egui::Rect, ppp: f32, size: [usize; 2]) -> (usize, usize, 
     let (x0, y0) = (start(r.min.x, size[0]), start(r.min.y, size[1]));
     let (x1, y1) = (end(r.max.x, size[0]), end(r.max.y, size[1]));
     (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
+/// The selected parts for one (document, journal end, scene) state and
+/// selection, and the ribbon's questions about them, answered once.
+#[derive(Default)]
+pub struct SelectionInfo {
+    key: Option<(u64, u64, u64, usize)>,
+    selection: Vec<Ref>,
+    parts: std::rc::Rc<Vec<Ref>>,
+    /// (property, every selected part has it true)
+    all_true: Vec<(&'static str, bool)>,
+    /// Some(shared material, if any) once asked.
+    material: Option<Option<u32>>,
 }

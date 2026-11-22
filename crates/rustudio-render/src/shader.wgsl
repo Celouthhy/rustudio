@@ -826,12 +826,24 @@ fn local_lights(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // DefaultUnifiedTiledFS.8 clustered local-light BRDF: each light has the
 // same GGX and Schlick terms as Lamp0, and removes reflected diffuse energy.
 struct LocalPbr { diffuse: vec3<f32>, specular: vec3<f32> };
+// SPEC_GLOBALS: the frame-wide conditions part_shade branches on, fixed
+// per pipeline (render.rs spec_mask): bit 1 perf.x < 0.5 (low tier), 2
+// perf.x < 1.5, 4 perf.w > 0.5 (Automatic), 8 lamp1.w > 1.5 (flat), 16
+// sun_color.w > 0.5 (voxel sun), 32 env_spec.z > 0.5. A pipeline is only
+// used in frames whose globals give the same mask, so each test answers as
+// the uniform would.
+const SPEC_GLOBALS: bool = false;
+const SPEC_MASK: u32 = 0u;
+fn spec_pred(bit: u32, dynamic: bool) -> bool {
+    return select(dynamic, (SPEC_MASK & bit) != 0u, SPEC_GLOBALS);
+}
+
 fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
              f0: vec3<f32>, kd: f32, ss: f32) -> LocalPbr {
     var result: LocalPbr;
     result.diffuse = vec3<f32>(0.0);
     result.specular = vec3<f32>(0.0);
-    if (g.sun_color.w > 0.5 || g.env_spec.z <= 0.5) {
+    if (spec_pred(16u, g.sun_color.w > 0.5) || !spec_pred(32u, g.env_spec.z > 0.5)) {
         result.diffuse = local_lights(world, n);
         return result;
     }
@@ -1211,6 +1223,19 @@ fn fs_part_opaque_shadowed(in: PartOut) -> @location(0) vec4<f32> {
     return shade_opaque_low(in, true);
 }
 
+// Specialisations of part_shade (render.rs spec_source substitutes these
+// constants in a separate module; plain consts here, not overrides: a module
+// with overrides is translated again for every pipeline made from it): each
+// is true by default (the paths taken at run time, as always); a pipeline that
+// sets one false is only used for draws the CPU has checked never take that
+// path, so the paths left compile to the same maths with fewer registers.
+// SPEC_TEXTURED false: every instance has texture mode 0 (extra.w).
+const SPEC_TEXTURED: bool = true;
+// SPEC_SPECIAL_KINDS false: no glass (3), water (5) or ForceField (6) kind.
+const SPEC_SPECIAL_KINDS: bool = true;
+// SPEC_DEBUG_VIEWS false: the frame has no debug view (sky_rot.z <= 0.5).
+const SPEC_DEBUG_VIEWS: bool = true;
+
 fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     // RUSTUDIO_PROBE_FLAT: the raster alone (overdraw, depth, MSAA), with no
     // shading: a measurement switch, not a quality level.
@@ -1221,7 +1246,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     let layer = i32(code >> 4u) - 1;
     // Modern Realistic lighting uses the HQ material variant even when
     // an old Technology property is absent (env_spec.z is legacy state).
-    let material_lq = layer >= 0 && g.env_spec.z <= 0.5 && g.sun_color.w > 0.5;
+    let material_lq = layer >= 0 && !spec_pred(32u, g.env_spec.z > 0.5) && spec_pred(16u, g.sun_color.w > 0.5);
     // Material map coordinate and its screen gradients (taken here, in
     // uniform control flow): the mesh's UVs, or the box face in studs.
     var muv = face_studs(in.objn, in.local, in.half, in.oblique) * in.mscale.xy + in.mscale.zw;
@@ -1255,15 +1280,15 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     // its byte value, then squared. The part colour is squared already.
     // An untiled Decal clamps at the image's edges (a skinned mesh's
     // projection reaches past them: skin.rs decal_base); tiled Textures repeat.
-    let decal_clamp = u32(in.extra.w + 0.5) == 2u && all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let decal_clamp = select(0u, u32(in.extra.w + 0.5), SPEC_TEXTURED) == 2u && all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
     let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
     let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
     let t_s = textureSample(tex, tex_sampler, suv);
     let t_raw = select(1.055 * pow(max(t_s.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055), 12.92 * t_s.rgb, t_s.rgb <= vec3<f32>(0.0031308));
     let t = vec4<f32>(t_raw * t_raw, t_s.a);
     let emask = textureSample(emissive_tex, tex_sampler, in.uv).r;
-    let mode = u32(in.extra.w + 0.5);
-    if (kind == 6.0) {
+    let mode = select(0u, u32(in.extra.w + 0.5), SPEC_TEXTURED);
+    if (SPEC_SPECIAL_KINDS && kind == 6.0) {
         // DefaultUnifiedForcefieldFS: the texture encodes pulse phase in
         // red (not albedo), with a minimum 5% rim coverage. No lighting.
         let view = normalize(g.cam_pos.xyz - in.world);
@@ -1311,8 +1336,8 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     // Performance > Shading detail: Low skips the material atlas below and
     // takes part_shade_low after the box faces' surfaces. Glass, water and
     // ViewportFrames keep their own paths.
-    let low_part = g.perf.x < 0.5 && kind < 2.5 && g.lamp1.w <= 1.5;
-    let cheap_material = low_part || (g.perf.w > 0.5 && g.perf.x < 1.5 && kind < 2.5 && g.lamp1.w <= 1.5);
+    let low_part = spec_pred(1u, g.perf.x < 0.5) && kind < 2.5 && !spec_pred(8u, g.lamp1.w > 1.5);
+    let cheap_material = low_part || (spec_pred(4u, g.perf.w > 0.5) && spec_pred(2u, g.perf.x < 1.5) && kind < 2.5 && !spec_pred(8u, g.lamp1.w > 1.5));
     // extra.y: placeholder (bit 0) and the six surfaces above it.
     // Material maps (Studio's part shader): colour × part colour, squared;
     // the normal map (OpenGL convention, X right, Y up the image) bends the
@@ -1324,7 +1349,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     let sa = textureSample(surface_tex, tex_sampler, in.uv);
     let udx = dpdx(in.uv);
     let udy = dpdy(in.uv);
-    if (!(g.perf.w > 0.5 && cheap_material) && (mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
+    if (!(spec_pred(4u, g.perf.w > 0.5) && cheap_material) && (mode == 1u || mode >= 3u) && textureDimensions(surface_tex).x > 1u) {
         mat_rough = sa.b;
         mat_metal = sa.a;
         let det = udx.x * udy.y - udx.y * udy.x;
@@ -1479,7 +1504,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
     if (low_part) {
         return part_shade_low(in, base, alpha, kind);
     }
-    if (g.lamp1.w > 1.5) {
+    if (spec_pred(8u, g.lamp1.w > 1.5)) {
         // A ViewportFrame (vf_render.rs): Ambient² + LightColor² × N·L
         // toward -LightDirection (ambient, sun_color, sun_dir here, squared
         // already), clamped to 1, times the surface colour² (Studio 0.747,
@@ -1489,7 +1514,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         return see_out(lit * base, alpha, alpha);
     }
     var c: vec3<f32>;
-    if (kind > 4.5 && kind < 5.5) {
+    if (SPEC_SPECIAL_KINDS && kind > 4.5 && kind < 5.5) {
         // Terrain water (round 21, Studio's SmoothWater FS LQ): WaterColor
         // lit by ambient and the shadowed sun (no N·L), mixed with the sky's
         // reflection by (clamp(0.78 − 2.5|N·V|) + 0.3) × WaterReflectance;
@@ -1523,7 +1548,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // Neon glows at its own colour, unlit (and blooms). See-through
         // Neon blends the same radiance (neon_over_scene below).
         c = base * base * NEON_GLOW;
-    } else if (g.perf.x < 1.5) {
+    } else if (spec_pred(2u, g.perf.x < 1.5)) {
         // Performance > Shading detail "Medium": the same diffuse light as
         // High (sun shadow, sky light grid, ambient), without the
         // environment BRDF, sky reflections, sun highlight or local lights.
@@ -1533,7 +1558,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         let sv = light_grid(in.world, normalize(in.normal));
         c = base * (g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
             + g.sun_color.rgb * g.sun_dir.w * ndl * shadow * sun_cover());
-        if (g.perf.w > 0.5) {
+        if (spec_pred(4u, g.perf.w > 0.5)) {
             c += base * local_grid_light(in.world, normalize(in.normal));
         }
     } else {
@@ -1544,7 +1569,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // light (SkyAmbient, AmbientCube[0..5] in the FS): the light grid,
         // parts and terrain alike.
         let sv = light_grid(in.world, normalize(in.normal));
-        let is_glass = kind > 2.5 && kind < 3.5;
+        let is_glass = SPEC_SPECIAL_KINDS && kind > 2.5 && kind < 3.5;
         // Studio's HQ part FS (DefaultUnifiedFlatOpaqueFS / TiledFS /
         // PlasticReflectionFS variant 3, Studio measurements "Environment light
         // and AO"). s = EnvironmentSpecularScale, fading out with distance;
@@ -1552,7 +1577,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         let v = normalize(g.cam_pos.xyz - in.world);
         let nv = max(dot(n, v), 1e-4);
         let fade = clamp(1.0 - length(g.cam_pos.xyz - in.world) * ENV_SPEC_FADE, 0.0, 1.0);
-        let sS = select(0.0, g.sky_grad[1].w * fade, g.env_spec.z > 0.5);
+        let sS = select(0.0, g.sky_grad[1].w * fade, spec_pred(32u, g.env_spec.z > 0.5));
         let rough = select(g.env_spec.y, ENV_ROUGH_BASE + ENV_ROUGH_SCALE * mat_rough, mat_rough >= 0.0);
         // Reflectance: Studio draws such parts with PlasticReflectionFS: the
         // albedo becomes the sharp sky reflection by Reflectance, no metal.
@@ -1566,7 +1591,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // The sun: GGX (a = roughness⁴), Schlick Fresnel at L·H.
         var sun_spec = vec3<f32>(0.0);
         var fs = vec3<f32>(0.0);
-        if (g.env_spec.z > 0.5) {
+        if (spec_pred(32u, g.env_spec.z > 0.5)) {
             let h = normalize(v + l);
             let nh = max(dot(n, h), 0.001);
             let lh = dot(l, h);
@@ -1585,7 +1610,7 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         let nl = dot(n, l);
         // Voxel / Soft-LQ (DefaultUnifiedFlatOpaqueVS 0: VARYING5 = Lamp0 ×
         // sat(N·L) + Lamp1 × sat(−N·L), all × the grid's sun channel).
-        let voxel_sun = g.sun_color.w > 0.5 && g.env_spec.z <= 0.5;
+        let voxel_sun = spec_pred(16u, g.sun_color.w > 0.5) && !spec_pred(32u, g.env_spec.z > 0.5);
         var back = select(0.0, -nl, nl < 0.0 && g.bloom.z < 0.5);
         if (voxel_sun && nl < 0.0) {
             back = -nl * sun_shadow(in.world, normalize(in.normal));
@@ -1596,11 +1621,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
             + (kd - fs * sS * kd) * sun_light
             + g.lamp1.rgb * kd * back;
-        let local = local_pbr(in.world, select(n, normalize(in.normal), g.sun_color.w > 0.5), v, rough, f0, kd, sS);
+        let local = local_pbr(in.world, select(n, normalize(in.normal), spec_pred(16u, g.sun_color.w > 0.5)), v, rough, f0, kd, sS);
         light += local.diffuse;
         sun_spec += local.specular;
         // RUSTUDIO_SHADE_DEBUG light / local / sun / ambient: that light alone, no albedo.
-        if (g.sky_rot.z > 4.5) {
+        if (SPEC_DEBUG_VIEWS && g.sky_rot.z > 4.5) {
             let dm = g.sky_rot.z;
             var dl = light;
             if (dm > 5.5 && dm < 6.5) { dl = local.diffuse; }
@@ -1650,7 +1675,8 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         c += t.rgb * emask * in.emissive;
     }
     // Debug views (RUSTUDIO_SHADE_DEBUG): world normal, or surface colour.
-    if (g.sky_rot.z > 0.5 && g.sky_rot.z < 1.5) {
+    if (!SPEC_DEBUG_VIEWS) {
+    } else if (g.sky_rot.z > 0.5 && g.sky_rot.z < 1.5) {
         c = sq(n * 0.5 + vec3<f32>(0.5));
     } else if (g.sky_rot.z > 1.5 && g.sky_rot.z < 2.5) {
         c = base;

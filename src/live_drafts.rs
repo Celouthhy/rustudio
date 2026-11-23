@@ -90,6 +90,10 @@ impl DraftStore {
                     .is_some_and(|s| s != &d.base && s != &d.text)
         })
     }
+    /// The server ids that have a draft.
+    pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.drafts.keys().copied()
+    }
     pub fn has_unsubmitted(&self) -> bool {
         self.drafts.values().any(|d| !d.submitted)
     }

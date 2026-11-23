@@ -45,25 +45,40 @@ pub enum Indicator {
     Ended { reason: String },
 }
 
-/// What the live session holds that the server lacks.
+/// What the live session holds that the server lacks. Starts from the
+/// drafts and commits in flight (a handful), not the place's instances: the
+/// status bar asks every frame, and a big live place has hundreds of
+/// thousands of them.
 fn lacking(doc: &rustudio_core::doc::Document, live: &LiveView) -> Vec<String> {
     let mut out: Vec<String> = live.unsynced.clone();
-    for inst in doc.dom.descendants() {
+    let mut ids: Vec<u64> = live.drafts.ids().collect();
+    ids.extend(live.script_commits.values().map(|(script, _, _)| *script));
+    ids.sort_unstable();
+    ids.dedup();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for id in ids {
+        let Some(r) = live.model.reference(id) else { continue };
+        let Some(inst) = doc.dom.get_by_ref(r) else { continue };
         if !matches!(inst.class.as_str(), "Script" | "LocalScript" | "ModuleScript") {
             continue;
         }
-        let Some(id) = live.model.server_id(inst.referent()) else { continue };
-        let path = crate::live_sync::path(doc, inst.referent());
-        if live.script_commits.values().any(|(script, _, _)| *script == id) {
-            out.push(format!("{path}: script commit not confirmed by the server yet"));
+        let note = if live.script_commits.values().any(|(script, _, _)| *script == id) {
+            "script commit not confirmed by the server yet"
         } else if let Some(d) = live.drafts.get(id) {
             if d.rejected {
-                out.push(format!("{path}: script draft the server rejected"));
+                "script draft the server rejected"
             } else if !d.submitted {
-                out.push(format!("{path}: script draft not committed"));
+                "script draft not committed"
+            } else {
+                continue;
             }
-        }
+        } else {
+            continue;
+        };
+        found.push((crate::live_sync::path(doc, r), note.to_string()));
     }
+    found.sort();
+    out.extend(found.into_iter().map(|(path, note)| format!("{path}: {note}")));
     out
 }
 

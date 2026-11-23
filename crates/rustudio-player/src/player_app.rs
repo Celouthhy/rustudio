@@ -202,9 +202,12 @@ impl eframe::App for PlayerApp {
         self.frame(ui);
     }
 
-    fn raw_input_hook(&mut self, _: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         let now = self.run.now();
         self.run.input.inject(self.game.viewport_rect, self.game.lock_center_held(), now, raw, |_, _| {});
+        if self.game.play_game_input() && ctx.memory(|m| m.focused().is_none()) {
+            crate::keys::PhysicalKeys::keep_tab_for_game(raw);
+        }
         self.game.phys.ingest(raw);
     }
 

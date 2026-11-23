@@ -2114,7 +2114,7 @@ impl eframe::App for RustudioApp {
             s.save(&self.dock, &self.panels, &self.ed);
         }
     }
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         // A scripted run's window on Windows sits on the real desktop: the
         // person's (or an idle session's) mouse pointer over it would hover
         // and click like the script (a ribbon tooltip in a screenshot). Linux
@@ -2144,6 +2144,9 @@ impl eframe::App for RustudioApp {
         }
         if let Some(u) = self.ed.harness.ui_shots.as_mut() {
             u.inject(raw);
+        }
+        if self.ed.game.play_game_input() && ctx.memory(|m| m.focused().is_none()) {
+            rustudio_player::keys::PhysicalKeys::keep_tab_for_game(raw);
         }
         self.ed.game.phys.ingest(raw);
     }

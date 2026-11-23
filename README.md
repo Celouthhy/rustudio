@@ -17,7 +17,7 @@ quite yet.
 
 ![Editing a place in rustudio](docs/images/editor.png)
 
-![Playing a test place in rustudio](docs/images/play.png)
+![Playing a test place in rustudio](docs/images/play-mode.png)
 
 ![The rustudio home screen](docs/images/home.png)
 

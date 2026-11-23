@@ -158,6 +158,11 @@ fn studio_fast_int(flag: &str) -> Option<i64> {
     match flag {
         // Measured live in Studio 0.748 (StudioAppSettings.json):
         "RelocateMobileMenuButtonsVariant" => Some(2),
+        // CoreScripts React work slice. Roblox ships 15 ms (live client and
+        // Studio settings), but our Luau runs that much work slower, and at
+        // 144 Hz a 15 ms slice drops frames when menus mount. Use React's
+        // upstream 5 ms slice: same UI, the work spreads over more frames.
+        "ReactSchedulerYieldInterval2" => Some(5),
         // Built-in Toolbox & TerrainEditor FastInt defaults (measured live in Studio 0.748:
         // returning 0 breaks Toolbox Essential section limit=0 / modulo-by-zero insert yielding,
         // and SmoothTerrainMaxCppRegion < selection volume forces TerrainEditor RegionTransform

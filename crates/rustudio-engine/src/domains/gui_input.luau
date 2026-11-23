@@ -1709,14 +1709,46 @@ local function parse_selector(s)
     selector_cache[s] = alts
     return alts
 end
+-- Per-restyle caches of native reads (ClassName, Name, tags, Parent) for the
+-- styleable nodes, so matching a sheet against a big CoreGui tree does table
+-- lookups instead of tens of thousands of IsA / HasTag / Parent calls.
+-- `sx` is nil outside step_styles.
+local NO_TOKEN = {}
+local sx = nil -- { cls = {}, name = {}, tags = {}, par = {}, inroot = {} }
+local isa_cache = {} -- ClassName → { class → bool } (IsA depends only on the class)
+local function isa_fast(o, cls)
+    local cn = sx and sx.cls[o]
+    if not cn then return o:IsA(cls) end
+    local m = isa_cache[cn]
+    if not m then m = {} isa_cache[cn] = m end
+    local v = m[cls]
+    if v == nil then v = o:IsA(cls) m[cls] = v end
+    return v
+end
+local function parent_fast(o)
+    if not sx then return o.Parent end
+    local p = sx.par[o]
+    if p == nil then p = o.Parent or false sx.par[o] = p end
+    return p or nil
+end
 local function compound_matches(c, o)
-    if c.class and not o:IsA(c.class) then return false end
-    if c.name and o.Name ~= c.name then return false end
-    for _, t in c.tags do
-        if not o:HasTag(t) then return false end
+    if c.class and not isa_fast(o, c.class) then return false end
+    local ts = sx and sx.tags[o]
+    if c.name then
+        local nm = if ts then sx.name[o] else o.Name
+        if nm ~= c.name then return false end
+    end
+    if ts then
+        for _, t in c.tags do
+            if not ts[t] then return false end
+        end
+    else
+        for _, t in c.tags do
+            if not o:HasTag(t) then return false end
+        end
     end
     if #c.states > 0 then
-        if not o:IsA("GuiObject") then return false end
+        if not isa_fast(o, "GuiObject") then return false end
         local st = get["GuiObject.GuiState"](o).Name:lower()
         for _, s in c.states do
             if s == "focus" then
@@ -1731,28 +1763,34 @@ end
 -- Does `steps` (right-most last) match o, with every step inside `root`?
 -- `scope`: the instances a nested rule's parent matched (nil: the root).
 local function steps_match(steps, o, root, scopes)
+    local root_parent = parent_fast(root)
+    local inroot = sx and sx.inroot
+    local function within(p)
+        if p == root or (inroot and inroot[p]) then return true end
+        return p:IsDescendantOf(root)
+    end
     local function from(i, node)
         local c = steps[i]
         if not compound_matches(c, node) then return false end
         if i == 1 then
             if scopes then
                 if c.rel == "self" then return scopes[node] == true end
-                local p = node.Parent
+                local p = parent_fast(node)
                 if c.rel == "child" then return p ~= nil and scopes[p] == true end
-                while p and p ~= root.Parent do
+                while p and p ~= root_parent do
                     if scopes[p] then return true end
-                    p = p.Parent
+                    p = parent_fast(p)
                 end
                 return false
             end
-            if c.rel == "child" then return node.Parent == root end
-            return node == root or node:IsDescendantOf(root)
+            if c.rel == "child" then return parent_fast(node) == root end
+            return within(node)
         end
-        local p = node.Parent
+        local p = parent_fast(node)
         if c.rel == "child" then return p ~= nil and from(i - 1, p) end
-        while p and (p == root or p:IsDescendantOf(root)) do
+        while p and within(p) do
             if from(i - 1, p) then return true end
-            p = p.Parent
+            p = parent_fast(p)
         end
         return false
     end
@@ -1907,41 +1945,122 @@ local function step_styles(style_rev, w, h, hover_sig)
         return inst
     end
     local screen = Vector2.new(w, h - 58)
+    sx = { cls = {}, name = {}, tags = {}, par = {}, inroot = nil }
+    -- Rules per sheet, read once per restyle (CoreScripts link one sheet
+    -- from ~20 places).
+    local sheet_memo = {}
+    local function sheet_rules(sheet)
+        local mm = sheet_memo[sheet]
+        if mm then return mm end
+        local rules, sheets = {}, {}
+        G.profile_step(3, collect_rules, sheet, rules, sheets, {})
+        local anchored = false
+        for i, e in rules do
+            local r = e.rule
+            e.seq = i
+            e.sel = r.Selector or ""
+            e.query = r:FindFirstAncestorWhichIsA("StyleQuery")
+            e.priority = r.Priority
+            if e.parent == nil and e.sel ~= "" then
+                for _, alt in parse_selector(e.sel) do
+                    if alt[1].rel ~= "desc" then anchored = true end
+                end
+            end
+        end
+        mm = { rules = rules, sheets = sheets, anchored = anchored }
+        sheet_memo[sheet] = mm
+        return mm
+    end
+    -- A link is redundant when another link to the same sheet styles the
+    -- same parent or an ancestor: that pass matches this subtree too and
+    -- sets the same values (unless a top-level selector is anchored to the
+    -- root with ">" or "&").
+    local active_links = {}
     for link in links do
         local sheet, root = link.StyleSheet, link.Parent
         if sheet and root and not hidden_plugin_gui(link) and link:IsDescendantOf(game) then
-            local rules = {}
-            local sheets = {}
-            collect_rules(sheet, rules, sheets, {})
-            for _, item in sheets do watched_sheets[item] = true end
-            local nodes = G.style_targets(root)
-            local by_tag, by_name = {}, {}
-            for _, n in nodes do
-                local nm = n.Name
+            table.insert(active_links, { link = link, sheet = sheet, root = root })
+        end
+    end
+    for i, a in active_links do
+        if sheet_rules(a.sheet).anchored then continue end
+        for j, b in active_links do
+            if i ~= j and b.sheet == a.sheet then
+                if (b.root == a.root and j < i) or (b.root ~= a.root and a.root:IsDescendantOf(b.root)) then
+                    a.skip = true
+                    break
+                end
+            end
+        end
+    end
+    for _, al in active_links do
+        local sheet, root = al.sheet, al.root
+        local mm = sheet_rules(sheet)
+        for _, item in mm.sheets do watched_sheets[item] = true end
+        if not al.skip then
+            local rules, sheets = mm.rules, mm.sheets
+            local nodes, n_cls, n_name, n_tags = G.style_index(root)
+            local by_tag, by_name, by_cls = {}, {}, {}
+            local inroot = {}
+            sx.inroot = inroot
+            G.profile_step(4, function()
+            local s_cls, s_name, s_tags = sx.cls, sx.name, sx.tags
+            for i, n in nodes do
+                inroot[n] = true
+                local cn, nm = n_cls[i], n_name[i]
+                s_cls[n] = cn
+                s_name[n] = nm
+                s_tags[n] = n_tags[i]
                 local ln = by_name[nm]
                 if ln then table.insert(ln, n) else by_name[nm] = { n } end
-                local tags = n:GetTags()
-                if tags then
-                    for _, tg in tags do
-                        local lt = by_tag[tg]
-                        if lt then table.insert(lt, n) else by_tag[tg] = { n } end
-                    end
+                local lc = by_cls[cn]
+                if lc then table.insert(lc, n) else by_cls[cn] = { n } end
+                for tg in s_tags[n] do
+                    local lt = by_tag[tg]
+                    if lt then table.insert(lt, n) else by_tag[tg] = { n } end
                 end
+            end
+            end)
+            -- Candidates for a compound: by #Name, else the rarest .tag,
+            -- else every node whose class IsA the compound's class.
+            local cls_cands = {}
+            local function cands_for(st)
+                if st.name then return by_name[st.name] end
+                if st.tags[1] then
+                    local best
+                    for _, tg in st.tags do
+                        local lt = by_tag[tg]
+                        if not lt then return nil end
+                        if not best or #lt < #best then best = lt end
+                    end
+                    return best
+                end
+                if st.class then
+                    local got = cls_cands[st.class]
+                    if not got then
+                        got = {}
+                        for _, lc in by_cls do
+                            if isa_fast(lc[1], st.class) then
+                                for _, n in lc do table.insert(got, n) end
+                            end
+                        end
+                        cls_cands[st.class] = got
+                    end
+                    return got
+                end
+                return nodes
             end
             -- Matches per rule (nested rules match inside their parent's).
             local matched = {}
-            local order = {}
-            for i, e in rules do
-                e.seq = i
-                order[i] = e
-            end
+            local order = table.clone(rules)
+            G.profile_step(5, function()
             for _, e in order do
                 local r = e.rule
                 local active = true
-                local q = r:FindFirstAncestorWhichIsA("StyleQuery")
+                local q = e.query
                 if q and not query_active(q, screen) then active = false end
                 local m = {}
-                local selector = active and r.Selector
+                local selector = active and e.sel
                 if selector and selector ~= "" then
                     local scopes = e.parent and matched[e.parent] or nil
                     if e.parent == nil or (scopes and next(scopes) ~= nil) then
@@ -1954,7 +2073,7 @@ local function step_styles(style_rev, w, h, hover_sig)
                                 if #alt == 1 then
                                     if scopes then
                                         for n in scopes do
-                                            if n:IsA("GuiBase2d") then
+                                            if isa_fast(n, "GuiBase2d") then
                                                 local pk = get_or_make_pseudo(n, last.class)
                                                 if pk then m[pk] = true end
                                             end
@@ -1967,16 +2086,10 @@ local function step_styles(style_rev, w, h, hover_sig)
                                         for pi = 1, #alt - 1 do prefix[pi] = alt[pi] end
                                         pseudo_prefixes[alt] = prefix
                                     end
-                                    local plast = prefix[#prefix]
-                                    local cands = nodes
-                                    if plast.name then
-                                        cands = by_name[plast.name]
-                                    elseif plast.tags[1] then
-                                        cands = by_tag[plast.tags[1]]
-                                    end
+                                    local cands = cands_for(prefix[#prefix])
                                     if cands then
                                         for _, n in cands do
-                                            if n:IsA("GuiBase2d") and steps_match(prefix, n, root, scopes) then
+                                            if isa_fast(n, "GuiBase2d") and steps_match(prefix, n, root, scopes) then
                                                 local pk = get_or_make_pseudo(n, last.class)
                                                 if pk then m[pk] = true end
                                             end
@@ -1984,12 +2097,7 @@ local function step_styles(style_rev, w, h, hover_sig)
                                     end
                                 end
                             else
-                                local cands = nodes
-                                if last.name then
-                                    cands = by_name[last.name]
-                                elseif last.tags[1] then
-                                    cands = by_tag[last.tags[1]]
-                                end
+                                local cands = cands_for(last)
                                 if cands then
                                     for _, n in cands do
                                         if not m[n] and steps_match(alt, n, root, scopes) then m[n] = true end
@@ -2001,13 +2109,14 @@ local function step_styles(style_rev, w, h, hover_sig)
                 end
                 matched[r] = m
             end
-            for _, e in order do
-                e.priority = e.rule.Priority
-            end
+            end)
             table.sort(order, function(a, b)
                 if a.priority ~= b.priority then return a.priority < b.priority end
                 return a.seq < b.seq
             end)
+            local tok = mm.tok
+            if not tok then tok = {} mm.tok = tok end
+            G.profile_step(6, function()
             for _, e in order do
                 local r = e.rule
                 local props = rule_props[r]
@@ -2017,14 +2126,25 @@ local function step_styles(style_rev, w, h, hover_sig)
                         local t = want[n] or {}
                         want[n] = t
                         for k, v in props do
-                            local val = resolve_token(v, sheets)
+                            local val = v
+                            if type(v) == "string" and string.sub(v, 1, 1) == "$" then
+                                val = tok[v]
+                                if val == nil then
+                                    val = resolve_token(v, sheets)
+                                    if val == nil then val = NO_TOKEN end
+                                    tok[v] = val
+                                end
+                                if val == NO_TOKEN then val = nil end
+                            end
                             if val ~= nil then t[k] = { val, tr[k] or tr["*"] } end
                         end
                     end
                 end
             end
+            end)
         end
     end
+    sx = nil
     -- Cache per-class defaults so StyleRules never overwrite explicitly set
     -- instance properties (measured in Studio 0.747: direct property writes
     -- always take precedence over StyleRule properties).

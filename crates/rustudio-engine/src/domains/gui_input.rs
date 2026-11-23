@@ -987,6 +987,10 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             let name = match phase {
                 1 => "input_prune",
                 2 => "input_styles",
+                3 => "input_styles_rules",
+                4 => "input_styles_index",
+                5 => "input_styles_match",
+                6 => "input_styles_apply",
                 _ => return Err(rt_err("unknown GUI step phase")),
             };
             let _scope = rustudio_core::bench::scope(name);
@@ -1028,6 +1032,60 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 t.raw_set(i + 1, inst_value(lua, r)?)?;
             }
             Ok(t)
+        })?,
+    )?;
+    // style_targets plus each node's ClassName, Name and tag set, read in one
+    // native pass (the restyle index otherwise makes three Lua→Rust calls a
+    // node, which dominates restyling CoreGui).
+    g.set(
+        "style_index",
+        lua.create_function(|lua, root: Value| {
+            let Some(root_r) = opt_inst(&root) else {
+                return Ok((lua.create_table()?, lua.create_table()?, lua.create_table()?, lua.create_table()?));
+            };
+            let _scope = rustudio_core::bench::scope("input_style_index");
+            let found: Vec<(Ref, String, String, Vec<String>)> = {
+                let w = world(lua)?;
+                let d = w.d();
+                let mut out = Vec::new();
+                let mut stack = vec![root_r];
+                while let Some(r) = stack.pop() {
+                    let Some(inst) = d.dom.get_by_ref(r) else { continue };
+                    let cls = inst.class.as_str();
+                    if matches!(cls, "CorePackages" | "ModuleScript" | "LocalScript" | "Script" | "LocalizationTable") {
+                        continue;
+                    }
+                    if rustudio_core::doc::is_a(cls, "GuiBase2d") || rustudio_core::doc::is_a(cls, "UIBase") {
+                        let tags = match inst.properties.get(&rbx_dom_weak::ustr("Tags")) {
+                            Some(Variant::Tags(t)) => t.iter().map(|s| s.to_string()).collect(),
+                            Some(Variant::BinaryString(b)) => rbx_dom_weak::types::Tags::decode(b.as_ref())
+                                .map(|t| t.iter().map(|s| s.to_string()).collect())
+                                .unwrap_or_default(),
+                            _ => Vec::new(),
+                        };
+                        out.push((r, cls.to_string(), inst.name.to_string(), tags));
+                    }
+                    for &child in inst.children().iter().rev() {
+                        stack.push(child);
+                    }
+                }
+                out
+            };
+            let nodes = lua.create_table_with_capacity(found.len(), 0)?;
+            let classes = lua.create_table_with_capacity(found.len(), 0)?;
+            let names = lua.create_table_with_capacity(found.len(), 0)?;
+            let tag_sets = lua.create_table_with_capacity(found.len(), 0)?;
+            for (i, (r, cls, name, tags)) in found.into_iter().enumerate() {
+                nodes.raw_set(i + 1, inst_value(lua, r)?)?;
+                classes.raw_set(i + 1, cls)?;
+                names.raw_set(i + 1, name)?;
+                let set = lua.create_table_with_capacity(0, tags.len())?;
+                for t in tags {
+                    set.raw_set(t, true)?;
+                }
+                tag_sets.raw_set(i + 1, set)?;
+            }
+            Ok((nodes, classes, names, tag_sets))
         })?,
     )?;
     // Style application depends on the linked roots and their sheets, not

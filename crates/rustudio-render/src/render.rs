@@ -865,6 +865,23 @@ mod see_bounds_tests {
 }
 
 #[cfg(test)]
+mod sky_env_tests {
+    use super::*;
+
+    #[test]
+    fn prefilter_takes_only_six_faces_of_its_size() {
+        let pre = rustudio_core::mech::ENV_PREFILTER_SIZE as usize;
+        // A level of another size (a sky whose faces aren't 128 x 2^n) is
+        // refused instead of read past its end.
+        let wrong = vec![128u8; 6 * (pre + 22) * (pre + 22) * 4];
+        assert!(prefilter_env_mips(&wrong, pre as u32, None).is_empty());
+        let right = vec![128u8; 6 * pre * pre * 4];
+        let mips = prefilter_env_mips(&right, pre as u32, None);
+        assert_eq!(mips[0].1.len(), 6 * pre * pre * 4);
+    }
+}
+
+#[cfg(test)]
 mod caster_tests {
     use super::*;
 
@@ -4616,7 +4633,9 @@ impl Renderer {
                     let face_len: usize = (0..levels).map(|l| ((size >> l).max(1) as usize).pow(2) * 4).sum();
                     let base_off: usize = (0..base).map(|l| ((size >> l).max(1) as usize).pow(2) * 4).sum();
                     let bytes = w * w * 4;
-                    if f.len() >= 6 * face_len {
+                    // (a face size that isn't 128 x a power of two has no
+                    // 128px level: no prefiltered environment for it)
+                    if w == pre as usize && f.len() >= 6 * face_len {
                         let mut raw = Vec::with_capacity(6 * bytes);
                         for face in 0..6 {
                             let o = face * face_len + base_off;
@@ -8047,6 +8066,11 @@ impl SkyEnvKey {
 fn prefilter_env_mips(base_raw: &[u8], base_size: u32, atmos: Option<&Globals>) -> Vec<(u32, Vec<u8>)> {
     use rustudio_core::mech as m;
     let bw = base_size as usize;
+    // Six faces of exactly base_size; anything else would read or write past
+    // a level (nothing is uploaded, the sky keeps its plain mips).
+    if base_raw.len() != 6 * bw * bw * 4 {
+        return Vec::new();
+    }
     let levels = mip_levels(base_size, base_size) as usize;
     let to_lin_srgb: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).powf(2.2));
     let th_srgb: [f32; 255] = std::array::from_fn(|i| ((i as f32 + 0.5) / 255.0).powf(2.2));

@@ -219,6 +219,30 @@ impl UserData for LVector2 {
         m.add_method("Lerp", |_, this, (o, a): (LVector2, f32)| {
             Ok(LVector2(this.0.lerp(o.0, a)))
         });
+        // Roblox's Vector2 component-wise helpers (Min / Max take any
+        // number of vectors).
+        m.add_method("Min", |_, this, o: mlua::Variadic<LVector2>| {
+            Ok(LVector2(o.iter().fold(this.0, |a, b| a.min(b.0))))
+        });
+        m.add_method("Max", |_, this, o: mlua::Variadic<LVector2>| {
+            Ok(LVector2(o.iter().fold(this.0, |a, b| a.max(b.0))))
+        });
+        m.add_method("Abs", |_, this, ()| Ok(LVector2(this.0.abs())));
+        m.add_method("Ceil", |_, this, ()| Ok(LVector2(this.0.ceil())));
+        m.add_method("Floor", |_, this, ()| Ok(LVector2(this.0.floor())));
+        m.add_method("Sign", |_, this, ()| {
+            let sg = |x: f32| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 };
+            Ok(LVector2(glam::Vec2::new(sg(this.0.x), sg(this.0.y))))
+        });
+        m.add_method("Cross", |_, this, o: LVector2| Ok(this.0.perp_dot(o.0) as f64));
+        m.add_method("Angle", |_, this, (o, signed): (LVector2, Option<bool>)| {
+            let a = this.0.angle_to(o.0) as f64;
+            Ok(if signed.unwrap_or(false) { a } else { a.abs() })
+        });
+        m.add_method("FuzzyEq", |_, this, (o, eps): (LVector2, Option<f32>)| {
+            let eps = eps.unwrap_or(1e-5);
+            Ok((this.0 - o.0).abs().max_element() <= eps)
+        });
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| {
             // (Studio prints a Vector2's NaN as NAN, a Vector3's as nan)
             let c = |x: f32| if x.is_nan() { "NAN".to_string() } else { g9(x) };

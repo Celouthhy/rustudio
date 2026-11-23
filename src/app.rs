@@ -190,6 +190,8 @@ pub struct Editor {
     pub scripts: crate::script_editor::ScriptTabs,
     /// Studio plugins in the edit DataModel (src/plugin_host).
     pub plugins: crate::plugin_host::PluginHost,
+    /// Latched built-in plugin toggle and per-tool native/Roblox choices.
+    pub builtin_tools: rustudio_core::rustudio_settings::BuiltinToolChoices,
     /// Plugin toolbars / menus / shortcuts as the editor draws them
     /// (src/plugin_host/ui_ribbon.rs).
     pub plugin_bar: crate::plugin_host::ui_ribbon::PluginUi,
@@ -226,14 +228,12 @@ pub struct Editor {
     pub gizmo_points: Vec<(crate::viewport::Handle, egui::Pos2)>,
     /// Selection / hover outlines kept while nothing they depend on changes.
     pub outline_cache: std::cell::RefCell<crate::viewport::OutlineCache>,
-    /// The hovered instance's outline parts, for (hover, journal end).
-    /// The selection's outline parts, for (journal end, selection).
-    pub selection_outline_refs: std::cell::RefCell<(u64, Vec<rbx_dom_weak::types::Ref>, Vec<rbx_dom_weak::types::Ref>)>,
     /// The selected parts and what the ribbon asks of them, for one
     /// document state and selection (SelectionInfo).
     pub selection_info: std::cell::RefCell<SelectionInfo>,
     /// The view selector's meshes for the current view.
     pub selector_cache: crate::viewport::SelectorCache,
+    /// The hovered instance's outline parts, for (hover, journal end).
     pub hover_outline_refs: (Option<(rbx_dom_weak::types::Ref, u64, u64)>, Vec<rbx_dom_weak::types::Ref>),
     pub harness: Harness,
     pub last_frame: Instant,
@@ -301,12 +301,40 @@ pub struct RustudioApp {
 /// Studio's starting layout, from the placement table (src/panels.rs):
 /// Explorer right, Properties under it, Output under the 3D view.
 pub fn default_dock() -> DockState<Tab> {
+    default_dock_for(rustudio_core::rustudio_settings::BuiltinToolChoices::default())
+}
+
+pub fn default_dock_for(choices: rustudio_core::rustudio_settings::BuiltinToolChoices) -> DockState<Tab> {
     let mut dock = DockState::new(vec![Tab::Viewport]);
     let none = HashMap::new();
-    for t in [Tab::Explorer, Tab::Properties, Tab::Output, Tab::Toolbox] {
+    for t in [Tab::Explorer, Tab::Properties, Tab::Output] {
         crate::panels::place(&mut dock, t, &none);
     }
+    if choices.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+        crate::panels::place(&mut dock, Tab::Toolbox, &none);
+    }
     dock
+}
+
+fn native_tab_enabled(tab: Tab, choices: rustudio_core::rustudio_settings::BuiltinToolChoices) -> bool {
+    use rustudio_core::rustudio_settings::BuiltinTool;
+    match tab {
+        Tab::Toolbox => choices.use_native(BuiltinTool::Toolbox),
+        Tab::TerrainEditor => choices.use_native(BuiltinTool::TerrainEditor),
+        _ => true,
+    }
+}
+
+fn strip_disabled_native_tabs(
+    dock: &mut DockState<Tab>,
+    panels: &mut crate::panels::Panels,
+    choices: rustudio_core::rustudio_settings::BuiltinToolChoices,
+) {
+    for tab in [Tab::Toolbox, Tab::TerrainEditor] {
+        if !native_tab_enabled(tab, choices) {
+            panels.take(dock, &tab);
+        }
+    }
 }
 
 impl RustudioApp {
@@ -340,10 +368,16 @@ impl RustudioApp {
         rustudio_engine::ti::install(egui_ctx);
         theme::apply(egui_ctx);
         rustudio_engine::mouse_lock::note_window(wayland);
+        let builtin_tools = rustudio_core::rustudio_settings::BuiltinToolChoices::from_settings();
+        let initial_tool = if builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+            Tool::None
+        } else {
+            Tool::Select
+        };
         let mut ed = Editor {
             game: Game::new(render_state),
             dialogs: crate::file_dialog::Dialogs::new(egui_ctx.clone()),
-            tool: Tool::Select,
+            tool: initial_tool,
             collisions: mech::COLLISIONS_ON_BY_DEFAULT,
             join_surfaces: mech::JOIN_SURFACES_ON_BY_DEFAULT,
             physical_drag: mech::PHYSICAL_DRAG_BY_DEFAULT,
@@ -372,6 +406,7 @@ impl RustudioApp {
             document_tabs_reset: false,
             scripts: Default::default(),
             plugins: Default::default(),
+            builtin_tools,
             plugin_ui: Default::default(),
             plugin_bar: Default::default(),
             #[cfg(unix)]
@@ -392,7 +427,6 @@ impl RustudioApp {
             outline_cache: Default::default(),
             hover_outline_refs: (None, Vec::new()),
             selector_cache: Default::default(),
-            selection_outline_refs: std::cell::RefCell::new((u64::MAX, Vec::new(), Vec::new())),
             selection_info: Default::default(),
             harness,
             last_frame: Instant::now(),
@@ -497,7 +531,7 @@ impl RustudioApp {
             ed.start.open_page(&page);
         }
         // The last session's layout and view settings (plain runs only).
-        let mut dock = default_dock();
+        let mut dock = default_dock_for(ed.builtin_tools);
         let mut layout = None;
         let mut panels = crate::panels::Panels::default();
         if !ed.harness.run.no_ui && crate::layout_store::enabled(&ed.harness) {
@@ -513,6 +547,7 @@ impl RustudioApp {
             // (plugin widgets' restore state beside layout.json)
             crate::plugin_host::widgets_ui::set_persist_dir(Some(rustudio_core::paths::config().join("rustudio")));
         }
+        strip_disabled_native_tabs(&mut dock, &mut panels, ed.builtin_tools);
         // Comparison captures (src/control.rs) want the 3D view as big as the
         // other program's: the view alone, no Explorer / Properties / Output.
         #[cfg(unix)]
@@ -665,6 +700,7 @@ impl Editor {
         self.ui.dock_moves.clear();
         self.ui.panel_requests.retain(|(tab, _)| !matches!(tab, Tab::Script(_)));
         self.game.doc = doc;
+        self.game.edit_audio.reset();
         self.game.scene = Scene::default();
         self.drag = None;
         self.hover = None;
@@ -678,6 +714,26 @@ impl Editor {
         // Plugins run in the place that's open: the
         // old place's go, the new place gets them all.
         self.plugin_store.on_place_opened();
+        self.builtin_tools = rustudio_core::rustudio_settings::BuiltinToolChoices::from_settings();
+        if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+            if matches!(self.tool, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate) {
+                self.tool = Tool::None;
+            }
+        } else if self.tool == Tool::None {
+            self.tool = Tool::Select;
+        }
+        if !self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
+            self.chars.open = false;
+        }
+        if !self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor) {
+            self.terrain_ed.tool = None;
+        }
+        if self.harness.plugins_started && !self.harness.no_plugins {
+            self.plugins.replace_builtins(self.builtin_tools);
+            if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector) {
+                self.plugins.wake_plugin_by_name("ViewSelector");
+            }
+        }
     }
 
 
@@ -1164,7 +1220,9 @@ impl Editor {
             }
             return;
         }
-        let mut b = InstanceBuilder::new(class).with_name(class);
+        // Studio's Insert Object names it as its constructor does (a
+        // SpecialMesh "Mesh", a StringValue "Value").
+        let mut b = InstanceBuilder::new(class).with_name(doc::default_instance_name(class));
         if doc::is_a(class, "BasePart") {
             let size = Vec3::from(mech::NEW_PART_SIZE);
             let pos = self.spawn_point(size);
@@ -1201,17 +1259,35 @@ impl Editor {
     /// The selection info, brought up to date with the document, the scene
     /// and the selection first.
     fn selection_info_mut(&self) -> std::cell::RefMut<'_, SelectionInfo> {
-        let key = (self.game.doc.id, self.game.doc.journal_end(), self.game.scene.doc_id, self.game.scene.parts.len());
+        let doc = &self.game.doc;
+        let scene = (doc.id, self.game.scene.doc_id, self.game.scene.parts.len());
+        let journal = doc.journal_end();
         let mut info = self.selection_info.borrow_mut();
-        if info.key != Some(key) || info.selection != self.game.doc.selection {
+        let same_parts = info.scene == Some(scene) && info.selection == doc.selection;
+        if !same_parts || (info.journal != journal && !self.only_camera_motion_since(info.journal)) {
             *info = SelectionInfo {
-                key: Some(key),
-                selection: self.game.doc.selection.clone(),
+                scene: Some(scene),
+                selection: doc.selection.clone(),
                 parts: std::rc::Rc::new(self.walk_selected_parts()),
                 ..Default::default()
             };
         }
+        info.journal = journal;
         info
+    }
+
+    /// View-only edits leave selection membership, ribbon values and outline
+    /// geometry intact. An expired journal falls back to re-reading the scene.
+    pub(crate) fn only_camera_motion_since(&self, journal: u64) -> bool {
+        let doc = &self.game.doc;
+        doc.marks_since(journal).is_some_and(|marks| {
+            marks.iter().all(|mark| match mark {
+                doc::Mark::Prop(r, name) if matches!(name.as_str(), "CFrame" | "Focus" | "FieldOfView") => {
+                    doc.dom.get_by_ref(*r).is_some_and(|camera| camera.class == "Camera")
+                }
+                _ => false,
+            })
+        })
     }
 
     /// The selected parts (selected_parts) without copying them: the menu,
@@ -1308,7 +1384,9 @@ impl Editor {
     pub fn build_demo(&mut self) {
         let last = build_demo_parts(&mut self.game.doc);
         self.game.doc.selection = vec![last];
-        self.tool = Tool::Move;
+        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+            self.tool = Tool::Move;
+        }
         self.game.cam = Camera::default();
         self.game.cam.pos = Vec3::new(14.0, 22.0, 34.0);
         self.game.cam.yaw = 0.32;
@@ -1343,6 +1421,11 @@ impl Editor {
         }
         // While playing, WASD/Space/etc. belong to the game.
         self.game_keys(ctx);
+        // When a Play-mode TextBox has keyboard focus, don't let Studio editor
+        // shortcuts (Ctrl+C/X/V/A, Delete, etc.) steal its editing events.
+        if self.game.play_game_input() && self.game.gui.focus.is_some() {
+            return;
+        }
         // Studio's menu accelerators (Ctrl+Shift+V, Ctrl+Alt+G, Alt+A, F11…).
         for a in self.menu_shortcut_actions(ctx) {
             self.ui_action(ctx, a);
@@ -1424,7 +1507,9 @@ impl Editor {
     /// Puts a line on the system clipboard after a copy: egui-winit only
     /// delivers Ctrl+V when the system clipboard holds text.
     pub fn note_os_clipboard(&self, ctx: &egui::Context) {
-        if self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region) {
+        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+            && self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
+        {
             if self.terrain_ed.clipboard.is_some() && self.harness.selftest.is_none() {
                 ctx.copy_text("rustudio: terrain region copied".to_string());
             }
@@ -1437,7 +1522,8 @@ impl Editor {
 
     pub fn run_action(&mut self, a: &str) {
         // A Terrain Editor Region tool has Copy, Cut, Paste, Duplicate and Delete.
-        if self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
+        if self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+            && self.terrain_ed.tool.is_some_and(crate::terrain_editor::Tool::is_region)
             && matches!(a, "copy" | "cut" | "paste" | "duplicate" | "delete")
             && self.terrain_region_action(a)
         {
@@ -1468,10 +1554,10 @@ impl Editor {
             "toggle_space" => self.game.local_space = !self.game.local_space,
             "rotate_selection" => self.rotate_selection(false),
             "tilt_selection" => self.rotate_selection(true),
-            "tool_select" => self.tool = self.tool.toggle(Tool::Select),
-            "tool_move" => self.tool = self.tool.toggle(Tool::Move),
-            "tool_scale" => self.tool = self.tool.toggle(Tool::Scale),
-            "tool_rotate" => self.tool = self.tool.toggle(Tool::Rotate),
+            "tool_select" => self.trigger_dragger_or_native(Tool::Select, "SelectDragger"),
+            "tool_move" => self.trigger_dragger_or_native(Tool::Move, "MoveDragger"),
+            "tool_scale" => self.trigger_dragger_or_native(Tool::Scale, "ScaleDragger"),
+            "tool_rotate" => self.trigger_dragger_or_native(Tool::Rotate, "RotateDragger"),
             "rename" => {
                 if let Some(&r) = self.game.doc.selection.first() {
                     let name = self.game
@@ -1485,6 +1571,14 @@ impl Editor {
             }
             "focus" => self.focus_selection(),
             "focus_props_filter" => self.ui.panel_requests.push((Tab::Properties, Some(true))),
+            "audio_preview" => {
+                if self.game.play.is_none() && self.game.doc.selection.len() == 1 {
+                    let r = self.game.doc.selection[0];
+                    if matches!(self.game.doc.class_of(r).as_deref(), Some("Sound" | "AudioPlayer")) {
+                        self.game.edit_audio_preview_toggle(r);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1557,7 +1651,14 @@ impl Editor {
                 ui.label(RichText::new(format!("● {s}")).color(theme::ERROR).strong());
                 ui.separator();
             }
-            ui.label(RichText::new(format!("{} tool", self.tool.label())).color(theme::ACCENT));
+            let tool_label = if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+                && self.tool == Tool::None
+            {
+                self.active_roblox_dragger_label().unwrap_or(self.tool.label())
+            } else {
+                self.tool.label()
+            };
+            ui.label(RichText::new(format!("{tool_label} tool")).color(theme::ACCENT));
             ui.separator();
             ui.label(format!("{sel} selected"));
             ui.separator();
@@ -1763,6 +1864,8 @@ impl TabViewer for Viewer<'_> {
         *tab != Tab::Viewport
     }
 
+    // The button: its own OS window and back (dragging a tab out floats it
+    // inside rustudio instead).
     fn pop_out_docks_back(&self, _tab: &Tab) -> bool {
         self.window.is_some()
     }
@@ -1787,8 +1890,15 @@ impl TabViewer for Viewer<'_> {
         }
         let alone = self.window.is_some()
             && self.ed.ui.popped.iter().find(|(k, _)| Some(k.as_str()) == self.window).is_some_and(|(_, t)| t.len() == 1);
+        let floating = self.window.is_none() && self.ed.ui.floating_tabs.contains(tab);
         if !alone && ui.button("Pop Out").clicked() {
             self.ed.ui.dock_moves.push(DockMove::PopOut(*tab));
+        }
+        if self.window.is_none() && !floating && ui.button("Float in Window").clicked() {
+            self.ed.ui.dock_moves.push(DockMove::Float(*tab));
+        }
+        if floating && ui.button("Dock Back").clicked() {
+            self.ed.ui.dock_moves.push(DockMove::Unfloat(*tab));
         }
         if self.window.is_some() && ui.button("Dock Back").clicked() {
             self.ed.ui.dock_moves.push(DockMove::DockBack(*tab));
@@ -1808,6 +1918,10 @@ impl TabViewer for Viewer<'_> {
     fn no_tab_bar(&self, tabs: &[Tab]) -> bool {
         // The 3D view alone: no strip with the place's name over it.
         tabs == [Tab::Viewport]
+    }
+
+    fn show_eject_in_context_menu(&self, _tab: &Tab) -> bool {
+        false
     }
 
     fn allowed_in_windows(&self, tab: &mut Tab) -> bool {
@@ -1849,6 +1963,7 @@ impl RustudioApp {
     fn reset_document_tabs(&mut self) {
         if std::mem::take(&mut self.ed.document_tabs_reset) {
             crate::panels::close_document_tabs(&mut self.dock, &mut self.panels);
+            strip_disabled_native_tabs(&mut self.dock, &mut self.panels, self.ed.builtin_tools);
             self.ed.ui.popped.clear();
             self.ed.ui.viewport_group.clear();
         }
@@ -1860,9 +1975,16 @@ impl RustudioApp {
     /// area (a popped tab's window opens over where it was).
     fn panel_windows(&mut self, ctx: &egui::Context, windows: &[(String, String)], dock_rect: egui::Rect) {
         self.panels.remember_windows();
+        if !self.panels.popped.is_empty() {
+            crate::hypr::float_panel_windows();
+        }
         let mut closed = Vec::new();
         for (i, w) in self.panels.popped.iter_mut().enumerate() {
             let id = w.viewport_id();
+            if !w.preplaced {
+                w.preplaced = true;
+                crate::hypr::preplace(&w.app_id(), w.wm_restore.as_ref(), w.open_size(), w.open_pos());
+            }
             if std::mem::take(&mut w.focus) {
                 ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
             }
@@ -1933,8 +2055,38 @@ impl RustudioApp {
                 _ => None,
             }
         });
-        self.panels.adopt_floating(&mut self.dock, origin, zoom);
+        // (Tabs dragged out of the main dock stay floating inside it.)
         for mv in std::mem::take(&mut self.ed.ui.dock_moves) {
+            match &mv {
+                crate::panels::DockMove::Float(t) => {
+                    let Some(path) = self.dock.find_main_surface_tab(t).map(|(n, i)| (n, i)) else { continue };
+                    let rect = self.dock.main_surface()[path.0]
+                        .get_leaf()
+                        .map(|l| l.rect)
+                        .filter(|r| r.is_finite() && r.width() > 50.0 && r.height() > 50.0)
+                        .unwrap_or_else(|| egui::Rect::from_center_size(dock_rect.center(), egui::vec2(420.0, 320.0)));
+                    let Some(found) = self.dock.find_tab(t) else { continue };
+                    let Some(tab) = self.dock.remove_tab(found) else { continue };
+                    let surface = self.dock.add_window(vec![tab]);
+                    if let Some(w) = self.dock.get_window_state_mut(surface) {
+                        w.set_position(rect.min + egui::vec2(24.0, 24.0)).set_size(rect.size());
+                    }
+                    continue;
+                }
+                crate::panels::DockMove::Unfloat(t) => {
+                    if let Some(found) = self.dock.find_tab(t).filter(|p| !p.surface.is_main()) {
+                        if let Some(tab) = self.dock.remove_tab(found) {
+                            // (not the remembered whole-layout snapshot: it was
+                            // taken with this tab floating and would float it again)
+                            let mut homes = self.panels.homes.clone();
+                            homes.remove("__topology");
+                            crate::panels::place(&mut self.dock, tab, &homes);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             // A popped tab opens about where it sat, at its size.
             let tab = match &mv {
                 crate::panels::DockMove::PopOut(t) => Some(*t),
@@ -1956,6 +2108,7 @@ impl eframe::App for RustudioApp {
     fn on_exit(&mut self) {
         crate::studio_settings::flush();
         rustudio_core::rustudio_settings::flush();
+        rustudio_render::pipeline_cache::save(true);
         crate::plugin_host::widgets_ui::on_exit();
         if let Some(s) = self.layout.as_mut() {
             s.save(&self.dock, &self.panels, &self.ed);
@@ -2005,6 +2158,9 @@ impl eframe::App for RustudioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        // The driver's pipeline cache goes to disk once a burst of pipeline
+        // builds is over (pipeline_cache.rs): the next start skips them.
+        rustudio_render::pipeline_cache::save(false);
         if let Some(message) = rustudio_render::gpu_health::take_uncaptured() {
             self.ed.warn(message);
         }
@@ -2085,15 +2241,30 @@ impl RustudioApp {
     }
 
     pub fn tick_plugins_between_frames(&mut self, now: Instant) -> Option<Instant> {
-        if self.ed.place_loading() || !self.ed.plugins.needs_idle_tick() {
+        let active_audio = self.ed.game.play.is_none() && self.ed.game.edit_audio.has_active();
+        if self.ed.place_loading() || (!self.ed.plugins.needs_idle_tick() && !active_audio) {
             return None;
         }
-        if now >= self.last_plugin_tick + PLUGIN_IDLE_INTERVAL {
+        let interval = if active_audio {
+            std::time::Duration::from_millis(33)
+        } else {
+            PLUGIN_IDLE_INTERVAL
+        };
+        if now >= self.last_plugin_tick + interval {
             Self::tick_plugins(&mut self.ed, &mut self.last_plugin_tick, now);
+            self.ed.edit_audio_tick();
             self.plugins_ticked_between_frames = true;
         }
-        (!self.ed.place_loading() && self.ed.plugins.needs_idle_tick())
-            .then(|| self.last_plugin_tick + PLUGIN_IDLE_INTERVAL)
+        let still_audio = self.ed.game.play.is_none() && self.ed.game.edit_audio.has_active();
+        (!self.ed.place_loading() && (self.ed.plugins.needs_idle_tick() || still_audio))
+            .then(|| {
+                self.last_plugin_tick
+                    + if still_audio {
+                        std::time::Duration::from_millis(33)
+                    } else {
+                        PLUGIN_IDLE_INTERVAL
+                    }
+            })
     }
 
     fn tick_plugins(ed: &mut Editor, last_tick: &mut Instant, now: Instant) {
@@ -2159,6 +2330,7 @@ impl RustudioApp {
         if ctx.input(|i| i.viewport().visible() != Some(false)) {
             if !std::mem::take(&mut self.plugins_ticked_between_frames) {
                 Self::tick_plugins(ed, &mut self.last_plugin_tick, now);
+                ed.edit_audio_tick();
             }
             Self::schedule_plugin_repaint(ed, &ctx);
         }
@@ -2167,9 +2339,13 @@ impl RustudioApp {
         ed.file_sync_tick();
         ed.template_preview_tick();
         ed.plugins_tick();
-        ed.toolbox_tick(&ctx);
+        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+            ed.toolbox_tick(&ctx);
+        }
         ed.asset_manager_tick(&ctx);
-        ed.toolbox_harness_tick();
+        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+            ed.toolbox_harness_tick();
+        }
         if self.ed.harness.run.no_ui {
             self.no_ui_frame(ui, &ctx, frame_start, dt);
             return;
@@ -2212,6 +2388,7 @@ impl RustudioApp {
             && ed.harness.run.screenshot.is_none()
             && ed.harness.selftest.is_none()
             && ed.harness.run.bench.is_none()
+            && ed.harness.ui_shots.is_none()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ed.confirm_discard = Some(PendingAction::Quit);
@@ -2223,9 +2400,12 @@ impl RustudioApp {
             // Reset Layout: panel windows close, their tabs go back too.
             let popped: Vec<Tab> = self.panels.popped_tabs().collect();
             self.panels = crate::panels::Panels::default();
-            self.dock = default_dock();
+            self.dock = default_dock_for(self.ed.builtin_tools);
             for t in popped {
-                if self.dock.find_tab(&t).is_none() && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync) {
+                if self.dock.find_tab(&t).is_none()
+                    && native_tab_enabled(t, self.ed.builtin_tools)
+                    && !matches!(t, Tab::AvatarSettings | Tab::TerrainEditor | Tab::Toolbox | Tab::AssetManager | Tab::FileSync)
+                {
                     crate::panels::place(&mut self.dock, t, &self.panels.homes);
                 }
             }
@@ -2312,6 +2492,12 @@ impl RustudioApp {
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
                 dock_rect = ui.max_rect();
+                self.ed.ui.floating_tabs = self
+                    .dock
+                    .iter_surfaces_indexed()
+                    .filter(|(i, _)| !i.is_main())
+                    .flat_map(|(_, s)| s.iter_all_tabs().map(|(_, t)| *t).collect::<Vec<_>>())
+                    .collect();
                 DockArea::new(&mut self.dock)
                     .style(theme::dock_style(ui.style()))
                     .show_add_buttons(false)
@@ -2350,7 +2536,13 @@ impl RustudioApp {
                 }
             }
         }
+        if let Some(on) = rustudio_engine::gui::share().microprofiler_req.take() {
+            self.ed.ui.panel_requests.push((Tab::Profiler, Some(on)));
+        }
         for (tab, want) in std::mem::take(&mut self.ed.ui.panel_requests) {
+            if !native_tab_enabled(tab, self.ed.builtin_tools) {
+                continue;
+            }
             let found = self.panels.locate(&self.dock, &tab);
             let open = want.unwrap_or(found.is_none());
             match (found, open) {
@@ -2454,7 +2646,9 @@ impl RustudioApp {
         rustudio_engine::runtime::domains::assets_cloud::capture::frame_tick(&ctx, ed.game.viewport_rect);
         ed.confirm_ui(&ctx);
         ed.account_window(&ctx);
-        ed.character_builder_window(&ctx);
+        if ed.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
+            ed.character_builder_window(&ctx);
+        }
         ed.cloud_windows(&ctx);
         ed.mcp_windows(&ctx);
         ed.file_sync_popover_ui(&ctx);
@@ -2473,6 +2667,7 @@ impl RustudioApp {
         #[cfg(unix)]
         ed.control_tick(&ctx);
         ed.mcp_tick(&ctx);
+        ed.edit_audio_tick();
         ed.ui_shots_tick(&ctx);
         let work_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
         ed.last_work_ms = work_ms;
@@ -2497,6 +2692,7 @@ impl RustudioApp {
         }
         if ed.drag.is_some()
             || ed.game.play.is_some()
+            || (ed.game.play.is_none() && ed.game.edit_audio.has_active())
             || ed.game.assets.busy()
             || ed.game.textures.decoding()
             || ctx.input(|i| i.pointer.any_down() || !i.keys_down.is_empty())
@@ -2673,7 +2869,8 @@ pub fn view_pixels(r: egui::Rect, ppp: f32, size: [usize; 2]) -> (usize, usize, 
 /// selection, and the ribbon's questions about them, answered once.
 #[derive(Default)]
 pub struct SelectionInfo {
-    key: Option<(u64, u64, u64, usize)>,
+    scene: Option<(u64, u64, usize)>,
+    journal: u64,
     selection: Vec<Ref>,
     parts: std::rc::Rc<Vec<Ref>>,
     /// (property, every selected part has it true)

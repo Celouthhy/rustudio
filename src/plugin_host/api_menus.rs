@@ -84,6 +84,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
                         *allow_binding = false;
                     }
                 }
+                v.ui_rev = v.ui_rev.wrapping_add(1);
             }
             menu_items(lua, this, |items| items.push(MenuItem::Item(r)))?;
             ret1(inst_value(lua, r)?)
@@ -149,6 +150,8 @@ fn menu_items(lua: &Lua, menu: Ref, f: impl FnOnce(&mut Vec<MenuItem>)) -> mlua:
     }
     let mut m = lua.app_data_mut::<Menus>().ok_or_else(|| rt_err("menus missing"))?;
     f(m.0.entry(menu).or_default());
+    drop(m);
+    vm::bump_ui_rev(lua);
     Ok(())
 }
 
@@ -200,6 +203,8 @@ pub fn open_menu(lua: &Lua, menu: Ref) -> mlua::Result<Option<u64>> {
     s.next += 1;
     let token = s.next;
     s.open.push(OpenMenu { token, menu, plugin });
+    drop(s);
+    vm::bump_ui_rev(lua);
     Ok(Some(token))
 }
 
@@ -211,11 +216,16 @@ pub fn open_menus(lua: &Lua) -> Vec<OpenMenu> {
 /// Answers an open popup: `choice` is the picked action (nil: dismissed).
 /// Its ShowAsync returns on the calling thread's next resume.
 pub fn answer(lua: &Lua, token: u64, choice: Option<Ref>) {
+    let mut changed = false;
     if let Some(mut s) = state(lua) {
         if let Some(i) = s.open.iter().position(|m| m.token == token) {
             s.open.remove(i);
             s.done.insert(token, choice);
+            changed = true;
         }
+    }
+    if changed {
+        vm::bump_ui_rev(lua);
     }
 }
 

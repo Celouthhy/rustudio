@@ -124,9 +124,14 @@ pub enum Reader {
     RenderSnapshot = 21,
     /// Animator bindings to joints and bones in a rig.
     AnimatorBindings = 22,
+    /// Server-side anchored / AnimationController rigs posed from Motor6D.Transform.
+    ServerJoints = 23,
+    /// Edit-mode Sound preview playback and on-demand Sound loading
+    /// (crates/rustudio-player/src/edit_audio.rs).
+    EditAudio = 24,
 }
 
-const JOURNAL_READERS: usize = Reader::AnimatorBindings as usize + 1;
+const JOURNAL_READERS: usize = Reader::EditAudio as usize + 1;
 
 /// What a reader gets back: everything changed (rebuild), or the new marks.
 pub enum Marks {
@@ -139,6 +144,12 @@ struct Journal {
     /// Sequence number of `marks[0]`.
     base: u64,
     marks: Vec<Mark>,
+    /// Spatial queries can be idle through many unrelated UI or script
+    /// changes. Retain only marks the query cache consumes until its next
+    /// read. None means its next read must rebuild.
+    query: Option<Vec<Mark>>,
+    /// Selector inputs can outlive the general journal between GUI steps.
+    styles: Option<Vec<Mark>>,
     /// Next sequence number each reader wants; None = hasn't read yet.
     read: [Option<u64>; JOURNAL_READERS],
     /// The joint graph's position (crates/rustudio-engine/src/domains/world_part.rs), read through
@@ -182,6 +193,9 @@ pub struct Document {
     pub id: u64,
     /// Bumped when instances are added, moved, removed or renamed.
     pub tree_revision: u64,
+    /// Bumped when tree structure or style-relevant properties (Name, Tags,
+    /// Attributes, Selector, Priority, StyleSheet) change.
+    pub style_revision: u64,
     journal: Journal,
     /// ChangeHistoryService's state (doc_history.rs).
     history: history::History,
@@ -460,8 +474,14 @@ pub fn db() -> &'static rbx_reflection::ReflectionDatabase<'static> {
 
 /// Services Studio keeps for the session only (never saved with the place):
 /// the plugin host puts plugin widgets and plugin GUI in them.
-pub const UNSAVED_SERVICES: &[&str] =
-    &["PluginGuiService", "CoreGui", "StudioService", "PluginDebugService", "ScriptEditorService"];
+pub const UNSAVED_SERVICES: &[&str] = &[
+    "PluginGuiService",
+    "RobloxPluginGuiService",
+    "CoreGui",
+    "StudioService",
+    "PluginDebugService",
+    "ScriptEditorService",
+];
 
 /// Whether `r` is in (or is) one of the UNSAVED_SERVICES.
 pub fn in_unsaved_service(d: &Document, r: Ref) -> bool {
@@ -501,12 +521,20 @@ pub fn vec3_of(v: Option<Variant>) -> Option<Vec3> {
 
 #[inline]
 pub fn xform_of(doc: &Document, r: Ref) -> Option<Xform> {
-    match doc.prop(r, "CFrame")? {
-        // Old places can hold slightly skewed rotations: square them up so
-        // nothing draws stretched.
-        Variant::CFrame(cf) => Some(Xform::from_cframe(&cf).orthonormalized()),
-        _ => None,
-    }
+    let key = crate::ukey!("CFrame");
+    let inst = doc.dom.get_by_ref(r)?;
+    // The pose journal normally points to a saved CFrame. Read the borrowed
+    // value directly; older parts can still need the property fallback.
+    let xf = match inst.properties.get(&key) {
+        Some(Variant::CFrame(cf)) => Xform::from_cframe(cf),
+        Some(_) => return None,
+        None => match doc.prop_key(r, key)? {
+            Variant::CFrame(cf) => Xform::from_cframe(&cf),
+            _ => return None,
+        },
+    };
+    // Old places can hold slightly skewed rotations.
+    Some(xf.orthonormalized())
 }
 
 /// `Instance:IsA` against the reflection database.
@@ -698,9 +726,12 @@ impl Document {
             selection: Vec::new(),
             id: NEXT_DOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tree_revision: 0,
+            style_revision: 0,
             journal: Journal {
                 base: 0,
                 marks: Vec::new(),
+                query: None,
+                styles: None,
                 read: [None; JOURNAL_READERS],
                 graph_pos: std::sync::atomic::AtomicU64::new(0),
             },
@@ -713,21 +744,35 @@ impl Document {
     /// Notes a property change (and bumps the revision).
     pub fn mark_prop(&mut self, r: Ref, name: Ustr) {
         self.revision += 1;
-        if name == "Name" {
+        let s = name.as_str();
+        if s == "Name" {
             self.tree_revision += 1;
         }
-        self.push_mark(Mark::Prop(r, name));
+        let mark = Mark::Prop(r, name);
+        if matches!(s, "Name" | "Tags" | "Attributes" | "Selector" | "Priority" | "StyleSheet" | "Interactable") {
+            self.push_style_mark(mark);
+        }
+        self.push_mark(mark);
     }
 
     /// Notes that `r`'s subtree was created, moved or removed.
     pub fn mark_tree(&mut self, r: Ref) {
         self.revision += 1;
         self.tree_revision += 1;
-        self.push_mark(Mark::Tree(r));
+        let mark = Mark::Tree(r);
+        self.push_style_mark(mark);
+        self.push_mark(mark);
     }
 
     /// Everything may have changed: readers rebuild.
     pub fn mark_all(&mut self) {
+        self.journal.query = None;
+        self.journal.styles = None;
+        self.style_revision += 1;
+        self.reset_general_marks();
+    }
+
+    fn reset_general_marks(&mut self) {
         self.revision += 1;
         self.tree_revision += 1;
         let j = &mut self.journal;
@@ -735,11 +780,43 @@ impl Document {
         j.marks.clear();
     }
 
+    fn push_style_mark(&mut self, mark: Mark) {
+        self.style_revision += 1;
+        if let Some(marks) = self.journal.styles.as_mut() {
+            if marks.len() >= mech::JOURNAL_READER_LAG {
+                self.journal.styles = None;
+            } else {
+                marks.push(mark);
+            }
+        }
+    }
+
+    /// Reads the style selector changes independently of spatial readers.
+    pub fn take_style_marks(&mut self) -> Marks {
+        self.journal.styles.replace(Vec::new()).map_or(Marks::All, Marks::Some)
+    }
+
     fn push_mark(&mut self, m: Mark) {
         let j = &mut self.journal;
+        if let Some(query) = &mut j.query {
+            let relevant = match m {
+                Mark::Tree(_) => true,
+                Mark::Prop(_, name) => matches!(
+                    name.as_str(), "CFrame" | "Size" | "CanCollide" | "CanQuery" | "SmoothGrid" | "Shape"
+                ),
+            };
+            if relevant {
+                if query.len() >= mech::JOURNAL_READER_LAG {
+                    j.query = None;
+                } else {
+                    query.push(m);
+                }
+            }
+        }
         if j.marks.len() >= mech::JOURNAL_LIMIT {
-            // Nobody is reading fast enough: drop it and let readers rebuild.
-            self.mark_all();
+            // General readers rebuild. Spatial queries still have their
+            // relevant marks, including the one that overflowed this list.
+            self.reset_general_marks();
             return;
         }
         j.marks.push(m);
@@ -749,13 +826,30 @@ impl Document {
     /// fell too far behind). Marks every reader has seen are dropped.
     pub fn marks_for(&mut self, reader: Reader) -> Marks {
         let j = &mut self.journal;
-        let end = j.base + j.marks.len() as u64;
-        let slot = reader as usize;
-        let out = match j.read[slot] {
-            Some(pos) if pos >= j.base => Marks::Some(j.marks[(pos - j.base) as usize..].to_vec()),
-            _ => Marks::All,
+        let out = if reader == Reader::Query {
+            j.query.replace(Vec::new()).map_or(Marks::All, Marks::Some)
+        } else {
+            match j.read[reader as usize] {
+                Some(pos) if pos >= j.base => Marks::Some(j.marks[(pos - j.base) as usize..].to_vec()),
+                _ => Marks::All,
+            }
         };
-        j.read[slot] = Some(end);
+        self.advance_mark_reader(reader);
+        out
+    }
+
+    /// Advance past changes already known to a reader, such as its own writes.
+    pub fn discard_marks_for(&mut self, reader: Reader) {
+        if reader == Reader::Query {
+            self.journal.query.get_or_insert_with(Vec::new).clear();
+        }
+        self.advance_mark_reader(reader);
+    }
+
+    fn advance_mark_reader(&mut self, reader: Reader) {
+        let j = &mut self.journal;
+        let end = j.base + j.marks.len() as u64;
+        j.read[reader as usize] = Some(end);
         // A reader that stopped reading doesn't hold the journal back: it
         // rebuilds from scratch if it comes back.
         for r in j.read.iter_mut() {
@@ -775,7 +869,6 @@ impl Document {
             j.marks.drain(..n);
             j.base += n as u64;
         }
-        out
     }
 
     /// The journal's end: what the next mark's sequence number will be.
@@ -908,9 +1001,15 @@ impl Document {
             root.add_child(InstanceBuilder::new(class).with_name(class));
         }
         root.add_child(player);
-        for class in ["Teams", "SoundService", "TextChatService"] {
+        for class in ["Teams", "SoundService"] {
             root.add_child(InstanceBuilder::new(class).with_name(class));
         }
+        // Studio's new places start with TextChatService (Enum.ChatVersion.TextChatService = 1).
+        root.add_child(
+            InstanceBuilder::new("TextChatService")
+                .with_name("TextChatService")
+                .with_property("ChatVersion", Variant::Enum(rbx_dom_weak::types::Enum::from_u32(1))),
+        );
         let mut doc = Self::from_dom(
             WeakDom::new(root),
             DocKind::Place,
@@ -1269,6 +1368,11 @@ impl Document {
         }
         if let Some(v) = inst.properties.get(&key) {
             return Some(v.clone());
+        }
+        // Reflection's Terrain.MaterialColors default describes the legacy
+        // palette. A modern place with no saved blob uses the 2022 tints.
+        if inst.class == "Terrain" && name == "MaterialColors" && use_2022_materials(self) {
+            return Some(Variant::MaterialColors(crate::terrain_mat::default_colors_2022()));
         }
         if inst.class == "Lighting" && matches!(name, "LightingStyle" | "PrioritizeLightingQuality") {
             let (style, quality) = lighting_style_default(inst);
@@ -1968,6 +2072,47 @@ impl Document {
 mod tests {
     use super::*;
 
+    #[test]
+    fn idle_queries_keep_spatial_marks_through_unrelated_journal_churn() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        let changed = Mark::Prop(root, ustr("Size"));
+        assert!(matches!(doc.marks_for(Reader::Query), Marks::All));
+        let _ = doc.marks_for(Reader::Physics);
+        doc.mark_prop(root, ustr("Size"));
+        for _ in 0..=mech::JOURNAL_READER_LAG {
+            doc.mark_prop(root, ustr("Text"));
+        }
+        let _ = doc.marks_for(Reader::Physics);
+        assert!(matches!(doc.marks_for(Reader::Query), Marks::Some(m) if m == [changed]));
+        doc.mark_all();
+        assert!(matches!(doc.marks_for(Reader::Query), Marks::All));
+    }
+
+    #[test]
+    fn stylesheet_marks_survive_general_journal_consumption() {
+        let mut doc = Document::new_place();
+        let root = doc.dom.root_ref();
+        assert!(matches!(doc.take_style_marks(), Marks::All));
+        let _ = doc.marks_for(Reader::Physics);
+        let tag = ustr("Tags");
+        let interactable = ustr("Interactable");
+        doc.mark_prop(root, tag);
+        doc.mark_prop(root, interactable);
+        let rev = doc.style_revision;
+        for _ in 0..=mech::JOURNAL_LIMIT {
+            doc.mark_prop(root, ustr("CFrame"));
+        }
+        let _ = doc.marks_for(Reader::Physics);
+        assert_eq!(doc.style_revision, rev);
+        assert!(matches!(
+            doc.take_style_marks(),
+            Marks::Some(m) if m == [Mark::Prop(root, tag), Mark::Prop(root, interactable)]
+        ));
+        doc.mark_all();
+        assert!(matches!(doc.take_style_marks(), Marks::All));
+    }
+
     /// ScreenGui.IgnoreGuiInset is ScreenInsets ≠ CoreUISafeInsets, both ways
     /// (measured in Studio 0.744 on Laser Tag's GameplayGui / ReticleGui).
     #[test]
@@ -2555,9 +2700,13 @@ impl ClassIndex {
         for m in marks {
             let Mark::Tree(t) = m else { continue };
             tree = true;
-            for r in d.subtree(t) {
-                let live = d.dom.get_by_ref(r).is_some_and(|i| want(i.class.as_str()));
-                if live {
+            if d.dom.get_by_ref(t).is_none() {
+                // Limbo and freed instances are pruned from the live list below.
+                continue;
+            }
+            for instance in d.dom.descendants_of(t) {
+                let r = instance.referent();
+                if want(instance.class.as_str()) {
                     if self.set.insert(r) {
                         self.list.push(r);
                         changed = true;

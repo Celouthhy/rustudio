@@ -139,26 +139,30 @@ pub fn sky_tint(sun_y: f32) -> Vec3 {
 }
 
 /// Post effects under Lighting and the camera (Enabled ones; several of a
-/// kind combine).
-#[derive(Default, Clone, Copy)]
+/// kind combine per Studio `updatePostEffects`).
+#[derive(Default, Clone, Copy, Debug)]
 pub struct Effects {
+    /// Enabled `BloomEffect` aggregate: `(intensity, size, threshold)`.
+    /// `None` when no enabled `BloomEffect` exists (falls back to Studio default Neon glow).
     pub bloom: Option<(f32, f32, f32)>,
     pub cc: Option<(f32, f32, f32, Vec3)>,
     pub blur: f32,
     pub dof: Option<[f32; 4]>,
+    pub sun_rays: Option<(f32, f32)>,
     pub retro: bool,
 }
 
 pub fn effects(d: &Document, cam_obj: Option<Ref>) -> Effects {
     let mut e = Effects::default();
     let root = d.dom.root_ref();
-    let parents: Vec<Ref> = d
+    let parents: Vec<(Ref, bool)> = d
         .find_child(root, "Lighting")
         .into_iter()
-        .chain(cam_obj)
+        .map(|r| (r, true))
+        .chain(cam_obj.map(|r| (r, false)))
         .collect();
     let mut cc_acc: Option<(f32, f32, f32, Vec3)> = None;
-    for p in parents {
+    for (p, is_lighting) in parents {
         for c in d
             .dom
             .get_by_ref(p)
@@ -171,16 +175,28 @@ pub fn effects(d: &Document, cam_obj: Option<Ref>) -> Effects {
             }
             let num = |n: &str, dflt: f32| f32_of(d.prop(c, n)).unwrap_or(dflt);
             match class.as_str() {
+                // Studio: FocusDistance = max, InFocusRadius = last wins,
+                // NearIntensity = max, FarIntensity = max.
                 "DepthOfFieldEffect" => {
-                    e.dof = Some([num("FocusDistance", 0.05).max(0.0), num("InFocusRadius", 10.0).max(0.0),
-                        num("NearIntensity", 0.75).clamp(0.0, 1.0), num("FarIntensity", 0.75).clamp(0.0, 1.0)]);
+                    let fd = num("FocusDistance", 0.05).max(0.0);
+                    let r = num("InFocusRadius", 10.0).max(0.0);
+                    let ni = num("NearIntensity", 0.75).clamp(0.0, 1.0);
+                    let fi = num("FarIntensity", 0.75).clamp(0.0, 1.0);
+                    e.dof = Some(match e.dof {
+                        None => [fd, r, ni, fi],
+                        Some([ofd, _, oni, ofi]) => [ofd.max(fd), r, oni.max(ni), ofi.max(fi)],
+                    });
                 }
+                // Studio: first sets (max(0,I), max(0,S), clamp(T,0,4));
+                // subsequent add Intensity, max Size, min Threshold (clamped >= 0).
                 "BloomEffect" => {
-                    e.bloom = Some((
-                        num("Intensity", 1.0),
-                        num("Size", 24.0),
-                        num("Threshold", 2.0),
-                    ))
+                    let i = num("Intensity", 1.0);
+                    let s = num("Size", 24.0);
+                    let t = num("Threshold", 2.0);
+                    e.bloom = Some(match e.bloom {
+                        None => (i.max(0.0), s.max(0.0), t.clamp(0.0, 4.0)),
+                        Some((oi, os, ot)) => ((oi + i).max(0.0), os.max(s), ot.min(t).clamp(0.0, 4.0)),
+                    });
                 }
                 "ColorCorrectionEffect" => {
                     let tint = color_of(d.prop(c, "TintColor"))
@@ -194,10 +210,20 @@ pub fn effects(d: &Document, cam_obj: Option<Ref>) -> Effects {
                         t * tint,
                     ));
                 }
-                "BlurEffect" => e.blur = e.blur.max(num("Size", 24.0)),
-                // TonemapperPreset: Default 0, Retro 1.
-                "ColorGradingEffect" => {
-                    e.retro = enum_u32(d.prop(c, "TonemapperPreset")) == Some(1)
+                "BlurEffect" => e.blur = e.blur.max(num("Size", 24.0).max(0.0)),
+                // Studio: SunRays Intensity sums, Spread takes max.
+                "SunRaysEffect" => {
+                    let i = num("Intensity", 0.01);
+                    let sp = num("Spread", 0.1).clamp(0.0, 1.0);
+                    e.sun_rays = Some(match e.sun_rays {
+                        None => (i.max(0.0), sp),
+                        Some((oi, osp)) => ((oi + i).max(0.0), osp.max(sp)),
+                    });
+                }
+                // Studio: ColorGradingEffect is read ONLY under Lighting,
+                // never under CurrentCamera. TonemapperPreset: Default 0, Retro 1.
+                "ColorGradingEffect" if is_lighting => {
+                    e.retro = enum_u32(d.prop(c, "TonemapperPreset")) == Some(1);
                 }
                 _ => {}
             }
@@ -268,6 +294,7 @@ pub fn atmos_haze_cube(a: &Atmos, sky_irr: &[Vec3; 6]) -> [Vec3; 6] {
 /// Everything the shaders need for a frame.
 pub struct FrameLighting {
     pub globals: Globals,
+    pub postfx: crate::postfx::PostFxParams,
     pub sun: Vec3,
     /// Toward the sun (Lighting:GetSunDirection), even at night: the light
     /// grid's sun channel flips it to the moon itself.
@@ -397,20 +424,23 @@ pub fn globals(
     if override_flag("nopost") {
         fx.cc = None;
         fx.bloom = Some((0.0, mech::DEFAULT_GLOW_SIZE_PX, mech::DEFAULT_GLOW_THRESHOLD));
+        fx.blur = 0.0;
+        fx.dof = None;
+        fx.sun_rays = None;
     }
+    let saved_tech = saved_technology(d);
     let no_tone = no_tone || fx.retro;
     let fog_start = f32_of(get("FogStart")).unwrap_or(0.0);
     let fog_end = f32_of(get("FogEnd")).unwrap_or(100_000.0);
     let fog_color = sq(color_of(get("FogColor")).unwrap_or([192, 192, 192]));
-    let atmos = if override_flag("noatmos") { None } else { atmosphere(d) };
     // With an Atmosphere, Lighting's FogStart / FogEnd don't apply (Roblox
     // docs): objects fade into the sky behind them, e^(−k·d) (fog.z 3,
-    // exp2 form as Studio's FogParams). Only with a Sky too: Studio's fog
-    // update (Windows 0.744 Studio) takes the Atmosphere's fog only
-    // when Lighting has both, else the FogStart / FogEnd fog
-    // (checks/fog-linear, 2026-11-14).
+    // exp2 form as Studio's FogParams). Only with a Sky too: Studio's
+    // Atmosphere sky/haze and fog only activate
+    // when Lighting has both an Atmosphere and a Sky.
     let has_sky = lighting.and_then(|l| sky_child(d, l)).is_some();
-    let fog = match atmos.filter(|_| has_sky) {
+    let atmos = if override_flag("noatmos") || !has_sky { None } else { atmosphere(d) };
+    let fog = match atmos {
         Some(a) if a.fog_k > 0.0 => [0.0, a.fog_k / std::f32::consts::LN_2, 3.0, day],
         Some(_) => [0.0, 1e9, 0.0, day],
         None => [
@@ -611,8 +641,61 @@ pub fn globals(
             );
         }
     }
+    let tonemap_mode = if raw_debug || saved_tech.is_none() {
+        crate::postfx::TonemapMode::RawSqrt
+    } else if fx.retro || saved_tech.is_some_and(|t| mech::TECHNOLOGY_NO_TONE_CURVE.contains(&t)) {
+        crate::postfx::TonemapMode::Retro
+    } else {
+        crate::postfx::TonemapMode::Default
+    };
+    let aspect = (rect.width() / rect.height().max(1.0)).max(0.01);
+    let tan_y = (cam.fov_deg.to_radians() * 0.5).tan().max(1e-4);
+    let tan_x = tan_y * aspect;
+    let sun_u = sun.normalize_or_zero();
+    let cam_fwd = cam.forward();
+    let sun_view = Vec3::new(sun_u.dot(cam.right()), sun_u.dot(cam.up()), -sun_u.dot(cam_fwd));
+    let sun_ndc = if sun_view.z < -1e-4 {
+        [
+            sun_view.x / (-sun_view.z * tan_x),
+            sun_view.y / (-sun_view.z * tan_y),
+        ]
+    } else {
+        [0.0, 0.0]
+    };
+    let (sr_intensity, sr_spread) = fx.sun_rays.unwrap_or((0.0, 0.1));
+    let postfx = crate::postfx::PostFxParams {
+        exposure: 2f32.powf(exposure),
+        tonemap_mode,
+        raw_debug,
+        terrain_capture_id: false,
+        post_fx_tier: 3,
+        bloom_allowed: true,
+        bloom_effect_enabled: fx.bloom.is_some(),
+        bloom_intensity: bloom_i,
+        bloom_size,
+        bloom_threshold: bloom_thr,
+        blur_size: if raw_debug { 0.0 } else { fx.blur },
+        dof: if raw_debug { [0.0; 4] } else { fx.dof.unwrap_or([0.0; 4]) },
+        cc_enabled: fx_cc_on,
+        cc_brightness: ccb,
+        cc_contrast: ccc,
+        cc_saturation: ccs,
+        cc_tint: cct.to_array(),
+        sun_rays_enabled: fx.sun_rays.is_some() && !raw_debug,
+        sun_rays_intensity: sr_intensity,
+        sun_rays_spread: sr_spread,
+        sun_dir_world: sun_u.to_array(),
+        cam_forward: cam_fwd.to_array(),
+        sun_ndc,
+        sun_view: sun_view.to_array(),
+        inv_proj_xy: [tan_x, tan_y],
+        ssao_half_diag: [globals.ssao[0], globals.ssao[1]],
+        near_plane: mech::NEAR,
+        is_ortho: cam.ortho.is_some(),
+    };
     FrameLighting {
         globals,
+        postfx,
         sun: light_dir,
         sun_true: sun,
         shadows: shadows && light_irr > 0.0,
@@ -805,18 +888,32 @@ impl LightCache {
             out.sort_by(|a, b| a.0.total_cmp(&b.0));
             out.truncate(mech::MAX_LIGHTS);
         }
-        // Realistic: the nearest Shadows lights within LOCAL_LIGHT_DIST get a
-        // cube shadow map each (Studio's Future clustered lights).
+        // Realistic: the shadowed lights whose influence sphere is nearest the
+        // camera (within LOCAL_LIGHT_DIST) get a cube shadow map each (Studio's
+        // Future clustered lights). Sorting by effective distance to the light's
+        // influence sphere ensures large-range SurfaceLights reaching the view
+        // aren't starved by distant small-range lights.
         if !soft {
-            let mut slot = 0usize;
-            for (dist, l) in out.iter_mut() {
-                if slot >= mech::LSHADOW_MAX_LIGHTS {
-                    break;
-                }
-                if l.extra[2] > 0.5 && *dist - l.pos_range[3] <= mech::LOCAL_LIGHT_DIST {
-                    l.extra[3] = slot as f32;
-                    slot += 1;
-                }
+            let mut order: Vec<(f32, f32, usize)> = out
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (dist, l))| {
+                    if l.extra[2] <= 0.5 {
+                        return None;
+                    }
+                    let [a, b, ..] = l.extra;
+                    let radius = l.pos_range[3] + (a * a + b * b).sqrt();
+                    let eff = (*dist - radius).max(0.0);
+                    if eff <= mech::LOCAL_LIGHT_DIST {
+                        Some((eff, *dist, i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            order.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+            for (slot, (_, _, idx)) in order.into_iter().take(mech::LSHADOW_MAX_LIGHTS).enumerate() {
+                out[idx].1.extra[3] = slot as f32;
             }
         }
         if std::env::var_os("RUSTUDIO_LIGHT_DEBUG").is_some() {
@@ -1134,6 +1231,121 @@ mod tests {
         assert_eq!(sky_faces(&d)[0], "rbxassetid://123");
         assert_eq!(effects(&d, None).dof, Some([4.72, 0.0, 0.0, 0.567]));
 
+    }
+
+    #[test]
+    fn post_effects_stacking_and_parenting_match_studio() {
+        use rbx_dom_weak::types::{Color3, Enum};
+        let dom = WeakDom::new(
+            InstanceBuilder::new("DataModel")
+                .with_child(
+                    InstanceBuilder::new("Lighting")
+                        .with_name("Lighting")
+                        .with_child(
+                            InstanceBuilder::new("BloomEffect")
+                                .with_property("Intensity", 0.5f32)
+                                .with_property("Size", 16.0f32)
+                                .with_property("Threshold", 1.5f32),
+                        )
+                        .with_child(
+                            InstanceBuilder::new("BloomEffect")
+                                .with_property("Enabled", false)
+                                .with_property("Intensity", 9.0f32),
+                        )
+                        .with_child(
+                            InstanceBuilder::new("DepthOfFieldEffect")
+                                .with_property("FocusDistance", 30.0f32)
+                                .with_property("InFocusRadius", 25.0f32)
+                                .with_property("NearIntensity", 0.2f32)
+                                .with_property("FarIntensity", 0.8f32),
+                        )
+                        .with_child(
+                            InstanceBuilder::new("SunRaysEffect")
+                                .with_property("Intensity", 0.1f32)
+                                .with_property("Spread", 0.3f32),
+                        )
+                        .with_child(
+                            InstanceBuilder::new("BlurEffect").with_property("Size", 8.0f32),
+                        )
+                        .with_child(
+                            InstanceBuilder::new("ColorCorrectionEffect")
+                                .with_property("Brightness", 0.1f32)
+                                .with_property("Contrast", 0.2f32)
+                                .with_property("Saturation", -0.3f32)
+                                .with_property("TintColor", Color3::new(1.0, 0.5, 0.5)),
+                        ),
+                )
+                .with_child(
+                    InstanceBuilder::new("Workspace")
+                        .with_name("Workspace")
+                        .with_child(
+                            InstanceBuilder::new("Camera")
+                                .with_name("Camera")
+                                .with_child(
+                                    InstanceBuilder::new("BloomEffect")
+                                        .with_property("Intensity", 0.75f32)
+                                        .with_property("Size", 40.0f32)
+                                        .with_property("Threshold", 0.9f32),
+                                )
+                                .with_child(
+                                    InstanceBuilder::new("DepthOfFieldEffect")
+                                        .with_property("FocusDistance", 20.0f32)
+                                        .with_property("InFocusRadius", 8.0f32)
+                                        .with_property("NearIntensity", 0.6f32)
+                                        .with_property("FarIntensity", 0.3f32),
+                                )
+                                .with_child(
+                                    InstanceBuilder::new("SunRaysEffect")
+                                        .with_property("Intensity", 0.15f32)
+                                        .with_property("Spread", 0.9f32),
+                                )
+                                .with_child(
+                                    InstanceBuilder::new("BlurEffect").with_property("Size", 20.0f32),
+                                )
+                                .with_child(
+                                    InstanceBuilder::new("ColorCorrectionEffect")
+                                        .with_property("Brightness", -0.05f32)
+                                        .with_property("Contrast", 0.3f32)
+                                        .with_property("Saturation", 0.5f32)
+                                        .with_property("TintColor", Color3::new(0.5, 1.0, 0.5)),
+                                )
+                                // ColorGradingEffect under Camera must be ignored (Lighting only).
+                                .with_child(
+                                    InstanceBuilder::new("ColorGradingEffect")
+                                        .with_property("TonemapperPreset", Enum::from_u32(1)),
+                                ),
+                        ),
+                ),
+        );
+        let d = Document::from_play_dom(dom, "stack".into());
+        let ws = d.workspace().unwrap();
+        let cam = d.find_child(ws, "Camera").unwrap();
+        let fx = effects(&d, Some(cam));
+        // Bloom: sum intensity, max size, min threshold
+        let (bi, bs, bt) = fx.bloom.unwrap();
+        assert!((bi - 1.25).abs() < 1e-5);
+        assert!((bs - 40.0).abs() < 1e-5);
+        assert!((bt - 0.9).abs() < 1e-5);
+        // DOF: max FocusDistance (30), LAST InFocusRadius (8), max Near (0.6), max Far (0.8)
+        let dof = fx.dof.unwrap();
+        assert!((dof[0] - 30.0).abs() < 1e-5);
+        assert!((dof[1] - 8.0).abs() < 1e-5);
+        assert!((dof[2] - 0.6).abs() < 1e-5);
+        assert!((dof[3] - 0.8).abs() < 1e-5);
+        // SunRays: sum intensity, max spread
+        let (sri, srs) = fx.sun_rays.unwrap();
+        assert!((sri - 0.25).abs() < 1e-5);
+        assert!((srs - 0.9).abs() < 1e-5);
+        // Blur: max size
+        assert!((fx.blur - 20.0).abs() < 1e-5);
+        // CC: sum B/C/S, multiply tint
+        let (b, c, s, t) = fx.cc.unwrap();
+        assert!((b - 0.05).abs() < 1e-5);
+        assert!((c - 0.5).abs() < 1e-5);
+        assert!((s - 0.2).abs() < 1e-5);
+        assert!((t.x - 0.5).abs() < 1e-2 && (t.y - 0.5).abs() < 1e-2 && (t.z - 0.25).abs() < 1e-2);
+        // ColorGradingEffect under Camera is ignored
+        assert!(!fx.retro);
     }
 
     /// A Bone's Transform moves what hangs under it (selftest/attachment.rs

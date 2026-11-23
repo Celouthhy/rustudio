@@ -216,7 +216,7 @@ pub fn unregister_generated(id:&str){
 }
 
 pub fn generated(id: &str) -> Option<Arc<Vec<u8>>> {
-    if !id.starts_with("rbxtemp://rustudio/") {
+    if !id.starts_with("rbxtemp://") {
         return None;
     }
     GENERATED.lock().ok()?.as_ref()?.get(id).cloned()
@@ -292,8 +292,16 @@ fn legacy_table(content: &Path) -> HashMap<String, u64> {
         .collect()
 }
 
+fn normalize_rbxasset(rest: &str) -> String {
+    rest.replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn legacy_lookup(table: &HashMap<String, u64>, rest: &str) -> Option<u64> {
-    let key = rest.trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
+    let key = normalize_rbxasset(rest).to_ascii_lowercase();
     table.get(&key).copied()
 }
 
@@ -301,7 +309,8 @@ fn legacy_lookup(table: &HashMap<String, u64>, rest: &str) -> Option<u64> {
 pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
     let id = id.trim();
     if let Some(rest) = id.strip_prefix("rbxasset://") {
-        let rest = rest.trim_start_matches('/');
+        let rest_norm = normalize_rbxasset(rest);
+        let rest = rest_norm.as_str();
         // rbxasset:// names a file in the content folder, nothing outside it.
         if !Path::new(rest)
             .components()
@@ -310,15 +319,25 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
             return None;
         }
         let p = content_dir().join(rest);
-        // Like Studio: what isn't in content/ may be in the platform
-        // content beside it (PlatformContent/pc/textures/sky/... holds the
-        // default skybox).
+        // Like Studio: what isn't in content/ may be in StudioContent (built-in
+        // plugin & DeveloperFramework UI textures), PlatformContent/pc (default
+        // skybox, terrain), or ExtraContent beside it.
         if !p.exists() {
             if let Some(alt) = content_dir()
                 .canonicalize()
                 .ok()
-                .and_then(|c| c.parent().map(|s| s.join("PlatformContent/pc").join(rest)))
-                .filter(|a| a.is_file())
+                .and_then(|c| c.parent().map(|s| s.to_path_buf()))
+                .into_iter()
+                .chain(crate::default_scripts::studio_dir())
+                .chain(crate::paths::installed_studio())
+                .chain(crate::paths::windows_studio_install())
+                .flat_map(|s| [
+                    s.join("content").join(rest),
+                    s.join("StudioContent").join(rest),
+                    s.join("PlatformContent/pc").join(rest),
+                    s.join("ExtraContent").join(rest),
+                ])
+                .find(|a| a.is_file())
             {
                 return Some(alt);
             }
@@ -341,6 +360,83 @@ pub fn resolve(id: &str, doc_dir: Option<&Path>) -> Option<PathBuf> {
             }
         }
         return Some(p);
+    }
+    if let Some(rest) = id.strip_prefix("rbxlocaltheme://") {
+        let rest_norm = normalize_rbxasset(rest);
+        let name = rest_norm.trim_end_matches(".png");
+        if name.is_empty()
+            || !Path::new(name)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return None;
+        }
+        let svg_roots: Vec<PathBuf> = [
+            content_dir().join("studio_svg_textures/Shared"),
+            content_dir().join("studio_svg_textures/Lua"),
+        ]
+        .into_iter()
+        .chain(
+            content_dir()
+                .canonicalize()
+                .ok()
+                .and_then(|c| c.parent().map(|s| s.to_path_buf()))
+                .into_iter()
+                .chain(crate::default_scripts::studio_dir())
+                .chain(crate::paths::installed_studio())
+                .chain(crate::paths::windows_studio_install())
+                .flat_map(|s| {
+                    [
+                        s.join("content/studio_svg_textures/Shared"),
+                        s.join("content/studio_svg_textures/Lua"),
+                    ]
+                }),
+        )
+        .filter(|d| d.is_dir())
+        .collect();
+        for root in &svg_roots {
+            for theme in ["Dark", "Light"] {
+                for rel in [
+                    format!("WidgetIcons/{theme}/Large/{name}.png"),
+                    format!("WidgetIcons/{theme}/Standard/{name}.png"),
+                    format!("InsertableObjects/{theme}/Large/{name}.png"),
+                    format!("InsertableObjects/{theme}/Standard/{name}.png"),
+                    format!("Ribbon/{theme}/Medium/Ribbon{name}.png"),
+                    format!("Ribbon/{theme}/Large/Ribbon{name}.png"),
+                    format!("Ribbon/{theme}/Standard/Ribbon{name}.png"),
+                    format!("Ribbon/{theme}/Standard/Ribbon{name}Small.png"),
+                    format!("Ribbon/{theme}/Medium/{name}.png"),
+                    format!("Ribbon/{theme}/Large/{name}.png"),
+                    format!("Ribbon/{theme}/Standard/{name}.png"),
+                ] {
+                    let p = root.join(rel);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+                if let Ok(rd) = std::fs::read_dir(root) {
+                    for entry in rd.flatten() {
+                        let cat = entry.path();
+                        if !cat.is_dir() {
+                            continue;
+                        }
+                        for size in ["Large", "Medium", "Standard"] {
+                            for fname in [
+                                format!("{name}.png"),
+                                format!("Ribbon{name}.png"),
+                                format!("Ribbon{name}Small.png"),
+                            ] {
+                                let p = cat.join(theme).join(size).join(fname);
+                                if p.is_file() {
+                                    return Some(p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return None;
     }
     if let Some(rest) = id.strip_prefix("file://") {
         return Some(PathBuf::from(rest));
@@ -428,10 +524,259 @@ pub fn session_checking(on: bool) {
 
 /// The session check ended (from its worker thread): signed in or not.
 pub fn session_ready(client: Option<SharedClient>) {
+    let signed_in = client.is_some();
     if let Ok(mut g) = SESSION.lock() {
         *g = client;
     }
+    if signed_in {
+        forget_refusals();
+    }
     session_checking(false);
+}
+
+// ------------------------------------------------------------ refusals
+
+/// Assets delivery refused this process (private to their owner, deleted,
+/// moderated): asking again costs a request and gets the same answer. A
+/// place's preload lists name its owner's private animations by the
+/// hundred; without this every PreloadAsync (the server's, then each
+/// client's) and every play of them asked again. A login session can
+/// change the answer, so it empties the list.
+static REFUSED: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+
+fn refused(id: u64) -> Option<String> {
+    REFUSED.lock().ok()?.as_ref()?.get(&id).cloned()
+}
+
+fn note_refused(id: u64, why: &str) {
+    if let Ok(mut g) = REFUSED.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id, why.to_string());
+    }
+}
+
+/// A session arrived (or changed): what was private may be served now.
+pub fn forget_refusals() {
+    if let Ok(mut g) = REFUSED.lock() {
+        *g = None;
+    }
+}
+
+/// Notes a refusal and gives the error back as text.
+fn download_error(id: u64, error: AssetDownloadError) -> String {
+    if let AssetDownloadError::Refused(_) = &error {
+        note_refused(id, &error.to_string());
+    }
+    error.to_string()
+}
+
+// ------------------------------------------------------- shared downloads
+
+/// One download per asset at a time: a second asker for the same asset
+/// (a preload and the first play of an animation; the server's and the
+/// client's preloads of one list; a part's texture asked by the scene while
+/// a script preloads it) waits for the first's bytes instead of asking
+/// delivery again.
+static INFLIGHT: LazyLock<Mutex<HashMap<AssetRef, Arc<Inflight>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct Inflight {
+    done: Mutex<Option<Result<Arc<Vec<u8>>, String>>>,
+    changed: Condvar,
+}
+
+/// Runs `download` (which also writes the cache file) unless another
+/// thread is already downloading `a`, in which case its result is shared.
+fn download_shared(a: AssetRef, download: impl FnOnce() -> Result<Vec<u8>, String>) -> Result<Arc<Vec<u8>>, String> {
+    let (slot, first) = {
+        let mut m = INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get(&a) {
+            Some(slot) => (slot.clone(), false),
+            None => {
+                let slot = Arc::new(Inflight::default());
+                m.insert(a, slot.clone());
+                (slot, true)
+            }
+        }
+    };
+    if !first {
+        let mut done = slot.done.lock().unwrap_or_else(|e| e.into_inner());
+        while done.is_none() {
+            done = slot.changed.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        return done.clone().unwrap();
+    }
+    // Publishes on every exit, a panic in `download` included: nobody
+    // waits forever on a download that never finished.
+    struct Publish(AssetRef, Arc<Inflight>);
+    impl Drop for Publish {
+        fn drop(&mut self) {
+            let mut done = self.1.done.lock().unwrap_or_else(|e| e.into_inner());
+            if done.is_none() {
+                *done = Some(Err("download did not finish".into()));
+            }
+            drop(done);
+            self.1.changed.notify_all();
+            if let Ok(mut m) = INFLIGHT.lock() {
+                m.remove(&self.0);
+            }
+        }
+    }
+    let publish = Publish(a, slot.clone());
+    let result = download().map(Arc::new);
+    *slot.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+    drop(publish);
+    result
+}
+
+/// How soon a download is wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Something waits for it: a part on screen, a sound told to play, an
+    /// animation a track was made for.
+    Needed,
+    /// ContentProvider:PreloadAsync, warming the cache: after everything
+    /// needed, and never on more than a few of the download slots.
+    Preload,
+}
+
+/// Preloads downloading at once, out of [`MAX_ASSET_DOWNLOADS`]: the rest
+/// of the slots stay free for what is needed now.
+pub const MAX_PRELOAD_DOWNLOADS: usize = 4;
+
+struct Scheduler {
+    state: Mutex<Queues>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Queues {
+    needed: std::collections::VecDeque<DownloadJob>,
+    preload: std::collections::VecDeque<DownloadJob>,
+    preload_active: usize,
+}
+
+impl Scheduler {
+    fn push(&self, priority: Priority, job: DownloadJob) {
+        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match priority {
+            Priority::Needed => q.needed.push_back(job),
+            Priority::Preload => q.preload.push_back(job),
+        }
+        drop(q);
+        self.changed.notify_one();
+    }
+
+    /// The next job: a needed one, else a preload while fewer than
+    /// [`MAX_PRELOAD_DOWNLOADS`] run.
+    fn next(&self) -> (DownloadJob, Priority) {
+        let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = q.needed.pop_front() {
+                return (job, Priority::Needed);
+            }
+            if q.preload_active < MAX_PRELOAD_DOWNLOADS {
+                if let Some(job) = q.preload.pop_front() {
+                    q.preload_active += 1;
+                    return (job, Priority::Preload);
+                }
+            }
+            q = self.changed.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finished(&self, priority: Priority) {
+        if priority == Priority::Preload {
+            let mut q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            q.preload_active -= 1;
+            drop(q);
+            self.changed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> (usize, usize) {
+        let q = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (q.needed.len(), q.preload.len())
+    }
+}
+
+/// Queues a download job for the asset workers.
+pub fn schedule(priority: Priority, job: impl FnOnce() + Send + 'static) {
+    LazyLock::force(&ASSET_WORKERS);
+    SCHEDULER.push(priority, Box::new(job));
+}
+
+static SCHEDULER: LazyLock<Scheduler> = LazyLock::new(|| Scheduler {
+    state: Mutex::new(Queues::default()),
+    changed: Condvar::new(),
+});
+
+/// How long ContentProvider:PreloadAsync waits for its list, in seconds
+/// (RUSTUDIO_PRELOAD_DEADLINE overrides; domains/assets_cloud.rs). Roblox
+/// waits for each asset to arrive or time out; a place that preloads 2000
+/// assets from the server script that then starts its game would wait
+/// minutes on a slow link. What is still queued at the deadline is
+/// reported TimedOut and goes on downloading.
+pub fn preload_deadline() -> f64 {
+    std::env::var("RUSTUDIO_PRELOAD_DEADLINE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(20.0)
+}
+
+/// A download held open (tests): every asker of `a` waits on it until
+/// [`DownloadHold::release`] hands them the bytes, as a slow link would.
+#[doc(hidden)]
+pub struct DownloadHold(AssetRef, Arc<Inflight>);
+
+#[doc(hidden)]
+pub fn hold_download(a: AssetRef) -> DownloadHold {
+    let slot = Arc::new(Inflight::default());
+    INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()).insert(a, slot.clone());
+    DownloadHold(a, slot)
+}
+
+impl DownloadHold {
+    pub fn release(self, result: Result<Vec<u8>, String>) {
+        *self.1.done.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.map(Arc::new));
+        self.1.changed.notify_all();
+        if let Ok(mut m) = INFLIGHT.lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+/// ContentProvider:PreloadAsync's fetch of one content id, after what the
+/// scene and the scripts need now; `done` gets true once the bytes are
+/// cached (false: can't be had). One queued download serves every asker
+/// of the same id (the server's preload, then the client's).
+pub fn preload_content(id: &str, done: Arc<Mutex<Option<bool>>>) {
+    static WAITERS: Mutex<Option<HashMap<String, Vec<Arc<Mutex<Option<bool>>>>>>> = Mutex::new(None);
+    let key = content_key(id);
+    {
+        let mut g = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(HashMap::new);
+        if let Some(list) = map.get_mut(&key) {
+            list.push(done);
+            return;
+        }
+        map.insert(key.clone(), vec![done]);
+    }
+    let id = id.to_string();
+    schedule(Priority::Preload, move || {
+        let ok = script_content_blocking(&id).is_ok();
+        let waiters = WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|m| m.remove(&key))
+            .unwrap_or_default();
+        for w in waiters {
+            *w.lock().unwrap_or_else(|e| e.into_inner()) = Some(ok);
+        }
+    });
 }
 
 /// Waits (up to `max`) for a session check that is still running, so a
@@ -484,22 +829,35 @@ fn fetch_cached(id: u64, local: bool) -> Result<Arc<Vec<u8>>, String> {
     if let Some(b) = local.then(|| ledger_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
         return Ok(Arc::new(b));
     }
-    let fetched = download_asset_bytes(id);
-    let b = match fetched {
-        Ok(b) => b,
+    let fetched = match refused(id) {
+        Some(why) => Err(why),
+        None => download_shared(a, || {
+            if let Ok(b) = std::fs::read(cache_path(a)) {
+                return Ok(b);
+            }
+            let b = download_asset_bytes(id)?;
+            write_cache(a, &b);
+            Ok(b)
+        }),
+    };
+    match fetched {
+        Ok(b) => Ok(b),
         Err(e) => {
             if let Some(b) = local.then(|| local_store_path(id).and_then(|p| std::fs::read(p).ok())).flatten() {
                 return Ok(Arc::new(b));
             }
-            return Err(e);
+            Err(e)
         }
-    };
+    }
+}
+
+/// Saves downloaded bytes under the asset's cache path.
+fn write_cache(a: AssetRef, bytes: &[u8]) {
     let path = cache_path(a);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, &b);
-    Ok(Arc::new(b))
+    let _ = std::fs::write(&path, bytes);
 }
 
 const MAX_ASSET_DOWNLOADS: usize = 12;
@@ -528,25 +886,20 @@ fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration> {
 type DownloadResult = Result<Vec<u8>, AssetDownloadError>;
 type DownloadJob = Box<dyn FnOnce() + Send>;
 
-// Only queued jobs use these workers. Blocking callers use the same
-// download permits directly, including when waiting out a shared pause.
-static ASSET_WORKERS: LazyLock<Sender<DownloadJob>> = LazyLock::new(|| {
-    let (send, receive) = channel::<DownloadJob>();
-    let receive = Arc::new(Mutex::new(receive));
+// Only queued jobs (`schedule`) use these workers; they take needed
+// downloads before preloads. Blocking callers use the same download
+// permits directly, including when waiting out a shared pause.
+static ASSET_WORKERS: LazyLock<()> = LazyLock::new(|| {
     for i in 0..MAX_ASSET_DOWNLOADS {
-        let receive = receive.clone();
         let _ = std::thread::Builder::new().name(format!("asset-download-{i}")).spawn(move || loop {
-            let job = receive.lock().unwrap().recv();
-            match job {
-                Ok(job) => {
-                    let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
-                    job()
-                }
-                Err(_) => break,
+            let (job, priority) = SCHEDULER.next();
+            {
+                let _p = crate::profiler::scope("asset_download", crate::profiler::Cat::Assets);
+                job();
             }
+            SCHEDULER.finished(priority);
         });
     }
-    send
 });
 
 static ASSET_DOWNLOADS: LazyLock<AssetDownloads> =
@@ -649,16 +1002,25 @@ impl AssetDownloads {
         version: Option<u64>,
         account: Option<impl FnMut() -> DownloadResult>,
         public: impl FnMut() -> DownloadResult,
-    ) -> Result<Vec<u8>, String> {
+    ) -> DownloadResult {
         match account.map(|download| self.retry(download)) {
             Some(Ok(bytes)) => Ok(bytes),
-            Some(Err(error @ AssetDownloadError::Transient { .. })) => Err(error.to_string()),
-            Some(Err(error)) if version.is_some() => Err(error.to_string()),
-            Some(Err(error)) => self
-                .retry(public)
-                .map_err(|public| format!("{error}; {public}")),
-            None if version.is_some() => Err("sign in (Account) to download asset versions".into()),
-            None => self.retry(public).map_err(|error| error.to_string()),
+            Some(Err(error @ AssetDownloadError::Transient { .. })) => Err(error),
+            Some(Err(error)) if version.is_some() => Err(error),
+            Some(Err(error)) => self.retry(public).map_err(|public| {
+                let both = rustudio_account::Error::new(format!("{error}; {public}"));
+                match public {
+                    AssetDownloadError::Transient { status, retry_after, .. } => {
+                        AssetDownloadError::Transient { status, retry_after, error: both }
+                    }
+                    AssetDownloadError::Refused(_) => AssetDownloadError::Refused(both),
+                    AssetDownloadError::Other(_) => AssetDownloadError::Other(both),
+                }
+            }),
+            None if version.is_some() => Err(AssetDownloadError::Other(rustudio_account::Error::new(
+                "sign in (Account) to download asset versions",
+            ))),
+            None => self.retry(public),
         }
     }
 }
@@ -680,25 +1042,26 @@ fn download_asset_bytes(id: u64) -> Result<Vec<u8>, String> {
         }
     } else {
         match public() {
-            Err(AssetDownloadError::Other(error)) => {
-                let c = wait_for_session(Duration::from_secs(30))
+            Err(error @ (AssetDownloadError::Refused(_) | AssetDownloadError::Other(_))) => {
+                let session = wait_for_session(Duration::from_secs(30))
                     .then(session_client)
-                    .flatten()
-                    .ok_or_else(|| error.to_string())?;
+                    .flatten();
+                let Some(c) = session else {
+                    return Err(download_error(id, error));
+                };
                 let d = {
                     let guard = c.lock().map_err(|_| "account busy".to_string())?;
-                    guard
-                        .as_ref()
-                        .ok_or_else(|| error.to_string())?
-                        .session
-                        .downloader()
+                    match guard.as_ref() {
+                        Some(c) => c.session.downloader(),
+                        None => return Err(download_error(id, error)),
+                    }
                 };
                 ASSET_DOWNLOADS.retry(|| d.download_asset_typed(id, None))
             }
             result => result,
         }
     };
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| download_error(id, error))
 }
 
 /// Any content id's bytes, blocking (background threads): generated
@@ -897,11 +1260,133 @@ fn public_prefetch_inner(id: u64) -> Fetch {
         };
     }
     map.insert(id, None);
-    std::thread::spawn(move || {
+    drop(g);
+    // On the asset workers, ahead of preloads (a track was made for this
+    // clip, a sound was told to play): a thread per id made a client
+    // warming 1400 animations spawn 1400 threads.
+    schedule(Priority::Needed, move || {
         let r = public_cached(id).map(|_| ());
         content_track(&format!("rbxassetid://{id}"),if r.is_ok(){2}else{3});
         if let Ok(mut g) = STATES.lock() {
             g.get_or_insert_with(HashMap::new).insert(id, Some(r));
+        }
+    });
+    Fetch::Pending
+}
+
+/// Fetches a `rbxthumb://type=...&id=...&w=...&h=...` image via Roblox's
+/// public thumbnails v1 API, cached in memory and under `cache_dir()/thumbs/`.
+fn fetch_rbxthumb(uri: &str) -> Fetch {
+    type States = HashMap<String, Option<Result<Arc<Vec<u8>>, String>>>;
+    static STATES: Mutex<Option<States>> = Mutex::new(None);
+    let Some(rest) = uri.strip_prefix("rbxthumb://") else {
+        return Fetch::Unavailable("not an rbxthumb uri".into());
+    };
+    let (mut kind, mut id, mut w, mut h) = ("", 0u64, 150u32, 150u32);
+    for pair in rest.split('&') {
+        let Some((k, v)) = pair.split_once('=') else { continue };
+        match k {
+            "type" => kind = v,
+            "id" => id = v.parse().unwrap_or(0),
+            "w" => w = v.parse().unwrap_or(150),
+            "h" => h = v.parse().unwrap_or(150),
+            _ => {}
+        }
+    }
+    if id == 0 || kind.is_empty() {
+        return Fetch::Unavailable(format!("invalid rbxthumb id ({kind}:{id})"));
+    }
+    // Snap to standard Roblox thumbnail square sizes so the API never returns 400.
+    let valid: &[u32] = match kind {
+        "AvatarHeadShot" | "AvatarBust" => &[48, 60, 75, 100, 110, 150, 180, 352, 420, 720],
+        "Avatar" | "Outfit" => &[30, 48, 60, 75, 100, 110, 140, 150, 180, 250, 352, 420, 720],
+        _ => &[50, 150, 256, 420, 512],
+    };
+    let req_sz = w.max(h);
+    let sz = *valid
+        .iter()
+        .find(|&&v| v >= req_sz)
+        .unwrap_or(valid.last().unwrap_or(&150));
+    let key = format!("{kind}_{id}_{sz}x{sz}");
+    let mut g = STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    match map.get(&key) {
+        Some(Some(Ok(b))) => return Fetch::Ready(b.clone()),
+        Some(Some(Err(e))) => return Fetch::Unavailable(e.clone()),
+        Some(None) => return Fetch::Pending,
+        None => {}
+    }
+    let disk = cache_dir().join("thumbs").join(format!("{key}.png"));
+    if let Ok(b) = std::fs::read(&disk) {
+        if !b.is_empty() {
+            let b = Arc::new(b);
+            map.insert(key, Some(Ok(b.clone())));
+            return Fetch::Ready(b);
+        }
+    }
+    let api_url = match kind {
+        "AvatarHeadShot" => format!(
+            "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "AvatarBust" => format!(
+            "https://thumbnails.roblox.com/v1/users/avatar-bust?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "Avatar" => format!(
+            "https://thumbnails.roblox.com/v1/users/avatar?userIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "Asset" => format!(
+            "https://thumbnails.roblox.com/v1/assets?assetIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "GameIcon" => format!(
+            "https://thumbnails.roblox.com/v1/games/icons?universeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "BadgeIcon" => format!(
+            "https://thumbnails.roblox.com/v1/badges/icons?badgeIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "GroupIcon" => format!(
+            "https://thumbnails.roblox.com/v1/groups/icons?groupIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        "Outfit" => format!(
+            "https://thumbnails.roblox.com/v1/users/outfits?userOutfitIds={id}&size={sz}x{sz}&format=Png&isCircular=false"
+        ),
+        _ => return Fetch::Unavailable(format!("unsupported rbxthumb type '{kind}'")),
+    };
+    map.insert(key.clone(), None);
+    std::thread::spawn(move || {
+        let r = (|| -> Result<Arc<Vec<u8>>, String> {
+            let agent = rustudio_account::api::agent();
+            let mut resp = agent.get(&api_url).call().map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status().as_u16()));
+            }
+            let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let img_url = v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("imageUrl"))
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| "thumbnail not ready".to_string())?;
+            let mut img_resp = agent.get(img_url).call().map_err(|e| e.to_string())?;
+            if !img_resp.status().is_success() {
+                return Err(format!("image HTTP {}", img_resp.status().as_u16()));
+            }
+            let bytes = img_resp
+                .body_mut()
+                .with_config()
+                .limit(8 * 1024 * 1024)
+                .read_to_vec()
+                .map_err(|e| e.to_string())?;
+            if let Some(parent) = disk.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&disk, &bytes);
+            Ok(Arc::new(bytes))
+        })();
+        if let Ok(mut g) = STATES.lock() {
+            g.get_or_insert_with(HashMap::new).insert(key, Some(r));
         }
     });
     Fetch::Pending
@@ -979,6 +1464,7 @@ impl AssetStore {
         self.client = client;
         if !had && self.client.is_some() {
             // Retry what failed only because nobody was signed in.
+            forget_refusals();
             self.deferred.extend(self.failed.drain().map(|(a, _)| a));
             self.auth_told = false;
         }
@@ -1019,6 +1505,12 @@ impl AssetStore {
         if let Some(why) = self.failed.get(&a) {
             return Fetch::Unavailable(why.clone());
         }
+        if a.version.is_none() {
+            if let Some(why) = refused(a.id) {
+                self.failed.insert(a, why.clone());
+                return Fetch::Unavailable(why);
+            }
+        }
         // The session check is still running: wait for it rather than
         // fail anonymously (most assets need the session).
         if self.client.is_none() && CHECKING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1033,34 +1525,40 @@ impl AssetStore {
         let client = self.client.clone().or_else(session_client);
         self.pending.insert(a);
         let tx = self.tx.clone();
-        ASSET_WORKERS
-            .send(Box::new(move || {
-                let result = (|| -> Result<(), String> {
-                    // Copy the session out so downloads run side by side.
-                    let downloader = client
-                        .and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()));
-                    let bytes = ASSET_DOWNLOADS.editor_download(
+        schedule(Priority::Needed, move || {
+            let result = download_shared(a, || {
+                // (a preload may have cached it while this job queued)
+                if let Ok(bytes) = std::fs::read(cache_path(a)) {
+                    return Ok(bytes);
+                }
+                // Copy the session out so downloads run side by side.
+                let downloader =
+                    client.and_then(|client| Some(client.lock().ok()?.as_ref()?.session.downloader()));
+                let bytes = ASSET_DOWNLOADS
+                    .editor_download(
                         a.version,
                         downloader.map(|d| move || d.download_asset_typed(a.id, a.version)),
                         || public_asset_typed(a.id),
-                    )?;
-                    let path = cache_path(a);
-                    if let Some(dir) = path.parent() {
-                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                    }
-                    std::fs::write(&path, bytes).map_err(|e| e.to_string())
-                })();
-                content_track(
-                    &format!(
-                        "rbxassetid://{}{}",
-                        a.id,
-                        a.version.map(|v| format!("?version={v}")).unwrap_or_default()
-                    ),
-                    if result.is_ok() { 2 } else { 3 },
-                );
-                let _ = tx.send((a, result));
-            }))
-            .expect("asset workers stopped");
+                    )
+                    .map_err(|error| download_error(a.id, error))?;
+                let path = cache_path(a);
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+                Ok(bytes)
+            })
+            .map(|_| ());
+            content_track(
+                &format!(
+                    "rbxassetid://{}{}",
+                    a.id,
+                    a.version.map(|v| format!("?version={v}")).unwrap_or_default()
+                ),
+                if result.is_ok() { 2 } else { 3 },
+            );
+            let _ = tx.send((a, result));
+        });
         Fetch::Pending
     }
 
@@ -1171,6 +1669,9 @@ impl AssetStore {
         if let Some(b) = generated(id) {
             return Fetch::Ready(b);
         }
+        if id.starts_with("rbxthumb://") {
+            return fetch_rbxthumb(id);
+        }
         if let Some(a) = asset_ref(id) {
             return self.fetch(a);
         }
@@ -1241,6 +1742,8 @@ pub struct MeshCache {
     /// SolidMesh union stores none (its UV array is empty in all 5658 of
     /// a game's solid mesh holders), so there are none to keep.
     uvless: std::collections::HashSet<String>,
+    /// Loaded ids whose mesh file contains skinning data (bones & weights).
+    skinned: std::collections::HashSet<String>,
     /// Messages for the Output panel (one per new failure).
     pub messages: Vec<String>,
 }
@@ -1342,14 +1845,20 @@ impl MeshCache {
             }
             Fetch::Ready(bytes) => match mesh::parse_with_lods(&bytes)
                 .or_else(|_| mesh::parse(&bytes).map(|mesh| (mesh, mesh::MeshLods::default())))
-                .and_then(|(mesh, lods)| normalize_mesh(mesh).map(|geometry| (geometry, lods))) {
-                Ok(((pos, nrm, uv, extent, mut colors, planes, center), lods)) => {
+                .and_then(|(mesh, lods)| {
+                    let is_skinned = mesh.skin.is_some();
+                    normalize_mesh(mesh).map(|geometry| (geometry, lods, is_skinned))
+                }) {
+                Ok(((pos, nrm, uv, extent, mut colors, planes, center), lods, is_skinned)) => {
                     // A union with UsePartColor: its own Color, not its children's.
                     if id.ends_with("#partcolor") {
                         colors.clear();
                     }
                     if uv.iter().all(|t| *t == Vec2::ZERO) {
                         self.uvless.insert(id.to_string());
+                    }
+                    if is_skinned {
+                        self.skinned.insert(id.to_string());
                     }
                     Some(LoadedMesh {
                         index: upload(&pos, &nrm, &uv, &colors, &planes, &lods),
@@ -1393,6 +1902,11 @@ impl MeshCache {
     /// Whether `id`'s loaded mesh has UVs of its own (not all at 0,0).
     pub fn authored_uvs(&self, id: &str) -> bool {
         !self.uvless.contains(id)
+    }
+
+    /// Whether `id`'s loaded mesh file contains skinning data (bones & weights).
+    pub fn has_skin(&self, id: &str) -> bool {
+        self.skinned.contains(id)
     }
 
     /// Meshes asked for so far (loaded or failed).
@@ -1477,14 +1991,14 @@ pub struct LoadedTexture {
 }
 
 /// Released pixels kept around for the next composite that shares them.
-const LOOSE_PIXELS_BYTES: usize = 64 << 20;
+const LOOSE_PIXELS_BYTES: usize = 192 << 20;
 
 #[derive(Default)]
 pub struct TextureCache {
     entries: HashMap<String, Option<LoadedTexture>>,
     /// Why an entry is None (fetch or decode error).
     reasons: HashMap<String, String>,
-    /// Composites (clothing): key → GPU index.
+    /// Composites (clothing / SurfaceAppearance): key → GPU index.
     composites: HashMap<String, u32>,
     pub messages: Vec<String>,
     /// Decodes running on worker threads, and finished ones not yet uploaded.
@@ -1506,11 +2020,13 @@ pub struct TextureCache {
     editable_gens: HashMap<String, u64>,
     editable_composites: HashMap<String, (String, u32)>,
     /// Decoded pixels still wanted after their upload: of ids a composite is
-    /// about to be made from (`pinned`), and released ones up to
-    /// LOOSE_PIXELS_BYTES, oldest dropped first (`loose`).
+    /// about to be made from (`pinned`), and released ones kept while recently
+    /// wanted or under LOOSE_PIXELS_BYTES (`loose`).
     pixels: HashMap<String, Arc<Rgba>>,
     pinned: std::collections::HashSet<String>,
+    last_wanted: HashMap<String, u64>,
     loose: std::collections::VecDeque<String>,
+    loose_set: std::collections::HashSet<String>,
     loose_bytes: usize,
 }
 
@@ -1565,7 +2081,7 @@ impl TextureCache {
             None => match store.content(id, doc_dir) {
                 Fetch::Pending => return None,
                 Fetch::Unavailable(why) => {
-                    if asset_ref(id).is_none() {
+                    if asset_ref(id).is_none() && !id.starts_with("rbxthumb://") {
                         self.messages
                             .push(format!("Texture {id} not loaded ({why})"));
                     }
@@ -1627,6 +2143,56 @@ impl TextureCache {
         if !self.pinned.contains(id) {
             self.pinned.insert(id.to_string());
         }
+        if let Some(f) = self.last_wanted.get_mut(id) {
+            *f = self.decode_frame;
+        } else {
+            self.last_wanted.insert(id.to_string(), self.decode_frame);
+        }
+    }
+
+    fn queue_loose(&mut self, id: &str) {
+        if self.loose_set.contains(id) {
+            return;
+        }
+        if let Some(px) = self.pixels.get(id) {
+            self.loose_bytes += px.pixels.len();
+            self.loose_set.insert(id.to_string());
+            self.loose.push_back(id.to_string());
+        }
+    }
+
+    fn evict_loose(&mut self) {
+        let mut checked = 0;
+        let max_checks = self.loose.len();
+        while checked < max_checks {
+            let Some(id) = self.loose.pop_front() else {
+                self.loose_bytes = 0;
+                break;
+            };
+            checked += 1;
+            let age = self
+                .last_wanted
+                .get(&id)
+                .map_or(u64::MAX, |f| self.decode_frame.saturating_sub(*f));
+            // Keep shared composite inputs alive for a few frames so other
+            // waiting parts don't thrash re-decoding them when one part finishes.
+            if self.pinned.contains(&id) || age <= 4 {
+                self.loose.push_back(id);
+                continue;
+            }
+            if self.loose_bytes <= LOOSE_PIXELS_BYTES && age <= 12 {
+                self.loose.push_back(id);
+                continue;
+            }
+            self.loose_set.remove(&id);
+            if let Some(px) = self.pixels.remove(&id) {
+                self.loose_bytes = self.loose_bytes.saturating_sub(px.pixels.len());
+            }
+            self.last_wanted.remove(&id);
+        }
+        if self.loose.is_empty() {
+            self.loose_bytes = 0;
+        }
     }
 
     /// The composite is made: the pixels wait a while for another one that
@@ -1634,22 +2200,96 @@ impl TextureCache {
     pub fn release_pixels<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
         for id in ids {
             if self.pinned.remove(id) {
-                if let Some(px) = self.pixels.get(id) {
-                    self.loose_bytes += px.pixels.len();
-                    self.loose.push_back(id.to_string());
-                }
+                self.queue_loose(id);
             }
         }
-        while self.loose_bytes > LOOSE_PIXELS_BYTES {
-            let Some(id) = self.loose.pop_front() else {
-                self.loose_bytes = 0;
-                break;
-            };
-            let Some(px) = self.pixels.get(&id) else { continue };
-            self.loose_bytes = self.loose_bytes.saturating_sub(px.pixels.len());
-            // (pinned again since, or queued twice: the later entry decides)
-            if !self.pinned.contains(&id) && !self.loose.contains(&id) {
-                self.pixels.remove(&id);
+        if self.loose_bytes > LOOSE_PIXELS_BYTES {
+            self.evict_loose();
+        }
+    }
+
+    /// True when this frame has already spent its texture upload budget (used to
+    /// spread SurfaceAppearance composite uploads across frames).
+    pub fn over_upload_budget(&self) -> bool {
+        (self.upload_ms > UPLOAD_BUDGET_MS || self.upload_bytes >= upload_budget_bytes())
+            && !sync_decode()
+    }
+
+    /// Mark that a composite upload was deferred to the next frame by the upload budget.
+    pub fn defer_upload(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Account for a composite's GPU upload against this frame's upload budget.
+    pub fn record_upload(&mut self, bytes: usize, ms: f32) {
+        self.upload_bytes += bytes;
+        self.upload_ms += ms;
+    }
+
+    /// Fetch and decode an image's CPU pixels without uploading a standalone GPU
+    /// texture (for SurfaceAppearance / emissive composite inputs). Uses the same
+    /// async decode pool and failure tracking as `image()`.
+    pub fn fetch_pixels(
+        &mut self,
+        id: &str,
+        doc_dir: Option<&Path>,
+        store: &mut AssetStore,
+    ) -> Option<Arc<Rgba>> {
+        if id.starts_with("rbxtemp://rustudio/editable/") {
+            return crate::editable_source::image_pixels(id).map(|(_, img)| Arc::new(img));
+        }
+        if !store.allows(id) || self.failed(id) {
+            return None;
+        }
+        if let Some(px) = self.pixels.get(id) {
+            if let Some(f) = self.last_wanted.get_mut(id) {
+                *f = self.decode_frame;
+            }
+            return Some(px.clone());
+        }
+        if self.decoding.contains(id) {
+            return None;
+        }
+        let decoded = match self.decoded.remove(id) {
+            Some((d, _)) => d,
+            None => match store.content(id, doc_dir) {
+                Fetch::Pending => return None,
+                Fetch::Unavailable(why) => {
+                    if asset_ref(id).is_none() {
+                        self.messages.push(format!("Texture {id} not loaded ({why})"));
+                    }
+                    self.reasons.insert(id.to_string(), format!("not fetched: {why}"));
+                    self.entries.insert(id.to_string(), None);
+                    return None;
+                }
+                Fetch::Ready(bytes) if bytes.len() <= 16 * 1024 || sync_decode() => {
+                    texture::decode(&bytes).map(|i| (i, None, None))
+                }
+                Fetch::Ready(bytes) => {
+                    let (tx, _) = self.decode_chan.get_or_insert_with(std::sync::mpsc::channel);
+                    texture::decode_async(bytes, tx.clone(), id.to_string());
+                    self.decoding.insert(id.to_string());
+                    return None;
+                }
+            },
+        };
+        match decoded {
+            Ok((img, _mips, _waiting)) => {
+                let px = Arc::new(img);
+                self.pixels.insert(id.to_string(), px.clone());
+                if !self.pinned.contains(id) {
+                    self.queue_loose(id);
+                    if self.loose_bytes > LOOSE_PIXELS_BYTES {
+                        self.evict_loose();
+                    }
+                }
+                Some(px)
+            }
+            Err(e) => {
+                self.messages.push(format!("Texture {id} not loaded: {e}"));
+                self.reasons.insert(id.to_string(), format!("not decoded: {e}"));
+                self.entries.insert(id.to_string(), None);
+                None
             }
         }
     }
@@ -1667,9 +2307,10 @@ impl TextureCache {
         let px = Arc::new(texture::decode(&bytes).ok()?);
         self.pixels.insert(id.to_string(), px.clone());
         if !self.pinned.contains(id) {
-            self.loose_bytes += px.pixels.len();
-            self.loose.push_back(id.to_string());
-            self.release_pixels([]);
+            self.queue_loose(id);
+            if self.loose_bytes > LOOSE_PIXELS_BYTES {
+                self.evict_loose();
+            }
         }
         Some(px)
     }
@@ -1678,6 +2319,9 @@ impl TextureCache {
     /// caller bumps its asset generation so waiting parts are redone).
     pub fn poll_decoded(&mut self) -> bool {
         self.decode_frame += 1;
+        if !self.loose.is_empty() {
+            self.evict_loose();
+        }
         // Completed results for parts that left the scene must release their
         // Waiting tokens. Otherwise they permanently consume the worker budget.
         // Give arrivals several render passes to be requested; upload-budget
@@ -1775,7 +2419,9 @@ impl TextureCache {
         self.entries
             .retain(|id, _| asset_ref(id).is_none_or(|a| !done.contains(&a)));
         if !done.is_empty() {
-            self.composites.clear();
+            let done_ids: Vec<String> = done.iter().map(|a| a.id.to_string()).collect();
+            self.composites
+                .retain(|k, _| !done_ids.iter().any(|id| k.contains(id.as_str())));
         }
     }
 }
@@ -2435,7 +3081,7 @@ mod tests {
                     || panic!("transient failure must not use public delivery"),
                 )
                 .unwrap_err();
-            assert_eq!(error, format!("HTTP {status}"));
+            assert_eq!(error.to_string(), format!("HTTP {status}"));
             assert_eq!(tries, ASSET_BACKOFF.len() + 1);
         }
     }
@@ -2455,9 +3101,196 @@ mod tests {
                 .editor_download(Some(3), Some(auth), || panic!(
                     "versioned asset used public delivery"
                 ))
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
             "Authentication required"
         );
+    }
+
+    #[test]
+    fn needed_downloads_go_before_preloads_which_keep_slots_free() {
+        let scheduler = Scheduler {
+            state: Mutex::new(Queues::default()),
+            changed: Condvar::new(),
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let note = |what: &'static str| {
+            let order = order.clone();
+            Box::new(move || order.lock().unwrap().push(what)) as DownloadJob
+        };
+        for _ in 0..MAX_PRELOAD_DOWNLOADS + 1 {
+            scheduler.push(Priority::Preload, note("preload"));
+        }
+        scheduler.push(Priority::Needed, note("needed"));
+        assert_eq!(scheduler.queued(), (1, MAX_PRELOAD_DOWNLOADS + 1));
+        let (job, priority) = scheduler.next();
+        assert_eq!(priority, Priority::Needed);
+        job();
+        assert_eq!(*order.lock().unwrap(), ["needed"]);
+        // Preloads take at most MAX_PRELOAD_DOWNLOADS slots while running.
+        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+            let (job, priority) = scheduler.next();
+            assert_eq!(priority, Priority::Preload);
+            job();
+        }
+        std::thread::scope(|scope| {
+            let (send, receive) = channel();
+            let scheduler = &scheduler;
+            scope.spawn(move || {
+                let (job, priority) = scheduler.next();
+                job();
+                send.send(priority).unwrap();
+            });
+            assert!(
+                receive.recv_timeout(Duration::from_millis(200)).is_err(),
+                "a fifth preload started while four were running"
+            );
+            // A needed download still goes through at once.
+            scheduler.push(Priority::Needed, note("needed-late"));
+            let (job, priority) = scheduler.next();
+            assert_eq!(priority, Priority::Needed);
+            job();
+            scheduler.finished(Priority::Preload);
+            assert_eq!(receive.recv_timeout(Duration::from_secs(5)).unwrap(), Priority::Preload);
+        });
+        assert_eq!(order.lock().unwrap().len(), MAX_PRELOAD_DOWNLOADS + 3);
+    }
+
+    /// Until a second asker holds the in-flight slot (the map's, the
+    /// downloader's and its publisher's references, plus one).
+    fn wait_for_waiter(a: AssetRef) {
+        let t0 = Instant::now();
+        loop {
+            let waiting = INFLIGHT.lock().unwrap().get(&a).map(Arc::strong_count).unwrap_or(0) >= 4;
+            if waiting || t0.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn one_download_serves_every_asker_of_an_asset() {
+        let a = AssetRef { id: 7_000_000_001, version: Some(1) };
+        let downloads = std::sync::atomic::AtomicUsize::new(0);
+        let gate = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                download_shared(a, || {
+                    downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+                    Ok(vec![1, 2, 3])
+                })
+            });
+            // The second asker arrives while the first downloads.
+            while !INFLIGHT.lock().unwrap().contains_key(&a) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let second = scope.spawn(|| download_shared(a, || panic!("downloaded twice")));
+            wait_for_waiter(a);
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            assert_eq!(*first.join().unwrap().unwrap(), vec![1, 2, 3]);
+            assert_eq!(*second.join().unwrap().unwrap(), vec![1, 2, 3]);
+        });
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!INFLIGHT.lock().unwrap().contains_key(&a));
+        // A download that panics still answers its waiters.
+        let b = AssetRef { id: 7_000_000_002, version: Some(1) };
+        let gate = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                std::panic::catch_unwind(|| {
+                    download_shared(b, || {
+                        let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+                        panic!("boom")
+                    })
+                })
+                .unwrap_err()
+            });
+            while !INFLIGHT.lock().unwrap().contains_key(&b) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let second = scope.spawn(|| download_shared(b, || Ok(vec![])));
+            wait_for_waiter(b);
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            first.join().unwrap();
+            assert_eq!(second.join().unwrap().unwrap_err(), "download did not finish");
+        });
+    }
+
+    #[test]
+    fn refusals_are_remembered_until_a_session_arrives() {
+        let id = 7_000_000_003;
+        assert_eq!(refused(id), None);
+        let refusal = AssetDownloadError::Refused(rustudio_account::Error::new(
+            "asset 7000000003: public asset delivery: Authentication required to access Asset.",
+        ));
+        assert_eq!(
+            download_error(id, refusal),
+            "asset 7000000003: public asset delivery: Authentication required to access Asset."
+        );
+        assert!(refused(id).is_some());
+        // Other failures (the link was down) are asked again.
+        download_error(7_000_000_004, AssetDownloadError::Other(rustudio_account::Error::new("io")));
+        assert_eq!(refused(7_000_000_004), None);
+        download_error(7_000_000_005, transient(429, None));
+        assert_eq!(refused(7_000_000_005), None);
+        forget_refusals();
+        assert_eq!(refused(id), None);
+    }
+
+    #[test]
+    fn preloads_wait_while_the_preload_slots_are_busy() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..MAX_PRELOAD_DOWNLOADS {
+            let gate = gate.clone();
+            schedule(Priority::Preload, move || {
+                let _open = gate.1.wait_while(gate.0.lock().unwrap(), |open| !*open).unwrap();
+            });
+        }
+        let id = "rbxtemp://rustudio/preload-slots-test";
+        register_generated(id, vec![1]);
+        let done = Arc::new(Mutex::new(None));
+        preload_content(id, done.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(*done.lock().unwrap(), None, "a preload ran on a busy slot: {:?}", SCHEDULER.queued());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let t0 = Instant::now();
+        while done.lock().unwrap().is_none() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*done.lock().unwrap(), Some(true));
+        unregister_generated(id);
+    }
+
+    #[test]
+    fn preload_content_answers_every_asker_through_the_workers() {
+        let id = "rbxtemp://rustudio/preload-content-test";
+        register_generated(id, vec![9; 16]);
+        let first = Arc::new(Mutex::new(None));
+        let second = Arc::new(Mutex::new(None));
+        preload_content(id, first.clone());
+        preload_content(id, second.clone());
+        let t0 = Instant::now();
+        while (first.lock().unwrap().is_none() || second.lock().unwrap().is_none())
+            && t0.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*first.lock().unwrap(), Some(true));
+        assert_eq!(*second.lock().unwrap(), Some(true));
+        assert_eq!(content_fetch_status(id), 2);
+        unregister_generated(id);
+        let missing = Arc::new(Mutex::new(None));
+        preload_content("rbxtemp://rustudio/preload-content-missing", missing.clone());
+        let t0 = Instant::now();
+        while missing.lock().unwrap().is_none() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*missing.lock().unwrap(), Some(false));
     }
 
     #[test]
@@ -2605,6 +3438,10 @@ mod tests {
         let id = |s: &str| legacy_lookup(&table, s.strip_prefix("rbxasset://").unwrap());
         assert_eq!(id("rbxasset://fonts/sword.mesh"), Some(12221720));
         assert_eq!(id("rbxasset://Fonts/Torso.mesh"), Some(12221758));
+        assert_eq!(id("rbxasset://fonts//leftarm.mesh"), Some(12221505));
+        assert_eq!(id("rbxasset://fonts//torso.mesh"), Some(12221758));
+        assert_eq!(asset_ref("rbxasset://fonts//leftarm.mesh").map(|a| a.id), Some(12221505));
+        assert_eq!(resolve("rbxasset://fonts//leftarm.mesh", None), None);
         assert_eq!(id("rbxasset://textures/SwordTexture.png"), Some(12224218));
         assert_eq!(id("rbxasset://textures/rocketlaunchertex.png"), Some(12224070));
         assert_eq!(id("rbxasset://fonts/clonewand.mesh"), Some(12221344));

@@ -30,6 +30,61 @@ pub fn active() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|v| !v.is_empty())
 }
 
+/// Hyprland tiles a new window unless a rule says otherwise, and
+/// `restore` only floats it after the next poll (up to a second of a tiled
+/// panel). A runtime window rule (not written to the user's config) floats
+/// rustudio's panel windows as they open. Blocks once: call before the
+/// first panel window is created.
+pub fn float_panel_windows() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if !active() {
+            return;
+        }
+        let lua = r#"hl.window_rule({ name = "rustudio-panel-windows", match = { class = "^rustudio-panel-.*$" }, float = true })"#;
+        let ok = Command::new("hyprctl")
+            .args(["eval", lua])
+            .output()
+            .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok");
+        if !ok {
+            // Before 0.55 (no Lua config).
+            let _ = Command::new("hyprctl")
+                .args(["keyword", "windowrulev2", "float,class:^(rustudio-panel-.*)$"])
+                .output();
+        }
+    });
+}
+
+/// Before a panel window opens: a rule for its class with the size, place
+/// and workspace it should open at (the saved placement, else the size it
+/// asks for), so it doesn't map at a default size and jump a poll later.
+/// `at` / `size` in Hyprland's layout pixels.
+pub fn preplace(class: &str, saved: Option<&Placement>, size: [f32; 2], at: Option<[f32; 2]>) {
+    if !active() || saved.is_some_and(|p| !p.floating) {
+        return;
+    }
+    float_panel_windows();
+    let (size, at, workspace) = match saved {
+        Some(p) => ([p.size[0] as f32, p.size[1] as f32], Some([p.at[0] as f32, p.at[1] as f32]), p.workspace.clone()),
+        None => (size, at, String::new()),
+    };
+    let mut fields = vec![
+        format!("name = {:?}", format!("rustudio-{class}")),
+        format!("match = {{ class = {:?} }}", format!("^{class}$")),
+        "float = true".to_string(),
+        format!("size = \"{} {}\"", size[0].round(), size[1].round()),
+    ];
+    match at {
+        Some(a) => fields.push(format!("move = \"{} {}\"", a[0].round(), a[1].round())),
+        None => fields.push("center = true".to_string()),
+    }
+    if !workspace.is_empty() {
+        fields.push(format!("workspace = {:?}", format!("{workspace} silent")));
+    }
+    let lua = format!("hl.window_rule({{ {} }})", fields.join(", "));
+    let _ = Command::new("hyprctl").args(["eval", &lua]).output();
+}
+
 /// The latest snapshot: class → (address, placement).
 fn seen_map() -> &'static Mutex<HashMap<String, (String, Placement)>> {
     static SEEN: OnceLock<Mutex<HashMap<String, (String, Placement)>>> = OnceLock::new();

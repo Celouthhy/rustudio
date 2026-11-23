@@ -31,6 +31,7 @@ impl NarrowPhase {
         let mut update_candidates = core::mem::take(&mut self.update_candidates);
         collect_pairs_to_update(
             &mut update_candidates,
+            &mut self.update_candidate_bits,
             &self.graph_indices,
             &self.intersection_graph.graph,
             islands,

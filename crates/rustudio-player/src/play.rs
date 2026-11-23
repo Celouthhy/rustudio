@@ -23,6 +23,7 @@ use crate::game::{Game, GameHost};
 use rustudio_render::camera::{Camera, CameraMode};
 use rustudio_core::doc::{self, Document};
 use rustudio_core::log::Level;
+use rustudio_engine::gui::{GuiArg, GuiEvent};
 use rustudio_engine::ltypes::LEnumItem;
 use rustudio_core::math::Xform;
 use rustudio_core::mech;
@@ -30,6 +31,7 @@ use rustudio_physics::physics::{CharBody, Physics, PhysicsFrame, PhysicsJob, Ste
 use rustudio_engine::replicate::{self, RepMap};
 use rustudio_core::body::State;
 use rustudio_engine::rig::{self, Rig, RigType};
+use rustudio_engine::runtime::signal_timing::SignalMode;
 use rustudio_engine::runtime::{RemoteKind, RepOp, RunMode, Runtime, Side, World};
 use rustudio_render::scene::f32_of;
 
@@ -53,8 +55,6 @@ pub struct Character {
     pub humanoid: Ref,
     pub rig: Rig,
     pub rig_type: RigType,
-    /// Body part touches are reported with this part as "other".
-    pub touch_part: Ref,
     pub body: CharBody,
     /// HumanoidRootPart centre above the capsule centre.
     root_lift: f32,
@@ -63,6 +63,7 @@ pub struct Character {
     pub velocity: Vec3,
     pub dead: bool,
     touching: HashSet<Ref>,
+    touch_pairs: rustc_hash::FxHashSet<(Ref, Ref)>,
     /// What it touched when the seats last looked (a Seat sits whoever
     /// starts touching it, not whoever stands on it).
     seat_seen: HashSet<Ref>,
@@ -198,6 +199,7 @@ struct PlayKeys {
     keys: HashSet<String>,
     began: Vec<(String, bool)>,
     ended: Vec<(String, bool)>,
+    perf_stats_toggle: bool,
 }
 
 pub(crate) struct PlayKeyboard {
@@ -206,17 +208,39 @@ pub(crate) struct PlayKeyboard {
     textbox: bool,
     modifiers: egui::Modifiers,
     shift_tapped: bool,
+    perf_stats_toggle: bool,
     no_ui: bool,
     shift: bool,
 }
 
 impl PlayKeyboard {
     pub(crate) fn read(ctx: &egui::Context, textbox: bool, no_ui: bool, shift: bool) -> Self {
-        let (focused, modifiers, shift_tapped) = ctx.input(|i| {
+        let (focused, modifiers, shift_tapped, perf_stats_toggle) = ctx.input(|i| {
             let taps = rustudio_engine::mouse_lock::shift_taps(false, &i.raw.events, i.modifiers.shift);
-            (i.focused, i.modifiers, taps > 0)
+            let perf = i.raw.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F7,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.ctrl && modifiers.shift
+                )
+            });
+            (i.focused, i.modifiers, taps > 0, perf)
         });
-        Self { focused, blocked: ctx.egui_wants_keyboard_input(), textbox, modifiers, shift_tapped, no_ui, shift }
+        Self {
+            focused,
+            blocked: ctx.egui_wants_keyboard_input(),
+            textbox,
+            modifiers,
+            shift_tapped,
+            perf_stats_toggle,
+            no_ui,
+            shift,
+        }
     }
 }
 
@@ -235,9 +259,7 @@ pub(crate) struct ServerPhase {
     dt: f32,
     realtime: bool,
     part_touches: Vec<(Ref, Ref, bool)>,
-    char_part: Ref,
-    char_began: Vec<Ref>,
-    char_ended: Vec<Ref>,
+    character_touch_start: usize,
     client_only: HashSet<Ref>,
     velocities: rustc_hash::FxHashMap<Ref, Vec3>,
     state_names: HashMap<Ref, &'static str>,
@@ -300,44 +322,23 @@ impl ServerPhase {
             Some(m) => m.get(&r).copied().or_else(|| self.client_only.contains(&r).then_some(r)),
             None => (!self.client_only.contains(&r)).then_some(r),
         };
-        for (a, b, started) in &self.part_touches {
+        for (index, (a, b, started)) in self.part_touches.iter().enumerate() {
             let ev = if *started { "Touched" } else { "TouchEnded" };
-            // Studio fires the deprecated twins with them: StoppedTouching
-            // with TouchEnded, LocalSimulationTouched with Touched where
-            // the part is simulated (the server's parts).
-            let twin = match (*started, map.is_none()) {
-                (true, true) => Some("LocalSimulationTouched"),
-                (false, _) => Some("StoppedTouching"),
-                _ => None,
-            };
+            let character_touch = index >= self.character_touch_start;
             if let (Some(a), Some(b)) = (m(*a), m(*b)) {
                 rt.fire(a, ev, vec![rt.inst(b)]);
                 rt.fire(b, ev, vec![rt.inst(a)]);
                 if *started {
                     rustudio_engine::rig::fire_humanoid_touched(rt, a, b);
-                }
-                if let Some(t) = twin {
-                    rt.fire(a, t, vec![rt.inst(b)]);
-                    rt.fire(b, t, vec![rt.inst(a)]);
-                }
-            }
-        }
-        if let Some(cp) = m(self.char_part) {
-            for p in &self.char_began {
-                if let Some(p) = m(*p) {
-                    rt.fire(p, "Touched", vec![rt.inst(cp)]);
-                    rt.fire(cp, "Touched", vec![rt.inst(p)]);
-                    rustudio_engine::rig::fire_humanoid_touched(rt, cp, p);
-                    // The character is simulated by its client.
-                    if map.is_some() {
-                        rt.fire(cp, "LocalSimulationTouched", vec![rt.inst(p)]);
+                    if character_touch == map.is_some() {
+                        rt.fire(a, "LocalSimulationTouched", vec![rt.inst(b)]);
                     }
-                }
-            }
-            for p in &self.char_ended {
-                if let Some(p) = m(*p) {
-                    rt.fire(p, "TouchEnded", vec![rt.inst(cp)]);
-                    rt.fire(p, "StoppedTouching", vec![rt.inst(cp)]);
+                    if map.is_none() {
+                        rt.fire(b, "LocalSimulationTouched", vec![rt.inst(a)]);
+                    }
+                } else {
+                    rt.fire(a, "StoppedTouching", vec![rt.inst(b)]);
+                    rt.fire(b, "StoppedTouching", vec![rt.inst(a)]);
                 }
             }
         }
@@ -418,6 +419,7 @@ pub struct PlaySession {
     pub character: Option<Character>,
     /// The Player instance (server ref).
     pub player: Ref,
+    initial_spawn_frames: Option<u8>,
     respawn_at: Option<f64>,
     /// The dead character's parts the server took over (lane DEATH): server part → the
     /// client copy's interpolation buffer (physics::hum_body::Handover).
@@ -442,6 +444,8 @@ pub struct PlaySession {
     memstats_worst: f32,
     /// Places the parts of assemblies only the client has.
     client_joints: rustudio_physics::client_joints::ClientJoints,
+    /// Places the parts of server-side AnimationController / anchored Humanoid rigs.
+    server_joints: rustudio_physics::client_joints::ClientJoints,
     /// The client DataModel's own simulation (crates/rustudio-physics/src/physics_client.rs).
     client_sim: rustudio_physics::physics::client::ClientSim,
     /// Touch changes between the client world's parts (client refs), fired on
@@ -458,7 +462,9 @@ pub struct PlaySession {
     /// Characters spawned so far (the first one keeps the joining Backpack).
     pub spawns: u32,
     pub mouse_moved: bool,
+    pub mouse_move_processed: bool,
     pub wheel: f32,
+    pub wheel_processed: bool,
     /// The client's UserInputService.MouseBehavior (0 Default, 1 LockCenter,
     /// 2 LockCurrentPosition) and MouseIconEnabled, read after its scripts ran.
     pub mouse_behavior: u32,
@@ -498,6 +504,7 @@ impl PlaySession {
             touch_seen: None,
             character: None,
             player: Ref::none(),
+            initial_spawn_frames: None,
             respawn_at: None,
             handover: HashMap::default(),
             time: 0.0,
@@ -511,6 +518,7 @@ impl PlaySession {
             memstats_frames: 0,
             memstats_worst: 0.0,
             client_joints: Default::default(),
+            server_joints: Default::default(),
             client_sim: Default::default(),
             client_touches: Vec::new(),
             state_log: Vec::new(),
@@ -518,7 +526,9 @@ impl PlaySession {
             mouse_delta: glam::Vec2::ZERO,
             spawns: 0,
             mouse_moved: false,
+            mouse_move_processed: false,
             wheel: 0.0,
+            wheel_processed: false,
             mouse_behavior: 0,
             mouse_icon: true,
             cursor_image: None,
@@ -620,6 +630,7 @@ fn key_name(k: egui::Key, all: bool) -> Option<&'static str> {
         F4 => "F4",
         Comma => "Comma",
         Period => "Period",
+        Slash => "Slash",
         Minus => "Minus",
         Equals => "Equals",
         Semicolon => "Semicolon",
@@ -637,7 +648,7 @@ fn key_name(k: egui::Key, all: bool) -> Option<&'static str> {
     })
 }
 
-fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> {
+fn new_side(mode: RunMode, side: Side, peer: bool, signal_mode: SignalMode) -> Result<SideState, String> {
     let runtime = Runtime::new()?;
     runtime
         .install_side()
@@ -650,6 +661,7 @@ fn new_side(mode: RunMode, side: Side, peer: bool) -> Result<SideState, String> 
     world.doc = None;
     world.side = side;
     world.has_peer = peer;
+    world.signal_mode = signal_mode;
     Ok(SideState {
         runtime,
         world: Some(world),
@@ -790,6 +802,16 @@ impl Game {
         if self.play.is_some() {
             return;
         }
+        self.edit_audio.stop_playback();
+        {
+            let mut sh = rustudio_engine::gui::share();
+            sh.core_menu_open = false;
+            sh.selection_visible = false;
+            sh.ui_nav_toggle_disabled = false;
+            sh.fullscreen_req = None;
+            sh.microprofiler_req = None;
+            sh.saved_quality = None;
+        }
         rustudio_core::load_trace::mark("play: start asked");
         // A play-testing teleport plays its destination instead of the edit
         // document, and its player arrives with the teleport's data.
@@ -819,10 +841,11 @@ impl Game {
         // The local player is the signed-in account (identity and avatar),
         // as in Studio: a session check still running at Play is waited for.
         if mode == RunMode::Play {
-            // (No character until a script asks, with CharacterAutoLoads
-            // off: the avatar download needn't hold Play's start.)
-            let avatar = self.character_auto_loads();
-            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), avatar) {
+            // Wait for the signed-in user's avatar before scripts start, even
+            // when CharacterAutoLoads is false: scripts commonly call
+            // Players:GetHumanoidDescriptionFromUserId in PlayerAdded for lobby
+            // or class-preview rigs.
+            for (level, text) in self.account.settle_for_play(std::time::Duration::from_secs(20), true) {
                 self.push_log(level, text);
             }
         }
@@ -851,7 +874,9 @@ impl Game {
         if rustudio_core::rustudio_settings::live_data() {
             self.info("DataStores: live");
         }
-        let server = match new_side(mode, Side::Server, two) {
+        let play_doc = teleport.as_ref().map_or(&self.doc, |destination| &destination.doc);
+        let signal_mode = SignalMode::of(play_doc);
+        let server = match new_side(mode, Side::Server, two, signal_mode) {
             Ok(s) => s,
             Err(e) => {
                 self.error(format!("Could not start the Luau runtime: {e}"));
@@ -859,7 +884,7 @@ impl Game {
             }
         };
         let client = if two {
-            match new_side(mode, Side::Client, true) {
+            match new_side(mode, Side::Client, true, signal_mode) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     self.error(format!("Could not start the client runtime: {e}"));
@@ -941,7 +966,26 @@ impl Game {
         // Tools saved in an NPC's hand: gripped as the session's DataModel loads (Handle
         // CanCollide false, tool_grip.rs), before the client's copy is made from it.
         rustudio_engine::tool_grip::grip_at_load(&mut server_doc);
-        let (client_doc, map) = if two {
+        // Ensure RobloxReplicatedStorage + version RemoteFunctions exist before
+        // initial_client so SettingsHub's GetServerVersionBlocking() maps 1:1.
+        if two && rustudio_core::rustudio_settings::core_scripts() {
+            let root = server_doc.dom.root_ref();
+            let rrs = server_doc
+                .find_child(root, "RobloxReplicatedStorage")
+                .unwrap_or_else(|| {
+                    server_doc
+                        .dom
+                        .insert(root, InstanceBuilder::new("RobloxReplicatedStorage").with_name("RobloxReplicatedStorage"))
+                });
+            for rf_name in ["GetServerVersion", "GetServerChannel"] {
+                if server_doc.find_child(rrs, rf_name).is_none() {
+                    server_doc
+                        .dom
+                        .insert(rrs, InstanceBuilder::new("RemoteFunction").with_name(rf_name));
+                }
+            }
+        }
+        let (mut client_doc, map) = if two {
             let (c, m) = replicate::initial_client(
                 &server_doc,
                 format!("{} ({label}: Client)", self.doc.title),
@@ -951,6 +995,62 @@ impl Game {
             (None, RepMap::default())
         };
         rustudio_core::load_trace::mark("play: client DataModel replicated");
+        // Roblox's own CoreScripts (core_scripts.rs): CorePackages and
+        // CoreGui.RobloxGui from Studio's data model patch. Install into the
+        // client DataModel before server scripts start so decoding/cloning
+        // DataModelPatch.rbxm does not stall wall-clock time between server
+        // startup and client join. CoreScripts still start in
+        // `setup_client_player` once LocalPlayer exists.
+        let core_scripts = if let Some(cdoc) = client_doc.as_mut() {
+            if rustudio_core::rustudio_settings::core_scripts()
+                && (rustudio_core::core_scripts::patch_path().is_some()
+                    || rustudio_core::rustudio_settings::core_scripts_forced())
+            {
+                // Populate Stats.PerformanceStats with native StatsItem children
+                // (not creatable via Instance.new) for DevConsole & PerformanceStats.
+                let root = cdoc.dom.root_ref();
+                let stats = cdoc.find_child(root, "Stats").unwrap_or_else(|| {
+                    cdoc.dom
+                        .insert(root, InstanceBuilder::new("Stats").with_name("Stats"))
+                });
+                let perf = cdoc
+                    .dom
+                    .get_by_ref(stats)
+                    .and_then(|s| {
+                        s.children()
+                            .iter()
+                            .copied()
+                            .find(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == "PerformanceStats"))
+                    })
+                    .unwrap_or_else(|| {
+                        cdoc.dom
+                            .insert(stats, InstanceBuilder::new("Folder").with_name("PerformanceStats"))
+                    });
+                for n in [
+                    "Memory", "CPU", "GPU", "NetworkSent", "NetworkReceived", "Ping",
+                    "MaxMemory", "MaxCPU", "MaxGPU", "MaxNetworkSent", "MaxNetworkReceived", "MaxPing",
+                ] {
+                    let exists = cdoc.dom.get_by_ref(perf).is_some_and(|p| {
+                        p.children()
+                            .iter()
+                            .any(|c| cdoc.dom.get_by_ref(*c).is_some_and(|i| i.name == n))
+                    });
+                    if !exists {
+                        cdoc.dom.insert(
+                            perf,
+                            InstanceBuilder::new("StatsItem")
+                                .with_name(n)
+                                .with_property("DisplayName", rbx_dom_weak::types::Variant::String(n.into())),
+                        );
+                    }
+                }
+                Some(load_core_scripts(cdoc))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let saved_sel = std::mem::take(&mut edit_doc.as_mut().unwrap_or(&mut self.doc).selection);
         let saved_doc = std::mem::replace(&mut self.doc, server_doc);
         let saved_doc = edit_doc.take().unwrap_or(saved_doc);
@@ -984,6 +1084,7 @@ impl Game {
         // The menu's settings from earlier playtests (volume, camera
         // sensitivity, inverted): onto the mixer now, and onto the client's
         // UserGameSettings on its first tick.
+        rustudio_engine::runtime::domains::services::set_keep_game_settings(self.keep_game_settings);
         if self.keep_game_settings {
             let saved = rustudio_core::game_settings::load();
             if let Some(v) = saved.volume {
@@ -1040,6 +1141,12 @@ impl Game {
         rustudio_core::load_trace::mark("play: server scripts started");
         if two {
             self.create_player();
+            if self.play.as_ref().is_some_and(|s| s.map.streaming()) {
+                let (position, _) = self.character_spawn_point();
+                if let Some(s) = &mut self.play {
+                    s.map.set_streaming_spawn(position);
+                }
+            }
             let player = self
                 .play
                 .as_ref()
@@ -1053,10 +1160,16 @@ impl Game {
                 .filter_map(|c| self.doc.find_child(player, c))
                 .flat_map(|f| self.server_scripts(Some(f)))
                 .collect();
+            // Establish the client's Player and its containers in the join
+            // snapshot. Server PlayerAdded writes arrive through the next
+            // replication phase, after the client starts PlayerScripts.
+            self.replicate_now();
             let players = self.doc.find_child(self.doc.dom.root_ref(), "Players");
+            let joined = self.doc.dom.descendants_of(player).map(|i| i.referent()).collect();
             self.with_side(Side::Server, |rt, _, _| {
                 if let Some(p) = players {
                     rt.fire(p, "PlayerAdded", vec![rt.inst(player)]);
+                    rt.notify_parent(player, Ref::none(), p, joined);
                 }
                 for r in backpack {
                     rt.start_collected(r);
@@ -1064,16 +1177,26 @@ impl Game {
                 rt.dispatch();
             });
             rustudio_core::load_trace::mark("play: player added");
-            self.replicate_now();
-            rustudio_core::load_trace::mark("play: replicated");
             self.with_side(Side::Client, |rt, _, _| rt.warm_queries());
             rustudio_core::load_trace::mark("play: client queries warmed");
-            self.setup_client_player();
+            self.setup_client_player(core_scripts);
+            // Client CoreScripts startup ran synchronously after server scripts
+            // started (still at s.time == 0, before frame 1). Re-anchor server
+            // timer wall clocks so server waits do not burst-fire on frame 1.
+            self.with_side(Side::Server, |rt, _, _| rt.reset_timer_walls());
             rustudio_core::load_trace::mark("play: client player set up");
             // Players.CharacterAutoLoads false: no character until a script
             // calls Player:LoadCharacter (the client's camera is the scripts').
             if self.character_auto_loads() {
-                self.spawn_character();
+                // Local Studio Play measured six to seven server Heartbeats
+                // between PlayerAdded and the first CharacterAdded. Give the
+                // bootstrap scripts and the join replica those frames before
+                // cloning the character and firing the first PlayerGui scripts.
+                if let Some(s) = self.play.as_mut() {
+                    s.initial_spawn_frames = Some(6);
+                }
+            } else {
+                self.info("No character: Players.CharacterAutoLoads is false (a script's Player:LoadCharacter spawns one)");
             }
             // Studio shows the client's view while playing.
             if self.play_shows_client {
@@ -1165,6 +1288,15 @@ impl Game {
         }
         rustudio_core::telemetry::flush();
         self.stop_all_sounds();
+        {
+            let mut sh = rustudio_engine::gui::share();
+            sh.core_menu_open = false;
+            sh.selection_visible = false;
+            sh.ui_nav_toggle_disabled = false;
+            sh.fullscreen_req = None;
+            sh.microprofiler_req = None;
+            sh.saved_quality = None;
+        }
         self.cam.basis = None;
         let Some(mut s) = self.play.take() else {
             return;
@@ -1172,6 +1304,8 @@ impl Game {
         if let Some(d) = s.saved_doc.take() {
             self.doc = d;
         }
+        self.edit_audio.stop_playback();
+        self.doc.discard_marks_for(doc::Reader::EditAudio);
         self.doc.selection = s.saved_sel.clone();
         self.cam = s.saved_cam.clone();
         self.scene = rustudio_render::scene::Scene::default();
@@ -1299,6 +1433,7 @@ impl Game {
             player,
             InstanceBuilder::new("PlayerGui").with_name("PlayerGui"),
         );
+        self.doc.dom.insert(player, InstanceBuilder::new("StarterGear"));
         // PlayerGui starts empty: StarterGui is copied in when a character
         // spawns (reset_player_gui), as on Roblox.
         let _ = gui;
@@ -1345,7 +1480,10 @@ impl Game {
 
     /// Client side of joining: LocalPlayer, PlayerScripts (client-only,
     /// filled from StarterPlayerScripts), then LocalScripts start.
-    fn setup_client_player(&mut self) {
+    fn setup_client_player(
+        &mut self,
+        core: Option<Result<(rustudio_core::core_scripts::Installed, String), String>>,
+    ) {
         let Some(s) = self.play.as_ref() else { return };
         let Some(cplayer) = s.map.s2c.get(&s.player).copied() else {
             return;
@@ -1419,18 +1557,65 @@ impl Game {
                 cdoc,
                 &[cdoc.find_child(root, "ReplicatedFirst"), Some(cplayer)],
             );
-            // RunContext = Client Scripts run anywhere replicated.
-            for i in cdoc.dom.descendants() {
-                if i.class == "Script"
-                    && rustudio_render::scene::enum_u32(cdoc.prop(i.referent(), "RunContext")) == Some(2)
-                    && script_enabled(cdoc, i.referent())
-                    && !local.contains(&i.referent())
-                {
-                    local.push(i.referent());
+            // RunContext = Client Scripts run anywhere replicated (skip
+            // client-only CoreGui / CorePackages installed from the patch).
+            let services: Vec<Ref> = cdoc
+                .dom
+                .get_by_ref(root)
+                .map(|r| {
+                    r.children()
+                        .iter()
+                        .copied()
+                        .filter(|&c| {
+                            cdoc.dom
+                                .get_by_ref(c)
+                                .is_some_and(|i| i.class != "CoreGui" && i.class != "CorePackages")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for svc in services {
+                for i in cdoc.dom.descendants_of(svc) {
+                    if i.class == "Script"
+                        && rustudio_render::scene::enum_u32(cdoc.prop(i.referent(), "RunContext")) == Some(2)
+                        && script_enabled(cdoc, i.referent())
+                        && !local.contains(&i.referent())
+                    {
+                        local.push(i.referent());
+                    }
                 }
             }
         }
         self.sync_view_size();
+        match core {
+            Some(Ok((installed, note))) => {
+                self.info(note);
+                // Attach server handlers for RobloxReplicatedStorage version queries.
+                let _ = self.run_luau_as(
+                    Side::Server,
+                    r#"
+                    local rrs = game:GetService("RobloxReplicatedStorage")
+                    local gv = rrs:FindFirstChild("GetServerVersion")
+                    if gv then gv.OnServerInvoke = function() return "0.747.0.7470000" end end
+                    local gc = rrs:FindFirstChild("GetServerChannel")
+                    if gc then gc.OnServerInvoke = function() return "LIVE" end end
+                    "#,
+                    rustudio_engine::runtime::security::CORE,
+                );
+                let started = self.with_side(Side::Client, |rt, _, _| rt.start_core_scripts(installed));
+                match started {
+                    Some(Ok(())) => {
+                        if let Some(s) = self.play.as_mut() {
+                            s.game.core_scripts_active = true;
+                        }
+                    }
+                    Some(Err(e)) => self.error(format!("CoreScripts: {e}")),
+                    None => {}
+                }
+            }
+            Some(Err(e)) => self.error(e),
+            None => {}
+        }
         self.with_side(Side::Client, |rt, _, _| {
             for r in local {
                 rt.start_collected(r);
@@ -1482,6 +1667,7 @@ impl Game {
             .with_side(Side::Client, |rt, _, map| {
                 let plugin_pins = host.plugin_pins(&rt.lua);
                 let freed = rt.collect(&|r| map.c2s.contains_key(&r) || plugin_pins.contains(&r), rustudio_core::mech::GC_BUDGET);
+                map.forget_collected_client(&freed);
                 (freed.len(), if due { rt.mem_stats() } else { String::new() })
             })
             .unwrap_or_default();
@@ -1516,23 +1702,66 @@ impl Game {
     }
 
     fn replicate_with(&mut self, budgeted: bool) {
-        let ops = match self.server_world() {
-            Some(w) => std::mem::take(&mut w.rep),
+        let (mut ops, requests) = match self.server_world() {
+            Some(w) => (std::mem::take(&mut w.rep), std::mem::take(&mut w.stream_requests)),
             None => return,
         };
-        let idle = self.play.as_ref().is_none_or(|p| p.client.is_none() || p.map.backlog() == 0);
-        if ops.is_empty() && idle || self.play.as_ref().is_none_or(|p| p.client.is_none()) {
+        let Some(play) = self.play.as_ref().filter(|p| p.client.is_some()) else { return };
+        let streaming = play.map.streaming();
+        if !streaming && ops.is_empty() && play.map.backlog() == 0 {
             return;
         }
+        let player = play.player;
         self.with_side(Side::Client, |rt, server, map| {
             if let Some(server) = server {
+                if streaming {
+                    replicate::update_streaming(server, rt, map, player, &mut ops, requests);
+                }
                 if budgeted {
                     replicate::apply_budgeted(server, rt, map, ops);
                 } else {
                     replicate::apply(server, rt, map, ops);
                 }
+                if streaming {
+                    replicate::finish_streaming(server, rt, map);
+                }
             }
             let _sc = rustudio_core::bench::scope("rep_dispatch");
+            rt.dispatch();
+        });
+    }
+
+    /// Legacy button input can reach server Scripts in the player's
+    /// replicated PlayerGui during local Play.
+    fn fire_server_gui_buttons(&mut self, buttons: Vec<GuiEvent>) {
+        if buttons.is_empty() {
+            return;
+        }
+        let Some(gui) = self.play.as_ref()
+            .and_then(|s| self.doc.find_child(s.player, "PlayerGui"))
+        else {
+            return;
+        };
+        self.with_side(Side::Server, |rt, _, map| {
+            for event in buttons {
+                let GuiEvent::Fire(client, name @ ("MouseButton1Down" | "MouseButton1Click"), args) = event else {
+                    continue;
+                };
+                let Some(server) = map.c2s.get(&client).copied() else {
+                    continue;
+                };
+                let owned_button = rt.world_mut().is_some_and(|w| {
+                    w.d().class_of(server).is_some_and(|class| doc::is_a(&class, "GuiButton"))
+                        && w.d().is_ancestor(gui, server)
+                });
+                if owned_button {
+                    let args = args.into_iter().filter_map(|arg| match arg {
+                        GuiArg::Num(n) => Some(Value::Number(n)),
+                        _ => None,
+                    }).collect();
+                    rt.fire(server, name, args);
+                }
+            }
             rt.dispatch();
         });
     }
@@ -1728,9 +1957,11 @@ impl Game {
 
     fn spawn_character(&mut self) {
         let Some(player) = self.play.as_ref().map(|p| p.player).filter(|p| p.is_some()) else {
+            self.warn("No character: the play session has no Player (Run has none; Play makes one)");
             return;
         };
         let Some(ws) = self.doc.workspace() else {
+            self.warn("No character: the place has no Workspace to spawn it in");
             return;
         };
         let (mut rig_type, colors, scales) = self.character_look();
@@ -1757,6 +1988,7 @@ impl Game {
         }
         self.info(why);
         let humanoid = self.humanoid_builder();
+        let custom_starter = starter.is_some();
         let name = self.player_name();
         let m = match starter {
             Some((sc, _)) => {
@@ -1786,6 +2018,32 @@ impl Game {
                     &scales,
                     humanoid,
                 );
+                // What the body is made of, for a report of a character that
+                // can't be seen (the Studio files' meshes or the stand-in blocks).
+                let (parts, meshes) = self
+                    .doc
+                    .dom
+                    .get_by_ref(m)
+                    .map(|i| {
+                        i.children().iter().filter_map(|c| self.doc.dom.get_by_ref(*c)).fold((0usize, 0usize), |(p, mm), ch| {
+                            (p + usize::from(doc::is_a(&ch.class, "BasePart")), mm + usize::from(&*ch.class == "MeshPart"))
+                        })
+                    })
+                    .unwrap_or((0, 0));
+                self.info(format!("Character body: {parts} parts, {meshes} of them MeshParts"));
+                // Everything a player expects of the character comes from
+                // Studio's content: the body with its face, Animate, and the
+                // PlayerModule whose CameraModule follows it and whose
+                // ControlModule moves it. Without, the game looks broken in
+                // three ways at once; say which one it is.
+                if meshes == 0 && rustudio_core::default_scripts::studio_dir().is_none() {
+                    self.warn(concat!(
+                        "Studio's content isn't installed yet, so this character is rustudio's stand-in: ",
+                        "no face, no animations, and no camera or movement scripts follow it. ",
+                        "The download that starts with rustudio ends with a \"Studio content … installed\" line above ",
+                        "(or says what failed); stop and press Play again after it.",
+                    ));
+                }
                 self.dress_character(m);
                 // The avatar's equipped emotes (Humanoid:PlayEmote, /e, the
                 // emote wheel read them from here).
@@ -1798,8 +2056,9 @@ impl Game {
             }
         };
         // Studio's avatar joint upgrade (StarterPlayer.AvatarJointUpgrade):
-        // an R15 body's rig Motor6Ds become AnimationConstraints + ball sockets.
-        if rig_type == RigType::R15 && rig::joint_upgrade(&self.doc) {
+        // an R15 default body's rig Motor6Ds become AnimationConstraints + ball
+        // sockets; custom StarterCharacter models keep their authored Motor6Ds.
+        if !custom_starter && rig_type == RigType::R15 && rig::joint_upgrade(&self.doc) {
             rig::upgrade_rig(&mut self.doc.dom, m);
         }
         // StarterCharacterScripts go into the character.
@@ -1890,17 +2149,6 @@ impl Game {
             }
         }
         let rig = Rig::read(&self.doc, m);
-        let touch_part = self
-            .doc
-            .find_named(
-                m,
-                if rig_type == RigType::R15 {
-                    "LowerTorso"
-                } else {
-                    "Torso"
-                },
-            )
-            .unwrap_or(rig.root);
         let (start, start_yaw) = self.character_spawn_point();
         let root_lift =
             rig::root_height(&self.doc, m)
@@ -1912,7 +2160,6 @@ impl Game {
             humanoid,
             rig,
             rig_type,
-            touch_part,
             body: CharBody {
                 pos: start,
                 vel_y: 0.0,
@@ -1926,6 +2173,7 @@ impl Game {
             velocity: Vec3::ZERO,
             dead: false,
             touching: HashSet::new(),
+            touch_pairs: Default::default(),
             seat_seen: HashSet::new(),
             state: State::Freefall,
             landed_for: 0.0,
@@ -1966,18 +2214,29 @@ impl Game {
             p.respawn_at = None;
         }
 
-        // Fresh tools from StarterPack (not for the first character: the
-        // Backpack was filled when the player joined).
+        // Apply the player's StarterGear on each spawn. The first spawn
+        // keeps the StarterPack copies that were made at player join.
         let first = self.play.as_ref().is_some_and(|s| s.spawns == 0);
         if let Some(s) = self.play.as_mut() {
+            s.initial_spawn_frames = None;
             s.spawns += 1;
         }
-        let tools = if first { Vec::new() } else { self.refill_backpack(player) };
+        let tools = self.refill_backpack(player, first);
 
-        // Server: CharacterAdded, server Scripts inside the character.
+        // Publish the rig and Character ref before spawn callbacks can add children
+        // to the rig. Such children follow the rig into the client replica.
+        self.record(RepOp::Parent(m));
+        self.record(RepOp::Prop(player, "Character".into()));
         let server_scripts = self.server_scripts(Some(m));
+        let spawned = self.doc.dom.descendants_of(m).map(|i| i.referent()).collect();
         self.with_side(Side::Server, |rt, _, _| {
             rt.fire(player, "CharacterAdded", vec![rt.inst(m)]);
+            rt.notify_prop(player, "Character");
+            rt.notify_parent(m, Ref::none(), ws, spawned);
+            rt.spawn_global("__rs_character_appearance_loaded", vec![rt.inst(player), rt.inst(m)]);
+            rt.dispatch();
+        });
+        self.with_side(Side::Server, |rt, _, _| {
             for r in server_scripts {
                 rt.start_collected(r);
             }
@@ -1985,8 +2244,6 @@ impl Game {
         });
         // Replicate the new character, then the client's CharacterAdded and LocalScripts.
         // (Its LocalScripts wait for CharacterAdded and the GUI's: `held` below.)
-        self.record(RepOp::Parent(m));
-        self.record(RepOp::Prop(player, "Character".into()));
         self.with_side(Side::Client, |rt, _, _| {
             if let Some(mut w) = rt.world_mut() {
                 w.hold_character_scripts = true;
@@ -2036,6 +2293,21 @@ impl Game {
                 );
             self.with_side(Side::Client, |rt, _, _| {
                 if let (Some(cam), Some(h)) = (ccam, chum) {
+                    if first {
+                        // In Studio Play, the client's first character load (when
+                        // CameraSubject was nil, e.g. CharacterAutoLoads = false)
+                        // resets CurrentCamera.CameraType back to Custom so the
+                        // default camera controller follows the new character even
+                        // if a pre-spawn loading script set Scriptable. Subsequent
+                        // respawns preserve CameraType.
+                        rt.apply_prop(
+                            cam,
+                            "CameraType",
+                            Variant::Enum(rbx_dom_weak::types::Enum::from_u32(
+                                mech::CAMERA_TYPE_CUSTOM,
+                            )),
+                        );
+                    }
                     rt.set(cam, "CameraSubject", rt.inst(h));
                 }
                 rt.fire(cp, "CharacterAdded", vec![rt.inst(cm)]);
@@ -2411,42 +2683,41 @@ impl Game {
         }
     }
 
-    /// Each spawn after the first: the Backpack is emptied and StarterPack
-    /// copied in again (Roblox gives every new character fresh tools). The
-    /// copies' server Scripts start now; returns them for the client's
-    /// LocalScripts once replicated.
-    fn refill_backpack(&mut self, player: Ref) -> Vec<Ref> {
-        let root = self.doc.dom.root_ref();
-        let (Some(bp), Some(pack)) = (
-            self.doc.find_child(player, "Backpack"),
-            self.doc.find_child(root, "StarterPack"),
-        ) else {
+    /// Copies StarterGear on every spawn and refreshes the StarterPack
+    /// tools on later spawns. Returns the copies for client LocalScripts.
+    fn refill_backpack(&mut self, player: Ref, first: bool) -> Vec<Ref> {
+        let Some(bp) = self.doc.find_child(player, "Backpack") else {
             return Vec::new();
         };
-        let old: Vec<Ref> = self
-            .doc
-            .dom
-            .get_by_ref(bp)
-            .map(|i| i.children().to_vec())
-            .unwrap_or_default();
-        self.with_side(Side::Server, |rt, _, _| {
-            for c in &old {
-                rt.apply_destroy(*c);
-            }
-        });
+        if !first {
+            let old = self.doc.dom.get_by_ref(bp)
+                .map(|i| i.children().to_vec())
+                .unwrap_or_default();
+            self.with_side(Side::Server, |rt, _, _| {
+                for c in &old {
+                    rt.apply_destroy(*c);
+                }
+            });
+        }
+        let pack = (!first)
+            .then(|| self.doc.find_child(self.doc.dom.root_ref(), "StarterPack"))
+            .flatten();
+        let gear = self.doc.find_child(player, "StarterGear");
         let mut copies = Vec::new();
-        for k in self
-            .doc
-            .dom
-            .get_by_ref(pack)
-            .map(|i| i.children().to_vec())
-            .unwrap_or_default()
-        {
-            let c = self.doc.dom.clone_within(k);
-            self.doc.dom.transfer_within(c, bp);
-            self.doc.mark_tree(c);
-            self.record(RepOp::Parent(c));
-            copies.push(c);
+        for source in [pack, gear].into_iter().flatten() {
+            let children = self.doc.dom.get_by_ref(source)
+                .map(|i| i.children().to_vec())
+                .unwrap_or_default();
+            for child in children {
+                let copy = self.doc.dom.clone_within(child);
+                self.doc.dom.transfer_within(copy, bp);
+                self.doc.mark_tree(copy);
+                self.record(RepOp::Parent(copy));
+                copies.push(copy);
+            }
+        }
+        if copies.is_empty() {
+            return copies;
         }
         let scripts: Vec<Ref> = copies
             .iter()
@@ -2615,6 +2886,7 @@ impl Game {
             }
             self.with_side(Side::Server, |rt, _, _| {
                 rt.spawn_global("__rs_unseat", vec![rt.inst(humanoid), rt.inst(seat)]);
+                rt.dispatch();
             });
             // Out of the seat: the capsule rises clear of the seat's top (it
             // sat sunk into it).
@@ -2639,7 +2911,7 @@ impl Game {
             }
             return Some(SeatChange {
                 active: false,
-                seat: None,
+                seat: Some(seat),
             });
         }
         if dead || seat_off {
@@ -2687,9 +2959,31 @@ impl Game {
                 "__rs_seat",
                 vec![rt.inst(humanoid), rt.inst(pick), rt.inst(root)],
             );
+            rt.dispatch();
         });
         if let Some(ch) = self.play.as_mut().and_then(|s| s.character.as_mut()) {
             ch.seat = Some(pick);
+        }
+        // Mirror the character's new seated CFrames onto the client document
+        // right away so that when SeatWeld replicates to the client,
+        // entering_joint_moves sees the character already at the seat rather
+        // than pulling an unanchored vehicle to the character's old position.
+        if let Some(root_xf) = rustudio_render::scene::xform_of(&self.doc, root) {
+            let pose = self
+                .play
+                .as_ref()
+                .and_then(|s| s.character.as_ref())
+                .map(|ch| ch.rig.solve(root_xf, &ch.dynamic.transforms));
+            if let Some(pose) = pose {
+                if let Some(s) = self.play.as_mut() {
+                    if let Some(cdoc) = s.other_doc.as_mut() {
+                        rig::write_pose(cdoc, &pose, Some(&s.map.s2c));
+                    }
+                    if let Some(ch) = s.character.as_mut() {
+                        ch.last_root = Some(root_xf);
+                    }
+                }
+            }
         }
         Some(SeatChange {
             active: true,
@@ -2817,11 +3111,18 @@ impl Game {
         }) {
             self.play_input_pose_due = true;
         }
-        PlayKeys { focused: keyboard.focused, keys, began, ended }
+        PlayKeys {
+            focused: keyboard.focused,
+            keys,
+            began,
+            ended,
+            perf_stats_toggle: !typing && keyboard.perf_stats_toggle,
+        }
     }
 
     /// One frame of the play session.
     pub fn play_tick(&mut self, ctx: &egui::Context, dt: f32, host: &mut dyn GameHost, no_ui: bool, shift: bool) {
+        rustudio_core::load_trace::play_frame();
         let keyboard = PlayKeyboard::read(ctx, self.gui.focus.is_some(), no_ui, shift);
         if self.play_thread.is_some() {
             self.threaded_step(keyboard, dt, host);
@@ -2840,6 +3141,7 @@ impl Game {
             textbox: false,
             modifiers: egui::Modifiers::default(),
             shift_tapped: false,
+            perf_stats_toggle: false,
             no_ui,
             shift: false,
         };
@@ -2991,7 +3293,11 @@ impl Game {
         let dt = elapsed;
         // The in-game menu's Leave stops the session; Reset Character kills
         // the character on the server (Humanoid.Health = 0, as Roblox does).
-        if self.play.as_ref().is_some_and(|s| s.game.leave_request) {
+        if self.play.as_ref().is_some_and(|s| {
+            s.game.leave_request
+                || [s.server.as_ref().and_then(|vm| vm.world.as_ref()), s.client.as_ref().and_then(|vm| vm.world.as_ref())]
+                    .into_iter().flatten().any(|w| w.shutdown_requested)
+        }) {
             self.stop_play(host);
             return true;
         }
@@ -3055,6 +3361,10 @@ impl Game {
             let w = s.server.as_mut().and_then(|server| server.world.as_mut()).expect("server world");
             let vel = std::mem::take(&mut w.velocity_requests);
             s.physics.sync(&mut self.doc);
+            s.physics.set_streaming_visibility(
+                s.map.streaming_collider_revision(),
+                s.map.unstreamed_parts(),
+            );
             if let Some(c) = s.other_doc.as_mut() {
                 s.physics.follow_client(&self.doc, c, &s.map.c2s);
             }
@@ -3090,7 +3400,9 @@ impl Game {
         // 2. Character (owned by the client: written to both DataModels).
         let sc = rustudio_core::bench::scope("p2_character");
         let mut hum_out: Option<hum_glue::HumFrameOut> = None;
-        if mode == RunMode::Play && self.play_has_character() {
+        if mode == RunMode::Play && self.play_has_character()
+            && !self.play.as_ref().is_some_and(|s| s.map.gameplay_paused())
+        {
             let _s = rustudio_core::bench::scope("p2_player_humanoid");
             hum_out = Some(self.hum_pre(dt));
         }
@@ -3123,6 +3435,19 @@ impl Game {
                     s.physics.set_velocity(r, v);
                 }
             }
+            // If `sync` rebuilt the vehicle assembly (e.g. on the frame SeatWeld was
+            // created), re-attach the seated character's FixedJoint to the live seat body.
+            if let Some((model, seat, seat_root)) = self
+                .play
+                .as_ref()
+                .and_then(|s| s.character.as_ref())
+                .and_then(|c| c.seat.map(|seat| (c.model, seat)))
+                .and_then(|(m, seat)| self.seat_root_xform().map(|xf| (m, seat, xf)))
+            {
+                if let Some(s) = self.play.as_mut() {
+                    s.physics.seat_humanoid(model, Some((seat, seat_root)));
+                }
+            }
         }
         if hum_out.is_some() {
             self.hum_roots_seen();
@@ -3134,6 +3459,7 @@ impl Game {
         {
             let _pose = rustudio_core::bench::scope("p2_npc_pose");
             self.npc_pose();
+            self.server_pose_rigs();
         }
 
         drop(sc);
@@ -3184,17 +3510,17 @@ impl Game {
     fn finish_server_phase(&mut self, input: PlayFrameInput, result: StepResult) -> ServerPhase {
         let PlayFrameInput { mode, dt, realtime, humanoid: hum_out, .. } = input;
         let sc = rustudio_core::bench::scope("p3_physics_publish");
-        let mut char_touches: Vec<Ref> = Vec::new();
+        let mut char_touches = None;
         let mut state_change: Option<(State, State)> = None;
         let mut seat_change: Option<SeatChange> = None;
         let mut move_event: Option<(&'static str, f32)> = None;
         let mut running_speed: Option<f32> = None;
         let mut floor_changed: Option<u32> = None;
-        let mut char_part = Ref::none();
         let mut humanoid_ref = Ref::none();
         {
             let _s = rustudio_core::bench::scope("p3a_npc_post");
             self.npc_post();
+            self.server_pose_rigs();
         }
         if let Some(mut o) = hum_out {
             let _s = rustudio_core::bench::scope("p3a_humanoid_post");
@@ -3208,7 +3534,6 @@ impl Game {
             move_event = o.move_event;
             running_speed = o.running_speed;
             floor_changed = o.floor_changed;
-            char_part = o.char_part;
             humanoid_ref = o.humanoid;
         }
         for (r, _) in &result.moved {
@@ -3216,30 +3541,18 @@ impl Game {
         }
         // Below FallenPartsDestroyHeight a part is taken out of the tree: its
         // Parent goes to nil (Studio: ChildRemoved and AncestryChanged fire, not
-        // Destroying, and it can be parented back). Scripts watching it see
-        // that, as in Studio (a game's welded copy of an accessory restored the
-        // hidden original when its copy fell away).
-        let mut fallen_signals: Vec<(Ref, Ref, Vec<Ref>)> = Vec::new();
-        for r in &result.fallen {
-            let old = self.doc.dom.get_by_ref(*r).map(|i| i.parent()).unwrap_or_else(Ref::none);
-            let below: Vec<Ref> = if old.is_some() {
-                // (The moved instance first, then the subtree below it.)
-                std::iter::once(*r).chain(self.doc.dom.descendants_of(*r).map(|i| i.referent()).filter(|d| d != r)).collect()
-            } else {
-                Vec::new()
-            };
-            self.doc.dom.transfer_within(*r, Ref::none());
-            self.doc.mark_tree(*r);
+        // Destroying, and it can be parented back), ancestor Models lose a
+        // PrimaryPart that fell, and ancestor Models with no remaining BaseParts
+        // are removed as well.
+        let (fallen_signals, fallen_removed) = unparent_fallen_parts(&mut self.doc, &result.fallen);
+        for r in &fallen_removed {
             self.record(RepOp::Parent(*r));
-            if old.is_some() {
-                fallen_signals.push((*r, old, below));
-            }
         }
         for (r, old, below) in fallen_signals {
             self.with_side(Side::Server, |rt, _, _| rt.notify_parent(r, old, Ref::none(), below));
         }
         if let Some(s) = self.play.as_mut() {
-            s.engine_orphans.extend(result.fallen.iter().copied());
+            s.engine_orphans.extend(fallen_removed);
         }
 
         drop(sc);
@@ -3254,31 +3567,60 @@ impl Game {
             });
             !matches!(v, Some(Variant::Bool(false)))
         };
-        let part_touches: Vec<(Ref, Ref, bool)> = result
-            .touches
-            .iter()
-            .copied()
-            .filter(|(a, b, _)| can_touch(&self.doc, *a) && can_touch(&self.doc, *b))
-            .collect();
-        let char_now: HashSet<Ref> = char_touches.into_iter().filter(|r| can_touch(&self.doc, *r)).collect();
-        let (char_began, char_ended): (Vec<Ref>, Vec<Ref>) =
-            match self.play.as_mut().and_then(|s| s.character.as_mut()) {
-                Some(ch) if char_part.is_some() => {
-                    let now = char_now;
-                    let b = now.difference(&ch.touching).copied().collect();
-                    let e = ch.touching.difference(&now).copied().collect();
-                    ch.touching = now;
-                    (b, e)
-                }
-                _ => (Vec::new(), Vec::new()),
+        // The local character's solver can regenerate several manifolds for
+        // the same part pair inside a frame. Its pair snapshot also includes
+        // contacts with client-only stand-ins. Use it for persistent edges,
+        // while the rest of the world keeps its solver events.
+        let player = self.play.as_ref().and_then(|s| s.character.as_ref().map(|c| (s, c.model)));
+        let is_character_part = |r| player.is_some_and(|(s, model)| s.physics.hums.of_part.get(&r) == Some(&model));
+        let mut part_touches = Vec::new();
+        let mut transient = rustc_hash::FxHashMap::default();
+        for (a, b, began) in result.touches {
+            if !can_touch(&self.doc, a) || !can_touch(&self.doc, b) {
+                continue;
+            }
+            let pair = if char_touches.is_none() {
+                None
+            } else if is_character_part(a) {
+                Some((a, b))
+            } else if is_character_part(b) {
+                Some((b, a))
+            } else {
+                None
             };
-        // The character's touches of parts only its client has: they fire there.
-        let client_only: HashSet<Ref> = char_began
-            .iter()
-            .chain(char_ended.iter())
-            .copied()
-            .filter(|r| self.doc.dom.get_by_ref(*r).is_none())
-            .collect();
+            if let Some(pair) = pair {
+                if began {
+                    transient.entry(pair).or_insert(false);
+                } else if let Some(ended) = transient.get_mut(&pair) {
+                    *ended = true;
+                }
+            } else {
+                part_touches.push((a, b, began));
+            }
+        }
+        let character_touch_start = part_touches.len();
+        let mut client_only = HashSet::new();
+        if let Some(mut now) = char_touches {
+            now.retain(|(a, b)| can_touch(&self.doc, *a) && can_touch(&self.doc, *b));
+            if let Some(ch) = self.play.as_mut().and_then(|s| s.character.as_mut()) {
+                part_touches.extend(now.difference(&ch.touch_pairs).map(|&(a, b)| (a, b, true)));
+                part_touches.extend(ch.touch_pairs.difference(&now).map(|&(a, b)| (a, b, false)));
+                // A fast crossing can begin and end between snapshots.
+                // Keep one complete solver event pair for that crossing.
+                for (pair @ (a, b), ended) in transient {
+                    if ended && !now.contains(&pair) && !ch.touch_pairs.contains(&pair) {
+                        part_touches.extend([(a, b, true), (a, b, false)]);
+                    }
+                }
+                client_only.extend(part_touches[character_touch_start..].iter().map(|&(_, b, _)| b)
+                    .filter(|&r| self.doc.dom.get_by_ref(r).is_none()));
+                ch.touching = now.iter().map(|&(_, b)| b).collect();
+                ch.touching.extend(ch.dynamic.floor_part.filter(|r| {
+                    !matches!(self.doc.prop(*r, "CanTouch"), Some(Variant::Bool(false)))
+                }));
+                ch.touch_pairs = now;
+            }
+        }
         let velocities = self
             .play
             .as_ref()
@@ -3307,7 +3649,7 @@ impl Game {
         let run_service = self.doc.find_child(root, "RunService");
         let humanoid_server = humanoid_ref.is_some().then_some(humanoid_ref);
         let mut phase = ServerPhase {
-            mode, dt, realtime, part_touches, char_part, char_began, char_ended, client_only, velocities,
+            mode, dt, realtime, part_touches, character_touch_start, client_only, velocities,
             state_names, npc_events, state_change, seat_change, move_event, running_speed, humanoid_server,
             seat_server, server_out: Default::default(),
         };
@@ -3362,15 +3704,12 @@ impl Game {
     /// The client half of a finished tick: client scripts with the keys of
     /// this display boundary, the client's own simulation, respawns, the view.
     fn finish_client_phase(&mut self, host: &mut dyn GameHost, mut phase: ServerPhase, display_keys: &mut PlayKeys) {
-        let PlayKeys { focused: focused_now, keys, began, ended } = display_keys;
+        let PlayKeys { focused: focused_now, keys, began, ended, perf_stats_toggle } = display_keys;
         let focused_now = *focused_now;
         let began = std::mem::take(began);
         let ended = std::mem::take(ended);
         let (mode, dt, realtime) = (phase.mode, phase.dt, phase.realtime);
-        let (char_part, humanoid_server, seat_server) = (phase.char_part, phase.humanoid_server, phase.seat_server);
-        let part_touches = std::mem::take(&mut phase.part_touches);
-        let char_began = std::mem::take(&mut phase.char_began);
-        let char_ended = std::mem::take(&mut phase.char_ended);
+        let (humanoid_server, seat_server) = (phase.humanoid_server, phase.seat_server);
         let velocities = std::mem::take(&mut phase.velocities);
         let state_names = std::mem::take(&mut phase.state_names);
         let sc = rustudio_core::bench::scope("p6_client_lua");
@@ -3378,20 +3717,23 @@ impl Game {
             let prep = rustudio_core::bench::scope("p6a_prep");
             // Server → client refs for just what this phase looks up (touches,
             // the character, humanoid states, moving parts): cloning the whole
-            // map (a large test place: 116k instances) was 0.75 ms a frame.
+            // map (116k instances) was 0.75 ms a frame.
+            let current_seat = self
+                .play
+                .as_ref()
+                .and_then(|s| s.character.as_ref())
+                .and_then(|c| c.seat);
             let map_s2c: rustudio_core::RefMap = self
                 .play
                 .as_ref()
                 .map(|s| {
                     let full = &s.map.s2c;
-                    part_touches
+                    phase.part_touches
                         .iter()
                         .flat_map(|(a, b, _)| [*a, *b])
-                        .chain([char_part])
-                        .chain(char_began.iter().copied())
-                        .chain(char_ended.iter().copied())
                         .chain(humanoid_server)
                         .chain(seat_server)
+                        .chain(current_seat)
                         .chain(velocities.keys().copied())
                         .chain(state_names.keys().copied())
                         .chain(s.character.as_ref().map(|c| c.rig.root))
@@ -3432,6 +3774,10 @@ impl Game {
                     ),
                     None => Default::default(),
                 };
+            let server_buttons = gui_events.iter()
+                .filter(|event| matches!(event, GuiEvent::Fire(_, "MouseButton1Down" | "MouseButton1Click", _)))
+                .cloned()
+                .collect();
             let gui_service = self
                 .play
                 .as_ref()
@@ -3439,18 +3785,21 @@ impl Game {
                 .and_then(|cd| cd.find_child(cd.dom.root_ref(), "GuiService"));
             // Mouse over the game view: position (GUI coordinates, under the
             // top bar), motion and wheel since last frame.
-            let (mouse_xy, mouse_delta, mouse_moved, wheel) = match self.play.as_mut() {
-                Some(s) => {
-                    let xy = s.game.last_pointer.map(|p| p.xy).unwrap_or([0.0, 0.0]);
-                    (
-                        xy,
-                        std::mem::take(&mut s.mouse_delta),
-                        std::mem::take(&mut s.mouse_moved),
-                        std::mem::take(&mut s.wheel),
-                    )
-                }
-                None => ([0.0, 0.0], glam::Vec2::ZERO, false, 0.0),
-            };
+            let (mouse_xy, mouse_delta, mouse_moved, mouse_move_processed, wheel, wheel_processed) =
+                match self.play.as_mut() {
+                    Some(s) => {
+                        let xy = s.game.last_pointer.map(|p| p.xy).unwrap_or([0.0, 0.0]);
+                        (
+                            xy,
+                            std::mem::take(&mut s.mouse_delta),
+                            std::mem::take(&mut s.mouse_moved),
+                            std::mem::take(&mut s.mouse_move_processed),
+                            std::mem::take(&mut s.wheel),
+                            std::mem::take(&mut s.wheel_processed),
+                        )
+                    }
+                    None => ([0.0, 0.0], glam::Vec2::ZERO, false, false, 0.0, false),
+                };
             let (mx, my) = (
                 mouse_xy[0] as f64,
                 (mouse_xy[1] - mech::GUI_TOP_INSET) as f64,
@@ -3497,9 +3846,70 @@ impl Game {
             let mut client_velocities = client_velocities;
             client_velocities.extend(client_own.iter().map(|(r, m)| (*r, m.0)));
             drop(prep);
+            let vehicle_input: Option<(Ref, Ref, f32, f32)> = current_seat
+                .filter(|&seat| self.doc.class_of(seat).as_deref() == Some("VehicleSeat"))
+                .and_then(|seat| map_s2c.get(&seat).copied().map(|cseat| (seat, cseat)))
+                .map(|(seat, cseat)| {
+                    let fwd = keys.contains("W") || keys.contains("Up");
+                    let back = keys.contains("S") || keys.contains("Down");
+                    let right = keys.contains("D") || keys.contains("Right");
+                    let left = keys.contains("A") || keys.contains("Left");
+                    let mut tf = (i32::from(fwd) - i32::from(back)) as f32;
+                    let mut sf = (i32::from(right) - i32::from(left)) as f32;
+                    if tf == 0.0 && sf == 0.0 {
+                        for input in &gamepads.inputs {
+                            if input.key == "Thumbstick1" {
+                                if input.position.y.abs() > 0.14 {
+                                    tf = input.position.y.clamp(-1.0, 1.0);
+                                }
+                                if input.position.x.abs() > 0.14 {
+                                    sf = input.position.x.clamp(-1.0, 1.0);
+                                }
+                            }
+                        }
+                    }
+                    (seat, cseat, tf, sf)
+                });
+            let mut vehicle_changed: Option<(Ref, i32, f32, i32, f32)> = None;
             let lua_sc = rustudio_core::bench::scope("p6b_lua");
             let server_doc_id = self.doc.id;
             self.with_side(Side::Client, |rt, _, _| {
+                if let Some((seat, cseat, tf, sf)) = vehicle_input {
+                    let ti = if tf > 0.0 { 1 } else if tf < 0.0 { -1 } else { 0 };
+                    let si = if sf > 0.0 { 1 } else if sf < 0.0 { -1 } else { 0 };
+                    let (cur_t, cur_tf, cur_s, cur_sf) = rt
+                        .world_mut()
+                        .map(|w| {
+                            let d = w.d();
+                            let i32p = |k: &str| match d.prop(cseat, k) {
+                                Some(Variant::Int32(n)) => n,
+                                Some(Variant::Float32(f)) => f as i32,
+                                _ => 0,
+                            };
+                            let f32p = |k: &str| match d.prop(cseat, k) {
+                                Some(Variant::Float32(f)) => f,
+                                Some(Variant::Int32(n)) => n as f32,
+                                _ => 0.0,
+                            };
+                            (i32p("Throttle"), f32p("ThrottleFloat"), i32p("Steer"), f32p("SteerFloat"))
+                        })
+                        .unwrap_or((0, 0.0, 0, 0.0));
+                    if cur_t != ti || (cur_tf - tf).abs() > 1e-4 || cur_s != si || (cur_sf - sf).abs() > 1e-4 {
+                        if cur_t != ti {
+                            rt.apply_prop(cseat, "Throttle", Variant::Int32(ti));
+                        }
+                        if (cur_tf - tf).abs() > 1e-4 {
+                            rt.apply_prop(cseat, "ThrottleFloat", Variant::Float32(tf));
+                        }
+                        if cur_s != si {
+                            rt.apply_prop(cseat, "Steer", Variant::Int32(si));
+                        }
+                        if (cur_sf - sf).abs() > 1e-4 {
+                            rt.apply_prop(cseat, "SteerFloat", Variant::Float32(sf));
+                        }
+                        vehicle_changed = Some((seat, ti, tf, si, sf));
+                    }
+                }
                 if let Some(mut w) = rt.world_mut() {
                     w.velocities = client_velocities;
                     // Angular velocities / awake counts for the client's
@@ -3591,7 +4001,7 @@ impl Game {
                         "Unknown",
                         (mx, my, 0.0),
                         (mouse_delta.x as f64, mouse_delta.y as f64),
-                        false,
+                        mouse_move_processed,
                     );
                 }
                 if wheel != 0.0 {
@@ -3601,7 +4011,7 @@ impl Game {
                         "Unknown",
                         (mx, my, wheel as f64),
                         (0.0, 0.0),
-                        false,
+                        wheel_processed,
                     );
                 }
                 // Button releases after the GUI's events (Up / Click / Activated).
@@ -3617,7 +4027,45 @@ impl Game {
                     rt.fire(*a, twin, vec![rt.inst(*b)]);
                     rt.fire(*b, twin, vec![rt.inst(*a)]);
                 }
-                phase.fire_humanoid(rt, humanoid_client, seat_server.and_then(|s| map_s2c.get(&s).copied()), true);
+                let cseat = seat_server.and_then(|s| map_s2c.get(&s).copied());
+                // Roblox switches CurrentCamera.CameraSubject to a VehicleSeat
+                // on sit (activating PlayerModule's VehicleCamera) and restores
+                // it to the Humanoid on stand.
+                if let (Some(sc), Some(chum)) = (&phase.seat_change, humanoid_client) {
+                    let cam_update = rt.world_mut().and_then(|w| {
+                        let d = w.d();
+                        let ws = d.workspace()?;
+                        let cam = match d.prop(ws, "CurrentCamera") {
+                            Some(Variant::Ref(c)) if d.exists(c) => c,
+                            _ => return None,
+                        };
+                        let cur = match d.prop(cam, "CameraSubject") {
+                            Some(Variant::Ref(r)) if r.is_some() => Some(r),
+                            _ => None,
+                        };
+                        if sc.active {
+                            let s = cseat?;
+                            if d.class_of(s).as_deref() == Some("VehicleSeat") && cur == Some(chum) {
+                                Some((cam, s))
+                            } else {
+                                None
+                            }
+                        } else if cur.is_some()
+                            && (cur == cseat
+                                || cur.is_some_and(|r| {
+                                    !d.exists(r) || d.class_of(r).as_deref() == Some("VehicleSeat")
+                                }))
+                        {
+                            Some((cam, chum))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((cam, subj)) = cam_update {
+                        rt.set(cam, "CameraSubject", rt.inst(subj));
+                    }
+                }
+                phase.fire_humanoid(rt, humanoid_client, cseat, true);
                 phase.fire_npcs(rt, Some(&map_s2c));
                 if let Some(mut w) = rt.world_mut() {
                     w.input.gamepads = gamepads.connected;
@@ -3637,6 +4085,9 @@ impl Game {
                         }
                     }
                 }
+                if !gamepads.inputs.is_empty() {
+                    rustudio_engine::gui::share().selection_visible = true;
+                }
                 for input in &gamepads.inputs {
                     ev(
                         input.state,
@@ -3645,6 +4096,23 @@ impl Game {
                         (f64::from(input.position.x), f64::from(input.position.y), 0.0),
                         (f64::from(input.delta.x), f64::from(input.delta.y)),
                         false,
+                    );
+                }
+                // Ctrl+Shift+F7 toggles PerformanceStats overlay (like Studio/Client).
+                let perf_shortcut = *perf_stats_toggle
+                    || (began.iter().any(|(k, processed)| !processed && k == "F7")
+                        && keys.contains("LeftControl")
+                        && keys.contains("LeftShift"));
+                if perf_shortcut {
+                    let _ = rustudio_engine::runtime::security::with_main_identity(
+                        &rt.lua,
+                        rustudio_engine::runtime::security::CORE,
+                        || {
+                            rt.lua
+                                .load(r#"local g = UserSettings():GetService("UserGameSettings"); g.PerformanceStatsVisible = not g.PerformanceStatsVisible"#)
+                                .set_name("=perf_stats_shortcut")
+                                .exec()
+                        },
                     );
                 }
                 for (list, state) in [(&began, "Begin"), (&ended, "End")] {
@@ -3699,6 +4167,16 @@ impl Game {
                 }
             });
             drop(lua_sc);
+            if let Some((seat, ti, tf, si, sf)) = vehicle_changed {
+                self.with_side(Side::Server, |rt, _, _| {
+                    rt.apply_prop(seat, "Throttle", Variant::Int32(ti));
+                    rt.apply_prop(seat, "ThrottleFloat", Variant::Float32(tf));
+                    rt.apply_prop(seat, "Steer", Variant::Int32(si));
+                    rt.apply_prop(seat, "SteerFloat", Variant::Float32(sf));
+                    rt.dispatch();
+                });
+            }
+            self.fire_server_gui_buttons(server_buttons);
             let req = rustudio_core::bench::scope("p6c_requests");
             self.game_requests(Side::Client);
             self.read_client_input_state();
@@ -3708,6 +4186,31 @@ impl Game {
                 self.hum_face_camera();
             }
             self.deliver_remotes();
+            // Client -> Server Animator replication for the local player's character
+            // (in Studio, the owning client drives its character's Animator and
+            // replicates those tracks back to the server Animator).
+            if let Some((s_anim, c_anim)) = self.play.as_ref().and_then(|s| {
+                let hum = s.character.as_ref()?.humanoid;
+                let sa = self
+                    .doc
+                    .dom
+                    .get_by_ref(hum)?
+                    .children()
+                    .iter()
+                    .copied()
+                    .find(|r| self.doc.class_of(*r).is_some_and(|c| c == "Animator"))?;
+                let ca = s.map.s2c.get(&sa).copied()?;
+                Some((sa, ca))
+            }) {
+                let snaps = self
+                    .with_side(Side::Client, |rt, _, _| {
+                        rustudio_engine::anim_replicate::collect_client_tracks(&rt.lua, c_anim)
+                    })
+                    .unwrap_or_default();
+                self.with_side(Side::Server, |rt, _, _| {
+                    rustudio_engine::anim_replicate::sync_from_client(&rt.lua, s_anim, &snaps);
+                });
+            }
             drop(req);
             // The client's own assemblies (its simulation step in Studio).
             let _cj = rustudio_core::bench::scope("p6d_client_joints");
@@ -3719,6 +4222,7 @@ impl Game {
             drop(_cj);
             let _cp = rustudio_core::bench::scope("p6e_client_physics");
             let server_doc = self.doc.id;
+            let mut client_fallen_signals: Vec<(Ref, Ref, Vec<Ref>)> = Vec::new();
             if let Some(s) = self.play.as_mut() {
                 // Velocities client scripts gave parts (the character's own
                 // stay for client_root_movers).
@@ -3789,10 +4293,8 @@ impl Game {
                     let can_touch = |r: Ref| !matches!(cd.prop(r, "CanTouch"), Some(Variant::Bool(false)));
                     s.client_touches
                         .extend(out.touches.into_iter().filter(|(a, b, _)| can_touch(*a) && can_touch(*b)));
-                    for r in out.fallen {
-                        cd.dom.transfer_within(r, Ref::none());
-                        cd.mark_tree(r);
-                    }
+                    let (c_sigs, _) = unparent_fallen_parts(cd, &out.fallen);
+                    client_fallen_signals.extend(c_sigs);
                     // Its step published the client world's stats under the
                     // client's document: the server's mirror goes back under
                     // them for scripts that run before the next frame's.
@@ -3802,6 +4304,9 @@ impl Game {
                         rustudio_physics::physics::live::overlay_spins(cd.id, own.into_iter().map(|(r, m)| (r, (m.1, m.2))));
                     }
                 }
+            }
+            for (r, old, below) in client_fallen_signals {
+                self.with_side(Side::Client, |rt, _, _| rt.notify_parent(r, old, Ref::none(), below));
             }
         }
         drop(sc);
@@ -3827,6 +4332,18 @@ impl Game {
             .is_some_and(|s| s.respawn_at.is_some_and(|t| s.time >= t));
         if due || !reload.is_empty() {
             self.respawn();
+        }
+        let initial_due = self.play.as_mut().is_some_and(|s| {
+            let Some(frames) = s.initial_spawn_frames.as_mut() else { return false };
+            *frames -= 1;
+            if *frames != 0 {
+                return false;
+            }
+            s.initial_spawn_frames = None;
+            true
+        });
+        if initial_due && self.character_auto_loads() {
+            self.spawn_character();
         }
         self.replicate();
 
@@ -3936,6 +4453,20 @@ impl Game {
         r.flatten()
     }
 
+    /// The chat button state and free rectangle of the client's top bar.
+    pub(crate) fn play_topbar(&self) -> (bool, Option<rustudio_engine::ltypes::LRect>) {
+        let Some(s) = self.play.as_ref() else {
+            return (true, None);
+        };
+        if let Some(view) = s.presentation.as_ref() {
+            return (view.chat_on, view.topbar_inset);
+        }
+        s.client
+            .as_ref()
+            .and_then(|c| c.world.as_ref())
+            .map_or((true, None), |w| (!w.core_gui_off.contains("Chat"), w.topbar_inset))
+    }
+
     /// `with_side` from outside the Play tick (the editor's UI, the plugin
     /// host): the server is put in front first and the shown side back
     /// after, so each side's runtime gets its own DataModel whichever side
@@ -4035,6 +4566,27 @@ fn script_enabled(d: &Document, r: Ref) -> bool {
 fn kept_on_spawn(d: &Document, r: Ref) -> bool {
     d.class_of(r).is_some_and(|c| doc::is_a(&c, "LayerCollector"))
         && matches!(d.prop(r, "ResetOnSpawn"), Some(Variant::Bool(false)))
+}
+
+/// Puts Studio's data model patch in the client's DataModel
+/// (core_scripts::install). Returns what to start and a line for Output.
+fn load_core_scripts(cdoc: &mut Document) -> Result<(rustudio_core::core_scripts::Installed, String), String> {
+    let path = rustudio_core::core_scripts::patch_path().ok_or_else(|| {
+        format!("CoreScripts: no {} in the Studio install", rustudio_core::core_scripts::PATCH)
+    })?;
+    let t0 = std::time::Instant::now();
+    let (installed, cached) =
+        rustudio_core::core_scripts::install_cached(cdoc, &path).map_err(|e| format!("CoreScripts: {e}"))?;
+    let note = format!(
+        "CoreScripts: {} modules and {} CoreScripts from {} ({} ms, {})",
+        installed.modules.len(),
+        installed.scripts.len(),
+        path.display(),
+        t0.elapsed().as_millis(),
+        if cached { "cached" } else { "decoded" }
+    );
+    rustudio_core::load_trace::mark("play: core scripts installed");
+    Ok((installed, note))
 }
 
 fn client_scripts(cd: &Document, under: &[Option<Ref>]) -> Vec<Ref> {
@@ -4170,6 +4722,25 @@ mod client_start_order_tests {
     use rbx_dom_weak::InstanceBuilder;
     use rustudio_engine::runtime::{RunMode, Side};
 
+    #[test]
+    fn play_uses_workspace_signal_behavior_on_both_sides() {
+        use super::SignalMode;
+        use rbx_dom_weak::{types::Enum, ustr};
+
+        let mut game = Game::new(None);
+        let workspace = game.doc.workspace().unwrap();
+        game.doc.dom.get_by_ref_mut(workspace).unwrap().properties.insert(
+            ustr("SignalBehavior2"),
+            Enum::from_u32(2).into(),
+        );
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let play = game.play.as_ref().unwrap();
+        for side in [&play.server, &play.client] {
+            let world = side.as_ref().unwrap().world.as_ref().unwrap();
+            assert_eq!(world.signal_mode, SignalMode::Deferred);
+        }
+    }
+
     /// Studio Play: a ReplicatedFirst LocalScript runs before the
     /// StarterPlayerScripts and StarterGui ones. A Future test place's
     /// boot cover (made in ReplicatedFirst, found and removed by a
@@ -4223,6 +4794,110 @@ mod client_start_order_tests {
         }
     }
 
+    #[test]
+    fn engine_join_and_spawn_notify_server_scripts_before_client_gui() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let sss = game.doc.find_child(root, "ServerScriptService").unwrap();
+        let sg = game.doc.find_child(root, "StarterGui").unwrap();
+        game.doc.dom.insert(sss, InstanceBuilder::new("Script").with_property("Source", r#"
+            local players = game:GetService("Players")
+            players.ChildAdded:Connect(function(player)
+                assert(player:IsA("Player") and player:FindFirstChildOfClass("Backpack"))
+                Instance.new("Folder", player).Name = "Joined"
+            end)
+            players.PlayerAdded:Connect(function(player)
+                player.Changed:Connect(function(property)
+                    if property == "Character" then
+                        Instance.new("Folder", player.Character).Name = "Assigned"
+                        local tool = Instance.new("Tool")
+                        tool.TextureId = "rbxassetid://123"
+                        tool.Parent = player.Backpack
+                    end
+                end)
+            end)
+            workspace.ChildAdded:Connect(function(model)
+                if players:GetPlayerFromCharacter(model) then
+                    Instance.new("Folder", model).Name = "Parented"
+                end
+            end)
+        "#.to_string()));
+        let gui = game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui"));
+        game.doc.dom.insert(gui, InstanceBuilder::new("LocalScript").with_property("Source", r#"
+            local player = game:GetService("Players").LocalPlayer
+            assert(player:FindFirstChild("Joined"), "join data missing when GUI started")
+            assert(player.Character:FindFirstChild("Assigned"), "Character Changed data missing when GUI started")
+            assert(player.Character:FindFirstChild("Parented"), "Workspace ChildAdded data missing when GUI started")
+            local tool = player.Backpack:FindFirstChildOfClass("Tool")
+            assert(tool and tool.TextureId == "rbxassetid://123", "spawn loadout missing when GUI started")
+            _G.spawnReady = true
+        "#.to_string()));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local player = game:GetService("Players").LocalPlayer
+                assert(player.Character == nil and _G.spawnReady == nil, "character or GUI ran at join")
+                assert(not player:FindFirstChild("Joined"), "join data arrived in the bootstrap snapshot")
+            "#),
+            None
+        );
+        tick(&mut game, 5);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local player = game:GetService("Players").LocalPlayer
+                assert(player:FindFirstChild("Joined"), "join data did not replicate")
+                assert(player.Character == nil and _G.spawnReady == nil, "character or GUI ran before the sixth heartbeat")
+            "#),
+            None
+        );
+        tick(&mut game, 1);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"assert(_G.spawnReady == true, "spawn GUI did not see initialized data")"#),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_player_gui_clicks_reach_server_scripts() {
+        use rustudio_engine::gui::{GuiArg, GuiEvent};
+
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let sg = game.doc.find_child(root, "StarterGui").unwrap();
+        game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_child(
+            InstanceBuilder::new("TextButton").with_child(
+                InstanceBuilder::new("Script").with_property("Source", r#"
+                    _G.events = {}
+                    script.Parent.MouseButton1Down:Connect(function(x, y)
+                        table.insert(_G.events, x .. "," .. y)
+                    end)
+                    script.Parent.MouseButton1Click:Connect(function()
+                        table.insert(_G.events, "clicked")
+                    end)
+                    script.Parent.Activated:Connect(function()
+                        table.insert(_G.events, "activated")
+                    end)
+                "#.to_string()),
+            ),
+        ));
+        game.play_shows_client = false;
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 6);
+        let s = game.play.as_ref().unwrap();
+        let gui = game.doc.find_child(s.player, "PlayerGui").unwrap();
+        let button = game.doc.dom.descendants_of(gui).find(|i| i.class == "TextButton").unwrap().referent();
+        let client = s.map.s2c[&button];
+        game.fire_server_gui_buttons(vec![
+            GuiEvent::Fire(client, "MouseButton1Down", vec![GuiArg::Num(12.0), GuiArg::Num(34.0)]),
+            GuiEvent::Fire(client, "MouseButton1Click", vec![]),
+            GuiEvent::Fire(client, "Activated", vec![]),
+        ]);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"assert(table.concat(_G.events, ";") == "12,34;clicked")"#),
+            None,
+        );
+    }
+
     /// Studio Play (measured): ReplicatedFirst, then StarterPlayerScripts
     /// (no character yet), then CharacterAdded, and only then StarterGui's
     /// LocalScripts, copied into PlayerGui when the character spawns. A
@@ -4239,9 +4914,29 @@ mod client_start_order_tests {
         let sg = game.doc.find_child(root, "StarterGui")
             .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("StarterGui").with_name("StarterGui")));
         let gui = game.doc.dom.insert(sg, InstanceBuilder::new("ScreenGui").with_name("G"));
+        let sss = game.doc.find_child(root, "ServerScriptService")
+            .unwrap_or_else(|| game.doc.dom.insert(root, InstanceBuilder::new("ServerScriptService")));
+        game.doc.dom.insert(sss, InstanceBuilder::new("Script").with_property("Source", r#"
+            local heartbeat = game:GetService("RunService").Heartbeat
+            game:GetService("Players").PlayerAdded:Connect(function(player)
+                local early = Instance.new("Folder")
+                early.Name = "Early"
+                early.Parent = player
+                for _ = 1, 5 do heartbeat:Wait() end
+                local afterBeat = Instance.new("Folder")
+                afterBeat.Name = "AfterBeat"
+                afterBeat.Parent = player
+            end)
+        "#.to_string()));
         game.doc.dom.insert(sps, ls(r#"
             local p = game:GetService("Players").LocalPlayer
             _G.log = { "sps char=" .. tostring(p.Character ~= nil) .. " g=" .. tostring(p.PlayerGui:FindFirstChild("G") ~= nil) }
+            assert(not p:FindFirstChild("Early"), "PlayerAdded changes arrived in the bootstrap packet")
+            p.ChildAdded:Connect(function(child)
+                if child.Name == "Early" or child.Name == "AfterBeat" then
+                    table.insert(_G.log, child.Name)
+                end
+            end)
             -- made before the first spawn: Studio keeps both through it
             Instance.new("ScreenGui", p.PlayerGui).Name = "PreGui"
             Instance.new("Folder", p.PlayerGui).Name = "PreFolder"
@@ -4252,6 +4947,7 @@ mod client_start_order_tests {
         "#));
         game.doc.dom.insert(gui, ls(r#"
             local p = game:GetService("Players").LocalPlayer
+            assert(p:FindFirstChild("AfterBeat"), "the GUI started before the player's replicated data")
             table.insert(_G.log, "gui char=" .. tostring(p.Character ~= nil))
         "#));
         game.start_play(RunMode::Play, &mut (), false, None);
@@ -4259,7 +4955,7 @@ mod client_start_order_tests {
         assert_eq!(
             game.run_luau(Side::Client, r#"
                 local got = table.concat(_G.log, ",")
-                assert(got == "sps char=false g=false,added,deferred,gui char=true", got)
+                assert(got == "sps char=false g=false,Early,AfterBeat,added,deferred,gui char=true", got)
                 local pg = game:GetService("Players").LocalPlayer.PlayerGui
                 assert(pg:FindFirstChild("PreGui") and pg:FindFirstChild("PreFolder"), "first spawn reset PlayerGui")
             "#),
@@ -4303,6 +4999,39 @@ mod client_start_order_tests {
                 assert(n("MadeKeeps") == 1, "MadeKeeps went")
                 assert(n("MadeFolder") == 0, "MadeFolder survived")
             "#),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_modules_folder_added_when_load_default_chat_enabled() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        if game.doc.find_child(root, "Chat").is_none() {
+            game.doc.dom.insert(root, InstanceBuilder::new("Chat").with_name("Chat"));
+        }
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"assert(game:GetService("Chat"):FindFirstChild("ChatModules") ~= nil, "missing ChatModules")"#),
+            None
+        );
+
+        let mut game_off = Game::new(None);
+        let root_off = game_off.doc.dom.root_ref();
+        let chat_off = game_off
+            .doc
+            .find_child(root_off, "Chat")
+            .unwrap_or_else(|| game_off.doc.dom.insert(root_off, InstanceBuilder::new("Chat").with_name("Chat")));
+        game_off
+            .doc
+            .dom
+            .get_by_ref_mut(chat_off)
+            .unwrap()
+            .properties
+            .insert(rbx_dom_weak::ustr("LoadDefaultChat"), rbx_dom_weak::types::Variant::Bool(false));
+        game_off.start_play(RunMode::Play, &mut (), false, None);
+        assert_eq!(
+            game_off.run_luau(Side::Server, r#"assert(game:GetService("Chat"):FindFirstChild("ChatModules") == nil, "unexpected ChatModules")"#),
             None
         );
     }
@@ -4361,6 +5090,28 @@ mod character_weld_and_fall_tests {
         "#), None);
     }
 
+    #[test]
+    fn player_uses_workspace_fallen_parts_height() {
+        let mut game = with_floor();
+        let workspace = game.doc.workspace().unwrap();
+        game.doc.set_prop_live(workspace, "FallenPartsDestroyHeight".into(), (-1000.0f32).into());
+        game.start_play(RunMode::Play, &mut (), false, None);
+        tick(&mut game, 10);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local character = game:GetService("Players"):GetPlayers()[1].Character
+            character:PivotTo(CFrame.new(0, -600, 0))
+        "#), None);
+        tick(&mut game, 10);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local character = game:GetService("Players"):GetPlayers()[1].Character
+            assert(character.HumanoidRootPart.Position.Y < -500)
+            assert(character.Humanoid.Health > 0)
+            character:PivotTo(CFrame.new(0, -1100, 0))
+        "#), None);
+        tick(&mut game, 10);
+        assert!(game.play.as_ref().unwrap().character.as_ref().unwrap().dead);
+    }
+
     /// Studio (measured in Play): a part below FallenPartsDestroyHeight goes
     /// to Parent nil: ChildRemoved and AncestryChanged fire, Destroying does
     /// not, and it can be parented back.
@@ -4389,6 +5140,43 @@ mod character_weld_and_fall_tests {
             _G.fallPart.Parent = workspace
             assert(_G.fallPart.Parent == workspace)
         "#), None);
+    }
+
+    /// When a Model's PrimaryPart falls below FallenPartsDestroyHeight,
+    /// PrimaryPart clears to nil and an ancestor Model left without BaseParts
+    /// is removed from the tree (matching Studio).
+    #[test]
+    fn fallen_primary_part_clears_primary_part_and_empty_model() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local m = Instance.new("Model"); m.Name = "FallModel"
+                local p = Instance.new("Part"); p.Name = "Handle"; p.Size = Vector3.new(1, 1, 1)
+                p.Position = Vector3.new(80, -490, 80); p.Parent = m
+                m.PrimaryPart = p
+                m.Parent = workspace
+                _G.fm = m
+                _G.fp = p
+            "#),
+            None
+        );
+        tick(&mut game, 180);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                assert(_G.fp.Parent == nil, "Handle should unparent")
+                assert(_G.fm.PrimaryPart == nil, "PrimaryPart should clear to nil")
+                assert(_G.fm.Parent == nil, "empty Model should unparent after last BasePart fell")
+            "#),
+            None
+        );
     }
 }
 
@@ -4449,9 +5237,87 @@ mod spawn_script_order_tests {
     }
 }
 
+/// Unparent parts that fell below `Workspace.FallenPartsDestroyHeight`.
+/// Matches Studio: clears `PrimaryPart` (preserving `WorldPivotData`) on any
+/// ancestor `Model` whose `PrimaryPart` fell, unparents the fallen part, and
+/// also unparents ancestor `Model`s (other than Workspace/characters) left
+/// with no remaining `BasePart` descendants. Returns `(signals, removed)`.
+fn unparent_fallen_parts(doc: &mut Document, fallen: &[Ref]) -> (Vec<(Ref, Ref, Vec<Ref>)>, Vec<Ref>) {
+    let mut signals: Vec<(Ref, Ref, Vec<Ref>)> = Vec::new();
+    let mut removed: Vec<Ref> = Vec::new();
+    for &r in fallen {
+        let Some(old) = doc.dom.get_by_ref(r).map(|i| i.parent()) else { continue };
+        if old.is_none() {
+            continue;
+        }
+        // Clear PrimaryPart on any ancestor Model pointing to `r` or its subtree.
+        let mut clear_models: Vec<(Ref, Option<rbx_dom_weak::types::CFrame>)> = Vec::new();
+        let mut cur = old;
+        while cur.is_some() {
+            let Some(inst) = doc.dom.get_by_ref(cur) else { break };
+            if doc::is_a(&inst.class, "Model") {
+                if let Some(Variant::Ref(pp)) = doc.prop(cur, "PrimaryPart") {
+                    if pp.is_some() && (pp == r || doc.is_ancestor(r, pp)) {
+                        let cf = match doc.prop(pp, "CFrame") {
+                            Some(Variant::CFrame(c)) => Some(c),
+                            _ => None,
+                        };
+                        clear_models.push((cur, cf));
+                    }
+                }
+            }
+            cur = inst.parent();
+        }
+        for (model, cf) in clear_models {
+            doc.set_prop_live(model, "PrimaryPart".into(), Variant::Ref(Ref::none()));
+            if let Some(c) = cf {
+                doc.set_prop_live(model, "WorldPivotData".into(), Variant::OptionalCFrame(Some(c)));
+            }
+        }
+        let below: Vec<Ref> = std::iter::once(r)
+            .chain(doc.dom.descendants_of(r).map(|i| i.referent()).filter(|d| *d != r))
+            .collect();
+        doc.dom.transfer_within(r, Ref::none());
+        doc.mark_tree(r);
+        signals.push((r, old, below));
+        removed.push(r);
+
+        // Studio removes ancestor Models left without any BasePart descendants
+        // after a part falls below FallenPartsDestroyHeight (excluding Workspace
+        // and character models carrying a Humanoid).
+        let mut anc = old;
+        while anc.is_some() {
+            let Some(inst) = doc.dom.get_by_ref(anc) else { break };
+            if inst.class != "Model" {
+                break;
+            }
+            let has_part_or_hum = doc
+                .dom
+                .descendants_of(anc)
+                .any(|d| d.referent() != anc && (doc::is_a(&d.class, "BasePart") || d.class == "Humanoid"));
+            if has_part_or_hum {
+                break;
+            }
+            let m_old = inst.parent();
+            let m_below: Vec<Ref> = std::iter::once(anc)
+                .chain(doc.dom.descendants_of(anc).map(|i| i.referent()).filter(|d| *d != anc))
+                .collect();
+            doc.dom.transfer_within(anc, Ref::none());
+            doc.mark_tree(anc);
+            if m_old.is_some() {
+                signals.push((anc, m_old, m_below));
+            }
+            removed.push(anc);
+            anc = m_old;
+        }
+    }
+    (signals, removed)
+}
+
 #[cfg(test)]
 mod respawn_gui_tests {
     use crate::game::Game;
+    use rbx_dom_weak::types::{self as rbx_types, Variant};
     use rbx_dom_weak::InstanceBuilder;
     use rustudio_engine::runtime::{RunMode, Side};
 
@@ -4527,6 +5393,307 @@ mod respawn_gui_tests {
                 assert(pg.Reset:GetAttribute('hp') == 100, 'hp after respawn ' .. tostring(pg.Reset:GetAttribute('hp')))
                 assert(_G.Keep == 1, 'Keep ran ' .. tostring(_G.Keep))
                 assert(pg.Keep == _G.keepGui, 'Keep was replaced')"),
+            None
+        );
+    }
+
+    /// Sitting in an unanchored VehicleSeat moves the character onto the seat
+    /// without pulling the vehicle toward the character, switches
+    /// CurrentCamera.CameraSubject to the VehicleSeat on the client, and
+    /// unseating zeroes Throttle/Steer and restores CameraSubject to Humanoid.
+    #[test]
+    fn vehicle_seat_seating_camera_subject_and_unseat() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let ws = game.doc.workspace().unwrap();
+        let car = game.doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Car"));
+        let chassis = game.doc.dom.insert(
+            car,
+            InstanceBuilder::new("Part")
+                .with_name("Chassis")
+                .with_property("Size", Variant::Vector3(rbx_types::Vector3::new(6.0, 1.0, 10.0)))
+                .with_property("CFrame", Variant::CFrame(rbx_types::CFrame::new(
+                    rbx_types::Vector3::new(40.0, 3.0, 0.0),
+                    rbx_types::Matrix3::identity(),
+                )))
+                .with_property("Anchored", Variant::Bool(false)),
+        );
+        let seat = game.doc.dom.insert(
+            car,
+            InstanceBuilder::new("VehicleSeat")
+                .with_name("DriveSeat")
+                .with_property("Size", Variant::Vector3(rbx_types::Vector3::new(2.0, 1.0, 2.0)))
+                .with_property("CFrame", Variant::CFrame(rbx_types::CFrame::new(
+                    rbx_types::Vector3::new(40.0, 4.0, 0.0),
+                    rbx_types::Matrix3::identity(),
+                )))
+                .with_property("Anchored", Variant::Bool(false)),
+        );
+        game.doc.dom.insert(
+            seat,
+            InstanceBuilder::new("WeldConstraint")
+                .with_name("SeatToChassis")
+                .with_property("Part0", Variant::Ref(chassis))
+                .with_property("Part1", Variant::Ref(seat)),
+        );
+        // Floor under spawn and car.
+        game.doc.dom.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_name("Floor")
+                .with_property("Size", Variant::Vector3(rbx_types::Vector3::new(200.0, 2.0, 200.0)))
+                .with_property("CFrame", Variant::CFrame(rbx_types::CFrame::new(
+                    rbx_types::Vector3::new(20.0, 0.0, 0.0),
+                    rbx_types::Matrix3::identity(),
+                )))
+                .with_property("Anchored", Variant::Bool(true)),
+        );
+        let _ = root;
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                local hum = plr.Character:WaitForChild("Humanoid")
+                workspace.Car.DriveSeat:Sit(hum)
+            "#),
+            None
+        );
+        tick(&mut game, 15);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local seat = workspace.Car.DriveSeat
+                local ch = workspace.Car.Chassis
+                assert(seat.Occupant ~= nil, "Occupant should be set")
+                assert(ch.Position.X > 35, "unanchored car must not teleport to spawn: " .. tostring(ch.Position))
+                local cam = workspace.CurrentCamera
+                assert(cam.CameraSubject == seat, "CameraSubject should switch to VehicleSeat, got " .. tostring(cam.CameraSubject))
+            "#),
+            None
+        );
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                plr.Character.Humanoid.Sit = false
+            "#),
+            None
+        );
+        tick(&mut game, 15);
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local plr = game:GetService("Players").LocalPlayer
+                local hum = plr.Character.Humanoid
+                local seat = workspace.Car.DriveSeat
+                assert(seat.Occupant == nil, "Occupant should clear on unseat")
+                assert(seat.Throttle == 0 and seat.Steer == 0, "Throttle/Steer should zero on unseat")
+                local cam = workspace.CurrentCamera
+                assert(cam.CameraSubject == hum, "CameraSubject should restore to Humanoid, got " .. tostring(cam.CameraSubject))
+            "#),
+            None
+        );
+    }
+
+    /// Custom StarterPlayer.StarterCharacter models keep their authored Motor6D
+    /// joints rather than being upgraded to read-only-C0 AnimationConstraints.
+    #[test]
+    fn custom_starter_character_keeps_motor6ds() {
+        let mut game = Game::new(None);
+        let sp = game.doc.find_child(game.doc.dom.root_ref(), "StarterPlayer").unwrap();
+        let sc = rustudio_engine::rig::insert_character(
+            &mut game.doc.dom,
+            sp,
+            "StarterCharacter",
+            rustudio_engine::rig::RigType::R15,
+            &rustudio_engine::rig::BodyColors::default(),
+            &rustudio_engine::rig::Scales::default(),
+            rbx_dom_weak::InstanceBuilder::new("Humanoid"),
+        );
+        assert!(game.doc.dom.descendants_of(sc).any(|i| i.class == "Motor6D"));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        for _ in 0..30 {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local ch = game:GetService("Players").LocalPlayer.Character
+                assert(ch, "character missing")
+                local waist = ch.UpperTorso:FindFirstChild("Waist")
+                assert(waist and waist:IsA("Motor6D"), "expected Motor6D Waist, got " .. tostring(waist and waist.ClassName))
+                local c0 = waist.C0
+                waist.C0 = c0 * CFrame.Angles(0.1, 0, 0)
+            "#),
+            None
+        );
+    }
+
+    #[test]
+    fn first_character_load_resets_camera_type_to_custom_but_respawn_preserves_scriptable() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let players = match game.doc.find_child(root, "Players") {
+            Some(p) => p,
+            None => game
+                .doc
+                .dom
+                .insert(root, InstanceBuilder::new("Players").with_name("Players")),
+        };
+        if let Some(i) = game.doc.dom.get_by_ref_mut(players) {
+            i.properties.insert(
+                rbx_dom_weak::ustr("CharacterAutoLoads"),
+                rbx_dom_weak::types::Variant::Bool(false),
+            );
+        }
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 5);
+        assert_eq!(
+            game.run_luau(
+                Side::Client,
+                r#"local cam = workspace.CurrentCamera
+                cam.CameraType = Enum.CameraType.Scriptable
+                assert(cam.CameraType == Enum.CameraType.Scriptable)"#,
+            ),
+            None
+        );
+        assert_eq!(
+            game.run_luau(
+                Side::Server,
+                "game:GetService('Players'):GetPlayers()[1]:LoadCharacter()",
+            ),
+            None
+        );
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(
+                Side::Client,
+                r#"local cam = workspace.CurrentCamera
+                assert(cam.CameraType == Enum.CameraType.Custom, 'first load should reset to Custom, got ' .. tostring(cam.CameraType))
+                assert(cam.CameraSubject ~= nil and cam.CameraSubject:IsA('Humanoid'), 'subject should be Humanoid')
+                cam.CameraType = Enum.CameraType.Scriptable"#,
+            ),
+            None
+        );
+        assert_eq!(
+            game.run_luau(
+                Side::Server,
+                "game:GetService('Players'):GetPlayers()[1]:LoadCharacter()",
+            ),
+            None
+        );
+        tick(&mut game, 10);
+        assert_eq!(
+            game.run_luau(
+                Side::Client,
+                r#"local cam = workspace.CurrentCamera
+                assert(cam.CameraType == Enum.CameraType.Scriptable, 'respawn should preserve Scriptable, got ' .. tostring(cam.CameraType))"#,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn remote_event_fire_before_client_connect_is_delivered_on_connect() {
+        let mut game = Game::new(None);
+        let root = game.doc.dom.root_ref();
+        let rs = game
+            .doc
+            .find_child(root, "ReplicatedStorage")
+            .unwrap_or_else(|| {
+                game.doc
+                    .dom
+                    .insert(root, InstanceBuilder::new("ReplicatedStorage").with_name("ReplicatedStorage"))
+            });
+        game.doc
+            .dom
+            .insert(rs, InstanceBuilder::new("RemoteEvent").with_name("WaveEvent"));
+        let sss = game
+            .doc
+            .find_child(root, "ServerScriptService")
+            .unwrap_or_else(|| {
+                game.doc.dom.insert(
+                    root,
+                    InstanceBuilder::new("ServerScriptService").with_name("ServerScriptService"),
+                )
+            });
+        game.doc.dom.insert(
+            sss,
+            InstanceBuilder::new("Script")
+                .with_name("WaveSender")
+                .with_property(
+                    "Source",
+                    r#"
+                    local Players = game:GetService("Players")
+                    local re = game:GetService("ReplicatedStorage"):WaitForChild("WaveEvent")
+                    -- Fired before any player has joined: must reach zero clients.
+                    re:FireAllClients("pre-join-ignored")
+                    Players.PlayerAdded:Connect(function(p)
+                        re:FireClient(p, "early-1")
+                        re:FireClient(p, "early-2")
+                    end)
+                    "#,
+                ),
+        );
+        let sp = game
+            .doc
+            .find_child(root, "StarterPlayer")
+            .unwrap_or_else(|| {
+                game.doc
+                    .dom
+                    .insert(root, InstanceBuilder::new("StarterPlayer").with_name("StarterPlayer"))
+            });
+        let sps = game
+            .doc
+            .find_child(sp, "StarterPlayerScripts")
+            .unwrap_or_else(|| {
+                game.doc.dom.insert(
+                    sp,
+                    InstanceBuilder::new("StarterPlayerScripts")
+                        .with_name("StarterPlayerScripts"),
+                )
+            });
+        game.doc.dom.insert(
+            sps,
+            InstanceBuilder::new("LocalScript")
+                .with_name("LateListener")
+                .with_property(
+                    "Source",
+                    r#"
+                    local re = game:GetService("ReplicatedStorage"):WaitForChild("WaveEvent")
+                    -- Delay connecting past the first frames, like Knit bootstrapping controllers.
+                    task.wait(0.1)
+                    _G.received = {}
+                    re.OnClientEvent:Connect(function(tag)
+                        table.insert(_G.received, tag)
+                    end)
+                    "#,
+                ),
+        );
+
+        game.start_play(RunMode::Play, &mut (), false, None);
+        assert!(game.is_playing());
+        let ctx = egui::Context::default();
+        for _ in 0..20 {
+            game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+        }
+        assert_eq!(
+            game.run_luau(
+                Side::Client,
+                r#"local got = table.concat(_G.received or {}, ",")
+                assert(got == "early-1,early-2", "expected queued remotes, got: " .. got)"#,
+            ),
             None
         );
     }

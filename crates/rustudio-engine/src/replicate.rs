@@ -11,6 +11,9 @@ use rbx_dom_weak::{ustr, InstanceBuilder, Ustr, WeakDom};
 
 use rustudio_core::doc::Document;
 use crate::runtime::{RemoteMsg, RepOp, Runtime};
+use crate::replicate_streaming::{self, Streaming};
+
+pub use crate::replicate_streaming::StreamRequest;
 
 /// Services whose contents never reach the client.
 pub const SERVER_ONLY: &[&str] = &["ServerStorage", "ServerScriptService"];
@@ -30,6 +33,7 @@ enum RepKey {
 pub struct RepMap {
     pub s2c: rustudio_core::RefMap,
     pub c2s: rustudio_core::RefMap,
+    streaming: Option<Streaming>,
     /// Server changes not yet applied to the client, oldest first.
     queue: VecDeque<Pending>,
     /// Ops enqueued so far (each op's sequence number).
@@ -96,6 +100,43 @@ const PIECE: usize = 128;
 const MOVE_BATCH: usize = 32;
 
 impl RepMap {
+    pub fn streaming(&self) -> bool {
+        self.streaming.is_some()
+    }
+
+    pub fn set_streaming_spawn(&mut self, position: glam::Vec3) {
+        if let Some(state) = &mut self.streaming {
+            state.spawn_focus = Some(position);
+        }
+    }
+
+    pub fn streaming_collider_revision(&self) -> Option<u64> {
+        self.streaming.as_ref().map(|s| s.collider_revision)
+    }
+
+    pub fn unstreamed_parts(&self) -> impl Iterator<Item = Ref> + '_ {
+        self.streaming.iter().flat_map(Streaming::part_refs)
+            .filter(|r| !self.s2c.contains_key(r))
+    }
+
+    pub fn gameplay_paused(&self) -> bool {
+        self.streaming.as_ref().is_some_and(|s| s.paused)
+    }
+
+    pub fn forget_collected_client(&mut self, freed: &[Ref]) {
+        if let Some(state) = &mut self.streaming {
+            for c in freed {
+                if let Some(s) = state.parked_client.remove(c) {
+                    state.parked.remove(&s);
+                }
+            }
+        }
+    }
+
+    fn allowed(&self, r: Ref) -> bool {
+        self.streaming.as_ref().is_none_or(|s| s.allowed(r))
+    }
+
     /// Changes each time a server ↔ client pair is made or dropped.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -105,6 +146,9 @@ impl RepMap {
         self.revision += 1;
         self.s2c.insert(s, c);
         self.c2s.insert(c, s);
+        if let Some(state) = &mut self.streaming {
+            state.part_mapping_changed(s);
+        }
         if self.pending_refs.contains_key(&s) {
             self.arrived.push(s);
         }
@@ -114,6 +158,9 @@ impl RepMap {
         self.revision += 1;
         if let Some(s) = self.c2s.remove(&c) {
             self.s2c.remove(&s);
+            if let Some(state) = &mut self.streaming {
+                state.part_mapping_changed(s);
+            }
         }
     }
 
@@ -225,10 +272,7 @@ fn copy_subtree(
     map: &mut RepMap,
     created: &mut Vec<Ref>,
 ) -> Option<Ref> {
-    let b = builder_of(src, r)?;
-    let c = dst.insert(parent, b);
-    map.link(r, c);
-    created.push(c);
+    let c = copy_one(src, r, dst, parent, map, created)?;
     // A stack, children pushed last-first: each parent gets its children in
     // the server's order (Roblox's GetChildren is the file's order; Place B
     // Newer's Fast Travel list, LayoutOrder ties, read upside down when the
@@ -241,16 +285,54 @@ fn copy_subtree(
         .map(|k| (*k, c))
         .collect();
     while let Some((s, cp)) = queue.pop() {
-        let Some(b) = builder_of(src, s) else {
+        let Some(cc) = copy_one(src, s, dst, cp, map, created) else {
             continue;
         };
-        let cc = dst.insert(cp, b);
-        map.link(s, cc);
-        created.push(cc);
         if let Some(i) = src.get_by_ref(s) {
             queue.extend(i.children().iter().rev().map(|k| (*k, cc)));
         }
     }
+    Some(c)
+}
+
+fn copy_one(
+    src: &WeakDom, r: Ref, dst: &mut WeakDom, parent: Ref, map: &mut RepMap,
+    created: &mut Vec<Ref>,
+) -> Option<Ref> {
+    if map.streaming() && (!map.allowed(r) || map.s2c.contains_key(&r)) {
+        return None;
+    }
+    let i = src.get_by_ref(r)?;
+    let retained = map.streaming.as_mut().and_then(|s| {
+        let c = s.parked.remove(&r)?;
+        s.parked_client.remove(&c);
+        Some(c)
+    });
+    let c = if let Some(c) = retained.filter(|c| dst.get_by_ref(*c).is_some()) {
+        let children = dst.get_by_ref(c)?.children().to_vec();
+        for child in children {
+            // Parked server children that are no longer eligible may
+            // need their own independent arrival later.
+            if map.streaming.as_ref().is_some_and(|s| s.parked_client.get(&child).is_some_and(|&sr| {
+                !s.allowed(sr) || src.get_by_ref(sr).is_none_or(|i| i.parent() != r)
+            })) {
+                dst.transfer_within(child, Ref::none());
+            }
+        }
+        let copy = dst.get_by_ref_mut(c)?;
+        copy.name = i.name.clone();
+        copy.properties = i.properties.clone();
+        dst.transfer_within(c, parent);
+        c
+    } else {
+        let mut builder = builder_of(src, r)?;
+        if i.class == "Terrain" && map.streaming() {
+            builder.add_property("SmoothGrid", Variant::BinaryString(rustudio_core::terrain::Voxels::empty().encode().into()));
+        }
+        dst.insert(parent, builder)
+    };
+    map.link(r, c);
+    created.push(c);
     Some(c)
 }
 
@@ -313,6 +395,9 @@ fn flush_refs(client: &Runtime, map: &mut RepMap) {
 /// server-only services present but empty.
 pub fn initial_client(server: &Document, title: String) -> (Document, RepMap) {
     let mut map = RepMap::default();
+    if replicate_streaming::enabled(server) {
+        map.streaming = Some(Streaming::new(server));
+    }
     let sroot = server.dom.root();
     let mut root_b = InstanceBuilder::new(sroot.class).with_name(sroot.name.clone());
     for (k, v) in &sroot.properties {
@@ -337,10 +422,99 @@ pub fn initial_client(server: &Document, title: String) -> (Document, RepMap) {
             copy_subtree(&server.dom, child, &mut dom, croot, &mut map, &mut created);
         }
     }
-    remap_refs(None, &mut dom, &created, &mut map);
+    let source = map.streaming().then_some(server);
+    remap_refs(source, &mut dom, &created, &mut map);
     let mut doc = Document::from_play_dom(dom, title);
     doc.revision += 1;
     (doc, map)
+}
+
+/// Updates Workspace interest before the normal ordered replication drain.
+pub fn update_streaming(
+    server: &Document, client: &Runtime, map: &mut RepMap, player: Ref,
+    ops: &mut Vec<RepOp>, mut requests: Vec<StreamRequest>,
+) {
+    let Some(state) = &mut map.streaming else { return };
+    let Some(mut world) = client.world_mut() else { return };
+    requests.extend(world.stream_requests.drain(..).map(|mut request| {
+        request.player = map.c2s.get(&request.player).copied().unwrap_or_else(Ref::none);
+        request
+    }));
+    let time = world.time;
+    drop(world);
+    state.player = player;
+    state.changed(server, ops);
+    let changed = state.step(server, time, requests);
+    let terrain = state.terrain_blob.take();
+    let paused = state.paused;
+    if changed {
+        let mut departures = Vec::new();
+        if let Some(mut w) = client.world_mut() {
+            let d = w.dm();
+            for s in std::mem::take(&mut state.departures) {
+                let Some(&c) = map.s2c.get(&s) else { continue };
+                let cp = d.dom.get_by_ref(c).map(|i| i.parent()).unwrap_or_else(Ref::none);
+                if map.c2s.get(&cp).is_none_or(|p| state.allowed(*p)) {
+                    departures.push(c);
+                }
+            }
+        }
+        if departures.len() >= 8 && client.stream_out_workspace_parts(&departures) {
+            for c in departures {
+                park_mapping(map, c);
+            }
+        } else {
+            for c in departures {
+                park(client, map, c);
+            }
+        }
+        let arrivals = map.streaming.as_ref().unwrap().arrivals(&map.s2c);
+        ops.extend(arrivals.into_iter().map(RepOp::Parent));
+    }
+    if let Some(blob) = terrain {
+        let terrain = server.workspace().and_then(|ws| server.find_child(ws, "Terrain"));
+        if let Some(c) = terrain.and_then(|r| map.s2c.get(&r).copied()) {
+            client.apply_prop(c, "SmoothGrid", Variant::BinaryString(blob.into()));
+        }
+    }
+    if let Some(&c) = map.s2c.get(&player) {
+        let value = Variant::Bool(paused);
+        let changed = client.world_mut().is_some_and(|w| w.d().prop(c, "GameplayPaused").unwrap_or(Variant::Bool(false)) != value);
+        if changed {
+            client.apply_prop(c, "GameplayPaused", value);
+        }
+    }
+}
+
+fn park(client: &Runtime, map: &mut RepMap, root: Ref) {
+    let subtree = client.world_mut().map(|mut w| w.dm().subtree(root)).unwrap_or_default();
+    client.apply_parent(root, Ref::none());
+    for c in subtree {
+        park_mapping(map, c);
+    }
+}
+
+fn park_mapping(map: &mut RepMap, c: Ref) {
+    if let Some(&s) = map.c2s.get(&c) {
+        map.unlink_client(c);
+        let state = map.streaming.as_mut().unwrap();
+        state.parked.insert(s, c);
+        state.parked_client.insert(c, s);
+    }
+}
+
+pub fn finish_streaming(server: &Document, client: &Runtime, map: &mut RepMap) {
+    let empty = map.queue.is_empty();
+    let Some(state) = &mut map.streaming else { return };
+    if empty {
+        state.complete_requests();
+    }
+    if empty && !state.ready && state.initial_stream_delivered() && map.s2c.contains_key(&state.player) {
+        state.ready = true;
+        if let Some(ws) = server.workspace().and_then(|w| map.s2c.get(&w).copied()) {
+            client.fire(ws, "PersistentLoaded", Vec::new());
+        }
+    }
 }
 
 /// Applies server changes to the client, all of them now (engine steps
@@ -467,24 +641,42 @@ fn arrive(
     seq: u64,
     created: &mut Vec<Ref>,
 ) -> bool {
-    let big = !whole && server.dom.descendants_of(r).nth(PIECE).is_some();
-    let mut new_refs = Vec::new();
-    let copy = {
+    let atomic = map.streaming.as_ref().is_some_and(|state| state.atomic(r));
+    let parked = map.streaming.as_ref().is_some_and(|state| state.parked.contains_key(&r));
+    let big = !whole && !atomic && !parked && server.dom.descendants_of(r).nth(PIECE).is_some();
+    let first_created = created.len();
+    let (copy, attached) = {
         let Some(mut w) = client.world_mut() else {
             return false;
         };
+        // A fresh leaf has no client instance for existing joints or scripts
+        // to reference yet. Put it directly under Workspace and queue the
+        // same parent signals after remapping its properties.
+        let direct = map.streaming()
+            && !parked
+            && w.d().workspace() == Some(cp)
+            && server.dom.get_by_ref(r).is_some_and(|instance| {
+                instance.children().is_empty()
+                    && instance.class != "Terrain"
+                    && rustudio_core::doc::is_a(&instance.class, "BasePart")
+            });
         let copy = if big {
             builder_of(&server.dom, r).map(|b| {
                 let c = w.dm().dom.insert(Ref::none(), b);
                 map.link(r, c);
-                new_refs.push(c);
+                created.push(c);
                 c
             })
         } else {
-            copy_subtree(&server.dom, r, &mut w.dm().dom, Ref::none(), map, &mut new_refs)
+            let parent = if direct { cp } else { Ref::none() };
+            copy_subtree(&server.dom, r, &mut w.dm().dom, parent, map, created)
         };
-        remap_refs(Some(server), &mut w.dm().dom, &new_refs, map);
+        let new_refs = &created[first_created..];
+        remap_refs(Some(server), &mut w.dm().dom, new_refs, map);
         w.structure_changed = true;
+        if let Some(c) = copy.filter(|_| direct) {
+            w.dm().mark_tree(c);
+        }
         // A new instance: class, name, parent and every property.
         let bytes: u64 = new_refs
             .iter()
@@ -492,12 +684,15 @@ fn arrive(
             .map(|i| 10 + i.name.len() as u64 + i.properties.values().map(|v| 2 + crate::runtime::domains::services::perf::value_bytes(v)).sum::<u64>())
             .sum();
         crate::runtime::domains::services::perf::net(true, false, bytes);
-        copy
+        (copy, direct)
     };
     if let Some(c) = copy {
-        client.apply_parent(c, cp);
+        if attached {
+            client.notify_parent(c, Ref::none(), cp, vec![c]);
+        } else {
+            client.apply_parent_replicated(c, cp);
+        }
     }
-    created.extend(new_refs);
     if big {
         map.queue.push_front(Pending { seq, at: Instant::now(), kind: PendingKind::Attach { s: r, next: 0 } });
     }
@@ -528,7 +723,7 @@ fn attach(
     while k < kids.len() {
         let sc = kids[k];
         k += 1;
-        if map.s2c.contains_key(&sc) {
+        if map.s2c.contains_key(&sc) || !map.allowed(sc) {
             continue;
         }
         if did && over(map) {
@@ -568,6 +763,9 @@ fn apply_op(
 ) {
     match op {
         RepOp::Prop(r, name) => {
+            if name == "SmoothGrid" && map.streaming() && server.class_of(r).is_some_and(|c| c == "Terrain") {
+                return;
+            }
             if !seen_props.insert((r, RepKey::Prop(ustr(&name)))) {
                 return;
             }
@@ -642,7 +840,22 @@ fn apply_op(
                 crate::runtime::domains::services::perf::net(true, false, 6 + i.name.len() as u64 + 2);
             }
         }
+        RepOp::Persistence(_, _, _) => {}
         RepOp::Destroy(r) => {
+            if let Some(state) = &mut map.streaming {
+                state.persistence.remove(&r);
+                if let Some(c) = state.parked.remove(&r) {
+                    let subtree = client.world_mut().map(|mut w| w.dm().subtree(c)).unwrap_or_default();
+                    client.apply_destroy(c);
+                    state.parked_client.remove(&c);
+                    for child in subtree {
+                        if let Some(s) = state.parked_client.remove(&child) {
+                            state.parked.remove(&s);
+                        }
+                    }
+                    return;
+                }
+            }
             // Studio's DestroyInstance item: the client runs Destroy on its
             // copy (one op, however big the subtree).
             let Some(c) = map.s2c.get(&r).copied() else {
@@ -664,12 +877,18 @@ fn apply_op(
                 .get_by_ref(r)
                 .map(|i| i.parent())
                 .unwrap_or_else(Ref::none);
+            if !map.allowed(r) {
+                if let Some(&c) = map.s2c.get(&r) {
+                    park(client, map, c);
+                }
+                return;
+            }
             let visible = server.dom.get_by_ref(r).is_some() && replicated(server, r);
             let cp = map.s2c.get(&sp).copied();
             match (visible, map.s2c.get(&r).copied(), cp) {
                 (true, Some(c), Some(cp)) => {
                     crate::runtime::domains::services::perf::net(true, false, 10);
-                    client.apply_parent(c, cp)
+                    client.apply_parent_replicated(c, cp)
                 }
                 (true, None, Some(cp)) => {
                     // New to the client: copy it (unparented), then parent it
@@ -733,6 +952,320 @@ mod tests {
         }
         drop(w);
         c.dispatch();
+    }
+
+    #[test]
+    fn batched_workspace_stream_out_preserves_survivors_and_signal_order() {
+        let (_, client, _) = pair();
+        client.lua.load(r#"
+            for n = 1, 9 do
+                local part = Instance.new("Part")
+                part.Name = "StreamPart" .. n
+                part.Anchored = true
+                part.Parent = workspace
+            end
+            _G.departed = {}
+            workspace.ChildRemoved:Connect(function(instance)
+                table.insert(_G.departed, instance.Name .. ":" .. tostring(instance.Parent))
+            end)
+        "#).exec().unwrap();
+        let refs = {
+            let world = client.world_mut().unwrap();
+            let doc = world.d();
+            let workspace = doc.workspace().unwrap();
+            (1..=9).map(|n| doc.find_named(workspace, &format!("StreamPart{n}")).unwrap()).collect::<Vec<_>>()
+        };
+        let removed = [refs[3], refs[1], refs[7], refs[4]];
+        assert!(client.stream_out_workspace_parts(&removed));
+        client.dispatch();
+        let actual: String = client.lua.load(r#"
+            local survivors = {}
+            for _, instance in workspace:GetChildren() do
+                if instance.Name:match("^StreamPart") then
+                    table.insert(survivors, instance.Name)
+                end
+            end
+            return table.concat(survivors, ",") .. "|" .. table.concat(_G.departed, ",")
+        "#).eval().unwrap();
+        assert_eq!(
+            actual,
+            "StreamPart1,StreamPart3,StreamPart6,StreamPart7,StreamPart9|StreamPart4:nil,StreamPart2:nil,StreamPart8:nil,StreamPart5:nil",
+        );
+    }
+
+    fn streaming_probe(mode: &str) -> (Runtime, Runtime, RepMap, Ref) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../checks/streaming/places").join(format!("{mode}.rbxlx"));
+        let mut sd = Document::open(&path).unwrap();
+        sd.ensure_services();
+        let ws = sd.workspace().unwrap();
+        let model = sd.dom.insert(ws, InstanceBuilder::new("Model").with_name("Character"));
+        sd.dom.insert(model, InstanceBuilder::new("Part").with_name("HumanoidRootPart"));
+        let players = sd.find_child(sd.dom.root_ref(), "Players").unwrap();
+        let player = sd.dom.insert(players, InstanceBuilder::new("Player")
+            .with_name("Tester").with_property("Character", Variant::Ref(model)));
+        let (cd, map) = initial_client(&sd, "client".into());
+        assert!(map.streaming());
+        let mut sw = World::new(sd, RunMode::Play);
+        sw.has_peer = true;
+        let s = Runtime::new().unwrap();
+        s.enter(sw);
+        s.bind_globals().unwrap();
+        let mut cw = World::new(cd, RunMode::Play);
+        cw.side = Side::Client;
+        cw.has_peer = true;
+        let c = Runtime::new().unwrap();
+        c.enter(cw);
+        c.bind_globals().unwrap();
+        (s, c, map, player)
+    }
+
+    fn stream_at(s: &Runtime, c: &Runtime, map: &mut RepMap, player: Ref, time: f64) {
+        c.world_mut().unwrap().time = time;
+        let mut ops = ops(s);
+        let sw = s.world_mut().unwrap();
+        update_streaming(sw.d(), c, map, player, &mut ops, Vec::new());
+        apply(sw.d(), c, map, ops);
+        finish_streaming(sw.d(), c, map);
+        drop(sw);
+        c.dispatch();
+        c.step(1.0 / 60.0);
+    }
+
+    fn drain_weld_map(s: &Runtime, c: &Runtime, map: &mut RepMap, o: &mut Vec<RepOp>) {
+        let mut frames = 0;
+        loop {
+            {
+                let w = s.world_mut().unwrap();
+                map.begin_frame(1.0 / 60.0);
+                map.frame_budget = Some(Duration::from_millis(2));
+                apply_budgeted(w.d(), c, map, std::mem::take(o));
+            }
+            c.dispatch();
+            frames += 1;
+            assert!(frames < 100_000, "replication backlog failed to drain");
+            if map.backlog() == 0 {
+                break;
+            }
+        }
+    }
+
+    /// A big welded model (every part welded to an anchored base, all
+    /// siblings under one Model) streams over a budgeted client in pieces:
+    /// each piece regroups the one growing assembly, which must stay
+    /// linear in its size (it was quadratic while the member sort scanned
+    /// the Model's children per joint), and ends
+    /// as one assembly rooted at the base.
+    #[test]
+    fn welded_map_streams_in_without_quadratic_regroups() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local m = Instance.new('Model') m.Name = 'Map'\n\
+            local base = Instance.new('Part') base.Name = 'Base' base.Anchored = true base.Parent = m\n\
+            for i = 1, 3000 do local p = Instance.new('Part') p.Name = 'P' .. i p.Position = Vector3.new(i, 0, 0)\n\
+              local w = Instance.new(if i % 2 == 0 then 'Weld' else 'WeldConstraint')\n\
+              if i % 2 == 0 then w.C0 = CFrame.new(i, 0, 0) end\n\
+              w.Part0 = base w.Part1 = p w.Parent = p p.Parent = m end\n\
+            m.Parent = workspace").exec().unwrap();
+        let mut o = ops(&s);
+        drain_weld_map(&s, &c, &mut map, &mut o);
+        let joined: String = c.lua.load("local m = workspace.Map local n = 0\n\
+            for _, p in m:GetChildren() do if p.AssemblyRootPart == m.Base then n += 1 end end\n\
+            return n .. ' ' .. #m:GetChildren()").eval().unwrap();
+        assert_eq!(joined, "3001 3001");
+    }
+
+    /// A map whose parts are welded to each other (a chain from an anchored
+    /// base: no part is a leaf) streams in piece by piece, and each piece
+    /// is posed against the parts already there, not by walking the map
+    /// from its roots (which walked every part already there for each
+    /// piece).
+    #[test]
+    fn chained_welded_map_poses_only_the_arriving_pieces() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local m = Instance.new('Model') m.Name = 'Map'\n\
+            local base = Instance.new('Part') base.Name = 'Base' base.Anchored = true base.Parent = m\n\
+            local prev = base\n\
+            for i = 1, 3000 do local p = Instance.new('Part') p.Name = 'P' .. i p.Position = Vector3.new(i, 0, 0)\n\
+              local w = Instance.new('Weld') w.Part0 = prev w.Part1 = p w.C0 = prev.CFrame:Inverse() * p.CFrame w.Parent = p\n\
+              p.Parent = m prev = p end\n\
+            m.Parent = workspace").exec().unwrap();
+        let mut o = ops(&s);
+        rustudio_core::bench::take_sections();
+        drain_weld_map(&s, &c, &mut map, &mut o);
+        let walked: f64 = rustudio_core::bench::take_sections().iter().filter(|e| e.0 == "count: jp_walked").map(|e| e.1).sum();
+        assert!(walked <= 2.0 * 3001.0, "{walked} parts walked to pose a 3001-part map");
+        let last: String = c.lua.load("return tostring(workspace.Map.P3000.Position) .. ' ' .. workspace.Map.P3000.AssemblyRootPart.Name").eval().unwrap();
+        assert_eq!(last, "3000, 0, 0 Base");
+    }
+
+    /// A replicated part welded to a part the client moved itself (its
+    /// own character's hand) is posed against the client's copy of it.
+    #[test]
+    fn arriving_weld_poses_against_the_clients_part() {
+        let (s, c, mut map) = pair();
+        s.lua.load("local h = Instance.new('Part') h.Name = 'Hand' h.Size = Vector3.new(4, 4, 4) h.Position = Vector3.new(0, 10, 0) h.Parent = workspace").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        c.lua.load("workspace.Hand.CFrame = CFrame.new(5, 10, 0)").exec().unwrap();
+        s.lua.load("local a = Instance.new('Part') a.Name = 'Hat' a.Position = Vector3.new(0, 12, 0)\n\
+            local w = Instance.new('Weld') w.Part0 = workspace.Hand w.Part1 = a w.C0 = CFrame.new(0, 2, 0) w.Parent = a\n\
+            a.Parent = workspace").exec().unwrap();
+        sync(&s, &c, &mut map, false);
+        let at: String = c.lua.load("return tostring(workspace.Hat.Position) .. ' ' .. tostring(workspace.Hand.Position)").eval().unwrap();
+        assert_eq!(at, "5, 12, 0 5, 10, 0");
+    }
+
+    #[test]
+    fn fresh_streamed_leaf_has_parent_and_properties_when_signaled() {
+        let (server, client, mut map, player) = streaming_probe("grid");
+        client.lua.load(r#"
+            _G.leafEvents = {}
+            local function observe(event, part)
+                if part.Name == "FixtureLeaf" then
+                    table.insert(_G.leafEvents, event .. ":" .. tostring(part.Parent == workspace)
+                        .. ":" .. tostring(part.Anchored))
+                end
+            end
+            workspace.ChildAdded:Connect(function(part) observe("child", part) end)
+            workspace.DescendantAdded:Connect(function(part) observe("descendant", part) end)
+        "#).exec().unwrap();
+        server.lua.load(r#"
+            local part = Instance.new("Part")
+            part.Name = "FixtureLeaf"
+            part.Anchored = true
+            part.Parent = workspace
+        "#).exec().unwrap();
+        stream_at(&server, &client, &mut map, player, 1.0);
+        let events: String = client.lua.load("return table.concat(_G.leafEvents, ',')").eval().unwrap();
+        assert_eq!(events, "child:true:true,descendant:true:true");
+    }
+
+    #[test]
+    fn streaming_focus_events_models_terrain_and_persistence() {
+        let (s, c, mut map, player) = streaming_probe("opportunistic");
+        c.lua.load(r#"
+            assert(workspace:GetStreamingEnabled())
+            assert(workspace.Always and not workspace:FindFirstChild("Ring32"))
+            assert(not workspace:FindFirstChild("DefaultDistant"))
+            assert(not workspace:FindFirstChild("NonatomicDistant"))
+            _G.events = {}
+            workspace.ChildAdded:Connect(function(i) _G.events[i.Name] = true end)
+            workspace.DescendantRemoving:Connect(function(i)
+                if i.Name == "Ring32" then _G.removed = true end
+            end)
+        "#).exec().unwrap();
+        s.lua.load(r#"
+            workspace.Character.HumanoidRootPart.Position = Vector3.new(0,55,0)
+            workspace.Terrain:FillBlock(CFrame.new(16,46,0), Vector3.new(8,8,8), Enum.Material.Grass)
+            workspace.Terrain:FillBlock(CFrame.new(1024,46,0), Vector3.new(8,8,8), Enum.Material.Grass)
+        "#).exec().unwrap();
+        crate::runtime::ext::flush_terrain(&s.lua);
+        stream_at(&s, &c, &mut map, player, 0.05);
+        stream_at(&s, &c, &mut map, player, 0.25);
+        c.lua.load(r#"
+            assert(_G.events.Ring32 and workspace.Ring32.Ring32Gui)
+            assert(workspace:FindFirstChild("Ring192") and not workspace:FindFirstChild("Ring256"))
+            assert(workspace.Atomic.AtomicNear and workspace.Atomic.AtomicFar)
+            assert(workspace.PersistentDistant.PersistentRemote)
+            assert(not workspace.Default:FindFirstChild("DefaultFar"))
+            assert(not workspace.Nonatomic:FindFirstChild("NonatomicFar"))
+            _G.original = workspace.Ring32
+            _G.hasTerrain = function(x)
+                local _, v = workspace.Terrain:ReadVoxels(Region3.new(Vector3.new(x,44,0),Vector3.new(x+4,48,4)),4)
+                return v[1][1][1] > 0
+            end
+            assert(_G.hasTerrain(16) and not _G.hasTerrain(1024))
+        "#).exec().unwrap();
+
+        s.lua.load(r#"
+            local player = game.Players.Tester
+            workspace.PerPlayerDistant:AddPersistentPlayer(player)
+            assert(workspace.PerPlayerDistant:GetPersistentPlayers()[1] == player)
+            player.ReplicationFocus = workspace.Focus
+        "#).exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 1.0);
+        stream_at(&s, &c, &mut map, player, 6.2);
+        c.lua.load(r#"
+            assert(_G.removed and _G.original.Parent == nil)
+            assert(workspace.FocusNeighbor and workspace.Character.HumanoidRootPart)
+            assert(workspace.PerPlayerDistant.PerPlayerRemote)
+            assert(not workspace:FindFirstChild("Atomic"))
+        "#).exec().unwrap();
+        s.lua.load(r#"
+            local player = game.Players.Tester
+            workspace.PerPlayerDistant:RemovePersistentPlayer(player)
+            assert(#workspace.PerPlayerDistant:GetPersistentPlayers() == 0)
+            player.ReplicationFocus = nil
+        "#).exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 7.0);
+        c.lua.load(r#"
+            assert(not workspace:FindFirstChild("PerPlayerDistant"))
+            assert(workspace.Ring32 == _G.original and workspace.Ring32.Ring32Gui)
+            assert(workspace.PersistentDistant.PersistentRemote)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn streaming_default_retains_loaded_parts_and_requests_load_minimum_region() {
+        let (s, c, mut map, player) = streaming_probe("default");
+        s.lua.load("workspace.Character.HumanoidRootPart.Position = Vector3.new(0,55,0)").exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 0.1);
+        stream_at(&s, &c, &mut map, player, 0.4);
+        c.lua.load(r#"
+            assert(workspace.DefaultDistant and #workspace.DefaultDistant:GetChildren() == 0)
+            assert(workspace.Ring32 and not workspace:FindFirstChild("Ring1024"))
+        "#).exec().unwrap();
+        s.lua.load(r#"
+            task.spawn(function()
+                game.Players.Tester:RequestStreamAroundAsync(Vector3.new(1024,55,0), 2)
+                _G.request_done = true
+            end)
+        "#).exec().unwrap();
+        let mut changes = ops(&s);
+        let mut sw = s.world_mut().unwrap();
+        let requests = std::mem::take(&mut sw.stream_requests);
+        assert_eq!(requests.len(), 1);
+        update_streaming(sw.d(), &c, &mut map, player, &mut changes, requests);
+        apply(sw.d(), &c, &mut map, changes);
+        finish_streaming(sw.d(), &c, &mut map);
+        drop(sw);
+        s.step(1.0 / 60.0);
+        c.lua.load("assert(workspace.Ring1024 and workspace.DefaultDistant.DefaultRemote)").exec().unwrap();
+        assert!(s.lua.load("return _G.request_done == true").eval::<bool>().unwrap());
+        s.lua.load("game.Players.Tester.ReplicationFocus = workspace.Focus").exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 20.0);
+        c.lua.load("assert(workspace.Ring32 and workspace.Ring1024 and workspace.FocusNeighbor)").exec().unwrap();
+    }
+
+    #[test]
+    fn client_stream_request_and_unanchored_assembly() {
+        let (s, c, mut map, player) = streaming_probe("opportunistic");
+        s.lua.load(r#"
+            workspace.Character.HumanoidRootPart.Position = Vector3.new(0,55,0)
+            local a = Instance.new("Part")
+            a.Name = "WeldedNear"
+            a.Position = Vector3.new(12,55,0)
+            a.Parent = workspace
+            local b = Instance.new("Part")
+            b.Name = "WeldedFar"
+            b.Position = Vector3.new(2000,55,0)
+            b.Parent = workspace
+            local weld = Instance.new("WeldConstraint")
+            weld.Part0, weld.Part1 = a, b
+            weld.Parent = a
+        "#).exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 0.05);
+        stream_at(&s, &c, &mut map, player, 0.25);
+        c.lua.load(r#"
+            assert(workspace.WeldedNear and workspace.WeldedFar)
+            assert(workspace.WeldedNear.WeldConstraint.Part1 == workspace.WeldedFar)
+            assert(not workspace:FindFirstChild("Ring1024"))
+            task.spawn(function()
+                game.Players.Tester:RequestStreamAroundAsync(Vector3.new(1024,55,0), 2)
+                _G.client_request_done = true
+            end)
+        "#).exec().unwrap();
+        stream_at(&s, &c, &mut map, player, 0.4);
+        c.lua.load("assert(_G.client_request_done and workspace.Ring1024)").exec().unwrap();
     }
 
     fn names(d: &Document, r: Ref) -> Vec<String> {

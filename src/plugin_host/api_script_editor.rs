@@ -513,13 +513,18 @@ pub fn active_script() -> Option<Ref> {
 /// bar's document is the service's child as soon as the service exists
 /// (Studio: ScriptEditorService has 1 child with no script open).
 pub fn fire_events(lua: &Lua) -> mlua::Result<bool> {
-    let has_service = {
-        let w = world(lua)?;
-        let d = w.d();
-        d.find_child(d.dom.root_ref(), "ScriptEditorService").is_some()
-    };
-    if has_service {
-        cmdbar(lua)?;
+    if ses(lua).cmdbar.is_none() {
+        let has_service = {
+            let w = world(lua)?;
+            let d = w.d();
+            d.find_child(d.dom.root_ref(), "ScriptEditorService").is_some()
+        };
+        if has_service {
+            cmdbar(lua)?;
+        }
+    }
+    if !script_docs::has_events() {
+        return Ok(false);
     }
     let events = {
         // (Closed: a script already gone from the document still had a

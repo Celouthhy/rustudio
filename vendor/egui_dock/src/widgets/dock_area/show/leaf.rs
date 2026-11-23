@@ -536,6 +536,7 @@ impl<Tab> DockArea<'_, Tab> {
                         tab_viewer.context_menu(ui, tab, path);
                         if (path.surface.is_main() || !is_lonely_tab)
                             && tab_viewer.allowed_in_windows(tab)
+                            && tab_viewer.show_eject_in_context_menu(tab)
                             && ui.add(eject_button).clicked()
                         {
                             self.to_detach.push((path, tab_index).into());

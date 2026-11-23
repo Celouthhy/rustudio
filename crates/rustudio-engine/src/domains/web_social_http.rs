@@ -124,7 +124,20 @@ fn id(a: &mlua::Table, k: usize) -> mlua::Result<u64> {
     }
     Ok(n as u64)
 }
-fn read(name: &str, a: &mlua::Table) -> mlua::Result<Read> {
+fn player_in_server(lua: &Lua, user: u64) -> bool {
+    let Ok(w) = world(lua) else {
+        return false;
+    };
+    let uid = user as i64;
+    w.d().dom.descendants().any(|i| {
+        i.class.as_str() == "Player"
+            && matches!(
+                i.properties.get(&"UserId".into()),
+                Some(rbx_dom_weak::types::Variant::Int64(id)) if *id == uid
+            )
+    })
+}
+fn read(lua: &Lua, name: &str, a: &mlua::Table) -> mlua::Result<Read> {
     Ok(match name {
         "CanPromptOptInAsync" => Read::CanPromptOptIn(id(a,1)?),
         "GetPartyAsync" => Read::Party { id: a.get(1)?, universe: id(a,2)?, place: id(a,3)?, job: a.get(4)? },
@@ -186,17 +199,25 @@ fn read(name: &str, a: &mlua::Table) -> mlua::Result<Read> {
             subscription: a.get(2)?,
         },
         "GetBadgeInfoAsync" => Read::Badge(id(a, 1)?),
-        "UserHasBadgeAsync" => Read::HasBadge {
-            user: id(a, 1)?,
-            badge: id(a, 2)?,
-        },
-        "CheckUserBadgesAsync" | "GetUserBadgesAsync" => Read::CheckBadges {
-            user: id(a, 1)?,
-            badges: a
-                .get::<mlua::Table>(2)?
-                .sequence_values::<i64>()
-                .collect::<mlua::Result<_>>()?,
-        },
+        "UserHasBadgeAsync" => {
+            let user = id(a, 1)?;
+            Read::HasBadge {
+                user,
+                badge: id(a, 2)?,
+                in_server: player_in_server(lua, user),
+            }
+        }
+        "CheckUserBadgesAsync" | "GetUserBadgesAsync" => {
+            let user = id(a, 1)?;
+            Read::CheckBadges {
+                user,
+                badges: a
+                    .get::<mlua::Table>(2)?
+                    .sequence_values::<i64>()
+                    .collect::<mlua::Result<_>>()?,
+                in_server: player_in_server(lua, user),
+            }
+        }
         "GetGroupInfoAsync" => Read::Group(id(a, 1)?),
         "GetGroupsAsync" => Read::Groups(a.get(1)?),
         "GetRolesInGroupAsync" => Read::GroupRoles {
@@ -239,7 +260,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set(
         "__ws_begin",
         lua.create_function(|lua, (name, a): (String, mlua::Table)| {
-            let request = read(&name, &a)?;
+            let request = read(lua, &name, &a)?;
             background(lua,move |session,scope|request.fetch_in(&session,&scope).map_err(|e|e.to_string()))
         })?,
     )?;
@@ -333,7 +354,7 @@ local function fetch(name,...)
                 elseif name=='GetUpcomingExperienceEventsAsync' or name=='GetExperienceEventAsync' then err='HttpError '..(string.match(err,'^HTTP (%d+)') or err)
                 elseif name=='UserOwnsGamePassAsync' then err='MarketplaceService::userOwnsGamePassAsync - GetGamePassOwnership failed: HTTP request failed with status code: '..(string.match(err,'^HTTP (%d+)') or err)
                 elseif name=='GetBadgeInfoAsync' and string.match(err,'^HTTP 404') then err='badgeId is invalid or does not exist.'
-                elseif name=='UserHasBadgeAsync' then err='UserHasBadgeAsync: Internal error.'
+                elseif name=='UserHasBadgeAsync' then err=string.match(err,'^HTTP 429') and 'UserHasBadgeAsync: Too many requests' or 'UserHasBadgeAsync: Internal error.'
                 elseif name=='GetUserBadgesAsync' and string.match(err,'^HTTP 404') then err='GetUserBadgesAsync: User is invalid or does not exist.'
                 elseif name=='CheckUserBadgesAsync' or name=='GetUserBadgesAsync' then err=name..': '..(string.match(err,'^HTTP 429') and 'Too many requests' or err)
                 elseif name=='GetUserSubscriptionStatusAsync' or name=='GetUserSubscriptionDetailsAsync' then err='MarketPlaceService::'..name..' failed because: '..err

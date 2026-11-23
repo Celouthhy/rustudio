@@ -1,22 +1,57 @@
-//! A Tool going into a character's hand turns its Handle's CanCollide off, as
-//! Studio's grip builder does (see `gripped_handles`). The write itself is in
-//! runtime.rs's parent change, after the hierarchy signals.
+//! A Tool going into a character's hand creates its `RightGrip` Weld and turns
+//! its Handle's CanCollide off, as Studio's grip builder does (see
+//! `gripped_tools`). Removing the Tool from the character destroys `RightGrip`.
+//! The writes happen in runtime.rs's parent change, after the hierarchy signals.
 
-use rbx_dom_weak::types::{Ref, Variant};
+use glam::{Mat3, Vec3};
+use rbx_dom_weak::types::{CFrame, Ref, Variant};
+use rbx_dom_weak::{ustr, InstanceBuilder};
 use rustudio_core::doc::{self, Document};
+use rustudio_core::math::Xform;
 
-/// The Handles of the Tools that this parent change puts in a character's grip, whose
-/// CanCollide goes false. Studio: a Tool's equip steps end in the grip
-/// builder, which needs the Tool's parent to be
-/// a Model with a Humanoid (the first Humanoid child), that Humanoid's
-/// right hand (RightHand for R15, Right Arm for R6) and the Tool's Handle
-/// (the child BasePart named "Handle"); it checks or remakes the RightGrip
-/// weld and calls the Handle's CanCollide setter with false. Only the Handle: other tool parts keep theirs. Nothing puts it
-/// back on unequip. Measured in Studio Play: the Tool parented into
-/// the character or a Model carrying a held Tool entering the Workspace sets it, on the
-/// server and on the client; a dead Humanoid's model too; not outside the Workspace,
-/// not under a Folder, not without the right arm, not for a Handle added later.
-pub fn gripped_handles(d: &Document, r: Ref, enters_ws: bool) -> Vec<Ref> {
+/// One Tool entering a character's hand in the Workspace.
+pub struct GrippedTool {
+    pub hand: Ref,
+    pub handle: Ref,
+    pub c0: CFrame,
+    pub c1: CFrame,
+    pub turn_off_collide: bool,
+}
+
+fn grip_c0(d: &Document, hand: Ref) -> CFrame {
+    let att = d.find_named(hand, "RightGripAttachment").and_then(|a| match d.prop(a, "CFrame") {
+        Some(Variant::CFrame(cf)) => Some(Xform::from_cframe(&cf)),
+        _ => None,
+    });
+    let mut c0 = att.unwrap_or(Xform {
+        pos: Vec3::new(0.0, -1.0, 0.0),
+        rot: Mat3::IDENTITY,
+    });
+    if c0.rot.abs_diff_eq(Mat3::IDENTITY, 1e-4) {
+        c0.rot = Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    }
+    c0.to_cframe()
+}
+
+fn grip_c1(d: &Document, tool: Ref) -> CFrame {
+    match d.prop(tool, "Grip") {
+        Some(Variant::CFrame(cf)) => cf,
+        _ => Xform {
+            pos: Vec3::ZERO,
+            rot: Mat3::IDENTITY,
+        }
+        .to_cframe(),
+    }
+}
+
+/// The Tools a parent change puts in a character's grip. A Tool must be
+/// under a Model with a Humanoid and a right hand (RightHand for R15 or
+/// Right Arm for R6). Studio welds the BasePart named Handle with RightGrip
+/// and disables collision on the Handle. Unequipping leaves CanCollide off.
+/// This runs when equipping or when a model carrying a held Tool enters
+/// Workspace, including rigs with dead Humanoids. It does not run for
+/// handles added after equipping.
+pub fn gripped_tools(d: &Document, r: Ref, enters_ws: bool) -> Vec<GrippedTool> {
     let Some(ws) = d.workspace() else { return Vec::new() };
     let mut tools: Vec<Ref> = Vec::new();
     if d.class_of(r).is_some_and(|c| doc::is_a(&c, "Tool")) {
@@ -35,11 +70,68 @@ pub fn gripped_handles(d: &Document, r: Ref, enters_ws: bool) -> Vec<Ref> {
             if !d.is_ancestor(ws, t) || !d.class_of(model).is_some_and(|c| doc::is_a(&c, "Model")) {
                 return None;
             }
+            if matches!(d.prop(t, "RequiresHandle"), Some(Variant::Bool(false))) {
+                // Tools with RequiresHandle = false still create a grip when a Handle exists.
+            }
             let hum = d.dom.get_by_ref(model)?.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| doc::is_a(&k, "Humanoid")))?;
             let r15 = rustudio_render::scene::enum_u32(d.prop(hum, "RigType")).unwrap_or(0) != 0;
-            child(model, if r15 { "RightHand" } else { "Right Arm" })?;
+            let hand = child(model, if r15 { "RightHand" } else { "Right Arm" })?;
             let handle = child(t, "Handle")?;
-            matches!(d.prop(handle, "CanCollide"), Some(Variant::Bool(true)) | None).then_some(handle)
+            let turn_off_collide = matches!(d.prop(handle, "CanCollide"), Some(Variant::Bool(true)) | None);
+            Some(GrippedTool {
+                hand,
+                handle,
+                c0: grip_c0(d, hand),
+                c1: grip_c1(d, t),
+                turn_off_collide,
+            })
+        })
+        .collect()
+}
+
+/// Any `RightGrip` Weld on `old_parent`'s right hand that held Tool `r`'s
+/// Handle, to be removed when `r` leaves the character.
+pub fn ungripped_welds(d: &Document, r: Ref, old_parent: Ref) -> Vec<Ref> {
+    if old_parent.is_none() || !d.class_of(r).is_some_and(|c| doc::is_a(&c, "Tool")) {
+        return Vec::new();
+    }
+    if !d.class_of(old_parent).is_some_and(|c| doc::is_a(&c, "Model")) {
+        return Vec::new();
+    }
+    let Some(old_inst) = d.dom.get_by_ref(old_parent) else {
+        return Vec::new();
+    };
+    let Some(hum) = old_inst.children().iter().copied().find(|c| d.class_of(*c).is_some_and(|k| doc::is_a(&k, "Humanoid"))) else {
+        return Vec::new();
+    };
+    let r15 = rustudio_render::scene::enum_u32(d.prop(hum, "RigType")).unwrap_or(0) != 0;
+    let hand_name = if r15 { "RightHand" } else { "Right Arm" };
+    let Some(hand) = old_inst.children().iter().copied().find(|c| {
+        d.dom.get_by_ref(*c).is_some_and(|i| i.name == hand_name && doc::is_a(&i.class, "BasePart"))
+    }) else {
+        return Vec::new();
+    };
+    let handle = d.dom.get_by_ref(r).and_then(|t| {
+        t.children().iter().copied().find(|c| {
+            d.dom.get_by_ref(*c).is_some_and(|i| i.name == "Handle" && doc::is_a(&i.class, "BasePart"))
+        })
+    });
+    let Some(hand_inst) = d.dom.get_by_ref(hand) else {
+        return Vec::new();
+    };
+    hand_inst
+        .children()
+        .iter()
+        .copied()
+        .filter(|c| {
+            let Some(i) = d.dom.get_by_ref(*c) else { return false };
+            if i.name != "RightGrip" || !doc::is_a(&i.class, "Weld") {
+                return false;
+            }
+            match d.prop(*c, "Part1") {
+                Some(Variant::Ref(p1)) => handle.is_some_and(|h| p1 == h) || p1.is_none(),
+                _ => false,
+            }
         })
         .collect()
 }
@@ -51,10 +143,34 @@ pub fn gripped_handles(d: &Document, r: Ref, enters_ws: bool) -> Vec<Ref> {
 pub fn grip_at_load(d: &mut Document) -> Vec<Ref> {
     let Some(ws) = d.workspace() else { return Vec::new() };
     let tools: Vec<Ref> = d.dom.descendants_of(ws).filter(|i| doc::is_a(&i.class, "Tool")).map(|i| i.referent()).collect();
-    let handles: Vec<Ref> = tools.into_iter().flat_map(|t| gripped_handles(d, t, false)).collect();
-    for h in &handles {
-        if let Some(i) = d.dom.get_by_ref_mut(*h) {
-            i.properties.insert(rbx_dom_weak::ustr("CanCollide"), Variant::Bool(false));
+    let gripped: Vec<GrippedTool> = tools.into_iter().flat_map(|t| gripped_tools(d, t, false)).collect();
+    let mut handles = Vec::new();
+    for g in gripped {
+        if g.turn_off_collide {
+            if let Some(i) = d.dom.get_by_ref_mut(g.handle) {
+                i.properties.insert(ustr("CanCollide"), Variant::Bool(false));
+            }
+            handles.push(g.handle);
+        }
+        let has_grip = d.dom.get_by_ref(g.hand).is_some_and(|h| {
+            h.children().iter().any(|c| {
+                d.dom.get_by_ref(*c).is_some_and(|i| {
+                    i.name == "RightGrip"
+                        && doc::is_a(&i.class, "Weld")
+                        && matches!(d.prop(*c, "Part1"), Some(Variant::Ref(p1)) if p1 == g.handle)
+                })
+            })
+        });
+        if !has_grip {
+            d.dom.insert(
+                g.hand,
+                InstanceBuilder::new("Weld")
+                    .with_name("RightGrip")
+                    .with_property("Part0", Variant::Ref(g.hand))
+                    .with_property("Part1", Variant::Ref(g.handle))
+                    .with_property("C0", Variant::CFrame(g.c0))
+                    .with_property("C1", Variant::CFrame(g.c1)),
+            );
         }
     }
     handles
@@ -180,5 +296,37 @@ print("accessory", ah.CanCollide)
         for want in ["outside workspace true", "model enters workspace false", "no humanoid true", "folder true", "no arm true", "accessory true"] {
             assert!(o.contains(want), "{want}: {o}");
         }
+    }
+
+    #[test]
+    fn equip_creates_and_unequip_removes_right_grip() {
+        let out = run(
+            &format!(
+                "{RIG}{}",
+                r#"
+local m = rig(true, workspace)
+local att = Instance.new("Attachment")
+att.Name = "RightGripAttachment"
+att.Position = Vector3.new(0, -0.15, 0)
+att.Parent = m.RightHand
+local t, h = sword()
+t.Grip = CFrame.new(0.1, 0.2, 0.3)
+t.Parent = game.ServerStorage
+t.Parent = m
+local rg = m.RightHand:FindFirstChild("RightGrip")
+assert(rg and rg:IsA("Weld"), "missing RightGrip on equip")
+assert(rg.Part0 == m.RightHand and rg.Part1 == h, "wrong RightGrip parts")
+assert((rg.C0.Position - Vector3.new(0, -0.15, 0)).Magnitude < 1e-4, tostring(rg.C0))
+assert(rg.C0.LookVector:FuzzyEq(Vector3.new(0, -1, 0), 1e-3), tostring(rg.C0.LookVector))
+assert((rg.C1.Position - Vector3.new(0.1, 0.2, 0.3)).Magnitude < 1e-4, tostring(rg.C1))
+t.Parent = game.ServerStorage
+assert(m.RightHand:FindFirstChild("RightGrip") == nil, "RightGrip not removed on unequip")
+print("GRIP_OK")
+"#
+            ),
+            RunMode::Play,
+        );
+        let o = out.join("\n");
+        assert!(o.contains("GRIP_OK"), "{o}");
     }
 }

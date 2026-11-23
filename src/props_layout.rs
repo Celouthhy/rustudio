@@ -31,6 +31,10 @@ fn left_out(class: &str, prop: &str) -> bool {
         || (prop == "Source" && is("LuaSourceContainer"))
         || (prop.starts_with("SelectionBehavior") && is("LayerCollector"))
         || (prop == "ModelStreamingMode" && is("Model"))
+        // Studio 0.748 shows Asset -> AudioContent (with Preview child) instead
+        // of legacy SoundId / Asset in Properties.
+        || (prop == "SoundId" && is("Sound"))
+        || (prop == "Asset" && is("AudioPlayer"))
         // shown as composite rows instead
         || (matches!(prop, "CFrame" | "PivotOffset" | "Origin" | "Position" | "Orientation") && is("BasePart"))
         || (matches!(prop, "Origin" | "WorldPivot") && is("Model"))

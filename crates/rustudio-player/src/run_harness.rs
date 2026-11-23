@@ -320,7 +320,7 @@ impl RunHarness {
         }
         // Timed Luau (`--luau`), once Play runs.
         let t = self.now()?;
-        if game.play.is_some() {
+        if game.is_playing() {
             let due: Vec<(bool, String)> = self.input
                 .actions
                 .iter()
@@ -552,9 +552,11 @@ impl RunHarness {
 #[derive(Debug, Clone)]
 pub enum HarnessAction {
     Click(f32, f32),
-    Key(egui::Key),
-    /// A key held down (true) or let go (false): `--key NAME@S:HOLD`.
-    KeyState(egui::Key, bool),
+    Key(egui::Key, egui::Modifiers),
+    /// A key held down (true) or let go (false): `--key [MOD+]NAME@S:HOLD`.
+    KeyState(egui::Key, egui::Modifiers, bool),
+    /// `--paste TEXT@S`: paste text into a focused TextBox.
+    Paste(String),
     /// `--wheel NOTCHES@S` over the 3D view's centre (positive = forward,
     /// zoom in), or `--wheel NOTCHES@S:X,Y` at that view position.
     Wheel(f32, Option<(f32, f32)>),
@@ -583,8 +585,52 @@ pub enum HarnessAction {
     UiButton(f32, f32, bool),
 }
 
+pub fn parse_harness_key(spec: &str) -> Option<(egui::Key, egui::Modifiers)> {
+    let mut mods = egui::Modifiers::NONE;
+    let mut key_name = spec.trim();
+    if spec.contains('+') {
+        let parts: Vec<&str> = spec.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        key_name = parts[parts.len() - 1];
+        for m in &parts[..parts.len() - 1] {
+            match m.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => {
+                    mods.ctrl = true;
+                    mods.command = true;
+                }
+                "cmd" | "command" => {
+                    mods.command = true;
+                    mods.mac_cmd = true;
+                }
+                "shift" => mods.shift = true,
+                "alt" | "opt" | "option" => mods.alt = true,
+                _ => return None,
+            }
+        }
+    }
+    let key = match key_name.to_ascii_lowercase().as_str() {
+        "left" => egui::Key::ArrowLeft,
+        "right" => egui::Key::ArrowRight,
+        "up" => egui::Key::ArrowUp,
+        "down" => egui::Key::ArrowDown,
+        "return" | "enter" => egui::Key::Enter,
+        "backspace" | "bs" => egui::Key::Backspace,
+        "delete" | "del" => egui::Key::Delete,
+        "esc" | "escape" => egui::Key::Escape,
+        "home" => egui::Key::Home,
+        "end" => egui::Key::End,
+        "tab" => egui::Key::Tab,
+        "space" => egui::Key::Space,
+        "slash" | "/" => egui::Key::Slash,
+        _ => egui::Key::from_name(key_name)?,
+    };
+    Some((key, mods))
+}
+
 impl HarnessAction {
-    /// "X,Y@S" for clicks, "NAME@S" for a key tap, "NAME@S:HOLD" to hold
+    /// "X,Y@S" for clicks, "[MOD+]NAME@S" for a key tap, "[MOD+]NAME@S:HOLD" to hold
     /// it HOLD seconds.
     pub fn parse(s: &str, click: bool) -> Option<Vec<(f32, HarnessAction)>> {
         let (what, at) = s.split_once('@')?;
@@ -596,17 +642,35 @@ impl HarnessAction {
                 HarnessAction::Click(x.trim().parse().ok()?, y.trim().parse().ok()?),
             )]);
         }
-        let key = egui::Key::from_name(what.trim())?;
+        let (key, mods) = parse_harness_key(what)?;
         match at.split_once(':') {
             Some((at, hold)) => {
                 let (at, hold): (f32, f32) = (at.trim().parse().ok()?, hold.trim().parse().ok()?);
                 Some(vec![
-                    (at, HarnessAction::KeyState(key, true)),
-                    (at + hold, HarnessAction::KeyState(key, false)),
+                    (at, HarnessAction::KeyState(key, mods, true)),
+                    (at + hold, HarnessAction::KeyState(key, mods, false)),
                 ])
             }
-            None => Some(vec![(at.trim().parse().ok()?, HarnessAction::Key(key))]),
+            None => Some(vec![(at.trim().parse().ok()?, HarnessAction::Key(key, mods))]),
         }
+    }
+
+    /// `--dblclick X,Y@S`: two clicks 50ms apart in the 3D view.
+    pub fn parse_dblclick(s: &str) -> Option<Vec<(f32, HarnessAction)>> {
+        let (what, at) = s.split_once('@')?;
+        let at: f32 = at.trim().parse().ok()?;
+        let (x, y) = what.split_once(',')?;
+        let (x, y): (f32, f32) = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+        Some(vec![
+            (at, HarnessAction::Click(x, y)),
+            (at + 0.05, HarnessAction::Click(x, y)),
+        ])
+    }
+
+    /// `--paste TEXT@S`: paste text at S seconds.
+    pub fn parse_paste(s: &str) -> Option<(f32, HarnessAction)> {
+        let (text, at) = s.rsplit_once('@')?;
+        Some((at.trim().parse().ok()?, HarnessAction::Paste(text.to_string())))
     }
 
     /// `--ui-click X,Y@S` (window coordinates): move there at S, press at
@@ -757,26 +821,45 @@ impl HarnessInput {
                         });
                     }
                 }
-                HarnessAction::Key(key) => {
+                HarnessAction::Key(key, modifiers) => {
                     for pressed in [true, false] {
                         raw.events.push(egui::Event::Key {
                             key,
                             physical_key: None,
                             pressed,
                             repeat: false,
-                            modifiers: egui::Modifiers::NONE,
+                            modifiers,
                         });
+                        // A real keyboard also sends the key's character in
+                        // the same frame (winit text) when no command/ctrl/alt
+                        // modifier is held; "/" opening chat must not type itself.
+                        let sym = key.symbol_or_name();
+                        if pressed
+                            && !modifiers.command
+                            && !modifiers.ctrl
+                            && !modifiers.alt
+                            && sym.len() == 1
+                            && sym.as_bytes()[0].is_ascii_graphic()
+                        {
+                            let ch = if modifiers.shift {
+                                sym.to_uppercase()
+                            } else {
+                                sym.to_lowercase()
+                            };
+                            raw.events.push(egui::Event::Text(ch));
+                        }
                     }
                 }
-                HarnessAction::KeyState(key, pressed) => {
+                HarnessAction::KeyState(key, modifiers, pressed) => {
                     raw.events.push(egui::Event::Key {
                         key,
                         physical_key: None,
                         pressed,
                         repeat: false,
-                        modifiers: egui::Modifiers::NONE,
+                        modifiers,
                     });
                 }
+                HarnessAction::Paste(text) => raw.events.push(egui::Event::Paste(text)),
                 HarnessAction::Wheel(n, at) => {
                     let p = at.map_or(vp.center(), |(x, y)| vp.min + egui::vec2(x, y));
                     raw.events.push(egui::Event::PointerMoved(p));

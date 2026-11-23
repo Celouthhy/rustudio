@@ -51,7 +51,7 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
             vm::record_ui(lua, root, r, UiKind::Toolbar { name: title });
             ret1(inst_value(lua, r)?)
         })(),
-        ("PluginToolbar", "CreateButton") => (|| {
+        ("PluginToolbar", "CreateButton" | "CreatePopupButton") => (|| {
             require_args(args, 3)?;
             let id = arg_string(args, 1)?;
             let tooltip = arg_string(args, 2)?;
@@ -92,9 +92,13 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
             ret1(inst_value(lua, r)?)
         })(),
         // The pressed look of the button (a grey box behind its icon).
-        ("PluginToolbarButton", "SetActive") => (|| {
+        ("PluginToolbarButton", "SetActive" | "SetDropdownActive") => (|| {
             let on = arg_bool(args, 1)?;
-            set_button_active(lua, this, on);
+            if name == "SetActive" {
+                set_button_active(lua, this, on);
+            } else {
+                set_button_dropdown_active(lua, this, on);
+            }
             ret0()
         })(),
         _ => return None,
@@ -107,10 +111,22 @@ fn set_button_active(lua: &Lua, r: Ref, on: bool) {
     if let Ok(t) = active_table(lua) {
         let _ = t.raw_set(format!("{r:?}"), on);
     }
+    vm::bump_ui_rev(lua);
 }
 
 pub fn button_active(lua: &Lua, r: Ref) -> bool {
     active_table(lua).and_then(|t| t.raw_get::<bool>(format!("{r:?}"))).unwrap_or(false)
+}
+
+fn set_button_dropdown_active(lua: &Lua, r: Ref, on: bool) {
+    if let Ok(t) = dropdown_active_table(lua) {
+        let _ = t.raw_set(format!("{r:?}"), on);
+    }
+    vm::bump_ui_rev(lua);
+}
+
+pub fn button_dropdown_active(lua: &Lua, r: Ref) -> bool {
+    dropdown_active_table(lua).and_then(|t| t.raw_get::<bool>(format!("{r:?}"))).unwrap_or(false)
 }
 
 fn active_table(lua: &Lua) -> mlua::Result<mlua::Table> {
@@ -124,11 +140,25 @@ fn active_table(lua: &Lua) -> mlua::Result<mlua::Table> {
     }
 }
 
+fn dropdown_active_table(lua: &Lua) -> mlua::Result<mlua::Table> {
+    match lua.named_registry_value::<mlua::Table>("rs_plugin_button_dropdown_active") {
+        Ok(t) => Ok(t),
+        Err(_) => {
+            let t = lua.create_table()?;
+            lua.set_named_registry_value("rs_plugin_button_dropdown_active", t.clone())?;
+            Ok(t)
+        }
+    }
+}
+
 pub fn prop_get(_lua: &Lua, _r: Ref, _class: &str, _key: &str) -> mlua::Result<Option<Value>> {
     Ok(None)
 }
 
-pub fn newindex(_lua: &Lua, _r: Ref, _class: &str, _key: &str, _value: &Value) -> mlua::Result<bool> {
+pub fn newindex(lua: &Lua, _r: Ref, class: &str, _key: &str, _value: &Value) -> mlua::Result<bool> {
+    if matches!(class, "PluginToolbar" | "PluginToolbarButton" | "PluginAction" | "PluginMenu") {
+        vm::bump_ui_rev(lua);
+    }
     Ok(false)
 }
 
@@ -207,13 +237,18 @@ pub fn ribbon(lua: &Lua, doc: &rustudio_core::doc::Document) -> Vec<RibbonGroup>
                 Some(Variant::Bool(x)) => x,
                 _ => d,
             };
-            let icon = match doc.prop(u.r, "Icon") {
+            let mut icon = match doc.prop(u.r, "Icon") {
                 Some(Variant::ContentId(c)) => c.as_str().to_string(),
                 Some(Variant::String(s)) => s,
                 Some(Variant::Content(c)) => c.as_uri().map(str::to_string).unwrap_or_default(),
                 _ if alive => String::new(),
                 _ => icon.clone(),
             };
+            if icon.trim().is_empty() {
+                if let Some(fallback) = crate::plugin_host::builtin_lazy::builtin_default_icon(&p.name, &g.name, id) {
+                    icon = fallback.to_string();
+                }
+            }
             g.buttons.push(RibbonButton {
                 r: u.r,
                 id: id.clone(),
@@ -222,7 +257,7 @@ pub fn ribbon(lua: &Lua, doc: &rustudio_core::doc::Document) -> Vec<RibbonGroup>
                 icon,
                 enabled: b("Enabled", true),
                 clickable_when_viewport_hidden: b("ClickableWhenViewportHidden", false),
-                active: button_active(lua, u.r),
+                active: button_active(lua, u.r) || button_dropdown_active(lua, u.r),
                 key: format!("{}_{}_{}", p.name, g.name, id),
             });
         }

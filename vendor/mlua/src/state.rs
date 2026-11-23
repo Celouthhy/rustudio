@@ -1322,6 +1322,25 @@ impl Lua {
         unsafe { (*lua.extra.get()).enable_jit = enable };
     }
 
+    /// rustudio: generates native code for a loaded function's `--!native`
+    /// protos now (its load skipped them while JIT was off: runtime.rs
+    /// compile_script defers the big games' native builds to the frames
+    /// after Play starts). A function compiled already, or without native
+    /// marks, is left as it is.
+    #[cfg(any(feature = "luau-jit", doc))]
+    pub fn compile_native(&self, f: &Function) {
+        let lua = self.lock();
+        let state = lua.state();
+        unsafe {
+            if ffi::luau_codegen_supported() == 0 || ffi::lua_checkstack(state, 1) == 0 {
+                return;
+            }
+            let _sg = StackGuard::new(state);
+            lua.push_ref(&f.0);
+            ffi::luau_codegen_compile_native(state, -1);
+        }
+    }
+
     /// Configures JIT options for this Lua VM.
     #[cfg(any(feature = "luau-jit", doc))]
     #[cfg_attr(docsrs, doc(cfg(feature = "luau-jit")))]

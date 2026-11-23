@@ -58,6 +58,8 @@ pub struct Layers {
     blit: Option<Blit>,
     /// The world's globals from the last frame (material params, exposure).
     pub(super) base: Option<Globals>,
+    /// Bumped whenever Renderer::rebind_globals replaces any globals binding.
+    pub(super) globals_gen: u64,
     /// Frames drawn in the last call (bench / checks).
     pub drawn: u32,
 }
@@ -79,6 +81,7 @@ impl Layers {
             }
             let class = match pass_of(d) {
                 Some(Pass::Opaque) => Class::Opaque,
+                Some(Pass::Cutout) => Class::Blended,
                 Some(Pass::Decal) => Class::Decal,
                 // (terrain water has no place in a frame)
                 None if d.custom_mesh.is_some() && d.material == 5.0 => continue,
@@ -114,8 +117,10 @@ struct Target {
     depth: wgpu::TextureView,
     resolve: wgpu::TextureView,
     out: wgpu::Texture,
+    out_view: wgpu::TextureView,
     blit_bg: wgpu::BindGroup,
     globals_buf: wgpu::Buffer,
+    globals_bg: Option<(u64, usize, usize, bool, wgpu::BindGroup)>,
     inst_buf: wgpu::Buffer,
     inst_cap: usize,
     /// What it was last drawn from (request, layer generation).
@@ -200,6 +205,74 @@ impl Renderer {
         self.vf.targets.get(&vf).map(|t| (t.id, t.size))
     }
 
+    /// Reads back a rendered ViewportFrame's 8-bit sRGB target as PNG bytes
+    /// (for `ViewportFrame:CaptureSnapshotAsync`). Unpremultiplies alpha back
+    /// to straight RGBA8 so PNG viewers and GUI decoding composite cleanly.
+    pub fn readback_vf_png(&self, rs: &egui_wgpu::RenderState, vf: Ref) -> Option<Vec<u8>> {
+        let t = self.vf.targets.get(&vf)?;
+        let [w, h] = t.size;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vf snapshot readback"),
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vf snapshot copy"),
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &t.out,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        rs.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        rs.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        rx.recv().ok()?.ok()?;
+        let data = slice.get_mapped_range().ok()?;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            let o = (y * row) as usize;
+            rgba.extend_from_slice(&data[o..o + (w * 4) as usize]);
+        }
+        drop(data);
+        buf.unmap();
+        for px in rgba.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if a > 0 && a < 255 {
+                px[0] = ((px[0] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[1] = ((px[1] as u32 * 255 + a / 2) / a).min(255) as u8;
+                px[2] = ((px[2] as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+        let mut png = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+            .ok()?;
+        Some(png)
+    }
+
     /// Draws the ViewportFrames in `reqs` whose parts, camera, size or
     /// lighting changed since their last draw; frees the targets of frames
     /// not asked for in 30 s. After the frame's `render` (skinned vertices
@@ -268,10 +341,11 @@ impl Renderer {
                 depth_stencil: None,
                 multisample: Default::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             });
             self.vf.blit = Some(Blit { pipeline, layout });
         }
+        let mut encoder: Option<wgpu::CommandEncoder> = None;
         for (&vf, req) in reqs {
             let gen = self.vf.gen.get(&vf).copied().unwrap_or(0);
             let size = [req.size[0].clamp(1, 4096), req.size[1].clamp(1, 4096)];
@@ -291,7 +365,14 @@ impl Renderer {
             t.drawn = Some((*req, gen));
             let _s = rustudio_core::bench::scope("vf_draw");
             self.vf.drawn += 1;
-            self.draw_vf(rs, vf, req, size, base, &glass_bg);
+            let enc = encoder.get_or_insert_with(|| {
+                rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport frame") })
+            });
+            self.draw_vf(rs, enc, vf, req, size, base, &glass_bg);
+        }
+        if let Some(enc) = encoder {
+            let _up = rustudio_core::bench::scope("vf_submit");
+            crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: viewport frames", [enc.finish()]);
         }
     }
 
@@ -312,7 +393,7 @@ impl Renderer {
         let att = wgpu::TextureUsages::RENDER_ATTACHMENT;
         // The sample count of the pipelines it is drawn with (1 on OpenGL);
         // at one sample the scene is drawn straight into `resolve`.
-        let samples = self.viewport.samples;
+        let samples = self.probe_samples;
         let depth = tex("viewport frame depth", DEPTH_FORMAT, samples, att).create_view(&Default::default());
         let resolve = tex("viewport frame resolve", HDR_FORMAT, 1, att | wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
@@ -321,7 +402,12 @@ impl Renderer {
         } else {
             tex("viewport frame msaa", HDR_FORMAT, samples, att).create_view(&Default::default())
         };
-        let out = tex("viewport frame", wgpu::TextureFormat::Rgba8Unorm, 1, att | wgpu::TextureUsages::TEXTURE_BINDING);
+        let out = tex(
+            "viewport frame",
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            att | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        );
         let out_view = out.create_view(&Default::default());
         let id = rs.renderer.write().register_native_texture(device, &out_view, wgpu::FilterMode::Linear);
         // (the world GUI pass draws it on SurfaceGuis / BillboardGuis)
@@ -345,8 +431,10 @@ impl Renderer {
             depth,
             resolve,
             out,
+            out_view,
             blit_bg,
             globals_buf,
+            globals_bg: None,
             inst_buf: Self::make_buf(device, "viewport frame instances", 64 * std::mem::size_of::<InstanceRaw>()),
             inst_cap: 64,
             drawn: None,
@@ -354,7 +442,18 @@ impl Renderer {
         }
     }
 
-    fn draw_vf(&mut self, rs: &egui_wgpu::RenderState, vf: Ref, req: &Request, size: [u32; 2], base: Globals, glass_bg: &wgpu::BindGroup) {
+    fn draw_vf(
+        &mut self,
+        rs: &egui_wgpu::RenderState,
+        encoder: &mut wgpu::CommandEncoder,
+        vf: Ref,
+        req: &Request,
+        size: [u32; 2],
+        base: Globals,
+        glass_bg: &wgpu::BindGroup,
+    ) {
+        // (a frame draws at probe_samples: the set for it, made on first use)
+        self.ensure_pipelines(rs, self.probe_samples);
         let (device, queue) = (&rs.device, &rs.queue);
         // The frame's camera: reverse-Z like the world's.
         let aspect = size[0] as f32 / size[1].max(1) as f32;
@@ -448,33 +547,43 @@ impl Renderer {
         see_runs.extend(runs(&mut surface_decals.iter().map(|e| e.1), at));
         at += surface_decals.len() as u32;
         see_runs.extend(runs(&mut blended.iter().map(|e| e.1), at));
+        let bg_key = (self.vf.globals_gen, self.probe.cur, self.probe.next(), self.reduced);
+        let need_bg = self
+            .vf
+            .targets
+            .get(&vf)
+            .and_then(|t| t.globals_bg.as_ref())
+            .is_none_or(|(g, cur, next, red, _)| (*g, *cur, *next, *red) != bg_key);
+        if need_bg {
+            let bg = Self::globals_group(
+                device,
+                &self.globals_layout,
+                &self.vf.targets.get(&vf).unwrap().globals_buf,
+                &self.lights_buf,
+                &self.sky_view,
+                &self.sky_sampler,
+                &self.sun.atlas_view,
+                &self.lightgrid_view,
+                &self.lightocc_view,
+                &self.localgrid_view,
+                &self.studs_view,
+                &self.studs_sampler,
+                &self.low_material_sampler,
+                &self.materials,
+                &self.probe.slot_views[self.probe.cur],
+                &self.probe.slot_views[self.probe.next()],
+                &self.brdf_view,
+                &self.lshadow,
+                self.reduced,
+            );
+            self.vf.targets.get_mut(&vf).unwrap().globals_bg = Some((bg_key.0, bg_key.1, bg_key.2, bg_key.3, bg));
+        }
         let t = self.vf.targets.get(&vf).unwrap();
-        let globals_bg = Self::globals_group(
-            device,
-            &self.globals_layout,
-            &t.globals_buf,
-            &self.lights_buf,
-            &self.sky_view,
-            &self.sky_sampler,
-            &self.sun.atlas_view,
-            &self.lightgrid_view,
-            &self.lightocc_view,
-            &self.localgrid_view,
-            &self.studs_view,
-            &self.studs_sampler,
-            &self.low_material_sampler,
-            &self.materials,
-            &self.probe.slot_views[self.probe.cur],
-            &self.probe.slot_views[self.probe.next()],
-            &self.brdf_view,
-            &self.lshadow,
-            self.reduced,
-        );
+        let globals_bg = &t.globals_bg.as_ref().unwrap().4;
         // The background, premultiplied, in the frame's squared space.
         let b = req.background;
         let clear = wgpu::Color { r: (b[0] * b[0] * b[3]) as f64, g: (b[1] * b[1] * b[3]) as f64, b: (b[2] * b[2] * b[3]) as f64, a: b[3] as f64 };
-        let multisampled = self.viewport.samples > 1;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport frame") });
+        let multisampled = self.probe_samples > 1;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport frame"),
@@ -496,7 +605,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &globals_bg, &[]);
+            pass.set_bind_group(0, globals_bg, &[]);
             pass.set_bind_group(2, glass_bg, &[]);
             pass.set_vertex_buffer(1, t.inst_buf.slice(..));
             let draw = |pass: &mut wgpu::RenderPass, key: (usize, usize), range: std::ops::Range<u32>| {
@@ -504,12 +613,13 @@ impl Renderer {
                 pass.set_bind_group(1, self.textures.get(key.1).unwrap_or(&self.textures[0]), &[]);
                 mesh.draw(pass, range);
             };
+            let viewport = self.pipelines(self.probe_samples);
             for r in &opaque_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.opaque } else { &self.viewport.opaque_two_sided });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.opaque } else { &viewport.opaque_two_sided });
                 draw(&mut pass, r.0, r.1..r.2);
             }
             for r in &see_runs {
-                pass.set_pipeline(if self.culls_back(r.0 .0) { &self.viewport.transparent_culled } else { &self.viewport.transparent });
+                pass.set_pipeline(if self.culls_back(r.0 .0) { &viewport.transparent_culled } else { &viewport.transparent });
                 draw(&mut pass, r.0, r.1..r.2);
             }
         }
@@ -517,7 +627,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport frame out"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.out.create_view(&Default::default()),
+                    view: &t.out_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
@@ -531,7 +641,6 @@ impl Renderer {
             pass.set_bind_group(0, &t.blit_bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        crate::gpu_timing::submit(device, queue, "gpu: viewport frames", [encoder.finish()]);
         crate::world_gui::native_changed(t.id);
     }
 }

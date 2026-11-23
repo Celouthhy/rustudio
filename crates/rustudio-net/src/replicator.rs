@@ -1193,16 +1193,12 @@ fn terrain_packet(body: &[u8], streaming: bool) -> R<RepOp> {
     Ok(RepOp::Terrain { id, chunks })
 }
 
-/// SET_GLOBALS assigns the client's GUID namespace after seven flags.
-/// Native client parser:...
-/// The second flag enables an optional terrain block, not supported here.
+/// SET_GLOBALS assigns the client's GUID namespace after seven bool flags
+/// (StreamingEnabled, filtering, three third-party permissions, on-demand
+/// ads, CharacterAutoLoads). Live joins can have filtering enabled.
 pub fn assigned_peer_scope(body: &[u8]) -> Result<u32, String> {
     let mut c = Cur::new(body);
-    c.u8().map_err(|e| format!("{e:?}"))?;
-    if c.u8().map_err(|e| format!("{e:?}"))? != 0 {
-        return Err("terrain globals block".into());
-    }
-    c.take(5).map_err(|e| format!("{e:?}"))?;
+    c.take(7).map_err(|e| format!("{e:?}"))?;
     let scope = c.varint().map_err(|e| format!("{e:?}"))?;
     if scope <= 1 || scope > u32::MAX as u64 {
         return Err("invalid client namespace".into());
@@ -2037,7 +2033,8 @@ mod tests {
             assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 0xac, 2, 0, 0, 0]).unwrap(),
             300
         );
-        assert!(assigned_peer_scope(&[1, 1, 0, 0, 0, 0, 1, 5]).is_err());
+        // Filtering on (every live game) still assigns the namespace.
+        assert_eq!(assigned_peer_scope(&[1, 1, 0, 0, 0, 0, 1, 5]).unwrap(), 5);
         assert!(assigned_peer_scope(&[1, 0, 0, 0, 0, 0, 1, 1]).is_err());
     }
 

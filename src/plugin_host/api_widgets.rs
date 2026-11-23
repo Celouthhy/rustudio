@@ -113,7 +113,7 @@ fn create_dock(lua: &Lua, this: Ref, args: &MultiValue) -> mlua::Result<Ref> {
         None if matches!(argv(args, 2), Value::Nil) => return Err(rt_err("Argument 2 missing or nil")),
         None => return Err(rt_err("Unable to cast value to DockWidgetPluginGuiInfo")),
     };
-    make_widget(lua, this, "DockWidgetPluginGui", id, Some(info))
+    make_widget(lua, this, "DockWidgetPluginGui", id, Some(info), None)
 }
 
 fn dock_info(lua: &Lua, v: &Value) -> mlua::Result<Option<vm::DockInfo>> {
@@ -133,16 +133,60 @@ fn dock_info(lua: &Lua, v: &Value) -> mlua::Result<Option<vm::DockInfo>> {
     }))
 }
 
+/// Creates a QWidgetPluginGui for Panels:CreateAsync (api_builtin.rs).
+pub(crate) fn make_panel_widget(lua: &Lua, this: Ref, id: String) -> mlua::Result<Ref> {
+    make_widget(lua, this, "QWidgetPluginGui", id, None, None)
+}
+
+struct QWidgetOpts {
+    title: Option<String>,
+    initial_enabled: bool,
+    float_x: f64,
+    float_y: f64,
+}
+
+fn read_qwidget_opts(v: &Value) -> QWidgetOpts {
+    let mut o = QWidgetOpts {
+        title: None,
+        initial_enabled: false,
+        float_x: 0.0,
+        float_y: 0.0,
+    };
+    let Value::Table(t) = v else { return o };
+    if let Ok(Value::String(s)) = t.get::<Value>("Title") {
+        if let Ok(st) = s.to_str() {
+            o.title = Some(st.to_string());
+        }
+    }
+    if let Ok(Value::Boolean(b)) = t.get::<Value>("InitialEnabled") {
+        o.initial_enabled = b;
+    }
+    if let Ok(sz) = t.get::<Value>("Size") {
+        if let Some(v2) = opt_ud::<rustudio_engine::ltypes::LVector2>(&sz) {
+            o.float_x = v2.0.x as f64;
+            o.float_y = v2.0.y as f64;
+        }
+    }
+    o
+}
+
 /// A widget as Studio makes it: Name
 /// "PluginGui", Title "", Enabled = InitialEnabled, ZIndexBehavior Global,
 /// ResetOnSpawn true, under PluginGuiService; one per id per plugin.
-fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::DockInfo>) -> mlua::Result<Ref> {
+fn make_widget(
+    lua: &Lua,
+    this: Ref,
+    class: &str,
+    id: String,
+    info: Option<vm::DockInfo>,
+    qopts: Option<QWidgetOpts>,
+) -> mlua::Result<Ref> {
     let root = plugin_root(lua, this)?;
     let dup = vm::vm(lua).is_some_and(|v| {
         let pid = v.by_root(root).map(|p| p.id);
         v.ui.iter().any(|u| {
             Some(u.plugin) == pid
-                && matches!(&u.kind, UiKind::DockWidget { id: i, .. } | UiKind::QWidget { id: i } if *i == id)
+                && matches!(&u.kind, UiKind::DockWidget { id: i, .. } | UiKind::QWidget { id: i, .. } if *i == id)
         })
     });
     if dup {
@@ -154,18 +198,19 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
     let edit = world(lua)?.mode == RunMode::Edit;
     let key = format!("edit_{pname}_{id}");
     let saved = if edit && info.is_some() { crate::plugin_host::widgets_ui::restored(&key) } else { None };
-    let initial = info.as_ref().is_some_and(|i| i.initial_enabled);
+    let initial = info.as_ref().map(|i| i.initial_enabled).or_else(|| qopts.as_ref().map(|q| q.initial_enabled)).unwrap_or(false);
     let enabled = match (saved, info.as_ref()) {
         (Some(_), Some(i)) if i.override_enabled_restore => initial,
         (Some(e), _) => e,
         _ => initial,
     };
+    let title = qopts.as_ref().and_then(|q| q.title.clone()).unwrap_or_default();
     let r = vm::make_owned(
         lua,
         root,
         class,
         vec![
-            ("Title", Variant::String(String::new())),
+            ("Title", Variant::String(title)),
             ("Enabled", Variant::Bool(enabled)),
             ("ResetOnSpawn", Variant::Bool(true)),
             // ZIndexBehavior.Global
@@ -179,14 +224,16 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
             i.name = "PluginGui".into();
         }
     }
+    let is_builtin = vm::vm(lua).and_then(|v| v.by_root(root).map(|p| p.is_builtin)).unwrap_or(false);
+    let svc_name = if is_builtin { "RobloxPluginGuiService" } else { "PluginGuiService" };
     let service = {
         let mut w = world(lua)?;
         let d = w.dm();
         let top = d.dom.root_ref();
-        match d.find_child(top, "PluginGuiService") {
+        match d.find_child(top, svc_name) {
             Some(s) => s,
             None => {
-                let s = d.dom.insert(top, rbx_dom_weak::InstanceBuilder::new("PluginGuiService").with_name("PluginGuiService"));
+                let s = d.dom.insert(top, rbx_dom_weak::InstanceBuilder::new(svc_name).with_name(svc_name));
                 d.mark_tree(s);
                 s
             }
@@ -197,11 +244,13 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
     if saved.is_some() {
         set_store(lua, r, "HostWidgetWasRestored", Value::Boolean(true))?;
     }
+    let (qfx, qfy) = qopts.as_ref().map(|q| (q.float_x, q.float_y)).unwrap_or((0.0, 0.0));
     // Its content size from the start (F47: a 320×240 Float reads 318×216
     // at once; 0, 0 while disabled), until the panel is laid out.
     if enabled {
         let size = match &info {
             Some(i) => crate::plugin_host::widgets_ui::initial_size(&i.initial_dock_state, i.float_x, i.float_y),
+            None if qfx > 0.0 && qfy > 0.0 => crate::plugin_host::widgets_ui::float_client(qfx as f32, qfy as f32),
             None => [0.0, 0.0],
         };
         world(lua)?.input.gui_layout.insert(r, rustudio_engine::gui::GuiBox { size, ..Default::default() });
@@ -212,7 +261,7 @@ fn make_widget(lua: &Lua, this: Ref, class: &str, id: String, info: Option<vm::D
     }
     let kind = match info {
         Some(info) => UiKind::DockWidget { id, info },
-        None => UiKind::QWidget { id },
+        None => UiKind::QWidget { id, float_x: qfx, float_y: qfy },
     };
     vm::record_ui(lua, root, r, kind);
     Ok(r)
@@ -329,7 +378,8 @@ pub fn call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) ->
         })(),
         ("Plugin", "CreateQWidgetPluginGui") => (|| {
             let id = arg_string(args, 1)?;
-            let r = make_widget(lua, this, "QWidgetPluginGui", id, None)?;
+            let opts = read_qwidget_opts(&argv(args, 2));
+            let r = make_widget(lua, this, "QWidgetPluginGui", id, None, Some(opts))?;
             ret1(inst_value(lua, r)?)
         })(),
         // Widget pixels from the panel's content top-left (title bar not

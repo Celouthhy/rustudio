@@ -1238,6 +1238,8 @@ pub struct Physics {
     asms: HashMap<u32, Assembly>,
     next_asm: u32,
     by_collider: rustc_hash::FxHashMap<rp::ColliderHandle, Ref>,
+    /// Full rebuilds index the batch together in `prime`.
+    query_live: bool,
     /// The parts whose overlaps something hears (play.rs `sync_touch_interest`); None:
     /// every part's (no runtime tells). See `apply_touch_quiet`.
     touch_parts: Option<rustc_hash::FxHashSet<Ref>>,
@@ -1369,7 +1371,7 @@ pub struct Physics {
 
 /// Environment ticks owed at most (Play's 1/15 s game-step cap); older ones are lost, as a
 /// throttled frame's are.
-const ENV_OWED_MAX: u32 = mech::MAX_PHYSICS_STEPS as u32;
+const ENV_OWED_MAX: u32 = (mech::MAX_FRAME_DT * mech::PHYSICS_HZ) as u32;
 /// Frames the environment may sit out in a row before a hurried job still catches up
 /// one frame of it: Studio's highest throttle level steps it one frame in 16
 /// (throttle.rs).
@@ -1501,6 +1503,7 @@ impl Physics {
             asms: HashMap::default(),
             next_asm: 0,
             by_collider: Default::default(),
+            query_live: true,
             touch_parts: None,
             touch_refresh: false,
             touch_pending: Vec::new(),
@@ -1577,6 +1580,22 @@ impl Physics {
     /// Full rebuild from the document.
     pub fn reconcile(&mut self, doc: &Document) {
         self.world = new_world(self.gravity);
+        // The new arenas can reuse old handle values. Preserve solver
+        // configuration and clock phase while discarding per-world records.
+        if let Some(solver) = self.studio.as_mut() {
+            let mut fresh = crate::solver::StudioSolver::new(solver.path);
+            fresh.cfg = solver.cfg.clone();
+            fresh.ticks = solver.ticks;
+            fresh.throttled = solver.throttled;
+            **solver = fresh;
+        }
+        self.sj_cache = None;
+        self.link.new_world();
+        self.client_owned.clear();
+        self.touch_pending.clear();
+        self.union_offsets.clear();
+        self.pushed_last.clear();
+        self.lv_track.clear();
         self.parts.clear();
         self.asms.clear();
         self.dyn_version += 1;
@@ -1593,8 +1612,7 @@ impl Physics {
         self.terrain_tris = 0;
         self.terrain = None;
         // The world is new: characters' bodies are built again by their owner.
-        self.hums.by_model.clear();
-        self.hums.of_part.clear();
+        self.hums.new_world();
         let Some(ws) = Self::workspace_of(doc) else {
             return;
         };
@@ -1633,11 +1651,11 @@ impl Physics {
             // Part serials for the solver's pair order (narrow.rs `first_is_a`).
             sv.number_parts(doc.dom.descendants_of(ws).map(|i| i.referent()));
         }
+        self.query_live = false;
         self.build(doc, ws, seeds);
         self.build_terrain(doc);
-        // Queries only see colliders after a step: prime the broad phase so
-        // the first character move already stands on the ground.
         self.prime();
+        self.query_live = true;
     }
 
     fn prime(&mut self) {
@@ -1738,7 +1756,7 @@ impl Physics {
         // (Sets are walked in ref order: with RUSTUDIO_DETERMINISTIC refs follow
         // creation order, and rapier's arena indices — the solver's body and contact
         // order — come out the same on every run.)
-        let mut stack: Vec<Ref> = seeds.into_iter().collect();
+        let mut stack: Vec<Ref> = seeds.iter().copied().collect();
         stack.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
         while let Some(r) = stack.pop() {
             if !all.insert(r) {
@@ -1749,13 +1767,35 @@ impl Physics {
                     stack.extend(a.parts.iter().copied());
                 }
             }
+            // Keep the existing fixed part as support in the rebuilt
+            // group without walking its other welds.
+            if !seeds.contains(&r)
+                && self.parts.get(&r).is_some_and(|p| p.asm.is_none())
+                && self.wanted(doc, ws, r)
+                && (self.external.contains(&r) || matches!(doc.prop(r, "Anchored"), Some(Variant::Bool(true))))
+            {
+                continue;
+            }
             stack.extend(self.neighbours(r));
         }
         drop(b1);
         let b2 = rustudio_core::bench::scope("pb_drop");
-        // 2. Drop what's there now.
+        // 2. Drop what's there now (remembering dynamic bodies' velocity so
+        //    rebuilding an assembly, e.g. adding a Weld, preserves motion).
         let mut all: Vec<Ref> = all.into_iter().collect();
         all.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
+        let mut prev_vel: HashMap<Ref, (Vec3, Vec3)> = HashMap::default();
+        for r in &all {
+            if let Some(b) = self.body_of(*r).and_then(|h| self.world.bodies.get(h)) {
+                if b.is_dynamic() {
+                    let v = gv(b.linvel());
+                    let w = gv(b.angvel());
+                    if v != Vec3::ZERO || w != Vec3::ZERO {
+                        prev_vel.insert(*r, (v, w));
+                    }
+                }
+            }
+        }
         for r in &all {
             self.drop_part(*r);
         }
@@ -1801,12 +1841,18 @@ impl Physics {
                 stack.extend(self.neighbours(r));
             }
             group.sort_unstable_by_key(|r| rbx_dom_weak::ref_order(*r));
-            self.add_assembly(doc, &group, &info);
+            self.add_assembly(doc, &group, &info, &prev_vel);
             self.rebuilt += 1;
         }
     }
 
-    fn add_assembly(&mut self, doc: &Document, group: &[Ref], info: &HashMap<Ref, (Xform, Sig)>) {
+    fn add_assembly(
+        &mut self,
+        doc: &Document,
+        group: &[Ref],
+        info: &HashMap<Ref, (Xform, Sig)>,
+        prev_vel: &HashMap<Ref, (Vec3, Vec3)>,
+    ) {
         let anchored = group.iter().any(|r| info[r].1.anchored);
         if anchored {
             // Anchored assembly: plain fixed colliders, never simulated.
@@ -1871,9 +1917,44 @@ impl Physics {
                         .get_by_ref(*r)
                         .is_some_and(|i| i.name == "HumanoidRootPart")
             });
+        // Seed initial velocity: preserve across dynamic rebuilds, carry over
+        // velocity assigned while Anchored = true (e.g. anchored projectiles
+        // whose Velocity is set before unanchoring), or read saved Velocity.
+        let mut init_lin = Vec3::ZERO;
+        let mut init_ang = Vec3::ZERO;
+        for &r in std::iter::once(&root).chain(group.iter().filter(|r| **r != root)) {
+            let anch = self.anchored_vel.remove(&r);
+            if init_lin == Vec3::ZERO {
+                if let Some((v, w)) = prev_vel.get(&r) {
+                    if v.is_finite() {
+                        init_lin = *v;
+                    }
+                    if init_ang == Vec3::ZERO && w.is_finite() {
+                        init_ang = *w;
+                    }
+                } else if let Some(v) = anch.filter(|v| v.is_finite() && *v != Vec3::ZERO) {
+                    init_lin = v;
+                } else if let Some(v) = vec3_of(doc.prop(r, "AssemblyLinearVelocity"))
+                    .or_else(|| vec3_of(doc.prop(r, "Velocity")))
+                    .filter(|v| v.is_finite() && *v != Vec3::ZERO)
+                {
+                    init_lin = v;
+                }
+            }
+            if init_ang == Vec3::ZERO {
+                if let Some(w) = vec3_of(doc.prop(r, "AssemblyAngularVelocity"))
+                    .or_else(|| vec3_of(doc.prop(r, "RotVelocity")))
+                    .filter(|w| w.is_finite() && *w != Vec3::ZERO)
+                {
+                    init_ang = w;
+                }
+            }
+        }
         // Studio Settings > Physics > Allow Sleep.
         let mut rb = rp::RigidBodyBuilder::dynamic()
             .pose(root_pose)
+            .linvel(rv(init_lin))
+            .angvel(rv(init_ang))
             .can_sleep(rustudio_core::rustudio_settings::studio_flag("PhysicsSettings", "AllowSleep", true));
         if upright {
             rb = rb.lock_rotations();
@@ -2050,14 +2131,23 @@ impl Physics {
         let mut resized: HashSet<Ref> = HashSet::default();
         for c in changed {
             let Some(&s) = c2s.get(&c) else { continue };
-            if self.server_moved.contains(&s) && !self.client_over.contains_key(&s) {
+            let override_size = self.client_over.get(&s).map(|(_, size)| *size);
+            if self.server_moved.contains(&s) && override_size.is_none() {
                 continue;
             }
             // A loose assembly this player owns (`client_owned`): the owning client is
             // its simulation in Studio, so a client script's CFrame write moves it for
             // everyone (probe T23_kickcf) — here, its body in the one world.
+            // Only follow the assembly's root part (whose local pose in the body is
+            // identity, and which `carry_assembly` always moves on any part.CFrame
+            // write), so client-local joint offset animations like `WheelWeld.C0`
+            // on a non-root wheel do not teleport the entire vehicle body.
             if self.in_bodies(s, &self.client_owned) {
-                if seen.insert(c) {
+                let is_root = self.parts.get(&s).is_some_and(|pb| {
+                    pb.local.translation.length_squared() < 1e-8
+                        && pb.local.rotation.w.abs() > 1.0 - 1e-6
+                });
+                if is_root && seen.insert(c) {
                     if let (Some((cx, _)), Some((sx, _))) = (part_sig(client, c), part_sig(server, s)) {
                         let near = |a: Vec3, b: Vec3| (a - b).abs().max_element() < 1e-3;
                         if !(near(cx.pos, sx.pos) && cx.rot.abs_diff_eq(sx.rot, 1e-4)) {
@@ -2067,7 +2157,21 @@ impl Physics {
                 }
                 continue;
             }
-            if !seen.insert(c) || !self.parts.get(&s).is_some_and(|pb| pb.asm.is_none()) {
+            if !self.parts.get(&s).is_some_and(|pb| pb.asm.is_none()) {
+                continue;
+            }
+            // Most eligible copies already match. An active override still
+            // needs the normal transition when the server catches up.
+            if override_size.is_none() {
+                if let Some((client_part, server_part)) = client.dom.get_by_ref(c).zip(server.dom.get_by_ref(s)) {
+                    if client_part.properties.get(&cframe) == server_part.properties.get(&cframe)
+                        && client_part.properties.get(&size) == server_part.properties.get(&size)
+                    {
+                        continue;
+                    }
+                }
+            }
+            if !seen.insert(c) {
                 continue;
             }
             let (Some((cx, csig)), Some((sx, ssig))) = (part_sig(client, c), part_sig(server, s)) else {
@@ -2076,7 +2180,7 @@ impl Physics {
             let near = |a: Vec3, b: Vec3| (a - b).abs().max_element() < 1e-3;
             let same = near(cx.pos, sx.pos) && cx.rot.abs_diff_eq(sx.rot, 1e-4) && near(csig.size, ssig.size);
             // The size the collider has now.
-            let had = self.client_over.get(&s).map_or(ssig.size, |o| o.1);
+            let had = override_size.unwrap_or(ssig.size);
             if !same {
                 self.client_over.insert(s, (cx, csig.size));
                 if near(had, csig.size) {
@@ -2332,30 +2436,29 @@ impl Physics {
     /// (Re)builds Workspace.Terrain's colliders: its non-water surface as fixed
     /// triangle meshes, one per TERRAIN_COLLIDER_CELL cube so each stays small.
     fn build_terrain(&mut self, doc: &Document) {
-        // Same solid voxels as the colliders were made from: keep them.
         let terrain = Self::workspace_of(doc).and_then(|ws| doc.find_child(ws, "Terrain"));
-        if let (Some(old), Some(t)) = (self.voxels.as_ref(), terrain) {
-            if Some(t) == self.terrain {
-                if let Some(Ok(v)) = terrain::Voxels::from_dom(&doc.dom) {
-                    if v.same_solid(old) {
-                        self.voxels = Some(v);
-                        return;
-                    }
-                }
-            }
+        let voxels = {
+            let _dec = rustudio_core::bench::scope("pt_decode");
+            terrain
+                .and_then(|_| terrain::Voxels::from_dom(&doc.dom))
+                .and_then(|result| result.map_err(|e| eprintln!("physics: terrain not loaded: {e}")).ok())
+        };
+        // Same solid voxels as the colliders were made from: keep them.
+        if terrain == self.terrain
+            && self.voxels.as_ref().zip(voxels.as_ref()).is_some_and(|(old, new)| new.same_solid(old))
+        {
+            self.voxels = voxels;
+            return;
         }
         // Studio solver: a sleeping body resting on (or touching) terrain that changed wakes
         // (SLEEP §7.2's property-write wake; rapier's own wake on a removed collider is
         // undone there as a non-write).
-        if self.studio.is_some() {
-            let old = self.voxels.take();
-            let new = terrain.and_then(|_| terrain::Voxels::from_dom(&doc.dom)).and_then(|r| r.ok());
-            let region = match (&old, &new) {
-                (Some(o), Some(n)) => o.solid_diff_world_bounds(n),
-                (Some(o), None) => o.world_bounds(),
-                (None, _) => None,
+        if let (Some(old), Some(sv)) = (self.voxels.as_ref(), self.studio.as_mut()) {
+            let region = match &voxels {
+                Some(new) => old.solid_diff_world_bounds(new),
+                None => old.world_bounds(),
             };
-            if let (Some((lo, hi)), Some(sv)) = (region, self.studio.as_mut()) {
+            if let Some((lo, hi)) = region {
                 sv.region_changed(Vec3::from(lo), Vec3::from(hi));
             }
         }
@@ -2365,23 +2468,13 @@ impl Physics {
         }
         self.terrain_tris = 0;
         self.voxels = None;
-        self.terrain = Self::workspace_of(doc).and_then(|ws| doc.find_child(ws, "Terrain"));
-        let Some(t) = self.terrain else { return };
-        let dec = rustudio_core::bench::scope("pt_decode");
-        let voxels = match terrain::Voxels::from_dom(&doc.dom) {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                eprintln!("physics: terrain not loaded: {e}");
-                return;
-            }
-            None => return,
-        };
+        self.terrain = terrain;
+        let (Some(t), Some(voxels)) = (terrain, voxels) else { return };
         if voxels.count() == 0 {
             return;
         }
-        drop(dec);
         let mesh_scope = rustudio_core::bench::scope("pt_mesh");
-        let (pos, idx) = terrain::collision_mesh(&terrain::build_meshes(&voxels));
+        let (pos, idx) = terrain::collision_mesh(&terrain::build_solid_meshes(&voxels));
         drop(mesh_scope);
         let _col = rustudio_core::bench::scope("pt_colliders");
         self.voxels = Some(voxels);
@@ -3343,6 +3436,15 @@ impl Physics {
 
     fn register_collider(&mut self, handle: rp::ColliderHandle, part: Ref) {
         self.by_collider.insert(handle, part);
+        // Studio's ContactManager::onAssemblyAdded inserts into the query
+        // broad phase before the next world step (including floor rays).
+        if self.query_live {
+            let world = &mut self.world;
+            if let Some(collider) = world.colliders.get(handle) {
+                let aabb = collider.compute_broad_phase_aabb(&world.integration_parameters, &world.bodies);
+                world.broad_phase.set_aabb(&world.integration_parameters, handle, aabb);
+            }
+        }
         if self.touch_parts.is_some() && !self.touch_refresh {
             self.touch_pending.push(handle);
         }
@@ -3474,13 +3576,6 @@ impl Physics {
                 self.pending_vel.insert(r, (v, left - 1));
             }
         }
-        let (hz, _, max_steps) = step_rate();
-        let h = 1.0 / hz;
-        // Discard elapsed time above the frame budget on a hitch. Keep the
-        // fractional remainder so ordinary frames stay on the 240 Hz grid.
-        let wanted = self.accum + dt.max(0.0);
-        self.accum = wanted.min(h * max_steps as f32);
-        let owed = ((wanted - self.accum) * 60.0) as u32;
         self.throttle.mode = doc
             .workspace()
             .and_then(|w| match doc.prop(w, "PhysicsEnvironmentalThrottle") {
@@ -3494,6 +3589,14 @@ impl Physics {
         if let Some(v) = *FORCE.get_or_init(|| std::env::var("RUSTUDIO_PHYSICS_ENV_THROTTLE").ok().and_then(|v| v.parse().ok())) {
             self.throttle.mode = crate::throttle::Mode::from_value(v);
         }
+        let h = 1.0 / step_rate().0;
+        // Studio's cyclic executive caps this frame and remembers less
+        // than four steps for the next. The worker and inline paths use
+        // the same frame budget, including the opening fractional tick.
+        let max_steps = self.throttle.max_world_steps();
+        let wanted = self.accum + dt.max(0.0);
+        self.accum = wanted.min(h * (max_steps as f32 + mech::PHYSICS_CARRY_MAX_STEPS));
+        let owed = ((wanted - self.accum) * 60.0) as u32;
         let jsc = rustudio_core::bench::scope("ph_joints");
         {
             let _a = rustudio_core::bench::scope("pj_apply_joints");
@@ -3683,6 +3786,9 @@ impl Physics {
         // held still. Unlike the throttle's frames the environment's ticks are owed, not
         // lost: `catch_up_environment` steps them while no frame is waiting.
         let can_hurry = studio && frame.adaptive && doc.is_none() && hurry_enabled();
+        if let Some(sv) = self.studio.as_mut().filter(|sv| sv.throttled && sv.throttle_exempt.is_empty()) {
+            sv.throttle_exempt.extend(humanoid_assemblies(&self.hums, &self.parts, &self.asms));
+        }
         let mut hurried_frames = 0u64;
         // The environmental throttle decides per 60 Hz frame (a group of
         // maxLevel ticks); an unthrottled frame's wall time feeds its level
@@ -5270,13 +5376,211 @@ mod tests {
     }
 
     #[test]
-    fn physics_hitch_keeps_no_step_debt() {
-        let (mut doc, mut physics) = hum_world(vec![]);
-        let (hz, _, max_steps) = step_rate();
-        physics.step(&mut doc, 1.0);
-        assert_eq!(physics.steps, max_steps as u64);
-        physics.step(&mut doc, 1.0 / hz);
-        assert_eq!(physics.steps, (max_steps + 1) as u64);
+    fn welding_to_an_anchored_web_rebuilds_only_its_edge() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let chain: Vec<Ref> = (0..20)
+            .map(|i| doc.dom.insert(ws, part(&format!("M{i}"), Vec3::new(2.0 * i as f32, 30.0, 0.0), true)))
+            .collect();
+        for w in chain.windows(2) {
+            doc.dom.insert(w[0], InstanceBuilder::new("WeldConstraint").with_property("Part0", w[0]).with_property("Part1", w[1]));
+        }
+        let loose = doc.dom.insert(ws, part("Loose", Vec3::new(40.0, 30.0, 0.0), false));
+        doc.dom.insert(loose, InstanceBuilder::new("WeldConstraint").with_property("Part0", chain[19]).with_property("Part1", loose));
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 2);
+        let collider = |p: &Physics, r: Ref| p.parts[&r].collider;
+        let far = collider(&p, chain[10]);
+        let loose_before = collider(&p, loose);
+        // The regenerated model: a part welded to the map's first part, and
+        // an unanchored one welded to it.
+        let new = doc.dom.insert(ws, part("New", Vec3::new(-2.0, 30.0, 0.0), true));
+        let hang = doc.dom.insert(ws, part("Hang", Vec3::new(-4.0, 30.0, 0.0), false));
+        let j1 = doc.dom.insert(new, InstanceBuilder::new("WeldConstraint").with_property("Part0", new).with_property("Part1", chain[0]));
+        let j2 = doc.dom.insert(new, InstanceBuilder::new("WeldConstraint").with_property("Part0", new).with_property("Part1", hang));
+        for r in [new, hang, j1, j2] {
+            doc.mark_tree(r);
+        }
+        p.sync(&mut doc);
+        assert_eq!(collider(&p, chain[10]), far, "the rest of the map keeps its colliders");
+        assert_eq!(collider(&p, loose), loose_before, "so does what hangs off it");
+        assert!(p.parts[&new].asm.is_none() && p.parts[&hang].asm.is_none(), "the new parts are fixed");
+        assert_eq!(p.counts().0, 0, "nothing simulated");
+        // Unanchoring the new part: Hang still hangs off the map through it.
+        doc.set_prop_live(new, ustr("Anchored"), Variant::Bool(false));
+        p.sync(&mut doc);
+        assert!(p.parts[&new].asm.is_none() && p.parts[&hang].asm.is_none(), "held by the map");
+        // The weld to the map gone: New and Hang fall together.
+        doc.dom.transfer_within(j1, Ref::none());
+        doc.mark_tree(j1);
+        p.sync(&mut doc);
+        assert_eq!(p.counts().0, 1, "New and Hang are one loose assembly");
+        assert_eq!(collider(&p, chain[10]), far, "the map still untouched");
+    }
+
+    #[test]
+    fn part_added_under_a_standing_humanoid_holds_it_at_once() {
+        for steps in [0, 3] {
+            let (mut doc, mut p) = hum_world(vec![]);
+            run(&mut p, &mut doc, steps);
+            let ws = doc.workspace().unwrap();
+            let slab = doc.dom.insert(
+                ws,
+                part("Slab", Vec3::new(0.0, 0.25, 0.0), true).with_property("Size", Vector3::new(20.0, 0.5, 20.0)),
+            );
+            doc.mark_tree(slab);
+            p.sync(&mut doc);
+            let sh = hum_shape_r15();
+            let root = Vec3::Y * (0.5 + sh.hip + sh.root_size.y * 0.5);
+            let floor = p.find_floor(root, Quat::IDENTITY, &sh, true, &HashSet::<Ref>::default()).expect("a floor");
+            assert_eq!(floor.part, Some(slab), "the floor rays find the part parented this frame");
+            assert!((floor.y - 0.5).abs() < 1e-3, "on the slab's top, not the floor below: {}", floor.y);
+        }
+    }
+
+    #[test]
+    fn character_in_a_rebuilt_world_stands_still() {
+        use crate::humanoid::{Humanoid, StepIn};
+        if crate::solver::kind() == crate::solver::SolverKind::Rapier {
+            return;
+        }
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        for name in ["SpawnLocation", "Baseplate"] {
+            if let Some(r) = doc.find_named(ws, name) {
+                doc.dom.destroy(r);
+            }
+        }
+        // The old world: one loose 2×1.2×1 part, body (0, 0), mass record 1.68.
+        let crate_part = doc.dom.insert(ws, part("Crate", Vec3::new(40.0, 20.0, 40.0), false).with_property("Size", Vector3::new(2.0, 1.2, 1.0)));
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 1);
+        doc.dom.destroy(crate_part);
+        doc.dom.insert(ws, part("Floor", Vec3::new(0.0, -1.0, 0.0), true).with_property("Size", Vector3::new(400.0, 2.0, 400.0)));
+        let sh = hum_shape_r15();
+        let full_hip = sh.root_size.y * 0.5 + sh.hip;
+        let model = doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Character"));
+        doc.dom.insert(model, InstanceBuilder::new("Humanoid"));
+        let at = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        // 2×2×1 at density 3.5: the whole character's 14.
+        let heavy = rbx_dom_weak::types::PhysicalProperties::Custom(rbx_dom_weak::types::CustomPhysicalProperties::new(3.5, 0.3, 0.5, 1.0, 1.0, 1.0));
+        let root = doc.dom.insert(
+            model,
+            part("HumanoidRootPart", at(0.0, full_hip), false).with_property("Size", Vector3::new(2.0, 2.0, 1.0)).with_property("CustomPhysicalProperties", heavy),
+        );
+        let limb = |name: &str, pos: Vec3, size: Vector3, collide: bool| {
+            part(name, pos, false).with_property("Size", size).with_property("Massless", true).with_property("CanCollide", collide)
+        };
+        for (name, pos, size, collide) in [
+            ("LowerTorso", at(0.0, full_hip - 0.8), Vector3::new(2.0, 0.4, 1.0), true),
+            ("UpperTorso", at(0.0, full_hip + 0.2), Vector3::new(2.0, 1.6, 1.0), true),
+            ("Head", at(0.0, full_hip + 1.6), Vector3::new(1.2, 1.2, 1.2), true),
+            ("LeftUpperLeg", at(-0.5, 1.0), Vector3::new(1.0, 2.0, 1.0), false),
+            ("RightUpperLeg", at(0.5, 1.0), Vector3::new(1.0, 2.0, 1.0), false),
+        ] {
+            doc.dom.insert(model, limb(name, pos, size, collide));
+        }
+        let parts_of = |doc: &Document| -> Vec<(Ref, Xform)> {
+            doc.dom
+                .descendants_of(model)
+                .filter(|i| doc::is_a(&i.class, "BasePart"))
+                .filter_map(|i| Some((i.referent(), xform_of(doc, i.referent())?)))
+                .collect()
+        };
+        // The character's parts are the Humanoid's; the world is rebuilt
+        // without the crate, so the character's body is its first.
+        p.skip.extend(parts_of(&doc).iter().map(|(r, _)| *r));
+        p.reconcile(&doc);
+        p.add_humanoid(&doc, model, root, &parts_of(&doc));
+        let root_at = xform_of(&doc, root).unwrap();
+        let mut hum = Humanoid::default();
+        let (mut worst_v, mut worst_w, mut lowest_up) = (0.0f32, 0.0f32, 1.0f32);
+        for frame in 0..180 {
+            if frame == 30 {
+                // The server's accessories arrive after the character was taken.
+                for (name, y) in [("Hat", full_hip + 2.4), ("Hair", full_hip + 1.8)] {
+                    let acc = doc.dom.insert(model, InstanceBuilder::new("Accessory").with_name(name));
+                    let handle = doc.dom.insert(acc, limb("Handle", at(0.0, y), Vector3::new(2.0, 1.0, 2.0), false));
+                    doc.mark_tree(acc);
+                    p.skip.insert(handle);
+                }
+                let parts = parts_of(&doc);
+                p.refresh_humanoid(&doc, model, root, &parts);
+                for (part, _) in parts {
+                    assert_eq!(p.hums.of_part.get(&part), Some(&model));
+                }
+            }
+            // Each part where the rig holds it, relative to the root (no animation).
+            let local: std::collections::HashMap<Ref, Xform> =
+                parts_of(&doc).into_iter().map(|(r, xf)| (r, Xform { pos: xf.pos - root_at.pos, rot: Mat3::IDENTITY })).collect();
+            p.set_humanoid_pose(model, &local, &local);
+            let (xf, _, _) = p.humanoid_root(model).unwrap();
+            let own: HashSet<Ref> = local.keys().copied().collect();
+            let floor = p.humanoid_floor(&doc, model, xf.pos, Quat::from_mat3(&xf.rot), &sh, true, &own);
+            hum.floor_target_y = floor.map_or(f32::INFINITY, |f| f.0.y + full_hip);
+            let step = StepIn {
+                floor: floor.map(|f| f.0),
+                full_hip,
+                cos_max_slope: 89f32.to_radians().cos(),
+                ladder: false,
+                jump_velocity: 50.0,
+                accel_scale: 1.0,
+                ceiling: false,
+            };
+            let ctl = hum_body::HumCtl { hum: hum.clone(), step, floor_part: floor.and_then(|f| f.1), hrp: root, last: Default::default(), level: 1, swim: None };
+            p.set_humanoid_ctl(model, Some(ctl));
+            p.sync(&mut doc);
+            p.step(&mut doc, DT);
+            hum = p.humanoid_ctl(model).unwrap().hum.clone();
+            let (xf, v, w) = p.humanoid_root(model).unwrap();
+            worst_v = worst_v.max(v.length());
+            worst_w = worst_w.max(w.length());
+            lowest_up = lowest_up.min(xf.rot.y_axis.y);
+        }
+        let (xf, _, _) = p.humanoid_root(model).unwrap();
+        assert!(worst_v < 1.0 && worst_w < 0.5 && lowest_up > 0.99, "standing: |v| up to {worst_v}, |ω| up to {worst_w}, up.y down to {lowest_up}");
+        assert!((xf.pos - root_at.pos).length() < 0.2, "stays where it stood: {:?} from {:?}", xf.pos, root_at.pos);
+    }
+
+    #[test]
+    fn matching_client_copy_clears_a_live_size_override() {
+        let (mut server, mut physics) = hum_world(vec![part("Followed", Vec3::Y * 50.0, true)]);
+        let r = server.find_named(server.workspace().unwrap(), "Followed").unwrap();
+        let mut client = server.clone_for_play("Client".to_string());
+        let c = client.find_named(client.workspace().unwrap(), "Followed").unwrap();
+        let mut refs = rustudio_core::RefMap::default();
+        refs.insert(c, r);
+        let size = ustr("Size");
+        let changed = Variant::Vector3(Vector3::new(5.0, 2.0, 3.0));
+        client.set_prop_live(c, size, changed.clone());
+        physics.follow_client(&server, &mut client, &refs);
+        assert!(physics.client_over.contains_key(&r));
+        server.set_prop_live(r, size, changed.clone());
+        physics.sync(&mut server);
+        client.set_prop_live(c, size, changed);
+        // A replication mark may repeat the value already set by the client.
+        client.mark_prop(c, size);
+        physics.follow_client(&server, &mut client, &refs);
+        assert!(!physics.client_over.contains_key(&r));
+    }
+
+    #[test]
+    fn physics_hitch_caps_ticks_and_retains_only_four_steps_of_debt() {
+        for (mode, cap) in [(1, 12), (4, 4)] {
+            let (mut doc, mut physics) = hum_world(vec![]);
+            let ws = doc.workspace().unwrap();
+            doc.set_prop_live(ws, ustr("PhysicsEnvironmentalThrottle"), Variant::Enum(rbx_dom_weak::types::Enum::from_u32(mode)));
+            let h = 1.0 / step_rate().0;
+            physics.step(&mut doc, 1.0);
+            assert_eq!(physics.steps, cap);
+            assert!(physics.accum < 4.0 * h);
+            physics.step(&mut doc, 1.0);
+            assert_eq!(physics.steps, 2 * cap);
+            physics.step(&mut doc, h);
+            assert_eq!(physics.steps, 2 * cap + cap.min(5));
+            physics.step(&mut doc, h);
+            assert_eq!(physics.steps, 2 * cap + 6);
+        }
     }
 
     #[test]
@@ -5289,9 +5593,12 @@ mod tests {
         physics.reconcile(&mut doc);
         let block = doc.find_named(ws, "Block").unwrap();
         let body = physics.body_of(block).unwrap();
-        for _ in 0..30 {
+        for frame in 1..=30 {
             physics.step(&mut doc, 1.0 / 60.0);
-            assert_eq!(physics.studio.as_ref().unwrap().next_solve(body), (1, true));
+            assert_eq!(physics.steps, frame * 4);
+            if let Some(solver) = &physics.studio {
+                assert_eq!(solver.next_solve(body), (1, true));
+            }
         }
     }
 
@@ -5727,6 +6034,33 @@ mod tests {
         run(&mut p, &mut doc, 20);
         assert_eq!(p.mover_count(), 0);
         assert!(vel_of(&p, a).y < -20.0, "falls: {:?}", vel_of(&p, a));
+    }
+
+    #[test]
+    fn unanchoring_part_preserves_assigned_velocity() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let part = doc.dom.insert(
+            ws,
+            InstanceBuilder::new("Part")
+                .with_name("RocketCollider")
+                .with_property("Size", Vector3::new(1.0, 1.0, 1.0))
+                .with_property("CFrame", CFrame::new(Vector3::new(0.0, 30.0, 0.0), rbx_dom_weak::types::Matrix3::identity()))
+                .with_property("Anchored", true),
+        );
+        doc.mark_tree(part);
+        let mut p = Physics::new(&mut doc);
+        run(&mut p, &mut doc, 2);
+        // Script assigns velocity while Anchored = true, then unanchors next frame.
+        p.set_velocity(part, Vec3::new(0.0, 0.0, -90.0));
+        run(&mut p, &mut doc, 1);
+        doc.set_prop_live(part, ustr("Anchored"), Variant::Bool(false));
+        run(&mut p, &mut doc, 2);
+        let v = vel_of(&p, part);
+        assert!(
+            (v.z - (-90.0)).abs() < 1.0,
+            "unanchored part should keep velocity assigned while anchored, got {v:?}"
+        );
     }
 
     #[test]

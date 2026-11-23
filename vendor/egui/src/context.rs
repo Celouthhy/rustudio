@@ -582,14 +582,17 @@ impl ContextImpl {
                         .families
                         .entry(family.family)
                         .or_default();
-                    match family.priority {
-                        FontPriority::Highest => fam.insert(0, font.name.clone()),
-                        FontPriority::Lowest => fam.push(font.name.clone()),
+                    if !fam.contains(&font.name) {
+                        match family.priority {
+                            FontPriority::Highest => fam.insert(0, font.name.clone()),
+                            FontPriority::Lowest => fam.push(font.name.clone()),
+                        }
                     }
                 }
                 self.font_definitions
                     .font_data
-                    .insert(font.name, Arc::new(font.data));
+                    .entry(font.name)
+                    .or_insert_with(|| Arc::new(font.data));
             }
 
             log::trace!("Adding new fonts");
@@ -2218,6 +2221,13 @@ impl Context {
                     .definitions()
                     .font_data
                     .contains_key(&new_font.name)
+                && new_font.families.iter().all(|f| {
+                    current_fonts
+                        .definitions()
+                        .families
+                        .get(&f.family)
+                        .is_some_and(|list| list.contains(&new_font.name))
+                })
             {
                 update_fonts = false; // no need to update
             }

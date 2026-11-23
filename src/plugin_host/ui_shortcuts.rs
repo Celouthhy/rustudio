@@ -141,6 +141,9 @@ impl Editor {
             }
         }
         for g in &self.plugin_bar.model.groups {
+            if self.is_hidden_from_plugins_tab(g) {
+                continue;
+            }
             for b in &g.buttons {
                 if let Some(s) = labels.get(&b.key) {
                     targets.push((b.r, "Click", s.clone()));
@@ -184,6 +187,9 @@ impl Editor {
             });
         }
         for g in &self.plugin_bar.model.groups {
+            if self.is_hidden_from_plugins_tab(g) {
+                continue;
+            }
             for b in &g.buttons {
                 rows.push(Row {
                     key: Some(b.key.clone()),

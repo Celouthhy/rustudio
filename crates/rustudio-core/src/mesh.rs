@@ -2434,9 +2434,56 @@ mod facs_tests {
         m.extend(&blk);
         assert_eq!(parse_mesh_facs(&m).unwrap().controls.len(), 2);
     }
+
+    #[test]
+    fn union_mesh_ignores_orphan_csgk_key_and_resolves_csg_dictionary() {
+        use rbx_dom_weak::{InstanceBuilder, WeakDom};
+        let key = b"CSGK62b5db54ca4f52fce1ca958f91edfb5c".to_vec();
+        let u = InstanceBuilder::new("UnionOperation")
+            .with_property("MeshData", rbx_dom_weak::types::BinaryString::from(key.clone()));
+        let ur = u.referent();
+        let doc = Document::from_play_dom(
+            WeakDom::new(InstanceBuilder::new("DataModel").with_child(u)),
+            "csgk-orphan".into(),
+        );
+        assert!(union_mesh(&doc, ur).is_none());
+
+        let blob = b"SolidMesh\0\0\0\0".to_vec();
+        let u2 = InstanceBuilder::new("UnionOperation")
+            .with_property("MeshData", rbx_dom_weak::types::BinaryString::from(key));
+        let u2r = u2.referent();
+        let entry = InstanceBuilder::new("BinaryStringValue")
+            .with_name("CSGK62b5db54ca4f52fce1ca958f91edfb5c")
+            .with_property("Value", rbx_dom_weak::types::BinaryString::from(blob));
+        let dict = InstanceBuilder::new("CSGDictionaryService").with_child(entry);
+        let doc2 = Document::from_play_dom(
+            WeakDom::new(InstanceBuilder::new("DataModel").with_child(dict).with_child(u2)),
+            "csgk-dict".into(),
+        );
+        let asset = union_mesh(&doc2, u2r).expect("CSGDictionaryService lookup");
+        assert!(asset.id.starts_with("rbxtemp://rustudio/union/"));
+    }
 }
 
 // ------------------------------------------------------------------ unions
+
+fn csg_dictionary_blob(doc: &Document, key: &[u8]) -> Option<Vec<u8>> {
+    let name = std::str::from_utf8(key).ok()?;
+    let dict = doc.find_child(doc.dom.root_ref(), "CSGDictionaryService")?;
+    let entry = doc
+        .dom
+        .get_by_ref(dict)?
+        .children()
+        .iter()
+        .copied()
+        .find(|&c| doc.dom.get_by_ref(c).is_some_and(|i| i.name == name))?;
+    match doc.prop(entry, "Value") {
+        Some(Variant::BinaryString(b)) if !AsRef::<[u8]>::as_ref(&b).is_empty() => {
+            Some(AsRef::<[u8]>::as_ref(&b).to_vec())
+        }
+        _ => None,
+    }
+}
 
 /// A short content hash for a mesh blob without its own (MeshData).
 fn blake3_hex(data: &[u8]) -> String {
@@ -2464,9 +2511,19 @@ pub fn union_mesh(doc: &Document, r: Ref) -> Option<MeshAsset> {
             }
             _ => match doc.prop(r, "MeshData") {
                 Some(Variant::BinaryString(b)) if !AsRef::<[u8]>::as_ref(&b).is_empty() => {
-                    let data: Vec<u8> = AsRef::<[u8]>::as_ref(&b).to_vec();
-                    let h = blake3_hex(&data);
-                    Some((data, h))
+                    let raw: &[u8] = AsRef::<[u8]>::as_ref(&b);
+                    if raw.starts_with(b"CSGK") && raw.len() <= 64 {
+                        // Legacy CSG dictionary key (`CSGK<md5>`), not raw mesh bytes:
+                        // resolve via CSGDictionaryService if present, else fall back to Content.
+                        csg_dictionary_blob(doc, raw).map(|data| {
+                            let h = blake3_hex(&data);
+                            (data, h)
+                        })
+                    } else {
+                        let data: Vec<u8> = raw.to_vec();
+                        let h = blake3_hex(&data);
+                        Some((data, h))
+                    }
                 }
                 _ => None,
             },

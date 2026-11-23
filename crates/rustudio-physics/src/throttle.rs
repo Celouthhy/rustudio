@@ -75,6 +75,19 @@ impl Throttle {
         }
     }
 
+    /// World steps one frame may run (Studio 0.746 `World::updateStepsRequiredForCyclicExecutive`
+    /// 0x100309f1e: `DFInt::MaxMissedWorldStepsRemembered` (12, at least 12) while more than
+    /// 0.4 of the frames step the environment, else 4, one 60 Hz frame's worth). Studio's
+    /// rule reads the throttle factor; Always and Disabled have none here, so they keep 12.
+    pub fn max_world_steps(&self) -> usize {
+        let throttled = matches!(self.mode, Mode::Default | Mode::Skip(_)) && self.fraction() <= 0.4;
+        if throttled {
+            rustudio_core::mech::THROTTLED_MAX_PHYSICS_STEPS
+        } else {
+            rustudio_core::mech::MAX_PHYSICS_STEPS
+        }
+    }
+
     /// Starts the next 60 Hz frame: whether the environment is throttled in it.
     pub fn begin_frame(&mut self) -> bool {
         if self.ticks == 4 && !self.throttled {

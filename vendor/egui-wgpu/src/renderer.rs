@@ -253,6 +253,7 @@ pub struct Renderer {
     /// sampler). The texture may be None if the `TextureId` is just a handle to a user-provided
     /// sampler.
     textures: HashMap<epaint::TextureId, Texture>,
+    short_font_atlas: Option<Texture>,
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
 
@@ -464,6 +465,7 @@ impl Renderer {
             uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
+            short_font_atlas: None,
             next_user_texture_id: 0,
             samplers: HashMap::default(),
             options,
@@ -657,7 +659,7 @@ impl Renderer {
         };
         let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
 
-        let queue_write_data_to_texture = |texture, origin| {
+        let queue_write_data_to_texture = |texture: &wgpu::Texture, origin| {
             profiling::scope!("write_texture");
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -771,10 +773,44 @@ impl Renderer {
                 );
                 // (the shorter atlas is freed on another thread; this frame's
                 // earlier passes using it are submitted, and wgpu waits for them)
-                let shorter: Vec<wgpu::Texture> = old.as_ref().and_then(|t| t.texture.clone()).into_iter().collect();
-                crate::prewarm::destroy_later(shorter, old);
+                if id == epaint::TextureId::default() {
+                    // A font reset returns to the smaller atlas. Retain one
+                    // allocation so that full replacement can reuse it.
+                    let previous = std::mem::replace(&mut self.short_font_atlas, old);
+                    if previous.is_some() {
+                        crate::prewarm::drop_later(previous);
+                    }
+                } else {
+                    let shorter = old.as_ref().and_then(|t| t.texture.clone()).into_iter().collect();
+                    crate::prewarm::destroy_later(shorter, old);
+                }
                 return;
             }
+        }
+
+        // Font resets with the same dimensions can keep the allocation and
+        // bind group. The full write still clears glyphs from the old atlas.
+        if id == epaint::TextureId::default() && image_delta.pos.is_none() && image_delta.grown.is_none()
+            && let Some(entry) = self.textures.get(&id)
+            && entry.options == Some(image_delta.options)
+            && let Some(texture) = entry.texture.as_ref().filter(|texture| texture.size() == size)
+        {
+            queue_write_data_to_texture(texture, wgpu::Origin3d::ZERO);
+            return;
+        }
+
+        if id == epaint::TextureId::default() && image_delta.pos.is_none() && image_delta.grown.is_none()
+            && self.short_font_atlas.as_ref().is_some_and(|entry| {
+                entry.options == Some(image_delta.options)
+                    && entry.texture.as_ref().is_some_and(|texture| texture.size() == size)
+            })
+        {
+            let entry = self.short_font_atlas.take().expect("matching font atlas");
+            queue_write_data_to_texture(entry.texture.as_ref().expect("font texture"), wgpu::Origin3d::ZERO);
+            if let Some(old) = self.textures.insert(id, entry) {
+                crate::prewarm::drop_later(old);
+            }
+            return;
         }
 
         let (texture, origin, bind_group) = if let Some(pos) = image_delta.pos {

@@ -168,11 +168,12 @@ pub fn install(ctx: &egui::Context) {
     }
     let mono = defs.families[&FontFamily::Monospace].clone();
     defs.families.entry(FontFamily::Name("mono-bold".into())).or_default().extend(mono);
-    // Symbols the faces lack (a game's text in egui's default font, "✓"):
-    // the same fallback fonts as game fonts get.
+    // Symbols and scripts the faces lack (emoji, Arabic, CJK, ...):
+    // the same shared fallback fonts as game fonts get.
     for (i, bytes) in crate::gui::fallback_fonts().iter().enumerate() {
-        let key = format!("fallback{i}");
-        defs.font_data.insert(key.clone(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+        let key = format!("rbx:fallback{i}");
+        defs.font_data
+            .insert(key.clone(), std::sync::Arc::new(crate::gui::fallback_font_data(bytes)));
         defs.families.entry(FontFamily::Proportional).or_default().push(key);
     }
     // Bold falls back to the regular face (and then egui's) when missing.

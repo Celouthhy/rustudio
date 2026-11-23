@@ -184,7 +184,11 @@ impl Editor {
         match &wanted {
             Some(names) => {
                 for n in names {
-                    let v = doc.prop(r, n).map(|v| tree::value_json(&class, n, &v)).unwrap_or(J::Null);
+                    let v = self
+                        .live_sound_prop(r, n)
+                        .or_else(|| doc.prop(r, n))
+                        .map(|v| tree::value_json(&class, n, &v))
+                        .unwrap_or(J::Null);
                     props.insert(n.clone(), v);
                 }
             }
@@ -199,7 +203,26 @@ impl Editor {
                         }
                         ("Attributes" | "Tags", _) => {}
                         _ => {
-                            props.insert(n.to_string(), tree::value_json(&class, n.as_str(), v));
+                            let val = self.live_sound_prop(r, n.as_str()).unwrap_or_else(|| v.clone());
+                            props.insert(n.to_string(), tree::value_json(&class, n.as_str(), &val));
+                        }
+                    }
+                }
+                if self.game.play.is_none() {
+                    let ea = &self.game.edit_audio;
+                    if class == "Sound"
+                        && (ea.is_loaded(r) || matches!(doc.prop(r, "Playing"), Some(Variant::Bool(true))))
+                    {
+                        for k in ["IsLoaded", "TimeLength", "IsPlaying", "IsPaused"] {
+                            if let Some(val) = self.live_sound_prop(r, k) {
+                                props.insert(k.to_string(), tree::value_json(&class, k, &val));
+                            }
+                        }
+                    } else if class == "AudioPlayer" && (ea.is_loaded(r) || ea.preview_ref() == Some(r)) {
+                        for k in ["IsReady", "TimeLength", "IsPlaying", "TimePosition"] {
+                            if let Some(val) = self.live_sound_prop(r, k) {
+                                props.insert(k.to_string(), tree::value_json(&class, k, &val));
+                            }
                         }
                     }
                 }
@@ -327,11 +350,19 @@ impl Editor {
                     return Err("A place is still loading; try again when it has opened.".into());
                 }
                 let identity = rustudio_engine::runtime::security::COMMAND;
+                self.edit_audio_tick();
+                let ea_len = self.game.edit_audio.lengths.clone();
                 let sync_done = self.plugins.with_edit_vm(&mut self.game.doc, |rt| -> R<Option<J>> {
+                    if let Ok(mut w) = rustudio_engine::runtime::world(&rt.lua) {
+                        for (&r, &len) in &ea_len {
+                            w.input.sound_len.insert(r, len);
+                        }
+                    }
                     rustudio_player::luau_eval::start(&rt.lua, &code, id, identity)?;
                     rt.dispatch();
                     Ok(rustudio_player::luau_eval::poll(&rt.lua, id))
                 })??;
+                self.edit_audio_tick();
                 if sync_done.is_some() {
                     self.game.doc.commit_pending_script_changes("Run Luau (MCP)");
                 }
@@ -669,14 +700,14 @@ impl Editor {
             let at = now + num(st, "at").unwrap_or(0.0).max(0.0) as f32;
             let bad = |what: &str| format!("Nothing was sent. step {}: {what}", i + 1);
             if let Some(k) = s(st, "key") {
-                let key = egui::Key::from_name(k).ok_or_else(|| bad(&format!("{k:?} isn't a key name (egui names: A, Space, Enter, ArrowUp, F1…)")))?;
+                let (key, mods) = rustudio_player::run_harness::parse_harness_key(k).ok_or_else(|| bad(&format!("{k:?} isn't a key name (egui names: A, Space, Enter, ArrowUp, F1, ctrl+a…)")))?;
                 match num(st, "hold") {
                     Some(h) if h > 0.0 => {
-                        out.push((at, H::KeyState(key, true)));
-                        out.push((at + h as f32, H::KeyState(key, false)));
+                        out.push((at, H::KeyState(key, mods, true)));
+                        out.push((at + h as f32, H::KeyState(key, mods, false)));
                         until = until.max(at + h as f32);
                     }
-                    _ => out.push((at, H::Key(key))),
+                    _ => out.push((at, H::Key(key, mods))),
                 }
             } else if let Some(xy) = st.get("click").and_then(|c| c.as_array()) {
                 let v: Vec<f32> = xy.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect();

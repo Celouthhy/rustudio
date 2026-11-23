@@ -219,6 +219,9 @@ fn init_file(dir: &Path) -> Option<(PathBuf, FileKind)> {
 pub struct Reader<'a> {
     pub ignore: &'a [glob::Pattern],
     pub root: &'a Path,
+    /// What `$path`s, directory entries and files may resolve into
+    /// (`bound`): the project's git repository, or its folder.
+    pub bound: Option<PathBuf>,
     pub warnings: Warnings,
     /// Bytes of every file read (the sync compares against them).
     pub read: HashMap<PathBuf, Vec<u8>>,
@@ -239,10 +242,15 @@ pub fn argon_project(file: &Path, json: &J) -> bool {
 }
 
 impl<'a> Reader<'a> {
+    fn inside(&self, p: &Path) -> bool {
+        self.bound.as_deref().is_none_or(|b| within(b, p))
+    }
+
     pub fn new(root: &'a Path, ignore: &'a [glob::Pattern]) -> Self {
         Reader {
             ignore,
             root,
+            bound: bound(root),
             warnings: Vec::new(),
             read: HashMap::new(),
             argon: false,
@@ -256,6 +264,10 @@ impl<'a> Reader<'a> {
     }
 
     fn bytes(&mut self, p: &Path) -> Option<Vec<u8>> {
+        if !self.inside(p) {
+            self.warnings.push(format!("{}: outside the project's repository, not read", p.display()));
+            return None;
+        }
         match std::fs::read(p) {
             Ok(b) => {
                 self.read.insert(p.to_path_buf(), b.clone());
@@ -297,6 +309,10 @@ impl<'a> Reader<'a> {
     /// path gives the name.
     pub fn snapshot(&mut self, path: &Path) -> Option<Snap> {
         if self.ignored(path) || !path.exists() {
+            return None;
+        }
+        if !self.inside(path) {
+            self.warnings.push(format!("{}: outside the project's repository, not read", path.display()));
             return None;
         }
         if path.is_dir() {
@@ -556,7 +572,12 @@ impl<'a> Reader<'a> {
         });
         if let Some(path) = n.get("$path").and_then(|p| p.as_str().or_else(|| p.get("optional").and_then(|o| o.as_str()))) {
             let full = clean(&project.parent().unwrap_or(Path::new(".")).join(path));
-            match self.snapshot(&full) {
+            let inside = self.inside(&full);
+            if !inside {
+                self.warnings
+                    .push(format!("{}: $path {} is outside the project's repository (Studio Settings > rustudio > Projects allows it)", project.display(), full.display()));
+            }
+            match inside.then(|| self.snapshot(&full)).flatten() {
                 Some(mut ps) => {
                     ps.name = name.to_string();
                     if ps.class == "Folder" {
@@ -564,7 +585,7 @@ impl<'a> Reader<'a> {
                     }
                     s = ps;
                 }
-                None if n.get("$path").is_some_and(|p| p.is_string()) && !full.exists() => {
+                None if inside && n.get("$path").is_some_and(|p| p.is_string()) && !full.exists() => {
                     self.warnings
                         .push(format!("{}: $path {} doesn't exist", project.display(), full.display()));
                 }
@@ -629,6 +650,76 @@ pub fn clean(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The folder a project's paths must stay inside: the git repository that
+/// holds the project folder (a `.git` folder or file in it or an ancestor),
+/// else the project folder itself. `None` when Studio Settings > rustudio >
+/// Projects lets project files reach anywhere (`RUSTUDIO_PROJECT_ANY_PATH`).
+/// The repository, not the folder, so a test project in `tests/ui/x/` can
+/// map `../../../src` (as Rojo allows) while a downloaded project still
+/// can't reach `~/.ssh`.
+pub fn bound(root: &Path) -> Option<PathBuf> {
+    if rustudio_core::rustudio_settings::project_any_path() {
+        return None;
+    }
+    Some(repo_root(root))
+}
+
+/// The git repository holding `dir` (its top folder), else `dir`. A
+/// repository at or above the home folder (a dotfiles repo in `~`) doesn't
+/// count: it would let a project reach `~/.ssh`.
+pub fn repo_root(dir: &Path) -> PathBuf {
+    let home = dirs::home_dir().map(|h| std::fs::canonicalize(&h).unwrap_or(h));
+    repo_root_below(dir, home.as_deref())
+}
+
+#[cfg(test)]
+pub fn repo_root_below_for_test(dir: &Path, home: Option<&Path>) -> PathBuf {
+    repo_root_below(dir, home)
+}
+
+fn repo_root_below(dir: &Path, home: Option<&Path>) -> PathBuf {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| clean(dir));
+    dir.ancestors()
+        .take_while(|a| home.is_none_or(|h| !h.starts_with(a)))
+        .find(|a| {
+            // A repository: .git/HEAD, or a .git file (a worktree). A stray
+            // empty .git folder isn't one (git ignores it too).
+            let g = a.join(".git");
+            g.is_file() || g.join("HEAD").is_file()
+        })
+        .map(Path::to_path_buf)
+        .unwrap_or(dir)
+}
+
+/// Whether `p` stays inside `root` as the filesystem resolves it (symlinks
+/// before `..`). A path that doesn't exist yet is judged by its nearest
+/// existing ancestor; a dangling symlink, or `..` after a missing part, is
+/// outside. Project files are untrusted: their `$path`s and symlinks must
+/// not reach the rest of the disk.
+pub fn within(root: &Path, p: &Path) -> bool {
+    use std::path::Component;
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| clean(root));
+    let mut probe = p;
+    let mut rest = Vec::new();
+    loop {
+        if std::fs::symlink_metadata(probe).is_ok() {
+            return match std::fs::canonicalize(probe) {
+                Ok(c) => rest.iter().rev().fold(c, |a, n| a.join(n)).starts_with(&root),
+                Err(_) => false,
+            };
+        }
+        match (probe.parent(), probe.components().next_back()) {
+            (Some(up), Some(Component::Normal(n))) => {
+                rest.push(n);
+                probe = up;
+            }
+            (Some(up), Some(Component::CurDir)) => probe = up,
+            (_, Some(Component::ParentDir)) => return false,
+            _ => return clean(p).starts_with(&root),
+        }
+    }
 }
 
 /// The data file beside a file: `X.meta.json` (or an existing `X.data.json`).

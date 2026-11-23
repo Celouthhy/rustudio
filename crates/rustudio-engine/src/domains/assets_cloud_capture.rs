@@ -150,7 +150,12 @@ M.StopVideoCapture=function(self) end
 M.ReadCapturesFromGalleryAsync=function(self,filters,allExperiences)
     if filters~=nil and type(filters)~='table' then error('Unable to cast value to Array',2) end
     task.wait()
-    return Enum.ReadCapturesFromGalleryResult.NeedPermission
+    local pages = {
+        IsFinished = true,
+        GetCurrentPage = function() return {} end,
+        AdvanceToNextPageAsync = function() end,
+    }
+    return Enum.ReadCapturesFromGalleryResult.Success, pages
 end
 M.CaptureScreenshot=function(self,callback) capture(self,callback,false) end
 M.TakeScreenshotCaptureAsync=function(self,callback,params) capture(self,callback,true) end

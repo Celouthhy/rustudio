@@ -731,6 +731,9 @@ fn rendering_phase(lua: &Lua, svc: Ref) -> mlua::Result<()> {
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     let first = {
         let mut s = st(lua)?;
+        if s.run_checked && s.run.is_none() {
+            return Ok(());
+        }
         !std::mem::replace(&mut s.run_checked, true)
     };
     if first {

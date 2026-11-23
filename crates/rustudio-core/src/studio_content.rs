@@ -85,13 +85,29 @@ pub fn spawn_background_install_if_missing() {
     }
     if let Some(root) = crate::default_scripts::studio_dir() {
         // Upgrade older rustudio downloads without replacing the rest of their content.
-        if root == install_dir() && !has_view_selector(&root) {
+        let need_vs = !has_view_selector(&root);
+        let need_lp = !has_lua_package_assets(&root);
+        let need_ui = !has_studio_ui_textures(&root);
+        if root == install_dir() && (need_vs || need_lp || need_ui) {
             if let Some(marker) = std::fs::read_to_string(root.join(MARKER)).ok() {
                 if let Some(version) = marker.split_whitespace().next().and_then(studio_version) {
                     let version = version.to_owned();
-                    let _ = std::thread::Builder::new().name("studio-view-selector".into()).spawn(move || {
-                        if let Err(e) = install_view_selector(&agent(), &version, &root) {
-                            post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                    let _ = std::thread::Builder::new().name("studio-content-upgrade".into()).spawn(move || {
+                        let a = agent();
+                        if need_vs {
+                            if let Err(e) = install_view_selector(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's View Selector: {e}"));
+                            }
+                        }
+                        if need_lp {
+                            if let Err(e) = install_lua_package_assets(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's LuaPackages assets: {e}"));
+                            }
+                        }
+                        if need_ui {
+                            if let Err(e) = install_studio_ui_textures(&a, &version, &root) {
+                                post(true, format!("Couldn't download Studio's UI textures: {e}"));
+                            }
                         }
                     });
                 }
@@ -217,6 +233,73 @@ fn install_view_selector(agent: &ureq::Agent, version: &str, root: &Path) -> Res
     has_view_selector(root).then_some(()).ok_or_else(|| "Studio packages are missing View Selector files".into())
 }
 
+const LUA_PACKAGE_REQUIRED_FILES: &[&str] = &[
+    "Packages/_Index/BuilderIcons/BuilderIcons/BuilderIcons.json",
+    "Packages/_Index/BuilderIcons/BuilderIcons/Font/BuilderIcons-Regular.ttf",
+    "Packages/_Index/BuilderIcons/BuilderIcons/Font/BuilderIcons-Filled.ttf",
+    "Packages/_Index/FoundationImages/FoundationImages/SpriteSheets/img_set_1x_4.png",
+];
+
+fn is_lua_package_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".ttf")
+        || lower.ends_with(".otf")
+        || lower.ends_with(".dds")
+        || lower.ends_with(".webp")
+        || lower.ends_with("buildericons.json")
+}
+
+fn has_lua_package_assets(root: &Path) -> bool {
+    LUA_PACKAGE_REQUIRED_FILES
+        .iter()
+        .all(|rel| root.join("ExtraContent/LuaPackages").join(rel).is_file())
+}
+
+fn install_lua_package_assets(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+    let url = format!("{CDN}/{version}-extracontent-luapackages.zip");
+    let bytes = get(agent, &url, None)?;
+    let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
+    let base = root.join("ExtraContent/LuaPackages");
+    for e in &zip.entries {
+        if e.name.ends_with(['/', '\\']) || !is_lua_package_asset(&e.name) {
+            continue;
+        }
+        let data = zip.read(&bytes, e).map_err(|err| format!("{url} {}: {err}", e.name))?;
+        write_file(&base, &e.name, &data)?;
+    }
+    has_lua_package_assets(root)
+        .then_some(())
+        .ok_or_else(|| "Studio packages are missing LuaPackages UI assets".into())
+}
+
+fn has_studio_ui_textures(root: &Path) -> bool {
+    root.join("content/studio_svg_textures/Shared/Utility/Dark/Standard/RadioOn.png").is_file()
+        && root.join("StudioContent/textures/StudioToolbox/RoundedBackground.png").is_file()
+}
+
+fn install_studio_ui_textures(agent: &ureq::Agent, version: &str, root: &Path) -> Result<(), String> {
+    for (pkg, sub) in [
+        ("content-studio_svg_textures.zip", "content/studio_svg_textures"),
+        ("studiocontent-textures.zip", "StudioContent/textures"),
+    ] {
+        let url = format!("{CDN}/{version}-{pkg}");
+        let bytes = get(agent, &url, None)?;
+        let zip = Zip::parse(&bytes).map_err(|e| format!("{url}: {e}"))?;
+        let base = root.join(sub);
+        for e in &zip.entries {
+            if e.name.ends_with(['/', '\\']) {
+                continue;
+            }
+            let data = zip.read(&bytes, e).map_err(|err| format!("{url} {}: {err}", e.name))?;
+            write_file(&base, &e.name, &data)?;
+        }
+    }
+    has_studio_ui_textures(root)
+        .then_some(())
+        .ok_or_else(|| "Studio packages are missing Studio UI textures".into())
+}
+
 pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
     let agent = agent();
     let v: serde_json::Value = serde_json::from_slice(&get(&agent, VERSION_URL, None)?)
@@ -233,6 +316,14 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
         if !has_view_selector(&dest) {
             progress("downloading Studio View Selector");
             install_view_selector(&agent, &version, &dest)?;
+        }
+        if !has_lua_package_assets(&dest) {
+            progress("downloading Studio LuaPackages UI assets");
+            install_lua_package_assets(&agent, &version, &dest)?;
+        }
+        if !has_studio_ui_textures(&dest) {
+            progress("downloading Studio UI textures");
+            install_studio_ui_textures(&agent, &version, &dest)?;
         }
         progress("already installed");
         return Ok(version);
@@ -275,6 +366,10 @@ pub fn install(progress: &dyn Fn(&str)) -> Result<String, String> {
         }
         progress("downloading Studio View Selector");
         install_view_selector(&agent, &version, &partial)?;
+        progress("downloading Studio LuaPackages UI assets");
+        install_lua_package_assets(&agent, &version, &partial)?;
+        progress("downloading Studio UI textures");
+        install_studio_ui_textures(&agent, &version, &partial)?;
         for (pkg, file) in SINGLE_FILES {
             progress(&format!("fetching {file} from {pkg}"));
             let url = format!("{CDN}/{version}-{pkg}");
@@ -317,22 +412,38 @@ fn write_file(root: &Path, name: &str, data: &[u8]) -> Result<(), String> {
 /// One file out of a remote zip: the end record, the central directory and
 /// that one entry, by range requests.
 fn fetch_one(agent: &ureq::Agent, url: &str, file: &str) -> Result<Vec<u8>, String> {
+    let mut out = fetch_many(agent, url, &[file])?;
+    Ok(out.remove(0).1)
+}
+
+/// Several files out of a remote zip, reading the central directory once.
+fn fetch_many<'a>(agent: &ureq::Agent, url: &str, files: &[&'a str]) -> Result<Vec<(&'a str, Vec<u8>)>, String> {
     let size = content_length(agent, url)?;
     let tail_len = size.min(65_536 + 22);
     let tail = get(agent, url, Some((size - tail_len, size - 1)))?;
     let (cd_off, cd_len) = Zip::end_record(&tail).map_err(|e| format!("{url}: {e}"))?;
     let cd = get(agent, url, Some((cd_off, cd_off + cd_len - 1)))?;
     let entries = Zip::central(&cd).map_err(|e| format!("{url}: {e}"))?;
-    let e = entries
-        .iter()
-        .find(|e| e.name.trim_start_matches(['\\', '/']).eq_ignore_ascii_case(file))
-        .ok_or_else(|| format!("{file} not in {url}"))?;
-    // Local header (30 bytes + name + extra) then the data; read generously.
-    let span = 30 + 1024 + e.comp_size;
-    let chunk = get(agent, url, Some((e.offset, (e.offset + span).min(size) - 1)))?;
-    let mut local = e.clone();
-    local.offset = 0;
-    Zip::read_entry(&chunk, &local)
+    let mut out = Vec::with_capacity(files.len());
+    for &file in files {
+        let want = file.trim_start_matches(['\\', '/']).replace('\\', "/");
+        let e = entries
+            .iter()
+            .find(|e| {
+                e.name
+                    .trim_start_matches(['\\', '/'])
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&want)
+            })
+            .ok_or_else(|| format!("{file} not in {url}"))?;
+        // Local header (30 bytes + name + extra) then the data; read generously.
+        let span = 30 + 1024 + e.comp_size;
+        let chunk = get(agent, url, Some((e.offset, (e.offset + span).min(size) - 1)))?;
+        let mut local = e.clone();
+        local.offset = 0;
+        out.push((file, Zip::read_entry(&chunk, &local)?));
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug)]

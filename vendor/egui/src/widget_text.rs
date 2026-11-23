@@ -474,6 +474,7 @@ impl RichText {
                 strikethrough,
                 valign,
                 expand_bg,
+                studio_text_size: None,
             },
         )
     }

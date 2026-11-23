@@ -61,6 +61,9 @@ pub struct HumBody {
     pub ctl: Option<HumCtl>,
     /// Seated: the seat part and, on a moving seat, the weld's joint.
     pub seat: Option<(Ref, Option<rp::ImpulseJointHandle>)>,
+    /// Local pose of the character root in the moving seat's body frame (used
+    /// by the Studio solver's rigid seat weld).
+    pub seat_local: rp::Pose,
     /// Held by an Anchored HumanoidRootPart (`anchor_humanoid`).
     anchored: bool,
     /// The root's pose and velocities after the last world tick (a level-2
@@ -376,6 +379,24 @@ pub struct Hums {
     /// RUSTUDIO_SOLVER=studio, `RUSTUDIO_REPL=interp` (default): the receiving side's
     /// interpolation buffer of each copied body (`Repl`).
     pub(super) repl: HashMap<rp::RigidBodyHandle, Repl>,
+}
+
+impl Hums {
+    /// A new world (`Physics::reconcile`): the characters' bodies are built
+    /// again by their owners, and what is kept by body or collider handle
+    /// (forces, floors, stand-ins, replication buffers) was the old world's.
+    pub(super) fn new_world(&mut self) {
+        self.force_models.clear();
+        self.by_model.clear();
+        self.of_part.clear();
+        self.fext.clear();
+        self.mid = MidSolve::default();
+        self.floor_levels.clear();
+        self.roles.clear();
+        self.ghosts.clear();
+        self.history.clear();
+        self.repl.clear();
+    }
 }
 
 /// One replicated state of an assembly: the sender's stamp (its clock, s), pose, v, ω.
@@ -750,7 +771,7 @@ impl Physics {
                 eprintln!("HUMDBG   {name} {:?} doc {:.4}", p.mp.mass(), part_mass(doc, p.part).mass);
             }
         }
-        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, anchored: false, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::default(), sig: sig_hash, solve0: None, arb: [0, 0] });
+        self.hums.by_model.insert(model, HumBody { body, root, parts: list, ctl: None, seat: None, seat_local: rp::Pose::IDENTITY, anchored: false, shown: None, lvl: 1, debounce: 0, rose: false, hold: None, span: 1, ref_v: None, hits: Vec::new(), lambda: HashMap::default(), sig: sig_hash, solve0: None, arb: [0, 0] });
     }
 
     /// What a character's body depends on besides its pose: each part's
@@ -1662,7 +1683,9 @@ impl Physics {
     /// AssemblyLinearVelocity / AssemblyAngularVelocity written by a script.
     pub fn set_humanoid_velocity(&mut self, model: Ref, v: Option<Vec3>, w: Option<Vec3>) {
         let Some(h) = self.hums.by_model.get_mut(&model) else { return };
-        if let Some(b) = self.world.bodies.get_mut(h.body) {
+        let body = h.body;
+        let seat_part = h.seat.and_then(|(part, j)| j.map(|_| part));
+        if let Some(b) = self.world.bodies.get_mut(body) {
             if let Some(v) = v {
                 b.set_linvel(rv(v), true);
             }
@@ -1677,6 +1700,45 @@ impl Physics {
             }
             if let Some(w) = w {
                 s.2 = w;
+            }
+        }
+        // Seated on a loose vehicle/seat: SeatWeld makes the character and
+        // vehicle one assembly in Studio, so a write to HumanoidRootPart's
+        // Velocity / RotVelocity drives the vehicle body too. Keep the two
+        // rigidly welded bodies kinematically consistent (v_h = v_sb + w × r).
+        if let Some(sb) = seat_part.and_then(|p| self.body_of(p)) {
+            let (sb_dyn, sb_v, sb_w, sb_com) = self
+                .world
+                .bodies
+                .get(sb)
+                .map(|b| (b.is_dynamic(), gv(b.linvel()), gv(b.angvel()), gv(b.center_of_mass())))
+                .unwrap_or((false, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO));
+            if sb_dyn {
+                let new_v = v.unwrap_or(sb_v);
+                let new_w = w.unwrap_or(sb_w);
+                if let Some(b) = self.world.bodies.get_mut(sb) {
+                    if v.is_some() {
+                        b.set_linvel(rv(new_v), true);
+                    }
+                    if w.is_some() {
+                        b.set_angvel(rv(new_w), true);
+                    }
+                }
+                if let Some(b) = self.world.bodies.get_mut(body) {
+                    let h_com = gv(b.center_of_mass());
+                    b.set_linvel(rv(new_v + new_w.cross(h_com - sb_com)), true);
+                    if w.is_some() {
+                        b.set_angvel(rv(new_w), true);
+                    }
+                }
+                if let Some(h) = self.hums.by_model.get_mut(&model) {
+                    if let Some(s) = h.shown.as_mut() {
+                        if let Some(b) = self.world.bodies.get(body) {
+                            s.1 = gv(b.linvel());
+                            s.2 = gv(b.angvel());
+                        }
+                    }
+                }
             }
         }
     }
@@ -1707,20 +1769,68 @@ impl Physics {
     }
 
     /// The owning client's movers on its character (read each frame from
-    /// the client document; replicated ones are the server's already).
+    /// the client document): both client-only movers (`foreign` / `foreign_descs`)
+    /// and replicated movers whose properties a LocalScript mutates locally
+    /// (`owned_movers` / `owned_descs`, matching Studio where the owning client
+    /// simulates its character from its own DataModel).
+    ///
+    /// Called immediately after `set_owned_movers`, which clears the per-frame
+    /// `owned_*` and `foreign*` collections before populating vehicle/assembly movers.
     pub fn set_client_movers(&mut self, cd: &Document, c2s: &rustudio_core::RefMap, client_model: Ref) {
-        self.hums.foreign.clear();
-        self.hums.foreign_descs.clear();
-        self.hums.foreign_att.clear();
         let Some(cws) = cd.workspace() else { return };
-        let found: Vec<Ref> = cd
+        let all_movers: Vec<Ref> = cd
             .dom
             .descendants_of(client_model)
             .filter(|i| is_mover_class(&i.class))
             .map(|i| i.referent())
-            .filter(|r| !c2s.contains_key(r))
             .collect();
-        for r in found {
+        for r in all_movers {
+            // Replicated mover on the character (e.g. a server-spawned VectorForce
+            // whose Force/Enabled a LocalScript updates each frame).
+            if let Some(&sr) = c2s.get(&r) {
+                self.hums.owned_movers.insert(sr);
+                if self.studio.is_some() {
+                    self.hums.desc_remap.clear();
+                    let parts = ["Attachment0", "Attachment1"]
+                        .iter()
+                        .filter_map(|n| match cd.prop(r, n) {
+                            Some(rbx_dom_weak::types::Variant::Ref(a)) if !a.is_none() => cd.dom.get_by_ref(a).map(|i| i.parent()),
+                            _ => None,
+                        })
+                        .chain(cd.dom.get_by_ref(r).map(|i| i.parent()))
+                        .collect::<Vec<_>>();
+                    for cp in parts {
+                        if let Some(sp) = c2s.get(&cp) {
+                            self.hums.desc_remap.insert(cp, *sp);
+                        }
+                    }
+                    if let Some(d) = self.studio_desc(cd, cws, r) {
+                        self.hums.owned_descs.insert(sr, d);
+                    } else {
+                        self.hums.owned_descs.remove(&sr);
+                    }
+                    self.hums.desc_remap.clear();
+                } else if let Some(mut m) = read_mover(cd, cws, r) {
+                    if let Some(sp) = c2s.get(&m.part).copied() {
+                        m.part = sp;
+                        let mut ok = true;
+                        for a in [&mut m.att0, &mut m.att1] {
+                            if let Some(ar) = *a {
+                                match c2s.get(&ar) {
+                                    Some(s) => *a = Some(*s),
+                                    None => ok = false,
+                                }
+                            }
+                        }
+                        if ok {
+                            self.movers.insert(sr, m);
+                        }
+                    }
+                } else {
+                    self.movers.remove(&sr);
+                }
+                continue;
+            }
             let Some(mut m) = read_mover(cd, cws, r) else { continue };
             let Some(sp) = c2s.get(&m.part).copied() else { continue };
             // The fallback's velocity and orientation servos compute a wrench for
@@ -1767,6 +1877,10 @@ impl Physics {
     /// never sees it, and the vehicle accelerates at F / m all the same).
     pub fn set_owned_movers(&mut self, cd: &Document, s2c: &rustudio_core::RefMap, c2s: &rustudio_core::RefMap, owned: &[Ref]) {
         self.hums.owned_movers.clear();
+        self.hums.owned_descs.clear();
+        self.hums.foreign.clear();
+        self.hums.foreign_descs.clear();
+        self.hums.foreign_att.clear();
         if owned.is_empty() {
             return;
         }
@@ -1801,7 +1915,6 @@ impl Physics {
             }
         }
         // The solver's connector for each, from the client's values (studio_constraints).
-        self.hums.owned_descs.clear();
         if self.studio.is_some() {
             let owned: Vec<Ref> = self.hums.owned_movers.iter().copied().collect();
             for r in owned {
@@ -1825,6 +1938,67 @@ impl Physics {
                 }
             }
             self.hums.desc_remap.clear();
+        }
+        // Movers created on the client (only in `cd`, not replicated from the
+        // server) on any part of an assembly this player owns (e.g. a LocalScript
+        // putting BodyThrust / BodyVelocity / BodyAngularVelocity on a car).
+        let asm_parts: Vec<Ref> = asms
+            .iter()
+            .filter_map(|id| self.asms.get(id))
+            .flat_map(|a| a.parts.iter().copied())
+            .collect();
+        for sp in asm_parts {
+            let Some(&cp) = s2c.get(&sp) else { continue };
+            let local_movers: Vec<Ref> = cd
+                .dom
+                .descendants_of(cp)
+                .filter(|i| is_mover_class(&i.class))
+                .map(|i| i.referent())
+                .filter(|cr| !c2s.contains_key(cr))
+                .collect();
+            for cr in local_movers {
+                if self.studio.is_some() {
+                    self.hums.desc_remap.clear();
+                    self.hums.desc_remap.insert(cp, sp);
+                    for n in ["Attachment0", "Attachment1"] {
+                        if let Some(rbx_dom_weak::types::Variant::Ref(a)) = cd.prop(cr, n) {
+                            if !a.is_none() {
+                                if let Some(ap) = cd.dom.get_by_ref(a).map(|i| i.parent()) {
+                                    if let Some(&sap) = c2s.get(&ap) {
+                                        self.hums.desc_remap.insert(ap, sap);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(desc) = self.studio_desc(cd, cws, cr) {
+                        self.hums.foreign_descs.push((cr, desc));
+                    }
+                    self.hums.desc_remap.clear();
+                } else {
+                    let Some(mut m) = read_mover(cd, cws, cr) else { continue };
+                    let Some(msp) = c2s.get(&m.part).copied() else { continue };
+                    m.part = msp;
+                    for a in [&mut m.att0, &mut m.att1] {
+                        let Some(ar) = *a else { continue };
+                        if let Some(s) = c2s.get(&ar) {
+                            *a = Some(*s);
+                            continue;
+                        }
+                        let parent = cd.dom.get_by_ref(ar).map(|i| i.parent()).unwrap_or_else(Ref::none);
+                        let Some(spart) = c2s.get(&parent).copied() else {
+                            *a = None;
+                            continue;
+                        };
+                        let local = match cd.prop(ar, "CFrame") {
+                            Some(Variant::CFrame(cf)) => Xform::from_cframe(&cf).orthonormalized(),
+                            _ => Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY },
+                        };
+                        self.hums.foreign_att.insert(ar, (spart, local));
+                    }
+                    self.hums.foreign.insert(cr, m);
+                }
+            }
         }
     }
 
@@ -1932,23 +2106,41 @@ impl Physics {
                         }
                     }
                     Some(sb) => {
-                        if matches!(had, Some((p, Some(_))) if p == part) {
-                            return;
+                        if let Some((p, Some(j))) = had {
+                            let alive = p == part
+                                && self.world.impulse_joints.get(j).is_some_and(|ij| {
+                                    (ij.body1() == sb && ij.body2() == body)
+                                        || (ij.body1() == body && ij.body2() == sb)
+                                });
+                            if alive {
+                                return;
+                            }
                         }
                         if let Some((_, Some(j))) = had {
                             self.world.impulse_joints.remove(j, true);
                         }
-                        let (Some(a), Some(b)) = (self.world.bodies.get(sb), self.world.bodies.get(body)) else { return };
-                        let f1 = a.position().inverse() * pose(&root_at);
-                        let _ = b;
+                        let Some(a) = self.world.bodies.get(sb) else { return };
+                        let seat_pose = *a.position();
+                        let seat_linvel = gv(a.linvel());
+                        let seat_angvel = gv(a.angvel());
+                        let seat_com = gv(a.center_of_mass());
+                        let f1 = seat_pose.inverse() * pose(&root_at);
                         if let Some(bm) = self.world.bodies.get_mut(body) {
                             bm.set_body_type(rp::RigidBodyType::Dynamic, true);
                             bm.set_position(pose(&root_at), true);
+                            let h_com = gv(bm.center_of_mass());
+                            bm.set_linvel(rv(seat_linvel + seat_angvel.cross(h_com - seat_com)), true);
+                            bm.set_angvel(rv(seat_angvel), true);
                         }
-                        let joint = rp::FixedJointBuilder::new().local_frame1(f1).local_frame2(rp::Pose::IDENTITY);
+                        let joint = rp::FixedJointBuilder::new()
+                            .local_frame1(f1)
+                            .local_frame2(rp::Pose::IDENTITY)
+                            .contacts_enabled(false);
                         let j = self.world.impulse_joints.insert(sb, body, joint, true);
                         if let Some(h) = self.hums.by_model.get_mut(&model) {
                             h.seat = Some((part, Some(j)));
+                            h.seat_local = f1;
+                            h.shown = None;
                         }
                     }
                 }
@@ -1956,13 +2148,13 @@ impl Physics {
         }
     }
 
-    /// What a character's parts overlap (Touched, seats): every part's own
-    /// shape where it is, grown by 0.1 studs (round 22's touch reach).
-    pub fn humanoid_touching(&self, model: Ref) -> Vec<Ref> {
-        let Some(h) = self.hums.by_model.get(&model) else { return Vec::new() };
+    /// The character's current part pairs (Touched, seats). The small contact
+    /// margin keeps a resting collision alive when the solver separates its shapes.
+    pub fn humanoid_touching(&self, model: Ref) -> HashSet<(Ref, Ref)> {
+        let Some(h) = self.hums.by_model.get(&model) else { return HashSet::default() };
         let own: HashSet<rp::ColliderHandle> = h.parts.iter().map(|p| p.collider).collect();
         let qp = self.world.query_pipeline();
-        let mut out: HashSet<Ref> = HashSet::default();
+        let mut out: HashSet<(Ref, Ref)> = HashSet::default();
         for p in &h.parts {
             let Some(c) = self.world.colliders.get(p.collider) else { continue };
             let aabb = rapier3d::parry::bounding_volume::BoundingVolume::loosened(&c.compute_aabb(), 0.1);
@@ -1988,12 +2180,14 @@ impl Physics {
                     .unwrap_or(true);
                 if close {
                     if let Some(r) = self.by_collider.get(&hd) {
-                        out.insert(*r);
+                        if *r != p.part {
+                            out.insert((p.part, *r));
+                        }
                     }
                 }
             }
         }
-        out.into_iter().collect()
+        out
     }
 
     /// The character's active contacts with other assemblies: (world

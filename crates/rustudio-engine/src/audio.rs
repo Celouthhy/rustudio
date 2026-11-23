@@ -930,10 +930,13 @@ impl Audio {
         done
     }
 
-    /// Keys of looped sounds that wrapped around since the last call (Sound.DidLoop), best
-    /// effort: the decoder's wrap count with a device, the clock in silent mode.
-    pub fn looped_since_poll(&mut self) -> Vec<u64> {
-        let now = rustudio_core::sim_clock::now();
+    /// Each newly completed wrap, as (sound key, cumulative loop count).
+    /// The decoder counts wraps with a device, and the clock counts in silent mode.
+    pub fn looped_since_poll(&mut self) -> Vec<(u64, u64)> {
+        self.looped_at(rustudio_core::sim_clock::now())
+    }
+
+    fn looped_at(&mut self, now: Instant) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         for (k, s) in self.sounds.iter_mut() {
             let total = match &s.ctl {
@@ -941,8 +944,8 @@ impl Audio {
                 None => s.clock_wraps(now),
             };
             if total > s.wraps_reported {
+                out.extend((s.wraps_reported + 1..=total).map(|count| (*k, count)));
                 s.wraps_reported = total;
-                out.push(*k);
             }
         }
         out.sort_unstable();
@@ -1151,14 +1154,16 @@ mod tests {
         let mut a = Audio::silent();
         a.play(5, wav(0.1, 8000), 0.5, 1.0, true, 0.0, Region::default())
             .unwrap();
-        sleep(Duration::from_millis(250));
+        let start = a.sounds[&5].anchor;
+        let first_poll = start + Duration::from_millis(250);
         assert!(a.is_playing(5));
         assert!(a.position(5) < 0.1);
-        assert_eq!(a.looped_since_poll(), vec![5]);
-        assert!(a.looped_since_poll().is_empty());
+        assert_eq!(a.looped_at(first_poll), vec![(5, 1), (5, 2)]);
+        assert!(a.looped_at(first_poll).is_empty());
+        assert_eq!(a.looped_at(start + Duration::from_millis(350)), vec![(5, 3)]);
         assert!(a.poll_finished().is_empty());
         a.set_looped(5, false);
-        sleep(Duration::from_millis(150));
+        a.sounds.get_mut(&5).unwrap().anchor -= Duration::from_millis(150);
         assert_eq!(a.poll_finished(), vec![5]);
     }
 
@@ -1258,7 +1263,12 @@ mod tests {
         // Sound 1 drained from the device even though its clock has barely moved.
         assert_eq!(a.poll_finished(), vec![1]);
         assert!(a.is_playing(2));
-        assert_eq!(a.looped_since_poll(), vec![2]);
+        let wraps = a.looped_since_poll();
+        // A quarter second of output contains four completed wraps and can
+        // include a fifth if the mixer reads ahead at the boundary.
+        assert!((4..=5).contains(&wraps.len()), "{wraps:?}");
+        assert!(wraps.iter().copied().eq((1..=wraps.len() as u64).map(|n| (2, n))), "{wraps:?}");
+        assert!(a.looped_since_poll().is_empty());
         a.stop(2);
         assert!(a.poll_finished().is_empty());
     }
@@ -1340,7 +1350,7 @@ mod tests {
         let p = a.position(4);
         assert!((0.5..0.6).contains(&p), "position {p} left the loop region");
         let w = a.looped_since_poll();
-        assert_eq!(w, vec![4]);
+        assert!(w.starts_with(&[(4, 1), (4, 2)]), "{w:?}");
         assert!(a.is_playing(4));
         assert!(a.poll_finished().is_empty());
     }

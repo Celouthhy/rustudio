@@ -24,6 +24,7 @@ pub enum SoundCmd {
 #[derive(Default)]
 pub struct Requests {
     pub sounds: Vec<(Ref, SoundCmd)>,
+    pub removed_sounds: Vec<crate::audio_scene::RemovedSound>,
     /// Sound.TimePosition set by a script while it plays: (sound, seconds).
     pub sound_seeks: Vec<(Ref, f64)>,
     /// Humanoid:MoveTo / WalkToPoint: (humanoid, target).
@@ -101,6 +102,7 @@ pub fn canonical(key: &str) -> Option<&'static str> {
         "getMass" => "GetMass",
         "GetModelCFrame" => return None,
         "lerp" => "Lerp",
+        "getPluginPolicy" => "GetPluginPolicy",
         _ => return None,
     })
 }
@@ -216,6 +218,9 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetVelocityAtPosition", "BasePart"),
     ("CanCollideWith", "BasePart"),
     ("Raycast", "WorldRoot"),
+    ("CacheCurrentTerrain", "WorldRoot"),
+    ("ClearCachedTerrain", "WorldRoot"),
+    ("RaycastCachedTerrain", "WorldRoot"),
     ("FindPartOnRay", "WorldRoot"),
     ("FindPartOnRayWithIgnoreList", "WorldRoot"),
     ("FindPartOnRayWithWhitelist", "WorldRoot"),
@@ -273,13 +278,12 @@ pub const METHODS: &[(&str, &str)] = &[
     ("JSONDecode", "HttpService"),
     ("GenerateGUID", "HttpService"),
     ("UrlEncode", "HttpService"),
-    ("GetMinutesAfterMidnight", "Lighting"),
-    ("SetMinutesAfterMidnight", "Lighting"),
     ("GetMouseLocation", "UserInputService"),
     ("IsMouseButtonPressed", "UserInputService"),
     ("GetKeysPressed", "UserInputService"),
     ("IsLoaded", "DataModel"),
     ("BindToClose", "DataModel"),
+    ("Shutdown", "DataModel"),
     ("SetCoreGuiEnabled", "StarterGui"),
     ("GetCoreGuiEnabled", "StarterGui"),
     ("SetCore", "StarterGui"),
@@ -339,8 +343,11 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetCollisionGroupName", "PhysicsService"),
     ("CollisionGroupContainsPart", "PhysicsService"),
     ("TweenPosition", "GuiObject"),
+    ("TweenPositionInternal", "GuiObject"),
     ("TweenSize", "GuiObject"),
+    ("TweenSizeInternal", "GuiObject"),
     ("TweenSizeAndPosition", "GuiObject"),
+    ("TweenSizeAndPositionInternal", "GuiObject"),
     ("GetLimb", "Humanoid"),
     ("GetBodyPartR15", "Humanoid"),
     ("GetMoveVelocity", "Humanoid"),
@@ -1028,6 +1035,8 @@ pub(super) fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
         .app_data_mut::<TagCache>()
         .ok_or_else(|| rt_err("tag cache missing"))?;
     let key = ustr("Tags");
+    let root = d.dom.root_ref();
+    let in_dm = |x: Ref| x == root || d.is_ancestor(root, x);
     let marks = if c.doc_id != d.id || !c.valid { doc::Marks::All } else { marks };
     match marks {
         doc::Marks::All => {
@@ -1046,24 +1055,33 @@ pub(super) fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
             for mk in m {
                 match mk {
                     doc::Mark::Tree(r) => {
+                        let inside = in_dm(r);
                         for x in d.subtree(r) {
-                            let t = d
-                                .dom
-                                .get_by_ref(x)
-                                .map(|i| tags_in(i.properties.get(&key)))
-                                .unwrap_or_default();
-                            if !t.is_empty() || c.of.contains_key(&x) {
-                                c.set(x, t);
+                            if inside {
+                                let t = d
+                                    .dom
+                                    .get_by_ref(x)
+                                    .map(|i| tags_in(i.properties.get(&key)))
+                                    .unwrap_or_default();
+                                if !t.is_empty() || c.of.contains_key(&x) {
+                                    c.set(x, t);
+                                }
+                            } else if c.of.contains_key(&x) {
+                                c.set(x, Vec::new());
                             }
                         }
                     }
                     doc::Mark::Prop(r, n) if n.as_str() == "Tags" => {
-                        let t = d
-                            .dom
-                            .get_by_ref(r)
-                            .map(|i| tags_in(i.properties.get(&key)))
-                            .unwrap_or_default();
-                        c.set(r, t);
+                        if in_dm(r) {
+                            let t = d
+                                .dom
+                                .get_by_ref(r)
+                                .map(|i| tags_in(i.properties.get(&key)))
+                                .unwrap_or_default();
+                            c.set(r, t);
+                        } else if c.of.contains_key(&r) {
+                            c.set(r, Vec::new());
+                        }
                     }
                     _ => {}
                 }
@@ -1073,11 +1091,11 @@ pub(super) fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
     let c = &mut *c;
     Ok(match c.by_tag.get_mut(tag) {
         Some(e) => {
-            // Also drop instances freed before their subtree was re-read.
+            // Drop instances freed or detached/destroyed out of the DataModel.
             let (list, set, _) = e;
             let of = &mut c.of;
             list.retain(|r| {
-                let keep = set.contains(r) && d.dom.get_by_ref(*r).is_some();
+                let keep = set.contains(r) && d.dom.get_by_ref(*r).is_some() && in_dm(*r);
                 if !keep && set.remove(r) {
                     of.remove(r);
                 }
@@ -1090,6 +1108,17 @@ pub(super) fn tagged(lua: &Lua, tag: &str) -> mlua::Result<Vec<Ref>> {
     })
 }
 
+type TerrainQuery = (Ref, std::sync::Arc<rustudio_core::terrain::Voxels>, Option<([f32; 3], [f32; 3])>);
+
+struct CachedTerrain {
+    terrain: Ref,
+    voxels: std::sync::Arc<rustudio_core::terrain::Voxels>,
+    bounds: Option<(Vec3, Vec3)>,
+    tris: HashMap<[i32; 3], std::rc::Rc<Vec<([Vec3; 3], [u8; 3])>>>,
+    water: HashMap<[i32; 3], std::rc::Rc<Vec<[Vec3; 3]>>>,
+    index: HashMap<[i32; 3], std::rc::Rc<TriIndex>>,
+}
+
 /// Workspace parts for queries, kept up to date from the document's change
 /// journal (only changed parts are re-read).
 #[derive(Default)]
@@ -1099,10 +1128,11 @@ struct QueryCache {
     // (Fx hashing: Ref keys are hashed thousands of times a frame here.)
     index: rustc_hash::FxHashMap<Ref, usize>,
     grid: QueryGrid,
-    /// Workspace.Terrain's voxels for rays (None = read them again).
-    /// With its voxel bounds (studs), which every ray needs (round 20: the
-    /// scan over every chunk per ray was 12% of Place B's Play frame).
-    terrain: Option<Option<(Ref, std::sync::Arc<rustudio_core::terrain::Voxels>, Option<([f32; 3], [f32; 3])>)>>,
+    /// Workspace.Terrain's decoded voxels and bounds. Keep the source bytes
+    /// across journal invalidations so unrelated changes do not discard meshes.
+    terrain: Option<TerrainQuery>,
+    terrain_source: Option<Vec<u8>>,
+    terrain_valid: bool,
     /// The material of the last ray that hit terrain (for its RaycastResult).
     terrain_material: Option<u8>,
     /// Terrain triangles per chunk for rays (dropped with `terrain`).
@@ -1113,6 +1143,9 @@ struct QueryCache {
     /// them): a ray tests the triangles in the cells it crosses, not all
     /// of the chunk's thousands.
     terrain_index: HashMap<[i32; 3], std::rc::Rc<TriIndex>>,
+    /// Snapshots for WorldRoot:CacheCurrentTerrain / RaycastCachedTerrain.
+    cached_terrain: HashMap<String, CachedTerrain>,
+    cached_terrain_seq: u64,
     /// Whether a class is a BasePart (a query part when under Workspace):
     /// property marks of other instances (a rig's Bones, Attachments) are
     /// passed over without reading the instance again.
@@ -1150,7 +1183,9 @@ struct QueryGrid {
     cells: rustc_hash::FxHashMap<[i32; 3], Vec<Ref>>,
     /// Each part's cell range (inclusive).
     of: rustc_hash::FxHashMap<Ref, ([i32; 3], [i32; 3])>,
-    big: rustc_hash::FxHashSet<Ref>,
+    /// Parts spanning too many cells, stored with their world AABB `(lo, hi)`
+    /// for cheap per-query culling.
+    big: rustc_hash::FxHashMap<Ref, (Vec3, Vec3)>,
 }
 
 impl QueryGrid {
@@ -1241,7 +1276,7 @@ impl QueryGrid {
             if crate::runtime::memstats_on() && count > 1 << 31 {
                 eprintln!("MEMSTATS query part spans {count} cells: pos {:?} size {:?}", p.xf.pos, p.size);
             }
-            self.big.insert(p.r);
+            self.big.insert(p.r, (lo, hi));
             return;
         }
         for x in a[0]..=b[0] {
@@ -1269,7 +1304,15 @@ impl QueryGrid {
         if count > mech::QUERY_GRID_SCAN_CELLS as i64 || count <= 0 {
             return None;
         }
-        let mut out: rustc_hash::FxHashSet<Ref> = self.big.clone();
+        let mut out: rustc_hash::FxHashSet<Ref> = self
+            .big
+            .iter()
+            .filter(|(_, (plo, phi))| {
+                !(plo.is_finite() && phi.is_finite())
+                    || (plo.x <= hi.x && phi.x >= lo.x && plo.y <= hi.y && phi.y >= lo.y && plo.z <= hi.z && phi.z >= lo.z)
+            })
+            .map(|(r, _)| *r)
+            .collect();
         for x in a[0]..=b[0] {
             for y in a[1]..=b[1] {
                 for z in a[2]..=b[2] {
@@ -1322,18 +1365,18 @@ fn geometry_box(d: &Document, r: Ref, class: &str, xf: Xform, size: Vec3) -> Xfo
 
 fn qpart(d: &Document, r: Ref) -> Option<QPart> {
     let class = d.class_of(r)?;
-    if class == "Terrain" || !doc::is_a(&class, "BasePart") {
+    if class == "Terrain" || !doc::is_a(&class, "BasePart") || !d.is_ancestor(d.workspace()?, r) {
         return None;
     }
-    let ws = d.workspace()?;
-    if !d.is_ancestor(ws, r) {
-        return None;
-    }
+    world_root_part(d, r, &class)
+}
+
+fn world_root_part(d: &Document, r: Ref, class: &str) -> Option<QPart> {
     let xf = rustudio_render::scene::xform_of(d, r)?;
     let size = rustudio_render::scene::vec3_of(d.prop(r, "Size")).unwrap_or(Vec3::ONE);
     let collide = !matches!(d.prop(r, "CanCollide"), Some(Variant::Bool(false)));
     let query = !matches!(d.prop(r, "CanQuery"), Some(Variant::Bool(false)));
-    let mesh_class = class == "MeshPart" || doc::is_a(&class, "PartOperation");
+    let mesh_class = class == "MeshPart" || doc::is_a(class, "PartOperation");
     // Studio's own collision pieces (PhysicalConfigData), which also say the
     // CollisionFidelity: the file has no such property for these classes.
     let geo = if mesh_class {
@@ -1355,10 +1398,10 @@ fn qpart(d: &Document, r: Ref) -> Option<QPart> {
         .filter(|v| v.max_element() > 0.0)
         .unwrap_or(size);
     // The pieces sit around the part's CFrame; otherwise the drawn mesh's box.
-    let xf = if cvx != 0 { xf } else { geometry_box(d, r, &class, xf, size) };
+    let xf = if cvx != 0 { xf } else { geometry_box(d, r, class, xf, size) };
     // CollisionFidelity: Default 0, Hull 1, Box 2, PreciseConvexDecomposition 3.
     let mesh = mesh_class && cvx == 0 && fidelity != Some(rustudio_physics::physics_mesh::FIDELITY_BOX);
-    let shape = rustudio_physics::query_shapes::kind_of(d, r, &class);
+    let shape = rustudio_physics::query_shapes::kind_of(d, r, class);
     Some(QPart {
         r,
         xf,
@@ -1395,11 +1438,20 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
     };
     match marks {
         doc::Marks::All => {
+            let _scope = rustudio_core::bench::scope("ray_query_rebuild");
             let parts: Vec<QPart> = match d.workspace() {
                 Some(ws) => d
                     .dom
                     .descendants_of(ws)
-                    .filter_map(|i| qpart(d, i.referent()))
+                    .skip(1)
+                    .filter_map(|i| {
+                        // This traversal already established Workspace ancestry.
+                        let class = i.class;
+                        let part = *c.part_classes.entry(class).or_insert_with(|| {
+                            class != "Terrain" && doc::is_a(class.as_str(), "BasePart")
+                        });
+                        part.then(|| world_root_part(d, i.referent(), class.as_str())).flatten()
+                    })
                     .collect(),
                 None => Vec::new(),
             };
@@ -1407,7 +1459,7 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
             c.grid.rebuild(&parts);
             c.parts = std::rc::Rc::new(parts);
             c.doc_id = d.id;
-            c.terrain = None;
+            c.terrain_valid = false;
         }
         doc::Marks::Some(m) if !m.is_empty() => {
             let mut touched: rustc_hash::FxHashSet<Ref> = Default::default();
@@ -1445,7 +1497,7 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
                             }
                         }
                         if bit == 0 && name == n_smooth {
-                            c.terrain = None;
+                            c.terrain_valid = false;
                         }
                         // A part's Shape: read the part again in full.
                         if bit == 0 && name == n_shape {
@@ -1454,7 +1506,7 @@ fn query_parts(lua: &Lua) -> mlua::Result<std::rc::Rc<Vec<QPart>>> {
                     }
                     doc::Mark::Tree(r) => {
                         if d.class_of(r).is_some_and(|k| k == "Terrain" || k == "Workspace") {
-                            c.terrain = None;
+                            c.terrain_valid = false;
                         }
                         touched.extend(d.subtree(r))
                     }
@@ -1706,6 +1758,19 @@ fn queryable(lua: &Lua, r: Ref) -> mlua::Result<bool> {
     Ok(d.workspace().is_some_and(|ws| d.dom.get_by_ref(r).is_some() && d.is_ancestor(ws, r)))
 }
 
+/// The nearest WorldRoot owns the part's spatial queries, including a
+/// WorldModel parented outside Workspace.
+fn query_root(d: &Document, part: Ref) -> Option<Ref> {
+    let mut parent = d.dom.get_by_ref(part)?.parent();
+    while let Some(instance) = d.dom.get_by_ref(parent) {
+        if matches!(instance.class.as_str(), "Workspace" | "WorldModel") {
+            return Some(parent);
+        }
+        parent = instance.parent();
+    }
+    None
+}
+
 /// A query met a cached part that is no longer queryable (the change
 /// journal missed its removal): the cache is rebuilt on the next query, and
 /// the first few are reported with what is known of the part.
@@ -1897,6 +1962,8 @@ fn cast_swept_once(
     let mut scanned_all = false;
     let mut refs: Vec<Ref> = Vec::new();
     let mut big_done = false;
+    let ray_lo = origin.min(origin + dir) - grow;
+    let ray_hi = origin.max(origin + dir) + grow;
     while t0 < len && !scanned_all {
         let t1 = (t0 + step).min(len);
         let (a, b) = (ray.at(t0), ray.at(t1));
@@ -1907,10 +1974,19 @@ fn cast_swept_once(
         let gridded = c.as_ref().is_some_and(|c| c.grid.in_box_into(a.min(b) - grow, a.max(b) + grow, &mut refs));
         match (gridded, c.as_ref()) {
             (true, Some(c)) => {
-                // Parts too big for the grid: once per ray.
+                // Parts too big for the grid: once per ray, AABB-culled against the ray box.
                 if !big_done {
                     big_done = true;
-                    refs.extend(c.grid.big.iter().copied());
+                    refs.extend(c.grid.big.iter().filter_map(|(r, (plo, phi))| {
+                        let overlap = !(plo.is_finite() && phi.is_finite())
+                            || (plo.x <= ray_hi.x
+                                && phi.x >= ray_lo.x
+                                && plo.y <= ray_hi.y
+                                && phi.y >= ray_lo.y
+                                && plo.z <= ray_hi.z
+                                && phi.z >= ray_lo.z);
+                        overlap.then_some(*r)
+                    }));
                 }
                 for r in &refs {
                     if let Some(p) = c.index.get(r).and_then(|i| c.parts.get(*i)) {
@@ -2183,32 +2259,41 @@ fn overlap_once(
 /// Workspace.Terrain with its voxels and their world bounds (studs), read
 /// once per terrain change.
 fn terrain_state(lua: &Lua) -> mlua::Result<Option<(Ref, std::sync::Arc<rustudio_core::terrain::Voxels>, (Vec3, Vec3))>> {
-    let cached = {
-        let c = lua.app_data_ref::<QueryCache>();
-        c.and_then(|c| c.terrain.clone())
-    };
-    let terrain = match cached {
-        Some(t) => t,
-        None => {
-            let t = {
-                let w = world(lua)?;
-                let d = w.d();
-                let r = d.workspace().and_then(|ws| d.find_child(ws, "Terrain"));
-                match (r, rustudio_core::terrain::Voxels::from_dom(&d.dom)) {
-                    (Some(r), Some(Ok(v))) if v.count() > 0 => {
-                        let b = v.world_bounds();
-                        Some((r, std::sync::Arc::new(v), b))
-                    }
+    let terrain = match lua.app_data_mut::<QueryCache>() {
+        Some(c) if c.terrain_valid => c.terrain.clone(),
+        Some(mut c) => {
+            use rustudio_core::terrain::Voxels;
+            let w = world(lua)?;
+            let d = w.d();
+            let r = d.workspace().and_then(|ws| d.find_child(ws, "Terrain"));
+            let source = Voxels::smooth_grid_bytes(&d.dom).and_then(Result::ok);
+            if c.terrain.as_ref().map(|t| t.0) != r || c.terrain_source.as_deref() != source {
+                c.terrain = match (r, source) {
+                    (Some(r), Some(bytes)) => Voxels::decode(bytes).ok().filter(|v| v.count() > 0).map(|v| {
+                        let bounds = v.world_bounds();
+                        (r, std::sync::Arc::new(v), bounds)
+                    }),
                     _ => None,
-                }
-            };
-            if let Some(mut c) = lua.app_data_mut::<QueryCache>() {
-                c.terrain = Some(t.clone());
+                };
+                c.terrain_source = source.map(<[u8]>::to_vec);
                 c.terrain_tris.clear();
                 c.terrain_water.clear();
                 c.terrain_index.clear();
             }
-            t
+            c.terrain_valid = true;
+            c.terrain.clone()
+        }
+        None => {
+            let w = world(lua)?;
+            let d = w.d();
+            let r = d.workspace().and_then(|ws| d.find_child(ws, "Terrain"));
+            match (r, rustudio_core::terrain::Voxels::from_dom(&d.dom)) {
+                (Some(r), Some(Ok(v))) if v.count() > 0 => {
+                    let bounds = v.world_bounds();
+                    Some((r, std::sync::Arc::new(v), bounds))
+                }
+                _ => None,
+            }
         }
     };
     Ok(terrain.and_then(|(r, v, b)| b.map(|(lo, hi)| (r, v, (Vec3::from(lo), Vec3::from(hi))))))
@@ -2302,6 +2387,106 @@ fn terrain_hit(
         t = seg_end;
     }
     Ok(best.map(|(d, n, m)| (r, origin + dir_n * d, n, d, m)))
+}
+
+/// Raycast against a snapshot cached by `WorldRoot:CacheCurrentTerrain`.
+fn raycast_cached_terrain(
+    lua: &Lua,
+    id: &str,
+    origin: Vec3,
+    dir: Vec3,
+    ignore_water: bool,
+) -> mlua::Result<Option<(Ref, Vec3, Vec3, f32, u8)>> {
+    use rustudio_core::terrain::VOXEL;
+    let len = dir.length();
+    if len <= 1e-9 || !len.is_finite() {
+        return Ok(None);
+    }
+    let dir_n = dir / len;
+    let Some(mut qc) = lua.app_data_mut::<QueryCache>() else {
+        return Ok(None);
+    };
+    let Some(ct) = qc.cached_terrain.get_mut(id) else {
+        return Ok(None);
+    };
+    let Some((lo, hi)) = ct.bounds else {
+        return Ok(None);
+    };
+    let (lo, hi) = (lo - VOXEL - Vec3::Y * rustudio_core::terrain::WATER_RAY_DROP, hi + VOXEL);
+    let (mut t0, mut t1) = (0.0f32, len);
+    for k in 0..3 {
+        if dir_n[k].abs() < 1e-9 {
+            if origin[k] < lo[k] || origin[k] > hi[k] {
+                return Ok(None);
+            }
+            continue;
+        }
+        let (a, b) = ((lo[k] - origin[k]) / dir_n[k], (hi[k] - origin[k]) / dir_n[k]);
+        t0 = t0.max(a.min(b));
+        t1 = t1.min(a.max(b));
+    }
+    if t0 > t1 {
+        return Ok(None);
+    }
+    let terrain_ref = ct.terrain;
+    let mut best: Option<(f32, Vec3, u8)> = None;
+    let chunk = VOXEL * 32.0;
+    let mut seen: HashSet<[i32; 3]> = HashSet::new();
+    let mut t = t0;
+    let step = chunk * 0.5;
+    loop {
+        let seg_end = (t + step).min(t1);
+        let (a, b) = (origin + dir_n * t, origin + dir_n * seg_end);
+        for key in terrain_chunk_keys(a.min(b), a.max(b)) {
+            if !seen.insert(key) || !ct.voxels.chunk_near(key) {
+                continue;
+            }
+            let solid = ct.tris.entry(key).or_insert_with(|| {
+                let verts = rustudio_core::terrain::chunk_triangles(&ct.voxels, key, &|_| false);
+                let tris: Vec<([Vec3; 3], [u8; 3])> = verts
+                    .chunks_exact(3)
+                    .map(|tri| {
+                        let mats = [0, 1, 2].map(|i| tri[0].palette[i] / 3);
+                        ([Vec3::from(tri[0].pos), Vec3::from(tri[1].pos), Vec3::from(tri[2].pos)], mats)
+                    })
+                    .collect();
+                std::rc::Rc::new(tris)
+            }).clone();
+            if !solid.is_empty() {
+                let index = ct.index.entry(key).or_insert_with(|| std::rc::Rc::new(TriIndex::build(&solid))).clone();
+                if let Some((d, i, w)) = index.ray(&solid, origin, dir_n, t0, t1) {
+                    if best.is_none_or(|(bt, _, _)| d < bt) {
+                        let tri = &solid[i];
+                        let n = (tri.0[1] - tri.0[0]).cross(tri.0[2] - tri.0[0]).normalize_or_zero();
+                        let k = if w.x >= w.y && w.x >= w.z { 0 } else if w.y >= w.z { 1 } else { 2 };
+                        best = Some((d, n, tri.1[k]));
+                    }
+                }
+            }
+            if !ignore_water {
+                let wet = ct.water.entry(key).or_insert_with(|| {
+                    let tris: Vec<[Vec3; 3]> = rustudio_core::terrain::chunk_water_triangles(&ct.voxels, key)
+                        .into_iter()
+                        .map(|tri| tri.map(Vec3::from))
+                        .collect();
+                    std::rc::Rc::new(tris)
+                }).clone();
+                for tri in wet.iter() {
+                    if let Some((d, _)) = ray_triangle(origin, dir_n, tri) {
+                        if d >= t0 && d <= t1 && best.is_none_or(|(bt, _, _)| d < bt) {
+                            let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+                            best = Some((d, n, rustudio_core::terrain::WATER));
+                        }
+                    }
+                }
+            }
+        }
+        if best.is_some_and(|(bt, _, _)| bt <= seg_end) || seg_end >= t1 {
+            break;
+        }
+        t = seg_end;
+    }
+    Ok(best.map(|(d, n, m)| (terrain_ref, origin + dir_n * d, n, d, m)))
 }
 
 /// Terrain against a swept shape (Spherecast / Blockcast / Shapecast):
@@ -3055,16 +3240,18 @@ fn break_joints(lua: &Lua, r: Ref) -> mlua::Result<()> {
             .filter(|i| joint_class(&i.class))
             .map(|i| i.referent())
             .collect();
-        // Joints elsewhere that hold one of these parts.
-        if let Some(ws) = d.workspace() {
-            for i in d.dom.descendants_of(ws) {
-                if joint_class(&i.class) && !js.contains(&i.referent()) {
-                    let touches = ["Part0", "Part1"].iter().any(|p| matches!(i.properties.get(&ustr(p)), Some(Variant::Ref(x)) if parts.contains(x)));
-                    if touches {
-                        js.push(i.referent());
+        // Joints elsewhere in Workspace that hold one of these parts (via joint graph).
+        if !parts.is_empty() && d.workspace().is_some() {
+            let mut seen: rustc_hash::FxHashSet<Ref> = js.iter().copied().collect();
+            domains::world::part::with_graph(d, |g| {
+                for &p in &parts {
+                    for j in g.joints_of(p) {
+                        if seen.insert(j) && d.class_of(j).is_some_and(|c| joint_class(&c)) {
+                            js.push(j);
+                        }
                     }
                 }
-            }
+            });
         }
         js
     };
@@ -3167,11 +3354,32 @@ fn sound_set_time(w: &World, r: Ref) -> f64 {
 /// puts it to 0; Pause keeps it. Changed fires for Playing and for a
 /// TimePosition that moved.
 pub fn sound_ev(lua: &Lua, r: Ref, cmd: SoundCmd, events: bool) -> mlua::Result<()> {
+    if world(lua)?.mode == RunMode::Edit
+        && matches!(cmd, SoundCmd::Play | SoundCmd::Resume | SoundCmd::PlayLocal)
+    {
+        super::domains::media::touch_sound(lua, r)?;
+    }
     if cmd == SoundCmd::PlayLocal {
         // SoundService:PlayLocalSound: a copy plays on this client only;
         // the Sound itself is untouched (Playing stays false, no events).
         world(lua)?.requests.sounds.push((r, cmd));
         return Ok(());
+    }
+    if events {
+        let ev = match cmd {
+            SoundCmd::Play => "Played",
+            SoundCmd::Stop => "Stopped",
+            SoundCmd::Pause => "Paused",
+            SoundCmd::Resume | SoundCmd::PlayLocal => "Resumed",
+        };
+        let sid = match world(lua)?.d().prop(r, "SoundId") {
+            Some(Variant::ContentId(c)) => c.as_str().to_string(),
+            Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        let s = Value::String(lua.create_string(&sid)?);
+        world(lua)?.fire(r, ev, vec![s]);
+        flush_immediate(lua);
     }
     let playing = matches!(cmd, SoundCmd::Play | SoundCmd::Resume);
     let moved = {
@@ -3190,7 +3398,9 @@ pub fn sound_ev(lua: &Lua, r: Ref, cmd: SoundCmd, events: bool) -> mlua::Result<
         if let Some(t) = new {
             w.input.sound_pos.insert(r, t);
         }
-        w.requests.sounds.push((r, cmd));
+        if w.mode != RunMode::Edit {
+            w.requests.sounds.push((r, cmd));
+        }
         if playing {
             w.input.sound_playing.insert(r);
         } else {
@@ -3213,22 +3423,6 @@ pub fn sound_ev(lua: &Lua, r: Ref, cmd: SoundCmd, events: bool) -> mlua::Result<
         w.fire(r, "Changed", vec![name]);
         w.fire(r, "Changed:TimePosition", vec![]);
     }
-    if !events {
-        return Ok(());
-    }
-    let ev = match cmd {
-        SoundCmd::Play => "Played",
-        SoundCmd::Stop => "Stopped",
-        SoundCmd::Pause => "Paused",
-        SoundCmd::Resume | SoundCmd::PlayLocal => "Resumed",
-    };
-    let sid = match world(lua)?.d().prop(r, "SoundId") {
-        Some(Variant::ContentId(c)) => c.as_str().to_string(),
-        Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
-        _ => String::new(),
-    };
-    let s = Value::String(lua.create_string(&sid)?);
-    world(lua)?.fire(r, ev, vec![s]);
     Ok(())
 }
 
@@ -3406,6 +3600,7 @@ pub fn dress_from_description(lua: &Lua, model: Ref, desc: Ref) -> mlua::Result<
         }
         d.dom.destroy(holder);
     }
+    dress_clothing_from_description(lua, model, desc, None)?;
     // The Humanoid keeps a copy of the description, as in Studio.
     let mut w = world(lua)?;
     let d = w.dm();
@@ -3415,6 +3610,144 @@ pub fn dress_from_description(lua: &Lua, model: Ref, desc: Ref) -> mlua::Result<
         let copy = d.dom.clone_within(desc);
         d.dom.transfer_within(copy, hum);
         d.mark_tree(copy);
+    }
+    Ok(())
+}
+
+/// Applies Shirt, Pants, GraphicTShirt, and Face from a HumanoidDescription to `model`.
+/// When `only_changed_from` is `Some(look)`, only slots whose id differs from `look` are
+/// replaced (preserving the pre-dressed account clothing for unchanged slots).
+fn dress_clothing_from_description(
+    lua: &Lua,
+    model: Ref,
+    desc: Ref,
+    only_changed_from: Option<&crate::avatar::AvatarLook>,
+) -> mlua::Result<()> {
+    let read_id = |d: &Document, prop: &str| -> i64 {
+        match d.prop(desc, prop) {
+            Some(Variant::Int64(v)) => v,
+            Some(Variant::Int32(v)) => v as i64,
+            Some(Variant::Float64(v)) => v as i64,
+            Some(Variant::Float32(v)) => v as i64,
+            _ => 0,
+        }
+    };
+    let read_content = |d: &Document, r: Ref, prop: &str| -> Option<String> {
+        let alt = format!("{prop}Content");
+        for k in [prop, alt.as_str()] {
+            match d.prop(r, k) {
+                Some(Variant::ContentId(c)) if !c.as_str().is_empty() => return Some(c.as_str().to_string()),
+                Some(Variant::Content(c)) => {
+                    if let Some(u) = c.as_uri().filter(|s| !s.is_empty()) {
+                        return Some(u.to_string());
+                    }
+                }
+                Some(Variant::String(s)) if !s.is_empty() => return Some(s),
+                _ => {}
+            }
+        }
+        None
+    };
+    const SLOTS: &[(&str, &str, &str, &str)] = &[
+        ("Shirt", "Shirt", "Shirt", "ShirtTemplate"),
+        ("Pants", "Pants", "Pants", "PantsTemplate"),
+        ("GraphicTShirt", "ShirtGraphic", "Shirt Graphic", "Graphic"),
+    ];
+    for &(prop, class, inst_name, field) in SLOTS {
+        let id = read_id(world(lua)?.d(), prop);
+        if let Some(look) = only_changed_from {
+            let orig = match prop {
+                "Shirt" => look.shirt_id.unwrap_or(0) as i64,
+                "Pants" => look.pants_id.unwrap_or(0) as i64,
+                "GraphicTShirt" => look.tshirt_id.unwrap_or(0) as i64,
+                _ => 0,
+            };
+            if id == orig {
+                continue;
+            }
+        } else if id <= 0 {
+            continue;
+        }
+        if id <= 0 {
+            let mut w = world(lua)?;
+            let d = w.dm();
+            let old: Vec<Ref> = d
+                .dom
+                .get_by_ref(model)
+                .map(|m| m.children().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| d.class_of(*c).is_some_and(|k| k == class))
+                .collect();
+            for c in old {
+                d.dom.destroy(c);
+            }
+            continue;
+        }
+        let Ok(holder) = load_asset(lua, id as u64) else {
+            continue;
+        };
+        let mut w = world(lua)?;
+        let d = w.dm();
+        let url = d
+            .dom
+            .descendants_of(holder)
+            .find(|i| i.class == class)
+            .and_then(|i| read_content(d, i.referent(), field));
+        d.dom.destroy(holder);
+        if let Some(url) = url {
+            let old: Vec<Ref> = d
+                .dom
+                .get_by_ref(model)
+                .map(|m| m.children().to_vec())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| d.class_of(*c).is_some_and(|k| k == class))
+                .collect();
+            for c in old {
+                d.dom.destroy(c);
+            }
+            let r = d.dom.insert(
+                model,
+                InstanceBuilder::new(class)
+                    .with_name(inst_name)
+                    .with_property(field, Variant::ContentId(rbx_types::ContentId::from(url))),
+            );
+            d.mark_tree(r);
+        }
+    }
+    let face_id = read_id(world(lua)?.d(), "Face");
+    let apply_face = match only_changed_from {
+        Some(look) => face_id > 0 && face_id != look.face_id.unwrap_or(0) as i64,
+        None => face_id > 0,
+    };
+    if apply_face {
+        if let Ok(holder) = load_asset(lua, face_id as u64) {
+            let mut w = world(lua)?;
+            let d = w.dm();
+            let url = d
+                .dom
+                .descendants_of(holder)
+                .find(|i| i.class == "Decal")
+                .and_then(|i| read_content(d, i.referent(), "Texture"));
+            d.dom.destroy(holder);
+            if let (Some(url), Some(head)) = (url, d.find_named(model, "Head")) {
+                if let Some(face) = d.find_named(head, "face") {
+                    if let Some(i) = d.dom.get_by_ref_mut(face) {
+                        i.properties.insert(ustr("Texture"), Variant::ContentId(rbx_types::ContentId::from(url)));
+                    }
+                    d.mark_tree(face);
+                } else {
+                    let face = d.dom.insert(
+                        head,
+                        InstanceBuilder::new("Decal")
+                            .with_name("face")
+                            .with_property("Texture", Variant::ContentId(rbx_types::ContentId::from(url))),
+                    );
+                    d.mark_tree(face);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3539,10 +3872,144 @@ pub struct AbsBox {
 /// its three lines, checks/plugins/ref/corpus/screens/argon-load-popup.jpg).
 /// A read (abs_now through a script) lays it out and replaces the zero box.
 pub(crate) fn seed_unlaid(w: &mut World, r: Ref) {
-    if !w.d().class_of(r).is_some_and(|c| doc::is_a(&c, "GuiObject")) || w.input.gui_layout.contains_key(&r) {
+    let Some(class) = w.d().class_of(r) else { return };
+    if !(doc::is_a(&class, "GuiObject") || class == "ScreenGui") || w.input.gui_layout.contains_key(&r) {
         return;
     }
     w.abs_seen.entry(r).or_insert(AbsBox { pos: [0.0; 2], size: [0.0; 2], rot: 0.0 });
+    if class == "ScrollingFrame" {
+        w.scroll_seen.entry(r).or_insert(([0.0; 2], [0.0; 2]));
+    }
+}
+
+/// Computes a ScrollingFrame's `(AbsoluteCanvasSize, AbsoluteWindowSize)` to
+/// match Studio (and `domains/gui_input.luau`).
+fn scrolling_sizes(w: &mut World, r: Ref) -> ([f32; 2], [f32; 2]) {
+    let size = drawn_box(w, r).map_or_else(|| abs_now(w, r).size, |b| b.size);
+    let d = w.d();
+    let cs = match d.prop(r, "CanvasSize") {
+        Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+        _ => [0.0, 0.0, 2.0, 0.0],
+    };
+    let thickness = rustudio_render::scene::f32_of(d.prop(r, "ScrollBarThickness")).unwrap_or(12.0);
+    let gutter = if thickness > 0.0 { thickness + 1.0 } else { 0.0 };
+    let sd = rustudio_render::scene::enum_u32(d.prop(r, "ScrollingDirection")).unwrap_or(4);
+    let can_x = sd != 2;
+    let can_y = sd != 1;
+    let laid = w.input.gui_layout.get(&r).copied();
+    let canvas = match laid {
+        Some(b) => b.canvas_for(cs).or(b.canvas).unwrap_or([
+            (cs[0] * size[0] + cs[1]).max(size[0]),
+            (cs[2] * size[1] + cs[3]).max(size[1]),
+        ]),
+        None => [
+            (cs[0] * size[0] + cs[1]).max(size[0]),
+            (cs[2] * size[1] + cs[3]).max(size[1]),
+        ],
+    };
+    let window = laid.and_then(|b| b.window).unwrap_or_else(|| {
+        let show_v = can_y && canvas[1] > size[1] + 0.5;
+        let show_h = can_x && canvas[0] > size[0] + 0.5;
+        [
+            if show_v { (size[0] - gutter).max(0.0) } else { size[0] },
+            if show_h { (size[1] - gutter).max(0.0) } else { size[1] },
+        ]
+    });
+    (canvas, window)
+}
+
+#[derive(Clone, Copy)]
+struct ScrollGeometry {
+    canvas: [f32; 2],
+    window: [f32; 2],
+    content: [f32; 2],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ScrollSizeInputs {
+    size: [f32; 2],
+    parent_size: [f32; 2],
+    scale: f32,
+}
+
+/// Geometry owned by a ScrollingFrame before its next draw.
+fn scroll_geometry(
+    d: &Document, r: Ref, inputs: ScrollSizeInputs,
+) -> ScrollGeometry {
+    use rustudio_render::scene::{enum_u32, f32_of};
+    let ScrollSizeInputs { size, parent_size, scale } = inputs;
+    let cs = match d.prop(r, "CanvasSize") {
+        Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+        _ => [0.0, 0.0, 2.0, 0.0],
+    };
+    let raw = [cs[0] * parent_size[0] + cs[1] * scale, cs[2] * parent_size[1] + cs[3] * scale];
+    let auto = enum_u32(d.prop(r, "AutomaticCanvasSize")).unwrap_or(0);
+    let nominal = [raw[0].max(size[0]), raw[1].max(size[1])];
+    let canvas = if auto == 0 {
+        nominal
+    } else {
+        crate::gui::grow_axes(d, r, nominal, scale, auto, nominal[0])
+    };
+    let direction = enum_u32(d.prop(r, "ScrollingDirection")).unwrap_or(4);
+    let vbar = direction != 1 && canvas[1] > size[1] + 0.5;
+    let hbar = direction != 2 && canvas[0] > size[0] + 0.5;
+    let thickness = f32_of(d.prop(r, "ScrollBarThickness")).unwrap_or(12.0);
+    let gutter = if thickness > 0.0 { (thickness + 1.0) * scale } else { 0.0 };
+    let window = [
+        (size[0] - if vbar { gutter } else { 0.0 }).max(0.0),
+        (size[1] - if hbar { gutter } else { 0.0 }).max(0.0),
+    ];
+    let inset = |name, shown| match enum_u32(d.prop(r, name)).unwrap_or(0) {
+        2 => gutter,
+        1 if shown => gutter,
+        _ => 0.0,
+    };
+    let insets = [inset("VerticalScrollBarInset", vbar), inset("HorizontalScrollBarInset", hbar)];
+    let content = [
+        (if auto & 1 != 0 { size[0] } else { canvas[0] }).min(canvas[0] - insets[0]).max(0.0),
+        (if auto & 2 != 0 { size[1] } else { canvas[1] }).min(canvas[1] - insets[1]).max(0.0),
+    ];
+    ScrollGeometry { canvas, window, content }
+}
+
+pub(crate) fn scrolling_prop(lua: &Lua, r: Ref, key: &str) -> mlua::Result<Value> {
+    let mut w = world(lua)?;
+    abs_scan(&mut w);
+    let laid = w.input.gui_layout.get(&r)
+        .filter(|_| !layout_needs_read(&w, r));
+    let cached = laid.and_then(|b| if key == "AbsoluteCanvasSize" { b.canvas } else { b.window });
+    let value = if let Some(v) = cached {
+        v
+    } else {
+        let size = abs_now(&mut w, r).size;
+        let scale = layout_scale(&mut w, r);
+        let geom = scroll_geometry_now(&mut w, r, size, scale);
+        if key == "AbsoluteCanvasSize" { geom.canvas } else { geom.window }
+    };
+    Ok(Value::UserData(lua.create_userdata(LVector2(glam::Vec2::from_array(value)))?))
+}
+
+fn scroll_geometry_now(w: &mut World, r: Ref, size: [f32; 2], scale: f32) -> ScrollGeometry {
+    let basis = w.read_layout.get(&r).and_then(|l| l.scroll_basis)
+        .or_else(|| w.input.gui_layout.get(&r)?.canvas_fit.map(|f| f.basis))
+        .unwrap_or(size);
+    let d = w.doc.as_ref().expect("checked by World::d");
+    ReadLayout::entry(&mut w.read_layout, d, r).scroll_geometry(d, r, ScrollSizeInputs {
+        size, parent_size: basis, scale,
+    })
+}
+
+fn layout_scale(w: &mut World, mut r: Ref) -> f32 {
+    let d = w.doc.as_ref().expect("checked by World::d");
+    let mut scale = 1.0;
+    while let Some(i) = d.dom.get_by_ref(r) {
+        scale *= ReadLayout::entry(&mut w.read_layout, d, r).own_scale;
+        if doc::is_a(&i.class, "LayerCollector") {
+            break;
+        }
+        r = i.parent();
+    }
+    scale
 }
 
 /// `r` is (in) a LayerCollector: a ScreenGui, a widget, a SurfaceGui ….
@@ -3561,8 +4028,7 @@ fn layer_collector(w: &World, r: Ref) -> Option<Ref> {
 
 pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
     abs_scan(w);
-    let w = &*w;
-    let d = w.d();
+    let d = w.doc.as_ref().expect("checked by World::d");
     let mut chain: Vec<Ref> = Vec::with_capacity(16);
     let mut c = r;
     while let Some(i) = d.dom.get_by_ref(c) {
@@ -3579,9 +4045,10 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
     let dirty_top = if w.abs_all {
         Some(chain.len() - 1)
     } else {
-        chain.iter().rposition(|x| w.abs_dirty.contains(x))
+        chain.iter().rposition(|x| w.abs_dirty.contains(x) || w.layout_dirty.contains(x))
     };
-    let drawn = |x: Ref| drawn_box(w, x);
+    let layout = &w.input.gui_layout;
+    let drawn = |x: Ref| layout.get(&x).map(|b| AbsBox { pos: b.pos, size: b.size, rot: b.rot });
     if dirty_top.is_none() {
         if let Some(b) = drawn(r) {
             return b;
@@ -3597,16 +4064,12 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
             (top, AbsBox { pos, size, rot: 0.0 })
         }
     };
-    let scale_of = |x: Ref| -> f32 {
-        d.dom
-            .get_by_ref(x)
-            .and_then(|i| i.children().iter().copied().find(|k| d.class_of(*k).is_some_and(|c| c == "UIScale")))
-            .and_then(|s| rustudio_render::scene::f32_of(d.prop(s, "Scale")))
-            .unwrap_or(1.0)
-    };
     // UIScale above: offsets of the objects below grow with it.
-    let mut scale: f32 = chain[base_idx..].iter().map(|x| scale_of(*x)).product();
+    let mut scale: f32 = chain[base_idx..].iter()
+        .map(|&r| ReadLayout::entry(&mut w.read_layout, d, r).own_scale)
+        .product();
     let mut cur_ref = chain[base_idx];
+    let mut scroll_basis = layout.get(&cur_ref).and_then(|b| b.canvas_fit).map(|f| f.basis).unwrap_or(cur.size);
     for k in (0..base_idx).rev() {
         let x = chain[k];
         let Some(class) = d.class_of(x) else { break };
@@ -3619,54 +4082,80 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
                 .get_by_ref(p)
                 .and_then(|i| i.children().iter().copied().find(|k| d.class_of(*k).is_some_and(|c| doc::is_a(&c, cls))))
         };
-        // Laid out by a UIListLayout / grid / page layout, or sized by its
-        // content: the drawn box is the best known.
-        let auto = rustudio_render::scene::enum_u32(d.prop(x, "AutomaticSize")).unwrap_or(0) != 0;
-        if child_of(cur_ref, "UIGridStyleLayout").is_some() || auto {
-            if let Some(b) = drawn(x) {
-                cur = b;
-                cur_ref = x;
-                scale *= scale_of(x);
-                continue;
-            }
-        }
+        let auto = rustudio_render::scene::enum_u32(d.prop(x, "AutomaticSize")).unwrap_or(0);
         let u2 = |name: &str| match d.prop(x, name) {
             Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
             _ => [0.0; 4],
         };
         // The parent's content box (inside its UIPadding), unturned.
         let (mut cpos, mut csize) = (cur.pos, cur.size);
-        if let Some(pad) = child_of(cur_ref, "UIPadding") {
+        let parent_layout = ReadLayout::entry(&mut w.read_layout, d, cur_ref);
+        if d.class_of(cur_ref).as_deref() == Some("ScrollingFrame") {
+            let ScrollGeometry { canvas, window, content } = parent_layout.scroll_geometry(d, cur_ref, ScrollSizeInputs {
+                size: cur.size, parent_size: scroll_basis, scale,
+            });
+            csize = content;
+            if let Some(Variant::Vector2(p)) = d.prop(cur_ref, "CanvasPosition") {
+                cpos[0] -= p.x.clamp(0.0, (canvas[0] - window[0]).max(0.0));
+                cpos[1] -= p.y.clamp(0.0, (canvas[1] - window[1]).max(0.0));
+            }
+        }
+        if let Some(pad) = parent_layout.padding {
             let u = |name: &str| match d.prop(pad, name) {
                 Some(Variant::UDim(u)) => [u.scale, u.offset as f32],
                 _ => [0.0, 0.0],
             };
             let (l, rr, t, b) = (u("PaddingLeft"), u("PaddingRight"), u("PaddingTop"), u("PaddingBottom"));
             let (left, topp) = (l[0] * csize[0] + l[1] * scale, t[0] * csize[1] + t[1] * scale);
-            cpos = [cpos[0] + left, cpos[1] + topp];
-            csize = [
-                csize[0] - left - rr[0] * csize[0] - rr[1] * scale,
-                csize[1] - topp - b[0] * csize[1] - b[1] * scale,
-            ];
+            let (x1, y1) = (cpos[0] + left, cpos[1] + topp);
+            let (x2, y2) = (
+                cpos[0] + csize[0] - rr[0] * csize[0] - rr[1] * scale,
+                cpos[1] + csize[1] - b[0] * csize[1] - b[1] * scale,
+            );
+            cpos = [x1.min(x2), y1.min(y2)];
+            csize = [(x2 - x1).abs(), (y2 - y1).abs()];
+        }
+        let placed = if d.dom.get_by_ref(x).is_some_and(|i| i.parent() == cur_ref) {
+            parent_layout.resolve(d, cur_ref, csize, scale);
+            parent_layout.slots.get(&x).map(|&rect| (rect, parent_layout.grid))
+        } else {
+            None
+        };
+        let child_layout = ReadLayout::entry(&mut w.read_layout, d, x);
+        if class == "ScrollingFrame" {
+            child_layout.scroll_basis = Some(csize);
+        }
+        let own = child_layout.own_scale;
+        // Page and table placement still comes from their drawn boxes.
+        if placed.is_none() && w.read_layout[&cur_ref].drawn_only {
+            if let Some(b) = drawn(x) {
+                cur = b;
+                cur_ref = x;
+                scroll_basis = csize;
+                scale *= own;
+                continue;
+            }
         }
         let s = u2("Size");
         let p = u2("Position");
-        let mut size = [s[0] * csize[0] + s[1] * scale, s[2] * csize[1] + s[3] * scale];
-        if auto {
-            // Not laid out yet (a drawn box `continue`d above): sized by
-            // its content now, by the walk's rules.
-            let at = [p[0] * csize[0] + p[1] * scale, p[2] * csize[1] + p[3] * scale];
-            if let Some(grown) = crate::gui::auto_grow_now(d, x, size, csize, at, scale) {
-                size = grown;
-            }
-        }
+        let (sw, sh) = match rustudio_render::scene::enum_u32(d.prop(x, "SizeConstraint")) {
+            Some(1) => (csize[0], csize[0]),
+            Some(2) => (csize[1], csize[1]),
+            _ => (csize[0], csize[1]),
+        };
+        let mut size = [s[0] * sw + s[1] * scale, s[2] * sh + s[3] * scale];
         if let Some(c) = child_of(x, "UISizeConstraint") {
             let v = |n: &str, dflt: f32| match d.prop(c, n) {
                 Some(Variant::Vector2(v)) => [v.x, v.y],
                 _ => [dflt, dflt],
             };
             let (mn, mx) = (v("MinSize", 0.0), v("MaxSize", f32::INFINITY));
-            size = [size[0].clamp(mn[0], mx[0].max(mn[0])), size[1].clamp(mn[1], mx[1].max(mn[1]))];
+            if mn[0] <= mx[0] {
+                size[0] = size[0].clamp(mn[0] * scale, mx[0] * scale);
+            }
+            if mn[1] <= mx[1] {
+                size[1] = size[1].clamp(mn[1] * scale, mx[1] * scale);
+            }
         }
         if let Some(c) = child_of(x, "UIAspectRatioConstraint") {
             let ratio = rustudio_render::scene::f32_of(d.prop(c, "AspectRatio")).unwrap_or(1.0).max(1e-3);
@@ -3676,22 +4165,48 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
                 } else {
                     size[1] = size[0] / ratio;
                 }
+                if csize[0] > 0.0 && size[0] > csize[0] {
+                    size[0] = csize[0];
+                    size[1] = size[0] / ratio;
+                }
+                if csize[1] > 0.0 && size[1] > csize[1] {
+                    size[1] = csize[1];
+                    size[0] = size[1] * ratio;
+                }
             } else if size[0] / size[1].max(1e-3) > ratio {
                 size[0] = size[1] * ratio;
             } else {
                 size[1] = size[0] / ratio;
             }
         }
-        let own = scale_of(x);
+        if auto != 0 && placed.is_none() {
+            // Not laid out yet (a drawn box `continue`d above): sized by
+            // its content now, by the walk's rules.
+            let at = [p[0] * csize[0] + p[1] * scale, p[2] * csize[1] + p[3] * scale];
+            if let Some(grown) = crate::gui::auto_grow_now(d, x, size, csize, at, scale) {
+                size = grown;
+            }
+        }
         // (negative sizes are reported as they are, as in Studio)
         size = [size[0] * own, size[1] * own];
         let anchor = match d.prop(x, "AnchorPoint") {
             Some(Variant::Vector2(v)) => [v.x, v.y],
             _ => [0.0, 0.0],
         };
+        let (left, top) = if let Some((slot, grid)) = placed {
+            size = [slot.width(), slot.height()];
+            if grid && auto != 0 && (drawn(x).is_none() || w.layout_dirty.contains(&x)) {
+                size = crate::gui::grow_axes(d, x, size, scale, auto, size[0]);
+            }
+            (cpos[0] + slot.left(), cpos[1] + slot.top())
+        } else {
+            (
+                cpos[0] + p[0] * csize[0] + p[1] * scale - anchor[0] * size[0],
+                cpos[1] + p[2] * csize[1] + p[3] * scale - anchor[1] * size[1],
+            )
+        };
         // Its centre, unturned, then turned about the parent's centre.
-        let cx = cpos[0] + p[0] * csize[0] + p[1] * scale - anchor[0] * size[0] + size[0] * 0.5;
-        let cy = cpos[1] + p[2] * csize[1] + p[3] * scale - anchor[1] * size[1] + size[1] * 0.5;
+        let (cx, cy) = (left + size[0] * 0.5, top + size[1] * 0.5);
         let (pcx, pcy) = (cur.pos[0] + cur.size[0] * 0.5, cur.pos[1] + cur.size[1] * 0.5);
         let (sn, cs) = cur.rot.to_radians().sin_cos();
         let (dx, dy) = (cx - pcx, cy - pcy);
@@ -3699,6 +4214,7 @@ pub(crate) fn abs_now(w: &mut World, r: Ref) -> AbsBox {
         let rot = rustudio_render::scene::f32_of(d.prop(x, "Rotation")).unwrap_or(0.0);
         cur = AbsBox { pos: [tx - size[0] * 0.5, ty - size[1] * 0.5], size, rot: cur.rot + rot };
         cur_ref = x;
+        scroll_basis = csize;
         scale *= own;
     }
     cur
@@ -3738,6 +4254,9 @@ fn layout_props() -> &'static rustc_hash::FxHashSet<rbx_dom_weak::Ustr> {
             "SortOrder", "CellSize", "CellPadding", "LayoutOrder", "Visible", "Enabled", "Name",
             "FillDirectionMaxCells", "StartCorner", "HorizontalFlex", "VerticalFlex",
             "ItemLineAlignment", "Wraps", "FlexMode", "GrowRatio", "ShrinkRatio", "AutomaticCanvasSize",
+            "ScrollBarThickness", "VerticalScrollBarInset", "HorizontalScrollBarInset",
+            "VerticalScrollBarPosition", "ScrollingDirection", "MajorAxis",
+            "FillEmptySpaceColumns", "FillEmptySpaceRows", "Circular",
         ]
         .into_iter()
         .map(rbx_dom_weak::ustr)
@@ -3784,24 +4303,144 @@ fn layout_ancestor_dirty(d: &Document, roots: &rustc_hash::FxHashSet<Ref>, mut r
     false
 }
 
+fn layout_needs_read(w: &World, r: Ref) -> bool {
+    w.abs_all
+        || layout_ancestor_dirty(w.d(), &w.abs_dirty, r)
+        || layout_ancestor_dirty(w.d(), &w.layout_dirty, r)
+}
+
 /// Reads the journal since the last look and notes what scripts changed
 /// (see `World::abs_dirty`).
 fn abs_scan(w: &mut World) {
-    if w.abs_all {
-        return;
-    }
     let end = w.d().journal_end();
     if end == w.abs_scan {
         return;
     }
-    let World { doc, abs_dirty, abs_scan, abs_all, .. } = w;
+    let World { doc, abs_dirty, abs_scan, abs_all, layout_dirty, read_layout, .. } = w;
     let d = doc.as_ref().expect("checked by World::d");
-    let Some(marks) = d.marks_since(*abs_scan) else {
+    if let Some(marks) = d.marks_since(*abs_scan) {
+        mark_layout_roots(d, marks, abs_dirty);
+        for mark in marks {
+            let r = match *mark {
+                doc::Mark::Prop(r, name) if layout_props().contains(&name) => r,
+                doc::Mark::Tree(r) => r,
+                _ => continue,
+            };
+            if let Some(i) = d.dom.get_by_ref(r) {
+                if doc::is_a(&i.class, "GuiBase2d") || doc::is_a(&i.class, "UIComponent") {
+                    // Changing a child's order invalidates its parent's placements.
+                    let root = if matches!(*mark, doc::Mark::Prop(_, name) if name.as_str() == "LayoutOrder") {
+                        i.parent()
+                    } else {
+                        r
+                    };
+                    invalidate_layout_ancestors(d, layout_dirty, read_layout, root);
+                }
+            }
+        }
+    } else {
         *abs_all = true;
-        return;
-    };
-    mark_layout_roots(d, marks, abs_dirty);
+        read_layout.clear();
+    }
     *abs_scan = end;
+}
+
+pub(crate) fn invalidate_layout_parent(w: &mut World, parent: Ref) {
+    let World { doc, layout_dirty, read_layout, .. } = w;
+    if let Some(d) = doc {
+        invalidate_layout_ancestors(d, layout_dirty, read_layout, parent);
+    }
+}
+
+fn invalidate_layout_ancestors(
+    d: &Document,
+    dirty: &mut rustc_hash::FxHashSet<Ref>,
+    cache: &mut rustc_hash::FxHashMap<Ref, ReadLayout>,
+    mut r: Ref,
+) {
+    while let Some(i) = d.dom.get_by_ref(r) {
+        if !doc::is_a(&i.class, "GuiBase2d") && !doc::is_a(&i.class, "UIComponent") && i.class != "Folder" {
+            break;
+        }
+        dirty.insert(r);
+        cache.remove(&r);
+        if doc::is_a(&i.class, "LayerCollector") {
+            break;
+        }
+        r = i.parent();
+    }
+}
+
+/// A placement pass is shared by all the geometry and content-size reads of
+/// a container until a relevant write invalidates it.
+pub(crate) struct ReadLayout {
+    basis: Option<([f32; 2], f32)>,
+    slots: std::collections::HashMap<Ref, egui::Rect>,
+    extents: Vec<(Ref, crate::gui::GuiBox)>,
+    own_scale: f32,
+    padding: Option<Ref>,
+    grid: bool,
+    list: bool,
+    drawn_only: bool,
+    scroll_basis: Option<[f32; 2]>,
+    scroll: Option<(ScrollSizeInputs, ScrollGeometry)>,
+}
+
+impl ReadLayout {
+    fn entry<'a>(
+        cache: &'a mut rustc_hash::FxHashMap<Ref, Self>,
+        d: &Document,
+        parent: Ref,
+    ) -> &'a mut Self {
+        cache.entry(parent).or_insert_with(|| {
+            let mut layout = Self {
+                basis: None,
+                slots: Default::default(),
+                extents: Vec::new(),
+                own_scale: 1.0,
+                padding: None,
+                grid: false,
+                list: false,
+                drawn_only: false,
+                scroll_basis: None,
+                scroll: None,
+            };
+            let mut ui_scale = false;
+            for &r in d.dom.get_by_ref(parent).map_or(&[][..], |i| i.children()) {
+                match d.class_of(r).as_deref() {
+                    Some("UIListLayout") => layout.list = true,
+                    Some("UIGridLayout") => layout.grid = true,
+                    Some("UIPageLayout" | "UITableLayout") => layout.drawn_only = true,
+                    Some("UIPadding") if layout.padding.is_none() => layout.padding = Some(r),
+                    Some("UIScale") if !ui_scale => {
+                        ui_scale = true;
+                        layout.own_scale = rustudio_render::scene::f32_of(d.prop(r, "Scale")).unwrap_or(1.0);
+                    }
+                    _ => {}
+                }
+            }
+            layout
+        })
+    }
+
+    fn scroll_geometry(&mut self, d: &Document, r: Ref, inputs: ScrollSizeInputs) -> ScrollGeometry {
+        if let Some((previous, geometry)) = self.scroll {
+            if previous == inputs {
+                return geometry;
+            }
+        }
+        let geometry = scroll_geometry(d, r, inputs);
+        self.scroll = Some((inputs, geometry));
+        geometry
+    }
+
+    fn resolve(&mut self, d: &Document, parent: Ref, size: [f32; 2], scale: f32) {
+        if self.basis == Some((size, scale)) || !(self.grid || self.list && !self.drawn_only) {
+            return;
+        }
+        (self.slots, self.extents) = crate::gui::layout_slots(d, parent, size, scale);
+        self.basis = Some((size, scale));
+    }
 }
 
 fn drawn_box(w: &World, r: Ref) -> Option<AbsBox> {
@@ -3815,6 +4454,7 @@ pub(crate) struct ContentDependencies {
     parent: Ref,
     children: Vec<Ref>,
     drawn: Vec<(Ref, AbsBox)>,
+    drawn_self: Option<AbsBox>,
     widget_canvas: Option<(Ref, Option<[f32; 2]>)>,
 }
 
@@ -3822,6 +4462,7 @@ impl ContentDependencies {
     fn dirty(
         &self,
         w: &World,
+        lay: Ref,
         parent: Ref,
         children: &[Ref],
         roots: &rustc_hash::FxHashSet<Ref>,
@@ -3831,12 +4472,13 @@ impl ContentDependencies {
             || layout_ancestor_dirty(w.d(), roots, parent)
             || (!roots.is_empty() && children.iter().any(|r| roots.contains(r)))
             || self.widget_canvas.is_some_and(|(r, old)| old != drawn_box(w, r).map(|b| b.size))
-            || ((!w.input.gui_layout.is_empty() || !self.drawn.is_empty())
-                && !children.iter().filter_map(|&r| drawn_box(w, r).map(|b| (r, b)))
-                    .eq(self.drawn.iter().copied()))
+            || ((!w.input.gui_layout.is_empty() || !self.drawn.is_empty() || self.drawn_self.is_some())
+                && (drawn_box(w, lay) != self.drawn_self
+                    || !children.iter().filter_map(|&r| drawn_box(w, r).map(|b| (r, b)))
+                        .eq(self.drawn.iter().copied())))
     }
 
-    fn capture(w: &World, parent: Ref, children: &[Ref]) -> Self {
+    fn capture(w: &World, lay: Ref, parent: Ref, children: &[Ref]) -> Self {
         // A dock widget can be resized independently of the main viewport.
         let widget_canvas = layer_collector(w, parent)
             .filter(|r| w.d().class_of(*r).is_some_and(|c| doc::is_a(&c, "PluginGui")))
@@ -3845,6 +4487,7 @@ impl ContentDependencies {
             parent,
             children: children.to_vec(),
             drawn: children.iter().filter_map(|&r| drawn_box(w, r).map(|b| (r, b))).collect(),
+            drawn_self: drawn_box(w, lay),
             widget_canvas,
         }
     }
@@ -3886,6 +4529,8 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
         // script reads still detect any mutations that happen after it.
         w.abs_scan = w.d().journal_end();
         w.abs_dirty.clear();
+        w.layout_dirty.clear();
+        w.read_layout.clear();
         w.abs_all = false;
         let mut roots = rustc_hash::FxHashSet::default();
         match marks {
@@ -3934,14 +4579,38 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
             }
         }
 
+        // ScrollingFrame.AbsoluteCanvasSize / AbsoluteWindowSize: Studio fires
+        // Changed / GetPropertyChangedSignal when CanvasSize, AutomaticCanvasSize,
+        // or the frame's own box changes either derived size (DeveloperFramework's
+        // Grid / MaterialGrid resizes its wrapper from AbsoluteCanvasSize).
+        let scroll_frames: Vec<Ref> = w.gui_listening.iter().copied()
+            .filter(|r| w.d().class_of(*r).as_deref() == Some("ScrollingFrame"))
+            .collect();
+        for r in scroll_frames {
+            if w.scroll_seen.get(&r).is_some_and(|&(c, win)| c == [0.0; 2] && win == [0.0; 2])
+                && layer_collector(&w, r).is_none()
+            {
+                continue;
+            }
+            let now = scrolling_sizes(&mut w, r);
+            if let Some(old) = w.scroll_seen.insert(r, now) {
+                if old.0 != now.0 {
+                    fires.push((r, "AbsoluteCanvasSize"));
+                }
+                if old.1 != now.1 {
+                    fires.push((r, "AbsoluteWindowSize"));
+                }
+            }
+        }
+
         let layouts: Vec<Ref> = w.layout_listening.iter().copied().filter(|r| {
             let (parent, children) = layout_parent_and_children(w.d(), *r);
             all || roots.contains(r) || w.layout_content.get(r)
-                .is_none_or(|deps| deps.dirty(&w, parent, children, &roots))
+                .is_none_or(|deps| deps.dirty(&w, *r, parent, children, &roots))
         }).collect();
         for r in layouts {
             let (parent, children) = layout_parent_and_children(w.d(), r);
-            let deps = ContentDependencies::capture(&w, parent, children);
+            let deps = ContentDependencies::capture(&w, r, parent, children);
             let size = content_size(&w, r);
             w.layout_content.insert(r, deps);
             let now = AbsBox { pos: [0.0; 2], size, rot: 0.0 };
@@ -3956,6 +4625,10 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
             let World { abs_seen, listening, .. } = &mut *w;
             abs_seen.retain(|r, _| listening.contains(r));
         }
+        if w.scroll_seen.len() > w.listening.len() {
+            let World { scroll_seen, listening, .. } = &mut *w;
+            scroll_seen.retain(|r, _| listening.contains(r));
+        }
         for (r, name) in &fires {
             let pname = Value::String(lua.create_string(name)?);
             w.fire(*r, "Changed", vec![pname]);
@@ -3965,10 +4638,13 @@ pub fn fire_layout_changes(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-/// UIListLayout / UIGridLayout / UITableLayout.AbsoluteContentSize: the
-/// extent of the visible GuiObjects it lays out (its siblings), as drawn
-/// last frame (before that, from their UDim2s).
+/// UIListLayout / UIGridLayout / UITableLayout / UIPageLayout.AbsoluteContentSize:
+/// the layout's own recorded extent from the last walk, else the bounding box of
+/// its visible direct GuiObject siblings from their UDim2s.
 pub(crate) fn content_size(w: &World, r: Ref) -> [f32; 2] {
+    if let Some(b) = w.input.gui_layout.get(&r) {
+        return b.size;
+    }
     let d = w.d();
     let (_, children) = layout_parent_and_children(d, r);
     let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
@@ -3990,6 +4666,32 @@ pub(crate) fn content_size(w: &World, r: Ref) -> [f32; 2] {
         }
     }
     if any { [mx[0] - mn[0], mx[1] - mn[1]] } else { [0.0; 2] }
+}
+
+fn content_size_now(w: &mut World, r: Ref) -> [f32; 2] {
+    let (parent, _) = layout_parent_and_children(w.d(), r);
+    if !matches!(w.d().class_of(r).as_deref(), Some("UIListLayout" | "UIGridLayout"))
+        || parent.is_none()
+    {
+        return content_size(w, r);
+    }
+    abs_scan(w);
+    if !layout_needs_read(w, parent) {
+        if let Some(b) = drawn_box(w, r) {
+            return b.size;
+        }
+    }
+    let mut size = abs_now(w, parent).size;
+    let scale = layout_scale(w, parent);
+    if w.d().class_of(parent).as_deref() == Some("ScrollingFrame") {
+        size = scroll_geometry_now(w, parent, size, scale).content;
+    }
+    let d = w.doc.as_ref().expect("checked by World::d");
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    let padded = crate::gui::read_padding(d, parent, rect, scale);
+    let slots = ReadLayout::entry(&mut w.read_layout, d, parent);
+    slots.resolve(d, parent, [padded.width(), padded.height()], scale);
+    slots.extents.iter().find(|(lay, _)| *lay == r).map_or([0.0; 2], |(_, b)| b.size)
 }
 
 fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
@@ -4020,6 +4722,12 @@ fn gui_rect(w: &World, r: Ref, depth: usize) -> ([f32; 2], [f32; 2]) {
         return match i.class.as_str() {
             "ScreenGui" if matches!(rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")), Some(0 | 1)) => {
                 ([0.0, -inset], screen)
+            }
+            // TopbarSafeInsets: the bar's free area, GuiService.TopbarInset
+            // (gui_input.rs roots; gui_input.luau topbar_inset).
+            "ScreenGui" if inset > 0.0 && rustudio_render::scene::enum_u32(d.prop(r, "ScreenInsets")) == Some(3) => {
+                let bar = w.topbar_inset(screen[0]);
+                ([bar.min.x, bar.min.y - inset], (bar.max - bar.min).to_array())
             }
             "ScreenGui" => ([0.0, 0.0], [screen[0], screen[1] - inset]),
             "SurfaceGui" => match d.prop(r, "CanvasSize") {
@@ -4303,12 +5011,23 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         "AbsoluteSize" | "AbsolutePosition" | "AbsoluteRotation"
     ) && doc::is_a(class, "GuiBase2d")
     {
-        // As drawn last frame; before that (or when hidden), from the UDim2s.
+        // Reuse the drawn box until a layout dependency changes.
         let b = {
             let mut w = world(lua)?;
             let b = abs_now(&mut w, r);
-            // (what the script saw: a later layout that differs fires Changed)
-            w.abs_seen.insert(r, b);
+            // Preserve a seeded zero box on a listened, not-yet-drawn GuiObject so
+            // the first layout pass still fires its initial AbsoluteSize/Position
+            // signal (e.g., ScrollingFrame.AbsoluteWindowSize reads AbsoluteSize
+            // internally during mount before the first draw).
+            let keep_zero = w.gui_listening.contains(&r)
+                && !w.input.gui_layout.contains_key(&r)
+                && w.abs_seen
+                    .get(&r)
+                    .is_some_and(|s| s.size == [0.0; 2] && s.pos == [0.0; 2]);
+            if !keep_zero {
+                // (what the script saw: a later layout that differs fires Changed)
+                w.abs_seen.insert(r, b);
+            }
             b
         };
         return Ok(Some(match key {
@@ -4322,17 +5041,44 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         }));
     }
     // UIListLayout / UIGridLayout / UITableLayout.AbsoluteContentSize: the
-    // extent of the visible GuiObjects it lays out (its siblings), as drawn
-    // last frame (before that, from their UDim2s).
+    // extent of the visible GuiObjects it lays out (its siblings).
     if key == "AbsoluteContentSize" && doc::is_a(class, "UIGridStyleLayout") {
         let size = {
             let mut w = world(lua)?;
-            let size = content_size(&w, r);
+            let size = content_size_now(&mut w, r);
             // (what the script saw: a later layout that differs fires Changed)
             w.abs_seen.insert(r, AbsBox { pos: [0.0; 2], size, rot: 0.0 });
             size
         };
         return Ok(Some(Value::UserData(lua.create_userdata(LVector2(glam::Vec2::new(size[0], size[1])))?)));
+    }
+    if key == "CanvasPosition" && class == "ScrollingFrame" {
+        let clamped = {
+            let w = world(lua)?;
+            let raw = match w.d().prop(r, "CanvasPosition") {
+                Some(Variant::Vector2(v)) => [v.x, v.y],
+                _ => [0.0, 0.0],
+            };
+            if let Some(b) = w.input.gui_layout.get(&r).copied() {
+                let cs = match w.d().prop(r, "CanvasSize") {
+                    Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+                    _ => [0.0, 0.0, 2.0, 0.0],
+                };
+                if let Some(canvas) = b.canvas_for(cs).or(b.canvas) {
+                    let win = b.window.unwrap_or(b.size);
+                    let max_x = (canvas[0] - win[0]).max(0.0);
+                    let max_y = (canvas[1] - win[1]).max(0.0);
+                    Some([raw[0].clamp(0.0, max_x), raw[1].clamp(0.0, max_y)])
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some([cx, cy]) = clamped {
+            return Ok(Some(Value::UserData(lua.create_userdata(LVector2(glam::Vec2::new(cx, cy)))?)));
+        }
     }
     if key == "TextBounds" && matches!(class, "TextLabel" | "TextButton" | "TextBox") {
         let measured = {
@@ -4467,6 +5213,15 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         let v: Value = get.call((inst_value(lua, r)?, key))?;
         return Ok(Some(v));
     }
+    if class == "StatsItem" && key == "DisplayName" {
+        let name = world(lua)?
+            .d()
+            .dom
+            .get_by_ref(r)
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
+        return stored_or(lua, r, key, |l| Ok(Value::String(l.create_string(&name)?)));
+    }
     if class == "Player" {
         let name = world(lua)?
             .d()
@@ -4575,18 +5330,22 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     }
     if class == "Sound" {
         let w = world(lua)?;
+        let edit = w.mode == RunMode::Edit;
+        let is_playing = if edit {
+            matches!(w.d().prop(r, "Playing"), Some(Variant::Bool(true)))
+        } else {
+            w.input.sound_playing.contains(&r)
+        };
         return Ok(match key {
-            "TimePosition" => Some(Value::Number(sound_time(&w, r))),
+            "TimePosition" => Some(Value::Number(if edit { sound_set_time(&w, r) } else { sound_time(&w, r) })),
             "TimeLength" => {
                 drop(w);
                 Some(Value::Number(super::domains::media::sound_length(lua, r)?.unwrap_or(0.0)))
             }
-            "IsPlaying" => Some(Value::Boolean(w.input.sound_playing.contains(&r))),
-            // Studio's IsPaused getter is
-            // == 0`, the same byte Playing / IsPlaying read
-            // a
-            // sound that never played or has ended reads IsPaused = true.
-            "IsPaused" => Some(Value::Boolean(!w.input.sound_playing.contains(&r))),
+            "IsPlaying" => Some(Value::Boolean(is_playing)),
+            // Studio reports IsPaused whenever IsPlaying is false, even before
+            // the sound first plays or after it ends.
+            "IsPaused" => Some(Value::Boolean(!is_playing)),
             "IsLoaded" => {
                 drop(w);
                 Some(Value::Boolean(super::domains::media::sound_length(lua, r)?.is_some()))
@@ -4619,14 +5378,14 @@ pub fn write_acts(class: &str, key: &str) -> bool {
 
 /// Lighting.ClockTime and TimeOfDay are one value in Roblox (whole seconds
 /// in [0, 24], mech::clock_time): writing either sets both.
-fn set_clock(lua: &Lua, r: Ref, hours: f32) -> mlua::Result<()> {
+pub(crate) fn set_clock(lua: &Lua, r: Ref, hours: f32) -> mlua::Result<()> {
     let t = mech::clock_time(hours);
     store_prop(lua, r, "ClockTime", Variant::Float32(t))?;
     store_prop(lua, r, "TimeOfDay", Variant::String(mech::format_time_of_day(t)))
 }
 
 /// Lighting's hours now: ClockTime, else the saved TimeOfDay, else 14.
-fn clock_hours(lua: &Lua, r: Ref) -> mlua::Result<f32> {
+pub(crate) fn clock_hours(lua: &Lua, r: Ref) -> mlua::Result<f32> {
     let w = world(lua)?;
     let d = w.d();
     Ok(rustudio_render::lighting::clock_hours(d.prop(r, "ClockTime"), d.prop(r, "TimeOfDay")))
@@ -4694,10 +5453,12 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             let on = matches!(value, Value::Boolean(true));
             let (playing, paused) = {
                 let w = world(lua)?;
-                (
-                    w.input.sound_playing.contains(&r),
-                    w.input.sound_paused.contains(&r),
-                )
+                let p = if w.mode == RunMode::Edit {
+                    matches!(w.d().prop(r, "Playing"), Some(Variant::Bool(true)))
+                } else {
+                    w.input.sound_playing.contains(&r)
+                };
+                (p, w.input.sound_paused.contains(&r))
             };
             let cmd = match (on, playing, paused) {
                 (true, true, _) | (false, false, _) => return Ok(true),
@@ -4719,9 +5480,9 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             };
             let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
             let mut w = world(lua)?;
-            let old = sound_time(&w, r);
+            let old = if w.mode == RunMode::Edit { sound_set_time(&w, r) } else { sound_time(&w, r) };
             w.input.sound_pos.insert(r, t);
-            if w.input.sound_playing.contains(&r) || w.input.sound_paused.contains(&r) {
+            if w.mode != RunMode::Edit && (w.input.sound_playing.contains(&r) || w.input.sound_paused.contains(&r)) {
                 w.requests.sound_seeks.push((r, t));
             }
             if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
@@ -4796,14 +5557,45 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             break_joints(lua, this)?;
             none()
         }
+        "Shutdown" => {
+            super::security::check_method_identity(lua, "DataModel", name)?;
+            world(lua)?.shutdown_requested = true;
+            none()
+        }
         "MakeJoints"
         | "SetNetworkOwner"
         | "SetNetworkOwnershipAuto"
         | "ApplyAngularImpulse"
         | "ApplyDescription"
         | "ClearCharacterAppearance"
-        | "BindToClose"
-        | "SetCore" => none(),
+        | "BindToClose" => none(),
+        "SetCore" => {
+            if let Value::String(k) = arg(args, 1) {
+                if let Ok(ks) = k.to_str() {
+                    let ks = ks.to_string();
+                    if ks == "TopbarEnabled" {
+                        let on = matches!(arg(args, 2), Value::Boolean(true));
+                        world(lua)?.topbar_off = !on;
+                    }
+                    if let Ok(f) = lua.globals().get::<Function>("__rs_core_set_core") {
+                        if f.call::<bool>((ks.clone(), arg(args, 2)))? {
+                            return none();
+                        }
+                    }
+                    if ks == "TopbarEnabled" {
+                        let on = matches!(arg(args, 2), Value::Boolean(true));
+                        if let Ok(f) = lua.globals().get::<Function>("__rs_pc_set_core") {
+                            let _ = f.call::<()>((ks, Value::Boolean(on)));
+                        }
+                    } else if ks.starts_with("Chat") {
+                        if let Ok(f) = lua.globals().get::<Function>("__rs_pc_set_core") {
+                            let _ = f.call::<()>((ks, arg(args, 2)));
+                        }
+                    }
+                }
+            }
+            none()
+        }
         "GetModelCFrame" => {
             let xf = model_pivot(&*world(lua)?, this);
             one(cframe_value(lua, xf)?)
@@ -4868,6 +5660,88 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             };
             match cast(lua, origin, dir, &filter)? {
                 Some(hit) => one(raycast_result(lua, hit)?),
+                None => one(Value::Nil),
+            }
+        }
+        "CacheCurrentTerrain" => {
+            let req_id = match arg(args, 1) {
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => String::new(),
+            };
+            let _center = vec3_arg(args, 2, "CacheCurrentTerrain").ok();
+            let _radius = num(&arg(args, 3));
+            if lua.app_data_ref::<QueryCache>().is_none() {
+                lua.set_app_data(QueryCache::default());
+            }
+            let id = {
+                let mut qc = lua.app_data_mut::<QueryCache>().expect("QueryCache");
+                if req_id.is_empty() {
+                    qc.cached_terrain_seq += 1;
+                    format!("terrain-cache-{}", qc.cached_terrain_seq)
+                } else {
+                    req_id
+                }
+            };
+            // Snapshot current Terrain voxels (including any unflushed edit this frame).
+            let snap = {
+                let w = world(lua)?;
+                if let Some((r, ref v)) = w.terrain_edit {
+                    let bounds = v.world_bounds().map(|(lo, hi)| (Vec3::from(lo), Vec3::from(hi)));
+                    rustudio_core::terrain::Voxels::decode(&v.encode())
+                        .ok()
+                        .map(|copy| (r, std::sync::Arc::new(copy), bounds))
+                } else {
+                    drop(w);
+                    terrain_state(lua)?.map(|(r, v, b)| (r, v, Some(b)))
+                }
+            };
+            if let Some((terrain, voxels, bounds)) = snap {
+                if let Some(mut qc) = lua.app_data_mut::<QueryCache>() {
+                    qc.cached_terrain.insert(
+                        id.clone(),
+                        CachedTerrain {
+                            terrain,
+                            voxels,
+                            bounds,
+                            tris: HashMap::new(),
+                            water: HashMap::new(),
+                            index: HashMap::new(),
+                        },
+                    );
+                }
+            }
+            one(Value::String(lua.create_string(&id)?))
+        }
+        "ClearCachedTerrain" => {
+            let id = match arg(args, 1) {
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => String::new(),
+            };
+            let removed = lua
+                .app_data_mut::<QueryCache>()
+                .and_then(|mut qc| qc.cached_terrain.remove(&id))
+                .is_some();
+            one(Value::Boolean(removed))
+        }
+        "RaycastCachedTerrain" => {
+            let id = match arg(args, 1) {
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => String::new(),
+            };
+            let origin = vec3_arg(args, 2, "RaycastCachedTerrain")?;
+            let dir = vec3_arg(args, 3, "RaycastCachedTerrain")?;
+            let ignore_water = match arg(args, 4) {
+                Value::Boolean(b) => b,
+                _ => false,
+            };
+            let hit = raycast_cached_terrain(lua, &id, origin, dir, ignore_water)?;
+            match hit {
+                Some((r, pos, norm, dist, mat)) => {
+                    if let Some(mut qc) = lua.app_data_mut::<QueryCache>() {
+                        qc.terrain_material = Some(mat);
+                    }
+                    one(raycast_result(lua, (r, pos, norm, dist))?)
+                }
                 None => one(Value::Nil),
             }
         }
@@ -5163,11 +6037,12 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
             let xf = part_xform(lua, p)?;
             let size = part_size(lua, p)?;
-            let probe_kind = {
+            let (probe_kind, is_workspace) = {
                 let w = world(lua)?;
                 let d = w.d();
-                let class = d.class_of(p).map(|c| c.to_string()).unwrap_or_default();
-                rustudio_physics::query_shapes::kind_of(d, p, &class)
+                let class = d.class_of(p).filter(|c| doc::is_a(c, "BasePart"))
+                    .ok_or_else(|| rt_err("GetPartsInPart: BasePart expected"))?;
+                (rustudio_physics::query_shapes::kind_of(d, p, &class), d.workspace() == Some(this))
             };
             let (lo, hi) = part_aabb(&QPart {
                 r: p,
@@ -5180,46 +6055,58 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 cvx: 0,
                 initial: Vec3::ONE,
             });
-            let mut filter = match arg(args, 2) {
+            let params = arg(args, 2);
+            let filter = match params {
                 Value::Nil => Filter::none(),
-                v => params_filter(&v),
+                _ => params_filter_groups(lua, &params),
             };
-            if !filter.include {
-                filter.list.insert(p);
-            }
-            let max = num(&ud_value(&arg(args, 2), "MaxParts"))
+            let max = num(&ud_value(&params, "MaxParts"))
                 .filter(|n| *n > 0.0)
                 .map(|n| n as usize)
                 .unwrap_or(usize::MAX);
-            // Bounds first, then the real shapes (GetPartsInPart is exact in
-            // Roblox: a turned brush's or a terrain chunk's box covers far more
-            // than the part).
-            let near = overlap(lua, lo, hi, None, &filter, usize::MAX)?;
-            let mut parts = Vec::new();
-            for r in near {
-                if parts.len() >= max {
-                    break;
-                }
-                let q = lua.app_data_ref::<QueryCache>().and_then(|c| {
+            let near = if is_workspace {
+                let refs = overlap(lua, lo, hi, None, &filter, usize::MAX)?;
+                let cache = lua.app_data_ref::<QueryCache>();
+                refs.into_iter().filter_map(|r| {
+                    let c = cache.as_ref()?;
                     c.index.get(&r).and_then(|i| c.parts.get(*i)).copied()
-                });
-                let Some(q) = q else { continue };
-                let exact = if q.mesh {
-                    let id = match world(lua)?.d().prop(r, "MeshId") {
-                        Some(Variant::ContentId(c)) => c.as_str().to_string(),
-                        _ => rustudio_core::mesh::union_mesh(world(lua)?.d(), r).map(|m| m.id).unwrap_or_default(),
-                    };
-                    match (!id.is_empty()).then(|| rustudio_core::mesh_bvh::for_mesh(&id)).flatten() {
-                        Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, size, &q.xf, q.size, &bvh),
-                        None => rustudio_physics::query_shapes::obb_obb(&xf, size, &q.xf, q.size),
+                }).collect::<Vec<_>>()
+            } else {
+                let w = world(lua)?;
+                let d = w.d();
+                d.dom.descendants_of(this).filter_map(|i| {
+                    let r = i.referent();
+                    if r == p || !doc::is_a(&i.class, "BasePart") || !filter.passes(d, r) {
+                        return None;
                     }
-                } else {
+                    let q = world_root_part(d, r, &i.class)?;
+                    let (qlo, qhi) = part_aabb(&q);
+                    ((q.query || q.collide) && qlo.cmple(hi).all() && qhi.cmpge(lo).all()).then_some(q)
+                }).collect()
+            };
+            let parts = {
+                let w = world(lua)?;
+                let d = w.d();
+                near.into_iter().filter(|q| {
+                    if q.r == p || query_root(d, q.r) != Some(this)
+                        || (filter.respect_collide && !q.collide)
+                    {
+                        return false;
+                    }
+                    if q.mesh {
+                        let id = if d.class_of(q.r).is_some_and(|c| doc::is_a(&c, "PartOperation")) {
+                            rustudio_core::mesh::union_mesh(d, q.r).map(|m| m.id)
+                        } else {
+                            rustudio_render::scene::content_string(d.prop(q.r, "MeshId"))
+                        };
+                        return match id.and_then(|id| rustudio_core::mesh_bvh::for_mesh(&id)) {
+                            Some(bvh) => rustudio_physics::query_shapes::obb_mesh_bvh(&xf, size, &q.xf, q.size, &bvh),
+                            None => rustudio_physics::query_shapes::obb_obb(&xf, size, &q.xf, q.size),
+                        };
+                    }
                     rustudio_physics::query_shapes::part_part(&xf, size, probe_kind, &q.xf, q.size, q.shape)
-                };
-                if exact {
-                    parts.push(r);
-                }
-            }
+                }).take(max).map(|q| q.r).collect::<Vec<_>>()
+            };
             one(Value::Table(list(lua, parts)?))
         }
         "GetServerTimeNow" => one(Value::Number(
@@ -5289,6 +6176,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 return one(Value::Boolean(!w.core_gui_off.contains(&ty_name)));
             }
             let on = matches!(arg(args, 2), Value::Boolean(true));
+            let chat_was_off = w.core_gui_off.contains("Chat");
             let set = |w: &mut World, t: String| {
                 if on {
                     w.core_gui_off.remove(&t);
@@ -5296,6 +6184,7 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     w.core_gui_off.insert(t);
                 }
             };
+            let ty_enum = enum_value(lua, ty.clone())?;
             if ty.value == mech::CORE_GUI_ALL {
                 for v in 0..mech::CORE_GUI_TYPE_COUNT {
                     if let Some(t) = label(v) {
@@ -5316,6 +6205,10 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                     }
                 }
             }
+            if w.topbar_inset.is_none() && chat_was_off != w.core_gui_off.contains("Chat") {
+                w.abs_all = true;
+            }
+            w.fire(this, "CoreGuiChangedSignal", vec![ty_enum, Value::Boolean(on)]);
             none()
         }
         "GetAccessories" => {
@@ -5419,9 +6312,11 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         "PlayLocalSound" => {
             let s =
                 opt_inst(&arg(args, 1)).ok_or_else(|| rt_err("PlayLocalSound: Sound expected"))?;
-            if world(lua)?.side == Side::Server {
+            let w = world(lua)?;
+            if w.side == Side::Server && w.mode != RunMode::Edit {
                 return Err(rt_err("SoundService:PlayLocalSound only works on a client."));
             }
+            drop(w);
             sound(lua, s, SoundCmd::PlayLocal)?;
             none()
         }
@@ -5527,7 +6422,21 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             one(Value::Table(list(lua, found)?))
         }
         "GetPlayerByUserId" => {
-            let id = num(&arg(args, 1)).unwrap_or(-1.0) as i64;
+            let id = match arg(args, 1) {
+                Value::Integer(i) => i as i64,
+                Value::Number(n) => n as i64,
+                Value::String(s) => s
+                    .to_str()
+                    .ok()
+                    .and_then(|t| {
+                        let t = t.trim();
+                        t.parse::<i64>()
+                            .ok()
+                            .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+                    })
+                    .unwrap_or(-1),
+                _ => -1,
+            };
             let found = {
                 let w = world(lua)?;
                 let d = w.d();
@@ -5591,12 +6500,6 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 .collect();
             one(Value::String(lua.create_string(enc)?))
         }
-        "GetMinutesAfterMidnight" => one(Value::Number(clock_hours(lua, this)? as f64 * 60.0)),
-        "SetMinutesAfterMidnight" => {
-            let m = num(&arg(args, 1)).ok_or_else(|| rt_err("SetMinutesAfterMidnight: number expected"))?;
-            set_clock(lua, this, m as f32 / 60.0)?;
-            none()
-        }
         "GetMouseLocation" => {
             let xy = world(lua)?.input.mouse_xy;
             one(Value::UserData(
@@ -5605,7 +6508,30 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
         }
         "IsMouseButtonPressed" => one(Value::Boolean(false)),
         "GetKeysPressed" => one(Value::Table(lua.create_table()?)),
-        "GetCore" => one(Value::Nil),
+        "GetCore" => {
+            if let Value::String(k) = arg(args, 1) {
+                if let Ok(ks) = k.to_str() {
+                    let ks = ks.to_string();
+                    if let Ok(f) = lua.globals().get::<Function>("__rs_core_get_core") {
+                        let (found, v): (bool, Value) = f.call(ks.clone())?;
+                        if found {
+                            return one(v);
+                        }
+                    }
+                    if ks == "TopbarEnabled" {
+                        return one(Value::Boolean(!world(lua)?.topbar_off));
+                    }
+                    if ks.starts_with("Chat") {
+                        if let Ok(f) = lua.globals().get::<Function>("__rs_pc_get_core") {
+                            if let Ok(v) = f.call::<Value>(ks) {
+                                return one(v);
+                            }
+                        }
+                    }
+                }
+            }
+            one(Value::Nil)
+        }
         "RemoveDefaultLoadingScreen" => none(),
         "RegisterKeyframeSequence" | "RegisterActiveKeyframeSequence" => {
             // A temporary content id for the sequence (Studio hands out a hash id).
@@ -5736,6 +6662,43 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                         for (kind, id, _) in &look.animations {
                             i.properties.insert(ustr(kind), Variant::Int64(*id as i64));
                         }
+                        // Clothing, face, head, and body part asset ids.
+                        for (k, id) in [
+                            ("Shirt", look.shirt_id),
+                            ("Pants", look.pants_id),
+                            ("GraphicTShirt", look.tshirt_id),
+                            ("Face", look.face_id),
+                            ("Head", look.head_id),
+                        ] {
+                            if let Some(id) = id {
+                                i.properties.insert(ustr(k), Variant::Int64(id as i64));
+                            }
+                        }
+                        for (kind, id) in &look.body_part_ids {
+                            i.properties.insert(ustr(kind), Variant::Int64(*id as i64));
+                        }
+                        // Rigid accessory comma-separated id strings (HatAccessory, BackAccessory, ...).
+                        let mut acc_by_prop: std::collections::HashMap<&'static str, Vec<String>> =
+                            std::collections::HashMap::new();
+                        for (kind, id) in &look.accessory_ids {
+                            let prop = match kind.as_str() {
+                                "Hat" => Some("HatAccessory"),
+                                "HairAccessory" => Some("HairAccessory"),
+                                "FaceAccessory" => Some("FaceAccessory"),
+                                "NeckAccessory" => Some("NeckAccessory"),
+                                "ShoulderAccessory" => Some("ShouldersAccessory"),
+                                "FrontAccessory" => Some("FrontAccessory"),
+                                "BackAccessory" => Some("BackAccessory"),
+                                "WaistAccessory" => Some("WaistAccessory"),
+                                _ => None,
+                            };
+                            if let Some(p) = prop {
+                                acc_by_prop.entry(p).or_default().push(id.to_string());
+                            }
+                        }
+                        for (prop, ids) in acc_by_prop {
+                            i.properties.insert(ustr(prop), Variant::String(ids.join(",")));
+                        }
                     }
                     w.avatar_descs.insert(r);
                 }
@@ -5806,12 +6769,28 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
             } else {
                 (Default::default(), Default::default())
             };
-            // Roblox's rig has its Animator under the Humanoid already
-            // (Place D's second admin script preview: humanoid:WaitForChild("Animator")
-            // warned of an infinite yield).
-            let humanoid = InstanceBuilder::new("Humanoid")
+            // Roblox's rig has its Animator (and for R15, its 6 scale
+            // NumberValues: BodyDepthScale, BodyHeightScale, BodyWidthScale,
+            // BodyProportionScale, BodyTypeScale, HeadScale) under Humanoid.
+            let mut humanoid = InstanceBuilder::new("Humanoid")
                 .with_name("Humanoid")
                 .with_child(InstanceBuilder::new("Animator").with_name("Animator"));
+            if r15 {
+                for (sname, sval) in [
+                    ("BodyDepthScale", scales.depth as f64),
+                    ("BodyHeightScale", scales.height as f64),
+                    ("BodyWidthScale", scales.width as f64),
+                    ("BodyProportionScale", scales.proportion as f64),
+                    ("BodyTypeScale", scales.body_type as f64),
+                    ("HeadScale", scales.head as f64),
+                ] {
+                    humanoid = humanoid.with_child(
+                        InstanceBuilder::new("NumberValue")
+                            .with_name(sname)
+                            .with_property("Value", Variant::Float64(sval)),
+                    );
+                }
+            }
             let r = crate::rig::insert_character(
                 &mut world(lua)?.dm().dom,
                 Ref::none(),
@@ -5871,9 +6850,18 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue, domains: u16)
                 }
                 dressed
             };
-            // Any other description: its accessories by asset id.
-            if let (false, Some(d)) = (account_look, desc) {
-                dress_from_description(lua, r, d)?;
+            // Any other description: its accessories and clothing by asset id.
+            // Even for an account description, apply any clothing/face fields that
+            // the script changed after GetHumanoidDescriptionFromUserId.
+            if let Some(d) = desc {
+                if account_look {
+                    let look = world(lua)?.avatar.clone();
+                    if let Some(ref look) = look {
+                        dress_clothing_from_description(lua, r, d, Some(look))?;
+                    }
+                } else {
+                    dress_from_description(lua, r, d)?;
+                }
             }
             one(inst_value(lua, r)?)
         }
@@ -6138,6 +7126,29 @@ mod tests {
     }
 
     #[test]
+    fn same_script_layout_reads_match_studio() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Edit);
+        w.side = crate::runtime::Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+
+        let fixture = include_str!("../../../checks/gui-midscript/probe.luau")
+            .replace("task.wait(0.12)", "");
+        let script = format!(
+            "local out = {{}}\nlocal function print(s) table.insert(out, s) end\n{fixture}\nreturn table.concat(out, '\\n')"
+        );
+        let actual: String = rt.lua.load(&script).eval().unwrap();
+        let snapshots = |s: &str| -> Vec<String> {
+            s.lines()
+                .filter(|line| !line.split('|').nth(1).unwrap_or_default().ends_with("frame"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(snapshots(&actual), snapshots(include_str!("../../../checks/gui-midscript/studio-edit.txt")));
+    }
+
+    #[test]
     fn layout_signals_follow_live_connections_and_waiters() {
         let rt = Runtime::new().unwrap();
         let mut w = World::new(Document::new_place(), RunMode::Play);
@@ -6193,6 +7204,70 @@ mod tests {
         "#).exec().unwrap();
         assert!(world(lua).unwrap().gui_listening.is_empty());
         assert!(world(lua).unwrap().layout_listening.is_empty());
+    }
+
+    #[test]
+    fn scrolling_frame_fires_absolute_canvas_and_window_size() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = crate::runtime::Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let lua = &rt.lua;
+        lua.load(r#"
+            screen = Instance.new("ScreenGui", workspace)
+            sf = Instance.new("ScrollingFrame", screen)
+            sf.Size = UDim2.new(0, 243, 0, 0)
+            sf.CanvasSize = UDim2.new(0, 0, 0, 0)
+            sf.VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar
+            sf.ScrollBarThickness = 8
+            canvas_fires, win_fires = {}, {}
+            sf:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+                table.insert(canvas_fires, sf.AbsoluteCanvasSize)
+            end)
+            sf:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(function()
+                table.insert(win_fires, sf.AbsoluteWindowSize)
+            end)
+        "#).exec().unwrap();
+        fire_layout_changes(lua).unwrap();
+        rt.dispatch();
+        lua.load("sf.CanvasSize = UDim2.new(0, 0, 0, 302)").exec().unwrap();
+        fire_layout_changes(lua).unwrap();
+        rt.dispatch();
+        lua.load(r#"
+            assert(#canvas_fires == 2, "expected 2 AbsoluteCanvasSize fires, got " .. #canvas_fires)
+            assert(canvas_fires[2].X == 243 and canvas_fires[2].Y == 302, tostring(canvas_fires[2]))
+            assert(#win_fires == 2, "expected 2 AbsoluteWindowSize fires, got " .. #win_fires)
+            -- ScrollBarThickness 8 + Studio's 1 px separator = 9 px gutter (243 - 9 = 234).
+            assert(win_fires[2].X == 234 and win_fires[2].Y == 0, tostring(win_fires[2]))
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn reading_absolute_size_before_first_draw_keeps_initial_change_signal() {
+        let rt = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Edit);
+        w.side = crate::runtime::Side::Client;
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        let lua = &rt.lua;
+        lua.load(r#"
+            screen = Instance.new("ScreenGui", workspace)
+            sf = Instance.new("ScrollingFrame", screen)
+            sf.Size = UDim2.new(0, 245, 0, 497)
+            abs_fires = 0
+            sf:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                abs_fires += 1
+            end)
+            -- Reading AbsoluteWindowSize internally reads AbsoluteSize before first draw;
+            -- the first layout pass must still deliver AbsoluteSize Changed.
+            local _ = sf.AbsoluteWindowSize
+        "#).exec().unwrap();
+        fire_layout_changes(lua).unwrap();
+        rt.dispatch();
+        lua.load(r#"
+            assert(abs_fires == 1, "expected 1 AbsoluteSize fire, got " .. abs_fires)
+        "#).exec().unwrap();
     }
 
     /// Studio's ProximityPrompt sizes its BillboardGui from an AutomaticSize
@@ -6557,6 +7632,35 @@ print("away", f(workspace:Raycast(Vector3.new(110, 0, 0), Vector3.new(0, 0, -20)
         assert!(out.iter().any(|l| l.starts_with("cached Workspace.Ghost.P")), "{text}");
         assert!(out.iter().any(|l| *l == "ghost nil nil 0"), "{text}");
         assert!(out.iter().any(|l| *l == "away nil 0"), "{text}");
+    }
+
+    #[test]
+    fn parts_in_part_uses_its_world_model_and_handles_unions() {
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(Document::new_place(), RunMode::Play));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local model = Instance.new("WorldModel", game:GetService("ServerStorage"))
+            local other = Instance.new("WorldModel", workspace)
+            local function part(class, parent)
+                local p = Instance.new(class, parent)
+                p.Position = Vector3.new(350, 1000, 0)
+                return p
+            end
+            local probe = part("Part", model)
+            local union = part("UnionOperation", model)
+            part("Part", other)
+            local outside = part("Part", workspace)
+            local hits = model:GetPartsInPart(probe)
+            assert(#hits == 1 and hits[1] == union)
+            assert(#workspace:GetPartsInPart(outside) == 0)
+            assert(#model:GetPartsInPart(outside) == 2)
+            local params = OverlapParams.new()
+            params.FilterType = Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances = {model}
+            hits = model:GetPartsInPart(probe, params)
+            assert(#hits == 1 and hits[1] == union)
+        "#).exec().unwrap();
     }
 
     /// Laser Tag's blaster parity (checks/laser-tag-parity/raycast): a
@@ -6948,6 +8052,40 @@ end
         for (_, t) in w.output {
             println!("{t}");
         }
+    }
+
+    #[test]
+    fn break_joints_uses_graph_and_big_aabb_culls_rays() {
+        let mut d = Document::new_place();
+        let sss = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let src = r#"
+            local ws = workspace
+            -- Part inside a Model, plus an external Weld parented to Workspace touching it.
+            local m = Instance.new("Model"); m.Name = "M"; m.Parent = ws
+            local a = Instance.new("Part"); a.Name = "A"; a.Anchored = true; a.CFrame = CFrame.new(0, 5, 0); a.Parent = m
+            local b = Instance.new("Part"); b.Name = "B"; b.Anchored = true; b.CFrame = CFrame.new(0, 8, 0); b.Parent = ws
+            local w = Instance.new("Weld"); w.Name = "ExtWeld"; w.Part0 = b; w.Part1 = a; w.Parent = b
+            local big = Instance.new("Part"); big.Name = "Huge"; big.Anchored = true; big.Size = Vector3.new(300, 10, 300); big.CFrame = CFrame.new(500, 0, 500); big.Parent = ws
+            m:BreakJoints()
+            assert(b:FindFirstChild("ExtWeld") == nil, "BreakJoints must remove external weld touching model part")
+            -- Ray hitting the huge part (in QueryGrid.big) must hit; ray far away must miss.
+            local h1 = ws:FindPartOnRayWithIgnoreList(Ray.new(Vector3.new(500, 20, 500), Vector3.new(0, -40, 0)), {})
+            assert(h1 == big, "ray should hit huge part: " .. tostring(h1))
+            local h2 = ws:FindPartOnRayWithIgnoreList(Ray.new(Vector3.new(-500, 20, -500), Vector3.new(0, -40, 0)), {})
+            assert(h2 == nil, "distant ray should miss huge part: " .. tostring(h2))
+            print("OK")
+        "#;
+        let s = d.dom.insert(sss, InstanceBuilder::new("Script").with_name("T").with_property("Source", src.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.run_script(s);
+        for _ in 0..5 {
+            rt.step(1.0 / 60.0);
+        }
+        let w = rt.leave();
+        assert!(w.output.iter().any(|(_, t)| t.contains("OK")), "output: {:?}", w.output);
+        assert_eq!(w.output.len(), 1, "unexpected output/errors: {:?}", w.output);
     }
 }
 

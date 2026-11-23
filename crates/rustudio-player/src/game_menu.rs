@@ -33,6 +33,30 @@ const TABS: [(MenuPage, &str, &str); 5] = [
     (MenuPage::Help, "Help", "help-circle"),
 ];
 
+/// The client's UserGameSettings the Settings page shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MenuSettings {
+    pub(crate) sensitivity: f64,
+    pub(crate) volume: f64,
+    pub(crate) inverted: bool,
+}
+
+/// The client's UserGameSettings (library.luau's table; MouseSensitivity,
+/// MasterVolume, CameraYInverted), from its Lua state between frames.
+pub(crate) fn user_game_settings(lua: &mlua::Lua) -> Option<MenuSettings> {
+    let t: mlua::Table = lua.named_registry_value("rs_user_game_settings").ok()?;
+    let num = |name: &str| match t.raw_get::<mlua::Value>(name).ok()? {
+        mlua::Value::Number(n) => Some(n),
+        mlua::Value::Integer(n) => Some(n as f64),
+        _ => None,
+    };
+    Some(MenuSettings {
+        sensitivity: num("MouseSensitivity")?,
+        volume: num("MasterVolume").unwrap_or(1.0),
+        inverted: matches!(t.raw_get::<mlua::Value>("CameraYInverted"), Ok(mlua::Value::Boolean(true))),
+    })
+}
+
 /// The menu's own state for a play session.
 #[derive(Default)]
 pub struct MenuState {
@@ -41,7 +65,7 @@ pub struct MenuState {
     /// SettingsHub's MenuStack).
     back: Option<MenuPage>,
     /// When it last opened or closed (egui time), for the shield tween.
-    changed_at: Option<f64>,
+    pub(crate) changed_at: Option<f64>,
     /// Scroll of the page view, per tab.
     scroll: [f32; 5],
     /// Where each button was drawn last frame (self-test clicks them).
@@ -50,6 +74,13 @@ pub struct MenuState {
     pub lua: Vec<String>,
     /// The Volume slider's level before the first change (MasterVolume × 10).
     volume: Option<u32>,
+    /// What the Settings page last asked for, shown until this egui time:
+    /// the client applies it on its next tick and, on the gameplay worker,
+    /// publishes it a frame or two later. Without this the slider and the
+    /// Camera Inverted selector snapped back for those frames (and on the
+    /// worker, where the main thread has no client, never caught up: the
+    /// selector showed Off whatever was set, so each tap set On again).
+    shown: Option<(MenuSettings, f64)>,
     /// The view has let go of the cursor for this opening of the menu
     /// (viewport.rs: free_cursor_for_menu); false again once it closes.
     pub cursor_freed: bool,
@@ -158,6 +189,8 @@ struct Asked {
     sensitivity: Option<u32>,
     volume: Option<u32>,
     inverted: Option<bool>,
+    /// The settings the page showed (what a change starts from).
+    settings: Option<MenuSettings>,
     fullscreen: Option<bool>,
 }
 
@@ -329,7 +362,7 @@ impl Game {
     }
 
     /// The menu over the game view, sliding in and out.
-    pub(super) fn game_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    pub(crate) fn game_menu(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.inspect_menu(ui, rect);
         let now = self.menu_clock();
         let Some((open, changed)) = self
@@ -452,6 +485,20 @@ impl Game {
                     saved.inverted = Some(on);
                 }
             });
+        }
+        if asked.sensitivity.is_some() || asked.volume.is_some() || asked.inverted.is_some() {
+            if let Some(mut shown) = asked.settings {
+                if let Some(x) = asked.sensitivity {
+                    shown.sensitivity = step_to_sensitivity(x);
+                }
+                if let Some(v) = asked.volume {
+                    shown.volume = v as f64 / 10.0;
+                }
+                if let Some(on) = asked.inverted {
+                    shown.inverted = on;
+                }
+                g.menu.shown = Some((shown, ctx.input(|i| i.time) + 1.0));
+            }
         }
         if let Some(x) = asked.sensitivity {
             g.menu.lua.push(format!(
@@ -856,24 +903,25 @@ impl Game {
         asked: &mut Asked,
     ) -> f32 {
         let ctx = ui.ctx().clone();
-        let ugs = |name: &str| -> Option<mlua::Value> {
-            let c = self.play.as_ref()?.client.as_ref()?;
-            c.runtime
-                .lua
-                .globals()
-                .get::<mlua::Table>("__rs_user_game_settings")
-                .ok()?
-                .get::<mlua::Value>(name)
-                .ok()
+        // The client's values: from its Lua state when it runs on this
+        // thread, else as the gameplay worker published them with the
+        // frame (PlayView.settings); a change just asked for shows at once.
+        let now = ctx.input(|i| i.time);
+        let live = self
+            .play_side_lua(Side::Client)
+            .and_then(user_game_settings)
+            .or_else(|| self.play.as_ref()?.presentation.as_ref()?.settings)
+            .unwrap_or(MenuSettings {
+                sensitivity: 0.52,
+                volume: rustudio_engine::audio::master_volume() as f64,
+                inverted: false,
+            });
+        let settings = match self.play.as_ref().and_then(|s| s.game.menu.shown) {
+            Some((asked, until)) if now < until => asked,
+            _ => live,
         };
-        let num = |v: Option<mlua::Value>| match v {
-            Some(mlua::Value::Number(n)) => Some(n),
-            Some(mlua::Value::Integer(n)) => Some(n as f64),
-            _ => None,
-        };
-        let sens = num(ugs("MouseSensitivity")).unwrap_or(0.52);
-        let vol = num(ugs("MasterVolume")).unwrap_or(rustudio_engine::audio::master_volume() as f64);
-        let inverted = matches!(ugs("CameraYInverted"), Some(mlua::Value::Boolean(true)));
+        asked.settings = Some(settings);
+        let MenuSettings { sensitivity: sens, volume: vol, inverted } = settings;
         let full = self.fullscreen;
         let label_f = font(&ctx, 16.0 * NOMINAL, Weight::Medium);
         let w = view.width();

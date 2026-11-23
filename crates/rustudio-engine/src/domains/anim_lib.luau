@@ -551,8 +551,6 @@ local ANIM = {}
 function ANIM.GetTrackByAnimationId(self, id)
     return __rs_track_by_id(self, tostring(id))
 end
-function ANIM.StepAnimations() return nil end
-function ANIM.ApplyJointVelocities() return nil end
 function ANIM.RegisterEvaluationParallelCallback() error("RegisterEvaluationParallelCallback is not enabled!", 0) end
 -- AnimationController:GetPlayingAnimationTracks (deprecated): its Animator's.
 local AC = {}

@@ -15,6 +15,13 @@ pub const DEVELOP_URL: &str = "https://develop.roblox.com/v1/universes";
 /// Public asset delivery (no authentication; see docs/MATERIALS.md): replies
 /// with JSON `locations`, each a CDN URL whose body is often gzip.
 pub const PUBLIC_ASSET_DELIVERY_URL: &str = "https://assetdelivery.roblox.com/v2/assetId";
+/// Asset delivery's redirecting endpoint: GET `{url}?id={assetId}` answers
+/// 302 to the CDN copy (or a JSON refusal: 401 private, 404 unknown).
+/// Anonymous requests to it are allowed 3000 a minute per address
+/// (`x-ratelimit-limit` in its replies, measured 2026-11) against 20 for
+/// the v2 descriptor: a place that preloads its ~2000 animations and sounds
+/// exhausts v2 in a second and then waits out 429s for an hour.
+pub const PUBLIC_ASSET_V1_URL: &str = "https://assetdelivery.roblox.com/v1/asset/";
 
 /// An asset delivery failure with retry information from the HTTP response.
 #[derive(Debug)]
@@ -24,6 +31,11 @@ pub enum AssetDownloadError {
         retry_after: Option<ureq::http::HeaderValue>,
         error: Error,
     },
+    /// Asset delivery answered, and said no: private to its owner
+    /// ("Authentication required to access Asset."), deleted, moderated.
+    /// Asking again this session gets the same answer (and costs a
+    /// request); a login session may change it.
+    Refused(Error),
     Other(Error),
 }
 
@@ -49,7 +61,7 @@ impl AssetDownloadError {
 impl std::fmt::Display for AssetDownloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transient { error, .. } | Self::Other(error) => error.fmt(f),
+            Self::Transient { error, .. } | Self::Refused(error) | Self::Other(error) => error.fmt(f),
         }
     }
 }
@@ -65,14 +77,17 @@ impl From<Error> for AssetDownloadError {
 impl From<AssetDownloadError> for Error {
     fn from(error: AssetDownloadError) -> Self {
         match error {
-            AssetDownloadError::Transient { error, .. } | AssetDownloadError::Other(error) => error,
+            AssetDownloadError::Transient { error, .. }
+            | AssetDownloadError::Refused(error)
+            | AssetDownloadError::Other(error) => error,
         }
     }
 }
 
-/// Downloads a public asset anonymously: GET the v2 descriptor, then its
-/// first location; gzip bodies are inflated. No cookie, key or token is
-/// sent, so only assets Roblox serves to anyone come back.
+/// Downloads a public asset anonymously: GET the v1 redirect (else the v2
+/// descriptor), then the CDN location it names; gzip bodies are inflated.
+/// No cookie, key or token is sent, so only assets Roblox serves to anyone
+/// come back.
 pub fn public_asset(asset_id: u64) -> Result<Vec<u8>> {
     public_asset_typed(asset_id).map_err(Error::from)
 }
@@ -80,6 +95,50 @@ pub fn public_asset(asset_id: u64) -> Result<Vec<u8>> {
 /// Like [`public_asset`], with HTTP retry information for download scheduling.
 pub fn public_asset_typed(asset_id: u64) -> std::result::Result<Vec<u8>, AssetDownloadError> {
     let a = agent();
+    let location = public_asset_location(&a, asset_id)?;
+    download_location(&a, asset_id, &location)
+}
+
+/// The CDN URL of a public asset: the v1 redirect, else (an answer that is
+/// neither a redirect nor a refusal) the v2 descriptor's first location.
+fn public_asset_location(a: &ureq::Agent, asset_id: u64) -> std::result::Result<String, AssetDownloadError> {
+    let url = format!("{PUBLIC_ASSET_V1_URL}?id={asset_id}");
+    let mut r = a
+        .get(&url)
+        .config()
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .build()
+        .call()
+        .map_err(Error::from)?;
+    if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
+        return Err(error);
+    }
+    if r.status().is_redirection() {
+        if let Some(location) = r.headers().get("location").and_then(|l| l.to_str().ok()) {
+            return Ok(location.to_string());
+        }
+    }
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    if let Some(why) = refusal(&text) {
+        return Err(AssetDownloadError::Refused(Error(format!(
+            "asset {asset_id}: public asset delivery: {why}"
+        ))));
+    }
+    public_asset_location_v2(a, asset_id)
+}
+
+/// The message of a JSON `errors` answer (`{"errors":[{"code":11,"message":"…"}]}`).
+fn refusal(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.pointer("/errors/0/message")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+}
+
+/// The v2 descriptor's first location (`locations[0].location`).
+fn public_asset_location_v2(a: &ureq::Agent, asset_id: u64) -> std::result::Result<String, AssetDownloadError> {
     let url = format!("{PUBLIC_ASSET_DELIVERY_URL}/{asset_id}");
     let mut r = a.get(&url).call().map_err(Error::from)?;
     if let Some(error) = AssetDownloadError::transient_response(asset_id, "public asset delivery", &r) {
@@ -98,17 +157,24 @@ pub fn public_asset_typed(asset_id: u64) -> std::result::Result<Vec<u8>, AssetDo
         .and_then(|l| l.get("location"))
         .and_then(|l| l.as_str());
     let Some(location) = location else {
-        let why = v
-            .pointer("/errors/0/message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("no download location");
+        let why = v.pointer("/errors/0/message").and_then(|m| m.as_str());
         // v2 answers 200 with the refusal in the body: naming that status
         // only reads as a contradiction.
         let http = if status == 200 { String::new() } else { format!(" (HTTP {status})") };
-        return Err(Error(format!(
-            "asset {asset_id}: public asset delivery: {why}{http}"
-        )).into());
+        let error = Error(format!(
+            "asset {asset_id}: public asset delivery: {}{http}",
+            why.unwrap_or("no download location")
+        ));
+        return Err(match why {
+            Some(_) => AssetDownloadError::Refused(error),
+            None => AssetDownloadError::Other(error),
+        });
     };
+    Ok(location.to_string())
+}
+
+/// An asset's bytes from its CDN location; gzip bodies are inflated.
+fn download_location(a: &ureq::Agent, asset_id: u64, location: &str) -> std::result::Result<Vec<u8>, AssetDownloadError> {
     let mut r = a.get(location)
         .header("Accept-Encoding", "gzip")
         .call()
@@ -144,6 +210,17 @@ mod asset_tests {
     use super::*;
 
     #[test]
+    fn asset_delivery_refusals_are_the_json_error_message() {
+        assert_eq!(
+            refusal(r#"{"errors":[{"code":11,"message":"Authentication required to access Asset."}]}"#).as_deref(),
+            Some("Authentication required to access Asset.")
+        );
+        assert_eq!(refusal(r#"{"errors":[{"code":0,"message":""}]}"#), None);
+        assert_eq!(refusal("<html>"), None);
+        assert_eq!(refusal(r#"{"locations":[]}"#), None);
+    }
+
+    #[test]
     fn asset_delivery_classifies_transient_http_responses() {
         for status in [401, 404, 429, 502, 503] {
             let response = ureq::http::Response::builder()
@@ -168,12 +245,25 @@ mod asset_tests {
     }
 }
 
+/// The anonymous agent, one for the process: an agent is its connection
+/// pool, and a fresh one per asset paid DNS, TCP and TLS twice per asset
+/// (descriptor, then CDN) — most of an asset's time on a long-latency
+/// mobile link. Clones share the pool.
 pub fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_resolve(Some(std::time::Duration::from_secs(15)))
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+            .timeout_per_read(Some(std::time::Duration::from_secs(60)))
+            .max_idle_connections_per_host(8)
+            .max_idle_connections(24)
+            .user_agent(concat!("rustudio/", env!("CARGO_PKG_VERSION")))
+            .build();
+        ureq::Agent::from(config)
+    });
+    AGENT.clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

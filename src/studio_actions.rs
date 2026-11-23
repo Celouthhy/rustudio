@@ -75,6 +75,14 @@ impl Editor {
         let open = |n: &str| Some(self.ui.panels_open.contains(n));
         match a {
             "new" | "open" | "open_roblox" | "open_folder" | "close_place" | "import_model" => (edit, None),
+            "import_3d" => {
+                if self.builtin_tools.plugins_enabled {
+                    let (en, ck) = self.builtin_button_state("AssetImporter", Some("Mesh Importer"), Some("Import"));
+                    (edit && en, ck)
+                } else {
+                    (false, None)
+                }
+            }
             "save" | "save_as" => (edit, None),
             "save_roblox" | "save_roblox_as" | "publish" | "publish_as" => {
                 (edit && self.game.doc.kind == rustudio_core::doc::DocKind::Place, None)
@@ -84,16 +92,41 @@ impl Editor {
             "experience_settings" | "account" | "add_account" => (true, None),
             "live_collaborators" | "invite_collaborators" => (true,None),
             "avatar_settings" => (true, open("Avatar Settings")),
-            "terrain_editor" => (true, open("Terrain Editor")),
-            "toolbox" => (true, open("Toolbox")),
+            "terrain_editor" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor) {
+                    self.promoted_button_state("TerrainEditor")
+                } else {
+                    (true, open("Terrain Editor"))
+                }
+            }
+            "toolbox" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                    self.promoted_button_state("Toolbox")
+                } else {
+                    (true, open("Toolbox"))
+                }
+            }
             "asset_manager" => (true, open("Asset Manager")),
             "microprofiler" => (true, open("MicroProfiler")),
-            a if a.starts_with("toolbox:") => (true, None),
-            "character" => (edit, Some(self.chars.open)),
-            a if a.starts_with("character:") => (edit, None),
+            a if a.starts_with("toolbox:") => (
+                self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox),
+                None,
+            ),
+            "character" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
+                    let (en, ck) = self.promoted_button_state("RigGenerator");
+                    (edit && en, ck)
+                } else {
+                    (edit, Some(self.chars.open))
+                }
+            }
+            a if a.starts_with("character:") => (
+                edit && self.builtin_tools.use_native(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder),
+                None,
+            ),
             "about" | "exit" | "studio_settings" | "logs_folder" => (true, None),
             "customize_shortcuts" => (true, Some(self.plugin_bar.shortcuts.open)),
-            a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") => (true, None),
+            a if a.starts_with("studio_settings:") || a.starts_with("studio_settings_fill:") || a.starts_with("ribbon_tab:") => (true, None),
             "undo" => (edit && self.game.doc.can_undo().is_some(), None),
             "redo" => (edit && self.game.doc.can_redo().is_some(), None),
             "cut" | "copy" | "duplicate" | "delete" => (edit && sel, None),
@@ -116,6 +149,135 @@ impl Editor {
             "unlock_all" | "select_all" => (edit, None),
             "zoom_in" | "zoom_out" => (true, None),
             "full_screen" => (true, Some(self.game.fullscreen)),
+            "view_selector" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector) {
+                    self.promoted_button_state("ViewSelector")
+                } else {
+                    (true, Some(self.ui.show_view_selector))
+                }
+            }
+            "wind_direction" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("WindControl", Some("windControl"), Some("WindControl"))
+                } else {
+                    (false, None)
+                }
+            }
+            "player_emulator" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("PlayerEmulator", Some("luaPlayerEmulatorToolbar"), Some("luaPlayerEmulatorButton"))
+                } else {
+                    (false, None)
+                }
+            }
+            "align" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("AlignmentTool", Some("Alignment"), Some("AlignTool"))
+                } else {
+                    (false, None)
+                }
+            }
+            "material_manager" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("MaterialManager", Some("Edit"), Some("MaterialManager"))
+                } else {
+                    (false, None)
+                }
+            }
+            "clip_editor" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("AnimationClipEditor", Some("Animations"), Some("Animation Editor"))
+                } else {
+                    (false, None)
+                }
+            }
+            "avatar_setup" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"))
+                } else {
+                    (false, None)
+                }
+            }
+            "style_editor" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton"))
+                } else {
+                    (false, None)
+                }
+            }
+            "localization_tools" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("LocalizationTools", Some("Localization"), Some("Tools"))
+                } else {
+                    (false, None)
+                }
+            }
+            "drafts" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("DraftsWidget", Some("draftsToolbar"), Some("draftsButton"))
+                } else {
+                    (false, None)
+                }
+            }
+            "tag_editor" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"))
+                } else {
+                    (false, None)
+                }
+            }
+            "audio_discovery" => {
+                if self.builtin_tools.plugins_enabled {
+                    self.builtin_button_state("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"))
+                } else {
+                    (false, None)
+                }
+            }
+            "pivot" => {
+                if self.builtin_tools.plugins_enabled {
+                    let (en, ck) = self.builtin_button_state("PivotEditor", Some("Pivot"), Some("EditPivot"));
+                    (edit && en, ck)
+                } else {
+                    (false, None)
+                }
+            }
+            "pivot_reset" => {
+                if self.builtin_tools.plugins_enabled {
+                    let (en, ck) = self.builtin_button_state("PivotEditor", Some("Pivot"), Some("ClearPivot"));
+                    (edit && en, ck)
+                } else {
+                    (false, None)
+                }
+            }
+            "constraint" => {
+                if self.builtin_tools.plugins_enabled {
+                    let any = crate::plugin_host::builtin_lazy::CONSTRAINT_MENU_ITEMS
+                        .iter()
+                        .flatten()
+                        .any(|(tb, _)| self.builtin_button_state("ConstraintTool", Some(tb), Some("Place")).0);
+                    let active = crate::plugin_host::builtin_lazy::CONSTRAINT_MENU_ITEMS
+                        .iter()
+                        .flatten()
+                        .any(|(tb, _)| self.builtin_button_state("ConstraintTool", Some(tb), Some("Place")).1 == Some(true));
+                    (edit && any, Some(active))
+                } else {
+                    (false, None)
+                }
+            }
+            "constraint_menu" => (
+                edit && self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("ConstraintTool", None, None).is_some(),
+                None,
+            ),
+            a if a.starts_with("constraint:") => {
+                if self.builtin_tools.plugins_enabled {
+                    let tb = &a["constraint:".len()..];
+                    let (en, ck) = self.builtin_button_state("ConstraintTool", Some(tb), Some("Place"));
+                    (edit && en, ck)
+                } else {
+                    (false, None)
+                }
+            }
             "show_grid" => (true, Some(self.show_grid)),
             "align_dragged" => (true, Some(self.align_dragged)),
             "dragger_menu" | "dragger_physical" | "dragger_geometric" => (true, None),
@@ -125,6 +287,15 @@ impl Editor {
             "show_ui" => (true, Some(self.ui.show_gui)),
             "screenshot" => (true, None),
             "mute" => (true, Some(rustudio_engine::audio::muted())),
+            "audio_preview" => {
+                let target = (edit && self.game.doc.selection.len() == 1)
+                    .then(|| self.game.doc.selection[0])
+                    .filter(|r| matches!(self.game.doc.class_of(*r).as_deref(), Some("Sound" | "AudioPlayer")));
+                match target {
+                    Some(r) => (true, Some(self.game.edit_audio.preview_state(r).0)),
+                    None => (false, None),
+                }
+            }
             "test" | "test_here" | "run" => (!playing, None),
             "break_never" => (false, Some(true)),
             "toggle_client_server" => (
@@ -145,11 +316,51 @@ impl Editor {
             "save_local_plugin" | "publish_plugin" => (edit && sel, None),
             "command_bar" => (false, Some(false)),
             // Ribbon-only actions.
-            "transform" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => (true, None),
+            "transform" => (true, None),
+            "tool_select" | "tool_move" | "tool_scale" | "tool_rotate" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+                    let stem = match a {
+                        "tool_select" => "SelectDragger",
+                        "tool_move" => "MoveDragger",
+                        "tool_scale" => "ScaleDragger",
+                        _ => "RotateDragger",
+                    };
+                    self.promoted_button_state(stem)
+                } else {
+                    (true, None)
+                }
+            }
             "part" | "part_block" | "part_sphere" | "part_wedge" | "part_corner" | "part_cylinder" => (edit, None),
             "gui" | "script" => (edit, None),
-            "effect" | "attachment" | "material" | "color" => (edit && self.has_selected_parts(), None),
-            "weld" => (edit && self.selected_parts_shared().len() >= 2, None),
+            "effect" | "color" => (edit && self.has_selected_parts(), None),
+            "material" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::MaterialPicker) {
+                    let (en, ck) = self.promoted_button_state("MaterialPicker");
+                    (edit && en, ck)
+                } else {
+                    (edit && self.has_selected_parts(), None)
+                }
+            }
+            "attachment" => {
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("ConstraintTool", Some("Attachment"), Some("Place")).is_some()
+                {
+                    let (en, ck) = self.builtin_button_state("ConstraintTool", Some("Attachment"), Some("Place"));
+                    (edit && en, ck)
+                } else {
+                    (edit && self.has_selected_parts(), None)
+                }
+            }
+            "weld" => {
+                if self.builtin_tools.plugins_enabled
+                    && self.builtin_plugin_button("ConstraintTool", Some("WeldConstraint"), Some("Place")).is_some()
+                {
+                    let (en, ck) = self.builtin_button_state("ConstraintTool", Some("WeldConstraint"), Some("Place"));
+                    (edit && en, ck)
+                } else {
+                    (edit && self.selected_parts_shared().len() >= 2, None)
+                }
+            }
             "ui_frame" | "ui_label" | "ui_input" | "ui_appearance" | "ui_layout" | "ui_constraint" => {
                 (edit && self.gui_target().is_some(), None)
             }
@@ -214,7 +425,16 @@ impl Editor {
                 self.cloud.refresh(client, tab);
             }
             "import_model" => self.insert_from_file(),
-            "character" => self.toggle_character_builder(),
+            "import_3d" => {
+                self.trigger_builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import"));
+            }
+            "character" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::RigBuilder) {
+                    self.trigger_promoted_plugin_button("RigGenerator");
+                } else {
+                    self.toggle_character_builder();
+                }
+            }
             a if a.starts_with("character:") => self.character_action(&a["character:".len()..]),
             // "Save to File": a place from Roblox goes to a file too (Ctrl+S
             // saves it to Roblox).
@@ -246,8 +466,20 @@ impl Editor {
             }
             "experience_settings" => self.cloud.settings_open = true,
             "avatar_settings" => self.ui.panel_requests.push((Tab::AvatarSettings, None)),
-            "terrain_editor" => self.ui.panel_requests.push((Tab::TerrainEditor, None)),
-            "toolbox" => self.ui.panel_requests.push((Tab::Toolbox, None)),
+            "terrain_editor" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor) {
+                    self.trigger_promoted_plugin_button("TerrainEditor");
+                } else {
+                    self.ui.panel_requests.push((Tab::TerrainEditor, None));
+                }
+            }
+            "toolbox" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Toolbox) {
+                    self.trigger_promoted_plugin_button("Toolbox");
+                } else {
+                    self.ui.panel_requests.push((Tab::Toolbox, None));
+                }
+            }
             "asset_manager" => self.ui.panel_requests.push((Tab::AssetManager, None)),
             "file_sync" => self.ui.panel_requests.push((Tab::FileSync, Some(true))),
             "microprofiler" => self.ui.panel_requests.push((Tab::Profiler, None)),
@@ -264,6 +496,15 @@ impl Editor {
             // the window like the Vinegar captures ("studio_settings_fill:…").
             a if a.starts_with("studio_settings:") => self.ui.studio_settings.open_at(&a["studio_settings:".len()..], false),
             a if a.starts_with("studio_settings_fill:") => self.ui.studio_settings.open_at(&a["studio_settings_fill:".len()..], true),
+            a if a.starts_with("ribbon_tab:") => {
+                let want = &a["ribbon_tab:".len()..];
+                if let Some(tab) = crate::studio_ui::RibbonTab::ALL
+                    .into_iter()
+                    .find(|t| t.label().eq_ignore_ascii_case(want))
+                {
+                    self.ui.tab = tab;
+                }
+            }
             "restart" => self.request(PendingAction::Restart),
             "exit" => self.request(PendingAction::Quit),
             "undo" | "redo" | "cut" | "copy" | "paste" | "paste_into" | "duplicate" | "delete" | "group"
@@ -321,6 +562,62 @@ impl Editor {
                 self.game.fullscreen = !self.game.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.game.fullscreen));
             }
+            "view_selector" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector) {
+                    self.trigger_promoted_plugin_button("ViewSelector");
+                } else {
+                    self.ui.show_view_selector = !self.ui.show_view_selector;
+                }
+            }
+            "wind_direction" => {
+                self.trigger_builtin_plugin_button("WindControl", Some("windControl"), Some("WindControl"));
+            }
+            "player_emulator" => {
+                self.trigger_builtin_plugin_button("PlayerEmulator", Some("luaPlayerEmulatorToolbar"), Some("luaPlayerEmulatorButton"));
+            }
+            "align" => {
+                self.trigger_builtin_plugin_button("AlignmentTool", Some("Alignment"), Some("AlignTool"));
+            }
+            "material_manager" => {
+                self.trigger_builtin_plugin_button("MaterialManager", Some("Edit"), Some("MaterialManager"));
+            }
+            "material" => {
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::MaterialPicker) {
+                    self.trigger_promoted_plugin_dropdown("MaterialPicker");
+                }
+            }
+            "clip_editor" => {
+                self.trigger_builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor"));
+            }
+            "avatar_setup" => {
+                self.trigger_builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar"));
+            }
+            "style_editor" => {
+                self.trigger_builtin_plugin_button("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton"));
+            }
+            "localization_tools" => {
+                self.trigger_builtin_plugin_button("LocalizationTools", Some("Localization"), Some("Tools"));
+            }
+            "drafts" => {
+                self.trigger_builtin_plugin_button("DraftsWidget", Some("draftsToolbar"), Some("draftsButton"));
+            }
+            "tag_editor" => {
+                self.trigger_builtin_plugin_button("TagEditor", Some("tagEditorToolbar"), Some("TagEditor"));
+            }
+            "audio_discovery" => {
+                self.trigger_builtin_plugin_button("AudioDiscovery", Some("Audio Discovery"), Some("View Sounds"));
+            }
+            "pivot" => {
+                self.trigger_builtin_plugin_button("PivotEditor", Some("Pivot"), Some("EditPivot"));
+            }
+            "pivot_reset" => {
+                self.trigger_builtin_plugin_button("PivotEditor", Some("Pivot"), Some("ClearPivot"));
+            }
+            "constraint_menu" => egui::Popup::open_id(ctx, egui::Id::new(crate::studio_ribbon::CONSTRAINT_MENU_ID)),
+            a if a.starts_with("constraint:") => {
+                let tb = &a["constraint:".len()..];
+                self.trigger_builtin_plugin_button("ConstraintTool", Some(tb), Some("Place"));
+            }
             "show_grid" => self.show_grid = !self.show_grid,
             "align_dragged" => self.align_dragged = !self.align_dragged,
             "dragger_menu" => egui::Popup::open_id(ctx, egui::Id::new(crate::studio_ribbon::DRAGGER_MENU_ID)),
@@ -343,10 +640,12 @@ impl Editor {
             "mute" => {
                 let on = !rustudio_engine::audio::muted();
                 rustudio_engine::audio::set_muted_global(on);
+                self.game.edit_audio.set_muted(on);
                 if let Some(s) = self.game.play.as_mut() {
                     s.game.set_muted(on);
                 }
             }
+            "audio_preview" => self.run_action("audio_preview"),
             "test" => self.start_run(RunType::Test),
             "test_here" => self.start_run(RunType::TestHere),
             "run" => self.start_run(RunType::Run),
@@ -399,10 +698,10 @@ impl Editor {
             "save_local_plugin" => self.save_local_plugin(),
             "publish_plugin" => self.publish_as_plugin(),
             "transform" => self.tool = self.tool.toggle(Tool::Transform),
-            "tool_select" => self.tool = self.tool.toggle(Tool::Select),
-            "tool_move" => self.tool = self.tool.toggle(Tool::Move),
-            "tool_scale" => self.tool = self.tool.toggle(Tool::Scale),
-            "tool_rotate" => self.tool = self.tool.toggle(Tool::Rotate),
+            "tool_select" => self.trigger_dragger_or_native(Tool::Select, "SelectDragger"),
+            "tool_move" => self.trigger_dragger_or_native(Tool::Move, "MoveDragger"),
+            "tool_scale" => self.trigger_dragger_or_native(Tool::Scale, "ScaleDragger"),
+            "tool_rotate" => self.trigger_dragger_or_native(Tool::Rotate, "RotateDragger"),
             "part" | "part_block" => self.insert_part(MeshKind::Block),
             "part_sphere" => self.insert_part(MeshKind::Ball),
             "part_wedge" => self.insert_part(MeshKind::Wedge),
@@ -421,19 +720,29 @@ impl Editor {
                 self.insert_class("Script", p);
             }
             "attachment" => {
-                for p in self.selected_parts() {
-                    self.insert_class("Attachment", p);
+                if self.builtin_tools.plugins_enabled
+                    && self.trigger_builtin_plugin_button("ConstraintTool", Some("Attachment"), Some("Place"))
+                {
+                } else {
+                    for p in self.selected_parts() {
+                        self.insert_class("Attachment", p);
+                    }
                 }
             }
             "weld" => {
-                let parts = self.selected_parts();
-                let (p0, p1) = (parts[0], parts[1]);
-                let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
-                    .with_name("WeldConstraint")
-                    .with_property("Part0", Variant::Ref(p0))
-                    .with_property("Part1", Variant::Ref(p1));
-                let w = self.game.doc.insert(p0, builder);
-                self.select(vec![w]);
+                if self.builtin_tools.plugins_enabled
+                    && self.trigger_builtin_plugin_button("ConstraintTool", Some("WeldConstraint"), Some("Place"))
+                {
+                } else {
+                    let parts = self.selected_parts();
+                    let (p0, p1) = (parts[0], parts[1]);
+                    let builder = rbx_dom_weak::InstanceBuilder::new("WeldConstraint")
+                        .with_name("WeldConstraint")
+                        .with_property("Part0", Variant::Ref(p0))
+                        .with_property("Part1", Variant::Ref(p1));
+                    let w = self.game.doc.insert(p0, builder);
+                    self.select(vec![w]);
+                }
             }
             other => {
                 if let Some(class) = other.strip_prefix("class:") {

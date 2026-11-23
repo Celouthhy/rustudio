@@ -314,3 +314,38 @@ fn gyro_first_step() {
     // the filters advanced: g = 0.1, h0 = the error
     assert!((c.gyro.as_ref().unwrap().filt[1][0] - 0.1).abs() < 1e-7);
 }
+
+/// Class::Fixed produces 6 rigid equality rows (3 positional + 3 orientational)
+/// locking two dynamic bodies together (used for dynamic seat welds).
+#[test]
+fn fixed_joint_builds_six_rigid_rows() {
+    let desc = Desc {
+        class: Class::Fixed,
+        a: End { body: None, pos: Vec3::new(0.0, 1.0, 0.0), rot: Mat3::IDENTITY, mass: 10.0 },
+        b: End { body: None, pos: Vec3::new(0.0, -1.0, 0.0), rot: Mat3::IDENTITY, mass: 2.0 },
+        in_world: true,
+    };
+    let mut next = 0;
+    let mut inst = Inst::new(&desc, &mut next);
+    assert_eq!(inst.active.count_ones(), 2, "Fixed weld builds BallInSocket + Orient connectors");
+    let h = 1.0 / 240.0;
+    let ra = Rec::default();
+    let rb = Rec {
+        v: Vec3::ZERO,
+        w: Vec3::ZERO,
+        com: Vec3::new(0.1, 2.0, 0.0),
+        v_ref: Vec3::ZERO,
+        w_ref: Vec3::ZERO,
+    };
+    let pb = Pose { r: Mat3::from_rotation_y(0.1), p: Vec3::new(0.1, 2.0, 0.0) };
+    let body_b = Body { inv_m: 0.5, inv_i: Mat3::from_diagonal(Vec3::splat(1.0)) };
+    let [(dv, dw), (dp, dq)] = ldl_only(&mut inst, &ra, &rb, &Pose::IDENTITY, &pb, &body_b, h);
+    let total_rows: usize = inst.conns.iter().enumerate()
+        .filter(|(ci, _)| inst.active & (1 << ci) != 0)
+        .map(|(_, c)| c.n_rows as usize)
+        .sum();
+    assert_eq!(total_rows, 6, "Fixed weld must lock all 6 DOF");
+    assert!(dv.length() < 1e-4 && dw.length() < 1e-4, "zero initial vel needs no vel impulse: {dv:?} {dw:?}");
+    assert!(dp.x < -0.05, "position lane corrects +X offset: {dp:?}");
+    assert!(dq.y < -0.05, "position lane corrects +Y yaw offset: {dq:?}");
+}

@@ -38,6 +38,12 @@ pub trait TabViewer {
     /// rustudio: the tab's pop-out button was clicked.
     fn on_pop_out(&mut self, _tab: &mut Self::Tab) {}
 
+    /// rustudio: whether the tab's context menu has egui_dock's own "Eject"
+    /// (a new floating window; rustudio's menu has Pop Out instead).
+    fn show_eject_in_context_menu(&self, _tab: &Self::Tab) -> bool {
+        true
+    }
+
     /// rustudio: the button docks the tab back instead (drawn with the
     /// arrow pointing into the box).
     fn pop_out_docks_back(&self, _tab: &Self::Tab) -> bool {

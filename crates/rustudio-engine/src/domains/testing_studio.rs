@@ -106,6 +106,9 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
         }
         ("StudioService", "StudioLocaleId") => lstr(lua, "en_US")?,
         ("StudioService", "UseLocalSpace") => written_or(lua, r, key, Value::Boolean(e.local_space))?,
+        ("StudioService", "HoverInstance") => written_or(lua, r, key, Value::Nil)?,
+        ("StudioService", "AlignDraggedObjects") => written_or(lua, r, key, Value::Boolean(false))?,
+        ("StudioService", "PivotSnapToGeometry") => written_or(lua, r, key, Value::Boolean(false))?,
         ("Plugin", "CollisionEnabled") => Value::Boolean(e.collisions),
         ("DraggerService", _) => {
             let dflt = match key {
@@ -120,12 +123,16 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
                 "DraggerMovementMode" => enum_item(lua, "DraggerMovementMode", 0)?,
                 "GeometrySnapColor" => color3(lua, [1.0, 0.0, 1.0])?,
                 "HoverAnimateFrequency" => num(1.0),
+                "HoverLineThickness" => num(2.0),
                 "HoverThickness" => num(4.0),
                 "JointsEnabled" => Value::Boolean(e.join_surfaces),
                 "LinearSnapEnabled" => Value::Boolean(e.snap_move),
                 "LinearSnapIncrement" => num(e.move_inc as f64),
+                "PartSnapEnabled" => Value::Boolean(false),
+                "PivotSnapToGeometry" => Value::Boolean(false),
                 "ShowHover" => Value::Boolean(true),
                 "ShowPivotIndicator" => Value::Boolean(false),
+                "UseBoundingBoxes" => Value::Boolean(false),
                 _ => return Ok(None),
             };
             written_or(lua, r, key, dflt)?

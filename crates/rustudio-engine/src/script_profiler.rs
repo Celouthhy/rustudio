@@ -37,6 +37,7 @@ const EXACT: u8 = 4;
 /// Exact mode was on at some point: threads may still be single-stepping.
 static EXACT_USED: AtomicBool = AtomicBool::new(false);
 static FLAGS: AtomicU8 = AtomicU8::new(0);
+static PROFILE_WORK: AtomicBool = AtomicBool::new(false);
 static SAMPLE_HZ: AtomicU32 = AtomicU32::new(1000);
 
 /// Any layer is on (one relaxed load: the hot-path check).
@@ -144,12 +145,14 @@ pub fn sample_hz() -> u32 {
 /// RUSTUDIO_SCRIPT_PROFILE=1|live|exact|<hz>: start at launch (headless
 /// captures, benches: `--bench` adds a "scripts" summary to its report and
 /// RUSTUDIO_SCRIPT_PROFILE_OUT=PATH writes PATH.json + PATH.folded). Reads
-/// the env once.
+/// the env once. With RUSTUDIO_BENCH_INSTR=1, script and callback
+/// rows also count self work (instructions on Linux, cycles on Windows).
 pub fn init_from_env() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(v) = std::env::var_os("RUSTUDIO_SCRIPT_PROFILE") else { return };
         let v = v.to_string_lossy().to_string();
+        PROFILE_WORK.store(std::env::var_os("RUSTUDIO_BENCH_INSTR").is_some(), Relaxed);
         match v.as_str() {
             "" | "0" => {}
             "live" => set_live(true),
@@ -283,6 +286,7 @@ struct Acc {
     total_ns: u64,
     self_ns: u64,
     max_ns: u64,
+    self_work: u64,
 }
 
 impl Acc {
@@ -655,8 +659,13 @@ pub fn with_entry<R>(
     r
 }
 
+thread_local! {
+    static CHILD_WORK: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Timing for one resumption (from `runtime::resume`).
 pub(crate) struct ResumeTimer {
+    work: Option<(u64, u64)>,
     slot: Arc<VmSlot>,
     kind: VmKind,
     script: Option<Name>,
@@ -699,10 +708,17 @@ fn begin_resume_slow(lua: &mlua::Lua, th: &mlua::Thread) -> Option<ResumeTimer> 
         exact::set_singlestep(th, exact_on);
     }
     let exact_prev = exact_on.then(|| exact::enter(th.to_pointer() as usize, kind, script));
-    Some(ResumeTimer { slot, kind, script, entry, prev_current, outer_child, t0: Instant::now(), marks, exact_prev, th: th.to_pointer() as usize, span })
+    let work = PROFILE_WORK.load(Relaxed).then(|| {
+        (rustudio_core::bench::instructions(), CHILD_WORK.replace(0))
+    });
+    Some(ResumeTimer { work, slot, kind, script, entry, prev_current, outer_child, t0: Instant::now(), marks, exact_prev, th: th.to_pointer() as usize, span })
 }
 
 pub(crate) fn end_resume(t: ResumeTimer, finished: bool) {
+    let self_work = t.work.map_or(0, |(start, outer)| {
+        let work = rustudio_core::bench::instructions().saturating_sub(start);
+        work.saturating_sub(CHILD_WORK.replace(outer + work))
+    });
     let ns = t.t0.elapsed().as_nanos() as u64;
     if let Some(prev) = t.exact_prev {
         exact::leave(t.th, prev, finished);
@@ -721,9 +737,12 @@ pub(crate) fn end_resume(t: ResumeTimer, finished: bool) {
     let mut s = state();
     let st = s.scripts.entry((t.kind, script)).or_default();
     st.acc.add(ns, self_ns);
+    st.acc.self_work += self_work;
     st.window.add(sec, self_ns);
     let (ek, h, e) = t.entry;
-    st.entries.entry((ek, h, e)).or_default().add(ns, self_ns);
+    let acc = st.entries.entry((ek, h, e)).or_default();
+    acc.add(ns, self_ns);
+    acc.self_work += self_work;
 }
 
 // ------------------------------------------------------------------ markers
@@ -1442,6 +1461,10 @@ pub(crate) mod timeline {
 
 // ------------------------------------------------------------------ snapshot
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EntryRow {
     pub kind: EntryKind,
@@ -1450,6 +1473,8 @@ pub struct EntryRow {
     /// Event name (Heartbeat, Touched, …) when known.
     pub event: Option<Arc<str>>,
     pub calls: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_work: u64,
     pub total_ms: f64,
     pub self_ms: f64,
     pub avg_ms: f64,
@@ -1458,6 +1483,8 @@ pub struct EntryRow {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScriptRow {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_work: u64,
     pub vm: VmKind,
     pub path: Arc<str>,
     pub native: bool,
@@ -1549,6 +1576,9 @@ pub struct VmRow {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
+    /// Unit of the optional work counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_unit: Option<String>,
     pub live: bool,
     pub recording: bool,
     pub sample_hz: u32,
@@ -1637,6 +1667,7 @@ fn snapshot_of(s: &State) -> Snapshot {
                     handler: opt(h),
                     event: opt(e),
                     calls: a.calls,
+                    self_work: a.self_work,
                     total_ms: ms(a.total_ns),
                     self_ms: ms(a.self_ns),
                     avg_ms: ms(a.total_ns) / a.calls.max(1) as f64,
@@ -1645,6 +1676,7 @@ fn snapshot_of(s: &State) -> Snapshot {
                 .collect();
             entries.sort_by(|a, b| b.self_ms.total_cmp(&a.self_ms));
             ScriptRow {
+                self_work: st.acc.self_work,
                 vm,
                 path: names(n),
                 native: st.native,
@@ -1881,6 +1913,9 @@ fn snapshot_of(s: &State) -> Snapshot {
     vms.sort_by_key(|v| v.vm);
 
     Snapshot {
+        work_unit: PROFILE_WORK.load(Relaxed).then(|| {
+            if cfg!(windows) { "cycles" } else { "instructions" }.to_owned()
+        }),
         live: live_stats(),
         recording: recording(),
         sample_hz: sample_hz(),
@@ -1942,6 +1977,7 @@ impl Snapshot {
     pub fn summary(&self, top: usize) -> serde_json::Value {
         serde_json::json!({
             "recorded_s": self.recorded_s,
+            "work_unit": self.work_unit,
             "samples": self.samples,
             "missed_samples": self.missed_samples,
             "sample_cost_us": self.sample_cost_us,
@@ -1949,6 +1985,7 @@ impl Snapshot {
             "vms": self.vms,
             "scripts": self.scripts.iter().take(top).map(|s| serde_json::json!({
                 "vm": s.vm, "path": s.path, "self_ms": s.self_ms, "ms_per_frame": s.ms_per_frame,
+                "self_work": s.self_work,
                 "resumes": s.resumes, "max_ms": s.max_ms, "heap_kb": s.heap_bytes / 1024,
                 "native": s.native, "activity_pct": s.activity_pct, "rate_hz": s.rate_hz,
             })).collect::<Vec<_>>(),

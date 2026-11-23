@@ -1378,6 +1378,22 @@ fn install_parts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_params_use_the_studio_off_sale_key() {
+        let rt = crate::runtime::Runtime::new().unwrap();
+        use crate::runtime::{RunMode, World};
+        rt.enter(World::new(rustudio_core::doc::Document::new_place(), RunMode::Run));
+        rt.bind_globals().unwrap();
+        rt.lua.load(r#"
+            local p = CatalogSearchParams.new()
+            assert(p.IncludeOffSale == false)
+            p.IncludeOffSale = true
+            assert(p.IncludeOffSale == true and string.find(tostring(p), "IncludeOffSale=true"))
+            assert(not pcall(function() return p.IncludeOffSaleItems end))
+            assert(not pcall(function() p.IncludeOffSaleItems = true end))
+        "#).exec().unwrap();
+    }
+
     use super::*;
 
     /// The CFrame fast paths (constructors, * + -, methods) give exactly

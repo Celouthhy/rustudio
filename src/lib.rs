@@ -731,6 +731,20 @@ pub fn run() -> eframe::Result<()> {
                     None => eprintln!("{a}: can't read {v:?}"),
                 }
             }
+            "--dblclick" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_dblclick(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--dblclick: can't read {v:?} (X,Y@SECONDS)"),
+                }
+            }
+            "--paste" => {
+                let v = args.next().unwrap_or_default();
+                match app::HarnessAction::parse_paste(&v) {
+                    Some(x) => actions.push(x),
+                    None => eprintln!("--paste: can't read {v:?} (TEXT@SECONDS)"),
+                }
+            }
             "--move" => {
                 // The pointer to view position X,Y at S (hover, no buttons).
                 let v = args.next().unwrap_or_default();

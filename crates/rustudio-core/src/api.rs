@@ -248,7 +248,8 @@ mod tests {
         use super::Kind::*;
         // Studio 0.744.0.7441077's own `-API` dump.
         assert_eq!(api.classes.len(), 942);
-        assert_eq!(api.count(Property, false), 3796);
+        // (+1: DataModel.ServerRegion, from Studio's current dump.)
+        assert_eq!(api.count(Property, false), 3797);
         assert_eq!(api.count(Function, false), 3374);
         assert_eq!(api.count(Event, false), 849);
         let (decl, m) = api.lookup("Part", "Anchored").unwrap();

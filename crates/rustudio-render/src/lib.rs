@@ -11,11 +11,13 @@
 //! the editor.
 
 pub mod quality;
+pub mod postfx;
 pub mod occlusion;
 pub mod render;
 pub mod gpu_timing;
 pub mod gpu_health;
 pub mod gpu_caps;
+pub mod pipeline_cache;
 pub mod world_gui;
 pub mod sun_shadow;
 pub mod highlight;

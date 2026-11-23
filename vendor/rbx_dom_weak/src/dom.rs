@@ -390,6 +390,24 @@ impl WeakDom {
         children
     }
 
+    /// Detaches matching direct children in one pass, preserving sibling order.
+    pub fn detach_matching_children(&mut self, parent: Ref, mut matches: impl FnMut(Ref) -> bool) {
+        let Some(instance) = self.instances.get_mut(&parent) else {
+            return;
+        };
+        let mut detached = Vec::new();
+        instance.children.retain(|&child| {
+            let remove = matches(child);
+            if remove {
+                detached.push(child);
+            }
+            !remove
+        });
+        for child in detached {
+            self.instances.get_mut(&child).unwrap().parent = Ref::none();
+        }
+    }
+
     /// rustudio: detaches the whole subtree under `referent` (not
     /// `referent` itself): every descendant ends with no parent and no
     /// children. Returns them in pre-order (each parent before its

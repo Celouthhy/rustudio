@@ -13,10 +13,22 @@
 //! its order varies; this is its deterministic run). `--plugin X.luau`
 //! still loads a .luau file given by name.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rbx_dom_weak::types::Ref;
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
+use rustudio_core::core_scripts::Bytecode;
+
+/// A decoded plugin model: its instance tree plus any ProtectedString Luau
+/// bytecode extracted from `Source` properties (built-in plugins ship compiled
+/// Luau bytecode v14).
+#[derive(Clone)]
+pub struct PluginModel {
+    pub dom: Arc<WeakDom>,
+    pub bytecode: Arc<HashMap<Ref, Bytecode>>,
+}
 
 /// Where a plugin comes from.
 #[derive(Clone, Debug)]
@@ -29,6 +41,9 @@ pub enum PluginSource {
     /// An installed (Creator Store) plugin: its model file on disk, as the
     /// store downloaded it.
     Cloud { asset_id: u64, path: PathBuf },
+    /// A Roblox Studio built-in plugin from
+    /// `<Studio>/BuiltInPlugins/Optimized_Embedded_Signature/<Name>.rbxm`.
+    BuiltIn(PathBuf),
     /// An instance tree already in memory: the root's children are the
     /// plugin's top-level items. `name` is the Plugin's Name as Studio
     /// would give it (`user_Name.rbxmx`, …).
@@ -36,6 +51,12 @@ pub enum PluginSource {
 }
 
 impl PluginSource {
+    /// Whether this is a Studio built-in plugin (higher security identity 6,
+    /// RobloxPluginGuiService widgets, ProtectedString bytecode sources).
+    pub fn is_builtin(&self) -> bool {
+        matches!(self, PluginSource::BuiltIn(_))
+    }
+
     /// The Plugin instance's Name.
     pub fn plugin_name(&self) -> String {
         match self {
@@ -44,22 +65,25 @@ impl PluginSource {
             }
             PluginSource::Nested { rel, .. } => format!("user_{rel}"),
             PluginSource::Cloud { asset_id, .. } => format!("cloud_{asset_id}"),
+            PluginSource::BuiltIn(p) => {
+                format!("builtin_{}", p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default())
+            }
             PluginSource::Tree { name, .. } => name.clone(),
         }
     }
 
-    /// printidentity's asset id: the store id, -2 for local plugins.
+    /// printidentity's asset id: the store id, -1 for built-ins, -2 for local plugins.
     pub fn asset_id(&self) -> i64 {
         match self {
             PluginSource::Cloud { asset_id, .. } => *asset_id as i64,
+            PluginSource::BuiltIn(_) => -1,
             PluginSource::Tree { asset_id: Some(a), .. } => *a as i64,
             _ => -2,
         }
     }
 
-    /// The settings file the plugin's GetSetting / SetSetting use: local
-    /// plugins share InstalledPlugins/0 (measured: a SetSetting in one
-    /// local plugin is read by another), installed ones have their own.
+    /// The settings file the plugin's GetSetting / SetSetting use: local and
+    /// built-in plugins share InstalledPlugins/0, installed ones have their own.
     pub fn settings_key(&self) -> String {
         match self {
             PluginSource::Cloud { asset_id, .. } => asset_id.to_string(),
@@ -71,22 +95,72 @@ impl PluginSource {
     /// The file it was read from, if any.
     pub fn path(&self) -> Option<&Path> {
         match self {
-            PluginSource::File(p) | PluginSource::Nested { path: p, .. } | PluginSource::Cloud { path: p, .. } => {
-                Some(p)
-            }
+            PluginSource::File(p)
+            | PluginSource::Nested { path: p, .. }
+            | PluginSource::Cloud { path: p, .. }
+            | PluginSource::BuiltIn(p) => Some(p),
             PluginSource::Tree { .. } => None,
         }
     }
 
     /// Reads the plugin's model (again, for a reload).
-    pub fn read(&self) -> Result<Arc<WeakDom>, String> {
+    pub fn read(&self) -> Result<PluginModel, String> {
         match self {
+            PluginSource::BuiltIn(p) => read_builtin_file(p),
             PluginSource::File(p) | PluginSource::Nested { path: p, .. } | PluginSource::Cloud { path: p, .. } => {
-                read_file(p).map(Arc::new)
+                read_file(p).map(|dom| PluginModel { dom: Arc::new(dom), bytecode: Arc::new(HashMap::new()) })
             }
-            PluginSource::Tree { dom, .. } => Ok(dom.clone()),
+            PluginSource::Tree { dom, .. } => Ok(PluginModel { dom: dom.clone(), bytecode: Arc::new(HashMap::new()) }),
         }
     }
+}
+
+/// Decodes a Studio built-in plugin `.rbxm` (ProtectedString Luau bytecode
+/// sources, embedded HASH / SIGN signature chunks stripped).
+pub fn read_builtin_file(path: &Path) -> Result<PluginModel, String> {
+    let patch = rustudio_core::core_scripts::read(path)?;
+    Ok(PluginModel {
+        dom: Arc::new(patch.dom),
+        bytecode: Arc::new(patch.bytecode),
+    })
+}
+
+/// Built-in `.rbxm` files in `dir`, sorted case-insensitively by filename.
+/// When `filter` is `Some`, only entries whose stem or filename matches
+/// (case-insensitively) are included.
+pub fn builtin_dir_order(dir: &Path, filter: Option<&[String]>) -> Result<Vec<PluginSource>, String> {
+    if !dir.is_dir() {
+        return Err(format!("{}: not a folder", dir.display()));
+    }
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let is_rbxm = p
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("rbxm"));
+        if !is_rbxm {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(wanted) = filter {
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let hit = wanted.iter().any(|w| {
+                w.eq_ignore_ascii_case(&name)
+                    || w.eq_ignore_ascii_case(&stem)
+                    || w.strip_prefix("builtin_").is_some_and(|s| s.eq_ignore_ascii_case(&name) || s.eq_ignore_ascii_case(&stem))
+            });
+            if !hit {
+                continue;
+            }
+        }
+        files.push((name, p));
+    }
+    files.sort_by_key(|(n, _)| n.to_lowercase());
+    Ok(files.into_iter().map(|(_, p)| PluginSource::BuiltIn(p)).collect())
 }
 
 /// A plugin file as a model: a script file becomes one Script named

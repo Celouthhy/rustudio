@@ -52,6 +52,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("PromptSetFavoriteCompleted", "AvatarEditorService"),
     ("PromptUpdateOutfitCompleted", "AvatarEditorService"),
     ("ApplyDescriptionFinished", "Humanoid"),
+    ("EmoteTriggered", "Humanoid"),
     ("EmotesChanged", "HumanoidDescription"),
     ("EquippedEmotesChanged", "HumanoidDescription"),
 ];
@@ -144,6 +145,14 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
 }
 
 pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
+    if class == "HumanoidDescription" && key == "NumberEmotesLoaded" {
+        let n = match world(lua)?.d().prop(r, key) {
+            Some(Variant::Int32(v)) => v as i64,
+            Some(Variant::Int64(v)) => v,
+            _ => 0,
+        };
+        return Ok(Some(Value::Integer(n)));
+    }
     if let Some(v) = props::prop_get(lua, r, class, key)? {
         return Ok(Some(v));
     }

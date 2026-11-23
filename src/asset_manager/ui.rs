@@ -12,6 +12,9 @@ use crate::toolbox::thumbs::Thumb;
 use crate::toolbox::ui::ToolboxDrag;
 use rustudio_engine::theme;
 
+/// The Asset Manager search box's narrowest width.
+const SEARCH_MIN_W: f32 = 110.0;
+
 const TILE: Color32 = Color32::from_rgb(44, 45, 51);
 const TILE_HOVER: Color32 = Color32::from_rgb(56, 58, 66);
 const ROW_ALT: Color32 = Color32::from_rgb(29, 30, 36);
@@ -250,8 +253,23 @@ impl AssetManager {
             self.go_forward();
         }
 
-        // Breadcrumbs (clipped if narrow).
-        self.draw_breadcrumbs(&mut child, dctx);
+        // Breadcrumbs get what the right-hand controls leave (six 24 px
+        // buttons, Import, the search box at its narrowest), clipped there,
+        // and none when that's too little to read.
+        let compact = child.available_width() < 520.0;
+        let import_w = if compact { 26.0 } else { 72.0 };
+        let right_w = 6.0 * 24.0 + import_w + 8.0 * 4.0 + SEARCH_MIN_W;
+        let room = child.available_width() - right_w - 6.0;
+        if room >= 48.0 {
+            let h = child.available_height();
+            child.allocate_ui_with_layout(Vec2::new(room, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_max_width(room);
+                let clip = ui.max_rect().intersect(ui.clip_rect());
+                ui.set_clip_rect(clip);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                self.draw_breadcrumbs(ui, dctx);
+            });
+        }
 
         // Right-aligned controls + flexible search bar.
         child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -382,7 +400,7 @@ impl AssetManager {
             }
 
             // Import button (Studio primary accent pill).
-            let import_size = Vec2::new(72.0, 24.0);
+            let import_size = Vec2::new(import_w, 24.0);
             let (imp_r, imp_resp) = ui.allocate_exact_size(import_size, Sense::click());
             let imp_bg = if imp_resp.hovered() {
                 Color32::from_rgb(70, 114, 255)
@@ -390,20 +408,24 @@ impl AssetManager {
                 theme::ACCENT
             };
             ui.painter().rect_filled(imp_r, 4.0, imp_bg);
-            icon(ui.painter(), Rect::from_min_size(imp_r.min + Vec2::new(7.0, 5.0), Vec2::splat(14.0)), "upload", Color32::WHITE);
-            ui.painter().text(
-                Pos2::new(imp_r.min.x + 25.0, imp_r.center().y),
-                Align2::LEFT_CENTER,
-                "Import",
-                medium(12.0),
-                Color32::WHITE,
-            );
+            if compact {
+                icon(ui.painter(), Rect::from_center_size(imp_r.center(), Vec2::splat(14.0)), "upload", Color32::WHITE);
+            } else {
+                icon(ui.painter(), Rect::from_min_size(imp_r.min + Vec2::new(7.0, 5.0), Vec2::splat(14.0)), "upload", Color32::WHITE);
+                ui.painter().text(
+                    Pos2::new(imp_r.min.x + 25.0, imp_r.center().y),
+                    Align2::LEFT_CENTER,
+                    "Import",
+                    medium(12.0),
+                    Color32::WHITE,
+                );
+            }
             if imp_resp.on_hover_text("Bulk import images, audio, models, or meshes").clicked() {
                 self.actions.push(Action::OpenImportDialog);
             }
 
             // Search box (takes remaining width up to 240px).
-            let search_w = ui.available_width().clamp(110.0, 240.0);
+            let search_w = ui.available_width().clamp(SEARCH_MIN_W, 240.0);
             let (sr, _) = ui.allocate_exact_size(Vec2::new(search_w, 24.0), Sense::hover());
             ui.painter().rect_filled(sr, 4.0, theme::PANEL_ALT);
             ui.painter().rect_stroke(sr, 4.0, Stroke::new(1.0, theme::DIVIDER), StrokeKind::Inside);
@@ -480,7 +502,7 @@ impl AssetManager {
             } else {
                 RichText::new(&label).size(12.5).color(theme::TEXT_DIM)
             };
-            let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+            let resp = ui.add(egui::Label::new(text).truncate().sense(Sense::click()));
             if resp.clicked() && !is_last {
                 self.navigate(target);
             }

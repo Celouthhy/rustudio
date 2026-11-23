@@ -268,7 +268,7 @@ fn fs_clouds_wind(in: ClOut) -> @location(0) vec4<f32> {
     if (cu.fogp.w != 0.0) {
         sky = g.fog_color.rgb;
     } else {
-        sky = sky_color_lod(dir, max(cu.fogp.y, fogf) * 5.0);
+        sky = env_sky_lod(dir, max(cu.fogp.y, fogf) * 5.0);
     }
     return vec4<f32>(mix(sky, col, vec3<f32>(fogf)), alpha * max(fogf, cu.fogp.y));
 }
@@ -307,13 +307,12 @@ fn fs_clouds_up(in: ClOut) -> @location(0) vec4<f32> {
     return c;
 }
 
-/// CloudsCompFS over the full view where nothing was drawn: alpha w², the
-/// colour blended in Studio's stored form sqrt(c × Exposure) (its
-/// R10G10B10A2 scene), skipped below w 0.12.
+/// CloudsCompFS over the sky inside the main scene pass (before opaque,
+/// terrain, water, glass and transparent parts): alpha w², blended over the
+/// sky in Studio's stored form sqrt(c × Exposure), skipped below w 0.12.
 @fragment
-fn fs_clouds_comp(in: ClOut) -> @location(0) vec4<f32> {
-    let px = vec2<i32>(in.pos.xy);
-    if (textureLoad(cl_depth, px, 0) > 0.0) {
+fn fs_clouds_sky(in: ClOut) -> @location(0) vec4<f32> {
+    if (under_water()) {
         discard;
     }
     let dir = cl_ray(in.pos.xy, cu.full.xy);
@@ -325,10 +324,15 @@ fn fs_clouds_comp(in: ClOut) -> @location(0) vec4<f32> {
     if (!(c.w > 0.12)) {
         discard;
     }
+    var dst = sky_color_lod_k(dir, 0.0, sky_level(dir));
+    if (g.sky_rot.x > 0.5 && dir.y > 0.0) {
+        let cell = floor(dir * 300.0);
+        let s = step(0.9985, hash3(cell)) * pow(hash3(cell + vec3<f32>(7.31, 1.7, 3.9)), 4.0);
+        dst += vec3<f32>(s * 0.6) * (1.0 - g.fog.w) * atmos_t(dir);
+    }
     let e = g.params.y * 0.25;
     let ec = sqrt(clamp(c.rgb * e, vec3<f32>(0.0), vec3<f32>(1.0)));
     let a = c.w * c.w;
-    let dst = textureLoad(cl_scene, px, 0).rgb;
     let ed = sqrt(clamp(dst * e, vec3<f32>(0.0), vec3<f32>(1.0)));
     let o = ec * a + ed * (1.0 - a);
     return vec4<f32>(o * o / max(e, 1e-6), 1.0);

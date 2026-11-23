@@ -84,8 +84,8 @@ pub enum Read {
     Owns { user: u64, id: u64, bundle: bool },
     PassOwnership { user: u64, pass: u64 },
     Badge(u64),
-    HasBadge { user: u64, badge: u64 },
-    CheckBadges { user: u64, badges: Vec<i64> },
+    HasBadge { user: u64, badge: u64, in_server: bool },
+    CheckBadges { user: u64, badges: Vec<i64>, in_server: bool },
     Group(u64),
     /// CoreScript metadata query; POST is read-only profile retrieval.
     GroupProfile {group:u64,actions_only:bool,deactivated:bool},
@@ -140,10 +140,10 @@ pub enum NotificationAction {
 impl NotificationAction {
     fn request(&self, session: &Session) -> Result<Request> {
         Ok(match self {
-            Self::Prompt { universe } => Request { host:"apis",path:"/notifications/v1/prompt-experience-notification-opt-in".into(),body:Some(json!({"universeId":universe})) },
+            Self::Prompt { universe } => Request { host:"apis",path:"/notifications/v1/prompt-experience-notification-opt-in".into(),body:Some(json!({"universeId":universe})),headers:Vec::new() },
             Self::Follow { user, universe } => {
                 if *user!=session.profile.id { return Err(Error::new("The local player does not match the login session")); }
-                Request { host:"followings",path:format!("/v1/users/{user}/universes/{universe}"),body:Some(json!([])) }
+                Request { host:"followings",path:format!("/v1/users/{user}/universes/{universe}"),body:Some(json!([])),headers:Vec::new() }
             },
         })
     }
@@ -207,7 +207,7 @@ impl RecommendationMutation {
 /// Development invokes the POST only against localhost fixtures.
 pub fn update_event_rsvp(session:&Session,event:&str,going:bool)->Result<Value> {update_event_rsvp_at(session,event,going,"https://apis.roblox.com")}
 fn update_event_rsvp_at(session:&Session,event:&str,going:bool,origin:&str)->Result<Value> {
-    send_read(session,origin,&Request{host:"apis",path:format!("/virtual-events/v1/virtual-events/{}/rsvps",component(event)),body:Some(json!({"rsvpStatus":if going{"going"}else{"notGoing"}}))})
+    send_read(session,origin,&Request{host:"apis",path:format!("/virtual-events/v1/virtual-events/{}/rsvps",component(event)),body:Some(json!({"rsvpStatus":if going{"going"}else{"notGoing"}})),headers:Vec::new()})
 }
 
 /// Native internal moderation action. Never included in Read; only localhost
@@ -230,7 +230,7 @@ fn request_content_review_at(session:&Session,universe:u64,id:&str,key:&str,orig
 /// Explicit user activation only; development exercises this transport only on localhost.
 pub fn join_community(session:&Session,group:u64)->Result<Value> {join_community_at(session,group,"https://groups.roblox.com")}
 fn join_community_at(session:&Session,group:u64,origin:&str)->Result<Value> {
-    let request=Request{host:"groups",path:format!("/v1/groups/{group}/users"),body:Some(json!([]))};
+    let request=Request{host:"groups",path:format!("/v1/groups/{group}/users"),body:Some(json!([])),headers:Vec::new()};
     send_read(session,origin,&request)
 }
 
@@ -391,6 +391,7 @@ pub struct Request {
     pub host: &'static str,
     pub path: String,
     pub body: Option<Value>,
+    pub headers: Vec<(&'static str, &'static str)>,
 }
 fn component(s: &str) -> String {
     s.bytes()
@@ -429,7 +430,7 @@ impl BatchKind {
                 ("/game-passes/v1/game-passes:batchGetOwnership".into(),Some(json!({"ownershipIdentifiers":ids})))
             },
         };
-        Request {host:"apis",path,body}
+        Request {host:"apis",path,body,headers:Vec::new()}
     }
 }
 struct BatchEntry { read: Read, at: Instant, result: Arc<Flight> }
@@ -442,10 +443,19 @@ fn send_read(session: &Session, origin: &str, request: &Request) -> Result<Value
     let url=format!("{origin}{}",request.path);
     let (status,body)=if let Some(body)=&request.body {
         session.post_csrf(&url,"application/json",&serde_json::to_vec(body)?)?
-    }else{session.get(&url)?};
+    } else if !request.headers.is_empty() {
+        session.get_with_headers(&url, &request.headers)?
+    } else {
+        session.get(&url)?
+    };
     if !(200..300).contains(&status) {
         let reason=ureq::http::StatusCode::from_u16(status).ok().and_then(|s|s.canonical_reason()).unwrap_or("Error");
         return Err(Error::new(format!("HTTP {status} ({reason})")));
+    }
+    // BadgeService::UserHasBadgeAsync in Studio: HTTP 204 No Content
+    // means the user does not own the badge (empty body, not a JSON error).
+    if status == 204 && request.path.ends_with("/awarded-date") {
+        return Ok(json!({}));
     }
     if request.path.starts_with("/notifications/v1/can-prompt-experience-notification-opt-in?") {
         if body.is_empty() { return Err(Error::new("Empty response received from Notification API")); }
@@ -530,12 +540,12 @@ impl Read {
                 Some(json!({"ownershipIdentifiers":[{"userId":user,"gamePassId":pass}]})),
             ),
             Self::Badge(id) => ("badges", format!("/v1/badges/{id}"), None),
-            Self::HasBadge { user, badge } => (
+            Self::HasBadge { user, badge, .. } => (
                 "badges",
                 format!("/v1/users/{user}/badges/{badge}/awarded-date"),
                 None,
             ),
-            Self::CheckBadges { user, badges } => (
+            Self::CheckBadges { user, badges, .. } => (
                 "badges",
                 format!(
                     "/v1/users/{user}/badges/awarded-dates?badgeIds={}",
@@ -689,7 +699,13 @@ impl Read {
                 None,
             ),
         };
-        Ok(Request { host, path, body })
+        let headers = match self {
+            Self::HasBadge { in_server, .. } | Self::CheckBadges { in_server, .. } => {
+                vec![("RequestUserIdIsInGameServer", if *in_server { "true" } else { "false" })]
+            }
+            _ => Vec::new(),
+        };
+        Ok(Request { host, path, body, headers })
     }
     pub fn fetch(&self, session: &Session) -> Result<Value> {
         self.fetch_at(session, |host| format!("https://{host}.roblox.com"))
@@ -786,6 +802,61 @@ mod tests {
     use crate::mock::{MockReply, MockServer};
     use crate::{Cookie, Profile};
     use std::sync::Arc;
+    #[test]
+    fn has_badge_handles_204_and_in_server_header() {
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen_c = seen.clone();
+        let server = MockServer::start(Arc::new(move |r| {
+            let hdr = r
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("requestuseridisingameserver"))
+                .map(|(_, v)| v.clone());
+            seen_c.lock().unwrap().push((r.path.clone(), hdr));
+            if r.path.contains("/badges/200/") {
+                MockReply::json(200, r#"{"badgeId":200,"awardedDate":"2026-01-01T00:00:00Z"}"#)
+            } else {
+                MockReply {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }
+            }
+        }))
+        .unwrap();
+        let session = Session::unchecked(
+            Cookie::new("badge-local-mock").unwrap(),
+            Profile {
+                id: 1,
+                name: "Mock".into(),
+                display_name: "Mock".into(),
+            },
+        );
+        let miss = Read::HasBadge {
+            user: 1,
+            badge: 204,
+            in_server: true,
+        }
+        .fetch_at(&session, |_| server.base.clone())
+        .unwrap();
+        assert_eq!(miss, json!({}));
+        let hit = Read::HasBadge {
+            user: 1,
+            badge: 200,
+            in_server: false,
+        }
+        .fetch_at(&session, |_| server.base.clone())
+        .unwrap();
+        assert_eq!(hit["badgeId"], 200);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("/v1/users/1/badges/204/awarded-date".to_string(), Some("true".to_string())),
+                ("/v1/users/1/badges/200/awarded-date".to_string(), Some("false".to_string())),
+            ]
+        );
+    }
+
     #[test]
     fn event_rsvp_updates_are_tested_only_against_localhost() {
         let values=Arc::new(Mutex::new(Vec::new()));let observed=values.clone();
@@ -1205,13 +1276,14 @@ mod tests {
             ),
             (Read::Badge(7), "/badges/v1/badges/7"),
             (
-                Read::HasBadge { user: 1, badge: 7 },
+                Read::HasBadge { user: 1, badge: 7, in_server: true },
                 "/badges/v1/users/1/badges/7/awarded-date",
             ),
             (
                 Read::CheckBadges {
                     user: 1,
                     badges: vec![7, 8],
+                    in_server: true,
                 },
                 "/badges/v1/users/1/badges/awarded-dates?badgeIds=7,8",
             ),

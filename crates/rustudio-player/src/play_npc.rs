@@ -631,7 +631,7 @@ impl Game {
                 // simulated on its own as well and fell away from the body (an
                 // accessory's welded copy was destroyed below
                 // FallenPartsDestroyHeight while its original stayed hidden).
-                // One unwelded again goes back to the loose simulation.
+                // A part that leaves the character goes back to the loose simulation.
                 if !ch.dead {
                     let now: HashSet<Ref> = ch.rig.attached.iter().map(|a| a.handle).collect();
                     let mut changed: Vec<Ref> = Vec::new();
@@ -642,7 +642,7 @@ impl Game {
                             changed.push(*r);
                         }
                     }
-                    let gone: Vec<Ref> = ch.carried.iter().copied().filter(|r| !now.contains(r)).collect();
+                    let gone: Vec<Ref> = ch.carried.iter().copied().filter(|r| !now.contains(r) && !self.doc.is_ancestor(ch.model, *r)).collect();
                     for r in gone {
                         ch.carried.remove(&r);
                         s.physics.skip.remove(&r);
@@ -662,6 +662,18 @@ impl Game {
                 v.stale = true;
             }
         }
+    }
+
+    /// After the Animator: poses server-side AnimationController rigs and
+    /// anchored Humanoid rigs (everything not driven by dynamic NPC / player
+    /// Humanoid physics) so server scripts read animated Part.CFrames as in Studio.
+    pub(super) fn server_pose_rigs(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let mut skip: rustc_hash::FxHashSet<Ref> = s.npcs.by_model.keys().copied().collect();
+        if let Some(c) = &s.character {
+            skip.insert(c.model);
+        }
+        s.server_joints.solve_server_rigs(&mut self.doc, &skip);
     }
 
     /// After the Animator: the colliders follow each character's animated
@@ -696,6 +708,7 @@ impl Game {
     /// its FloorMaterial.
     pub(super) fn npc_post(&mut self) {
         let Some(s) = self.play.as_ref() else { return };
+        let fallen_height = s.physics.fallen_height;
         let poses = {
             let _scope = rustudio_core::bench::scope("npc_solve_pose");
             let inputs: Vec<_> = s.npcs.by_model.iter().filter_map(|(&model, npc)| {
@@ -743,7 +756,7 @@ impl Game {
             // Fell out of the world: Studio destroys what falls past
             // FallenPartsDestroyHeight; the general physics does that once
             // the parts are its own again.
-            if root_xf.pos.y < mech::FALLEN_PARTS_HEIGHT {
+            if root_xf.pos.y < fallen_height {
                 self.npc_remove(model);
             }
         }

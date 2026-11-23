@@ -118,6 +118,10 @@ pub struct Layout {
     pub snap_rotate: Option<bool>,
     pub rotate_inc: Option<f32>,
     pub local_space: Option<bool>,
+    /// Output's ⋯ menu: Show Timestamp / Context / Source.
+    pub show_context: Option<bool>,
+    pub show_timestamp: Option<bool>,
+    pub show_source: Option<bool>,
     /// The dragger settings menu (Geometric ▾) and Align Dragged Objects.
     #[serde(default)]
     pub dragger: Option<DraggerSettings>,
@@ -250,6 +254,9 @@ impl Layout {
         if let Some(v) = self.snap_rotate { ed.game.snap_rotate = v; }
         if let Some(v) = self.rotate_inc.and_then(finite).filter(|v| *v > 0.0) { ed.game.rotate_inc = v; }
         if let Some(v) = self.local_space { ed.game.local_space = v; }
+        if let Some(v) = self.show_timestamp { ed.output_view.show_timestamp = v; }
+        if let Some(v) = self.show_context { ed.output_view.show_context = v; }
+        if let Some(v) = self.show_source { ed.output_view.show_source = v; }
         if let Some(d) = self.dragger {
             ed.physical_drag = d.physical;
             ed.collisions = d.collisions;
@@ -412,6 +419,9 @@ impl Saver {
             snap_rotate: Some(ed.game.snap_rotate),
             rotate_inc: Some(ed.game.rotate_inc),
             local_space: Some(ed.game.local_space),
+            show_context: Some(ed.output_view.show_context),
+            show_timestamp: Some(ed.output_view.show_timestamp),
+            show_source: Some(ed.output_view.show_source),
             dragger: Some(DraggerSettings {
                 physical: ed.physical_drag,
                 collisions: ed.collisions,
@@ -445,6 +455,25 @@ mod tests {
 
     /// Popped-out panels survive a save and a restart: tabs, key (app id),
     /// size and position; script tabs aren't kept.
+    #[test]
+    fn floating_windows_inside_the_main_window_round_trip() {
+        let mut dock = default_dock();
+        let at = dock.find_tab(&Tab::Explorer).unwrap();
+        let t = dock.remove_tab(at).unwrap();
+        let surface = dock.add_window(vec![t]);
+        dock.get_window_state_mut(surface).unwrap().set_position(egui::pos2(300.0, 200.0)).set_size(egui::vec2(260.0, 400.0));
+        let text = serde_json::to_string(&saved_dock(&dock)).unwrap();
+        let back: DockState<SavedTab> = serde_json::from_str(&text).unwrap();
+        let layout = Layout { version: VERSION, dock: Some(back), ..serde_json::from_str("{\"version\":1}").unwrap() };
+        let restored = layout.dock().unwrap();
+        let floating: Vec<Tab> = restored
+            .iter_surfaces_indexed()
+            .filter(|(i, _)| !i.is_main())
+            .flat_map(|(_, s)| s.iter_all_tabs().map(|(_, t)| *t).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(floating, vec![Tab::Explorer], "{text}");
+    }
+
     #[test]
     fn popped_windows_round_trip() {
         let mut dock = default_dock();

@@ -229,6 +229,22 @@ fn sky_color_lod(dir: vec3<f32>, lod: f32) -> vec3<f32> {
     return sky_color_lod_k(dir, lod, vec3<f32>(1.0));
 }
 
+/// Studio's PrefilteredEnvTexture at `lod_from_base` (0..5 from the 128px
+/// base mip). When Atmosphere is baked into the prefiltered mips of `sky_tex`
+/// (`g.atmos_glare.w > 0.5`), those mips already contain AdvSkyEnvFS
+/// (sky + haze + sun glare) GGX-prefiltered and sqrt(lin / 4) encoded, so
+/// sampling stays smooth across the horizon instead of dropping to haze at
+/// dir.y <= 0.
+fn env_sky_lod(dir: vec3<f32>, lod_from_base: f32) -> vec3<f32> {
+    let top = f32(textureNumLevels(sky_tex)) - 1.0;
+    let lod = min(max(top - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + lod_from_base, top);
+    if (g.atmos_glare.w > 0.5 && g.params.w > 0.5) {
+        let t = textureSampleLevel(sky_tex, sky_sampler, dir, lod).rgb;
+        return 4.0 * sq(t);
+    }
+    return sky_color_lod(dir, lod);
+}
+
 /// The drawn sky's time-of-day level in this direction, squared (1 for
 /// Studio's default sky, which sky_tint dims instead): Studio's SkyVS /
 /// AdvSkyVS multiply the skybox texel by mix(c1, c0, clamp(y / 1700, 0, 1)),
@@ -289,7 +305,7 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
     let x = f32(i32(i & 1u) * 4 - 1);
     let y = f32(i32(i >> 1u) * 4 - 1);
     var o: SkyOut;
-    o.pos = vec4<f32>(x, y, 1.0, 1.0);
+    o.pos = vec4<f32>(x, y, 0.0, 1.0);
     o.ndc = vec2<f32>(x, y);
     return o;
 }
@@ -304,7 +320,7 @@ fn under_water() -> bool {
 /// visible. FogStart / FogEnd use the same form (Windows 0.744 Studio:
 /// k = 1 / (FogEnd − FogStart), FogParams = (k·FogEnd, 0, −k, 1)), so
 /// 2^((FogEnd − d) / (FogEnd − FogStart)) − 1 is visible: not linear
-/// (checks/fog-linear).
+///.
 fn fog_amount(d: f32) -> f32 {
     if (g.fog.z > 2.5) {
         // Atmosphere: e^(−k·d), kept in exp2 form.
@@ -329,14 +345,11 @@ fn fog_rgb() -> vec3<f32> {
 /// is 0); otherwise fog_rgb.
 fn fog_rgb_at(world: vec3<f32>) -> vec3<f32> {
     if (g.fog.z > 2.5) {
-        // Studio's part FS: the prefiltered sky cube along the view ray at
-        // mip max(Offset, visibility) x 5; rustudio's skybox has more mips
-        // than that cube, so its top levels are skipped.
+        // Studio's part FS: PrefilteredEnvTexture along the view ray at
+        // mip max(Offset, visibility) x 5.
         let rel = world - g.cam_pos.xyz;
         let vis = 1.0 - fog_amount(length(rel));
-        let top = f32(textureNumLevels(sky_tex)) - 1.0;
-        let lod = max(top - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + max(g.atmos_sky.w, vis) * ATMOS_FOG_MIP;
-        return sky_color_lod(normalize(rel), min(lod, top));
+        return env_sky_lod(normalize(rel), max(g.atmos_sky.w, vis) * ATMOS_FOG_MIP);
     }
     return fog_rgb();
 }
@@ -540,10 +553,9 @@ fn sun_shadow(world: vec3<f32>, n: vec3<f32>) -> f32 {
 }
 
 /// Terrain.Clouds' sun cover (clouds.rs; 1 = clear), Studio's SkyAmbient.w:
-/// its surface shaders (Vulkan pack DefaultUnified*, SmoothCluster,
-/// SmoothWater, Grass) take the sun's diffuse × cover, its specular ×
-/// cover² and SkyAmbientNoIBL × skylight × (2 − cover). `sun_shadow`
-/// carries one cover; the specular sites add the second.
+/// its surface shaders scale direct sunlight by cover and SkyAmbientNoIBL
+/// by skylight × (2 − cover). `sun_shadow` carries this first cover factor.
+/// The Realistic part and terrain highlights apply two more factors.
 fn sun_cover() -> f32 {
     return g.outdoor.w;
 }
@@ -686,12 +698,10 @@ fn brdf_ab(rough: f32, nv: f32) -> vec2<f32> {
 /// the skylight (HQ part FS).
 fn env_reflect(r: vec3<f32>, rough: f32, sky: f32, sharp: bool) -> vec3<f32> {
     let m = select(rough * ENV_SPEC_MIP_PER_ROUGHNESS, 0.0, sharp);
-    let top_s = f32(textureNumLevels(sky_tex)) - 1.0;
     let top_i = f32(textureNumLevels(indoor_tex)) - 1.0;
-    let lod_s = min(max(top_s - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + m, top_s);
     let lod_i = min(max(top_i - (ATMOS_ENV_CUBE_LEVELS - 1.0), 0.0) + m, top_i);
     let tint = mix(g.sky_grad[1].rgb, g.sky_grad[0].rgb, clamp(r.y * ENV_REFLECT_UP_GAIN, 0.0, 1.0));
-    let outside = sky_color_lod(r, lod_s) * tint;
+    let outside = env_sky_lod(r, m) * tint;
     // Captured Future FS (Laser Tag door view, event 562): t14 at the
     // reflection's lod, mixed toward t2 by CB0[32].w when that's non-zero.
     var inside = textureSampleLevel(indoor_tex, sky_sampler, r, lod_i).rgb;
@@ -816,7 +826,7 @@ fn local_lights(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
             // Realistic: the light's own cube shadow map.
             c *= light_shadow(i32(l.extra.w), world);
         } else if (l.extra.z > 0.5) {
-            c *= light_occlusion(world, n, l.pos_range.xyz);
+            c *= light_occlusion(world, n, light_point(l, world));
         }
         sum += c;
     }
@@ -852,7 +862,7 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
         var radiance = local_light(light, world, n);
         if (!any(radiance > vec3<f32>(0.0))) { continue; }
         if (light.extra.w >= 0.0) { radiance *= light_shadow(i32(light.extra.w), world); }
-        else if (light.extra.z > 0.5) { radiance *= light_occlusion(world, n, light.pos_range.xyz); }
+        else if (light.extra.z > 0.5) { radiance *= light_occlusion(world, n, light_point(light, world)); }
         let direction = normalize(light_point(light, world) - world);
         let vh = v + direction;
         let h = vh * inverseSqrt(max(dot(vh, vh), 0.0001));
@@ -869,22 +879,23 @@ fn local_pbr(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, rough: f32,
     return result;
 }
 
-/// Studio's local light shadow (DefaultUnifiedTiledFS variant 8): the cube
-/// face along the light-to-point direction's largest axis, its EVSM moments
-/// at the point, Chebyshev on both warps with the bias as minimum variance,
-/// light-bleed cut (p − 0.2) × 1.25, the lesser of the two.
+/// Studio samples EVSM moments from the projected SurfaceLight shadow or
+/// the cube face along the light-to-point direction's largest axis.
 fn light_shadow(slot: i32, world: vec3<f32>) -> f32 {
 //#if FULL_BINDINGS
     let s = lshadow_slots[slot];
     let v = world - s.pos.xyz;
     let a = abs(v);
     var f = 0u;
-    if (a.x >= a.y && a.x >= a.z) {
-        f = select(1u, 0u, v.x > 0.0);
-    } else if (a.y >= a.z) {
-        f = select(3u, 2u, v.y > 0.0);
-    } else {
-        f = select(5u, 4u, v.z > 0.0);
+    // A negative inverse far distance selects the single projected face.
+    if (s.pos.w > 0.0) {
+        if (a.x >= a.y && a.x >= a.z) {
+            f = select(1u, 0u, v.x > 0.0);
+        } else if (a.y >= a.z) {
+            f = select(3u, 2u, v.y > 0.0);
+        } else {
+            f = select(5u, 4u, v.z > 0.0);
+        }
     }
     let clip = s.vp[f] * vec4<f32>(world, 1.0);
     let w = max(clip.w, 1e-4);
@@ -893,7 +904,7 @@ fn light_shadow(slot: i32, world: vec3<f32>) -> f32 {
     let cell = vec2<f32>(f32(k % LSHADOW_COLS), f32(k / LSHADOW_COLS));
     let uv = (cell + ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5)) * LSHADOW_CELL;
     let m = textureSampleLevel(lshadow_tex, lshadow_sampler, uv, 0.0);
-    return evsm_visibility(m, 2.0 * (w * s.pos.w) - 1.0);
+    return evsm_visibility(m, 2.0 * (w * abs(s.pos.w)) - 1.0);
 //#else
     // Reduced bindings: no light shadow atlas (render.rs skips its pass).
     return 1.0;
@@ -913,6 +924,16 @@ struct LShadowOut {
     @location(0) lin: f32,
 };
 
+@group(2) @binding(0) var shadow_tex: texture_2d<f32>;
+@group(2) @binding(1) var shadow_tex_sampler: sampler;
+
+struct LShadowCutoutOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) lin: f32,
+    @location(1) uv: vec2<f32>,
+    @location(2) alpha: f32,
+};
+
 @vertex
 fn vs_light_shadow(v: PartIn) -> LShadowOut {
     var o: LShadowOut;
@@ -925,8 +946,33 @@ fn vs_light_shadow(v: PartIn) -> LShadowOut {
     return o;
 }
 
+@vertex
+fn vs_light_shadow_cutout(v: PartIn) -> LShadowCutoutOut {
+    var o: LShadowCutoutOut;
+    let world = part_world(v);
+    o.clip = lface.vp * vec4<f32>(world, 1.0);
+    o.lin = dot(world - lface.pos.xyz, lface.axis.xyz) * lface.pos.w;
+    o.uv = v.uv * v.uvt.xy + select(v.uvt.zw, vec2<f32>(0.0), v.uvt.w < 0.0);
+    o.alpha = select(1.0, -v.vcol.a - 1.0, v.vcol.a < -0.5);
+    if (((u32(v.extra.y + 0.5) >> 19u) & 1u) == 1u) {
+        o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return o;
+}
+
 @fragment
 fn fs_light_shadow(i: LShadowOut) -> @location(0) vec4<f32> {
+    let z = 2.0 * clamp(i.lin, 0.0, 1.0) - 1.0;
+    let ep = exp(EVSM_POS_EXP * z);
+    let en = -exp(-EVSM_NEG_EXP * z);
+    return vec4<f32>(ep, ep * ep, en, en * en);
+}
+
+@fragment
+fn fs_light_shadow_cutout(i: LShadowCutoutOut) -> @location(0) vec4<f32> {
+    if (textureSample(shadow_tex, shadow_tex_sampler, i.uv).a * i.alpha < 0.5) {
+        discard;
+    }
     let z = 2.0 * clamp(i.lin, 0.0, 1.0) - 1.0;
     let ep = exp(EVSM_POS_EXP * z);
     let en = -exp(-EVSM_NEG_EXP * z);
@@ -996,15 +1042,25 @@ fn face_studs(objn: vec3<f32>, local: vec3<f32>, half: vec3<f32>, oblique: u32) 
     return vec2<f32>(c.x, 2.0 * half.y - c.y);
 }
 
-// Scene depth coverage for decals on any host, including invisible parts.
-// Test the same filtered alpha and authored opacity as the color pass.
+// Scene depth coverage for decals on any host (opaque texels), and for
+// opaque parts with SurfaceAppearance AlphaMode=Transparency (Studio's
+// DefaultSurfaceAppearanceDitheredDepthFS: writes depth for covered texels
+// so coplanar cutout layers and overlapping foliage depth-sort properly while
+// fractional edges blend in Studio's encoded see-through pass).
 @fragment
 fn fs_decal_depth(in: PartOut) -> @location(0) vec4<f32> {
-    let decal_clamp = all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
+    let mode = u32(in.extra.w + 0.5);
+    let decal_clamp = mode == 2u && all(abs(in.mscale - vec4<f32>(1.0, 1.0, 0.0, 0.0)) < vec4<f32>(1e-4));
     let edge_px = 0.5 / vec2<f32>(textureDimensions(tex));
     let suv = select(in.uv, clamp(in.uv, edge_px, vec2<f32>(1.0) - edge_px), decal_clamp);
-    let alpha = textureSample(tex, tex_sampler, suv).a * in.color.a;
-    if (u32(in.extra.w + 0.5) != 2u || alpha < 1.0) { discard; }
+    let ta = textureSample(tex, tex_sampler, suv).a;
+    if (mode == 2u) {
+        if (ta * in.color.a < 1.0) { discard; }
+    } else if (mode == 4u && in.color.a >= 0.999) {
+        if (ta * in.vtint.a < 0.5) { discard; }
+    } else {
+        discard;
+    }
     return vec4<f32>(0.0);
 }
 
@@ -1016,6 +1072,9 @@ fn fs_decal_depth(in: PartOut) -> @location(0) vec4<f32> {
 // see-through parts are drawn into a copy of the scene in that encoding
 // (fs_see_encode, then fs_part_enc, then fs_see_decode: render.rs).
 var<private> ENC_OUT: bool = false;
+// 0 = ordinary premultiplied/encoded output, 1 = alpha-to-coverage opaque cutout
+// (MSAA: un-premultiplied RGB + raw alpha), 2 = hard alpha-test (1x MSAA / probe).
+var<private> CUTOUT_OUT: u32 = 0u;
 // The encoding's exponent on rustudio's linear light: Studio's own is a
 // square root, but 0.525 fits its pixels (131 probe cells within 4 levels
 // but the alpha-to-coverage ones; 0.5 left them 3 levels dark on average,
@@ -1040,6 +1099,18 @@ fn see_dec(e: vec3<f32>) -> vec3<f32> {
 /// w, alpha a; premultiplied, linear or (fs_part_enc) encoded. The encoded
 /// alpha marks the pixel covered (fs_see_decode), so never quite 0.
 fn see_out(c: vec3<f32>, w: f32, a: f32) -> vec4<f32> {
+    if (CUTOUT_OUT == 1u) {
+        if (a <= 0.004) {
+            discard;
+        }
+        return vec4<f32>(c, a);
+    }
+    if (CUTOUT_OUT == 2u) {
+        if (a < 0.5) {
+            discard;
+        }
+        return vec4<f32>(c, 1.0);
+    }
     if (ENC_OUT) {
         return vec4<f32>(see_enc(c) * w, max(a, 1.0 / 1024.0));
     }
@@ -1054,6 +1125,18 @@ fn fs_part(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4
 @fragment
 fn fs_part_enc(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     ENC_OUT = true;
+    return part_shade(in, front);
+}
+
+@fragment
+fn fs_part_cutout(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    CUTOUT_OUT = 1u;
+    return part_shade(in, front);
+}
+
+@fragment
+fn fs_part_cutout_test(in: PartOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    CUTOUT_OUT = 2u;
     return part_shade(in, front);
 }
 
@@ -1116,7 +1199,8 @@ fn part_shade_low(in: PartOut, base: vec3<f32>, alpha: f32, kind: f32) -> vec4<f
         c = mix(c, fog_rgb_at(in.world), f);
     }
     if (see_through_neon) {
-        let a = 1.0 - visibility * (1.0 - alpha);
+        // DefaultUnifiedNeonFS transparent variant (#460): _1033 = vis * alpha.
+        let a = visibility * alpha;
         if (ENC_OUT) { return see_out(c, a, a); }
         return neon_over_scene(c, a, in.clip.xy);
     }
@@ -1356,7 +1440,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         if (abs(det) > 1e-10) {
             let tangent = (wdx * udy.y - wdy * udx.y) / det;
             let bitangent = (wdy * udx.x - wdx * udy.x) / det;
-            let tn = mat_normal(sa);
+            // The HQ SurfaceAppearance pass fades the tangent-space normal
+            // toward the geometric normal with the environment specular distance.
+            let distance = length(g.cam_pos.xyz - in.world);
+            let normal_weight = clamp(1.0 - distance * ENV_SPEC_FADE, 0.0, 1.0);
+            let tn = mix(vec3<f32>(0.0, 0.0, 1.0), mat_normal(sa), normal_weight);
             let tt = normalize(tangent - n * dot(n, tangent));
             let bb = normalize(bitangent - n * dot(n, bitangent));
             n = normalize(tt * tn.x - bb * tn.y + n * tn.z);
@@ -1578,7 +1666,12 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         let nv = max(dot(n, v), 1e-4);
         let fade = clamp(1.0 - length(g.cam_pos.xyz - in.world) * ENV_SPEC_FADE, 0.0, 1.0);
         let sS = select(0.0, g.sky_grad[1].w * fade, spec_pred(32u, g.env_spec.z > 0.5));
-        let rough = select(g.env_spec.y, ENV_ROUGH_BASE + ENV_ROUGH_SCALE * mat_rough, mat_rough >= 0.0);
+        // DefaultUnifiedFlatOpaqueVS decodes the flat material's gloss
+        // byte to perceptual roughness. SmoothPlastic's highlight matches
+        // byte 36 in the controlled panel captures.
+        let smooth_plastic_rough = ENV_ROUGH_BASE + ENV_ROUGH_SCALE * inverseSqrt(36.0 * 0.17453);
+        let flat_rough = select(g.env_spec.y, smooth_plastic_rough, kind == 2.0);
+        let rough = select(flat_rough, ENV_ROUGH_BASE + ENV_ROUGH_SCALE * mat_rough, mat_rough >= 0.0);
         // Reflectance: Studio draws such parts with PlasticReflectionFS: the
         // albedo becomes the sharp sky reflection by Reflectance, no metal.
         let refl = in.extra.z - 2.0 * step(1.5, in.extra.z);
@@ -1591,7 +1684,9 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         // The sun: GGX (a = roughness⁴), Schlick Fresnel at L·H.
         var sun_spec = vec3<f32>(0.0);
         var fs = vec3<f32>(0.0);
-        if (spec_pred(32u, g.env_spec.z > 0.5)) {
+        // Q21's SmoothPlastic panels use GGX in Soft lighting even
+        // when the selected shadow technique is the voxel grid.
+        if (spec_pred(32u, g.env_spec.z > 0.5) || kind == 2.0) {
             let h = normalize(v + l);
             let nh = max(dot(n, h), 0.001);
             let lh = dot(l, h);
@@ -1600,7 +1695,11 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
             let a = pow(rough, 4.0);
             let d = (nh * a - nh) * nh + 1.0;
             let dterm = (a + a * a) / (d * d * (lh * 3.0 + 0.5) * (nh * 0.75 + 0.25));
-            sun_spec = fs * dterm * ndl * shadow * g.sun_color.rgb * g.sun_dir.w * sun_cover();
+            // The Realistic pass applies cover² to the highlight after
+            // N·L has already been scaled by cover.
+            let cover = sun_cover();
+            let spec_cover = cover * select(cover, 1.0, spec_pred(16u, g.sun_color.w > 0.5));
+            sun_spec = fs * dterm * ndl * shadow * g.sun_color.rgb * g.sun_dir.w * spec_cover;
         }
         let sun_light = g.sun_color.rgb * g.sun_dir.w * ndl * shadow;
         // Lamp1 lights what faces away from Lamp0, through the same shadow
@@ -1699,7 +1798,8 @@ fn part_shade(in: PartOut, front: bool) -> vec4<f32> {
         c = mix(c, fog_rgb_at(in.world), f);
     }
     if (see_through_neon) {
-        let a = 1.0 - visibility * (1.0 - alpha);
+        // DefaultUnifiedNeonFS transparent variant (#460): _1033 = vis * alpha.
+        let a = visibility * alpha;
         // Drawn into the encoded scene: Studio's blend itself.
         if (ENC_OUT) { return see_out(c, a, a); }
         return neon_over_scene(c, a, in.clip.xy);
@@ -2052,22 +2152,26 @@ fn vs_terrain(v: TerrainIn) -> TerrainOut {
     o.clip = g.view_proj * vec4<f32>(p, 1.0);
     o.world = p;
     o.normal = v.normal.xyz;
-    // Grass frame data.x = 2.2 + 1.7 * Lamp0Dir.y. Lamp0Dir points
-    // away from the sun; our sun_dir points toward it.
-    // Actual capture draw248 cb2[3]=(1.2,.6) on the tint path.
-    // Legacy recolor uses (1,0); attenuation is interpolated after VS.
-    let grass_tint = tp.p[v.palette.x * 4u + 2u].w > 0.5;
-    let grass_height = select(vec2<f32>(1.0, 0.0), vec2<f32>(1.2, 0.6), grass_tint);
-    let grass_ao = exp2((-select(1.0, 0.0, v.palette.w == 2u) * grass_height.x + grass_height.y) * (2.2 - 1.7 * g.sun_dir.y));
-    let grass_l = normalize(g.sun_dir.xyz);
-    let grass_v = normalize(g.cam_pos.xyz - p);
-    let grass_h = normalize(grass_l + grass_v);
-    let grass_nl = abs(dot(v.normal.xyz, grass_l));
-    let grass_fade = 1.0 - clamp((length(g.cam_pos.xyz - p) - (GRASS_RADIUS) + 40.0) * 0.025, 0.0, 1.0);
-    o.grass_direct = g.sun_color.rgb * g.sun_dir.w * clamp((grass_nl + 0.9) / 1.9, 0.0, 1.0) * grass_ao;
-    o.grass_view = vec4<f32>(grass_nl * 0.5 + 0.5, abs(dot(grass_h, v.normal.xyz)),
-        dot(grass_v, -grass_l) * grass_fade * grass_ao,
-        pow(clamp(grass_h.y, 0.0, 1.0), 8.0) * grass_fade * grass_ao);
+    // These varyings are read only for grass blades. Ordinary terrain
+    // needs none of the grass lighting work.
+    if (!TERRAIN_LOW && v.palette.w > 0u) {
+        // Grass frame data.x = 2.2 + 1.7 * Lamp0Dir.y. Lamp0Dir points
+        // away from the sun; our sun_dir points toward it.
+        // Actual capture draw248 cb2[3]=(1.2,.6) on the tint path.
+        // Legacy recolor uses (1,0); attenuation is interpolated after VS.
+        let grass_tint = tp.p[v.palette.x * 4u + 2u].w > 0.5;
+        let grass_height = select(vec2<f32>(1.0, 0.0), vec2<f32>(1.2, 0.6), grass_tint);
+        let grass_ao = exp2((-select(1.0, 0.0, v.palette.w == 2u) * grass_height.x + grass_height.y) * (2.2 - 1.7 * g.sun_dir.y));
+        let grass_l = normalize(g.sun_dir.xyz);
+        let grass_v = normalize(g.cam_pos.xyz - p);
+        let grass_h = normalize(grass_l + grass_v);
+        let grass_nl = abs(dot(v.normal.xyz, grass_l));
+        let grass_fade = 1.0 - clamp((length(g.cam_pos.xyz - p) - (GRASS_RADIUS) + 40.0) * 0.025, 0.0, 1.0);
+        o.grass_direct = g.sun_color.rgb * g.sun_dir.w * clamp((grass_nl + 0.9) / 1.9, 0.0, 1.0) * grass_ao;
+        o.grass_view = vec4<f32>(grass_nl * 0.5 + 0.5, abs(dot(grass_h, v.normal.xyz)),
+            dot(grass_v, -grass_l) * grass_fade * grass_ao,
+            pow(clamp(grass_h.y, 0.0, 1.0), 8.0) * grass_fade * grass_ao);
+    }
     let corner = u32(round(v.normal.w * 127.0));
     o.bary = vec3<f32>(f32(corner == 0u), f32(corner == 1u), f32(corner == 2u));
     o.uv01 = vec4<f32>(
@@ -2087,12 +2191,13 @@ fn ycocg(c: vec3<f32>) -> vec3<f32> {
 
 /// One corner's texels (SmoothCluster FS HQ reads three arrays at the
 /// corner's coordinate): recoloured albedo as YCoCg, height, the normal
-/// map's X / Y, roughness and the emissive mask.
+/// map's X / Y, roughness, metalness and the emissive mask.
 struct TerrainSample {
     ycocg: vec3<f32>,
     height: f32,
     nxy: vec2<f32>,
     rough: f32,
+    metal: f32,
     glow: f32,
 };
 
@@ -2106,11 +2211,10 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
     // what Studio draws before its texture arrays fill.
     var t = vec4<f32>(tp.p[pal * 4u + 3u].rgb, 0.5);
     var su = vec4<f32>(0.5, 0.5, 1.0, 0.0);
-    var glow = 0.0;
+    var aux = vec2<f32>(0.0);
     if (blade) {
         t = vec4<f32>(GRASS_BLADE_COLOR, 0.5);
-        // Grass color has no texture tint mask: native multiplies the tint directly.
-        su.a = 1.0;
+        aux.y = 1.0;
     }
     if (layer >= 0 && !blade) {
         // Studio's terrain arrays are 512² (a 1024² pack drops its top
@@ -2121,21 +2225,19 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
         if (cheap) {
             t = textureSampleGrad(mat_albedo, low_material_sampler, uv, layer, dx * k, dy * k);
             if (rc.w > 0.5) {
-                su = textureSampleGrad(mat_surface, low_material_sampler, uv, layer, dx * k, dy * k);
+                aux = textureSampleGrad(mat_emission, low_material_sampler, uv, layer, dx * k, dy * k).rg;
             }
         } else {
             t = textureSampleGrad(mat_albedo, studs_sampler, uv, layer, dx * k, dy * k);
             su = textureSampleGrad(mat_surface, studs_sampler, uv, layer, dx * k, dy * k);
-        }
-        if (!cheap) {
-            glow = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).r;
+            aux = textureSampleGrad(mat_emission, studs_sampler, uv, layer, dx * k, dy * k).rg;
         }
     }
     // MaterialColors recolour (luma scale, chroma turn): Studio bakes it
     // into the array texels, so it blends as YCoCg.
     // A 2022 or MaterialService override layer takes CB4's tint form instead:
     // albedo × mix(1, MaterialColor, tint mask) (row 2 = colour, .w = 1; the
-    // mask rides in the surface map's alpha).
+    // mask rides in the emission texture's green channel).
     var y = ycocg(t.rgb);
     if (rc.w > 0.5) {
         // Captured cb3 = square(base blade RGB * MaterialColor).
@@ -2146,21 +2248,25 @@ fn terrain_sample(uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, pal: u32, blade: 
         let mean = tp.p[pal * 4u + 3u];
         let blade_base = select(vec3<f32>(194.0, 196.0, 188.0) / 255.0, mean.rgb, mean.w > 0.5);
         let tint_base = select(t.rgb, blade_base, blade);
-        let ty = ycocg(tint_base * mix(vec3<f32>(1.0), rc.rgb, su.a));
+        let ty = ycocg(tint_base * mix(vec3<f32>(1.0), rc.rgb, aux.y));
         s.ycocg = ty;
         s.height = t.a;
         s.nxy = su.rg;
         s.rough = su.b;
-        s.glow = glow;
+        s.metal = su.a;
+        s.glow = aux.x;
         return s;
     }
     s.ycocg = vec3<f32>(y.x * rc.x, rc.y * y.y - rc.z * y.z, rc.z * y.y + rc.y * y.z);
     s.height = t.a;
     s.nxy = su.rg;
     s.rough = su.b;
-    s.glow = glow;
+    s.metal = su.a;
+    s.glow = aux.x;
     return s;
 }
+
+override TERRAIN_LOW: bool = false;
 
 @fragment
 fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
@@ -2178,7 +2284,7 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let d1y = dpdy(in.uv01.zw);
     let d2x = dpdx(in.uv2);
     let d2y = dpdy(in.uv2);
-    let cheap = g.perf.w > 0.5 && g.perf.x < 1.5;
+    let cheap = TERRAIN_LOW || (g.perf.w > 0.5 && g.perf.x < 1.5);
     let s0 = terrain_sample(in.uv01.xy, d0x, d0y, in.palette.x, in.palette.w > 0u, cheap);
     let s1 = terrain_sample(in.uv01.zw, d1x, d1y, in.palette.y, in.palette.w > 0u, cheap);
     let s2 = terrain_sample(in.uv2, d2x, d2y, in.palette.z, in.palette.w > 0u, cheap);
@@ -2258,7 +2364,8 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     // Captured Grass VS samples at world + (0,6,0), independent of blade normal.
     let grid_n = select(n0, vec3<f32>(0.0, 1.0, 0.0), in.palette.w > 0u);
     let sv = light_grid(in.world, grid_n);
-    // FS HQ: F0 0.04 with the environment BRDF (PrecomputedBRDF at roughness,
+    // FS HQ blends dielectric F0 with the squared albedo by metalness.
+    // Apply the environment BRDF (PrecomputedBRDF at roughness,
     // N·V), the sun's Schlick Fresnel at L·H; both take their share from the
     // diffuse light, scaled by EnvironmentSpecularScale (fading with distance).
     let v = normalize(g.cam_pos.xyz - in.world);
@@ -2266,15 +2373,22 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let fade = clamp(1.0 - length(g.cam_pos.xyz - in.world) * ENV_SPEC_FADE, 0.0, 1.0);
     let sS = select(0.0, g.sky_grad[1].w * fade, g.env_spec.z > 0.5);
     let ab = brdf_ab(rough, nv);
-    let fe = (0.04 * ab.x + ab.y) / max(ab.x + ab.y, 1e-4);
+    let metal = dot(vec3<f32>(s0.metal, s1.metal, s2.metal), w);
+    let f0 = mix(vec3<f32>(0.04), base, metal);
+    let fe = (f0 * ab.x + ab.y) / max(ab.x + ab.y, 1e-4);
     let hv = normalize(v + l);
     let vh = dot(l, hv);
     let e5 = pow(1.0 - clamp(vh, 0.0, 1.0), 5.0);
-    let fr = e5 + 0.04 * (1.0 - e5);
-    var light = (1.0 - fe * sS) * env_cube(n, sv) + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain()
-        + (1.0 - fr * sS) * g.sun_color.rgb * g.sun_dir.w * ndl * shadow + glow;
-    // SmoothCluster VS/FS includes Lamp1 on faces turned away from the sun.
-    light += g.lamp1.rgb * max(-dot(n, l), 0.0);
+    let fr = e5 + f0 * (1.0 - e5);
+    let sky_diffuse = (1.0 - fe * sS) * env_cube(n, sv);
+    let sun_diffuse = (1.0 - fr * sS) * g.sun_color.rgb * g.sun_dir.w * ndl * shadow;
+    var light = (sky_diffuse + sun_diffuse) * (1.0 - metal)
+        + g.ambient.rgb + g.outdoor.rgb * sv * sky_gain() + glow;
+    // The legacy terrain path lights back faces with Lamp1. The
+    // Realistic SmoothCluster fragment pass only reads Lamp0.
+    if (g.sun_color.w > 0.5) {
+        light += g.lamp1.rgb * max(-dot(n, l), 0.0);
+    }
     light += local_lights(in.world, select(n, n0, g.sun_color.w > 0.5));
     if (in.palette.w > 0u) {
         // SHQ grass variants 3/7 add transmitted sunlight and a narrow
@@ -2309,7 +2423,9 @@ fn fs_terrain(in: TerrainOut) -> @location(0) vec4<f32> {
     let nh = max(dot(n, hv), 0.001);
     let dd = nh * nh * (a2 - 1.0) + 1.0;
     let spec = fr * (a2 + a2 * a2) / (dd * dd * (vh * 3.0 + 0.5) * (nh * 0.75 + 0.25));
-    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade * sun_cover();
+    let cover = sun_cover();
+    let spec_cover = cover * select(cover, 1.0, g.sun_color.w > 0.5);
+    c += g.sun_color.rgb * g.sun_dir.w * spec * ndl * shadow * fade * spec_cover;
     c += env_reflect(reflect(-v, n), rough, sv, false) * fe * sS;
     if (g.fog.z > 0.5) {
         let d = length(in.world - g.cam_pos.xyz);
@@ -2356,6 +2472,12 @@ struct ShadowOut {
     @builtin(position) clip: vec4<f32>,
 };
 
+struct ShadowCutoutOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) alpha: f32,
+};
+
 @vertex
 fn vs_shadow(v: PartIn) -> ShadowOut {
     var o: ShadowOut;
@@ -2367,6 +2489,27 @@ fn vs_shadow(v: PartIn) -> ShadowOut {
         o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }
     return o;
+}
+
+@vertex
+fn vs_shadow_cutout(v: PartIn) -> ShadowCutoutOut {
+    var o: ShadowCutoutOut;
+    o.clip = sunp.vp * vec4<f32>(part_world(v), 1.0);
+    o.clip.z = max(o.clip.z, 0.0);
+    o.uv = v.uv * v.uvt.xy + select(v.uvt.zw, vec2<f32>(0.0), v.uvt.w < 0.0);
+    o.alpha = select(1.0, -v.vcol.a - 1.0, v.vcol.a < -0.5);
+    if (((u32(v.extra.y + 0.5) >> 19u) & 1u) == 1u) {
+        o.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
+    return o;
+}
+
+@fragment
+fn fs_shadow_cutout(i: ShadowCutoutOut) {
+    // Studio DefaultSurfaceAppearanceDitheredDepthFS: discard below 0.5 alpha.
+    if (textureSample(shadow_tex, shadow_tex_sampler, i.uv).a * i.alpha < 0.5) {
+        discard;
+    }
 }
 
 // ---------------------------------------------------------------- lines

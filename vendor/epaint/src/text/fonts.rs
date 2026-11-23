@@ -261,6 +261,12 @@ pub struct FontTweak {
     ///
     /// Default: `4.0`.
     pub tab_size: f32,
+
+    /// rustudio: when used as a fallback face, scale this face by
+    /// `primary_row_height_per_em / fallback_row_height_per_em` so its line
+    /// height matches the primary face (Roblox Studio fallback sizing).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub normalize_line_height: bool,
 }
 
 impl Default for FontTweak {
@@ -275,6 +281,7 @@ impl Default for FontTweak {
             coords: VariationCoords::default(),
             thin_space_width: 0.5,
             tab_size: 4.0,
+            normalize_line_height: false,
         }
     }
 }
@@ -627,6 +634,9 @@ pub(super) struct CachedFamily {
     /// Location-independent (fallback choice depends only on charmap support,
     /// not on variation coordinates).
     pub face_cache: ahash::HashMap<char, FontFaceKey>,
+
+    /// rustudio: cache for emoji-presentation lookup (`char → color face`).
+    pub color_face_cache: ahash::HashMap<char, FontFaceKey>,
 }
 
 impl CachedFamily {
@@ -644,6 +654,7 @@ impl CachedFamily {
                 replacement_face_key: FontFaceKey::INVALID,
                 replacement_char: PRIMARY_REPLACEMENT_CHAR,
                 face_cache: Default::default(),
+                color_face_cache: Default::default(),
             };
         }
 
@@ -653,6 +664,7 @@ impl CachedFamily {
             replacement_face_key: FontFaceKey::INVALID,
             replacement_char: PRIMARY_REPLACEMENT_CHAR,
             face_cache: Default::default(),
+            color_face_cache: Default::default(),
         };
 
         let (replacement_face_key, replacement_char) = slf
@@ -690,6 +702,22 @@ impl CachedFamily {
             }
         }
         None
+    }
+
+    /// rustudio: walk the fallback chain preferring a color-glyph (COLR/CPAL)
+    /// face that supports `c` (for emoji presentation sequences like `1️⃣`, `❤️`).
+    pub(crate) fn find_color_face_for_char(
+        &self,
+        c: char,
+        fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    ) -> Option<FontFaceKey> {
+        for font_key in &self.fonts {
+            let font_face = fonts_by_id.get_mut(font_key).expect("Nonexistent font ID");
+            if font_face.has_color_glyphs() && font_face.glyph_id_resolution(c).is_some() {
+                return Some(*font_key);
+            }
+        }
+        self.find_face_for_char(c, fonts_by_id)
     }
 }
 

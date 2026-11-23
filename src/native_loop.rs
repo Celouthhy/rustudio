@@ -47,8 +47,13 @@ pub fn run(
         hook(&mut builder);
     }
     let event_loop = builder.build()?;
-    // Mailbox doesn't hold frames back to the refresh: pace them ourselves.
-    let pace_refresh = options.wgpu_options.surface.present_mode == eframe::egui_wgpu::wgpu::PresentMode::Mailbox;
+    // Mailbox doesn't hold frames back to the refresh: pace them ourselves,
+    // except on Wayland where egui-wgpu calls window.pre_present_notify() every
+    // frame and winit already holds RedrawRequested until the compositor's
+    // wl_surface.frame callback (the exact display refresh). A second timer on
+    // top of wl_surface.frame drifts past vblank and drops frames to half rate.
+    let pace_refresh = !is_wayland(&event_loop)
+        && options.wgpu_options.surface.present_mode == eframe::egui_wgpu::wgpu::PresentMode::Mailbox;
     let app_handle = RefCell::new(None);
     let initialized = Cell::new(false);
     let eframe = eframe::create_native(
@@ -70,7 +75,8 @@ pub fn run(
         wheel_received: None,
         last_wheel: None,
         pace_refresh,
-        refresh: None,
+        refresh_mhz: None,
+        pace_next: None,
         idle_since: None,
         redraw_wanted: None,
     })?;
@@ -90,12 +96,16 @@ struct NativeLoop<'a> {
     root_window: Option<WindowId>,
     wheel_received: Option<Instant>,
     last_wheel: Option<Instant>,
-    /// Mailbox presentation: an Unlimited frame limit means the display's
+    /// Mailbox presentation on platforms without compositor frame callbacks
+    /// (X11, Windows, macOS): an Unlimited frame limit means the display's
     /// refresh rate, as Studio's own frame cap does, so the GPU never runs
     /// unbounded (FIFO did this pacing by blocking the main thread).
     pace_refresh: bool,
-    /// (when read, Hz): the fastest connected display, re-read every 2 s.
-    refresh: Option<(Instant, u32)>,
+    /// (when read, mHz): the fastest connected display, re-read every 2 s.
+    refresh_mhz: Option<(Instant, u32)>,
+    /// Phase-locked next redraw deadline for software frame pacing (explicit
+    /// 60/30 FPS cap, or Mailbox on non-Wayland platforms).
+    pace_next: Option<Instant>,
     /// When the loop last went idle (--bench sleep accounting).
     idle_since: Option<Instant>,
     /// The earliest root redraw asked for and not yet drawn (hidden-window
@@ -158,6 +168,9 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
             })
         });
         if root && redraw {
+            self.pace_next = self
+                .pace_period(event_loop)
+                .map(|period| next_paced_deadline(self.pace_next, Instant::now(), period));
             // The display frame starts with the redraw (UI, paint, present);
             // app.rs leaves the boundary to this loop when it runs.
             NATIVE_FRAMES.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -188,13 +201,14 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
         #[allow(irrefutable_let_patterns)]
         if let UserEvent::RequestRepaint { viewport_id, when, .. } = &mut event {
             if *viewport_id == egui::ViewportId::ROOT {
-                let mut hz = [0, 60, 30][rustudio_core::rustudio_settings::performance_choice("fps")];
-                if hz == 0 && self.pace_refresh {
-                    hz = self.refresh_hz(event_loop);
-                }
-                if hz > 0 {
-                    if let Some(last) = self.last_ui_frame() {
-                        *when = (*when).max(last + Duration::from_secs_f64(1.0 / hz as f64));
+                if let Some(period) = self.pace_period(event_loop) {
+                    let now = Instant::now();
+                    let floor = self
+                        .pace_next
+                        .map(|due| due.min(now + period))
+                        .or_else(|| self.last_ui_frame().map(|last| last + period));
+                    if let Some(floor) = floor {
+                        *when = (*when).max(floor);
                     }
                 }
             }
@@ -247,15 +261,27 @@ impl ApplicationHandler<UserEvent> for NativeLoop<'_> {
 }
 
 impl NativeLoop<'_> {
-    fn refresh_hz(&mut self, event_loop: &ActiveEventLoop) -> u32 {
-        if let Some((at, hz)) = self.refresh {
+    fn pace_period(&mut self, event_loop: &ActiveEventLoop) -> Option<Duration> {
+        let cap_mhz = rustudio_core::rustudio_settings::fps_limit().map_or(0, |f| (f * 1000.0).round() as u32);
+        let mhz = if cap_mhz > 0 {
+            cap_mhz
+        } else if self.pace_refresh && eframe::egui_wgpu::winit::root_surface_uses_mailbox() {
+            self.refresh_mhz(event_loop)
+        } else {
+            return None;
+        };
+        Some(frame_period(mhz))
+    }
+
+    fn refresh_mhz(&mut self, event_loop: &ActiveEventLoop) -> u32 {
+        if let Some((at, mhz)) = self.refresh_mhz {
             if at.elapsed() < Duration::from_secs(2) {
-                return hz;
+                return mhz;
             }
         }
-        let hz = refresh_cap(event_loop.available_monitors().filter_map(|m| m.refresh_rate_millihertz()));
-        self.refresh = Some((Instant::now(), hz));
-        hz
+        let mhz = refresh_cap_mhz(event_loop.available_monitors().filter_map(|m| m.refresh_rate_millihertz()));
+        self.refresh_mhz = Some((Instant::now(), mhz));
+        mhz
     }
 
     fn last_ui_frame(&self) -> Option<Instant> {
@@ -263,10 +289,38 @@ impl NativeLoop<'_> {
     }
 }
 
-/// The redraw cap for mailbox presentation: the fastest display's refresh
-/// rate (a window can move to it), 60 Hz when none reports one.
-fn refresh_cap(millihertz: impl Iterator<Item = u32>) -> u32 {
-    millihertz.map(|m| (m + 500) / 1000).filter(|hz| *hz >= 24).max().unwrap_or(60)
+fn is_wayland(event_loop: &EventLoop<UserEvent>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::EventLoopExtWayland;
+        event_loop.is_wayland()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = event_loop;
+        false
+    }
+}
+
+/// The redraw cap for mailbox presentation on non-Wayland platforms: the
+/// fastest display's refresh rate in millihertz (a window can move to it),
+/// 60 Hz when none reports one.
+fn refresh_cap_mhz(millihertz: impl Iterator<Item = u32>) -> u32 {
+    millihertz.filter(|m| *m >= 24_000).max().unwrap_or(60_000)
+}
+
+fn frame_period(millihertz: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000_000u64 / u64::from(millihertz.max(1)))
+}
+
+/// Phase-locked frame deadline so timer wakeup slack doesn't accumulate across
+/// frames, while re-anchoring after an idle gap, early input redraw, or overrun
+/// so no catch-up burst runs.
+fn next_paced_deadline(prev: Option<Instant>, now: Instant, period: Duration) -> Instant {
+    match prev {
+        Some(due) if now >= due && now.saturating_duration_since(due) < period => due + period,
+        _ => now + period,
+    }
 }
 
 fn wheel_trace_enabled() -> bool {
@@ -288,9 +342,28 @@ mod tests {
 
     #[test]
     fn mailbox_redraws_are_capped_at_the_fastest_display() {
-        assert_eq!(refresh_cap([59_951, 143_998].into_iter()), 144);
-        assert_eq!(refresh_cap(std::iter::empty()), 60);
-        assert_eq!(refresh_cap([0].into_iter()), 60);
+        assert_eq!(refresh_cap_mhz([59_951, 143_998].into_iter()), 143_998);
+        assert_eq!(refresh_cap_mhz(std::iter::empty()), 60_000);
+        assert_eq!(refresh_cap_mhz([0].into_iter()), 60_000);
+        assert_eq!(frame_period(144_000), Duration::from_nanos(6_944_444));
+        assert_eq!(frame_period(143_912), Duration::from_nanos(6_948_690));
+    }
+
+    #[test]
+    fn paced_deadline_keeps_grid_without_catchup_burst() {
+        let t0 = Instant::now();
+        let period = frame_period(144_000);
+        let d1 = next_paced_deadline(None, t0, period);
+        assert_eq!(d1, t0 + period);
+        // Slightly late wakeup stays on the grid instead of drifting forward.
+        let d2 = next_paced_deadline(Some(d1), d1 + Duration::from_micros(300), period);
+        assert_eq!(d2, t0 + period * 2);
+        // Idle gap (> 1 period late) re-anchors instead of bursting.
+        let after_idle = d2 + period * 3;
+        assert_eq!(next_paced_deadline(Some(d2), after_idle, period), after_idle + period);
+        // Early input-driven redraw re-anchors forward from now.
+        let early = d2 - Duration::from_millis(2);
+        assert_eq!(next_paced_deadline(Some(d2), early, period), early + period);
     }
 
     #[test]

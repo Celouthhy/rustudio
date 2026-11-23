@@ -147026,6 +147026,28 @@
                 {
                     "Category": "JobInfo",
                     "MemberType": "Property",
+                    "Name": "ServerRegion",
+                    "Security": {
+                        "Read": "None",
+                        "Write": "None"
+                    },
+                    "Serialization": {
+                        "CanLoad": false,
+                        "CanSave": false
+                    },
+                    "Tags": [
+                        "ReadOnly",
+                        "NotReplicated"
+                    ],
+                    "ThreadSafety": "ReadSafe",
+                    "ValueType": {
+                        "Category": "Primitive",
+                        "Name": "string"
+                    }
+                },
+                {
+                    "Category": "JobInfo",
+                    "MemberType": "Property",
                     "Name": "JobId",
                     "Security": {
                         "Read": "None",

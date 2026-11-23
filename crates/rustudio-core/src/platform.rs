@@ -25,9 +25,83 @@ pub fn resident_bytes() -> Option<u64> {
             (r == libc::KERN_SUCCESS).then_some(info.resident_size)
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                ppsmem_counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        // SAFETY: GetCurrentProcess returns the pseudo-handle for this process;
+        // K32GetProcessMemoryInfo fills our sized POD struct.
+        unsafe {
+            let mut pmc: ProcessMemoryCounters = std::mem::zeroed();
+            pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            let h = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            (K32GetProcessMemoryInfo(h, &raw mut pmc, pmc.cb) != 0)
+                .then_some(pmc.working_set_size as u64)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         None
+    }
+}
+
+/// Whether the host is under physical memory pressure.
+pub fn low_memory() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Memory::{
+                CreateMemoryResourceNotification, LowMemoryResourceNotification,
+                QueryMemoryResourceNotification,
+            },
+        };
+        // The notification handle belongs to this call.
+        unsafe {
+            let handle = CreateMemoryResourceNotification(LowMemoryResourceNotification);
+            if handle.is_null() {
+                return false;
+            }
+            let mut low = 0;
+            let ok = QueryMemoryResourceNotification(handle, &mut low);
+            CloseHandle(handle);
+            ok != 0 && low != 0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // MemAvailable includes reclaimable caches and is reported in KiB.
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|info| {
+                info.lines().find_map(|line| {
+                    line.strip_prefix("MemAvailable:")?.split_whitespace().next()?.parse::<u64>().ok()
+                })
+            })
+            .is_some_and(|available| available < 256 * 1024)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
     }
 }
 

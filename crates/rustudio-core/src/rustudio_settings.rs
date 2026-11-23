@@ -75,6 +75,173 @@ pub struct Opt {
 
 pub const SOLVERS: &[(&str, &str)] = &[("studio", "Studio solver (default)"), ("rapier", "Legacy (rapier)")];
 
+/// Implementation choice for a tool that exists both natively in rustudio and
+/// as a Roblox Studio built-in plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolImpl {
+    #[default]
+    Rustudio,
+    Roblox,
+}
+
+impl ToolImpl {
+    pub fn id(self) -> &'static str {
+        match self {
+            ToolImpl::Rustudio => "rustudio",
+            ToolImpl::Roblox => "roblox",
+        }
+    }
+}
+
+pub const TOOL_IMPLS: &[(&str, &str)] = &[("rustudio", "rustudio's"), ("roblox", "Roblox's")];
+
+/// Duplicated Studio tools that can use either rustudio's native
+/// implementation or Roblox's built-in plugin when built-in plugins are on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinTool {
+    Toolbox,
+    TerrainEditor,
+    Draggers,
+    ViewSelector,
+    RigBuilder,
+    MaterialPicker,
+}
+
+impl BuiltinTool {
+    pub const ALL: [BuiltinTool; 6] = [
+        BuiltinTool::Toolbox,
+        BuiltinTool::TerrainEditor,
+        BuiltinTool::Draggers,
+        BuiltinTool::ViewSelector,
+        BuiltinTool::RigBuilder,
+        BuiltinTool::MaterialPicker,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            BuiltinTool::Toolbox => "builtin_toolbox",
+            BuiltinTool::TerrainEditor => "builtin_terrain_editor",
+            BuiltinTool::Draggers => "builtin_draggers",
+            BuiltinTool::ViewSelector => "builtin_view_selector",
+            BuiltinTool::RigBuilder => "builtin_rig_builder",
+            BuiltinTool::MaterialPicker => "builtin_material_picker",
+        }
+    }
+
+    pub fn env(self) -> &'static str {
+        match self {
+            BuiltinTool::Toolbox => "RUSTUDIO_BUILTIN_TOOLBOX",
+            BuiltinTool::TerrainEditor => "RUSTUDIO_BUILTIN_TERRAIN_EDITOR",
+            BuiltinTool::Draggers => "RUSTUDIO_BUILTIN_DRAGGERS",
+            BuiltinTool::ViewSelector => "RUSTUDIO_BUILTIN_VIEW_SELECTOR",
+            BuiltinTool::RigBuilder => "RUSTUDIO_BUILTIN_RIG_BUILDER",
+            BuiltinTool::MaterialPicker => "RUSTUDIO_BUILTIN_MATERIAL_PICKER",
+        }
+    }
+
+    /// Maps a Studio built-in `.rbxm` file stem to the duplicated tool it
+    /// implements, if any.
+    pub fn for_plugin_stem(stem: &str) -> Option<Self> {
+        if stem.eq_ignore_ascii_case("Toolbox") {
+            Some(BuiltinTool::Toolbox)
+        } else if stem.eq_ignore_ascii_case("TerrainEditor")
+            || stem.eq_ignore_ascii_case("TerrainPaletteEditor")
+        {
+            Some(BuiltinTool::TerrainEditor)
+        } else if stem.eq_ignore_ascii_case("SelectDragger")
+            || stem.eq_ignore_ascii_case("MoveDragger")
+            || stem.eq_ignore_ascii_case("RotateDragger")
+            || stem.eq_ignore_ascii_case("ScaleDragger")
+        {
+            Some(BuiltinTool::Draggers)
+        } else if stem.eq_ignore_ascii_case("ViewSelector") {
+            Some(BuiltinTool::ViewSelector)
+        } else if stem.eq_ignore_ascii_case("RigGenerator") {
+            Some(BuiltinTool::RigBuilder)
+        } else if stem.eq_ignore_ascii_case("MaterialPicker") {
+            Some(BuiltinTool::MaterialPicker)
+        } else {
+            None
+        }
+    }
+}
+
+/// Snapshot of the built-in plugin toggle and per-tool choices latched for a
+/// place session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BuiltinToolChoices {
+    pub plugins_enabled: bool,
+    pub toolbox: ToolImpl,
+    pub terrain_editor: ToolImpl,
+    pub draggers: ToolImpl,
+    pub view_selector: ToolImpl,
+    pub rig_builder: ToolImpl,
+    pub material_picker: ToolImpl,
+}
+
+impl BuiltinToolChoices {
+    /// Reads the live settings (`env > saved > default`).
+    pub fn from_settings() -> Self {
+        Self {
+            plugins_enabled: builtin_plugins(),
+            toolbox: builtin_tool_impl(BuiltinTool::Toolbox),
+            terrain_editor: builtin_tool_impl(BuiltinTool::TerrainEditor),
+            draggers: builtin_tool_impl(BuiltinTool::Draggers),
+            view_selector: builtin_tool_impl(BuiltinTool::ViewSelector),
+            rig_builder: builtin_tool_impl(BuiltinTool::RigBuilder),
+            material_picker: builtin_tool_impl(BuiltinTool::MaterialPicker),
+        }
+    }
+
+    /// All duplicated tools set to Roblox's plugin (used by synthetic host
+    /// tests and the eager 58-plugin survey).
+    pub fn all_roblox() -> Self {
+        Self {
+            plugins_enabled: true,
+            toolbox: ToolImpl::Roblox,
+            terrain_editor: ToolImpl::Roblox,
+            draggers: ToolImpl::Roblox,
+            view_selector: ToolImpl::Roblox,
+            rig_builder: ToolImpl::Roblox,
+            material_picker: ToolImpl::Roblox,
+        }
+    }
+
+    pub fn get(self, tool: BuiltinTool) -> ToolImpl {
+        match tool {
+            BuiltinTool::Toolbox => self.toolbox,
+            BuiltinTool::TerrainEditor => self.terrain_editor,
+            BuiltinTool::Draggers => self.draggers,
+            BuiltinTool::ViewSelector => self.view_selector,
+            BuiltinTool::RigBuilder => self.rig_builder,
+            BuiltinTool::MaterialPicker => self.material_picker,
+        }
+    }
+
+    /// True only when built-in plugins are enabled AND this tool is set to
+    /// Roblox's plugin.
+    pub fn use_roblox(self, tool: BuiltinTool) -> bool {
+        self.plugins_enabled && self.get(tool) == ToolImpl::Roblox
+    }
+
+    pub fn use_native(self, tool: BuiltinTool) -> bool {
+        !self.use_roblox(tool)
+    }
+
+    /// Whether a built-in `.rbxm` file stem should be registered/loaded under
+    /// these choices. Non-duplicated built-in plugins always load when
+    /// `plugins_enabled` is true.
+    pub fn should_load_builtin_stem(self, stem: &str) -> bool {
+        if !self.plugins_enabled {
+            return false;
+        }
+        match BuiltinTool::for_plugin_stem(stem) {
+            Some(tool) => self.use_roblox(tool),
+            None => true,
+        }
+    }
+}
+
 pub const OPTS: &[Opt] = &[
     Opt { key: "quality", cat: "Performance", label: "Graphics quality", desc: "Automatic adjusts the viewport quality level using recent frame times. Manual uses the settings below.", env: "RUSTUDIO_PERF_QUALITY", kind: OptKind::Choice(&[("manual", "Manual"), ("automatic", "Automatic")]) },
     Opt { key: "resolution", cat: "Performance", label: "3D resolution", desc: "Scales the 3D scene while keeping editor text sharp. The biggest saving on a weak graphics chip: 50% draws a quarter of the pixels.", env: "RUSTUDIO_PERF_RESOLUTION", kind: OptKind::Choice(&[("100", "100%"), ("75", "75%"), ("50", "50%"), ("33", "33%"), ("25", "25%")]) },
@@ -83,7 +250,7 @@ pub const OPTS: &[Opt] = &[
     Opt { key: "shadows", cat: "Performance", label: "Shadow quality", desc: "Reduced draws smaller sun shadow tiles. Off also disables local light shadows.", env: "RUSTUDIO_PERF_SHADOWS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
     Opt { key: "grass", cat: "Performance", label: "Grass detail", desc: "Reduced grows fewer blades over a shorter distance.", env: "RUSTUDIO_PERF_GRASS", kind: OptKind::Choice(&[("full", "Full"), ("reduced", "Reduced"), ("off", "Off")]) },
     Opt { key: "bloom", cat: "Performance", label: "Glow effects", desc: "Controls the bloom glow around bright surfaces.", env: "RUSTUDIO_PERF_BLOOM", kind: OptKind::Choice(&[("on", "On"), ("off", "Off")]) },
-    Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(&[("unlimited", "Unlimited"), ("60", "60 FPS"), ("30", "30 FPS")]) },
+    Opt { key: "fps", cat: "Performance", label: "Editor frame limit", desc: "Limits scheduled editor and playtest redraws. Input and window changes can redraw immediately.", env: "RUSTUDIO_PERF_FPS", kind: OptKind::Choice(FPS_PRESETS) },
     Opt { key: "present", cat: "Performance", label: "Presentation", desc: "Low latency shows each finished frame at the next screen refresh without waiting for one, like Studio, and paces redraws to the frame limit (the screen's refresh rate when Unlimited). Wait for vsync blocks each frame on the refresh. Applies after a restart.", env: "RUSTUDIO_PERF_PRESENT", kind: OptKind::Choice(&[("mailbox", "Low latency"), ("fifo", "Wait for vsync")]) },
     Opt { key: "idle", cat: "Performance", label: "Idle grass animation", desc: "Pauses grass animation redraws while the editor is idle.", env: "RUSTUDIO_PERF_IDLE", kind: OptKind::Choice(&[("animate", "Animate"), ("pause", "Pause when idle")]) },
     Opt { key: "background", cat: "Performance", label: "Hidden window", desc: "Keeps a running playtest and Team Create going while the window is on another workspace or minimized, without drawing (as Studio does behind other windows). Pause freezes them until the window shows again.", env: "RUSTUDIO_PERF_BACKGROUND", kind: OptKind::Choice(&[("run", "Keep running"), ("pause", "Pause")]) },
@@ -133,6 +300,78 @@ pub const OPTS: &[Opt] = &[
         label: "Use live DataStores",
         desc: "Off: in a published place, saves made while playing stay in memory and are thrown away when Play stops. On: Play reads and writes the place's real DataStores, MemoryStores and Messaging, like Studio with API access enabled. Next Play.",
         env: "RUSTUDIO_LIVE_DATA",
+        kind: OptKind::Bool,
+    },
+    Opt {
+        key: "core_scripts",
+        cat: "Play",
+        label: "Roblox's CoreScripts",
+        desc: "Play runs Roblox's own CoreScripts and CorePackages from Studio's data model patch (in-game chat, top bar, player list and escape menu) when installed, falling back to rustudio's built-in UI when absent or turned off. Next Play.",
+        env: "RUSTUDIO_CORE_SCRIPTS",
+        kind: OptKind::Bool,
+    },
+    Opt {
+        key: "builtin_plugins",
+        cat: "Plugins",
+        label: "Roblox's built-in plugins (experimental)",
+        desc: "Loads Roblox Studio's own built-in plugins from Studio's BuiltInPlugins folder in Edit mode when installed. Off by default. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_PLUGINS",
+        kind: OptKind::Bool,
+    },
+    Opt {
+        key: "builtin_toolbox",
+        cat: "Plugins",
+        label: "Toolbox",
+        desc: "Use rustudio's native Toolbox or Roblox's built-in Toolbox plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_TOOLBOX",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_terrain_editor",
+        cat: "Plugins",
+        label: "Terrain Editor",
+        desc: "Use rustudio's native Terrain Editor or Roblox's built-in TerrainEditor plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_TERRAIN_EDITOR",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_draggers",
+        cat: "Plugins",
+        label: "Select / Move / Scale / Rotate",
+        desc: "Use rustudio's native viewport tools or Roblox's built-in Select, Move, Scale and Rotate dragger plugins. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_DRAGGERS",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_view_selector",
+        cat: "Plugins",
+        label: "View cube",
+        desc: "Use rustudio's native viewport orientation cube or Roblox's built-in ViewSelector plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_VIEW_SELECTOR",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_rig_builder",
+        cat: "Plugins",
+        label: "Character / Rig Builder",
+        desc: "Use rustudio's native Character builder or Roblox's built-in RigGenerator plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_RIG_BUILDER",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "builtin_material_picker",
+        cat: "Plugins",
+        label: "Material Picker",
+        desc: "Use rustudio's native Material picker or Roblox's built-in MaterialPicker plugin. Applies when opening a place or restarting.",
+        env: "RUSTUDIO_BUILTIN_MATERIAL_PICKER",
+        kind: OptKind::Choice(TOOL_IMPLS),
+    },
+    Opt {
+        key: "project_any_path",
+        cat: "Projects",
+        label: "Let project files reach outside their repository",
+        desc: "Off: a project file's $path, symlinks and write-back stay inside the git repository the project file is in (its folder when it isn't in one), so a downloaded project can't read or overwrite other files on your computer. On: any path the project names is used, as in Rojo. Applies the next time a project opens.",
+        env: "RUSTUDIO_PROJECT_ANY_PATH",
         kind: OptKind::Bool,
     },
     Opt {
@@ -314,6 +553,15 @@ pub fn resolve_live_data(env: Option<&str>, saved: Option<&Value>) -> bool {
     }
 }
 
+/// Project paths outside the project's repository: `RUSTUDIO_PROJECT_ANY_PATH=1`
+/// when set, then saved, then off (project.rs `bound`).
+pub fn project_any_path() -> bool {
+    match env("RUSTUDIO_PROJECT_ANY_PATH") {
+        Some(v) => v == "1",
+        None => saved("project_any_path").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
+}
+
 pub fn live_data_now() -> bool {
     resolve_live_data(env("RUSTUDIO_LIVE_DATA").as_deref(), saved("live_data").as_ref())
 }
@@ -341,6 +589,115 @@ pub fn update_check() -> bool {
 
 pub fn local_assets() -> Option<PathBuf> {
     resolve_local_assets(env("RUSTUDIO_LOCAL_ASSETS").as_deref(), saved("local_assets").as_ref())
+}
+
+/// Roblox's CoreScripts in Play (core_scripts.rs): `RUSTUDIO_CORE_SCRIPTS`
+/// when set (`0` / `false` / `off` turns them off; any other value turns them
+/// on), then saved, then on by default (falling back silently to native UI when
+/// Studio's DataModelPatch.rbxm is not installed).
+pub fn resolve_core_scripts(env: Option<&str>, saved: Option<&Value>) -> bool {
+    match env {
+        Some(v) => !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")),
+        None => saved.and_then(Value::as_bool).unwrap_or(true),
+    }
+}
+
+pub fn core_scripts() -> bool {
+    resolve_core_scripts(env("RUSTUDIO_CORE_SCRIPTS").as_deref(), saved("core_scripts").as_ref())
+}
+
+/// True only when the user explicitly forced CoreScripts on via
+/// `RUSTUDIO_CORE_SCRIPTS=1` (so missing `DataModelPatch.rbxm` reports an error
+/// instead of silently falling back to the native UI).
+pub fn core_scripts_forced() -> bool {
+    matches!(env("RUSTUDIO_CORE_SCRIPTS").as_deref(), Some(v) if !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+}
+
+/// Roblox Studio's built-in plugins (experimental): `RUSTUDIO_BUILTIN_PLUGINS`
+/// when set (`""` / `0` / `false` / `off` turns them off; `1` / `true` / `on`
+/// or a comma-separated list of plugin names turns them on), then saved, then
+/// off by default.
+pub fn resolve_builtin_plugins(env: Option<&str>, saved: Option<&Value>) -> bool {
+    match env {
+        Some(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        None => saved.and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+pub fn builtin_plugins() -> bool {
+    resolve_builtin_plugins(env("RUSTUDIO_BUILTIN_PLUGINS").as_deref(), saved("builtin_plugins").as_ref())
+}
+
+/// Implementation choice for a duplicated tool: env var (`rustudio`|`roblox`,
+/// also `native`/`0`/`false` and `plugin`/`1`/`true`), then saved, then
+/// `ToolImpl::Rustudio`.
+pub fn resolve_tool_impl(env: Option<&str>, saved: Option<&Value>) -> ToolImpl {
+    match env {
+        Some(v) => {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("roblox")
+                || v.eq_ignore_ascii_case("plugin")
+                || v == "1"
+                || v.eq_ignore_ascii_case("true")
+            {
+                ToolImpl::Roblox
+            } else if v.is_empty()
+                || v.eq_ignore_ascii_case("rustudio")
+                || v.eq_ignore_ascii_case("native")
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+            {
+                ToolImpl::Rustudio
+            } else {
+                eprintln!("rustudio: unknown tool choice {v:?} (rustudio|roblox), using rustudio");
+                ToolImpl::Rustudio
+            }
+        }
+        None => match saved.and_then(Value::as_str) {
+            Some(v) if v.eq_ignore_ascii_case("roblox") => ToolImpl::Roblox,
+            _ => ToolImpl::Rustudio,
+        },
+    }
+}
+
+/// Configured choice for one duplicated tool (ignoring whether `builtin_plugins`
+/// is on; used by the settings UI and `BuiltinToolChoices::from_settings`).
+pub fn builtin_tool_impl(tool: BuiltinTool) -> ToolImpl {
+    resolve_tool_impl(env(tool.env()).as_deref(), saved(tool.key()).as_ref())
+}
+
+/// Effective choice: true only when built-in plugins are enabled and this tool
+/// is configured to use Roblox's plugin.
+pub fn use_roblox_tool(tool: BuiltinTool) -> bool {
+    builtin_plugins() && builtin_tool_impl(tool) == ToolImpl::Roblox
+}
+
+/// Optional comma-separated filter from `RUSTUDIO_BUILTIN_PLUGINS` (e.g.
+/// `AlignmentTool,TerrainEditor`). Returns `None` when all built-in plugins
+/// should load (`1` / `true` / `on` / saved setting).
+pub fn builtin_plugins_filter() -> Option<Vec<String>> {
+    let raw = env("RUSTUDIO_BUILTIN_PLUGINS")?;
+    let v = raw.trim();
+    if v.is_empty()
+        || v == "0"
+        || v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("on")
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("all")
+    {
+        return None;
+    }
+    let list: Vec<String> = v
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 // ------------------------------------------------------------------ latched per Play
@@ -439,6 +796,28 @@ pub fn overridden_by(o: &Opt) -> Option<&'static str> {
     None
 }
 
+/// Options read once at startup (or when a place opens): changing one shows
+/// "Restart" beside its label until the app restarts.
+const RESTART_KEYS: &[&str] = &["present", "builtin_plugins"];
+
+static FIRST_SHOWN: std::sync::Mutex<Option<std::collections::HashMap<&'static str, String>>> =
+    std::sync::Mutex::new(None);
+
+/// The option was changed this run and only takes effect after a restart.
+pub fn restart_pending(o: &Opt) -> bool {
+    if !RESTART_KEYS.contains(&o.key) {
+        return false;
+    }
+    let now = match shown(o) {
+        Shown::Bool(b) => b.to_string(),
+        Shown::Choice(n) => n.to_string(),
+        Shown::Path(p) => p,
+    };
+    let mut first = FIRST_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let first = first.get_or_insert_with(Default::default).entry(o.key).or_insert_with(|| now.clone());
+    *first != now
+}
+
 /// What the row shows now (the effective value, env included).
 pub enum Shown {
     Bool(bool),
@@ -488,6 +867,15 @@ pub fn shown(o: &Opt) -> Shown {
         "spin_guard" => Shown::Bool(spin_guard_now()),
         "client_link" => Shown::Bool(client_link_now()),
         "live_data" => Shown::Bool(live_data_now()),
+        "core_scripts" => Shown::Bool(core_scripts()),
+        "builtin_plugins" => Shown::Bool(builtin_plugins()),
+        "builtin_toolbox" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::Toolbox) == ToolImpl::Roblox)),
+        "builtin_terrain_editor" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::TerrainEditor) == ToolImpl::Roblox)),
+        "builtin_draggers" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::Draggers) == ToolImpl::Roblox)),
+        "builtin_view_selector" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::ViewSelector) == ToolImpl::Roblox)),
+        "builtin_rig_builder" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::RigBuilder) == ToolImpl::Roblox)),
+        "builtin_material_picker" => Shown::Choice(usize::from(builtin_tool_impl(BuiltinTool::MaterialPicker) == ToolImpl::Roblox)),
+        "project_any_path" => Shown::Bool(project_any_path()),
         "classic_death_sound" => Shown::Bool(classic_death_sound_fetch()),
         "update_check" => Shown::Bool(update_check()),
         "local_assets" => Shown::Path(local_assets().map(|p| p.display().to_string()).unwrap_or_default()),
@@ -495,19 +883,56 @@ pub fn shown(o: &Opt) -> Shown {
     }
 }
 
-/// Greyed because another option makes it meaningless (spin guard under Legacy).
+/// Greyed and disabled because another option makes it meaningless (spin guard
+/// under Legacy solver; per-tool built-in choices when built-in plugins are off).
 pub fn inactive(o: &Opt) -> Option<&'static str> {
-    (o.key == "spin_guard" && solver_now() == SolverKind::Rapier).then_some("Legacy solver")
+    if o.key == "spin_guard" && solver_now() == SolverKind::Rapier {
+        return Some("No effect with the Legacy solver.");
+    }
+    if BuiltinTool::ALL.iter().any(|t| t.key() == o.key) && !builtin_plugins() {
+        return Some("Turn on Roblox's built-in plugins to choose.");
+    }
+    None
 }
 
-/// The default of an on/off option (only Use live DataStores starts off).
+/// The default of an on/off option (Use live DataStores, project paths
+/// outside the repository and built-in plugins start off; Roblox's CoreScripts
+/// start on).
 pub fn bool_default(key: &str) -> bool {
-    key != "live_data"
+    !matches!(key, "live_data" | "project_any_path" | "builtin_plugins")
 }
 
 /// The dialog writes a value: defaults are removed from the file.
 pub fn set_bool(key: &str, b: bool) {
     set(key, (b != bool_default(key)).then_some(Value::Bool(b)));
+}
+
+/// The Editor frame limit's presets (any other whole number can be typed in).
+pub const FPS_PRESETS: &[(&str, &str)] = &[
+    ("unlimited", "Unlimited"),
+    ("30", "30 FPS"),
+    ("60", "60 FPS"),
+    ("75", "75 FPS"),
+    ("90", "90 FPS"),
+    ("120", "120 FPS"),
+    ("144", "144 FPS"),
+    ("165", "165 FPS"),
+    ("240", "240 FPS"),
+    ("360", "360 FPS"),
+];
+
+/// The Editor frame limit in frames per second (None: Unlimited). A preset
+/// or a typed number, from RUSTUDIO_PERF_FPS or the saved setting.
+pub fn fps_limit() -> Option<f32> {
+    let v = env("RUSTUDIO_PERF_FPS").or_else(|| saved("fps")?.as_str().map(str::to_owned))?;
+    parse_fps(&v)
+}
+
+/// "144", "144 FPS", "97.5" → frames per second; "unlimited", 0 or junk → None.
+pub fn parse_fps(v: &str) -> Option<f32> {
+    let t = v.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
+    let f: f32 = t.trim().parse().ok()?;
+    (f.is_finite() && f >= 1.0).then(|| f.min(1000.0))
 }
 
 pub fn set_choice(key: &str, v: &str, default: &str) {
@@ -524,6 +949,29 @@ pub fn set_path(key: &str, v: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn frame_limit_takes_presets_and_typed_numbers() {
+        assert_eq!(parse_fps("unlimited"), None);
+        assert_eq!(parse_fps("144"), Some(144.0));
+        assert_eq!(parse_fps(" 97.5 fps"), Some(97.5));
+        assert_eq!(parse_fps("0"), None);
+        assert_eq!(parse_fps("-5"), None);
+        assert_eq!(parse_fps("5000"), Some(1000.0));
+        assert_eq!(parse_fps("abc"), None);
+    }
+
+    #[test]
+    fn restart_shows_only_while_a_restart_option_differs_from_startup() {
+        let o = opt("present");
+        let start = matches!(shown(o), Shown::Choice(1));
+        assert!(!restart_pending(o));
+        set_choice("present", if start { "mailbox" } else { "fifo" }, "mailbox");
+        assert!(restart_pending(o));
+        set_choice("present", if start { "fifo" } else { "mailbox" }, "mailbox");
+        assert!(!restart_pending(o));
+        assert!(!restart_pending(opt("core_scripts")));
+    }
 
     #[test]
     fn env_beats_saved_beats_default() {
@@ -552,11 +1000,106 @@ mod tests {
         assert!(!resolve_live_data(Some("0"), Some(&json!(true))));
         assert!(!resolve_live_data(Some(""), Some(&json!(true))));
         assert!(resolve_live_data(Some("1"), Some(&json!(false))));
+        // CoreScripts: on by default, off with "0" / "false" / "off" or saved false.
+        assert!(resolve_core_scripts(None, None));
+        assert!(!resolve_core_scripts(None, Some(&json!(false))));
+        assert!(resolve_core_scripts(Some("1"), Some(&json!(false))));
+        assert!(!resolve_core_scripts(Some("0"), Some(&json!(true))));
+        assert!(!resolve_core_scripts(Some("false"), Some(&json!(true))));
+        assert!(!resolve_core_scripts(Some("off"), None));
+        assert!(bool_default("core_scripts"));
+        // Built-in plugins: off by default, on with "1" / "true" / "AlignmentTool" or saved true.
+        assert!(!resolve_builtin_plugins(None, None));
+        assert!(resolve_builtin_plugins(None, Some(&json!(true))));
+        assert!(resolve_builtin_plugins(Some("1"), Some(&json!(false))));
+        assert!(resolve_builtin_plugins(Some("AlignmentTool,TerrainEditor"), Some(&json!(false))));
+        assert!(!resolve_builtin_plugins(Some("0"), Some(&json!(true))));
+        assert!(!resolve_builtin_plugins(Some("false"), Some(&json!(true))));
+        assert!(!resolve_builtin_plugins(Some("off"), Some(&json!(true))));
+        assert!(!resolve_builtin_plugins(Some(""), Some(&json!(true))));
+        assert!(!bool_default("builtin_plugins"));
         // Local assets.
         assert_eq!(resolve_local_assets(None, None), None);
         assert_eq!(resolve_local_assets(None, Some(&json!("/a"))), Some(PathBuf::from("/a")));
         assert_eq!(resolve_local_assets(Some(""), Some(&json!("/a"))), None);
         assert_eq!(resolve_local_assets(Some("/b"), Some(&json!("/a"))), Some(PathBuf::from("/b")));
+        // Built-in tool choices: default rustudio, env beats saved beats default.
+        assert_eq!(resolve_tool_impl(None, None), ToolImpl::Rustudio);
+        assert_eq!(resolve_tool_impl(None, Some(&json!("roblox"))), ToolImpl::Roblox);
+        assert_eq!(resolve_tool_impl(None, Some(&json!("rustudio"))), ToolImpl::Rustudio);
+        assert_eq!(resolve_tool_impl(Some("roblox"), Some(&json!("rustudio"))), ToolImpl::Roblox);
+        assert_eq!(resolve_tool_impl(Some("rustudio"), Some(&json!("roblox"))), ToolImpl::Rustudio);
+        assert_eq!(resolve_tool_impl(Some("1"), None), ToolImpl::Roblox);
+        assert_eq!(resolve_tool_impl(Some("0"), Some(&json!("roblox"))), ToolImpl::Rustudio);
+        assert_eq!(resolve_tool_impl(Some("bogus"), Some(&json!("roblox"))), ToolImpl::Rustudio);
+    }
+
+    #[test]
+    fn builtin_tool_choices_gate_on_plugins_enabled_and_map_stems() {
+        // Built-in plugins OFF: always native regardless of per-tool settings, no built-in loads.
+        let off = BuiltinToolChoices {
+            plugins_enabled: false,
+            toolbox: ToolImpl::Roblox,
+            terrain_editor: ToolImpl::Roblox,
+            draggers: ToolImpl::Roblox,
+            view_selector: ToolImpl::Roblox,
+            rig_builder: ToolImpl::Roblox,
+            material_picker: ToolImpl::Roblox,
+        };
+        for tool in BuiltinTool::ALL {
+            assert!(!off.use_roblox(tool));
+            assert!(off.use_native(tool));
+        }
+        assert!(!off.should_load_builtin_stem("Toolbox"));
+        assert!(!off.should_load_builtin_stem("MaterialPicker"));
+        assert!(!off.should_load_builtin_stem("TagEditor"));
+
+        // Built-in plugins ON, default (all rustudio): duplicated plugins skipped, others load.
+        let native = BuiltinToolChoices { plugins_enabled: true, ..Default::default() };
+        for stem in [
+            "Toolbox",
+            "TerrainEditor",
+            "TerrainPaletteEditor",
+            "SelectDragger",
+            "MoveDragger",
+            "RotateDragger",
+            "ScaleDragger",
+            "ViewSelector",
+            "RigGenerator",
+            "MaterialPicker",
+        ] {
+            assert!(!native.should_load_builtin_stem(stem), "{stem} should be skipped when native");
+        }
+        assert!(native.should_load_builtin_stem("TagEditor"));
+        assert!(native.should_load_builtin_stem("AlignmentTool"));
+        assert!(native.should_load_builtin_stem("AssetImporter"));
+
+        // Switching one tool to Roblox loads only its plugin(s).
+        let tb = BuiltinToolChoices { plugins_enabled: true, toolbox: ToolImpl::Roblox, ..Default::default() };
+        assert!(tb.use_roblox(BuiltinTool::Toolbox));
+        assert!(tb.should_load_builtin_stem("Toolbox"));
+        assert!(!tb.should_load_builtin_stem("TerrainEditor"));
+        assert!(!tb.should_load_builtin_stem("TerrainPaletteEditor"));
+        assert!(!tb.should_load_builtin_stem("SelectDragger"));
+        assert!(!tb.should_load_builtin_stem("ViewSelector"));
+        assert!(!tb.should_load_builtin_stem("RigGenerator"));
+        assert!(!tb.should_load_builtin_stem("MaterialPicker"));
+
+        let mp = BuiltinToolChoices { plugins_enabled: true, material_picker: ToolImpl::Roblox, ..Default::default() };
+        assert!(mp.use_roblox(BuiltinTool::MaterialPicker));
+        assert!(mp.should_load_builtin_stem("MaterialPicker"));
+        assert!(!mp.should_load_builtin_stem("Toolbox"));
+
+        let terrain = BuiltinToolChoices { plugins_enabled: true, terrain_editor: ToolImpl::Roblox, ..Default::default() };
+        assert!(terrain.should_load_builtin_stem("TerrainEditor"));
+        assert!(terrain.should_load_builtin_stem("TerrainPaletteEditor"));
+        assert!(!terrain.should_load_builtin_stem("Toolbox"));
+
+        let draggers = BuiltinToolChoices { plugins_enabled: true, draggers: ToolImpl::Roblox, ..Default::default() };
+        for stem in ["SelectDragger", "MoveDragger", "RotateDragger", "ScaleDragger"] {
+            assert!(draggers.should_load_builtin_stem(stem));
+        }
+        assert!(!draggers.should_load_builtin_stem("Toolbox"));
     }
 
     #[test]

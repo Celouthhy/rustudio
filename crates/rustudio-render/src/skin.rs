@@ -133,7 +133,7 @@ pub fn cached_base(id: &str) -> Option<Arc<Base>> {
 /// assets::mesh_triangles), or None at rest / not skinned.
 pub fn posed_triangles(doc: &Document, part: Ref, id: &str) -> Option<Vec<[Vec3; 3]>> {
     let base = cached_base(id)?;
-    if !has_bones(doc, part) {
+    if !lookup(doc, part, &base).any {
         return None;
     }
     let (mats, scale, origin) = pose(doc, part, &base)?;
@@ -238,6 +238,112 @@ pub fn has_bones(doc: &Document, part: Ref) -> bool {
     }
     let rig = &index.models[&model];
     rig.group.get(&part).is_some_and(|g| rig.with_bones[*g as usize])
+}
+
+/// Whether `part` is jointed to at least one other part inside a Model
+/// (candidate for S15 / BasePart-driven skinning when its mesh has skin data).
+pub fn part_in_jointed_model(doc: &Document, part: Ref) -> bool {
+    let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
+        doc.class_of(*m).is_some_and(|c| rustudio_core::doc::is_a(&c, "Model"))
+    }) else {
+        return false;
+    };
+    let gen = RIG_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    let mut all = RIG_INDEX.lock().unwrap_or_else(|e| e.into_inner());
+    if all.len() > 8 && !all.contains_key(&doc.id) {
+        all.clear();
+    }
+    let index = all.entry(doc.id).or_default();
+    if index.gen != gen {
+        *index = RigIndex::build(doc, gen);
+    }
+    if !index.models.contains_key(&model) {
+        let rig = ModelRig::build(doc, model, &index.bone_above);
+        index.models.insert(model, rig);
+    }
+    index.models[&model].group.contains_key(&part)
+}
+
+/// Rest-pose CFrame of every BasePart in `part`'s jointed assembly, relative
+/// to `part` (`rest[part] = Identity`, `rest[B] = P_rest⁻¹ × B_rest`),
+/// computed from the assembly's enabled rigid joints (Motor6D / Weld /
+/// RigidConstraint / WeldConstraint / AnimationConstraint) with joint
+/// `Transform = Identity` — matching Studio's `Skeleton::computeTransforms`
+/// rest pose and `FastCluster` BasePart skinning.
+fn assembly_rest_poses(doc: &Document, part: Ref) -> HashMap<Ref, Xform> {
+    let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+    let mut rest = HashMap::new();
+    rest.insert(part, ident);
+    let Some(model) = doc.dom.get_by_ref(part).map(|i| i.parent()).filter(|m| {
+        doc.class_of(*m).is_some_and(|c| rustudio_core::doc::is_a(&c, "Model"))
+    }) else {
+        return rest;
+    };
+    let att_local = |a: Ref, p: Ref| -> Xform {
+        let mut chain = Vec::new();
+        let mut cur = a;
+        while cur != p {
+            let Some(i) = doc.dom.get_by_ref(cur) else { break };
+            if rustudio_core::doc::is_a(&i.class, "Attachment") {
+                chain.push(cf(doc, cur, "CFrame"));
+            }
+            cur = i.parent();
+        }
+        let mut out = ident;
+        for step in chain.into_iter().rev() {
+            out = mul(&out, &step);
+        }
+        out
+    };
+    let mut adj: HashMap<Ref, Vec<(Ref, Xform)>> = HashMap::new();
+    for i in doc.dom.descendants_of(model) {
+        let j = i.referent();
+        if !rustudio_core::body::is_rigid_joint(&i.class)
+            || !rustudio_core::body::joint_enabled(doc, j)
+        {
+            continue;
+        }
+        let edge = if i.class == "WeldConstraint" {
+            rustudio_core::body::joint_parts(doc, j).map(|(p0, p1)| {
+                let rel = mul(&inv(&cf(doc, p0, "CFrame")), &cf(doc, p1, "CFrame"));
+                (p0, p1, rel)
+            })
+        } else if i.class == "RigidConstraint" {
+            let pr = |k: &str| match doc.prop(j, k) {
+                Some(Variant::Ref(x)) if x.is_some() => Some(x),
+                _ => None,
+            };
+            pr("Attachment0").zip(pr("Attachment1")).and_then(|(a0, a1)| {
+                let p0 = rustudio_core::body::attachment_part(doc, a0)?;
+                let p1 = rustudio_core::body::attachment_part(doc, a1)?;
+                let rel = mul(&att_local(a0, p0), &inv(&att_local(a1, p1)));
+                Some((p0, p1, rel))
+            })
+        } else {
+            rustudio_core::body::joint_frames(doc, j)
+                .map(|(p0, p1, c0, c1)| (p0, p1, mul(&c0, &inv(&c1))))
+        };
+        if let Some((p0, p1, rel)) = edge {
+            if p0 != p1 {
+                adj.entry(p0).or_default().push((p1, rel));
+                adj.entry(p1).or_default().push((p0, inv(&rel)));
+            }
+        }
+    }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(part);
+    while let Some(cur) = queue.pop_front() {
+        let cur_xf = rest[&cur];
+        if let Some(neighbors) = adj.get(&cur) {
+            for (next, step) in neighbors {
+                if !rest.contains_key(next) {
+                    rest.insert(*next, mul(&cur_xf, step));
+                    queue.push_back(*next);
+                }
+            }
+        }
+    }
+    rest
 }
 
 /// Where a document's Bones and FaceControls are (for `has_bones`), valid
@@ -359,14 +465,27 @@ pub fn rig_class(class: &str) -> bool {
     matches!(class, "Bone" | "FaceControls") || rustudio_core::body::is_rigid_joint(class)
 }
 
-/// A part's mesh bones resolved to Bone instances (by mesh bone index),
-/// and what it redraws on.
+/// What drives one mesh bone: a Bone instance, or a BasePart in the same
+/// jointed assembly (S15 / R15 skinned body parts: Studio's
+/// `ModelTransformSourceBasePart` / `FastCluster`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    Bone(Ref),
+    Part(Ref),
+}
+
+/// A part's mesh bones resolved to Bone or jointed BasePart instances (by
+/// mesh bone index), and what it redraws on.
 pub struct Lookup {
     gen: u64,
     doc: u64,
-    pub bones: Vec<Option<Ref>>,
+    pub bones: Vec<Option<Target>>,
+    /// For each `Target::Part(B)`: `B_rest⁻¹ × P_rest` (precomputed from the
+    /// assembly's joint rest pose, cached until `RIG_GEN` changes).
+    pub part_rest: Vec<Option<Xform>>,
     pub deps: Vec<Ref>,
-    /// The part is skinned: Bones (its own or its assembly's) or FaceControls.
+    /// The part is skinned: Bones (its own or its assembly's), FaceControls,
+    /// or jointed BaseParts (S15 / R15).
     pub any: bool,
 }
 
@@ -374,8 +493,8 @@ static LOOKUPS: std::sync::LazyLock<Mutex<HashMap<Ref, (usize, Arc<Lookup>)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The part's bone lookup for this mesh (cached until the rig changes):
-/// mesh bone name → the part's own Bone of that name, else one of its
-/// assembly's (the first by name wins).
+/// mesh bone name → the part's own Bone of that name, else a Bone of its
+/// assembly, else a jointed BasePart of its assembly (S15 / R15).
 pub fn lookup(doc: &Document, part: Ref, base: &Base) -> Arc<Lookup> {
     let gen = RIG_GEN.load(std::sync::atomic::Ordering::Relaxed);
     let key = base as *const Base as usize;
@@ -394,31 +513,78 @@ pub fn lookup(doc: &Document, part: Ref, base: &Base) -> Arc<Lookup> {
         }
     }
     own(doc, part, &mut by_name);
-    // The assembly's only when some mesh bone has no Bone here (the BFS
-    // over the model's joints is the costly part).
+    // Walk the assembly's joints only when some mesh bone has no Bone on
+    // `part` itself (the BFS over the model's joints is the costly part).
+    let mut rest_map: HashMap<Ref, Xform> = HashMap::new();
+    let mut part_by_name: HashMap<&str, Ref> = HashMap::new();
     if base.skin.bones.iter().any(|b| !by_name.contains_key(b.name.as_str())) {
-        for h in bone_hosts(doc, part).into_iter().skip(1) {
-            own(doc, h, &mut by_name);
+        rest_map = assembly_rest_poses(doc, part);
+        if rest_map.len() > 1 {
+            if let Some(i) = doc.dom.get_by_ref(part) {
+                part_by_name.insert(i.name.as_str(), part);
+            }
+            for &h in rest_map.keys() {
+                if h == part {
+                    continue;
+                }
+                own(doc, h, &mut by_name);
+                if let Some(i) = doc.dom.get_by_ref(h) {
+                    part_by_name.entry(i.name.as_str()).or_insert(h);
+                }
+            }
         }
     }
-    let bones: Vec<Option<Ref>> = base.skin.bones.iter().map(|b| by_name.get(b.name.as_str()).copied()).collect();
+    let mut bones: Vec<Option<Target>> = Vec::with_capacity(base.skin.bones.len());
+    let mut part_rest: Vec<Option<Xform>> = Vec::with_capacity(base.skin.bones.len());
+    let mut has_other_part = false;
+    for b in &base.skin.bones {
+        if let Some(&r) = by_name.get(b.name.as_str()) {
+            bones.push(Some(Target::Bone(r)));
+            part_rest.push(None);
+        } else if let Some(&p) = part_by_name.get(b.name.as_str()) {
+            if p != part {
+                has_other_part = true;
+            }
+            bones.push(Some(Target::Part(p)));
+            part_rest.push(rest_map.get(&p).map(inv));
+        } else {
+            bones.push(None);
+            part_rest.push(None);
+        }
+    }
     let mut deps = face_controls(doc, part);
-    let any = !deps.is_empty() || !by_name.is_empty() || has_bones(doc, part);
+    let any = !deps.is_empty() || !by_name.is_empty() || has_other_part || has_bones(doc, part);
     let mut seen: std::collections::HashSet<Ref> = deps.iter().copied().collect();
-    for b in bones.iter().flatten() {
-        // The Bone and the Bones / Attachments above it (its frame's chain).
-        let mut cur = *b;
-        while let Some(i) = doc.dom.get_by_ref(cur) {
-            if rustudio_core::doc::is_a(&i.class, "BasePart") || !seen.insert(cur) {
-                break;
+    for t in bones.iter().flatten() {
+        match *t {
+            Target::Bone(b) => {
+                // The Bone and the Bones / Attachments above it (its frame's chain).
+                let mut cur = b;
+                while let Some(i) = doc.dom.get_by_ref(cur) {
+                    if rustudio_core::doc::is_a(&i.class, "BasePart") || !seen.insert(cur) {
+                        break;
+                    }
+                    if i.class == "Bone" || rustudio_core::doc::is_a(&i.class, "Attachment") {
+                        deps.push(cur);
+                    }
+                    cur = i.parent();
+                }
             }
-            if i.class == "Bone" || rustudio_core::doc::is_a(&i.class, "Attachment") {
-                deps.push(cur);
+            Target::Part(p) if has_other_part => {
+                if seen.insert(p) {
+                    deps.push(p);
+                }
             }
-            cur = i.parent();
+            Target::Part(_) => {}
         }
     }
-    let l = Arc::new(Lookup { gen, doc: doc.id, bones, deps, any });
+    // When another jointed BasePart drives this mesh, moving `part` itself
+    // also changes `part_inv * other_part`, so `part` must re-skin on its own
+    // CFrame change (otherwise scene.rs treats it as a rigid move).
+    if has_other_part && seen.insert(part) {
+        deps.push(part);
+    }
+    let l = Arc::new(Lookup { gen, doc: doc.id, bones, part_rest, deps, any });
     if let Ok(mut m) = LOOKUPS.lock() {
         m.insert(part, (key, l.clone()));
     }
@@ -433,6 +599,7 @@ pub fn forget_part(part: Ref) {
     }
     if let Ok(mut m) = LAST.lock() {
         m.remove(&(part, 0));
+        m.remove(&(part, R15_CLOTHING_TAG));
     }
 }
 
@@ -559,38 +726,51 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
     let bind_inv: Vec<Xform> = bind.iter().map(inv).collect();
     let facs = if base.facs.is_some() { facs_offsets(doc, part, base, scale) } else { HashMap::new() };
     let part_inv = inv(&cf(doc, part, "CFrame"));
-    let mut now: Vec<Option<Xform>> = vec![None; n];
+    let ident = Xform { pos: Vec3::ZERO, rot: Mat3::IDENTITY };
+    let mut mats: Vec<Option<Xform>> = vec![None; n];
     // Parents come before children in Roblox meshes; resolve in passes.
     for _ in 0..n.max(1) {
         let mut progress = false;
         for i in 0..n {
-            if now[i].is_some() {
+            if mats[i].is_some() {
                 continue;
             }
             let sb = &base.skin.bones[i];
-            if let Some(b) = look.bones[i] {
-                now[i] = Some(mul(&part_inv, &frames.world(b)));
-                progress = true;
-            } else {
-                // No Bone instance: the bind frame relative to its parent,
-                // times the FaceControls' FACS offset for this bone.
-                let local = facs.get(&sb.name).copied();
-                match sb.parent {
-                    None => {
-                        now[i] = Some(match local {
-                            Some(l) => mul(&bind[i], &l),
-                            None => bind[i],
-                        });
-                        progress = true;
-                    }
-                    Some(p) => {
-                        if let Some(pn) = now[p] {
-                            let rest = mul(&pn, &mul(&bind_inv[p], &bind[i]));
-                            now[i] = Some(match local {
-                                Some(l) => mul(&rest, &l),
-                                None => rest,
-                            });
+            match look.bones[i] {
+                Some(Target::Bone(b)) => {
+                    let now = mul(&part_inv, &frames.world(b));
+                    mats[i] = Some(mul(&now, &bind_inv[i]));
+                    progress = true;
+                }
+                Some(Target::Part(p)) => {
+                    let m = if p == part {
+                        ident
+                    } else if let Some(pr) = look.part_rest[i] {
+                        mul(&part_inv, &mul(&cf(doc, p, "CFrame"), &pr))
+                    } else {
+                        ident
+                    };
+                    mats[i] = Some(m);
+                    progress = true;
+                }
+                None => {
+                    // No Bone or BasePart: follows its parent rigidly, times
+                    // any FaceControls FACS offset for this bone.
+                    let local = facs.get(&sb.name).copied();
+                    let apply_facs = |base_m: Xform| match local {
+                        Some(l) => mul(&base_m, &mul(&bind[i], &mul(&l, &bind_inv[i]))),
+                        None => base_m,
+                    };
+                    match sb.parent {
+                        None => {
+                            mats[i] = Some(apply_facs(ident));
                             progress = true;
+                        }
+                        Some(p) => {
+                            if let Some(pm) = mats[p] {
+                                mats[i] = Some(apply_facs(pm));
+                                progress = true;
+                            }
                         }
                     }
                 }
@@ -600,9 +780,7 @@ pub fn matrices(doc: &Document, part: Ref, base: &Base, scale: Vec3) -> Option<V
             break;
         }
     }
-    let mats: Vec<Xform> = (0..n)
-        .map(|i| mul(&now[i].unwrap_or(bind[i]), &bind_inv[i]))
-        .collect();
+    let mats: Vec<Xform> = mats.into_iter().map(|m| m.unwrap_or(ident)).collect();
     let rest = mats
         .iter()
         .all(|m| m.pos.length_squared() < 1e-10 && m.rot.abs_diff_eq(Mat3::IDENTITY, 1e-5));
@@ -704,8 +882,41 @@ pub fn same_pose(part: Ref, tag: u32, base: &Base, palette: &[Xform], scale: Vec
     false
 }
 
+/// Slot tag of a skinned R15 body part's classic-clothing atlas copy.
+pub const R15_CLOTHING_TAG: u32 = 1;
+
 /// Slot tag of a skinned part's decal copy for a face (`slot_of_tag`).
 pub const DECAL_TAG: u32 = 16;
+
+/// A skinned R15 body part's base with UVs remapped into the composited
+/// classic-clothing atlas (`assets::r15_atlas_uvs`), cached by `(key, part_name)`.
+pub fn r15_clothing_base(base: &Base, key: &str, part_name: &str) -> Option<Arc<Base>> {
+    static CLOTHING: std::sync::LazyLock<Mutex<HashMap<String, Option<Arc<Base>>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let k = format!("{key}|r15cloth|{part_name}");
+    if let Some(b) = CLOTHING.lock().ok()?.get(&k) {
+        return b.clone();
+    }
+    let b = rustudio_core::assets::r15_atlas_uvs(part_name, &base.uvs).map(|uvs| {
+        Arc::new(Base {
+            positions: base.positions.clone(),
+            normals: base.normals.clone(),
+            uvs,
+            colors: Vec::new(),
+            extent: base.extent,
+            center: base.center,
+            skin: base.skin.clone(),
+            firsts: base.firsts.clone(),
+            corner_unique: base.corner_unique.clone(),
+            facs: None,
+            whole: base.whole,
+        })
+    });
+    if let Ok(mut g) = CLOTHING.lock() {
+        g.insert(k, b.clone());
+    }
+    b
+}
 
 /// RUSTUDIO_SKIN_CPU=1: deform on the CPU and re-upload (the old path,
 /// kept for comparison and for machines without compute).
@@ -957,6 +1168,106 @@ mod tests {
         // A property write is journalled (it bumps the revision the Bone frame memo keys on).
         doc.mark_prop(jaw, rbx_dom_weak::ustr("Transform"));
         assert!(matrices(&doc, part, &b, Vec3::ONE).is_none());
+    }
+
+    #[test]
+    fn s15_baseparts_deform_seamlessly_across_motor6d() {
+        use rbx_dom_weak::InstanceBuilder;
+        let mut doc = rustudio_core::doc::Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let model = doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Avatar"));
+        let lower_rest = Xform { pos: Vec3::new(0.0, 2.0, 0.0), rot: Mat3::IDENTITY };
+        let upper_rest = Xform { pos: Vec3::new(0.0, 3.0, 0.0), rot: Mat3::IDENTITY };
+        // Joint at world y = 2.5: C0 = (0, +0.5, 0) in LowerTorso, C1 = (0, -0.5, 0) in UpperTorso.
+        let c0 = Xform { pos: Vec3::new(0.0, 0.5, 0.0), rot: Mat3::IDENTITY };
+        let c1 = Xform { pos: Vec3::new(0.0, -0.5, 0.0), rot: Mat3::IDENTITY };
+        let lower = doc.dom.insert(
+            model,
+            InstanceBuilder::new("MeshPart")
+                .with_name("LowerTorso")
+                .with_property("CFrame", lower_rest.to_cframe())
+                .with_property("Size", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0))
+                .with_property("InitialSize", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0)),
+        );
+        let upper = doc.dom.insert(
+            model,
+            InstanceBuilder::new("MeshPart")
+                .with_name("UpperTorso")
+                .with_property("CFrame", upper_rest.to_cframe())
+                .with_property("Size", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0))
+                .with_property("InitialSize", rbx_dom_weak::types::Vector3::new(1.0, 1.0, 1.0)),
+        );
+        doc.dom.insert(
+            upper,
+            InstanceBuilder::new("Motor6D")
+                .with_name("Waist")
+                .with_property("Part0", Variant::Ref(lower))
+                .with_property("Part1", Variant::Ref(upper))
+                .with_property("C0", c0.to_cframe())
+                .with_property("C1", c1.to_cframe()),
+        );
+        rig_changed();
+
+        // Both meshes have arbitrary Blender bone rotations (non-identity) like real S15 assets.
+        let blender_rot = Mat3::from_euler(glam::EulerRot::XYZ, 2.5, -0.7, 1.2);
+        let make_s15_base = |seam_local: Vec3| Base {
+            positions: vec![seam_local],
+            normals: vec![Vec3::Z],
+            uvs: vec![Vec2::ZERO],
+            colors: Vec::new(),
+            extent: Vec3::ONE,
+            center: Vec3::ZERO,
+            facs: None,
+            whole: true,
+            firsts: vec![0],
+            corner_unique: vec![0],
+            skin: Skin {
+                bones: vec![
+                    SkinBone { name: "Root".into(), parent: None, rot: Mat3::IDENTITY, pos: Vec3::ZERO },
+                    SkinBone { name: "LowerTorso".into(), parent: Some(0), rot: blender_rot, pos: Vec3::new(1.0, -2.0, 0.3) },
+                    SkinBone { name: "UpperTorso".into(), parent: Some(1), rot: blender_rot.transpose(), pos: Vec3::new(-0.4, 0.8, 0.2) },
+                ],
+                corner_bones: vec![[1, 2, 0, 0]],
+                corner_weights: vec![[0.5, 0.5, 0.0, 0.0]],
+                corner_vertex: vec![0],
+                vertex_bones: Vec::new(),
+                vertex_weights: Vec::new(),
+            },
+        };
+        // Seam vertex at world (0.2, 2.5, 0.3): local (0.2, +0.5, 0.3) in LowerTorso, (0.2, -0.5, 0.3) in UpperTorso.
+        let lower_base = make_s15_base(Vec3::new(0.2, 0.5, 0.3));
+        let upper_base = make_s15_base(Vec3::new(0.2, -0.5, 0.3));
+
+        // 1. At rest: matrices() returns None even with arbitrary Blender bone rotations.
+        assert!(part_in_jointed_model(&doc, lower));
+        assert!(lookup(&doc, lower, &lower_base).any);
+        assert!(lookup(&doc, upper, &upper_base).any);
+        assert!(matrices(&doc, lower, &lower_base, Vec3::ONE).is_none());
+        assert!(matrices(&doc, upper, &upper_base, Vec3::ONE).is_none());
+        // Both parts depend on both LowerTorso and UpperTorso so either moving re-skins both.
+        let ldeps = &lookup(&doc, lower, &lower_base).deps;
+        assert!(ldeps.contains(&lower) && ldeps.contains(&upper), "{ldeps:?}");
+
+        // 2. Bend Waist 45° around X + 20° around Z: UpperTorso = LowerTorso * C0 * T * inv(C1).
+        let t = Xform { pos: Vec3::ZERO, rot: Mat3::from_euler(glam::EulerRot::XYZ, 0.785, 0.0, 0.35) };
+        let upper_now = mul(&mul(&mul(&lower_rest, &c0), &t), &inv(&c1));
+        doc.dom
+            .get_by_ref_mut(upper)
+            .unwrap()
+            .properties
+            .insert(rbx_dom_weak::ustr("CFrame"), Variant::CFrame(upper_now.to_cframe()));
+        doc.mark_prop(upper, rbx_dom_weak::ustr("CFrame"));
+
+        let lm = matrices(&doc, lower, &lower_base, Vec3::ONE).expect("lower deforms");
+        let um = matrices(&doc, upper, &upper_base, Vec3::ONE).expect("upper deforms");
+        let (lp, _) = deform(&lower_base, &lm, Vec3::ONE, origin_of(&doc, lower));
+        let (up, _) = deform(&upper_base, &um, Vec3::ONE, origin_of(&doc, upper));
+        let l_world = lower_rest.apply(lp[0]);
+        let u_world = upper_now.apply(up[0]);
+        assert!(
+            l_world.abs_diff_eq(u_world, 1e-5),
+            "seam gap! lower={l_world:?} upper={u_world:?}"
+        );
     }
 }
 

@@ -330,6 +330,7 @@ pub const DEFAULT_RIG_R15: bool = true; // default character rig when nothing el
 pub const JUMP_POWER: f32 = 50.0; // Humanoid.JumpPower default (used when UseJumpPower)
 #[allow(dead_code)] // used by library.luau __rs_seat (same number)
 pub const SEAT_WELD_MIN_ROOT_HEIGHT: f32 = 0.05; // R6 SeatWeld C1.Y = -(max(root.Size.Y, 0.05) × 0.5 + 0.5); R15 from the rig attachments (library.luau __rs_seat)
+pub const PLAYER_SCRIPTS_DEFAULT_IAS: bool = false; // Workspace.PlayerScriptsUseInputActionSystem Default means the classic PlayerScripts (Roblox's rollout phase 1, 2026; phase 2 — Default = Enabled — not before early 2027; devforum "Input Action System: PlayerScripts rollout" t/4678416). Flip when Roblox does.
 pub const PROJECT_DEBOUNCE_MS: u64 = 150; // a project folder's disk changes are applied once the folder has been quiet this long (well inside the 1 s promise)
 pub const SEAT_COOLDOWN_S: f32 = 1.0; // after leaving a seat the humanoid doesn't sit again for this long (estimated; Roblox debounces re-sitting)
 
@@ -367,7 +368,9 @@ pub const DYNAMIC_SETTLE_S: f32 = 5.0; // a per-frame part this long without cha
 pub const STATIC_REBUILD_MIN_S: f32 = 3.0; // static rebuilds (a full re-sort + upload) at most this often
 pub const DEPTH_BIAS_STEP: f32 = 4e-7; // per-part relative depth nudge (16 steps) against coplanar flicker
 pub const PHYSICS_SERIAL_MAX_AWAKE: usize = 512; // awake bodies up to which a world step runs on the stepping thread instead of rapier's rayon pool (fan-out costs more than it saves on small active sets). the NPC test place, 205 awake NPC bodies, release, load ~19: 2.5 ms of physics per frame on one thread against 4.6-7.7 ms on the pool
-pub const MAX_PHYSICS_STEPS: usize = 16; // 240 Hz world steps per frame at most = MAX_FRAME_DT × 240: Studio caps the game step at 1/15 s, slower frames slow the simulation instead of piling up
+pub const MAX_PHYSICS_STEPS: usize = 12;
+pub const THROTTLED_MAX_PHYSICS_STEPS: usize = 4;
+pub const PHYSICS_CARRY_MAX_STEPS: f32 = 3.99999;
 pub const PHYSICS_LENGTH_UNIT: f32 = 5.0; // rapier length scale in studs (sleep thresholds, contact tolerances) (estimated)
 pub const MAX_FRAME_DT: f32 = 1.0 / 15.0; // Play's game step per frame at most (Studio 0.746: PreAnimation dt and DistributedGameTime stop at 0.0667 s however long the frame; waits keep wall time)
 pub const SCRIPT_FRAME_BUDGET_MS: f64 = 6.0; // per side: waiting scripts past this resume next frame (estimated)
@@ -503,10 +506,129 @@ pub const FX_LOCAL_REACH: f32 = 4.0; // studs past Range a local light still rea
 pub const FX_LIGHT_CAP: f32 = 1.0; // the luminance an effect's ambient + local light is held to before the sun is added (ParticleLightingFS min(…, cap); measured: calibration q, white particles read 0.99 near a Range 30 PointLight; an orange light's red channel reads 1.58 at luminance 0.85)
 pub const FX_LIGHT_CLAMP: f32 = 4.5; // an effect's linear light is held to this (ParticleCustomFS sqrt(clamp(lin × exposure))) before it joins the scene's light, so Studio's bloom sees no more of it (measured: calibration b, white squares glow the same at Brightness 4, 10 and 100: the halo 1.8–3.5 studs out reads 8.8 / 10.0 / 12.4 levels; rustudio unclamped 8.9 / 28.7 / 96.3, clamped 9.1 / 11.0 / 10.9)
 
+/// Non-restricted services Studio pre-creates as direct children of
+/// `DataModel` in Play (in addition to `ALWAYS_SERVICES`), measured in live
+/// Studio 0.748 from identity-2 scripts. Restricted/Studio-only services
+/// (CoreGui, StudioService, DebuggerManager, ScriptEditorService,
+/// PluginGuiService, etc.) and on-demand services (DataStoreService) are
+/// intentionally excluded so legacy `game.<Name>` / `game:FindFirstChild`
+/// matches Studio's exact visibility.
+pub const DATAMODEL_SERVICES: &[&str] = &[
+    "AdService",
+    "AnalyticsService",
+    "AnimationClipProvider",
+    "AssetService",
+    "AvatarCreationService",
+    "AvatarEditorService",
+    "BadgeService",
+    "BrowserService",
+    "CaptureService",
+    "ChangeHistoryService",
+    "Chat",
+    "ClusterPacketCache",
+    "CollectionService",
+    "CommerceService",
+    "ConfigureServerService",
+    "ContentProvider",
+    "ContextActionService",
+    "CookiesService",
+    "Debris",
+    "FeatureRestrictionManager",
+    "FriendService",
+    "GamePassService",
+    "GenerationService",
+    "Geometry",
+    "GroupService",
+    "GuiService",
+    "GuidRegistryService",
+    "HapticService",
+    "HeapProfilerService",
+    "HttpRbxApiService",
+    "HttpService",
+    "InsertService",
+    "JointsService",
+    "KeyboardService",
+    "KeyframeSequenceProvider",
+    "LocalizationService",
+    "LogService",
+    "LuaWebService",
+    "MarketplaceService",
+    "MicroProfilerService",
+    "ModerationService",
+    "MouseService",
+    "NetworkClient",
+    "NetworkServer",
+    "NotificationService",
+    "OpenCloudService",
+    "Packages",
+    "PathfindingService",
+    "PermissionsService",
+    "PhysicsService",
+    "PlaceSettings",
+    "PlacesService",
+    "PointsService",
+    "PolicyService",
+    "ProcessInstancePhysicsService",
+    "ProximityPromptService",
+    "PublishService",
+    "RecommendationService",
+    "RemoteDebuggerServer",
+    "RunService",
+    "ScriptProfilerService",
+    "ScriptService",
+    "Selection",
+    "SelectionHighlightManager",
+    "ServiceVisibilityService",
+    "SharedTableRegistry",
+    "SlimContentProvider",
+    "SocialService",
+    "Stats",
+    "StudioTestService",
+    "TestService",
+    "TextService",
+    "TimerService",
+    "TouchInputService",
+    "TweenService",
+    "UserInputService",
+    "VRService",
+    "VideoCaptureService",
+    "VideoService",
+    "Visit",
+    "VoiceChatService",
+];
+
+/// A service's class from the Name its instance has in Roblox's DataModel.
+/// Covers both Roblox's spaced service names (`game["Run Service"]`,
+/// `game["Teleport Service"]`, `game["Script Context"]`) and the services
+/// Studio pre-creates as direct children of `DataModel` in Play (so legacy
+/// `game.<ServiceName>`, `game:FindFirstChild("<ServiceName>")`, and
+/// `game:WaitForChild` find them even when the `.rbxl` didn't serialize them).
+/// Security visibility (CoreGui, Studio-only services) is enforced by
+/// runtime.rs before creating/returning.
+pub fn service_class_for_name(name: &str) -> Option<&'static str> {
+    match name {
+        "Run Service" => Some("RunService"),
+        "Teleport Service" => Some("TeleportService"),
+        "Script Context" => Some("ScriptContext"),
+        _ => DATAMODEL_SERVICES.iter().copied().find(|s| *s == name),
+    }
+}
+
 // GUI (gui.rs)
 pub const GUI_TOP_INSET: f32 = 58.0; // GuiService:GetGuiInset() in Studio's Play (Studio, 863x675 view): ScreenGuis without IgnoreGuiInset start this far down
+pub const GUI_TOPBAR_LEFT: f32 = 72.0; // GuiService.TopbarInset.Min.X with Roblox's chat off: the free top-bar area starts past the Roblox button (ScreenSideOffset 16 in, TopBarButtonHeight 44 wide) and TopBarPadding 12
+pub const GUI_TOPBAR_LEFT_CHAT: f32 = 128.0; // ... with the chat button (TopBarPadding 12 + 44) before it; a ScreenGui with ScreenInsets TopbarSafeInsets (TopbarPlus) is the TopbarInset rect: it starts here and is GUI_TOP_INSET tall
+/// GuiService.TopbarInset's left edge: where the top bar's free area starts
+/// past Roblox's buttons, with or without the chat button.
+pub fn gui_topbar_left(chat: bool) -> f32 {
+    if chat { GUI_TOPBAR_LEFT_CHAT } else { GUI_TOPBAR_LEFT }
+}
 pub const GUI_FONT_EM_PER_TEXT_SIZE: f32 = 1.04; // font em = TextSize × this / (line height per em): a line is TextSize tall; the 1.04 matches TextService widths ("START GAME" in Oswald 14/18/24/32 → 46/58/78/104 px in Studio)
 pub const GUI_LEGACY_TEXT_SCALE: f32 = 1.5; // Font.Legacy (Arimo) is drawn at TextSize x this: a default TextLabel (Legacy 8) in Studio 0.747 draws "row 1" 26 px wide, 8 px tall (checks/plugins/widgets/captures/studio-wleft.png), Arimo at TextSize 12; other sizes not measured
+pub const GUI_MESSAGE_FILL: [f32; 4] = [0.5, 0.5, 0.5, 0.5]; // a Message's full-screen box, RGBA (Studio 0.747 Message::renderFullScreen: Adorn::rect2d over the whole view in Color4 (0.5, 0.5, 0.5, 0.5); a black sky reads 64,64,64 under it in the Roblox client)
+pub const GUI_MESSAGE_TEXT_SIZE: f32 = 14.0; // Message / Hint text: Font Legacy at this size, white, centred (Studio 0.747 Message::renderFullScreen / Hint::render2d: setPropsForLegacyAdornDraw2DTextCall(size 14, Legacy, XAlign centre, YAlign centre); a Message adds a black stroke, a Hint none)
+pub const GUI_MIN_FONT_SIZE: f32 = 0.01; // a text size of 0 or NaN (TextSize 0, TextScaled in a 0-tall box) is laid out at this size: Roblox draws nothing, and epaint refuses 0 (estimated; anything this small draws no visible glyph)
+pub const GUI_HINT_HEIGHT: f32 = 20.0; // a Hint's bar: opaque black, this many px from the top of the view, full width (Studio 0.747 Hint::render2d)
 pub const GUI_BUTTON_HOVER_DARKEN: f32 = 0.3; // AutoButtonColor: background darkened this much under the mouse (estimated)
 pub const GUI_BUTTON_PRESS_DARKEN: f32 = 0.5; // ... and while pressed (estimated)
 pub const GUI_SELECTION_RGB: [u8; 3] = [0, 162, 255]; // GuiService.SelectedObject outline (estimated)
@@ -608,7 +730,8 @@ pub const ENV_ROUGH_SCALE: f32 = 0.911;
 pub const ENV_SPEC_MIP_PER_ROUGHNESS: f32 = 5.0; // prefiltered env cube read at mip roughness × this
 pub const ENV_REFLECT_UP_GAIN: f32 = 1.588235; // spec env × mix(SkyGradientBottom, Top, clamp(R.y × this, 0, 1))
 pub const ENV_INDOOR_FACES: &str = "rbxasset://textures/sky/indoor512_"; // + bk/dn/ft/lf/rt/up .tex: the indoor environment (PrefilteredEnvIndoorTexture; its irradiance × EnvironmentDiffuseScale is AmbientCube[6..11])
-pub const ENV_SPEC_FADE: f32 = 0.0008; // the sky reflection fades out with distance: s × clamp(1 − studs × this) (CB0[28].y, RefractionBias_FadeDistance_GlowFactor, read from a running Studio's constant buffer)
+// CB0[28].y in the captured HQ SurfaceAppearance and terrain draws.
+pub const ENV_SPEC_FADE: f32 = 1.0 / 1200.0;
 // Screen-space ambient occlusion, as Studio's SSAO passes (
 // SSAODepthDownFS, SSAOFS, SSAOBlurX/YFS, SSAOCompositFS; LinearizeDepthFS;
 // setup). On by default in Studio's edit view (calibration: a white
@@ -645,8 +768,8 @@ pub const EVSM_BLEED_CUT: f32 = 0.2; // light-bleed reduction: clamp((p − 0.2)
 pub const LSHADOW_TAN_HALF_FOV: f32 = 1.053_774; // each cube face's projection scale 0.94896 = 1/tan(46.5°): 93° faces
 pub const LSHADOW_NEAR: f32 = 0.1; // face near plane (far = Range)
 pub const LSHADOW_ATLAS: u32 = 2048; // rustudio's atlas side (Studio packs faces at 3/32 × 1/20 of its atlas; its size isn't read yet)
-pub const LSHADOW_FACE: u32 = 192; // pixels per face (estimated: Studio's ratios fit 192 on a 2048-wide atlas)
-pub const LSHADOW_MAX_LIGHTS: usize = 16; // shadowed lights at once: (2048/192)² faces / 6 (Studio has 128 slots and shrinks faces as its atlas fills)
+pub const LSHADOW_FACE: u32 = 128; // pixels per face: 16×16 faces on a 2048 atlas (Studio shrinks faces as its atlas fills)
+pub const LSHADOW_MAX_LIGHTS: usize = 42; // shadowed lights at once: (2048/128)² faces / 6 (Studio has 128 slots)
 // The sun's shadow cascades (sun_shadow.rs; docs/MECHANICS.md "Sun shadow cascades").
 pub const SUN_CASCADE_SPLITS: [f32; 5] = [1e-5, 20.0, 45.0, 140.0, 600.0]; // view depths the four cascades span
 pub const SUN_CASCADE_TILES: [u32; 4] = [384, 768, 1024, 2048]; // texels across each cascade's tile (a running Studio's atlas matrices)
@@ -1085,5 +1208,28 @@ impl PhysicalProperties {
             acoustic_absorption: self.acoustic_absorption.max(0.0),
             default: self.default,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_class_for_name_matches_studio_datamodel() {
+        assert_eq!(service_class_for_name("ContentProvider"), Some("ContentProvider"));
+        assert_eq!(service_class_for_name("BadgeService"), Some("BadgeService"));
+        assert_eq!(service_class_for_name("JointsService"), Some("JointsService"));
+        assert_eq!(service_class_for_name("Run Service"), Some("RunService"));
+        assert_eq!(service_class_for_name("RunService"), Some("RunService"));
+        assert_eq!(service_class_for_name("Teleport Service"), Some("TeleportService"));
+        assert_eq!(service_class_for_name("Script Context"), Some("ScriptContext"));
+        // Restricted / Studio-only / on-demand services are excluded.
+        assert_eq!(service_class_for_name("CoreGui"), None);
+        assert_eq!(service_class_for_name("StudioService"), None);
+        assert_eq!(service_class_for_name("DebuggerManager"), None);
+        assert_eq!(service_class_for_name("ScriptEditorService"), None);
+        assert_eq!(service_class_for_name("DataStoreService"), None);
+        assert_eq!(service_class_for_name("NotAService"), None);
     }
 }

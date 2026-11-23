@@ -73,26 +73,28 @@ fn shown(d: &Document, layout: &HashMap<Ref, GuiBox>, lc: Ref, button: Ref) -> b
     rect(layout, lc).and_then(|r| clip(area, r)).is_some()
 }
 
-/// Whether the LocalPlayer's PlayerGui shows a Modal GuiButton now.
+/// Whether the LocalPlayer's PlayerGui or CoreGui shows a Modal GuiButton now.
 pub fn modal_shown(d: &Document, layout: &HashMap<Ref, GuiBox>) -> bool {
-    let Some(pg) = d.find_child(d.dom.root_ref(), "Players").and_then(|p| match d.prop(p, "LocalPlayer") {
+    let root = d.dom.root_ref();
+    let pg = d.find_child(root, "Players").and_then(|p| match d.prop(p, "LocalPlayer") {
         Some(Variant::Ref(lp)) if d.exists(lp) => d.find_child(lp, "PlayerGui"),
         _ => None,
-    }) else {
-        return false;
-    };
-    let Some(pgi) = d.dom.get_by_ref(pg) else { return false };
-    for &lc in pgi.children() {
-        let Some(li) = d.dom.get_by_ref(lc) else { continue };
-        if !doc::is_a(&li.class, "LayerCollector") || !flag(d, lc, "Enabled", true) {
-            continue;
-        }
-        for x in d.dom.descendants_of(lc) {
-            if doc::is_a(&x.class, "GuiButton")
-                && matches!(x.properties.get(&rbx_dom_weak::ustr("Modal")), Some(Variant::Bool(true)))
-                && shown(d, layout, lc, x.referent())
-            {
-                return true;
+    });
+    let cg = d.find_child(root, "CoreGui");
+    for container in [pg, cg].into_iter().flatten() {
+        let Some(ci) = d.dom.get_by_ref(container) else { continue };
+        for &lc in ci.children() {
+            let Some(li) = d.dom.get_by_ref(lc) else { continue };
+            if !doc::is_a(&li.class, "LayerCollector") || !flag(d, lc, "Enabled", true) {
+                continue;
+            }
+            for x in d.dom.descendants_of(lc) {
+                if doc::is_a(&x.class, "GuiButton")
+                    && matches!(x.properties.get(&rbx_dom_weak::ustr("Modal")), Some(Variant::Bool(true)))
+                    && shown(d, layout, lc, x.referent())
+                {
+                    return true;
+                }
             }
         }
     }
@@ -105,7 +107,7 @@ mod tests {
     use rbx_dom_weak::InstanceBuilder;
 
     fn gb(pos: [f32; 2], size: [f32; 2]) -> GuiBox {
-        GuiBox { pos, size, rot: 0.0, text: None, canvas: None, canvas_fit: None }
+        GuiBox { pos, size, ..Default::default() }
     }
 
     /// Studio's rules: Enabled collector, the Visible chain, an area left
@@ -152,5 +154,15 @@ mod tests {
         // Not laid out: not drawn.
         layout.remove(&b);
         assert!(!modal_shown(&d, &layout), "not laid out");
+
+        // CoreGui Modal button (e.g. SettingsHub's SettingsShield).
+        let cg = d.find_child(root, "CoreGui").unwrap_or_else(|| d.insert(root, InstanceBuilder::new("CoreGui")));
+        let csg = d.insert(cg, InstanceBuilder::new("ScreenGui").with_name("RobloxGui"));
+        let cb = d.insert(csg, InstanceBuilder::new("TextButton").with_name("SettingsShield").with_property("Modal", true));
+        layout.insert(csg, gb([0.0, 0.0], [800.0, 600.0]));
+        layout.insert(cb, gb([0.0, 0.0], [800.0, 600.0]));
+        assert!(modal_shown(&d, &layout), "CoreGui Modal button");
+        set(&mut d, cb, "Visible", Variant::Bool(false));
+        assert!(!modal_shown(&d, &layout), "CoreGui Modal button hidden");
     }
 }

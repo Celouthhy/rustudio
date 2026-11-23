@@ -76,8 +76,15 @@ impl Editor {
         self.selected_parts_material()
     }
 
-    /// Ribbon "Material": a drop-down grid of the part materials.
-    pub fn material_quick_button(&mut self, ui: &mut egui::Ui) {
+    /// Ribbon "Material": Roblox's built-in MaterialPicker plugin when chosen,
+    /// otherwise rustudio's native drop-down grid of part materials.
+    pub fn material_quick_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
+        if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::MaterialPicker) {
+            let active = self.action_state("material").1 == Some(true);
+            let r = self.rb(ui, "texture", "Material", "material", active, act);
+            self.ui_rects.insert("home.material", r);
+            return;
+        }
         let (enabled, _) = self.action_state("material");
         let resp = ribbon_button(ui, "texture", "Material", false, enabled);
         self.ui_rects.insert("home.material", resp.rect);

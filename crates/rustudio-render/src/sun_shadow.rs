@@ -466,7 +466,7 @@ impl SunShadows {
                     targets: &[Some(ATLAS_FORMAT.into())],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let h_pipe = pipe("sun shadow blur across", "fs_h", &[Some(&h_layout)]);

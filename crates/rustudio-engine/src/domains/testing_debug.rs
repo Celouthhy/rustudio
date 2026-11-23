@@ -291,6 +291,9 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     // Breakpoints and watches destroyed since last frame.
     let tracked: Vec<(Ref, Vec<Ref>, Vec<Ref>)> = {
         let s = st(lua)?;
+        if s.breakpoints.is_empty() && s.watches.is_empty() {
+            return Ok(());
+        }
         let mut keys: HashSet<Ref> = s.breakpoints.keys().copied().collect();
         keys.extend(s.watches.keys().copied());
         keys.into_iter()

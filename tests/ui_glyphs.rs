@@ -35,6 +35,8 @@ fn collect(tokens: TokenStream, path: &Path, glyphs: &mut BTreeMap<char, BTreeSe
                         // Unicode transport/segmentation test data.
                         ("scripts.rs" | "writer.rs", '🦊')
                             | ("globals_parity.rs", '\u{200d}')
+                        // The Studio font fixtures exercise runtime-provided fonts.
+                            | ("gui.rs", 'ו' | 'ל' | 'ם' | 'ע' | 'ש' | '\u{200d}' | '\u{fe0f}' | '🛒')
                         // The Output stack marker is stripped before display.
                             | ("runtime.rs" | "ui_shots.rs", '\u{2063}')
                     ) {

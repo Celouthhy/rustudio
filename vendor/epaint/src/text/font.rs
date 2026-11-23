@@ -32,6 +32,11 @@ pub struct UvRect {
 
     /// Bottom right corner (exclusive).
     pub max: [u16; 2],
+
+    /// rustudio: true when rasterized from a color glyph (COLR/CPAL) and stored
+    /// in the atlas as premultiplied RGBA; must not be tinted by text color.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_color: bool,
 }
 
 impl UvRect {
@@ -231,6 +236,15 @@ impl FontCell {
             "Can't allocate glyph for id 0"
         );
 
+        // rustudio: render COLR/CPAL color glyphs (e.g. TwemojiMozilla, RobloxEmoji)
+        // in full RGBA color directly into the atlas without applying the monochrome
+        // color_transfer_function.
+        if let Some(alloc) =
+            self.allocate_color_glyph_uncached(atlas, metrics, glyph_id, bin, location)
+        {
+            return Some(alloc);
+        }
+
         let mut path = kurbo::BezPath::new();
         let mut pen = VelloPen {
             path: &mut path,
@@ -307,6 +321,155 @@ impl FontCell {
                     (glyph_pos.0 + width as usize) as u16,
                     (glyph_pos.1 + height as usize) as u16,
                 ],
+                is_color: false,
+            }
+        };
+
+        Some(GlyphAllocation { uv_rect })
+    }
+
+    /// rustudio: rasterize a COLR/CPAL color glyph via `skrifa::color` + `vello_cpu`.
+    /// Returns `None` if `glyph_id` is not a color glyph in this face.
+    fn allocate_color_glyph_uncached(
+        &mut self,
+        atlas: &mut TextureAtlas,
+        metrics: &StyledMetrics,
+        glyph_id: GlyphId,
+        bin: SubpixelBin,
+        location: skrifa::instance::LocationRef<'_>,
+    ) -> Option<GlyphAllocation> {
+        use skrifa::raw::TableProvider as _;
+
+        struct ColrCollector<'a> {
+            palette: &'a [skrifa::color::Color],
+            current_glyph: Option<GlyphId>,
+            layers: Vec<(GlyphId, [u8; 4])>,
+        }
+
+        impl skrifa::color::ColorPainter for ColrCollector<'_> {
+            fn push_transform(&mut self, _transform: skrifa::color::Transform) {}
+            fn pop_transform(&mut self) {}
+            fn push_clip_glyph(&mut self, glyph_id: GlyphId) {
+                self.current_glyph = Some(glyph_id);
+            }
+            fn push_clip_box(&mut self, _clip_box: skrifa::raw::types::BoundingBox<f32>) {}
+            fn pop_clip(&mut self) {
+                self.current_glyph = None;
+            }
+            fn fill(&mut self, brush: skrifa::color::Brush<'_>) {
+                let Some(gid) = self.current_glyph else {
+                    return;
+                };
+                let rgba = match brush {
+                    skrifa::color::Brush::Solid {
+                        palette_index,
+                        alpha,
+                    } => {
+                        if palette_index == 0xFFFF {
+                            [255, 255, 255, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8]
+                        } else if let Some(c) = self.palette.get(palette_index as usize) {
+                            let a = ((c.alpha as f32 / 255.0) * alpha.clamp(0.0, 1.0) * 255.0)
+                                .round() as u8;
+                            [c.red, c.green, c.blue, a]
+                        } else {
+                            return;
+                        }
+                    }
+                    _ => return,
+                };
+                self.layers.push((gid, rgba));
+            }
+            fn push_layer(&mut self, _composite_mode: skrifa::color::CompositeMode) {}
+        }
+
+        let layer_paths: Vec<(kurbo::BezPath, [u8; 4])> = self.with_dependent_mut(|_, font_data| {
+            let color_glyph = font_data.skrifa.color_glyphs().get(glyph_id)?;
+            let cpal = font_data.skrifa.cpal().ok()?;
+            let palette = cpal.color_records_array()?.ok()?;
+            let mut collector = ColrCollector {
+                palette,
+                current_glyph: None,
+                layers: Vec::new(),
+            };
+            color_glyph.paint(location, &mut collector).ok()?;
+            if collector.layers.is_empty() {
+                return None;
+            }
+            let size = skrifa::instance::Size::new(metrics.scale);
+            let mut out = Vec::with_capacity(collector.layers.len());
+            for (gid, rgba) in collector.layers {
+                let Some(outline) = font_data.outline_glyphs.get(gid) else {
+                    continue;
+                };
+                let mut path = kurbo::BezPath::new();
+                let mut pen = VelloPen {
+                    path: &mut path,
+                    x_offset: bin.as_float() as f64,
+                };
+                let draw_settings = skrifa::outline::DrawSettings::unhinted(size, location);
+                if outline.draw(draw_settings, &mut pen).is_ok() {
+                    out.push((path, rgba));
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        })?;
+
+        let mut bounds: Option<kurbo::Rect> = None;
+        for (path, _) in &layer_paths {
+            let b = path.control_box();
+            if b.width() > 0.0 || b.height() > 0.0 {
+                bounds = Some(match bounds {
+                    Some(acc) => acc.union(b),
+                    None => b,
+                });
+            }
+        }
+        let bounds = bounds?.expand();
+        let width = bounds.width() as u16;
+        let height = bounds.height() as u16;
+
+        let uv_rect = if width == 0 || height == 0 {
+            UvRect::default()
+        } else {
+            let mut ctx = vello_cpu::RenderContext::new(width, height);
+            ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
+            for (path, [r, g, b, a]) in &layer_paths {
+                ctx.set_paint(color::AlphaColor::<color::Srgb>::from_rgba8(*r, *g, *b, *a));
+                ctx.fill_path(path);
+            }
+            let mut dest = vello_cpu::Pixmap::new(width, height);
+            let mut resources = vello_cpu::Resources::new();
+            ctx.render(&mut dest, &mut resources);
+
+            let glyph_pos = {
+                let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
+                let pixels = dest.data_as_u8_slice();
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let pixel_offset = 4 * ((y * width as usize) + x);
+                        image[(x + glyph_pos.0, y + glyph_pos.1)] =
+                            Color32::from_rgba_premultiplied(
+                                pixels[pixel_offset],
+                                pixels[pixel_offset + 1],
+                                pixels[pixel_offset + 2],
+                                pixels[pixel_offset + 3],
+                            );
+                    }
+                }
+                glyph_pos
+            };
+            let offset_in_pixels = vec2(bounds.x0 as f32, bounds.y0 as f32);
+            let offset =
+                offset_in_pixels / metrics.pixels_per_point + metrics.y_offset_in_points * Vec2::Y;
+            UvRect {
+                offset,
+                size: vec2(width as f32, height as f32) / metrics.pixels_per_point,
+                min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                max: [
+                    (glyph_pos.0 + width as usize) as u16,
+                    (glyph_pos.1 + height as usize) as u16,
+                ],
+                is_color: true,
             }
         };
 
@@ -355,6 +518,15 @@ pub struct FontFace {
     font: FontCell,
     tweak: FontTweak,
     subpixel_binning: bool,
+    has_color_glyphs: bool,
+    row_height_per_em: f32,
+    /// rustudio: unscaled hhea ascender - descender (Studio's FontSubsystem
+    /// overrides FreeType's USE_TYPO_METRICS back to hhea).
+    hhea_asc_desc: i32,
+    /// rustudio: unscaled hhea ascender - descender + line_gap.
+    hhea_height: i32,
+    /// rustudio: head.unitsPerEm.
+    units_per_em: u16,
 
     /// Cached `harfrust` shaper data (parsed GSUB/GPOS tables).
     /// `ShaperData` is `Copy` — lives outside the `self_cell`.
@@ -430,6 +602,32 @@ impl FontFace {
         })?;
 
         let shaper_data = harfrust::ShaperData::new(&font.borrow_dependent().skrifa);
+        let has_color_glyphs =
+            skrifa::raw::TableProvider::colr(&font.borrow_dependent().skrifa).is_ok();
+        let (hhea_asc_desc, hhea_height, units_per_em, row_height_per_em) = {
+            let dep = font.borrow_dependent();
+            let upem = dep.metrics.units_per_em.max(1);
+            let upem_f = upem as f32;
+            let (ad, tot) = if let Ok(hhea) = skrifa::raw::TableProvider::hhea(&dep.skrifa) {
+                let ad = hhea.ascender().to_i16() as i32 - hhea.descender().to_i16() as i32;
+                let tot = ad + hhea.line_gap().to_i16() as i32;
+                if ad > 0 && tot > 0 {
+                    (ad, tot)
+                } else {
+                    let ad = (dep.metrics.ascent - dep.metrics.descent).round() as i32;
+                    let tot =
+                        (dep.metrics.ascent - dep.metrics.descent + dep.metrics.leading).round() as i32;
+                    (ad.max(1), tot.max(1))
+                }
+            } else {
+                let ad = (dep.metrics.ascent - dep.metrics.descent).round() as i32;
+                let tot =
+                    (dep.metrics.ascent - dep.metrics.descent + dep.metrics.leading).round() as i32;
+                (ad.max(1), tot.max(1))
+            };
+            let rh = (tot as f32 / upem_f).max(0.5);
+            (ad, tot, upem, rh)
+        };
 
         let subpixel_binning = tweak.subpixel_binning.unwrap_or(options.subpixel_binning);
 
@@ -438,6 +636,11 @@ impl FontFace {
             font,
             tweak,
             subpixel_binning,
+            has_color_glyphs,
+            row_height_per_em,
+            hhea_asc_desc,
+            hhea_height,
+            units_per_em,
             shaper_data,
             shape_plans: Default::default(),
             glyph_id_cache: Default::default(),
@@ -603,6 +806,61 @@ impl FontFace {
 
     pub(crate) fn tweak(&self) -> &FontTweak {
         &self.tweak
+    }
+
+    pub(crate) fn has_color_glyphs(&self) -> bool {
+        self.has_color_glyphs
+    }
+
+    /// Unscaled line height (`(hhea.ascender - hhea.descender + hhea.line_gap) / units_per_em`).
+    #[inline]
+    pub(crate) fn row_height_per_em(&self) -> f32 {
+        self.row_height_per_em
+    }
+
+    /// rustudio: FreeType 16.16 `y_scale` matching Studio's `FontSubsystem::setSize`
+    /// (`FT_SIZE_REQUEST_TYPE_REAL_DIM` with `hhea` metrics, `trunc(text_size) + 1`,
+    /// and `lineGap` compensation).
+    #[inline]
+    pub(crate) fn studio_y_scale(&self, text_size: f32) -> i64 {
+        let ts_int = (text_size as i32).max(1) as i64;
+        let req_h_base = (ts_int + 1) << 6;
+        let h_ad = self.hhea_asc_desc as i64;
+        let h_tot = self.hhea_height as i64;
+        let req_h = if h_ad > 0 && h_tot > 0 {
+            (h_ad * req_h_base) / h_tot
+        } else {
+            req_h_base
+        };
+        if h_ad > 0 {
+            ((req_h << 16) + (h_ad >> 1)) / h_ad
+        } else {
+            let upem = (self.units_per_em as i64).max(1);
+            ((req_h << 16) + (upem >> 1)) / upem
+        }
+    }
+
+    /// rustudio: effective em size in logical points for rasterizing glyphs at
+    /// Studio's `text_size` (derived from `studio_y_scale`).
+    #[inline]
+    pub(crate) fn studio_em_size(&self, text_size: f32) -> f32 {
+        let y_scale = self.studio_y_scale(text_size);
+        let em_26_6 = ((self.units_per_em as i64) * y_scale + 0x8000) >> 16;
+        ((em_26_6 as f32) / 64.0).max(1.0)
+    }
+
+    /// rustudio: convert a HarfBuzz/font-unit horizontal advance to whole logical
+    /// pixels using FreeType's `FT_MulFix` (to 26.6) and Studio's `(adv + 32) >> 6`
+    /// rounding.
+    #[inline]
+    pub(crate) fn studio_advance_px(unscaled: i32, y_scale: i64) -> f32 {
+        let u = unscaled as i64;
+        let adv_26_6 = if u >= 0 {
+            (u * y_scale + 0x8000) >> 16
+        } else {
+            -((-u * y_scale + 0x8000) >> 16)
+        };
+        ((adv_26_6 + 32) >> 6) as f32
     }
 
     pub(crate) fn shaper_data(&self) -> &harfrust::ShaperData {
@@ -791,6 +1049,21 @@ impl Font<'_> {
             .find_face_for_char(c, self.fonts_by_id)
             .unwrap_or(self.cached_family.replacement_face_key);
         self.cached_family.face_cache.insert(c, font_key);
+        font_key
+    }
+
+    /// rustudio: resolve `c` preferring a COLR/CPAL color-glyph face (for emoji
+    /// presentation sequences such as `1️⃣`, `❤️`, flags, ZWJ).
+    #[inline]
+    pub(crate) fn resolve_color_face(&mut self, c: char) -> FontFaceKey {
+        if let Some(font_key) = self.cached_family.color_face_cache.get(&c) {
+            return *font_key;
+        }
+        let font_key = self
+            .cached_family
+            .find_color_face_for_char(c, self.fonts_by_id)
+            .unwrap_or(self.cached_family.replacement_face_key);
+        self.cached_family.color_face_cache.insert(c, font_key);
         font_key
     }
 

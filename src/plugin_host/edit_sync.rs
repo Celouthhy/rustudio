@@ -253,6 +253,7 @@ impl Pending {
             });
             if let Some(s) = sel {
                 rt.fire(s, "SelectionChanged", vec![]);
+                rt.fire(s, "SelectionChangedThisFrame", vec![]);
             }
         }
         lent

@@ -81,6 +81,21 @@ pub fn installed_studio() -> Option<PathBuf> {
         .find(|r| r.join("ExtraContent/scripts/PlayerScripts").is_dir() && r.join("content").is_dir())
 }
 
+/// Newest local Windows Roblox Studio install under `%LOCALAPPDATA%\Roblox\Versions`
+/// that contains `BuiltInPlugins/Optimized_Embedded_Signature`. Kept separate
+/// from [`installed_studio`] so `default_scripts::studio_dir()` continues to
+/// prefer rustudio's up-to-date CDN download over an older local install.
+pub fn windows_studio_install() -> Option<PathBuf> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let versions = data().join("Roblox/Versions");
+    let rd = std::fs::read_dir(versions).ok()?;
+    rd.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|r| r.join("BuiltInPlugins/Optimized_Embedded_Signature").is_dir())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
 /// A data file that ships with rustudio (`api-dump.json`), wherever this
 /// build keeps it: next to the executable, in a macOS app bundle's
 /// `Contents/Resources`, in `../share/rustudio` (an install prefix), else the

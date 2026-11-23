@@ -256,6 +256,7 @@ const ANY_KEY: &[(&str, &str)] = &[
     ("services", "RenderSettings"),
     // __rs_pc_get
     ("players_chat", "TextChatMessage"),
+    ("players_chat", "Team"),
     // loaded / imported metadata
     ("assets_cloud", "PackageLink"),
     ("assets_cloud", "MeshImportData"),
@@ -593,57 +594,89 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
-    {
-        let _s = rustudio_core::bench::scope("dstep_pages");
-        pages::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_web_social");
-        web_social::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_avatar");
-        avatar::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_data");
-        data::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_anim");
-        anim::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_world");
-        world::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_geometry");
-        geometry::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_gui_input");
-        gui_input::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_media");
-        media::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_services");
-        services::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_players_chat");
-        players_chat::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_assets_cloud");
-        assets_cloud::step(lua, dt)?;
-    }
-    {
-        let _s = rustudio_core::bench::scope("dstep_testing");
-        testing::step(lua, dt)?;
+    let edit = crate::runtime::world(lua).is_ok_and(|w| w.mode == crate::runtime::RunMode::Edit);
+    if !edit {
+        {
+            let _s = rustudio_core::bench::scope("dstep_pages");
+            pages::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_web_social");
+            web_social::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_avatar");
+            avatar::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_data");
+            data::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_anim");
+            anim::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_world");
+            world::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_geometry");
+            geometry::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_gui_input");
+            gui_input::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_media");
+            media::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_services");
+            services::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_players_chat");
+            players_chat::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_assets_cloud");
+            assets_cloud::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_testing");
+            testing::step(lua, dt)?;
+        }
+    } else {
+        // Edit-mode plugin VM: skip Play-only domains (pages, avatar face
+        // tracking, data stores, motor/animation loops, pathfinding nav,
+        // chat/players, web shop). Keep camera interp, GUI/input, explicit
+        // plugin audio, RunService timing, asset fetches, and test/debug hooks.
+        {
+            let _s = rustudio_core::bench::scope("dstep_world");
+            world::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_gui_input");
+            gui_input::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_media");
+            media::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_services");
+            services::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_assets_cloud");
+            assets_cloud::step(lua, dt)?;
+        }
+        {
+            let _s = rustudio_core::bench::scope("dstep_testing");
+            testing::step(lua, dt)?;
+        }
     }
     if let Some(d) = plugin_api::registered() {
         (d.step)(lua, dt)?;

@@ -162,8 +162,11 @@ pub fn watch_theme(lua: &Lua) -> mlua::Result<bool> {
 /// `watch_theme` with the theme the setting has now (tests).
 pub fn watch_theme_as(lua: &Lua, now: &'static str) -> mlua::Result<bool> {
     let before = lua.app_data_ref::<SeenTheme>().map(|t| t.0);
+    if before == Some(now) {
+        return Ok(false);
+    }
     lua.set_app_data(SeenTheme(now));
-    if before.is_none_or(|b| b == now) {
+    if before.is_none() {
         return Ok(false);
     }
     // settings().Studio, as a plugin would get it (identity 5).

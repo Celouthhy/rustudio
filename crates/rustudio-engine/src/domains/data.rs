@@ -231,9 +231,10 @@ fn install_mode(lua: &Lua, local_mode: bool) -> mlua::Result<()> {
     let server = lua.load("return function() local r=game:GetService('RunService'); return r:IsServer() and r:IsRunning() end").eval::<mlua::Function>()?;
     let remote = lua.create_table()?;
     lua.set_named_registry_value("rustudio_messaging_remote", remote.clone())?;
+    let messaging_local = local_mode || PLAY_UNIVERSE.load(std::sync::atomic::Ordering::Relaxed) == 0;
     lua.load(messaging::SOURCE)
         .set_name("=rustudio.data.messaging")
-        .call::<()>((local_mode, create.clone(), encode, server.clone(), remote))?;
+        .call::<()>((messaging_local, create.clone(), encode, server.clone(), remote))?;
     let properties = lua.create_function(|lua, (obj, props): (crate::runtime::LInst, Table)| {
         lua.app_data_mut::<State>()
             .unwrap()
@@ -268,7 +269,7 @@ fn install_mode(lua: &Lua, local_mode: bool) -> mlua::Result<()> {
         .call::<()>((local_mode, create, properties, fire, report, server, none))?;
     store::install(lua, local_mode)?;
     memory_backend::install(lua, local_mode)?;
-    messaging::install_backend(lua, local_mode)?;
+    messaging::install_backend(lua, messaging_local)?;
     Ok(())
 }
 pub fn step(_: &Lua, _: f64) -> mlua::Result<()> {
@@ -316,6 +317,35 @@ shared.__data_integration_done=true
             .unwrap_or(false);
         let out = rt.world_mut().unwrap().output.clone();
         assert!(done, "integration did not finish: {out:?}");
+    }
+    #[test]
+    fn messaging_uses_local_mode_when_unpublished() {
+        use rustudio_core::doc::Document;
+        use crate::runtime::{RunMode, Runtime};
+        use rbx_dom_weak::InstanceBuilder;
+        PLAY_UNIVERSE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut d = Document::new_place();
+        let parent = d.find_child(d.dom.root_ref(), "ServerScriptService").unwrap();
+        let script = d.dom.insert(parent, InstanceBuilder::new("Script").with_name("MsgLocal").with_property("Source", r#"
+local m = game:GetService('MessagingService')
+local got = 0
+local c = m:SubscribeAsync('t', function(msg) if msg.Data == 'hi' then got += 1 end end)
+m:PublishAsync('t', 'hi')
+task.wait()
+c:Disconnect()
+shared.__msg_local_got = got
+"#.to_string()));
+        let rt = Runtime::new().unwrap();
+        rt.enter(World::new(d, RunMode::Run));
+        rt.bind_globals().unwrap();
+        install_mode(&rt.lua, false).unwrap();
+        rt.run_script(script);
+        for _ in 0..10 {
+            rt.step(0.05);
+        }
+        let got = rt.lua.globals().get::<Table>("shared").unwrap().get::<i64>("__msg_local_got").unwrap_or(0);
+        let out = rt.world_mut().unwrap().output.clone();
+        assert_eq!(got, 1, "unpublished MessagingService should deliver locally: {out:?}");
     }
     #[test]
     fn metadata_is_deep_copied() {

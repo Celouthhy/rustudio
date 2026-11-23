@@ -81,6 +81,12 @@ struct Paragraph {
 
     /// In case of an empty paragraph ("\n"), use this as height.
     pub empty_paragraph_height: f32,
+
+    /// rustudio: next bidi run id within this paragraph.
+    pub next_bidi_run: u32,
+
+    /// rustudio: true when any glyph in this paragraph has `bidi_level > 0`.
+    pub has_rtl: bool,
 }
 
 impl Paragraph {
@@ -90,6 +96,8 @@ impl Paragraph {
             section_index_at_start,
             glyphs: vec![],
             empty_paragraph_height: 0.0,
+            next_bidi_run: 0,
+            has_rtl: false,
         }
     }
 }
@@ -223,8 +231,17 @@ pub(crate) fn layout_shaped(
 
     let intrinsic_size = calculate_intrinsic_size(point_scale, &job, &paragraphs);
 
+    let any_rtl = paragraphs.iter().any(|p| p.has_rtl);
     let mut elided = false;
     let mut rows = rows_from_paragraphs(paragraphs, &job, pixels_per_point, &mut elided);
+    if any_rtl {
+        for placed_row in &mut rows {
+            if placed_row.row.glyphs.iter().any(|g| g.bidi_level > 0) {
+                let row = Arc::make_mut(&mut placed_row.row);
+                super::bidi::reorder_row_glyphs(&mut row.glyphs);
+            }
+        }
+    }
     if elided && let Some(last_placed) = rows.last_mut() {
         let last_row = Arc::make_mut(&mut last_placed.row);
         replace_last_glyph_with_overflow_character(fonts, pixels_per_point, &job, last_row);
@@ -234,19 +251,23 @@ pub(crate) fn layout_shaped(
     }
 
     let justify = job.justify && job.wrap.max_width.is_finite();
+    let trim_soft_wrap_ws = job_uses_studio_text_size(&job);
 
     if justify || job.halign != Align::LEFT {
         let num_rows = rows.len();
         for (i, placed_row) in rows.iter_mut().enumerate() {
             let is_last_row = i + 1 == num_rows;
-            let justify_row = justify && !placed_row.ends_with_newline && !is_last_row;
+            let is_soft_wrapped = !placed_row.ends_with_newline && !is_last_row;
+            let justify_row = justify && is_soft_wrapped;
+            let keep_trailing =
+                job.keep_trailing_whitespace && !(trim_soft_wrap_ws && is_soft_wrapped);
             halign_and_justify_row(
                 point_scale,
                 placed_row,
                 job.halign,
                 job.wrap.max_width,
                 justify_row,
-                job.keep_trailing_whitespace,
+                keep_trailing,
             );
         }
     }
@@ -255,16 +276,26 @@ pub(crate) fn layout_shaped(
     galley_from_rows(point_scale, job, rows, elided, intrinsic_size)
 }
 
+#[inline]
+fn job_uses_studio_text_size(job: &LayoutJob) -> bool {
+    job.sections
+        .iter()
+        .any(|s| s.format.studio_text_size.is_some())
+}
+
 /// Shared context for emitting shaped glyphs into a [`Paragraph`].
 struct ShapingContext {
     pixels_per_point: f32,
     font_size: f32,
+    studio_text_size: Option<f32>,
     line_height: f32,
     extra_letter_spacing: f32,
     section_index: u32,
     font_metrics: StyledMetrics,
     is_first_glyph_in_section: bool,
     prev_cluster: Option<u32>,
+    bidi_level: u8,
+    bidi_run: u32,
 }
 
 impl ShapingContext {
@@ -288,6 +319,8 @@ impl ShapingContext {
             uv_rect,
             section_index: self.section_index,
             first_vertex: 0,
+            bidi_level: self.bidi_level,
+            bidi_run: self.bidi_run,
         }
     }
 }
@@ -300,6 +333,9 @@ struct TextRun {
 
     /// Byte range within the section text.
     byte_range: ByteRange,
+
+    /// rustudio: UAX #9 bidi embedding level (0 = LTR, odd = RTL).
+    bidi_level: u8,
 }
 
 /// Emit shaped glyphs from a [`harfrust::GlyphBuffer`] into a [`Paragraph`].
@@ -314,6 +350,7 @@ fn layout_shaped_run(
     run_text: &str,
     glyph_buffer: &harfrust::GlyphBuffer,
     face_metrics: &StyledMetrics,
+    studio_y_scale: Option<i64>,
     ctx: &mut ShapingContext,
     paragraph: &mut Paragraph,
 ) {
@@ -325,13 +362,20 @@ fn layout_shaped_run(
 
     // Track how many glyphs we emit per cluster so we can add zero-width
     // continuation glyphs when a cluster has more chars than glyphs.
+    // For RTL runs, HarfBuzz emits clusters in decreasing byte order.
+    let is_rtl = run.bidi_level % 2 == 1;
     let mut cluster_start_byte: usize = 0;
+    let mut cluster_end_byte: usize = run_text.len();
     let mut cluster_glyph_count: usize = 0;
 
     for (info, pos) in iter::zip(glyph_buffer.glyph_infos(), glyph_buffer.glyph_positions()) {
         let glyph_id = skrifa::GlyphId::new(info.glyph_id);
         let cluster = info.cluster;
-        let mut advance_width_px = pos.x_advance as f32 * px_scale;
+        let mut advance_width_px = if let Some(ys) = studio_y_scale {
+            FontFace::studio_advance_px(pos.x_advance, ys) * ctx.pixels_per_point
+        } else {
+            pos.x_advance as f32 * px_scale
+        };
         let x_offset_px = pos.x_offset as f32 * px_scale;
         let y_offset_px = -(pos.y_offset as f32 * px_scale); // harfrust Y+ up → screen Y+ down
 
@@ -346,13 +390,21 @@ fn layout_shaped_run(
             let tweak = font.fonts_by_id.get(&run.font_key).map(|ff| ff.tweak());
             let tab_size = tweak.map_or(4.0, |t| t.tab_size);
             let (_, space_info) = font.glyph_info(' ', face_metrics);
-            let space_width_px = space_info.advance_width_unscaled.0 * px_scale;
+            let space_width_px = if let Some(ys) = studio_y_scale {
+                FontFace::studio_advance_px(
+                    space_info.advance_width_unscaled.0.round() as i32,
+                    ys,
+                ) * ctx.pixels_per_point
+            } else {
+                space_info.advance_width_unscaled.0 * px_scale
+            };
             advance_width_px = tab_size * space_width_px;
         }
 
         // Thin space (U+2009) and narrow no-break space (U+202F):
-        // override the shaper's advance width with the configured fraction of a space.
-        if chr == '\u{2009}' || chr == '\u{202F}' {
+        // override the shaper's advance width with the configured fraction of a space
+        // (skipped in Studio mode, where HarfBuzz's shaped font advance is used directly).
+        if studio_y_scale.is_none() && (chr == '\u{2009}' || chr == '\u{202F}') {
             let tweak = font.fonts_by_id.get(&run.font_key).map(|ff| ff.tweak());
             let thin_space_width = tweak.map_or(0.5, |t| t.thin_space_width);
             let (_, space_info) = font.glyph_info(' ', face_metrics);
@@ -365,14 +417,22 @@ fn layout_shaped_run(
         let is_new_cluster = ctx.prev_cluster.is_none_or(|pc| pc != cluster);
         if is_new_cluster {
             if ctx.prev_cluster.is_some() {
+                let range = if is_rtl {
+                    cluster_start_byte..cluster_end_byte
+                } else {
+                    cluster_start_byte..cluster as usize
+                };
                 emit_continuation_glyphs(
                     ctx,
                     paragraph,
                     run_text,
-                    cluster_start_byte..cluster as usize,
+                    range,
                     cluster_glyph_count,
                     face_metrics,
                 );
+                if is_rtl {
+                    cluster_end_byte = cluster_start_byte;
+                }
             }
             if !ctx.is_first_glyph_in_section {
                 paragraph.cursor_x_px += ctx.extra_letter_spacing * ctx.pixels_per_point;
@@ -393,16 +453,30 @@ fn layout_shaped_run(
 
             // Use the fallback font face (not run.font_key which returned NOTDEF).
             let fallback_key = font.resolve_face(chr);
-            let fallback_metrics = font
+            let (fallback_metrics, fallback_ys) = font
                 .fonts_by_id
                 .get(&fallback_key)
                 .map(|ff| {
-                    ff.styled_metrics(ctx.pixels_per_point, ctx.font_size, &Default::default())
+                    let (fs, ys) = if let Some(ts) = ctx.studio_text_size {
+                        (ff.studio_em_size(ts), Some(ff.studio_y_scale(ts)))
+                    } else {
+                        (ctx.font_size, None)
+                    };
+                    (
+                        ff.styled_metrics(ctx.pixels_per_point, fs, &Default::default()),
+                        ys,
+                    )
                 })
                 .unwrap_or_default();
             let (_, glyph_info) = font.glyph_info(chr, &fallback_metrics);
-            let advance_width_px =
-                glyph_info.advance_width_unscaled.0 * fallback_metrics.px_scale_factor;
+            let advance_width_px = if let Some(ys) = fallback_ys {
+                FontFace::studio_advance_px(
+                    glyph_info.advance_width_unscaled.0.round() as i32,
+                    ys,
+                ) * ctx.pixels_per_point
+            } else {
+                glyph_info.advance_width_unscaled.0 * fallback_metrics.px_scale_factor
+            };
             let (glyph_alloc, physical_x) =
                 if let Some(ff) = font.fonts_by_id.get_mut(&fallback_key) {
                     ff.allocate_glyph(
@@ -463,11 +537,16 @@ fn layout_shaped_run(
 
     // Emit continuation glyphs for the last cluster in the run.
     if ctx.prev_cluster.is_some() {
+        let range = if is_rtl {
+            cluster_start_byte..cluster_end_byte
+        } else {
+            cluster_start_byte..run_text.len()
+        };
         emit_continuation_glyphs(
             ctx,
             paragraph,
             run_text,
-            cluster_start_byte..run_text.len(),
+            range,
             cluster_glyph_count,
             face_metrics,
         );
@@ -523,7 +602,20 @@ fn layout_section(
     } = section;
 
     let font_size = format.font_id.size;
-    let font_metrics = font.styled_metrics(pixels_per_point, font_size, &format.coords);
+    let studio_text_size = format.studio_text_size;
+    let primary_font_key = font.cached_family.fonts.first().copied();
+    let primary_em_size = match (
+        studio_text_size,
+        primary_font_key.and_then(|k| font.fonts_by_id.get(&k)),
+    ) {
+        (Some(ts), Some(ff)) => ff.studio_em_size(ts),
+        _ => font_size,
+    };
+    let font_metrics = font.styled_metrics(pixels_per_point, primary_em_size, &format.coords);
+    let primary_row_height_per_em = primary_font_key
+        .and_then(|k| font.fonts_by_id.get(&k))
+        .map(|ff| ff.row_height_per_em())
+        .unwrap_or(1.0);
     let line_height = section
         .format
         .line_height
@@ -539,13 +631,16 @@ fn layout_section(
     let section_text = &job.text[byte_range.as_usize()];
     let mut ctx = ShapingContext {
         pixels_per_point,
-        font_size,
+        font_size: primary_em_size,
+        studio_text_size,
         line_height,
         extra_letter_spacing,
         section_index,
         font_metrics,
         is_first_glyph_in_section: paragraph.glyphs.is_empty(),
         prev_cluster: None,
+        bidi_level: 0,
+        bidi_run: 0,
     };
     let mut runs = Vec::new();
 
@@ -561,7 +656,14 @@ fn layout_section(
             continue;
         }
 
-        segment_into_runs(font, segment, &mut runs);
+        let bidi_levels = if super::bidi::has_rtl(segment) {
+            paragraph.has_rtl = true;
+            Some(super::bidi::resolve_levels(segment).1)
+        } else {
+            None
+        };
+
+        segment_into_runs(font, segment, bidi_levels.as_deref(), &mut runs);
 
         let num_runs = runs.len();
         for (run_idx, run) in runs.iter().enumerate() {
@@ -570,8 +672,20 @@ fn layout_section(
                 continue;
             };
 
+            let (eff_font_size, studio_y_scale) = if let Some(ts) = studio_text_size {
+                (font_face.studio_em_size(ts), Some(font_face.studio_y_scale(ts)))
+            } else if primary_font_key.is_some_and(|pk| pk != run.font_key)
+                && font_face.tweak().normalize_line_height
+            {
+                (
+                    font_size * (primary_row_height_per_em / font_face.row_height_per_em()),
+                    None,
+                )
+            } else {
+                (font_size, None)
+            };
             let face_metrics =
-                font_face.styled_metrics(pixels_per_point, font_size, &format.coords);
+                font_face.styled_metrics(pixels_per_point, eff_font_size, &format.coords);
 
             // Set buffer flags for paragraph boundary context.
             let mut flags = harfrust::BufferFlags::empty();
@@ -582,7 +696,20 @@ fn layout_section(
                 flags |= harfrust::BufferFlags::END_OF_TEXT;
             }
 
-            let glyph_buffer = shape_text(font_face, run_text, &format.coords, shape_buffer, flags);
+            let explicit_dir = bidi_levels.as_ref().map(|_| {
+                if run.bidi_level % 2 == 1 {
+                    harfrust::Direction::RightToLeft
+                } else {
+                    harfrust::Direction::LeftToRight
+                }
+            });
+
+            ctx.bidi_level = run.bidi_level;
+            ctx.bidi_run = paragraph.next_bidi_run;
+            paragraph.next_bidi_run = paragraph.next_bidi_run.wrapping_add(1);
+
+            let glyph_buffer =
+                shape_text(font_face, run_text, &format.coords, shape_buffer, flags, explicit_dir);
 
             layout_shaped_run(
                 font,
@@ -590,6 +717,7 @@ fn layout_section(
                 run_text,
                 &glyph_buffer,
                 &face_metrics,
+                studio_y_scale,
                 &mut ctx,
                 paragraph,
             );
@@ -727,6 +855,7 @@ fn line_break(
     elided: &mut bool,
 ) {
     let wrap_width = job.effective_wrap_width();
+    let trim_soft_wrap_ws = job_uses_studio_text_size(job);
 
     // Keeps track of good places to insert row break if we exceed `wrap_width`.
     let mut row_break_candidates = RowBreakCandidates::default();
@@ -742,8 +871,11 @@ fn line_break(
         }
 
         let potential_row_width = paragraph.glyphs[i].max_x() - row_start_x;
+        let is_breakable_space = trim_soft_wrap_ws
+            && paragraph.glyphs[i].chr.is_whitespace()
+            && paragraph.glyphs[i].chr != '\u{A0}';
 
-        if wrap_width < potential_row_width {
+        if !is_breakable_space && wrap_width < potential_row_width {
             // Row break:
 
             if first_row_indentation > 0.0
@@ -775,7 +907,15 @@ fn line_break(
                     .collect();
 
                 let section_index_at_start = glyphs[0].section_index;
-                let paragraph_max_x = glyphs.last().unwrap().max_x();
+                let paragraph_max_x = if trim_soft_wrap_ws {
+                    glyphs
+                        .iter()
+                        .rev()
+                        .find(|g| !g.chr.is_whitespace())
+                        .map_or(0.0, |g| g.max_x())
+                } else {
+                    glyphs.last().unwrap().max_x()
+                };
 
                 out_rows.push(PlacedRow {
                     pos: pos2(0.0, f32::NAN),
@@ -859,12 +999,32 @@ fn replace_last_glyph_with_overflow_character(
         let font_size = section.format.font_id.size;
 
         let font_id = font.resolve_face(overflow_character);
-        let font_face_metrics = font
+        let (font_face_metrics, studio_ys) = font
             .fonts_by_id
             .get(&font_id)
-            .map(|f| f.styled_metrics(pixels_per_point, font_size, &section.format.coords))
+            .map(|f| {
+                let (fs, ys) = if let Some(ts) = section.format.studio_text_size {
+                    (f.studio_em_size(ts), Some(f.studio_y_scale(ts)))
+                } else {
+                    (font_size, None)
+                };
+                (
+                    f.styled_metrics(pixels_per_point, fs, &section.format.coords),
+                    ys,
+                )
+            })
             .unwrap_or_default();
         let (_, glyph_info) = font.glyph_info(overflow_character, &font_face_metrics);
+        let primary_em_size = match (
+            section.format.studio_text_size,
+            font.cached_family
+                .fonts
+                .first()
+                .and_then(|k| font.fonts_by_id.get(k)),
+        ) {
+            (Some(ts), Some(ff)) => ff.studio_em_size(ts),
+            _ => font_size,
+        };
         let mut font_face = font.fonts_by_id.get_mut(&font_id);
 
         let overflow_glyph_x = if let Some(prev_glyph) = row.glyphs.last() {
@@ -873,8 +1033,12 @@ fn replace_last_glyph_with_overflow_character(
             0.0 // TODO(emilk): heed paragraph leading_space 😬
         };
 
-        let advance_width_px =
-            glyph_info.advance_width_unscaled.0 * font_face_metrics.px_scale_factor;
+        let advance_width_px = if let Some(ys) = studio_ys {
+            FontFace::studio_advance_px(glyph_info.advance_width_unscaled.0.round() as i32, ys)
+                * pixels_per_point
+        } else {
+            glyph_info.advance_width_unscaled.0 * font_face_metrics.px_scale_factor
+        };
         let replacement_glyph_width = advance_width_px / pixels_per_point;
 
         // Check if we're within width budget:
@@ -899,7 +1063,7 @@ fn replace_last_glyph_with_overflow_character(
                 .unwrap_or_default();
 
             let font_metrics =
-                font.styled_metrics(pixels_per_point, font_size, &section.format.coords);
+                font.styled_metrics(pixels_per_point, primary_em_size, &section.format.coords);
             let line_height = section
                 .format
                 .line_height
@@ -917,6 +1081,8 @@ fn replace_last_glyph_with_overflow_character(
                 uv_rect: replacement_glyph_alloc.uv_rect,
                 section_index,
                 first_vertex: 0, // filled in later
+                bidi_level: 0,
+                bidi_run: 0,
             });
             return;
         }
@@ -1154,7 +1320,8 @@ fn tessellate_row(
 
     let glyph_index_start = mesh.indices.len();
     let glyph_vertex_start = mesh.vertices.len();
-    tessellate_glyphs(point_scale, job, row, &mut mesh);
+    let mut color_glyph_vertex_starts = Vec::new();
+    tessellate_glyphs(point_scale, job, row, &mut mesh, &mut color_glyph_vertex_starts);
     let glyph_vertex_end = mesh.vertices.len();
 
     if format_summary.any_underline {
@@ -1182,6 +1349,7 @@ fn tessellate_row(
         mesh_bounds,
         glyph_index_start,
         glyph_vertex_range: glyph_vertex_start..glyph_vertex_end,
+        color_glyph_vertex_starts,
     }
 }
 
@@ -1232,7 +1400,13 @@ fn add_row_backgrounds(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh
     end_run(run_start.take(), last_rect.right());
 }
 
-fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &mut Row, mesh: &mut Mesh) {
+fn tessellate_glyphs(
+    point_scale: PointScale,
+    job: &LayoutJob,
+    row: &mut Row,
+    mesh: &mut Mesh,
+    color_glyph_vertex_starts: &mut Vec<u32>,
+) {
     for glyph in &mut row.glyphs {
         glyph.first_vertex = mesh.vertices.len() as u32;
         let uv_rect = glyph.uv_rect;
@@ -1249,9 +1423,15 @@ fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &mut Row, me
 
             let format = &job.sections[glyph.section_index as usize].format;
 
-            let color = format.color;
+            let color = if uv_rect.is_color {
+                color_glyph_vertex_starts.push(glyph.first_vertex);
+                let a = format.color.a();
+                Color32::from_rgba_premultiplied(a, a, a, a)
+            } else {
+                format.color
+            };
 
-            if format.italics {
+            if format.italics && !uv_rect.is_color {
                 let idx = mesh.vertices.len() as u32;
                 mesh.add_triangle(idx, idx + 1, idx + 2);
                 mesh.add_triangle(idx + 2, idx + 1, idx + 3);
@@ -1447,21 +1627,60 @@ impl RowBreakCandidates {
 /// need script-aware splitting once RTL/bidi support is added.
 ///
 /// Results are appended to `out` (which is cleared first) to allow
+/// rustudio: whether a grapheme cluster explicitly requests color emoji
+/// presentation (Variation Selector-16, Keycap sequence, Regional Indicator
+/// flag, or ZWJ emoji sequence).
+#[inline]
+fn wants_color_emoji_face(grapheme: &str) -> bool {
+    if grapheme.is_ascii() {
+        return false;
+    }
+    let mut first = true;
+    for c in grapheme.chars() {
+        if matches!(c, '\u{FE0F}' | '\u{20E3}') {
+            return true;
+        }
+        if first && ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) {
+            return true;
+        }
+        if c == '\u{200D}' && grapheme.chars().any(|x| x as u32 >= 0x2600) {
+            return true;
+        }
+        first = false;
+    }
+    false
+}
+
 /// the caller to reuse the allocation across calls.
-fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
+fn segment_into_runs(
+    font: &mut Font<'_>,
+    text: &str,
+    bidi_levels: Option<&[u8]>,
+    out: &mut Vec<TextRun>,
+) {
     use unicode_segmentation::UnicodeSegmentation as _;
 
     out.clear();
 
+    let mut char_idx = 0usize;
     for (byte_offset, grapheme_str) in text.grapheme_indices(true) {
         let byte_offset = ByteIndex(byte_offset);
         let byte_end = byte_offset + grapheme_str.len();
 
         let base_char = grapheme_str.chars().next().unwrap_or(' ');
-        let font_key = font.resolve_face(base_char);
+        let font_key = if wants_color_emoji_face(grapheme_str) {
+            font.resolve_color_face(base_char)
+        } else {
+            font.resolve_face(base_char)
+        };
+        let bidi_level = bidi_levels
+            .and_then(|lvls| lvls.get(char_idx).copied())
+            .unwrap_or(0);
+        char_idx += grapheme_str.chars().count();
 
         if let Some(last_run) = out.last_mut()
             && last_run.font_key == font_key
+            && last_run.bidi_level == bidi_level
         {
             last_run.byte_range.end = byte_end;
             continue;
@@ -1469,6 +1688,7 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
         out.push(TextRun {
             font_key,
             byte_range: byte_offset..byte_end,
+            bidi_level,
         });
     }
 }
@@ -1484,6 +1704,7 @@ fn shape_text(
     coords: &VariationCoords,
     mut buffer: harfrust::UnicodeBuffer,
     flags: harfrust::BufferFlags,
+    explicit_dir: Option<harfrust::Direction>,
 ) -> harfrust::GlyphBuffer {
     let font_ref = font_face.skrifa_font_ref();
     let tweak = font_face.tweak();
@@ -1509,6 +1730,9 @@ fn shape_text(
 
     buffer.set_flags(flags);
     buffer.push_str(text);
+    if let Some(dir) = explicit_dir {
+        buffer.set_direction(dir);
+    }
     buffer.guess_segment_properties();
 
     // (the plan `shape` would build, kept on the face: rustudio)

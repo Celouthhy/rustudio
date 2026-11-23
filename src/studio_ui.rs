@@ -90,6 +90,9 @@ pub struct UiState {
     /// Pop out / dock back / move between panel windows, done at the end
     /// of the frame (src/panels.rs).
     pub dock_moves: Vec<crate::panels::DockMove>,
+    /// Main-window tabs in a floating window inside it (their pop-out
+    /// button docks them back).
+    pub floating_tabs: Vec<Tab>,
     /// The panel windows last frame: key and tabs (menus and the self-test).
     pub popped: Vec<(String, Vec<Tab>)>,
     /// The tabs in the 3D view's tab group last frame.
@@ -101,6 +104,7 @@ pub struct UiState {
     pub popped_class: Option<egui::ViewportClass>,
     pub zoom: f32,
     pub show_gui: bool,
+    pub show_view_selector: bool,
     pub grid_size: f32,
     pub about: bool,
     /// File > Studio Settings (src/studio_settings.rs).
@@ -117,12 +121,14 @@ impl Default for UiState {
             panel_requests: Vec::new(),
             panels_open: HashSet::new(),
             dock_moves: Vec::new(),
+            floating_tabs: Vec::new(),
             popped: Vec::new(),
             viewport_group: Vec::new(),
             viewport_hidden: false,
             popped_class: None,
             zoom: 1.0,
             show_gui: true,
+            show_view_selector: true,
             grid_size: rustudio_core::mech::GRID_SPACING,
             about: false,
             studio_settings: Default::default(),
@@ -342,6 +348,7 @@ pub const WINDOW: &[M] = &[
         I("Terrain", "", "terrain_editor"),
     ]),
     Sub("Avatar", &[I("Clip Editor", "", "clip_editor"), I("Accessory", "", "accessory_editor"), I("Setup", "", "avatar_setup")]),
+    Sub("Audio", &[I("View Sounds", "", "audio_discovery")]),
     Sub("Collaboration", &[I("Live Collaborators", "", "live_collaborators"), I("Invite Collaborators", "", "invite_collaborators")]),
     Sub("Debug", &[I("Breakpoints", "", "breakpoints"), I("Call Stack", "", "call_stack"), I("Watch", "", "watch")]),
     Sub("Localization", &[I("Localization Tools", "", "localization_tools")]),
@@ -357,6 +364,7 @@ pub const WINDOW: &[M] = &[
     ]),
     Sub("Script", &[
         I("Command Bar", "", "command_bar"),
+        I("Drafts", "", "drafts"),
         I("Find in Place", "", "find_in_place"),
         I("Object Browser", "", "object_browser"),
         I("Analysis", "", "script_analysis"),

@@ -108,13 +108,22 @@ pub struct FxGlass {
     pub pos: [f32; 4],
 }
 
+/// Which pipeline draws an `FxDraw` (strips, standard ParticleEmitter, or
+/// legacy Sparkles using ParticleCurveCrazySparklesFS).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FxKind {
+    Strip,
+    Particles,
+    Sparkles,
+}
+
 /// One draw of effects, far to near: a texture and a range of `FxFrame`'s
 /// strip indices or particles.
 #[derive(Clone, Copy, Debug)]
 pub struct FxDraw {
     pub texture: egui::TextureId,
     pub wrap: bool,
-    pub particles: bool,
+    pub kind: FxKind,
     pub start: u32,
     pub end: u32,
 }
@@ -129,6 +138,8 @@ pub struct FxFrame {
     pub cam: [f32; 4],
     /// The camera's right (FaceCamera's fallback side).
     pub right: [f32; 4],
+    /// Camera +Z axis (-view.forward, Studio's CB0[10]) for particle ZOffset.
+    pub cam_back: [f32; 4],
     /// effects::SceneLight: ambient, outdoor, sun, env (linear RGB).
     pub light: [[f32; 4]; 4],
     pub draws: Vec<FxDraw>,
@@ -158,14 +169,21 @@ impl FxFrame {
         self.strips.extend_from_slice(vertices);
         let start = self.indices.len() as u32;
         self.indices.extend(indices.iter().map(|i| base + i));
-        self.join(FxDraw { texture, wrap, particles: false, start, end: self.indices.len() as u32 });
+        self.join(FxDraw { texture, wrap, kind: FxKind::Strip, start, end: self.indices.len() as u32 });
     }
 
     /// Appends particles (one draw, joined like `push_strip`).
     pub fn push_particles(&mut self, texture: egui::TextureId, particles: &[FxParticle]) {
         let start = self.particles.len() as u32;
         self.particles.extend_from_slice(particles);
-        self.join(FxDraw { texture, wrap: false, particles: true, start, end: self.particles.len() as u32 });
+        self.join(FxDraw { texture, wrap: false, kind: FxKind::Particles, start, end: self.particles.len() as u32 });
+    }
+
+    /// Appends legacy Sparkles particles (ParticleCurveCrazySparklesFS).
+    pub fn push_sparkles(&mut self, texture: egui::TextureId, particles: &[FxParticle]) {
+        let start = self.particles.len() as u32;
+        self.particles.extend_from_slice(particles);
+        self.join(FxDraw { texture, wrap: false, kind: FxKind::Sparkles, start, end: self.particles.len() as u32 });
     }
 
     fn join(&mut self, d: FxDraw) {
@@ -173,7 +191,7 @@ impl FxFrame {
             return;
         }
         if let Some(l) = self.draws.last_mut() {
-            if l.texture == d.texture && l.wrap == d.wrap && l.particles == d.particles && l.end == d.start {
+            if l.texture == d.texture && l.wrap == d.wrap && l.kind == d.kind && l.end == d.start {
                 l.end = d.end;
                 return;
             }
@@ -277,7 +295,7 @@ const SOFT_DEPTH_MAX: f32 = 500.0;
 // light check), amb (w: local lights), outdoor, lamp (the sun), env:
 // effects::SceneLight's terms.
 struct Tone { curve: vec4<f32>, e_on: vec4<f32>, fog: vec4<f32>, fog_rgb: vec4<f32>, casc: array<mat4x4<f32>, 4>, sphere: array<vec4<f32>, 4>, rect: array<vec4<f32>, 4>, grid: vec4<f32>, sun: vec4<f32>,
-    vp: mat4x4<f32>, cam: vec4<f32>, amb: vec4<f32>, outdoor: vec4<f32>, lamp: vec4<f32>, env: vec4<f32>, right: vec4<f32> };
+    vp: mat4x4<f32>, cam: vec4<f32>, amb: vec4<f32>, outdoor: vec4<f32>, lamp: vec4<f32>, env: vec4<f32>, right: vec4<f32>, cam_back: vec4<f32> };
 // render.rs LightRaw / shader.wgsl Light.
 struct Light { pos_range: vec4<f32>, color: vec4<f32>, dir: vec4<f32>, extra: vec4<f32>, surface_u: vec4<f32>, surface_v: vec4<f32> };
 @group(0) @binding(0) var scene_depth: texture_depth_multisampled_2d;
@@ -331,7 +349,13 @@ fn fx_grid(p: vec3<f32>) -> vec2<f32> {
 // One local light without N·L (SceneLight::local).
 fn fx_local(l: Light, p: vec3<f32>) -> vec3<f32> {
     let range = l.pos_range.w;
-    let to = l.pos_range.xyz - p;
+    var source = l.pos_range.xyz;
+    if (l.color.w > 1.5) {
+        let rel = p - source;
+        source += l.surface_u.xyz * clamp(dot(rel, l.surface_u.xyz), -l.surface_u.w, l.surface_u.w)
+            + l.surface_v.xyz * clamp(dot(rel, l.surface_v.xyz), -l.surface_v.w, l.surface_v.w);
+    }
+    let to = source - p;
     let d = length(to);
     let reach = range + FX_LOCAL_REACH;
     if (range <= 0.0 || d >= reach) { return vec3<f32>(0.0); }
@@ -467,7 +491,8 @@ fn vs_strip(v: StripIn) -> VOut {
     o.blend = 0.0;
     o.soft = vec2<f32>(0.0);
     let t = fx_transmit(at, v.glass);
-    o.color = v.color * t;
+    // Unpremultiplied vertex colour; glass dims alpha only (TrailFSLight).
+    o.color = vec4<f32>(v.color.rgb, v.color.a * t);
     o.dist = length(p - tone.cam.xyz);
     o.world = p;
     o.beam_sun = vec3<f32>(0.0);
@@ -517,7 +542,8 @@ fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
     let c = fx_clip(p);
     var z = c.z;
     if (v.zoffset != 0.0) {
-        let q = p + toward_cam(p) * v.zoffset;
+        // ParticleCustomVS: offset along CB0[10] (camera +Z = -view.forward).
+        let q = p + tone.cam_back.xyz * v.zoffset;
         let cz = tone.vp * vec4<f32>(q, 1.0);
         if (abs(cz.w) > 1e-6) { z = cz.z * c.w / cz.w; }
     }
@@ -532,7 +558,8 @@ fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
     o.blend = v.blend;
     o.soft = vec2<f32>(v.soft, select(0.0, v.zoffset, v.soft > 0.0));
     let t = fx_transmit(v.centre, v.glass);
-    o.color = v.color * t;
+    // Unpremultiplied vertex colour; glass dims alpha only (ParticleCustomFS).
+    o.color = vec4<f32>(v.color.rgb, v.color.a * t);
     o.dist = length(p - tone.cam.xyz);
     o.world = p;
     o.beam_sun = vec3<f32>(0.0);
@@ -544,6 +571,43 @@ fn vs_particle(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
         o.light = vec3<f32>(v.look.x);
     }
     fx_checked(&o, o.light * t, v.check);
+    return o;
+}
+
+// Legacy Sparkles (ParticleCurveVS): unlit, color_curve(t) * SparkleColor in
+// v.look.xyz and Params.y (0.6) in v.look.w; no soft-particle fade.
+@vertex
+fn vs_sparkles(v: ParticleIn, @builtin(vertex_index) vi: u32) -> VOut {
+    var o: VOut;
+    var corners = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    let k = corners[vi];
+    let cx = select(-1.0, 1.0, k == 1u || k == 2u);
+    let cy = select(-1.0, 1.0, k >= 2u);
+    let p = v.centre + (v.e1 * cx + v.e2 * cy);
+    let c = fx_clip(p);
+    var z = c.z;
+    if (v.zoffset != 0.0) {
+        let q = p + tone.cam_back.xyz * v.zoffset;
+        let cz = tone.vp * vec4<f32>(q, 1.0);
+        if (abs(cz.w) > 1e-6) { z = cz.z * c.w / cz.w; }
+    }
+    o.pos = vec4<f32>(c.xy, z, c.w);
+    o.depth = z;
+    o.vw = c.w;
+    o.fx = 1.0;
+    o.alpha_mul = v.look.w;
+    let corner = vec2<f32>((cx + 1.0) * 0.5, 1.0 - (cy + 1.0) * 0.5) * v.cell;
+    o.uv = v.uv0 + corner;
+    o.uv2 = o.uv;
+    o.blend = 0.0;
+    o.soft = vec2<f32>(0.0);
+    let t = fx_transmit(v.centre, v.glass);
+    o.color = vec4<f32>(1.0, 1.0, 1.0, v.color.a * t);
+    o.dist = length(p - tone.cam.xyz);
+    o.world = p;
+    o.beam_sun = vec3<f32>(0.0);
+    o.beam_grid = 0.0;
+    o.light = v.look.xyz;
     return o;
 }
 
@@ -675,37 +739,96 @@ fn beam_light(in: VOut) -> vec3<f32> {
     return max(in.light + in.beam_sun * (visibility - in.beam_grid), vec3<f32>(0.0));
 }
 
+// Studio's effects buffer is R10G10B10A2_UNORM holding
+// e = sqrt(clamp(L * 0.25 * exposure, 0, 1)) (CB0[20].y = tone.fog_rgb.w).
+// Hardware One / OneMinusSrcAlpha blending clamps e to [0, 1] after every
+// particle draw, preventing unbounded additive bloom explosions.
+
 @fragment
-fn fs_fx(in: VOut) -> @location(0) vec4<f32> {
-    let t = mix(textureSample(tex, samp, in.uv), textureSample(tex, samp, in.uv2), in.blend);
+fn fs_fx_gui(in: VOut) -> @location(0) vec4<f32> {
+    let t = textureSample(tex, samp, in.uv);
     let g = in.color * t;
     let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
-    let depth = select(in.depth, in.pos.z, in.fx > 0.5);
-    if (g.a <= 0.0 || depth < s * (1.0 - 0.0015)) {
+    if (g.a <= 0.0 || in.depth < s * (1.0 - 0.0015)) {
         discard;
     }
-    // (e_on.w: mech::FX_LIGHT_CLAMP)
-    var lin = (g.rgb / g.a) * (g.rgb / g.a) * beam_light(in);
-    if (in.fx < 0.5) {
-        // UILitFogFS: lit world GUI colour enters the scene before post.
-        lin = mix(lin, tone.fog_rgb.rgb, fog_amount(in.dist));
-        return vec4<f32>(sqrt(max(lin, vec3<f32>(0.0))) * g.a, g.a);
+    // UILitFogFS: premultiplied egui texture -> linear light -> fog -> scene encoding.
+    var lin = (g.rgb / g.a) * (g.rgb / g.a) * in.light;
+    lin = mix(lin, tone.fog_rgb.rgb, fog_amount(in.dist));
+    let enc = sqrt(clamp(max(lin, vec3<f32>(0.0)) * tone.fog_rgb.w, vec3<f32>(0.0), vec3<f32>(1.0)));
+    return vec4<f32>(enc * g.a, g.a);
+}
+
+// Studio's TrailFSLight (Beams & Trails): straight RGBA texture, unpremultiplied
+// vertex colour, texture alpha multiplied outside the scene-encoding clamp.
+@fragment
+fn fs_fx_strip(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let base_a = in.color.a * f0.a;
+    if (base_a <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
     }
-    lin = min(lin, vec3<f32>(tone.e_on.w));
-    var a = g.a * (1.0 - fog_amount(in.dist));
+    let c = f0.rgb * in.color.rgb;
+    let lin = c * c * beam_light(in);
+    let a = base_a * (1.0 - fog_amount(in.dist));
+    let enc = sqrt(clamp(max(lin, vec3<f32>(0.0)) * tone.fog_rgb.w, vec3<f32>(0.0), vec3<f32>(1.0)));
+    return vec4<f32>(enc * a, a * in.alpha_mul);
+}
+
+// Studio's ParticleCustomFS / ParticleCustomFS_Soft: straight RGBA texture,
+// premultiplied after trilinear filtering and BEFORE squaring/clamping to
+// R10G10B10A2 scene encoding.
+@fragment
+fn fs_fx_particle(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let f1 = textureSample(tex, samp, in.uv2);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let tex_a = mix(f0.a, f1.a, in.blend);
+    if (in.color.a * tex_a <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    let c = mix(f0.rgb * f0.a, f1.rgb * f1.a, in.blend) * in.color.rgb;
+    let lin = c * c * in.light;
+    let enc = sqrt(clamp(max(lin, vec3<f32>(0.0)) * tone.fog_rgb.w, vec3<f32>(0.0), vec3<f32>(1.0)));
+    var v_a = in.color.a * (1.0 - fog_amount(in.dist));
     if (in.soft.x > 0.0) {
         let sd = select(SOFT_DEPTH_MAX, min(tone.e_on.z / max(s, 1e-9), SOFT_DEPTH_MAX), s > 0.0);
         let pd = min(in.vw - in.soft.y, SOFT_DEPTH_MAX - 1.0 / in.soft.x);
-        a *= clamp(abs(sd - pd) * in.soft.x, 0.0, 1.0);
+        v_a *= clamp(abs(sd - pd) * in.soft.x, 0.0, 1.0);
     }
-    return vec4<f32>(sqrt(lin) * a, a * in.alpha_mul);
+    return vec4<f32>(enc * v_a, v_a * tex_a * in.alpha_mul);
+}
+
+// Studio's ParticleCurveCrazySparklesFS (Sparkles): straight RGBA sparkles_main.dds
+// where RGB is a soft white glow and A is a crisp 8-point star; A < 0.5 scales
+// tint by 2*A (sharp coloured arms), A >= 0.5 lerps tint toward RGB (solid white
+// star core); alpha scaled by Params.y = 0.6.
+@fragment
+fn fs_fx_sparkles(in: VOut) -> @location(0) vec4<f32> {
+    let f0 = textureSample(tex, samp, in.uv);
+    let s = textureLoad(scene_depth, vec2<i32>(floor(in.pos.xy)), 0);
+    let f2 = f0.a;
+    if (in.color.a * f2 <= 0.0 || in.pos.z < s * (1.0 - 0.0015)) {
+        discard;
+    }
+    let f1 = in.light;
+    let f3 = f2 * 2.0;
+    let f7 = select(mix(f1, f0.rgb, vec3<f32>(f3 - 1.0)), f1 * f3, f2 < 0.5);
+    let f11 = f7 * in.color.a;
+    let f15 = sqrt(clamp((f11 * f11) * tone.fog_rgb.w, vec3<f32>(0.0), vec3<f32>(1.0)));
+    let f19 = 1.0 - fog_amount(in.dist);
+    return vec4<f32>(f15 * f19, (in.alpha_mul * f2) * (in.color.a * f19));
 }
 "#;
 
-/// The effects' buffer: filled with the square root of the scene's linear
-/// light, and squared back into it once the effects are in.
+/// The effects' buffer: encodes linear HDR into Studio's R10G10B10A2 scene
+/// encoding e = sqrt(clamp(L * 0.25 * exposure, 0, 1)) and decodes back via
+/// L = e^2 / (0.25 * exposure) once effects are blended.
 const FX_SHADER: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
+struct FxTone { data: array<vec4<f32>, 4> };
+@group(0) @binding(1) var<uniform> tone: FxTone;
 struct VOut { @builtin(position) pos: vec4<f32> };
 @vertex
 fn vs(@builtin(vertex_index) i: u32) -> VOut {
@@ -717,12 +840,14 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
 @fragment
 fn fs_in(in: VOut) -> @location(0) vec4<f32> {
     let c = textureLoad(src, vec2<i32>(in.pos.xy), 0);
-    return vec4<f32>(sqrt(max(c.rgb, vec3<f32>(0.0))), c.a);
+    let k = tone.data[3].w;
+    return vec4<f32>(sqrt(clamp(max(c.rgb, vec3<f32>(0.0)) * k, vec3<f32>(0.0), vec3<f32>(1.0))), 1.0);
 }
 @fragment
 fn fs_out(in: VOut) -> @location(0) vec4<f32> {
     let c = textureLoad(src, vec2<i32>(in.pos.xy), 0);
-    return vec4<f32>(c.rgb * c.rgb, c.a);
+    let k = max(tone.data[3].w, 1e-6);
+    return vec4<f32>((c.rgb * c.rgb) / k, 1.0);
 }
 "#;
 
@@ -745,6 +870,7 @@ pub struct SunCascades {
 
 pub struct WorldGuiPass {
     tone_buf: wgpu::Buffer,
+    staging: wgpu::util::StagingBelt,
     /// The sun's shadow cascades (sun_shadow.rs): the EVSM atlas.
     pub sun_atlas: wgpu::TextureView,
     sun_sampler: wgpu::Sampler,
@@ -754,6 +880,7 @@ pub struct WorldGuiPass {
     pub sun_cascades: SunCascades,
     pipeline: wgpu::RenderPipeline,
     depth_bgl: wgpu::BindGroupLayout,
+    depth_binding: Option<DepthBinding>,
     tex_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// Repeating, for beams' and trails' tiled textures (round 25).
@@ -778,9 +905,10 @@ pub struct WorldGuiPass {
     /// Effects (`effects`): their pipeline into the square-root buffer,
     /// the fill / square-back passes, and the buffer sized to the view.
     fx_pipeline: wgpu::RenderPipeline,
-    /// Effects (FxFrame): beams / trails, and particles (instanced).
+    /// Effects (FxFrame): beams / trails, particles, and legacy sparkles.
     strip_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
+    sparkles_pipeline: wgpu::RenderPipeline,
     /// The frame's local lights (render.rs lights_buf) and how many.
     pub lights: wgpu::Buffer,
     pub n_lights: u32,
@@ -802,13 +930,21 @@ pub struct WorldGuiPass {
     fx_tex: Option<([u32; 2], wgpu::TextureView)>,
 }
 
-/// The scene's HDR format (render.rs HDR_FORMAT) and the effects' buffer.
-const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The scene's HDR format (render.rs HDR_FORMAT) and Studio's R10G10B10A2
+/// effects blend target (`e = sqrt(clamp(L * 0.25 * exposure, 0, 1))`).
+const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const FX_BUF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgb10a2Unorm;
+
+struct DepthBinding {
+    views: [wgpu::TextureView; 3],
+    buffers: [wgpu::Buffer; 3],
+    group: wgpu::BindGroup,
+}
 
 /// `WorldGuiPass::upload`'s result.
 struct Upload {
     depth_bg: wgpu::BindGroup,
-    /// GUI vertices / indices, strip vertices / indices, particles
+    /// GUI vertices / indices, strip vertices / indices, particles / sparkles
     /// (`WorldGuiPass::bufs`).
     draws: Vec<(Kind, wgpu::BindGroup, u32, u32)>,
 }
@@ -818,6 +954,18 @@ enum Kind {
     Gui,
     Strip,
     Particles,
+    Sparkles,
+}
+
+fn stage(
+    staging: &mut wgpu::util::StagingBelt,
+    target: &wgpu::Buffer,
+    encoder: &mut wgpu::CommandEncoder,
+    data: &[u8],
+) {
+    if let Some(size) = wgpu::BufferSize::new(data.len() as u64) {
+        staging.write_buffer(encoder, target, 0, size).copy_from_slice(data);
+    }
 }
 
 /// The effects' shader constants (mech.rs).
@@ -839,7 +987,14 @@ fn fx_constants() -> String {
 
 /// Writes `data` into the kept buffer `slot`, growing it (to the next power
 /// of two) when it doesn't fit.
-fn fill(device: &wgpu::Device, queue: &wgpu::Queue, slot: &mut Option<wgpu::Buffer>, usage: wgpu::BufferUsages, data: &[u8]) {
+fn fill(
+    device: &wgpu::Device,
+    staging: &mut wgpu::util::StagingBelt,
+    encoder: &mut wgpu::CommandEncoder,
+    slot: &mut Option<wgpu::Buffer>,
+    usage: wgpu::BufferUsages,
+    data: &[u8],
+) {
     if data.is_empty() {
         return;
     }
@@ -853,7 +1008,7 @@ fn fill(device: &wgpu::Device, queue: &wgpu::Queue, slot: &mut Option<wgpu::Buff
         }));
     }
     if let Some(b) = slot {
-        queue.write_buffer(b, 0, data);
+        stage(staging, b, encoder, data);
     }
 }
 
@@ -879,16 +1034,17 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 
 /// Draws `mipped`'s levels from `tex` (level 0 a copy, each next level the
 /// 2 x 2 average of the one before), only inside `dirty` (level-0 texels)
-/// when given, else whole (cleared first). Returns the commands to submit.
+/// when given, else whole (cleared first).
 fn draw_mips(
     device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
     pipeline: &wgpu::RenderPipeline,
     bgl: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     tex: &wgpu::Texture,
     mipped: &wgpu::Texture,
     mut dirty: Option<[u32; 4]>,
-) -> wgpu::CommandEncoder {
+) {
     let size = tex.size();
     let levels = mipped.mip_level_count();
     let level_view = |l: u32| {
@@ -898,7 +1054,6 @@ fn draw_mips(
             ..Default::default()
         })
     };
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
     let mut source_size = [size.width, size.height];
     for l in 0..levels {
         let dst_size = [(size.width >> l).max(1), (size.height >> l).max(1)];
@@ -914,7 +1069,7 @@ fn draw_mips(
             ],
         });
         let dst = level_view(l);
-        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world gui mip"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &dst,
@@ -937,7 +1092,6 @@ fn draw_mips(
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
     }
-    enc
 }
 
 /// The mip-chain copy `WorldGuiPass` makes of a `width` x `height` egui
@@ -1114,7 +1268,7 @@ impl WorldGuiPass {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("world gui"),
@@ -1132,7 +1286,7 @@ impl WorldGuiPass {
         });
         let tone_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("world gui tone"),
-            size: 640,
+            size: 656,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1186,26 +1340,26 @@ impl WorldGuiPass {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
-        // Into the effects' buffer (`effects`): world GUIs, strips and
-        // particles, premultiplied, alpha kept (round 27).
-        let fx_into = |label: &str, entry: &str, stride: usize, step: wgpu::VertexStepMode, attributes: &[wgpu::VertexAttribute]| {
+        // Into the R10G10B10A2 effects buffer (`effects`): world GUIs, strips,
+        // particles and sparkles, premultiplied, alpha kept.
+        let fx_into = |label: &str, vs_entry: &str, fs_entry: &str, stride: usize, step: wgpu::VertexStepMode, attributes: &[wgpu::VertexAttribute]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some(entry),
+                    entry_point: Some(vs_entry),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout { array_stride: stride as u64, step_mode: step, attributes })],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some("fs_fx"),
+                    entry_point: Some(fs_entry),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: FX_FORMAT,
+                        format: FX_BUF_FORMAT,
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
                                 src_factor: wgpu::BlendFactor::One,
@@ -1225,35 +1379,48 @@ impl WorldGuiPass {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
-        let fx_pipeline = fx_into("world gui effects", "vs", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
-        let strip_pipeline = fx_into("effects strips", "vs_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
-        let particle_pipeline = fx_into("effects particles", "vs_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let fx_pipeline = fx_into("world gui effects", "vs", "fs_fx_gui", std::mem::size_of::<GuiVertex>(), wgpu::VertexStepMode::Vertex, &attrs);
+        let strip_pipeline = fx_into("effects strips", "vs_strip", "fs_fx_strip", std::mem::size_of::<FxVertex>(), wgpu::VertexStepMode::Vertex, &strip_attrs);
+        let particle_pipeline = fx_into("effects particles", "vs_particle", "fs_fx_particle", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
+        let sparkles_pipeline = fx_into("effects sparkles", "vs_sparkles", "fs_fx_sparkles", std::mem::size_of::<FxParticle>(), wgpu::VertexStepMode::Instance, &particle_attrs);
         let fx_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world gui effects buffer"),
             source: wgpu::ShaderSource::Wgsl(FX_SHADER.into()),
         });
         let fx_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("world gui effects buffer"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let fx_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world gui effects buffer"),
             bind_group_layouts: &[Some(&fx_bgl)],
             immediate_size: 0,
         });
-        let full = |label: &str, entry: &str| {
+        let full = |label: &str, entry: &str, fmt: wgpu::TextureFormat| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&fx_layout),
@@ -1267,17 +1434,17 @@ impl WorldGuiPass {
                     module: &fx_module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: FX_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format: fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
-        let fx_in = full("world gui effects in", "fs_in");
-        let fx_out = full("world gui effects out", "fs_out");
+        let fx_in = full("world gui effects in", "fs_in", FX_BUF_FORMAT);
+        let fx_out = full("world gui effects out", "fs_out", HDR_FORMAT);
         let no_lights = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("effects no lights"),
             size: std::mem::size_of::<crate::render::LightRaw>() as u64,
@@ -1316,6 +1483,7 @@ impl WorldGuiPass {
             fx_pipeline,
             strip_pipeline,
             particle_pipeline,
+            sparkles_pipeline,
             lights: no_lights,
             n_lights: 0,
             bufs: Default::default(),
@@ -1346,8 +1514,10 @@ impl WorldGuiPass {
             sun_params: [0.0, 580.0, 0.05, 0.0],
             sun_cascades: Default::default(),
             tone_buf,
+            staging: wgpu::util::StagingBelt::new(device.clone(), 64 << 10),
             pipeline,
             depth_bgl,
+            depth_binding: None,
             tex_bgl,
             sampler,
             sampler_wrap,
@@ -1364,7 +1534,7 @@ impl WorldGuiPass {
     }
 
     /// Copy and downsample a texture when its uploaded contents change.
-    fn mipped(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, revision: TextureRevision) -> wgpu::TextureView {
+    fn mipped(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, tex: &wgpu::Texture, revision: TextureRevision) -> wgpu::TextureView {
         let frame = self.frame;
         let mut dirty = None;
         let reuse = if let Some((copy, view, used, last)) = self.mips.get_mut(tex) {
@@ -1403,8 +1573,7 @@ impl WorldGuiPass {
                 view_formats: &[],
             }))
         };
-        let enc = draw_mips(device, &self.mip_pipeline, &self.mip_bgl, &self.mip_sampler, tex, &mipped, dirty);
-        crate::gpu_timing::submit(device, queue, "gpu: world gui mips", [enc.finish()]);
+        draw_mips(device, encoder, &self.mip_pipeline, &self.mip_bgl, &self.mip_sampler, tex, &mipped, dirty);
         if let Some((_, view)) = reuse {
             return view;
         }
@@ -1421,12 +1590,14 @@ impl WorldGuiPass {
     fn upload(
         &mut self,
         rs: &egui_wgpu::RenderState,
+        encoder: &mut wgpu::CommandEncoder,
         depth: &wgpu::TextureView,
         batches: &[GuiBatch],
         fx: Option<&FxFrame>,
         tone_curve: Option<[f32; 5]>,
         fog: [f32; 4],
         fog_rgb: [f32; 3],
+        exposure: f32,
     ) -> Option<Upload> {
         let fx_any = fx.is_some_and(|f| !f.draws.is_empty());
         if !fx_any && batches.iter().all(|b| b.indices.is_empty()) {
@@ -1434,9 +1605,10 @@ impl WorldGuiPass {
         }
         let device = &rs.device;
         let t = tone_curve.unwrap_or([0.0; 5]);
+        let exp_scale = 0.25 * exposure.max(1e-4);
         let u: [f32; 16] = [
             t[0], t[1], t[2], t[3], t[4], if tone_curve.is_some() { 1.0 } else { 0.0 }, rustudio_core::mech::NEAR, rustudio_core::mech::FX_LIGHT_CLAMP,
-            fog[0], fog[1], fog[2], fog[3], fog_rgb[0], fog_rgb[1], fog_rgb[2], 0.0,
+            fog[0], fog[1], fog[2], fog[3], fog_rgb[0], fog_rgb[1], fog_rgb[2], exp_scale,
         ];
         let mut u = u.to_vec();
         u.extend(self.sun_cascades.local.iter().flatten().flatten().copied());
@@ -1455,28 +1627,8 @@ impl WorldGuiPass {
         u.extend(f.light[2]);
         u.extend(f.light[3]);
         u.extend(f.right);
-        rs.queue.write_buffer(&self.tone_buf, 0, bytemuck::cast_slice(&u));
-        // (storage bindings can't be empty)
-        let st = wgpu::BufferUsages::STORAGE;
-        let pad = [FxGlass::default()];
-        let [g0, g1] = &mut self.glass;
-        fill(device, &rs.queue, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }));
-        fill(device, &rs.queue, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
-        let (Some(g0), Some(g1)) = (&self.glass[0], &self.glass[1]) else { return None };
-        let depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("world gui depth"),
-            layout: &self.depth_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.sun_atlas) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sun_sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sun_grid) },
-                wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: g1.as_entire_binding() },
-            ],
-        });
+        u.extend(f.cam_back);
+        let texture_groups = rustudio_core::bench::scope("fx_texture_groups");
         // A bind group per egui texture (and sampler).
         self.frame += 1;
         // (effects' textures unused for a while are let go)
@@ -1518,7 +1670,7 @@ impl WorldGuiPass {
         // (kept from frame to frame while egui's texture for the id is the
         // same one: making the bind groups again each frame was most of
         // this pass's CPU time)
-        let group = |this: &mut Self, id: egui::TextureId, wrap: bool| -> Option<wgpu::BindGroup> {
+        let mut group = |this: &mut Self, id: egui::TextureId, wrap: bool| -> Option<wgpu::BindGroup> {
             let (tex, native_gen) = match egui.texture(&id).and_then(|t| t.texture.clone()) {
                 Some(t) => (t, None),
                 None => {
@@ -1539,7 +1691,7 @@ impl WorldGuiPass {
                     let bg = bg.clone();
                     let first = std::mem::replace(used, frame) != frame;
                     if first && mipped {
-                        this.mipped(device, &rs.queue, &tex, revision);
+                        this.mipped(device, encoder, &tex, revision);
                     }
                     return Some(bg);
                 }
@@ -1575,7 +1727,8 @@ impl WorldGuiPass {
                                 usage: key.usage,
                                 view_formats: &[],
                             });
-                            let enc = draw_mips(&device, &pipeline, &bgl, &sampler, &source, &copy, None);
+                            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui mips") });
+                            draw_mips(&device, &mut enc, &pipeline, &bgl, &sampler, &source, &copy, None);
                             queue.submit([enc.finish()]);
                             let view = copy.create_view(&Default::default());
                             let _ = tx.send((copy, view));
@@ -1588,7 +1741,7 @@ impl WorldGuiPass {
                 }
             }
             let (view, sampler) = if mipped {
-                (this.mipped(device, &rs.queue, &tex, revision), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
+                (this.mipped(device, encoder, &tex, revision), if wrap { &this.sampler_mip_wrap } else { &this.sampler_mip })
             } else {
                 (tex.create_view(&Default::default()), if wrap { &this.sampler_wrap } else { &this.sampler })
             };
@@ -1624,22 +1777,71 @@ impl WorldGuiPass {
         for d in &f.draws {
             let bg = if d.texture == egui::TextureId::default() { Some(self.white.clone()) } else { group(self, d.texture, d.wrap) };
             let Some(bg) = bg else { continue };
-            draws.push((if d.particles { Kind::Particles } else { Kind::Strip }, bg, d.start, d.end));
+            let kind = match d.kind {
+                FxKind::Strip => Kind::Strip,
+                FxKind::Particles => Kind::Particles,
+                FxKind::Sparkles => Kind::Sparkles,
+            };
+            draws.push((kind, bg, d.start, d.end));
         }
+        drop(texture_groups);
         drop(egui);
         if draws.is_empty() {
             return None;
         }
-        let (q, v, i) = (&rs.queue, wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
+        {
+            let _scope = rustudio_core::bench::scope("fx_tone_write");
+            stage(&mut self.staging, &self.tone_buf, encoder, bytemuck::cast_slice(&u));
+        }
+        let glass_upload = rustudio_core::bench::scope("fx_glass_upload");
+        // (storage bindings can't be empty)
+        let st = wgpu::BufferUsages::STORAGE;
+        let pad = [FxGlass::default()];
+        let [g0, g1] = &mut self.glass;
+        fill(device, &mut self.staging, encoder, g0, st, bytemuck::cast_slice(if f.glass.is_empty() { &pad } else { &f.glass }));
+        fill(device, &mut self.staging, encoder, g1, st, bytemuck::cast_slice(if f.glass_idx.is_empty() { &[0u32][..] } else { &f.glass_idx }));
+        let (Some(g0), Some(g1)) = (&self.glass[0], &self.glass[1]) else { return None };
+        drop(glass_upload);
+        let views = [depth, &self.sun_atlas, &self.sun_grid];
+        let buffers = [&self.lights, g0, g1];
+        let depth_bg = {
+            let _bind = rustudio_core::bench::scope("fx_depth_binding");
+            if self.depth_binding.as_ref().is_none_or(|cached| {
+                !cached.views.iter().eq(views) || !cached.buffers.iter().eq(buffers)
+            }) {
+                self.depth_binding = Some(DepthBinding {
+                    views: views.map(Clone::clone),
+                    buffers: buffers.map(Clone::clone),
+                    group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("world gui depth"),
+                        layout: &self.depth_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
+                            wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.sun_atlas) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sun_sampler) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sun_grid) },
+                            wgpu::BindGroupEntry { binding: 5, resource: self.lights.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 6, resource: g0.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 7, resource: g1.as_entire_binding() },
+                        ],
+                    }),
+                });
+            }
+            self.depth_binding.as_ref().expect("depth bindings initialized").group.clone()
+        };
+        let _buffers = rustudio_core::bench::scope("fx_draw_buffer_upload");
+        let (v, i) = (wgpu::BufferUsages::VERTEX, wgpu::BufferUsages::INDEX);
         let [b0, b1, b2, b3, b4] = &mut self.bufs;
         if !indices.is_empty() {
             let _upload = rustudio_core::bench::scope("gui_world_mesh_upload");
-            fill(device, q, b0, v, bytemuck::cast_slice(&vertices));
-            fill(device, q, b1, i, bytemuck::cast_slice(&indices));
+            fill(device, &mut self.staging, encoder, b0, v, bytemuck::cast_slice(&vertices));
+            fill(device, &mut self.staging, encoder, b1, i, bytemuck::cast_slice(&indices));
         }
-        fill(device, q, b2, v, bytemuck::cast_slice(&f.strips));
-        fill(device, q, b3, i, bytemuck::cast_slice(&f.indices));
-        fill(device, q, b4, v, bytemuck::cast_slice(&f.particles));
+        fill(device, &mut self.staging, encoder, b2, v, bytemuck::cast_slice(&f.strips));
+        fill(device, &mut self.staging, encoder, b3, i, bytemuck::cast_slice(&f.indices));
+        fill(device, &mut self.staging, encoder, b4, v, bytemuck::cast_slice(&f.particles));
+        self.staging.finish_and_recall_on_submit(encoder);
         Some(Upload { depth_bg, draws })
     }
 
@@ -1667,17 +1869,22 @@ impl WorldGuiPass {
                         pass.set_pipeline(&self.particle_pipeline);
                         pass.set_vertex_buffer(0, vb.slice(..));
                     }
+                    Kind::Sparkles => {
+                        let Some(vb) = b4 else { continue };
+                        pass.set_pipeline(&self.sparkles_pipeline);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                    }
                 }
                 bound = Some(*kind);
             }
             pass.set_bind_group(1, bg, &[]);
             let tris = match kind {
-                Kind::Particles => 2 * (end - start),
+                Kind::Particles | Kind::Sparkles => 2 * (end - start),
                 _ => (end - start) / 3,
             };
             rustudio_core::bench::perf::draw(rustudio_core::bench::perf::UI3D, 1, tris as u64);
             match kind {
-                Kind::Particles => pass.draw(0..6, *start..*end),
+                Kind::Particles | Kind::Sparkles => pass.draw(0..6, *start..*end),
                 _ => pass.draw_indexed(*start..*end, 0, 0..1),
             }
         }
@@ -1696,8 +1903,8 @@ impl WorldGuiPass {
         fog: [f32; 4],
         fog_rgb: [f32; 3],
     ) {
-        let Some(up) = self.upload(rs, depth, batches, None, tone_curve, fog, fog_rgb) else { return };
         let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui") });
+        let Some(up) = self.upload(rs, &mut enc, depth, batches, None, tone_curve, fog, fog_rgb, 1.0) else { return };
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world gui"),
@@ -1735,10 +1942,12 @@ impl WorldGuiPass {
         tone_curve: Option<[f32; 5]>,
         fog: [f32; 4],
         fog_rgb: [f32; 3],
+        exposure: f32,
     ) -> bool {
+        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
         let up = {
             let _b = rustudio_core::bench::scope("fx_upload");
-            self.upload(rs, depth, batches, fx, tone_curve, fog, fog_rgb)
+            self.upload(rs, &mut enc, depth, batches, fx, tone_curve, fog, fog_rgb, exposure)
         };
         let Some(up) = up else { return false };
         let _b = rustudio_core::bench::scope("fx_encode");
@@ -1751,7 +1960,7 @@ impl WorldGuiPass {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: FX_FORMAT,
+                    format: FX_BUF_FORMAT,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 })
@@ -1763,11 +1972,13 @@ impl WorldGuiPass {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("world gui effects buffer"),
                 layout: &self.fx_bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) }],
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.tone_buf.as_entire_binding() },
+                ],
             })
         };
         let (from_hdr, from_buf) = (source(hdr), source(buf));
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("world gui effects") });
         let mut step = |label: &str, view: &wgpu::TextureView, f: &mut dyn FnMut(&mut wgpu::RenderPass<'_>)| {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
@@ -1796,7 +2007,12 @@ impl WorldGuiPass {
             p.draw(0..3, 0..1);
         });
         drop(step);
-        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [enc.finish()]);
+        let commands = {
+            let _b = rustudio_core::bench::scope("fx_finish");
+            enc.finish()
+        };
+        let _b = rustudio_core::bench::scope("fx_submit");
+        crate::gpu_timing::submit(&rs.device, &rs.queue, "gpu: world gui effects", [commands]);
         true
     }
 }

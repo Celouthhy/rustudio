@@ -27,6 +27,7 @@ pub mod gui_modal;
 pub mod mouse_lock;
 pub mod ltypes;
 pub mod replicate;
+mod replicate_streaming;
 pub mod anim_replicate;
 pub mod rig;
 pub mod runtime;

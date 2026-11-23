@@ -489,7 +489,13 @@ impl Editor {
         self.game.viewport_rect = rect;
         rustudio_render::grass_temporal::tick(&mut self.game.cam, ui.ctx());
         let selector = Self::view_selector_rect(rect);
-        let over_selector = !self.game.is_playing() && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| selector.contains(p)));
+        let native_view_selector = self
+            .builtin_tools
+            .use_native(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector)
+            && self.ui.show_view_selector;
+        let over_selector = native_view_selector
+            && !self.game.is_playing()
+            && ui.input(|i| i.pointer.hover_pos().is_some_and(|p| selector.contains(p)));
         let resp = ui.allocate_rect(rect, if over_selector { Sense::hover() } else { Sense::click_and_drag() });
         let ctx = ui.ctx().clone();
         let context_menu_open = resp.context_menu_opened();
@@ -589,19 +595,28 @@ impl Editor {
         }
 
         // ---------------------------------------------------------- render
+        let vf_snaps = rustudio_engine::gui::vf_snap_pending();
         {
             let _s = rustudio_core::bench::scope("vp_scene_sync");
             self.game.scene.sync(&mut self.game.doc);
-            // The parts of the ViewportFrames the GUI drew last frame.
-            // (plus the Toolbox detail page's 3D preview, an orphan frame)
-            self.toolbox_vf = self.toolbox.preview.frames(&mut self.game.doc);
-            if self.toolbox_vf.is_empty() {
-                self.game.vf_scene.set_viewport_frames(&self.game.doc, self.game.gui.viewport_frames());
+            // The parts of the ViewportFrames the GUI drew last frame
+            // (plus Toolbox detail previews, plugin widgets, and pending
+            // ViewportFrame:CaptureSnapshotAsync requests).
+            self.toolbox_vf = if self
+                .builtin_tools
+                .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
+            {
+                self.toolbox.preview.frames(&mut self.game.doc)
             } else {
-                let mut roots = self.game.gui.viewport_frames().clone();
-                roots.extend(self.toolbox_vf.keys().copied());
-                self.game.vf_scene.set_viewport_frames(&self.game.doc, &roots);
+                Default::default()
+            };
+            let mut roots = self.game.gui.viewport_frames().clone();
+            roots.extend(self.toolbox_vf.keys().copied());
+            self.plugin_ui.collect_viewport_frames(&mut roots);
+            for &(_, vf) in &vf_snaps {
+                roots.insert(vf);
             }
+            self.game.vf_scene.set_viewport_frames(&self.game.doc, &roots);
             self.game.vf_scene.sync(&mut self.game.doc);
         }
         let pointer = resp.hover_pos();
@@ -620,11 +635,16 @@ impl Editor {
             .play
             .as_ref()
             .is_some_and(|p| p.mode == rustudio_engine::runtime::RunMode::Play);
+        let roblox_dragger_idle = self
+            .builtin_tools
+            .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+            && self.tool == Tool::None;
         self.hover = if hover_handle.is_none()
             && self.drag.is_none()
             && self.marquee.is_none()
             && !in_play
             && !self.clean_view
+            && !roblox_dragger_idle
         {
             pointer.and_then(|p| self.hover_pick(rect, p, alt))
         } else {
@@ -673,9 +693,34 @@ impl Editor {
         } else {
             false
         };
-        self.game.render_viewport_frames(&self.toolbox_vf);
-        if let Some(r) = self.game.renderer.as_ref() {
-            self.toolbox.preview.set_texture(|vf| r.vf_texture(vf));
+        {
+            let mut extra = self.toolbox_vf.clone();
+            self.plugin_ui.collect_vf_requests(&self.game.doc, &mut extra);
+            for &(_, vf) in &vf_snaps {
+                let laid = self.game.gui.vf_size_of(vf).or_else(|| self.plugin_ui.vf_size_of(vf));
+                let size = rustudio_engine::gui::vf_snapshot_size(&self.game.doc, vf, laid);
+                if let Some(req) = rustudio_engine::gui::vf_request_for(&self.game.doc, vf, size) {
+                    extra.insert(vf, req);
+                }
+            }
+            self.game.render_viewport_frames(&extra);
+            if let (Some(r), Some(rs)) = (self.game.renderer.as_ref(), self.game.render_state.as_ref()) {
+                self.toolbox.preview.set_texture(|vf| r.vf_texture(vf));
+                self.plugin_ui.set_vf_textures(|vf| r.vf_texture(vf));
+                for &(snap_id, vf) in &vf_snaps {
+                    if !extra.contains_key(&vf) {
+                        rustudio_engine::gui::vf_snap_complete(snap_id, String::new());
+                    } else if let Some(png) = r.readback_vf_png(rs, vf) {
+                        let uri = format!("rbxtemp://rustudio/vf_snap_{snap_id}.png");
+                        rustudio_core::assets::register_generated(&uri, png);
+                        rustudio_engine::gui::vf_snap_complete(snap_id, uri);
+                    }
+                }
+            } else {
+                for &(snap_id, _) in &vf_snaps {
+                    rustudio_engine::gui::vf_snap_complete(snap_id, String::new());
+                }
+            }
         }
         self.game.finish_view_gui(&ctx, rect, dt);
 
@@ -716,7 +761,12 @@ impl Editor {
         let in_game = self.game.game_viewport(ui, rect, &resp, gui_took) || plugin_took;
 
         // The Terrain Editor's brush has the left button while one is picked.
-        let brushing = !in_game && !alt && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter);
+        let brushing = !in_game
+            && !alt
+            && self
+                .builtin_tools
+                .use_native(rustudio_core::rustudio_settings::BuiltinTool::TerrainEditor)
+            && self.terrain_brush_ui(&ctx, rect, &resp, pointer, &painter);
 
         if self.part_drag.is_some() {
             for (key, tilt) in [(egui::Key::R, false), (egui::Key::T, true)] {
@@ -824,7 +874,7 @@ impl Editor {
             self.sync_hover_refs(h);
             let refs = std::mem::take(&mut self.hover_outline_refs.1);
             self.draw_outline_union(&painter, rect, &refs,
-                Stroke::new(crate::studio_settings::hover_outline_px(), crate::studio_settings::color("Studio", "Hover Over Color", theme::HOVER_3D)));
+                Stroke::new(crate::studio_settings::hover_outline_px(), crate::studio_settings::color("Studio", "Hover Over Color", theme::HOVER_3D)), false);
             self.hover_outline_refs.1 = refs;
         }
         // A free drag hides the handles (Studio draws only the pivot then).
@@ -927,7 +977,11 @@ impl Editor {
             self.draw_drag_hotkeys(&painter, rect);
         }
         // A Toolbox card dragged here: preview and drop (src/toolbox/glue.rs).
-        if !self.game.is_playing() {
+        if !self.game.is_playing()
+            && self
+                .builtin_tools
+                .use_native(rustudio_core::rustudio_settings::BuiltinTool::Toolbox)
+        {
             self.toolbox_viewport_drop(ui, rect, &resp);
         }
     }
@@ -950,10 +1004,10 @@ impl Editor {
     }
 
     pub(crate) fn draw_outline(&self, painter: &egui::Painter, rect: Rect, sp: &ScenePart, stroke: Stroke) {
-        self.draw_outline_union(painter, rect, &[sp.r], stroke);
+        self.draw_outline_union(painter, rect, &[sp.r], stroke, false);
     }
 
-    fn draw_outline_union(&self, painter: &egui::Painter, rect: Rect, refs: &[Ref], stroke: Stroke) {
+    fn draw_outline_union(&self, painter: &egui::Painter, rect: Rect, refs: &[Ref], stroke: Stroke, selection: bool) {
         // Nothing to outline: no mask (building and scanning one costs about
         // 50 M instructions at a 952x569 view, and an empty one has no edges).
         if refs.is_empty() {
@@ -972,6 +1026,29 @@ impl Editor {
                 painter.extend(e.1.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
                 cache.entries.push(e);
                 return;
+            }
+        }
+        // A camera turn changes projection, while the selection's meshes and
+        // transforms usually stay fixed. Keep the gathered jobs for big selections.
+        let prepare = reuse && selection && refs.len() >= 128;
+        if prepare {
+            let quick = self.outline_quick_key(rect, vp);
+            let mut cache = self.outline_cache.borrow_mut();
+            let cache = &mut *cache;
+            if let Some(prepared) = &mut cache.prepared {
+                if prepared.refs == refs
+                    && prepared.inputs.same_geometry(quick)
+                    && (prepared.inputs.journal == quick.journal || self.only_camera_motion_since(prepared.inputs.journal))
+                {
+                    if prepared.inputs.vp != quick.vp || prepared.inputs.rect != quick.rect {
+                        prepared.edges = visible_outline_edges(
+                            rect, vp, self.game.cam.pos, prepared, &mut cache.scratch, &mut cache.extra,
+                        );
+                    }
+                    prepared.inputs = quick;
+                    painter.extend(prepared.edges.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
+                    return;
+                }
             }
         }
         let _key_scope = rustudio_core::bench::scope("ol_key");
@@ -1057,25 +1134,36 @@ impl Editor {
                     (e.0, e.1.clone())
                 }
             };
-            if bounds.is_some_and(|(lo, hi)| part_outside_frustum(vp, d.xf, d.size, lo, hi)) {
+            if !prepare && bounds.is_some_and(|(lo, hi)| part_outside_frustum(vp, d.xf, d.size, lo, hi)) {
                 continue;
             }
             jobs.push((tris, d.xf, d.size));
         }
-        // Big, near parts first: the union doesn't depend on the order, and
-        // covering more of the view early lets more parts be skipped.
-        let eye = self.game.cam.pos;
-        jobs.sort_by_cached_key(|(_, xf, size)| {
-            let reach = size.x * size.y + size.y * size.z + size.x * size.z;
-            std::cmp::Reverse((reach / (xf.pos - eye).length_squared().max(1e-3)).to_bits())
-        });
-        let total: usize = jobs.iter().map(|j| j.0.corners.len()).sum();
-        let threads = if total < OUTLINE_PARALLEL_TRIANGLES {
-            1
-        } else {
-            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, outline_threads())
-        };
         drop(_mask_scope);
+        if prepare {
+            // Posed skinned vertices can read more than the renderer's draw
+            // transforms. Only reuse static triangle lists between turns.
+            if !sources.iter().any(|(_, _, _, _, skinned)| *skinned) {
+                let mut prepared = PreparedOutline {
+                    inputs: self.outline_quick_key(rect, vp),
+                    refs: refs.to_vec(),
+                    jobs,
+                    sorted_from: None,
+                    edges: Vec::new(),
+                };
+                prepared.edges = visible_outline_edges(
+                    rect, vp, self.game.cam.pos, &mut prepared, &mut cache.scratch, &mut cache.extra,
+                );
+                painter.extend(prepared.edges.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
+                cache.prepared = Some(prepared);
+                return;
+            }
+            jobs.retain(|(tris, xf, size)| {
+                !tris.bounds.is_some_and(|(lo, hi)| part_outside_frustum(vp, *xf, *size, lo, hi))
+            });
+        }
+        sort_outline_jobs(self.game.cam.pos, &mut jobs);
+        let threads = outline_thread_count(jobs.iter().map(|j| j.0.corners.len()).sum());
         let edges = union_edges(rect, vp, &jobs, &mut cache.scratch, &mut cache.extra, threads);
 
         painter.extend(edges.iter().map(|edge| egui::Shape::line_segment(*edge, stroke)));
@@ -1091,18 +1179,9 @@ impl Editor {
 
     fn draw_selection(&self, painter: &egui::Painter, rect: Rect) {
         // Studio Settings > Selection: Selection Color, Selection Line Thickness.
-        // (the selected parts, walked again only when the selection or the
-        // document changes)
-        let journal = self.game.doc.journal_end();
-        let mut cached = self.selection_outline_refs.borrow_mut();
-        if cached.0 != journal || cached.1 != self.game.doc.selection {
-            *cached = (journal, self.game.doc.selection.clone(), self.selected_parts());
-        }
-        let refs = std::mem::take(&mut cached.2);
-        drop(cached);
+        let refs = self.selected_parts_shared();
         self.draw_outline_union(painter, rect, &refs,
-            Stroke::new(crate::studio_settings::selection_outline_px(), crate::studio_settings::color("Studio", "Select Color", theme::SELECT)));
-        self.selection_outline_refs.borrow_mut().2 = refs;
+            Stroke::new(crate::studio_settings::selection_outline_px(), crate::studio_settings::color("Studio", "Select Color", theme::SELECT)), true);
     }
 
     /// Releasing the box keeps what it held (with Shift / Ctrl, added to
@@ -1201,6 +1280,13 @@ impl Editor {
             p.text(rect.min + Vec2::splat(10.0), egui::Align2::LEFT_TOP,
                 format!("{}: {:+.2}{unit}", drag.handle.tool.label(), drag.amount),
                 egui::FontId::proportional(13.0), theme::TEXT);
+        }
+        if !self
+            .builtin_tools
+            .use_native(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector)
+            || !self.ui.show_view_selector
+        {
+            return;
         }
         let view = self.game.cam.view();
         let center = area.center() - Vec2::new(0.0, 5.0);
@@ -1519,6 +1605,7 @@ struct PartSig {
 /// to an entry's (with the same parts) means its OutlineKey would match.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct QuickKey {
+    doc: u64,
     rect: [u32; 4],
     vp: [u32; 16],
     journal: u64,
@@ -1527,9 +1614,16 @@ struct QuickKey {
     meshes: u64,
 }
 
+impl QuickKey {
+    fn same_geometry(self, other: Self) -> bool {
+        self.doc == other.doc && self.scene == other.scene && self.items == other.items && self.meshes == other.meshes
+    }
+}
+
 impl Editor {
     fn outline_quick_key(&self, rect: Rect, vp: Mat4) -> QuickKey {
         QuickKey {
+            doc: self.game.doc.id,
             rect: [rect.min.x, rect.min.y, rect.max.x, rect.max.y].map(f32::to_bits),
             vp: vp.to_cols_array().map(f32::to_bits),
             journal: self.game.doc.journal_end(),
@@ -1558,6 +1652,7 @@ pub struct OutlineCache {
     #[allow(clippy::type_complexity)]
     entries: Vec<(OutlineKey, Vec<[Pos2; 2]>, Option<QuickKey>)>,
     scratch: MaskScratch,
+    prepared: Option<PreparedOutline>,
     /// Model-space bounds and shared-corner form of each triangle list the outline has drawn, by
     /// (address, length). Primitives are static; a loaded mesh's Arc is
     /// held here, so its address can't be reused by another mesh.
@@ -1569,6 +1664,47 @@ pub struct OutlineCache {
 
 /// One part's triangles (model space) and how it's drawn.
 type OutlineJob = (std::sync::Arc<IndexedTris>, Xform, Vec3);
+
+struct PreparedOutline {
+    inputs: QuickKey,
+    refs: Vec<Ref>,
+    jobs: Vec<OutlineJob>,
+    sorted_from: Option<[u32; 3]>,
+    edges: Vec<[Pos2; 2]>,
+}
+
+fn sort_outline_jobs(eye: Vec3, jobs: &mut [OutlineJob]) {
+    // Big, near parts first: coverage of the view lets later parts skip rows.
+    jobs.sort_by_cached_key(|(_, xf, size)| {
+        let reach = size.x * size.y + size.y * size.z + size.x * size.z;
+        std::cmp::Reverse((reach / (xf.pos - eye).length_squared().max(1e-3)).to_bits())
+    });
+}
+
+fn outline_thread_count(triangles: usize) -> usize {
+    if triangles < OUTLINE_PARALLEL_TRIANGLES {
+        1
+    } else {
+        std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, outline_threads())
+    }
+}
+
+fn visible_outline_edges(
+    rect: Rect, vp: Mat4, eye: Vec3, prepared: &mut PreparedOutline, main: &mut MaskScratch, extra: &mut Vec<MaskScratch>,
+) -> Vec<[Pos2; 2]> {
+    let scope = rustudio_core::bench::scope("ol_prepared_cull");
+    let eye_key = eye.to_array().map(f32::to_bits);
+    if prepared.sorted_from != Some(eye_key) {
+        sort_outline_jobs(eye, &mut prepared.jobs);
+        prepared.sorted_from = Some(eye_key);
+    }
+    let jobs: Vec<_> = prepared.jobs.iter().filter(|(tris, xf, size)| {
+        !tris.bounds.is_some_and(|(lo, hi)| part_outside_frustum(vp, *xf, *size, lo, hi))
+    }).collect();
+    let threads = outline_thread_count(jobs.iter().map(|j| j.0.corners.len()).sum());
+    drop(scope);
+    union_edges(rect, vp, &jobs, main, extra, threads)
+}
 
 /// A triangle list with its corners shared: each distinct point (by its
 /// exact bits) once, and the triangles as indices into them. The outline
@@ -1613,7 +1749,7 @@ impl IndexedTris {
 /// outlines rasterize on `threads` threads, each into its own coverage
 /// deltas, summed after: the union (coverage > 0), and so the edges and
 /// their order, are the same as on one thread.
-fn union_edges(rect: Rect, vp: Mat4, jobs: &[OutlineJob], main: &mut MaskScratch, extra: &mut Vec<MaskScratch>, threads: usize) -> Vec<[Pos2; 2]> {
+fn union_edges(rect: Rect, vp: Mat4, jobs: &[impl std::borrow::Borrow<OutlineJob> + Sync], main: &mut MaskScratch, extra: &mut Vec<MaskScratch>, threads: usize) -> Vec<[Pos2; 2]> {
     let _mask_scope = rustudio_core::bench::scope("ol_raster");
     // One job: its triangles, unless every row it could touch is covered
     // already (its triangles would each skip those rows: SilhouetteMask::triangle).
@@ -1637,7 +1773,7 @@ fn union_edges(rect: Rect, vp: Mat4, jobs: &[OutlineJob], main: &mut MaskScratch
         loop {
             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Some(job) = jobs.get(i) else { break };
-            draw(mask, &mut clip, job);
+            draw(mask, &mut clip, job.borrow());
         }
     };
     let shared: Vec<std::sync::atomic::AtomicBool> = if threads > 1 {
@@ -1766,22 +1902,32 @@ fn triangle_bounds(triangles: &[[Vec3; 3]]) -> Option<(Vec3, Vec3)> {
 /// plane put every point of the box outside it; the margin keeps rounding
 /// in the per-triangle test from ever disagreeing.
 fn part_outside_frustum(vp: glam::Mat4, xf: Xform, size: Vec3, lo: Vec3, hi: Vec3) -> bool {
-    let corners: [glam::Vec4; 8] = std::array::from_fn(|i| {
+    let mut outside = 0b11_1111;
+    for i in 0..8 {
         let c = Vec3::new(
             if i & 1 == 0 { lo.x } else { hi.x },
             if i & 2 == 0 { lo.y } else { hi.y },
             if i & 4 == 0 { lo.z } else { hi.z },
         );
-        vp * (xf.pos + xf.rot * (c * size)).extend(1.0)
-    });
-    if corners.iter().any(|p| !p.is_finite()) {
-        return false;
+        let p = vp * (xf.pos + xf.rot * (c * size)).extend(1.0);
+        if !p.is_finite() {
+            return false;
+        }
+        outside &= clip_outcode(p, -1e-3 * (1.0 + p.w.abs()));
+        if outside == 0 {
+            return false;
+        }
     }
-    let distance = |plane: usize, p: glam::Vec4| match plane {
-        0 => p.x + p.w, 1 => p.w - p.x, 2 => p.y + p.w,
-        3 => p.w - p.y, 4 => p.z, _ => p.w - p.z,
-    };
-    (0..6).any(|plane| corners.iter().all(|p| distance(plane, *p) < -1e-3 * (1.0 + p.w.abs())))
+    true
+}
+
+/// One bit per WGPU clip plane that the point is outside, using the
+/// same plane-distance arithmetic as the polygon clipper.
+fn clip_outcode(p: glam::Vec4, margin: f32) -> u32 {
+    let sides = glam::Vec4::new(p.x + p.w, p.w - p.x, p.y + p.w, p.w - p.y);
+    sides.cmplt(glam::Vec4::splat(margin)).bitmask()
+        | (u32::from(p.z < margin) << 4)
+        | (u32::from(p.w - p.z < margin) << 5)
 }
 
 /// SilhouetteMask's buffers. `delta` is all zeros between uses (each use
@@ -1877,25 +2023,29 @@ impl<'a> SilhouetteMask<'a> {
             0 => p.x+p.w, 1 => p.w-p.x, 2 => p.y+p.w,
             3 => p.w-p.y, 4 => p.z, _ => p.w-p.z,
         };
-        // Wholly outside one frustum plane: nothing to clip or cover.
-        if (0..6).any(|plane| tri.iter().all(|p| distance(plane, *p) < 0.0)) { return; }
+        let [a, b, c] = tri.map(|p| clip_outcode(p, 0.0));
+        if a & b & c != 0 {
+            return;
+        }
         // WGPU homogeneous frustum, including the near plane, before divide
         // (a triangle clipped by 6 planes has at most 9 corners).
         let mut poly = [glam::Vec4::ZERO; 9];
         let mut len = 3;
         poly[..3].copy_from_slice(&tri);
-        for plane in 0..6 {
-            if poly[..len].iter().all(|p| distance(plane, *p) >= 0.0) { continue; }
-            let mut clipped = [glam::Vec4::ZERO; 9];
-            let mut n = 0;
-            for i in 0..len {
-                let a=poly[i]; let b=poly[(i+1)%len];
-                let da=distance(plane, a); let db=distance(plane, b);
-                if da >= 0.0 && n < 9 { clipped[n] = a; n += 1; }
-                if (da >= 0.0) != (db >= 0.0) && n < 9 { clipped[n] = a+(b-a)*(da/(da-db)); n += 1; }
+        if a | b | c != 0 {
+            for plane in 0..6 {
+                if poly[..len].iter().all(|p| distance(plane, *p) >= 0.0) { continue; }
+                let mut clipped = [glam::Vec4::ZERO; 9];
+                let mut n = 0;
+                for i in 0..len {
+                    let a=poly[i]; let b=poly[(i+1)%len];
+                    let da=distance(plane, a); let db=distance(plane, b);
+                    if da >= 0.0 && n < 9 { clipped[n] = a; n += 1; }
+                    if (da >= 0.0) != (db >= 0.0) && n < 9 { clipped[n] = a+(b-a)*(da/(da-db)); n += 1; }
+                }
+                poly=clipped; len=n;
+                if len<3 { return; }
             }
-            poly=clipped; len=n;
-            if len<3 { return; }
         }
         let mut points = [egui::Pos2::ZERO; 9];
         for (q, p) in points.iter_mut().zip(&poly[..len]) {

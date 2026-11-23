@@ -21,6 +21,21 @@ impl Editor {
             if self.harness.no_plugins {
                 self.plugins.set_enabled(false);
             } else {
+                self.builtin_tools = rustudio_core::rustudio_settings::BuiltinToolChoices::from_settings();
+                if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+                    && matches!(
+                        self.tool,
+                        crate::app::Tool::Select | crate::app::Tool::Move | crate::app::Tool::Scale | crate::app::Tool::Rotate
+                    )
+                {
+                    self.tool = crate::app::Tool::None;
+                }
+                if self.builtin_tools.plugins_enabled {
+                    let _ = self.plugins.load_builtins_with_choices(self.builtin_tools);
+                    if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::ViewSelector) {
+                        self.plugins.wake_plugin_by_name("ViewSelector");
+                    }
+                }
                 for d in self.harness.plugin_dirs.clone() {
                     let _ = self.plugins.load_dir(&d);
                 }
@@ -38,11 +53,18 @@ impl Editor {
         }
         // Plugin GUI / viewport input since the last tick (widgets_ui.rs).
         self.plugin_ui.dt = dt as f32;
-        self.plugin_ui_flush();
+        let ui_flush = self.prepare_plugin_ui_flush();
         // (Before the session check answers: the cached signed-in profile, as
         // the plugin store uses; Studio has the id before plugins run.)
         let uid = self.game.account.user_id().unwrap_or_else(|| {
-            if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() { 0 } else { crate::plugin_store::current_user_id() }
+            static FALLBACK_UID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *FALLBACK_UID.get_or_init(|| {
+                if std::env::var_os("RUSTUDIO_NO_SESSION").is_some() {
+                    0
+                } else {
+                    crate::plugin_store::current_user_id()
+                }
+            })
         });
         super::settings::set_user_id(uid);
         // Plugin.GridSize / GetJoinMode read the editor's toolbar settings
@@ -65,24 +87,89 @@ impl Editor {
         }
         // Headless with no prompt answers scheduled: permission prompts are
         // refused instead of waiting forever.
-        let answers = self.harness.run.input.actions.iter().any(|(_, a)| matches!(a, crate::app::HarnessAction::UiAction(n) if n.starts_with("plugin-prompt:")));
+        let answers = self.harness.run.no_ui
+            && self
+                .harness
+                .run
+                .input
+                .actions
+                .iter()
+                .any(|(_, a)| matches!(a, crate::app::HarnessAction::UiAction(n) if n.starts_with("plugin-prompt:")));
         super::permissions::set_auto_deny(self.harness.run.no_ui && !answers);
         let rendering = self.game.play.is_none();
         let realtime = self.game.fixed_dt.is_none() && !rustudio_core::sim_clock::on();
+        let mut cam_sent = ui_flush.cam_sent;
+        let pre = |rt: &rustudio_engine::runtime::Runtime| {
+            super::widgets_ui::apply_plugin_ui_flush(rt, ui_flush, &mut cam_sent);
+        };
         match self.game.play_saved_doc_mut() {
             Some(doc) => {
                 // (Play holds the edit document meanwhile.)
                 let doc: *mut rustudio_core::doc::Document = doc;
                 // SAFETY: `doc` lives in self.game.play, which plugin_tick
                 // doesn't touch while the host runs.
-                self.plugins.tick(unsafe { &mut *doc }, dt, rendering, realtime);
+                self.plugins.tick_with_pre(unsafe { &mut *doc }, dt, rendering, realtime, pre);
             }
-            None => self.plugins.tick(&mut self.game.doc, dt, rendering, realtime),
+            None => self.plugins.tick_with_pre(&mut self.game.doc, dt, rendering, realtime, pre),
         }
+        self.finish_plugin_ui_flush(cam_sent);
         self.plugin_ui_after_tick();
         self.plugin_output();
         self.profiler_open_requests();
         self.plugin_ui_sync();
+    }
+
+    /// Steps Edit-mode audio loading, `PlayLocalSound`, and Properties-panel
+    /// preview playback, bridging incremental DOM edits and Edit VM requests.
+    pub fn edit_audio_tick(&mut self) {
+        if self.game.play.is_some() || self.place_loading() {
+            return;
+        }
+        let (cmds, seeks, listener) = self.plugins.take_edit_audio_requests();
+        let events = self.game.edit_audio_tick(cmds, seeks, listener);
+        self.plugins.sync_edit_audio_to_vm(&self.game.edit_audio.lengths);
+        self.plugins.deliver_edit_audio_events(&mut self.game.doc, &events);
+    }
+
+    /// Mirrors loaded audio lengths into the Edit VM (used before running Edit
+    /// Luau so newly created VMs immediately see already-loaded sounds).
+    pub fn sync_edit_audio_to_vm(&mut self) {
+        if self.game.play.is_some() {
+            return;
+        }
+        self.plugins.sync_edit_audio_to_vm(&self.game.edit_audio.lengths);
+    }
+
+    /// Live runtime Sound / AudioPlayer property value in Edit mode (Properties
+    /// panel and MCP `get_properties`), without mutating or dirtying the saved
+    /// document. Matches Studio 0.748: Preview playback is invisible to `Sound`
+    /// properties (`Playing`, `IsPlaying`, `IsPaused`, `TimePosition`).
+    pub fn live_sound_prop(&self, r: rbx_dom_weak::types::Ref, name: &str) -> Option<rbx_dom_weak::types::Variant> {
+        use rbx_dom_weak::types::Variant;
+        if self.game.play.is_some() {
+            return None;
+        }
+        let ea = &self.game.edit_audio;
+        match self.game.doc.class_of(r).as_deref() {
+            Some("Sound") => {
+                let playing = matches!(self.game.doc.prop(r, "Playing"), Some(Variant::Bool(true)));
+                match name {
+                    "IsLoaded" => Some(Variant::Bool(ea.is_loaded(r))),
+                    "TimeLength" => Some(Variant::Float64(ea.time_length(r))),
+                    "IsPlaying" => Some(Variant::Bool(playing)),
+                    "IsPaused" => Some(Variant::Bool(!playing)),
+                    _ => None,
+                }
+            }
+            Some("AudioPlayer") => match name {
+                "IsReady" => Some(Variant::Bool(ea.is_loaded(r))),
+                "TimeLength" => Some(Variant::Float64(ea.time_length(r))),
+                "IsPlaying" if ea.preview_ref() == Some(r) => Some(Variant::Bool(ea.preview_state(r).0)),
+                "TimePosition" if ea.preview_ref() == Some(r) => Some(Variant::Float64(ea.preview_state(r).1)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The profiler's Scripts tab asked to open a script at a line.
@@ -139,7 +226,13 @@ impl Editor {
                 // rustudio tool and only report back).
                 super::EditorRequest::SelectRibbonTool { tool } => {
                     use crate::app::Tool;
+                    let roblox_draggers = self
+                        .builtin_tools
+                        .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers);
                     match tool.as_str() {
+                        "Select" | "Move" | "Scale" | "Rotate" if roblox_draggers => {
+                            self.tool = Tool::None;
+                        }
                         "Select" => self.tool = Tool::Select,
                         "Move" => self.tool = Tool::Move,
                         "Scale" => self.tool = Tool::Scale,

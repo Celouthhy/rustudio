@@ -51,6 +51,8 @@ pub mod fbx_anim;
 pub mod text;
 #[path = "api_testing.rs"]
 mod testing;
+#[path = "api_builtin.rs"]
+pub mod builtin;
 
 /// The plugin domain's member claims (build.rs scans src/plugin_host/api*.rs).
 /// The engine's member_claims.rs cannot include them (this file is above the
@@ -75,10 +77,15 @@ pub const METHODS: &[(&str, &str)] = &[
     ("Set", "Selection"),
     ("Add", "Selection"),
     ("Remove", "Selection"),
+    ("AddFocusCallback", "Selection"),
+    ("SetTerrainSelectionHack", "Selection"),
+    ("ClearTerrainSelectionHack", "Selection"),
     // api_toolbar.rs
     ("CreateToolbar", "Plugin"),
     ("CreateButton", "PluginToolbar"),
+    ("CreatePopupButton", "PluginToolbar"),
     ("SetActive", "PluginToolbarButton"),
+    ("SetDropdownActive", "PluginToolbarButton"),
     // api_widgets.rs (CreateDockWidgetPluginGui(Async) yield: LUA_METHODS)
     ("CreateQWidgetPluginGui", "Plugin"),
     ("GetRelativeMousePosition", "PluginGui"),
@@ -154,11 +161,131 @@ pub const METHODS: &[(&str, &str)] = &[
     // api_studio_service.rs
     ("GetClassIcon", "StudioService"),
     ("GizmoRaycast", "StudioService"),
+    ("GetUserId", "StudioService"),
+    ("HasInternalPermission", "StudioService"),
+    ("GetStartupAssetId", "StudioService"),
+    ("GetStartupPluginId", "StudioService"),
+    ("GetBadgeConfigureUrl", "StudioService"),
+    ("GetBadgeUploadUrl", "StudioService"),
+    ("GetResourceByCategory", "StudioService"),
+    ("GetTermsOfUseUrl", "StudioService"),
+    ("CopyToClipboard", "StudioService"),
+    ("IsPluginInstalled", "StudioService"),
+    ("IsPluginUpToDate", "StudioService"),
+    ("OpenInBrowser_DONOTUSE", "StudioService"),
+    ("SetPluginEnabled", "StudioService"),
+    ("ShowPublishToRoblox", "StudioService"),
+    ("UninstallPlugin", "StudioService"),
+    ("UpdatePluginManagement", "StudioService"),
+    ("TryInstallPlugin", "StudioService"),
+    ("AnimationIdSelected", "StudioService"),
+    // StudioAssetService / BrowserService
+    ("ShowSaveToRoblox", "StudioAssetService"),
+    ("ResolveSaveInstanceToRoblox", "StudioAssetService"),
+    ("PublishPackage", "StudioAssetService"),
+    ("UpdatePublishedPackage", "StudioAssetService"),
+    ("ConvertToPackageUpload", "StudioAssetService"),
+    ("FireOnUGCSubmitCompleted", "StudioAssetService"),
+    ("SerializeInstances", "StudioAssetService"),
+    ("DEPRECATED_SerializeInstances", "StudioAssetService"),
+    ("OpenBrowserWindow", "BrowserService"),
+    ("CloseBrowserWindow", "BrowserService"),
+    ("OpenNativeOverlay", "BrowserService"),
+    ("SendCommand", "BrowserService"),
+    ("EmitHybridEvent", "BrowserService"),
+    ("ExecuteJavaScript", "BrowserService"),
+    ("ReturnToJavaScript", "BrowserService"),
+    ("CopyAuthCookieFromBrowserToEngine", "BrowserService"),
+    ("Start", "SmoothVoxelsUpgraderService"),
+    ("Cancel", "SmoothVoxelsUpgraderService"),
+    ("CancelImportHeightmap", "HeightmapImporterService"),
+    ("GetHeightmapPreviewAsync", "HeightmapImporterService"),
+    ("ImportHeightmap", "HeightmapImporterService"),
+    ("ImportHeightmapWithMaterialSlotsAsync", "HeightmapImporterService"),
+    ("IsValidColormap", "HeightmapImporterService"),
+    ("IsValidHeightmap", "HeightmapImporterService"),
+    ("SetImportHeightmapPaused", "HeightmapImporterService"),
+    ("DefineCallout", "CalloutService"),
+    ("AttachCallout", "CalloutService"),
+    ("DetachCalloutsByDefinitionId", "CalloutService"),
+    ("ShowNotification", "ToastNotificationService"),
+    ("HideNotification", "ToastNotificationService"),
+    ("GetWidgetFromLabel", "StudioWidgetsService"),
+    ("GetWidgetFromPluginGui", "StudioWidgetsService"),
+    ("ApplyHighlight", "StudioWidgetsService"),
+    ("ApplySpotlight", "StudioWidgetsService"),
+    ("HideSpotlight", "StudioWidgetsService"),
+    ("ApplyShadows", "StudioWidgetsService"),
+    ("ApplyFillInBox", "StudioWidgetsService"),
+    ("GetAppliedStyles", "StylingService"),
+    ("GetStyleInfo", "StylingService"),
+    ("GetStyleSheetDerivesChain", "StylingService"),
+    ("GetStyleSheetInfo", "StylingService"),
+    ("UpdateUnitTestOnly", "StylingService"),
+    ("GetScriptFilePath", "CoreScriptSyncService"),
     ("GetBinaryContents", "File"),
     ("GetTemporaryId", "File"),
     ("ExportPlace", "PluginManagerInterface"),
     ("ExportSelection", "PluginManagerInterface"),
     ("CreatePlugin", "PluginManagerInterface"),
+    // api_builtin.rs (RobloxScriptSecurity built-in plugin APIs)
+    ("GetPluginComponent", "Plugin"),
+    ("GetUri", "Plugin"),
+    ("GetPreinitPayload", "Plugin"),
+    ("FinishFullLoading", "Plugin"),
+    ("SetReady", "Plugin"),
+    ("OnInvoke", "Plugin"),
+    ("OnInvokeSuspendOverride", "Plugin"),
+    ("Invoke", "Plugin"),
+    ("GetItem", "Plugin"),
+    ("SetItem", "Plugin"),
+    ("OnSetItem", "Plugin"),
+    ("GetPluginPolicy", "PluginPolicyService"),
+    ("ConvertToMockPackage", "PackageUIService"),
+    ("ConvertToPackageClosedCallback", "PackageUIService"),
+    ("ConvertToPackageUpload", "PackageUIService"),
+    ("ConvertToPackageAsync", "PackageUIService"),
+    ("GetPackageInfo", "PackageUIService"),
+    ("PublishPackage", "PackageUIService"),
+    ("SetPackageVersion", "PackageUIService"),
+    ("ClearUploadNames", "StudioPublishService"),
+    ("CloseAfterPublish", "StudioPublishService"),
+    ("PublishAs", "StudioPublishService"),
+    ("PublishThenTurnOnTeamCreate", "StudioPublishService"),
+    ("RefreshDocumentDisplayName", "StudioPublishService"),
+    ("RegisterPublishHold", "StudioPublishService"),
+    ("SaveOrPublishPlaceToRobloxIsCanceled", "StudioPublishService"),
+    ("SetTeamCreateOnPublishInfo", "StudioPublishService"),
+    ("SetUniverseDisplayName", "StudioPublishService"),
+    ("SetUploadNames", "StudioPublishService"),
+    ("ShowSaveOrPublishPlaceToRoblox", "StudioPublishService"),
+    // AssetImportService
+    ("GetAllPresets", "AssetImportService"),
+    ("GetPreset", "AssetImportService"),
+    ("RemovePreset", "AssetImportService"),
+    ("SavePreset", "AssetImportService"),
+    ("StartSessionWithPath", "AssetImportService"),
+    ("StartSingleFileWatch", "AssetImportService"),
+    ("StopSingleFileWatch", "AssetImportService"),
+    ("GetFilesInDirAsync", "AssetImportService"),
+    ("PickFileWithPromptAsync", "AssetImportService"),
+    ("PickImageFileWithPrompt", "AssetImportService"),
+    ("PickMeshFileWithPrompt", "AssetImportService"),
+    ("PickMultipleFilesWithPrompt", "AssetImportService"),
+    ("StartSessionWithPathAsync", "AssetImportService"),
+    ("UploadAssetFromContentAsync", "AssetImportService"),
+    ("UploadAssetFromPathAsync", "AssetImportService"),
+    ("UploadVersionedAssetFromContentAsync", "AssetImportService"),
+    ("UploadVersionedAssetFromPathAsync", "AssetImportService"),
+    // CollaboratorsService
+    ("GetCollaboratorsList", "CollaboratorsService"),
+    ("GetSelectionHighlightsEnabled", "CollaboratorsService"),
+    ("MultiGetCanCollaborate", "CollaboratorsService"),
+    ("RequestFlyToCollaborator", "CollaboratorsService"),
+    ("ToggleSelectionHighlights", "CollaboratorsService"),
+    ("ToggleTeamCreate", "CollaboratorsService"),
+    // TeamCreateService
+    ("CloseGameIfUserDoesntHavePerms", "TeamCreateService"),
 ];
 
 /// Events this domain (or the host) fires.
@@ -169,8 +296,13 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("Deactivation", "Plugin"),
     // Set / Add / Remove here, the editor's selection (edit_sync.rs)
     ("SelectionChanged", "Selection"),
+    ("SelectionChangedThisFrame", "Selection"),
+    ("Status", "SmoothVoxelsUpgraderService"),
+    ("ColormapHasUnknownPixels", "HeightmapImporterService"),
+    ("ProgressUpdate", "HeightmapImporterService"),
     // the harness's --action plugin-button:… (PluginHost::trigger)
     ("Click", "PluginToolbarButton"),
+    ("DropdownClick", "PluginToolbarButton"),
     // the harness's --action plugin-action:…
     ("Triggered", "PluginAction"),
     // settings().Studio.Theme written (services.rs)
@@ -197,6 +329,53 @@ pub const EVENTS: &[(&str, &str)] = &[
     // widgets_ui.rs: Toolbox instances dragged into the 3D view while the
     // plugin's mouse is active (api-walk.txt: "connect ok" in Studio)
     ("DragEnter", "PluginMouse"),
+    // Built-in plugin DataModel lifecycle & drag events
+    ("Ready", "Plugin"),
+    ("ViewportDragDropped", "Plugin"),
+    ("ViewportDragEntered", "Plugin"),
+    ("ViewportDragLeft", "Plugin"),
+    ("DataModelSessionStarted", "MultipleDocumentInterfaceInstance"),
+    ("DataModelSessionEnded", "MultipleDocumentInterfaceInstance"),
+    ("CurrentDataModelTypeAboutToChange", "DataModelSession"),
+    ("CurrentDataModelTypeChanged", "DataModelSession"),
+    // MouseService viewport hover events (widgets_ui.rs)
+    ("MouseEnterStudioViewport", "MouseService"),
+    ("MouseLeaveStudioViewport", "MouseService"),
+    // Built-in plugin service open/publish signals
+    ("OnOpenGameSettings", "StudioService"),
+    ("OnImportFromRoblox", "StudioService"),
+    ("OnOpenManagePackagePlugin", "StudioService"),
+    ("OnPluginInstalledFromToolbox", "StudioService"),
+    ("OnPluginInstalledFromWeb", "StudioService"),
+    ("OnPublishAsPlugin", "StudioService"),
+    ("OnSaveToRoblox", "StudioService"),
+    ("PromptTransformPluginCheckEnable", "StudioService"),
+    ("SaveLocallyAsComplete", "StudioService"),
+    ("OnSaveToRoblox", "StudioAssetService"),
+    ("OnConvertToPackageResult", "StudioAssetService"),
+    ("OnPromptSaveInstanceToRobloxAsync", "StudioAssetService"),
+    ("OnPublishPackageResult", "StudioAssetService"),
+    ("OnUGCSubmitCompleted", "StudioAssetService"),
+    ("AuthCookieCopiedToEngine", "BrowserService"),
+    ("BrowserWindowClosed", "BrowserService"),
+    ("BrowserWindowWillNavigate", "BrowserService"),
+    ("JavaScriptCallback", "BrowserService"),
+    ("OnOpenConvertToPackagePlugin", "PackageUIService"),
+    ("OnConvertToPackageResult", "PackageUIService"),
+    ("OnSaveOrPublishPlaceToRoblox", "StudioPublishService"),
+    ("GamePublishFinished", "StudioPublishService"),
+    ("GamePublishCancelled", "StudioPublishService"),
+    ("GameNameUpdated", "StudioPublishService"),
+    ("OnPublishAttempt", "StudioPublishService"),
+    ("SingleFileChanged", "AssetImportService"),
+    ("StartSingleMeshImport", "AssetImportService"),
+    ("CollaboratorIdleUpdate", "CollaboratorsService"),
+    ("CollaboratorInstanceCreatedSignal", "CollaboratorsService"),
+    ("CollaboratorInstanceDestroyedSignal", "CollaboratorsService"),
+    ("CollaboratorStatusUpdatedSignal", "CollaboratorsService"),
+    ("MultiGetCanCollaborateRetrieved", "CollaboratorsService"),
+    ("ServerMultiGetCanCollaborateRequested", "CollaboratorsService"),
+    ("ToggleSelectionHighlightsSignal", "CollaboratorsService"),
 ];
 
 pub const LUA_METHODS: &[(&str, &str)] = &[
@@ -267,6 +446,13 @@ fn mine(class: &str) -> bool {
         "Plugin" | "Selection" | "PluginToolbar" | "PluginToolbarButton" | "PluginMenu" | "PluginMouse"
             | "PluginAction" | "StudioTheme" | "ChangeHistoryService" | "ScriptEditorService" | "ScriptDocument"
             | "StudioService" | "File" | "PluginManagerInterface" | "PluginManager" | "TextService" | "Studio"
+            | "MultipleDocumentInterfaceInstance" | "DataModelSession"
+            | "SmoothVoxelsUpgraderService" | "HeightmapImporterService"
+            | "CalloutService" | "ToastNotificationService" | "StudioWidgetsService"
+            | "StylingService" | "CoreScriptSyncService"
+            | "PluginPolicyService" | "PackageUIService" | "StudioPublishService"
+            | "AssetImportService" | "CollaboratorsService" | "TeamCreateService"
+            | "StudioAssetService" | "BrowserService"
     ) || rustudio_core::doc::is_a(class, "PluginGui")
 }
 
@@ -282,6 +468,9 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
         return None;
     }
     if let Some(r) = core_call(lua, &class, name, this, args) {
+        return Some(r);
+    }
+    if let Some(r) = builtin::call(lua, &class, name, this, args) {
         return Some(r);
     }
     if let Some(r) = toolbar::call(lua, &class, name, this, args) {
@@ -318,6 +507,9 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     if !mine(class) {
         return Ok(None);
     }
+    if let Some(v) = core_prop_get(lua, r, class, key)? {
+        return Ok(Some(v));
+    }
     if let Some(v) = mouse::prop_get(lua, r, class, key)? {
         return Ok(Some(v));
     }
@@ -330,12 +522,18 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     if let Some(v) = studio_service::prop_get(lua, r, class, key)? {
         return Ok(Some(v));
     }
+    if let Some(v) = builtin::prop_get(lua, r, class, key)? {
+        return Ok(Some(v));
+    }
     menus::prop_get(lua, r, class, key)
 }
 
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
     if !mine(class) {
         return Ok(false);
+    }
+    if core_newindex(lua, r, class, key, value)? {
+        return Ok(true);
     }
     if toolbar::newindex(lua, r, class, key, value)? {
         return Ok(true);
@@ -353,6 +551,7 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     script_editor::install(lua)?;
     studio_service::install(lua)?;
     widgets::install(lua)?;
+    builtin::install(lua)?;
     testing::install(lua)
 }
 
@@ -522,6 +721,123 @@ pub(crate) fn plugin_root(lua: &Lua, this: Ref) -> mlua::Result<Ref> {
     }
 }
 
+fn studio_dm_type(lua: &Lua) -> mlua::Result<Value> {
+    let name = {
+        let w = world(lua)?;
+        match (w.mode, w.side) {
+            (RunMode::Edit, _) => "Edit",
+            (_, Side::Client) => "PlayClient",
+            (_, Side::Server) => "PlayServer",
+        }
+    };
+    enum_value(lua, "StudioDataModelType", name)
+}
+
+fn core_prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Option<Value>> {
+    match (class, key) {
+        ("Plugin", "HostDataModelType") => Ok(Some(studio_dm_type(lua)?)),
+        ("Plugin", "HostDataModelTypeIsCurrent") => Ok(Some(Value::Boolean(true))),
+        ("Plugin", "IsDebuggable") => Ok(Some(Value::Boolean(false))),
+        ("Plugin", "UsesAssetInsertionDrag") => Ok(Some(Value::Boolean(false))),
+        ("Plugin", "MultipleDocumentInterfaceInstance") => {
+            let child = {
+                let w = world(lua)?;
+                let d = w.d();
+                d.dom.get_by_ref(r).and_then(|i| {
+                    i.children()
+                        .iter()
+                        .copied()
+                        .find(|c| d.class_of(*c).as_deref() == Some("MultipleDocumentInterfaceInstance"))
+                })
+            };
+            Ok(Some(match child {
+                Some(c) => inst_value(lua, c)?,
+                None => Value::Nil,
+            }))
+        }
+        ("MultipleDocumentInterfaceInstance", "FocusedDataModelSession") => {
+            let child = {
+                let w = world(lua)?;
+                let d = w.d();
+                d.dom.get_by_ref(r).and_then(|i| {
+                    i.children()
+                        .iter()
+                        .copied()
+                        .find(|c| d.class_of(*c).as_deref() == Some("DataModelSession"))
+                })
+            };
+            Ok(Some(match child {
+                Some(c) => inst_value(lua, c)?,
+                None => Value::Nil,
+            }))
+        }
+        ("DataModelSession", "CurrentDataModelType") => Ok(Some(studio_dm_type(lua)?)),
+        ("DataModelSession", "SessionId") => Ok(Some(Value::Integer(1))),
+        ("Selection", "ActiveInstance") => {
+            let active = {
+                let w = world(lua)?;
+                let d = w.d();
+                let root = d.dom.root_ref();
+                let override_ref = lua
+                    .app_data_ref::<SelectionExtras>()
+                    .and_then(|s| s.active)
+                    .filter(|r| d.is_ancestor(root, *r) && d.selection.contains(r));
+                override_ref.or_else(|| {
+                    d.selection.iter().rev().copied().find(|r| d.is_ancestor(root, *r))
+                })
+            };
+            Ok(Some(match active {
+                Some(a) => inst_value(lua, a)?,
+                None => Value::Nil,
+            }))
+        }
+        ("Selection", "ShowActiveInstanceHighlight") => {
+            let on = lua.app_data_ref::<SelectionExtras>().is_some_and(|s| s.show_active_highlight);
+            Ok(Some(Value::Boolean(on)))
+        }
+        ("Selection", "SelectionBoxThickness" | "SelectionLineThickness") => Ok(Some(Value::Number(0.02))),
+        ("Selection", "RenderMode") => Ok(Some(enum_value(lua, "SelectionRenderMode", "BoundingBoxes")?)),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Default)]
+struct SelectionExtras {
+    active: Option<Ref>,
+    show_active_highlight: bool,
+}
+
+fn core_newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
+    match (class, key) {
+        ("Selection", "ActiveInstance") => {
+            let target = opt_inst(value);
+            if lua.app_data_ref::<SelectionExtras>().is_none() {
+                lua.set_app_data(SelectionExtras::default());
+            }
+            if let Some(mut s) = lua.app_data_mut::<SelectionExtras>() {
+                s.active = target;
+            }
+            world(lua)?.fire(r, "Changed", vec![lstr(lua, "ActiveInstance")?]);
+            Ok(true)
+        }
+        ("Selection", "ShowActiveInstanceHighlight") => {
+            let on = match value {
+                Value::Boolean(b) => *b,
+                Value::Nil => false,
+                _ => true,
+            };
+            if lua.app_data_ref::<SelectionExtras>().is_none() {
+                lua.set_app_data(SelectionExtras::default());
+            }
+            if let Some(mut s) = lua.app_data_mut::<SelectionExtras>() {
+                s.show_active_highlight = on;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ------------------------------------------------------------ Plugin core
 
 fn core_call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
@@ -609,6 +925,32 @@ fn core_call(lua: &Lua, class: &str, name: &str, this: Ref, args: &MultiValue) -
             set_selection(lua, this, SelFire::Given(given), |cur| cur.into_iter().filter(|r| !refs.contains(r)).collect())?;
             ret0()
         })(),
+        ("Selection", "AddFocusCallback") => (|| {
+            let conn = lua.create_table()?;
+            conn.set("Connected", true)?;
+            conn.set("Disconnect", lua.create_function(|_, ()| Ok(()))?)?;
+            ret1(Value::Table(conn))
+        })(),
+        ("Selection", "SetTerrainSelectionHack" | "ClearTerrainSelectionHack") => ret0(),
+        ("StudioService", "GetUserId") => ret1(Value::Number(crate::plugin_host::settings::user_id() as f64)),
+        ("StudioService", "HasInternalPermission") => ret1(Value::Boolean(false)),
+        ("SmoothVoxelsUpgraderService", "Start" | "Cancel") => ret0(),
+        ("HeightmapImporterService", _) => return builtin::heightmap_call(lua, this, name, args),
+        ("CalloutService", "DefineCallout" | "AttachCallout" | "DetachCalloutsByDefinitionId") => ret0(),
+        ("ToastNotificationService", "ShowNotification" | "HideNotification") => ret0(),
+        (
+            "StudioWidgetsService",
+            "ApplyHighlight" | "ApplySpotlight" | "HideSpotlight" | "ApplyShadows" | "ApplyFillInBox",
+        ) => ret0(),
+        ("StudioWidgetsService", "GetWidgetFromLabel" | "GetWidgetFromPluginGui") => ret1(Value::Nil),
+        ("StylingService", "GetAppliedStyles" | "GetStyleSheetDerivesChain") => (|| {
+            ret1(Value::Table(lua.create_table()?))
+        })(),
+        ("StylingService", "GetStyleInfo" | "GetStyleSheetInfo") => (|| {
+            ret1(Value::Table(lua.create_table()?))
+        })(),
+        ("StylingService", "UpdateUnitTestOnly") => ret0(),
+        ("CoreScriptSyncService", "GetScriptFilePath") => (|| ret1(lstr(lua, "")?))(),
         _ => return None,
     };
     Some(r)
@@ -668,6 +1010,7 @@ fn set_selection(lua: &Lua, sel: Ref, rule: SelFire, f: impl FnOnce(Vec<Ref>) ->
             }
         } else {
             w.fire(sel, "SelectionChanged", vec![]);
+            w.fire(sel, "SelectionChangedThisFrame", vec![]);
         }
     }
     Ok(())

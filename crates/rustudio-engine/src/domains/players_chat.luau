@@ -170,8 +170,10 @@ M.LoadCharacterWithAvatarRulesAsync = function(self) load_character(self) end
 M.RequestStreamAroundAsync = function(self, pos, timeout)
 	if typeof(pos) ~= "Vector3" then fail("Unable to cast value to Vector3") end
 	if not workspace.StreamingEnabled then fail("Workspace.StreamingEnabled is false, cannot RequestStreamAroundAsync") end
-	-- Everything is already there (one machine): the request completes.
-	task.wait()
+	if timeout ~= nil and typeof(timeout) ~= "number" then fail("Unable to cast value to double") end
+	local done = R.stream_around(self, pos)
+	local deadline = time() + (timeout or math.huge)
+	repeat task.wait() until done() or time() >= deadline
 end
 
 M.Kick = function(self, message)
@@ -310,17 +312,93 @@ local function can_chat2(self, a, b) user_id_arg(a); user_id_arg(b, 2); task.wai
 M.CanUserChatAsync = can_chat
 M.CanUsersChatAsync = can_chat2
 
+local UI = nil
 local bubble_settings = nil
+local muted_users = {} -- [userId] = true (client-side /mute)
+local pending_whisper = nil -- { name = string, body = string }
+
+local function escape_rich_text(s)
+	return (tostring(s or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function utf8_count(s)
+	local ok, n = pcall(utf8.len, s)
+	if ok and n then return n end
+	return #s
+end
+
+local function tcs_enabled()
+	local ok, v = pcall(function() return svc.TextChatService.ChatVersion end)
+	return ok and v == Enum.ChatVersion.TextChatService
+end
+
+local function ensure_ui()
+	if R.core_scripts_active and R.core_scripts_active() and tcs_enabled() then return nil end
+	if UI == nil and side() == "Client" and R.load_ui then
+		UI = R.load_ui({
+			get_bubble_settings = function() return bubble_settings end,
+			send_legacy = function(text)
+				table.insert(__rs_pc_outbox, {
+					kind = "legacy",
+					channel = nil,
+					text = text,
+					raw_text = text,
+					metadata = "",
+					id = "",
+					target_uid = 0,
+				})
+			end,
+		})
+	end
+	return UI
+end
+
+local function resolve_adornee(part)
+	if not part then return nil end
+	if part:IsA("Model") then
+		local cfg = svc.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+		local name = cfg and cfg.AdorneeName or "HumanoidRootPart"
+		return part:FindFirstChild(name) or part:FindFirstChild("Head") or part.PrimaryPart or part:FindFirstChildWhichIsA("BasePart")
+	end
+	return part
+end
+
 M.SetBubbleChatSettings = function(self, settings)
 	if type(settings) ~= "table" then
 		fail("Bad settings object passed to Chat:SetBubbleChatSettings:\ninside consolidated BubbleChat table expected, got " .. typeof(settings))
 	end
 	bubble_settings = settings
+	R.fire(self, "BubbleChatSettingsChanged", settings)
 	-- TextChatService's bubbles take the settings, as ExpChat maps them.
-	local cfg = game:GetService("TextChatService"):FindFirstChildOfClass("BubbleChatConfiguration")
+	local cfg = svc.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
 	if cfg then
 		for k, v in settings do
-			if type(k) == "string" and k ~= "UserSpecificSettings" then pcall(function() cfg[k] = v end) end
+			if type(k) == "string" then
+				if k == "Transparency" then
+					pcall(function() cfg.BackgroundTransparency = v end)
+				elseif k == "CornerRadius" then
+					local c = cfg:FindFirstChildOfClass("UICorner")
+					if c then pcall(function() c.CornerRadius = v end) end
+				elseif k == "Padding" and type(v) == "number" then
+					local p = cfg:FindFirstChildOfClass("UIPadding")
+					if p then
+						local u = UDim.new(0, v)
+						pcall(function() p.PaddingTop = u; p.PaddingBottom = u; p.PaddingLeft = u; p.PaddingRight = u end)
+					end
+				elseif k == "BackgroundGradient" and type(v) == "table" then
+					local g = cfg:FindFirstChildOfClass("UIGradient")
+					if g then
+						for gk, gv in v do pcall(function() g[gk] = gv end) end
+					end
+				elseif k == "BackgroundImage" and type(v) == "table" then
+					local img = cfg:FindFirstChildOfClass("ImageLabel")
+					if img then
+						for ik, iv in v do pcall(function() img[ik] = iv end) end
+					end
+				elseif k ~= "UserSpecificSettings" and k ~= "CornerEnabled" and k ~= "MaxWidth" and k ~= "SizeAnimation" and k ~= "TransparencyAnimation" and k ~= "Voice" then
+					pcall(function() cfg[k] = v end)
+				end
+			end
 		end
 	end
 end
@@ -328,21 +406,21 @@ end
 -- Chat:Chat(part, message, color): a bubble over the part, and Chat.Chatted.
 M.Chat = function(self, part, message, color)
 	if typeof(part) ~= "Instance" then fail("Argument 1 missing or nil") end
-	message = tostring(message or "")
-	R.fire(self, "Chatted", part, message, color or Enum.ChatColor.Blue)
+	local raw = tostring(message or "")
+	local col = color or Enum.ChatColor.Blue
+	R.fire(self, "Chatted", part, raw, col)
 	if part:IsDescendantOf(workspace) then
-		add_bubble(part, nil, message)
+		local ui = ensure_ui()
+		if ui then
+			local ad = resolve_adornee(part)
+			if ad then ui.add_bubble(ad, escape_rich_text(raw), nil, nil, col) end
+		end
 	end
 end
 
 ------------------------------------------------------------ TextChatService
 
 local STATUS = setmetatable({}, { __index = function(_, k) return Enum.TextChatMessageStatus[k] end })
-
-local function tcs_enabled()
-	local ok, v = pcall(function() return svc.TextChatService.ChatVersion end)
-	return ok and v == Enum.ChatVersion.TextChatService
-end
 
 local function channel_ok(ch, what)
 	if not ch:IsDescendantOf(svc.TextChatService) then
@@ -356,6 +434,30 @@ local function source_of(ch, uid)
 	end
 end
 
+local function prefix_for(channel, sender)
+	if not sender then return "" end
+	local base = sender.DisplayName .. ":"
+	if channel then
+		local cn = channel.Name
+		if cn:sub(1, 7) == "RBXTeam" then
+			return "[Team] " .. base
+		elseif cn:sub(1, 11) == "RBXWhisper:" then
+			local lp = svc.Players.LocalPlayer
+			local a, b = cn:sub(12):match("^(%-?%d+)_(%-?%d+)$")
+			if lp and a and b then
+				local other_id = tonumber(a) == lp.UserId and tonumber(b) or tonumber(a)
+				local other = other_id and svc.Players:GetPlayerByUserId(other_id)
+				if sender == lp and other then
+					return "[To " .. other.DisplayName .. "] " .. base
+				elseif other then
+					return "[From " .. sender.DisplayName .. "] " .. base
+				end
+			end
+		end
+	end
+	return base
+end
+
 local function new_message(fields)
 	local m = R.create("TextChatMessage")
 	local t = props(m)
@@ -366,21 +468,20 @@ local function new_message(fields)
 	t.MessageId = fields.MessageId or ""
 	t.Metadata = fields.Metadata or ""
 	t.PrefixText = fields.PrefixText or ""
-	t.Translation = ""
+	t.Translation = fields.Translation or ""
 	t.Timestamp = fields.Timestamp or DateTime.now()
 	return m
 end
 
--- OnIncomingMessage: the channel's, then the service's. A returned
--- TextChatMessageProperties changes the message (Studio copies its
--- PrefixText / Text / Translation onto it).
+-- OnIncomingMessage: TextChatService FIRST, then TextChannel (verified in Studio:
+-- both_order=TCS,CH). A returned TextChatMessageProperties mutates the message
+-- so the channel callback observes any updates made by the service callback.
 local function run_incoming(m)
 	local ch = props(m).TextChannel
-	for _, owner in { ch, svc.TextChatService } do
+	for _, owner in { svc.TextChatService, ch } do
 		if owner then
-			local cb = __rs_get_callback(owner, "OnIncomingMessage")
-			if cb then
-				local ok, res = pcall(cb, m)
+			local has, ok, res = __rs_call_callback(owner, "OnIncomingMessage", m)
+			if has then
 				if not ok then
 					warn(tostring(res))
 				elseif typeof(res) == "Instance" and res:IsA("TextChatMessageProperties") then
@@ -390,6 +491,8 @@ local function run_incoming(m)
 						if v ~= nil and v ~= "" then t[k] = v end
 					end
 					take("PrefixText"); take("Text"); take("Translation")
+					if res:IsA("BubbleChatMessageProperties") then t.BubbleChatMessageProperties = res end
+					if res:IsA("ChatWindowMessageProperties") then t.ChatWindowMessageProperties = res end
 					for _, c in res:GetChildren() do
 						if c:IsA("BubbleChatMessageProperties") then t.BubbleChatMessageProperties = c end
 						if c:IsA("ChatWindowMessageProperties") then t.ChatWindowMessageProperties = c end
@@ -400,57 +503,88 @@ local function run_incoming(m)
 	end
 end
 
--- The chat window's lines and the bubbles (drawn by play_game.rs, read
--- through __rs_pc_chat_view).
-local view = { lines = {}, bubbles = {}, seq = 0, cleared = 0 }
-local function view_line(m)
+local function ensure_window_props(m)
+	local t = props(m)
+	if t._win_done then return t.ChatWindowMessageProperties end
+	if t.Status ~= STATUS.Success then return t.ChatWindowMessageProperties end
+	t._win_done = true
+	local cb = __rs_get_callback(svc.TextChatService, "OnChatWindowAdded")
+	if cb then
+		local ok, res = pcall(cb, m)
+		if ok and typeof(res) == "Instance" and res:IsA("ChatWindowMessageProperties") then
+			t.ChatWindowMessageProperties = res
+			local function take(k)
+				local v = res[k]
+				if v ~= nil and v ~= "" then t[k] = v end
+			end
+			take("PrefixText"); take("Text"); take("Translation")
+		elseif not ok then
+			warn(tostring(res))
+		end
+	end
+	return t.ChatWindowMessageProperties
+end
+
+local function ensure_bubble_props(m, adornee)
+	if not m then return nil end
+	local t = props(m)
+	if t._bub_done then return t.BubbleChatMessageProperties end
+	if t.Status ~= STATUS.Success then return t.BubbleChatMessageProperties end
+	t._bub_done = true
+	if adornee == nil then
+		local src = t.TextSource
+		local sender = src and svc.Players:GetPlayerByUserId(src.UserId)
+		local char = sender and sender.Character
+		if char then
+			local cfg = svc.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+			local name = cfg and cfg.AdorneeName or "HumanoidRootPart"
+			adornee = char:FindFirstChild(name) or char:FindFirstChild("Head") or char.PrimaryPart
+		end
+	end
+	local cb = __rs_get_callback(svc.TextChatService, "OnBubbleAdded")
+	if cb then
+		local ok, res = pcall(cb, m, adornee)
+		if ok and typeof(res) == "Instance" and res:IsA("BubbleChatMessageProperties") then
+			t.BubbleChatMessageProperties = res
+		elseif not ok then
+			warn(tostring(res))
+		end
+	end
+	return t.BubbleChatMessageProperties
+end
+
+local function deliver_to_window(m)
 	local t = props(m)
 	local src = t.TextSource
 	local player = src and svc.Players:GetPlayerByUserId(src.UserId)
 	local color = nil
-	if player and player.Team and player.Neutral == false then color = player.TeamColor.Color end
-	local wp = t.ChatWindowMessageProperties
-	local cb = __rs_get_callback(svc.TextChatService, "OnChatWindowAdded")
-	if cb then
-		local ok, res = pcall(cb, m)
-		if ok and typeof(res) == "Instance" and res:IsA("ChatWindowMessageProperties") then wp = res
-		elseif not ok then warn(tostring(res)) end
+	if player and player.Team and player.Neutral == false then
+		local ok, tc = pcall(function() return player.Team.TeamColor.Color end)
+		color = (ok and tc) or player.TeamColor.Color
 	end
-	view.seq += 1
-	table.insert(view.lines, {
-		id = view.seq,
+	local wp = ensure_window_props(m)
+	local ui = ensure_ui()
+	if not ui then return end
+	ui.add_line({
 		prefix = t.PrefixText or "",
 		text = t.Text or "",
 		system = src == nil,
+		sender_name = player and player.Name or nil,
 		name_color = color,
-		text_color = wp and wp.TextColor3 or nil,
-		time = os.clock(),
-	})
-	while #view.lines > 50 do table.remove(view.lines, 1) end
-end
-local function view_bubble(adornee, m, text)
-	local t = m and props(m) or {}
-	local bp = t.BubbleChatMessageProperties
-	local cb = m and __rs_get_callback(svc.TextChatService, "OnBubbleAdded")
-	if cb then
-		local ok, res = pcall(cb, m, adornee)
-		if ok and typeof(res) == "Instance" and res:IsA("BubbleChatMessageProperties") then bp = res
-		elseif not ok then warn(tostring(res)) end
-	end
-	view.seq += 1
-	table.insert(view.bubbles, {
-		id = view.seq,
-		adornee = adornee,
-		text = text,
-		time = os.clock(),
-		bg = bp and bp.BackgroundColor3 or nil,
-		bg_t = bp and bp.BackgroundTransparency or nil,
-		fg = bp and bp.TextColor3 or nil,
+		window_props = wp,
+		channel = t.TextChannel,
+		message_id = t.MessageId or "",
 	})
 end
-add_bubble = view_bubble
 
--- The character a bubble hangs over (BubbleChatConfiguration.AdorneeName).
+local function deliver_to_bubble(adornee, m, text, user_id)
+	local bp = ensure_bubble_props(m, adornee)
+	local ui = ensure_ui()
+	if not ui then return end
+	ui.add_bubble(adornee, text, bp, user_id)
+end
+
+-- The character part a bubble hangs over (BubbleChatConfiguration.AdorneeName).
 local function bubble_adornee(player)
 	local char = player and player.Character
 	if not char then return nil end
@@ -459,16 +593,159 @@ local function bubble_adornee(player)
 	return char:FindFirstChild(name) or char:FindFirstChild("Head") or char.PrimaryPart
 end
 
--- Commands: an enabled TextChatCommand whose alias starts the text fires
--- Triggered(textSource, text) (the message still goes out, as in Studio).
-local function run_commands(text, source)
+local function find_matching_commands(text)
 	local word = text:match("^(%S+)")
-	if not word then return end
+	if not word then return {} end
+	local lw = word:lower()
+	local matched = {}
 	for _, cmd in svc.TextChatService:GetDescendants() do
 		if cmd:IsA("TextChatCommand") and cmd.Enabled then
 			local a, b = cmd.PrimaryAlias, cmd.SecondaryAlias
-			if (a ~= "" and word:lower() == a:lower()) or (b ~= "" and word:lower() == b:lower()) then
-				R.fire(cmd, "Triggered", source, text)
+			if (a ~= "" and lw == a:lower()) or (b ~= "" and lw == b:lower()) then
+				table.insert(matched, cmd)
+			end
+		end
+	end
+	return matched
+end
+
+local function sys_notice(msg)
+	local tc = svc.TextChatService:FindFirstChild("TextChannels")
+	local sys = tc and tc:FindFirstChild("RBXSystem")
+	if sys then
+		sys:DisplaySystemMessage(msg)
+	else
+		local ui = ensure_ui()
+		if ui then ui.add_line({ prefix = "", text = msg, system = true, message_id = "" }) end
+	end
+end
+
+local function find_player_by_query(query)
+	if not query or query == "" then return nil end
+	local lq = query:lower()
+	local prefix_match = nil
+	for _, p in svc.Players:GetPlayers() do
+		if p.Name:lower() == lq or p.DisplayName:lower() == lq then return p end
+		if not prefix_match and (p.Name:lower():sub(1, #lq) == lq or p.DisplayName:lower():sub(1, #lq) == lq) then
+			prefix_match = p
+		end
+	end
+	return prefix_match
+end
+
+local function play_emote(name)
+	local lp = svc.Players.LocalPlayer
+	local hum = lp and lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if not hum or name == "" then return end
+	task.spawn(function()
+		if not pcall(hum.PlayEmote, hum, name) then
+			local animate = lp.Character and lp.Character:FindFirstChild("Animate")
+			local bf = animate and animate:FindFirstChild("PlayEmote")
+			if bf and bf:IsA("BindableFunction") then
+				pcall(bf.Invoke, bf, name:lower())
+			end
+		end
+	end)
+end
+
+-- Execute Roblox's built-in TextChatCommands on the client.
+local function run_builtin_command(cmd_name, raw_text)
+	local rest = raw_text:match("^%S+%s+(.-)%s*$") or ""
+	local lp = svc.Players.LocalPlayer
+	if cmd_name == "RBXClearCommand" then
+		local ui = ensure_ui()
+		if ui then ui.clear_lines() end
+	elseif cmd_name == "RBXHelpCommand" then
+		sys_notice(
+			"These are the basic chat commands.\n"
+			.. "/me <text> : roleplaying command for doing actions.\n"
+			.. "/c <channel> : switch channel menu tabs.\n"
+			.. "/join <channel> or /j <channel> : join channel.\n"
+			.. "/leave <channel> or /l <channel> : leave channel.\n"
+			.. "/whisper <speaker> or /w <speaker> : open private message channel with speaker.\n"
+			.. "/mute <speaker> : mute a speaker.\n"
+			.. "/unmute <speaker> : unmute a speaker.\n"
+			.. "/team <message> or /t <message> : send a team chat to people on your team.\n"
+			.. "/clear or /cls : clear the chat window.\n"
+			.. "/emote <emote> or /e <emote> : perform an emote."
+		)
+	elseif cmd_name == "RBXVersionCommand" then
+		sys_notice("This experience is running TextChatService (ExperienceChat).")
+	elseif cmd_name == "RBXConsoleCommand" then
+		sys_notice("Developer console command triggered (/console).")
+	elseif cmd_name == "RBXEmoteCommand" then
+		if rest == "" then
+			sys_notice("You can use /emote <emoteName> (wave, point, dance, dance2, dance3, laugh, cheer).")
+		else
+			play_emote(rest)
+		end
+	elseif cmd_name == "RBXTeamCommand" then
+		if not lp or lp.Neutral or not lp.Team then
+			sys_notice("You cannot team chat if you are not on a team.")
+			return
+		end
+		local tc = svc.TextChatService:FindFirstChild("TextChannels")
+		local team_ch = tc and tc:FindFirstChild("RBXTeam" .. lp.TeamColor.Name)
+		if team_ch then
+			local cib = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+			if cib then pcall(function() cib.TargetTextChannel = team_ch end) end
+			local ui = ensure_ui()
+			if ui then ui.refresh_tabs() end
+			if rest ~= "" then
+				task.spawn(function() team_ch:SendAsync(rest) end)
+			end
+		else
+			sys_notice("You cannot team chat if you are not on a team.")
+		end
+	elseif cmd_name == "RBXMuteCommand" then
+		local target = find_player_by_query(rest)
+		if not target then
+			sys_notice("Player '" .. rest .. "' does not exist.")
+		elseif target == lp then
+			sys_notice("You cannot mute yourself.")
+		else
+			muted_users[target.UserId] = true
+			sys_notice(target.DisplayName .. " has been muted.")
+		end
+	elseif cmd_name == "RBXUnmuteCommand" then
+		local target = find_player_by_query(rest)
+		if not target then
+			sys_notice("Player '" .. rest .. "' does not exist.")
+		else
+			muted_users[target.UserId] = nil
+			sys_notice(target.DisplayName .. " has been unmuted.")
+		end
+	elseif cmd_name == "RBXWhisperCommand" then
+		local target_name, body = rest:match("^(%S+)%s*(.-)$")
+		local target = find_player_by_query(target_name)
+		if not target then
+			sys_notice("Player '" .. tostring(target_name or "") .. "' does not exist.")
+		elseif target == lp then
+			sys_notice("You cannot whisper to yourself.")
+		else
+			local a, b = math.min(lp.UserId, target.UserId), math.max(lp.UserId, target.UserId)
+			local cname = string.format("RBXWhisper:%d_%d", a, b)
+			local tc = svc.TextChatService:FindFirstChild("TextChannels")
+			local existing = tc and tc:FindFirstChild(cname)
+			if existing then
+				local cib = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+				if cib then pcall(function() cib.TargetTextChannel = existing end) end
+				local ui = ensure_ui()
+				if ui then ui.refresh_tabs() end
+				if body and body ~= "" then
+					task.spawn(function() existing:SendAsync(body) end)
+				end
+			else
+				pending_whisper = { name = cname, body = body or "" }
+				table.insert(__rs_pc_outbox, {
+					kind = "whisper_open",
+					channel = nil,
+					text = "",
+					raw_text = "",
+					metadata = "",
+					id = "",
+					target_uid = target.UserId,
+				})
 			end
 		end
 	end
@@ -479,31 +756,112 @@ __rs_pc_outbox = {}
 M.SendAsync = function(self, text, metadata)
 	if side() ~= "Client" then fail("TextChannel:SendAsync can only be called on the client.") end
 	channel_ok(self, "SendAsync")
-	text = tostring(text or "")
+	local raw = tostring(text or "")
 	local lp = svc.Players.LocalPlayer
 	local src = lp and source_of(self, lp.UserId)
+	local msg_id = tostring(lp and lp.UserId or 0) .. "-" .. svc.HttpService:GenerateGUID(true)
+	local meta = metadata ~= nil and tostring(metadata) or ""
+
+	-- Empty / whitespace-only: returns immediately with Sending & empty text, goes nowhere (Studio verified).
+	if raw:match("^%s*$") then
+		return new_message({
+			Text = "",
+			TextChannel = self,
+			TextSource = src,
+			Status = STATUS.Sending,
+			MessageId = msg_id,
+			Metadata = meta,
+			PrefixText = prefix_for(self, lp),
+		})
+	end
+
+	local escaped = escape_rich_text(raw)
 	local m = new_message({
-		Text = text,
+		Text = escaped,
 		TextChannel = self,
 		TextSource = src,
 		Status = STATUS.Sending,
-		MessageId = tostring(lp and lp.UserId or 0) .. "-" .. svc.HttpService:GenerateGUID(true),
-		Metadata = metadata ~= nil and tostring(metadata) or "",
-		PrefixText = lp and (lp.DisplayName .. ":") or "",
+		MessageId = msg_id,
+		Metadata = meta,
+		PrefixText = prefix_for(self, lp),
 	})
-	if src == nil or not src.CanSend then
-		props(m).Status = STATUS.Floodchecked
-		if src == nil then props(m).Status = STATUS.InvalidPrivacySettings end
+
+	-- Check TextChatCommands first (commands fire Triggered on client & server, don't broadcast as chat)
+	local cmds = find_matching_commands(raw)
+	if #cmds > 0 then
+		for _, cmd in cmds do
+			R.fire(cmd, "Triggered", src, raw)
+			run_builtin_command(cmd.Name, raw)
+		end
+		table.insert(__rs_pc_outbox, {
+			kind = "cmd",
+			channel = self,
+			text = escaped,
+			raw_text = raw,
+			metadata = meta,
+			id = msg_id,
+			target_uid = 0,
+		})
 		return m
 	end
-	-- (An empty line comes back Sending, as in Studio, and goes nowhere.)
-	if text:match("^%s*$") then return m end
+
 	run_incoming(m)
 	R.fire(svc.TextChatService, "SendingMessage", m)
-	run_commands(text, src)
-	table.insert(__rs_pc_outbox, { channel = self, text = text, metadata = props(m).Metadata, id = props(m).MessageId })
+
+	-- Permission / length checks: SendAsync returns Sending immediately (Studio verified),
+	-- then delivers the failure status asynchronously via MessageReceived.
+	if src == nil or not src.CanSend then
+		task.defer(function()
+			local err_text = "You do not have permission to send messages to this channel"
+			local fail_m = new_message({
+				Text = err_text,
+				TextChannel = self,
+				TextSource = src,
+				Status = src == nil and STATUS.InvalidPrivacySettings or STATUS.InvalidTextChannelPermissions,
+				MessageId = msg_id,
+				Metadata = meta,
+				PrefixText = "",
+			})
+			run_incoming(fail_m)
+			R.fire(svc.TextChatService, "MessageReceived", fail_m)
+			R.fire(self, "MessageReceived", fail_m)
+		end)
+		return m
+	end
+
+	if utf8_count(raw) > 200 then
+		task.defer(function()
+			local fail_m = new_message({
+				Text = "",
+				TextChannel = self,
+				TextSource = src,
+				Status = STATUS.MessageTooLong,
+				MessageId = msg_id,
+				Metadata = meta,
+				PrefixText = "",
+			})
+			run_incoming(fail_m)
+			R.fire(svc.TextChatService, "MessageReceived", fail_m)
+			R.fire(self, "MessageReceived", fail_m)
+		end)
+		return m
+	end
+
+	table.insert(__rs_pc_outbox, {
+		kind = "msg",
+		channel = self,
+		text = escaped,
+		raw_text = raw,
+		metadata = meta,
+		id = msg_id,
+		target_uid = 0,
+	})
 	return m
 end
+
+M.SendInternalAsync = M.SendAsync
+M.SendDictatedSpeechAsync = M.SendAsync
+M.SendPresetAsync = M.SendAsync
 
 M.DisplaySystemMessage = function(self, text, metadata)
 	if side() ~= "Client" then fail("TextChannel:DisplaySystemMessage can only be called on the client.") end
@@ -516,9 +874,11 @@ M.DisplaySystemMessage = function(self, text, metadata)
 		Metadata = metadata ~= nil and tostring(metadata) or "",
 	})
 	run_incoming(m)
-	R.fire(self, "MessageReceived", m)
-	R.fire(svc.TextChatService, "MessageReceived", m)
-	view_line(m)
+	R.fire_game(svc.TextChatService, "MessageReceived", m)
+	R.fire_game(self, "MessageReceived", m)
+	deliver_to_window(m)
+	R.fire_core(svc.TextChatService, "MessageReceived", m)
+	R.fire_core(self, "MessageReceived", m)
 	return m
 end
 
@@ -527,9 +887,15 @@ M.DisplayBubble = function(self, part, text)
 	if typeof(part) ~= "Instance" or not part:IsDescendantOf(workspace) then
 		fail("partOrCharacter must be in the Workspace")
 	end
-	local m = new_message({ Text = tostring(text or ""), Status = STATUS.Success })
-	R.fire(svc.TextChatService, "BubbleDisplayed", part, m)
-	view_bubble(part, m, props(m).Text)
+	local ad = resolve_adornee(part) or part
+	local m = new_message({
+		Text = escape_rich_text(text),
+		Status = STATUS.Success,
+		MessageId = "0-" .. svc.HttpService:GenerateGUID(true),
+	})
+	R.fire_game(svc.TextChatService, "BubbleDisplayed", part, m)
+	deliver_to_bubble(ad, m, props(m).Text, nil)
+	R.fire_core(svc.TextChatService, "BubbleDisplayed", part, m)
 end
 
 M.AddUserAsync = function(self, uid)
@@ -568,6 +934,7 @@ M.CanUsersDirectChatAsync = function(self, requester, ids)
 	end
 	return out
 end
+
 -- Everyone in a Studio test may chat with everyone: one group.
 M.GetChatGroupsAsync = function(self, players)
 	if type(players) ~= "table" then fail("Unable to cast value to Objects") end
@@ -587,19 +954,88 @@ M.DeriveNewMessageProperties = function(self)
 	return d
 end
 
--- Server: a client's SendAsync arrived (play_game.rs carries it across).
--- Fires Player.Chatted and the server's commands, asks the channel's
--- ShouldDeliverCallback per TextSource, and returns the user ids it goes to.
-function __rs_pc_server_receive(player, channel, text, metadata, id)
-	R.fire(player, "Chatted", text)
+local function make_text_source(ch, player, can_send)
+	local existing = source_of(ch, player.UserId)
+	if existing then return existing end
+	local s = R.create("TextSource")
+	s.Name = player.Name
+	__rs_set_raw(s, "UserId", player.UserId)
+	s.CanSend = can_send
+	s.Parent = ch
+	return s
+end
+
+-- Server: a client's message/command/whisper/legacy chat arrived.
+function __rs_pc_server_receive(player, channel, kind, text, raw_text, metadata, id, target_uid)
+	if kind == "legacy" then
+		local cb_res = M.InvokeChatCallback(svc.Chat, Enum.ChatCallbackType.OnServerReceivingMessage, {
+			FromSpeaker = player.Name,
+			Message = raw_text,
+		})
+		if cb_res == false then return {} end
+		R.fire(player, "Chatted", raw_text, nil)
+		local deliver = {}
+		for _, p in svc.Players:GetPlayers() do table.insert(deliver, p.UserId) end
+		return deliver
+	end
+
+	if kind == "whisper_open" then
+		local target = svc.Players:GetPlayerByUserId(target_uid)
+		if not target or target == player then return {} end
+		local folder = svc.TextChatService:FindFirstChild("TextChannels")
+		if not folder then return {} end
+		local a, b = math.min(player.UserId, target.UserId), math.max(player.UserId, target.UserId)
+		local cname = string.format("RBXWhisper:%d_%d", a, b)
+		local wch = folder:FindFirstChild(cname)
+		if not wch then
+			wch = Instance.new("TextChannel")
+			wch.Name = cname
+			props(wch).DirectChatRequester = player
+			wch.Parent = folder
+		end
+		make_text_source(wch, player, true)
+		make_text_source(wch, target, true)
+		if raw_text and raw_text ~= "" then
+			R.fire(player, "Chatted", raw_text, target)
+			return { player.UserId, target.UserId }
+		end
+		return {}
+	end
+
+	if not channel then return {} end
 	local src = source_of(channel, player.UserId)
-	if src == nil or not src.CanSend then return {} end
-	run_commands(text, src)
+
+	if kind == "cmd" then
+		R.fire(player, "Chatted", raw_text, nil)
+		for _, cmd in find_matching_commands(raw_text) do
+			R.fire(cmd, "Triggered", src, raw_text)
+		end
+		return {}
+	end
+
+	-- Regular message ("msg")
+	local recipient = nil
+	if channel.Name:sub(1, 11) == "RBXWhisper:" then
+		local a, b = channel.Name:sub(12):match("^(%-?%d+)_(%-?%d+)$")
+		if a and b then
+			local oid = tonumber(a) == player.UserId and tonumber(b) or tonumber(a)
+			recipient = oid and svc.Players:GetPlayerByUserId(oid) or nil
+		end
+	end
+	R.fire(player, "Chatted", raw_text, recipient)
+
+	if src == nil or not src.CanSend or utf8_count(raw_text) > 200 then return {} end
+
 	local deliver = {}
 	local cb = __rs_get_callback(channel, "ShouldDeliverCallback")
 	local probe = cb and new_message({
-		Text = text, TextChannel = channel, TextSource = src, Status = STATUS.Success,
-		MessageId = id, Metadata = metadata,
+		Text = text,
+		TextChannel = channel,
+		TextSource = src,
+		Status = STATUS.Success,
+		MessageId = id,
+		Metadata = metadata,
+		PrefixText = prefix_for(channel, player),
 	})
 	for _, s in channel:GetChildren() do
 		if s:IsA("TextSource") then
@@ -616,9 +1052,27 @@ function __rs_pc_server_receive(player, channel, text, metadata, id)
 end
 
 -- Client: the server delivered a message to this player.
-function __rs_pc_client_receive(channel, sender_id, text, metadata, id)
-	local src = source_of(channel, sender_id)
+function __rs_pc_client_receive(channel, sender_id, kind, text, raw_text, metadata, id)
+	if muted_users[sender_id] then return end
 	local sender = svc.Players:GetPlayerByUserId(sender_id)
+
+	if kind == "legacy" then
+		local ui = ensure_ui()
+		local name = sender and sender.DisplayName or "Player"
+		if ui then
+			ui.add_legacy_line("<b>" .. escape_rich_text(name) .. ":</b> " .. escape_rich_text(raw_text))
+			local bub_on = svc.Chat.BubbleChatEnabled or svc.Players.BubbleChat
+			if bub_on and sender then
+				local a = bubble_adornee(sender)
+				if a then ui.add_bubble(a, escape_rich_text(raw_text), nil, sender_id) end
+			end
+		end
+		if sender then R.fire(sender, "Chatted", raw_text, nil) end
+		return
+	end
+
+	if not channel then return end
+	local src = source_of(channel, sender_id)
 	local m = new_message({
 		Text = text,
 		TextChannel = channel,
@@ -626,21 +1080,27 @@ function __rs_pc_client_receive(channel, sender_id, text, metadata, id)
 		Status = STATUS.Success,
 		MessageId = id,
 		Metadata = metadata,
-		PrefixText = sender and (sender.DisplayName .. ":") or "",
+		PrefixText = prefix_for(channel, sender),
 	})
 	run_incoming(m)
-	R.fire(channel, "MessageReceived", m)
-	R.fire(svc.TextChatService, "MessageReceived", m)
-	view_line(m)
+	-- Match Studio's exact event order: game MessageReceived listeners run
+	-- first, then OnChatWindowAdded & OnBubbleAdded populate message
+	-- properties, then CoreScripts (ExpChat) receive the populated message.
+	R.fire_game(svc.TextChatService, "MessageReceived", m)
+	R.fire_game(channel, "MessageReceived", m)
+	deliver_to_window(m)
 	local cfg = svc.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
 	if cfg and cfg.Enabled and sender then
 		local a = bubble_adornee(sender)
-		if a then view_bubble(a, m, props(m).Text) end
+		if a then deliver_to_bubble(a, m, props(m).Text, sender_id) end
 	end
-	if sender then R.fire(sender, "Chatted", text) end
+	R.fire_core(svc.TextChatService, "MessageReceived", m)
+	R.fire_core(channel, "MessageReceived", m)
+	if sender then R.fire(sender, "Chatted", raw_text, nil) end
 end
 
--- Default channels and commands (server), TextSources per player.
+-- Default channels and commands (server), TextSources per player, Team channels,
+-- BubbleChatConfiguration default children (UIGradient, ImageLabel, UICorner, UIPadding).
 local DEFAULT_COMMANDS = {
 	{ "RBXTeamCommand", "/team", "/t" },
 	{ "RBXClearCommand", "/clear", "/cls" },
@@ -652,6 +1112,34 @@ local DEFAULT_COMMANDS = {
 	{ "RBXConsoleCommand", "/console", "" },
 	{ "RBXWhisperCommand", "/whisper", "/w" },
 }
+
+local function ensure_bcc_children(bcc)
+	if not bcc:FindFirstChildOfClass("UIGradient") then
+		local g = Instance.new("UIGradient")
+		g.Enabled = false
+		g.Parent = bcc
+	end
+	if not bcc:FindFirstChildOfClass("ImageLabel") then
+		local img = Instance.new("ImageLabel")
+		img.Image = ""
+		img.ImageColor3 = Color3.new(1, 1, 1)
+		img.ScaleType = Enum.ScaleType.Stretch
+		img.TileSize = UDim2.fromScale(1, 1)
+		img.Parent = bcc
+	end
+	if not bcc:FindFirstChildOfClass("UICorner") then
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 12)
+		c.Parent = bcc
+	end
+	if not bcc:FindFirstChildOfClass("UIPadding") then
+		local p = Instance.new("UIPadding")
+		local u = UDim.new(0, 8)
+		p.PaddingTop = u; p.PaddingBottom = u; p.PaddingLeft = u; p.PaddingRight = u
+		p.Parent = bcc
+	end
+end
+
 local set_up, configs = false, false
 local function server_setup()
 	-- The service's configuration children (Studio always has them).
@@ -659,9 +1147,13 @@ local function server_setup()
 		configs = true
 		local T = svc.TextChatService
 		for _, class in { "ChatWindowConfiguration", "ChatInputBarConfiguration", "BubbleChatConfiguration", "ChannelTabsConfiguration" } do
-			if not T:FindFirstChildOfClass(class) then
-				local c = R.create(class)
+			local c = T:FindFirstChildOfClass(class)
+			if not c then
+				c = R.create(class)
 				c.Parent = T
+			end
+			if class == "BubbleChatConfiguration" then
+				ensure_bcc_children(c)
 			end
 		end
 	end
@@ -694,142 +1186,255 @@ local function server_setup()
 		folder.Parent = svc.TextChatService
 	end
 end
+
 local sourced = setmetatable({}, { __mode = "k" })
+local player_team_channel = setmetatable({}, { __mode = "k" })
+
 local function server_sources()
-	if not set_up or not svc.TextChatService.CreateDefaultTextChannels then return end
-	local folder = svc.TextChatService:FindFirstChild("TextChannels")
-	if not folder then return end
-	for _, p in svc.Players:GetPlayers() do
-		if not sourced[p] then
-			sourced[p] = true
-			for _, n in { "RBXSystem", "RBXGeneral" } do
-				local ch = folder:FindFirstChild(n)
-				if ch and not source_of(ch, p.UserId) then
-					local s = R.create("TextSource")
-					s.Name = p.Name
-					__rs_set_raw(s, "UserId", p.UserId)
-					s.CanSend = n == "RBXGeneral"
-					s.Parent = ch
+	if not set_up then return end
+	local T = svc.TextChatService
+	local folder = T:FindFirstChild("TextChannels")
+	local players = svc.Players:GetPlayers()
+
+	-- 1. Default channels + Team channels (RBXTeam<BrickColor.Name>)
+	if T.CreateDefaultTextChannels and folder then
+		-- Ensure RBXTeam* channels exist for all Teams
+		local teams_svc = svc.Teams
+		local active_team_channels = {}
+		for _, tm in teams_svc:GetChildren() do
+			if tm:IsA("Team") then
+				local cname = "RBXTeam" .. tm.TeamColor.Name
+				local tch = folder:FindFirstChild(cname)
+				if not tch then
+					tch = Instance.new("TextChannel")
+					tch.Name = cname
+					tch.Parent = folder
 				end
+				active_team_channels[tm] = tch
+			end
+		end
+
+		for _, p in players do
+			if not sourced[p] then
+				sourced[p] = true
+				for _, n in { "RBXSystem", "RBXGeneral" } do
+					local ch = folder:FindFirstChild(n)
+					if ch then make_text_source(ch, p, n == "RBXGeneral") end
+				end
+			end
+			-- Sync player's Team TextSource
+			local want_ch = (not p.Neutral and p.Team) and active_team_channels[p.Team] or nil
+			local cur_ch = player_team_channel[p]
+			if cur_ch ~= want_ch then
+				if cur_ch and cur_ch.Parent then
+					local old_s = source_of(cur_ch, p.UserId)
+					if old_s then old_s:Destroy() end
+				end
+				if want_ch then
+					make_text_source(want_ch, p, true)
+				end
+				player_team_channel[p] = want_ch
 			end
 		end
 	end
+
+	-- 2. Any TextChannel with AddPlayersOnJoin == true
+	for _, ch in T:GetDescendants() do
+		if ch:IsA("TextChannel") and ch.AddPlayersOnJoin then
+			for _, p in players do
+				make_text_source(ch, p, true)
+			end
+		end
+	end
+
+	-- 3. Remove TextSources for departed players
 	for p in sourced do
 		if p.Parent == nil then
 			sourced[p] = nil
-			for _, ch in folder:GetChildren() do
-				local s = ch:IsA("TextChannel") and source_of(ch, p.UserId)
-				if s then s:Destroy() end
-			end
-		end
-	end
-end
-local client_ready = false
-local function client_setup()
-	if client_ready or not tcs_enabled() then return end
-	local bar = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
-	local general = svc.TextChatService:FindFirstChild("TextChannels") and svc.TextChatService.TextChannels:FindFirstChild("RBXGeneral")
-	if bar and general then
-		client_ready = true
-		if bar.TargetTextChannel == nil then bar.TargetTextChannel = general end
-	end
-end
-
--- CharacterAppearanceLoaded: once the new character's appearance is on
--- (the next frame after CharacterAdded, as Studio orders them).
-local appearance = setmetatable({}, { __mode = "k" })
-local function appearance_events()
-	for _, p in svc.Players:GetPlayers() do
-		local c = p.Character
-		local st = appearance[p]
-		if c ~= nil and (st == nil or st.char ~= c) then
-			appearance[p] = { char = c, frames = 0 }
-			-- The server's character keeps the description it was dressed
-			-- from under its Humanoid (Humanoid:GetAppliedDescription copies
-			-- it): the account's for CharacterAppearanceId, as in Studio.
-			local hum = side() ~= "Client" and c:FindFirstChildOfClass("Humanoid")
-			if hum and not hum:FindFirstChildOfClass("HumanoidDescription") then
-				local ok, d = pcall(function()
-					if not p.CanLoadCharacterAppearance then return R.create("HumanoidDescription") end
-					return svc.Players:GetHumanoidDescriptionFromUserIdAsync(p.CharacterAppearanceId)
-				end)
-				if ok and d then
-					d.Name = "HumanoidDescription"
-					d.Parent = hum
+			player_team_channel[p] = nil
+			for _, ch in T:GetDescendants() do
+				if ch:IsA("TextChannel") then
+					local s = source_of(ch, p.UserId)
+					if s then s:Destroy() end
 				end
 			end
-		elseif st and st.frames >= 0 then
-			st.frames += 1
-			if st.frames >= 1 then
-				st.frames = -1
-				R.fire(p, "CharacterAppearanceLoaded", c)
+		end
+	end
+end
+
+local client_ready = false
+local expchat_target_synced = false
+local last_tabs_enabled = false
+local last_local_team = nil
+local function client_setup(dt)
+	local ui = ensure_ui()
+	if ui then ui.step(dt) end
+	if not tcs_enabled() then return end
+
+	local bar = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+	local tc = svc.TextChatService:FindFirstChild("TextChannels")
+	local general = tc and tc:FindFirstChild("RBXGeneral")
+	if not client_ready and bar and general then
+		client_ready = true
+		if bar.TargetTextChannel == nil then bar.TargetTextChannel = general end
+		if ui and svc.TextChatService.ChatTranslationEnabled then
+			ui.show_translation_notice()
+		end
+	end
+	-- When ExpChat mounts after TargetTextChannel was already initialized on frame 1,
+	-- re-emit TargetTextChannel once so ExpChat's ChannelTabs store selects the active tab.
+	if not ui and bar and general then
+		local ec = svc.CoreGui:FindFirstChild("ExperienceChat")
+		local ctc = svc.TextChatService:FindFirstChildOfClass("ChannelTabsConfiguration")
+		local tabs_on = ctc and ctc.Enabled == true or false
+		local tabs_just_on = tabs_on and not last_tabs_enabled
+		last_tabs_enabled = tabs_on
+		if ec and (not expchat_target_synced or tabs_just_on) then
+			expchat_target_synced = true
+			local cur = bar.TargetTextChannel or general
+			pcall(function()
+				bar.TargetTextChannel = nil
+				bar.TargetTextChannel = cur
+			end)
+		end
+	end
+
+	-- Pending whisper channel replicated from server: switch target & send body
+	if pending_whisper and tc then
+		local wch = tc:FindFirstChild(pending_whisper.name)
+		if wch and bar then
+			local pw = pending_whisper
+			pending_whisper = nil
+			pcall(function() bar.TargetTextChannel = wch end)
+			if ui then ui.refresh_tabs() end
+			if pw.body ~= "" then
+				task.spawn(function() wch:SendAsync(pw.body) end)
+			end
+		end
+	end
+
+	-- Announce team changes on the client ("You are now on the 'X' team."), matching Studio!
+	local lp = svc.Players.LocalPlayer
+	if lp and ui then
+		local cur_team = (not lp.Neutral) and lp.Team or nil
+		if cur_team ~= last_local_team then
+			last_local_team = cur_team
+			if cur_team then
+				sys_notice(string.format("You are now on the '%s' team.", cur_team.Name))
+				ui.refresh_tabs()
 			end
 		end
 	end
 end
 
-function __rs_pc_step()
+-- The engine queues this after constructing an avatar. Assigning
+-- Player.Character in Luau does not load an appearance.
+function __rs_character_appearance_loaded(player, character)
+	task.wait()
+	if player.Character ~= character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid and not humanoid:FindFirstChildOfClass("HumanoidDescription") then
+		local ok, description = pcall(function()
+			if not player.CanLoadCharacterAppearance then return R.create("HumanoidDescription") end
+			return svc.Players:GetHumanoidDescriptionFromUserIdAsync(player.CharacterAppearanceId)
+		end)
+		if ok and description and player.Character == character then
+			description.Name = "HumanoidDescription"
+			description.Parent = humanoid
+		end
+	end
+	if player.Character == character then
+		R.fire(player, "CharacterAppearanceLoaded", character)
+	end
+end
+
+function __rs_pc_step(dt)
 	local s = side()
 	if s ~= "Client" then
 		server_setup()
 		server_sources()
 	end
-	if s ~= "Server" then client_setup() end
-	appearance_events()
+	if s == "Client" then
+		client_setup(dt)
+	end
 end
 
--- What play_game.rs draws: the window's lines and the live bubbles.
-function __rs_pc_chat_view()
-	local cfg = svc.TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
-	local duration = cfg and cfg.BubbleDuration or 15
-	local now = os.clock()
-	for i = #view.bubbles, 1, -1 do
-		local b = view.bubbles[i]
-		local alive = pcall(function() assert(b.adornee:IsDescendantOf(workspace)) end)
-		if now - b.time > duration or not alive then
-			table.remove(view.bubbles, i)
-		end
+local core_layout = {
+	ChatWindowConfiguration = { AbsolutePosition = { 0, 0 }, AbsoluteSize = { 0, 0 } },
+	ChatInputBarConfiguration = { AbsolutePosition = { 0, 0 }, AbsoluteSize = { 0, 0 }, IsFocused = false },
+	ChannelTabsConfiguration = { AbsolutePosition = { 0, 0 }, AbsoluteSize = { 0, 0 } },
+}
+
+function __rs_pc_set_layout(class, key, a, b)
+	local t = core_layout[class]
+	if not t then return end
+	if key == "IsFocused" then
+		t.IsFocused = a == true
+	else
+		t[key] = { tonumber(a) or 0, tonumber(b) or 0 }
 	end
-	view.now = now
-	return view
 end
-function __rs_pc_clear_view()
-	table.clear(view.lines)
-end
--- The local player typed a line in the chat bar: SendAsync on the target
--- channel (TextChatService chat), as the default chat does.
-function __rs_pc_chat_input(text)
-	local word = text:match("^(%S+)")
-	-- "/e name" (TextChatService's RBXEmoteCommand; legacy chat's emote
-	-- hook) plays an emote and isn't sent.
-	if word and (word:lower() == "/e" or word:lower() == "/emote") then
-		local cmd = tcs_enabled() and svc.TextChatService:FindFirstChild("RBXEmoteCommand", true)
-		if not cmd or cmd.Enabled then
-			local name = text:match("^%S+%s+(.-)%s*$") or ""
-			local lp = svc.Players.LocalPlayer
-			local hum = lp and lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-			if hum and name ~= "" then
-				task.spawn(function()
-					-- The player's own emote, else one of Animate's (wave, dance …).
-					if not pcall(hum.PlayEmote, hum, name) then
-						local animate = lp.Character:FindFirstChild("Animate")
-						local bf = animate and animate:FindFirstChild("PlayEmote")
-						if bf and bf:IsA("BindableFunction") then
-							bf:Invoke(name:lower())
-						end
+
+function __rs_pc_layout(class, key)
+	local ui = ensure_ui()
+	if not ui then
+		local t = core_layout[class]
+		if key == "IsFocused" then return t and t.IsFocused or false end
+		local v = t and t[key]
+		if v and (v[1] ~= 0 or v[2] ~= 0) then return v[1], v[2] end
+		-- Fallback before ExpChat's onAbsoluteSizeChanged fires: read the mounted
+		-- CoreGui.ExperienceChat chatWindow box directly when enabled and visible.
+		if class == "ChatWindowConfiguration" then
+			local cwc = svc.TextChatService:FindFirstChildOfClass("ChatWindowConfiguration")
+			if cwc and cwc.Enabled then
+				local ec = svc.CoreGui:FindFirstChild("ExperienceChat")
+				local cw = ec and ec:FindFirstChild("chatWindow", true)
+				if cw and cw:IsA("GuiObject") and cw.Visible then
+					local vec = key == "AbsolutePosition" and cw.AbsolutePosition or cw.AbsoluteSize
+					if vec.X ~= 0 or vec.Y ~= 0 then
+						return vec.X, vec.Y
 					end
-				end)
+				end
 			end
-			return true
 		end
+		return 0, 0
 	end
-	if not tcs_enabled() then return false end
+	return ui.layout_query(class, key)
+end
+
+function __rs_pc_set_core(key, val)
+	local ui = ensure_ui()
+	if ui then ui.set_core(key, val) end
+end
+
+function __rs_pc_get_core(key)
+	local ui = ensure_ui()
+	if ui then return ui.get_core(key) end
+	return nil
+end
+
+function __rs_pc_chat_input(text)
+	local raw = tostring(text or "")
+	if raw:match("^%s*$") then return true end
+	if not tcs_enabled() then
+		table.insert(__rs_pc_outbox, {
+			kind = "legacy",
+			channel = nil,
+			text = raw,
+			raw_text = raw,
+			metadata = "",
+			id = "",
+			target_uid = 0,
+		})
+		return true
+	end
 	local bar = svc.TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
 	local ch = bar and bar.TargetTextChannel
-	if ch == nil then return false end
-	if word and (word:lower() == "/clear" or word:lower() == "/cls") then
-		__rs_pc_clear_view()
+	if ch == nil then
+		local tc = svc.TextChatService:FindFirstChild("TextChannels")
+		ch = tc and tc:FindFirstChild("RBXGeneral")
 	end
-	task.spawn(function() ch:SendAsync(text) end)
+	if ch == nil then return false end
+	task.spawn(function() ch:SendAsync(raw) end)
 	return true
 end

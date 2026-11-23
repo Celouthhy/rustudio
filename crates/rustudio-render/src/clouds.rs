@@ -316,7 +316,7 @@ pub struct CloudsGpu {
 }
 
 impl CloudsGpu {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, shader_source: &str, hdr: wgpu::TextureFormat, samples: u32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, globals: &wgpu::BindGroupLayout, shader_source: &str, hdr: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, samples: u32) -> Self {
         let src = format!("{shader_source}\n{}", include_str!("clouds.wgsl"));
         let src = if samples == 1 { src.replace("texture_depth_multisampled_2d", "texture_depth_2d") } else { src };
         let src = crate::gpu_caps::shader_for(device, &src);
@@ -371,7 +371,7 @@ impl CloudsGpu {
                     targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::current(),
             })
         };
         let f16 = wgpu::TextureFormat::Rgba16Float;
@@ -379,7 +379,28 @@ impl CloudsGpu {
         let cover_pipe = pipe("clouds sun cover", "fs_clouds_cover", wgpu::TextureFormat::R8Unorm);
         let wind_pipe = pipe("clouds wind", "fs_clouds_wind", f16);
         let up_pipe = pipe("clouds upsample", "fs_clouds_up", f16);
-        let comp_pipe = pipe("clouds comp", "fs_clouds_comp", hdr);
+        let comp_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("clouds sky"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_clouds"), compilation_options: Default::default(), buffers: &[] },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Equal),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_clouds_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: hdr, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let target = |label: &str, w: u32, h: u32, format: wgpu::TextureFormat, samples: u32, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -520,7 +541,10 @@ impl CloudsGpu {
                     self.cover_buf.unmap();
                     if let Some(b) = byte {
                         self.target = (b as f32 / 255.0).max(COVER_FLOOR);
-                        self.have_cover = true;
+                        if !self.have_cover {
+                            self.cover = self.target;
+                            self.have_cover = true;
+                        }
                         if std::env::var_os("RUSTUDIO_CLOUDS_DEBUG").is_some() {
                             eprintln!("[clouds] sun cover texel {b} target {:.4} smoothed {:.4}", self.target, self.cover);
                         }
@@ -626,39 +650,23 @@ impl CloudsGpu {
         pass(encoder, "clouds upsample", &s.half_view, &self.up_pipe, &half_bg);
     }
 
-    /// Lays the clouds over the scene (`hdr`, whose copy is `scene`) where
-    /// the depth shows nothing was drawn.
-    pub fn composite(
-        &mut self,
+    /// Draws the clouds over the sky inside the main MSAA scene pass, before
+    /// opaque, terrain, water, glass and transparent passes.
+    pub fn draw_over_sky(
+        &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        pass: &mut wgpu::RenderPass<'_>,
         globals_bg: &wgpu::BindGroup,
-        hdr: &wgpu::TextureView,
-        scene: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
     ) {
         if !self.active {
             return;
         }
         let Some(s) = self.sized.as_ref() else { return };
-        let bg = self.group(device, &self.bsm, &s.half_view, scene, depth);
-        let mut p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("clouds comp"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: hdr,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        p.set_pipeline(&self.comp_pipe);
-        p.set_bind_group(0, globals_bg, &[]);
-        p.set_bind_group(3, &bg, &[]);
-        p.draw(0..3, 0..1);
+        let bg = self.group(device, &self.bsm, &s.half_view, &self.dummy2d, &self.dummy_depth);
+        pass.set_pipeline(&self.comp_pipe);
+        pass.set_bind_group(0, globals_bg, &[]);
+        pass.set_bind_group(3, &bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// After the frame's submit: start mapping the sun cover copied this frame.

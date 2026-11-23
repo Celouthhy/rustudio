@@ -21,6 +21,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// The longest the In-Experience list lags edits (`scan_document`).
+const EXPERIENCE_RESCAN: Duration = Duration::from_secs(1);
+
 use rbx_dom_weak::types::{Ref, Variant};
 use rustudio_account::cloud::CloudPlace;
 use rustudio_core::doc::Document;
@@ -632,6 +635,9 @@ pub struct AssetManager {
     pub experience_assets: Vec<AssetEntry>,
     pub experience_rev: u64,
     pub experience_root: Ref,
+    /// When the in-experience list was last rebuilt: edits (and Play, whose
+    /// world changes every frame) rescan at most once a second.
+    pub experience_scanned: Option<Instant>,
     pub lookup_cache: HashMap<u64, Option<AssetEntry>>,
     pub lookup_inflight: HashSet<u64>,
 
@@ -692,6 +698,7 @@ impl Default for AssetManager {
             experience_assets: Vec::new(),
             experience_rev: u64::MAX,
             experience_root: Ref::none(),
+            experience_scanned: None,
             lookup_cache: HashMap::new(),
             lookup_inflight: HashSet::new(),
             filter_popup: false,
@@ -1118,8 +1125,14 @@ impl AssetManager {
         if self.experience_rev == rev && self.experience_root == root {
             return;
         }
+        // (a walk of every instance: a big place in Play would pay it each frame)
+        let forced = self.experience_rev == u64::MAX || self.experience_root != root;
+        if !forced && self.experience_scanned.is_some_and(|t| t.elapsed() < EXPERIENCE_RESCAN) {
+            return;
+        }
         self.experience_rev = rev;
         self.experience_root = root;
+        self.experience_scanned = Some(Instant::now());
         self.experience_assets = scan_dom_assets(doc);
     }
 

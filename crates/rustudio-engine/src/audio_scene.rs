@@ -70,7 +70,7 @@ fn effects(d: &Document, r: Ref) -> Vec<Effect> {
             ));
         }
     }
-    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
     out.into_iter().map(|(_, e)| e).collect()
 }
 fn world(d: &Document, r: Ref, depth: u8) -> Option<Xform> {
@@ -105,6 +105,63 @@ fn world(d: &Document, r: Ref, depth: u8) -> Option<Xform> {
         xform_of(d, r)
     }
 }
+/// Parameters retained after a PlayOnRemove sound leaves the DataModel.
+pub struct RemovedSound {
+    pub source: Ref,
+    pub id: String,
+    pub volume: f32,
+    pub speed: f32,
+    pub position: f64,
+    pub region: crate::audio::Region,
+    pub groups: Vec<(u64, Settings)>,
+    pub settings: Settings,
+}
+
+pub fn on_remove(
+    d: &Document,
+    r: Ref,
+    listener: Option<(u32, Option<Xform>, Option<Ref>)>,
+) -> Option<RemovedSound> {
+    if d.class_of(r).as_deref() != Some("Sound")
+        || !matches!(d.prop(r, "PlayOnRemove"), Some(Variant::Bool(true)))
+    {
+        return None;
+    }
+    let id = match d.prop(r, "SoundId") {
+        Some(Variant::ContentId(c)) => c.as_str().to_owned(),
+        Some(Variant::Content(c)) => c.as_uri()?.to_owned(),
+        Some(Variant::String(s)) => s,
+        _ => return None,
+    };
+    if id.trim().is_empty() {
+        return None;
+    }
+    let camera = d.workspace().and_then(|ws| match d.prop(ws, "CurrentCamera") {
+        Some(Variant::Ref(camera)) if camera.is_some() => xform_of(d, camera),
+        _ => d.find_child(ws, "Camera").and_then(|camera| xform_of(d, camera)),
+    });
+    let (cam, right) = camera.map_or((Vec3::ZERO, Vec3::X), |c| (c.pos, c.rot.x_axis));
+    let (groups, settings) = settings(d, r, cam, right, listener);
+    let region = if matches!(d.prop(r, "PlaybackRegionsEnabled"), Some(Variant::Bool(true))) {
+        match d.prop(r, "PlaybackRegion") {
+            Some(Variant::NumberRange(n)) => Some((n.min as f64, n.max as f64)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Some(RemovedSound {
+        source: r,
+        id,
+        volume: number(d, r, "Volume", 0.5),
+        speed: number(d, r, "PlaybackSpeed", 1.0),
+        position: number(d, r, "TimePosition", 0.0) as f64,
+        region: crate::audio::Region { play: region, looped: None },
+        groups,
+        settings,
+    })
+}
+
 pub fn settings(
     d: &Document,
     r: Ref,
@@ -236,8 +293,8 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].1.gain * groups[1].1.gain, 0.125);
         assert_eq!(groups[1].1.effects.len(), 2);
-        assert_eq!(groups[1].1.effects[0].kind, "ReverbSoundEffect");
-        assert_eq!(groups[1].1.effects[1].kind, "EqualizerSoundEffect");
+        assert_eq!(groups[1].1.effects[0].kind, "EqualizerSoundEffect");
+        assert_eq!(groups[1].1.effects[1].kind, "ReverbSoundEffect");
         assert!((s.gain - 0.1).abs() < 1e-6);
         assert_eq!(s.pan, Some(1.));
         let (_, s) = settings(

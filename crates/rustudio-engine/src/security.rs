@@ -41,6 +41,12 @@ pub const CORE: u8 = 4;
 /// Studio plugins (printidentity prints 5 in a local plugin's Script, its
 /// ModuleScripts and spawned threads: measured in Studio 0.747, 2026-11-14).
 pub const PLUGIN_IDENT: u8 = 5;
+/// Studio's built-in plugins (`BuiltInPlugins/Optimized_Embedded_Signature/*.rbxm`):
+/// identity 6, holding RobloxScript + LocalUser + WritePlayer + Plugin
+/// capabilities (can call DefineFastFlag, access RobloxPluginGuiService,
+/// Plugin.HostDataModelType, Plugin:GetPluginComponent, DraggerService,
+/// PluginGui.InputBegan, etc.).
+pub const BUILTIN_PLUGIN: u8 = 6;
 
 // Legacy capability bits.
 const PLUGIN: u8 = 0x1;
@@ -73,7 +79,7 @@ fn legacy_granted(id: u8) -> u8 {
         // WritePlayer for the command bar is unmeasured (harness tests make
         // Players); game scripts measured without it.
         COMMAND => PLUGIN | LOCAL_USER | WRITE_PLAYER,
-        CORE => PLUGIN | LOCAL_USER | WRITE_PLAYER | ROBLOX_SCRIPT,
+        CORE | BUILTIN_PLUGIN => PLUGIN | LOCAL_USER | WRITE_PLAYER | ROBLOX_SCRIPT,
         // Measured for a plugin: settings(), PluginManager, CoreGui,
         // StudioService, RobloxLocked, GetDebugId (Plugin) are granted;
         // UsesAssetInsertionDrag / SourceAssetId (RobloxScript) and
@@ -93,8 +99,8 @@ fn legacy_granted(id: u8) -> u8 {
 fn sandbox_denied(id: u8) -> u8 {
     let _ = (SB_INTERNAL_TEST, SB_REMOTE_COMMAND, SB_ASSISTANT);
     match id {
-        // (A plugin reads RunService.RunState: measured.)
-        COMMAND | PLUGIN_IDENT => 0,
+        // (A plugin reads RunService.RunState: measured; CoreScripts call RunService:IsEdit().)
+        COMMAND | CORE | PLUGIN_IDENT | BUILTIN_PLUGIN => 0,
         _ => SB_PLUGIN_OR_OPEN_CLOUD,
     }
 }
@@ -322,6 +328,14 @@ pub fn current(lua: &Lua) -> u8 {
     unsafe { ident_of(state_of(&lua.current_thread())) }
 }
 
+pub fn set_current(lua: &Lua, id: u8) {
+    unsafe { set_ident(state_of(&lua.current_thread()), id) }
+}
+
+pub fn set_thread(th: &Thread, id: u8) {
+    unsafe { set_ident(state_of(th), id) }
+}
+
 pub fn set(th: &Thread, id: u8) {
     unsafe { set_ident(state_of(th), id) }
 }
@@ -366,6 +380,8 @@ fn internal_chunk(src: &[u8]) -> bool {
     s.starts_with(b"rustudio.")
         || s.starts_with(b"gui_input.")
         || s.starts_with(b"CoreGui.RobloxGui.CoreScripts/")
+        // The data model patch's entry CoreScript (runtime start_core_script).
+        || s == b"StarterScript"
         || s == b"StudioTestService"
         || s == b"geometry_ops"
         || s == b"geometry_nav"
@@ -450,6 +466,12 @@ pub fn check_global(lua: &Lua, name: &str) -> mlua::Result<()> {
     check_identity(lua, "call", name, Req { legacy: PLUGIN, sandbox: 0 })
 }
 
+/// UserGameSettings.SavedQualityLevel write check (measured in Studio 0.748:
+/// `The current thread cannot set 'render quality level' (lacking capability RobloxScript)`).
+pub fn check_set_quality(lua: &Lua) -> mlua::Result<()> {
+    check(lua, "set", "render quality level", None, Req { legacy: ROBLOX_SCRIPT, sandbox: 0 })
+}
+
 // ------------------------------------------------------------------ hooks
 
 /// Instance.new: a Player wants WritePlayer (`The current thread cannot
@@ -470,10 +492,23 @@ pub fn check_create(lua: &Lua, class: &str) -> mlua::Result<()> {
     Ok(())
 }
 
-/// GetService / FindService("CoreGui") answer nil to game scripts (measured
-/// in both Play contexts).
+/// Services invisible to identity-2 game scripts even when present in DataModel
+/// (CoreGui, CorePackages when CoreScripts are loaded).
+#[inline]
+pub fn is_hidden_service_class(name: &str) -> bool {
+    matches!(name, "CoreGui" | "CorePackages")
+}
+
+/// Whether the current thread cannot see hidden core services (`CoreGui`, `CorePackages`).
+#[inline]
+pub fn hides_core_services(lua: &Lua) -> bool {
+    current(lua) == GAME && !internal(lua)
+}
+
+/// GetService / FindService("CoreGui" | "CorePackages") answer nil to game
+/// scripts (measured in both Play contexts).
 pub fn service_hidden(lua: &Lua, name: &str) -> bool {
-    name == "CoreGui" && current(lua) == GAME && !internal(lua)
+    is_hidden_service_class(name) && hides_core_services(lua)
 }
 
 #[inline]
@@ -1069,4 +1104,54 @@ mod tests {
         assert_eq!(rule("Player", "InputLatency").unwrap().read.missing(COMMAND), Some("RobloxEngine"));
         assert_eq!(rule("Instance", "SourceAssetId").unwrap().read.missing(COMMAND), Some("RobloxScript"));
     }
+
+    #[test]
+    fn context_actions_keep_registries_and_binder_identity_across_input_and_yield() {
+        let (rt, _) = client("");
+        with_main_identity(&rt.lua, GAME, || rt.lua.load(r#"
+            local cas = game:GetService("ContextActionService")
+            cas:BindAction("same", function()
+                printidentity("game action")
+                assert(not pcall(function() return game:GetService("GuiService").SelectedCoreObject end))
+                return Enum.ContextActionResult.Pass
+            end, false, Enum.KeyCode.B)
+        "#).exec()).unwrap();
+        with_main_identity(&rt.lua, CORE, || rt.lua.load(r#"
+            local cas = game:GetService("ContextActionService")
+            cas:BindCoreAction("same", function()
+                printidentity("core action")
+                assert(pcall(function() return game:GetService("GuiService").SelectedCoreObject end))
+                __rs_input_event("Begin", "Keyboard", "B", 0, 0, 0, 0, 0, false)
+                task.wait()
+                printidentity("core resumed")
+            end, false, Enum.KeyCode.A)
+            assert(next(cas:GetBoundActionInfo("same")))
+            assert(next(cas:GetBoundCoreActionInfo("same")))
+        "#).exec()).unwrap();
+        with_main_identity(&rt.lua, GAME, || rt.lua.load(r#"
+            assert(__rs_call_action == nil)
+            __rs_input_event("Begin", "Keyboard", "A", 0, 0, 0, 0, 0, false)
+            game:GetService("ContextActionService"):UnbindAllActions()
+        "#).exec()).unwrap();
+        with_main_identity(&rt.lua, CORE, || rt.lua.load(r#"
+            local cas = game:GetService("ContextActionService")
+            assert(next(cas:GetBoundActionInfo("same")) == nil)
+            assert(next(cas:GetBoundCoreActionInfo("same")))
+        "#).exec()).unwrap();
+        rt.step(1.0 / 60.0);
+        let out = lines(rt);
+        assert!(has(&out, &format!("core action {CORE}")), "{out:?}");
+        assert!(has(&out, &format!("game action {GAME}")), "{out:?}");
+        assert!(has(&out, &format!("core resumed {CORE}")), "{out:?}");
+    }
+
+    #[test]
+    fn shutdown_uses_local_user_security() {
+        let (rt, _) = client("");
+        assert!(with_main_identity(&rt.lua, GAME, || rt.lua.load("game:Shutdown()").exec()).is_err());
+        assert!(!rt.world_mut().unwrap().shutdown_requested);
+        with_main_identity(&rt.lua, CORE, || rt.lua.load("game:Shutdown()").exec()).unwrap();
+        assert!(rt.world_mut().unwrap().shutdown_requested);
+    }
+
 }

@@ -341,6 +341,10 @@ struct Slot {
     /// it had, with no MouseLeave, until the pointer is over it again with
     /// no drag (Studio 0.747, checks/plugins/ref/captures/xdrag.txt S2-S4).
     hover_stale: bool,
+    /// True once `gui` has synced marks while visible; transitioning from
+    /// hidden to visible forces a full mark invalidation so changes made
+    /// while hidden are picked up immediately without syncing hidden widgets.
+    synced_visible: bool,
 }
 
 /// An input event for the edit VM, in order.
@@ -374,6 +378,8 @@ enum In {
     /// into the 3D view (toolbox/glue.rs `toolbox_drag_in`). Edit only: the
     /// 3D view's plugin input is the edit VM's (`plugin_viewport`).
     MouseDragEnter(Vec<Ref>),
+    /// MouseService.MouseEnterStudioViewport (true) / MouseLeaveStudioViewport.
+    ViewportHover(bool),
 }
 
 /// The pointer over the edit viewport this frame (for PluginMouse, Mouse
@@ -412,7 +418,10 @@ pub struct PluginUi {
     /// Buttons held over the viewport (the PluginMouse's Button1Up etc.).
     view_buttons: [bool; 2],
     keys_down: HashSet<String>,
+    keys_sent: HashSet<String>,
     layout_sent: HashMap<Ref, GuiBox>,
+    ui_rev_seen: u64,
+    had_play: bool,
     /// workspace.CurrentCamera as last written from the editor's view
     /// (CFrame, Focus position, FieldOfView): a plugin's write since moves
     /// the view.
@@ -432,6 +441,9 @@ pub struct PluginUi {
     /// active plugin's mouse): its release is not the editor's click, even
     /// when the plugin hands the tool back in between (Model Reflect).
     pub press_taken: bool,
+    /// `plugin-widget:…` actions waiting for a freshly awakened deferred plugin
+    /// to finish creating its DockWidgetPluginGui slot.
+    pending_widget_actions: Vec<(String, u8)>,
 }
 
 impl PluginUi {
@@ -439,6 +451,55 @@ impl PluginUi {
     /// camera keys leave it alone).
     pub fn has_text_focus(&self) -> bool {
         self.text_focus.is_some() || self.core.focus.is_some()
+    }
+
+    /// ViewportFrames drawn inside edit plugin widgets or CoreGui.
+    pub fn collect_viewport_frames(&self, out: &mut HashSet<Ref>) {
+        out.extend(self.core.viewport_frames().iter().copied());
+        for s in &self.slots {
+            if s.at == Where::Edit && s.enabled && s.open {
+                out.extend(s.gui.viewport_frames().iter().copied());
+            }
+        }
+    }
+
+    /// Render requests for ViewportFrames inside edit plugin widgets or CoreGui.
+    pub fn collect_vf_requests(
+        &self,
+        doc: &Document,
+        out: &mut HashMap<Ref, rustudio_render::render::vf::Request>,
+    ) {
+        out.extend(self.core.vf_requests(doc));
+        for s in &self.slots {
+            if s.at == Where::Edit && s.enabled && s.open {
+                out.extend(s.gui.vf_requests(doc));
+            }
+        }
+    }
+
+    /// Laid-out render size of a ViewportFrame in an edit plugin widget or CoreGui.
+    pub fn vf_size_of(&self, r: Ref) -> Option<[u32; 2]> {
+        if let Some(sz) = self.core.vf_size_of(r) {
+            return Some(sz);
+        }
+        for s in &self.slots {
+            if s.at == Where::Edit && s.enabled && s.open {
+                if let Some(sz) = s.gui.vf_size_of(r) {
+                    return Some(sz);
+                }
+            }
+        }
+        None
+    }
+
+    /// Feeds rendered ViewportFrame textures back to edit plugin widgets and CoreGui.
+    pub fn set_vf_textures(&mut self, tex: impl Fn(Ref) -> Option<(egui::TextureId, [u32; 2])>) {
+        self.core.set_vf_textures(&tex);
+        for s in &mut self.slots {
+            if s.at == Where::Edit && s.enabled && s.open {
+                s.gui.set_vf_textures(&tex);
+            }
+        }
     }
 
     /// The input queue of the VM a widget of `at` lives in.
@@ -610,21 +671,36 @@ impl Editor {
         self.plugin_camera_follow();
         let late = std::mem::take(&mut self.plugin_ui.late);
         if !late.is_empty() {
-            let active_mouse = self.plugins.active_plugin().and_then(|id| {
-                self.plugins
-                    .ui_items()
-                    .into_iter()
-                    .find(|u| u.plugin == id && matches!(u.kind, UiKind::Mouse))
-                    .map(|u| u.r)
-            });
+            let active_mouse = self.plugins.active_mouse();
             let doc: *mut Document = edit_doc(self);
             // SAFETY: as in plugin_widget_ui.
             let doc = unsafe { &mut *doc };
             self.plugins.with_edit(doc, |rt| fire_inputs(rt, late, active_mouse, None));
         }
+        let play_now = self.game.play.is_some();
+        let ui_rev = self.plugins.ui_rev();
+        static PLUGIN_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let debug_on = *PLUGIN_DEBUG.get_or_init(|| std::env::var_os("RUSTUDIO_PLUGIN_DEBUG").is_some());
+        if !play_now
+            && !self.plugin_ui.had_play
+            && self.plugin_ui.slots.is_empty()
+            && ui_rev == self.plugin_ui.ui_rev_seen
+            && self.plugin_ui.pending_widget_actions.is_empty()
+            && !debug_on
+        {
+            let doc: *mut Document = edit_doc(self);
+            // SAFETY: as in plugin_widget_ui.
+            let doc = unsafe { &mut *doc };
+            let marks = doc.marks_for(rustudio_core::doc::Reader::PluginGui);
+            self.plugin_ui.core.input_inset = Some(0.0);
+            self.plugin_ui.core.sync_plugin(doc, &marks);
+            return;
+        }
+        self.plugin_ui.ui_rev_seen = ui_rev;
+        self.plugin_ui.had_play = play_now;
         let items = self.plugins.ui_items();
         // RUSTUDIO_PLUGIN_DEBUG: the plugins' toolbar buttons (for --action plugin-button:…)
-        if std::env::var_os("RUSTUDIO_PLUGIN_DEBUG").is_some() {
+        if debug_on {
             for it in &items {
                 if let UiKind::Button { id, text, .. } = &it.kind {
                     let line = format!("[plugin-debug] button id={id:?} text={text:?}");
@@ -659,13 +735,14 @@ impl Editor {
             for it in items {
                 let (id, state) = match &it.kind {
                     UiKind::DockWidget { id, info } => (id.clone(), info.initial_dock_state.clone()),
-                    UiKind::QWidget { id } => (id.clone(), "Float".to_string()),
+                    UiKind::QWidget { id, .. } => (id.clone(), "Float".to_string()),
                     _ => continue,
                 };
                 let Some(pname) = names.get(&it.plugin) else { continue };
                 let key = format!("{}_{pname}_{id}", context_prefix(at));
                 let float = match &it.kind {
                     UiKind::DockWidget { info, .. } => [info.float_x as f32, info.float_y as f32],
+                    UiKind::QWidget { float_x, float_y, .. } => [*float_x as f32, *float_y as f32],
                     _ => [0.0, 0.0],
                 };
                 let idx = match self.plugin_ui.slots.iter().position(|s| s.key == key) {
@@ -696,6 +773,7 @@ impl Editor {
                             win: None,
                             last_fix_rect: None,
                             hover_stale: false,
+                            synced_visible: false,
                         });
                         self.plugin_ui.slots.len() - 1
                     }
@@ -709,6 +787,7 @@ impl Editor {
                     s.r = it.r;
                     s.gui = plugin_gui();
                     s.focused = false;
+                    s.synced_visible = false;
                 }
                 s.plugin = Some(it.plugin);
                 s.state = state.clone();
@@ -746,7 +825,16 @@ impl Editor {
                 s.want = enabled && at == front;
                 let title = if alive { str_prop(doc, s.r, "Title") } else { String::new() };
                 titles.push((i, title, enabled));
-                s.gui.sync_plugin(doc, &marks);
+                if enabled && (s.open || s.want) {
+                    if s.synced_visible {
+                        s.gui.sync_widget(doc, &marks);
+                    } else {
+                        s.gui.sync_widget(doc, &rustudio_core::doc::Marks::All);
+                        s.synced_visible = true;
+                    }
+                } else {
+                    s.synced_visible = false;
+                }
             }
             if at == Where::Edit {
                 self.plugin_ui.core.input_inset = Some(0.0);
@@ -779,6 +867,21 @@ impl Editor {
                 if s.r.is_some() && s.at == Where::Edit {
                     let docked = s.state != "Float";
                     r.now.insert(s.key.clone(), Saved { enabled: en, docked });
+                }
+            }
+        }
+        // Retry any `plugin-widget:` actions that woke a deferred plugin and
+        // were waiting for its DockWidget slot to appear.
+        if !self.plugin_ui.pending_widget_actions.is_empty() {
+            let pending = std::mem::take(&mut self.plugin_ui.pending_widget_actions);
+            let mut dummy_raw = egui::RawInput::default();
+            for (act, left) in pending {
+                if !self.try_plugin_widget_action(&act, &mut dummy_raw, false) {
+                    if left > 0 {
+                        self.plugin_ui.pending_widget_actions.push((act, left - 1));
+                    } else {
+                        self.push_log(crate::app::Level::Warn, format!("--action {act}: deferred plugin widget did not appear"));
+                    }
                 }
             }
         }
@@ -971,6 +1074,11 @@ impl Editor {
             .hover_pos()
             .or_else(|| if self.toolbox_drag_in_live() { ctx.pointer_hover_pos() } else { None })
             .filter(|p| rect.contains(*p));
+        let was_over = self.plugin_ui.view.xy.is_some();
+        let now_over = pointer.is_some();
+        if was_over != now_over {
+            self.plugin_ui.queue.push(In::ViewportHover(now_over));
+        }
         let ray = pointer.map(|p| self.game.cam.ray(rect, p));
         let hit = ray.as_ref().and_then(|r| self.plugin_pick(r).map(|(t, d)| (t, r.at(d))));
         self.plugin_ui.view = ViewIn {
@@ -1076,9 +1184,8 @@ impl Editor {
         }
         // The active plugin's PluginMouse.Icon over the view (Studio draws
         // the plugin's cursor image in place of the arrow).
-        if let (Some(p), Some(id)) = (pointer, self.plugins.active_plugin()) {
-            let mouse = self.plugins.ui_items().into_iter().find(|u| u.plugin == id && matches!(u.kind, UiKind::Mouse)).map(|u| u.r);
-            let icon = mouse.map(|m| str_prop(&self.game.doc, m, "Icon")).unwrap_or_default();
+        if let (Some(p), Some(mouse)) = (pointer, self.plugins.active_mouse()) {
+            let icon = str_prop(&self.game.doc, mouse, "Icon");
             if !icon.is_empty() && !over_gui {
                 let doc_dir = self.game.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
                 let Editor { plugin_ui, game: Game { assets, .. }, .. } = self;
@@ -1256,39 +1363,53 @@ impl Editor {
         ctx.request_repaint();
     }
 
-    /// Start of each plugin tick: the input queued since the last one
-    /// reaches the edit VM, in order, with the GUIs' layout (AbsoluteSize /
-    /// AbsolutePosition and their signals) and the viewport's pointer.
-    pub fn plugin_ui_flush(&mut self) {
+    /// Prepares the per-frame UI/input flush payload so `Editor::plugin_tick`
+    /// can apply it inside the same VM enter/leave pass as `PluginHost::tick`.
+    pub(super) fn prepare_plugin_ui_flush(&mut self) -> PluginUiFlush {
         self.plugin_ui.frame += 1;
-        if self.plugins.is_idle() {
-            return;
-        }
-        // Layout of every plugin GUI drawn (widgets and CoreGui).
-        let mut layout: HashMap<Ref, GuiBox> = self.plugin_ui.core.layout.clone();
         let frame = self.plugin_ui.frame;
-        for s in self.plugin_ui.slots.iter().filter(|s| s.at == Where::Edit) {
-            // (a panel not drawn last frame keeps its last layout, and so
-            // does an enabled one not shown: hidden while Play's DataModel
-            // is in front, or back at Stop before the dock reopens it)
-            if s.drawn + 2 >= frame || s.open || s.enabled {
-                layout.extend(s.gui.layout.iter().map(|(k, v)| (*k, *v)));
+        let has_edit_slots = self
+            .plugin_ui
+            .slots
+            .iter()
+            .any(|s| s.at == Where::Edit && (s.drawn + 2 >= frame || s.open || s.enabled) && !s.gui.layout.is_empty());
+        // Layout of every GUI drawn in the edit viewport (world SurfaceGui /
+        // BillboardGui and StarterGui from `game.gui`), overlaid with CoreGui
+        // and open plugin dock widgets.
+        let world = self.game.play.is_none() && !self.game.gui.layout.is_empty();
+        let layout = if !has_edit_slots && !world {
+            if self.plugin_ui.core.layout != self.plugin_ui.layout_sent {
+                let l = self.plugin_ui.core.layout.clone();
+                self.plugin_ui.layout_sent = l.clone();
+                Some(l)
+            } else {
+                None
             }
-        }
-        let layout_changed = layout != self.plugin_ui.layout_sent;
-        if layout_changed {
-            self.plugin_ui.layout_sent = layout.clone();
-        }
+        } else {
+            let mut l: HashMap<Ref, GuiBox> = if world { self.game.gui.layout.clone() } else { HashMap::new() };
+            l.extend(self.plugin_ui.core.layout.iter().map(|(k, v)| (*k, *v)));
+            for s in self.plugin_ui.slots.iter().filter(|s| s.at == Where::Edit) {
+                if s.drawn + 2 >= frame || s.open || s.enabled {
+                    l.extend(s.gui.layout.iter().map(|(k, v)| (*k, *v)));
+                }
+            }
+            if l != self.plugin_ui.layout_sent {
+                self.plugin_ui.layout_sent = l.clone();
+                Some(l)
+            } else {
+                None
+            }
+        };
         let queue = std::mem::take(&mut self.plugin_ui.queue);
         let view = self.plugin_ui.view;
-        let active_mouse = self.plugins.active_plugin().and_then(|id| {
-            self.plugins
-                .ui_items()
-                .into_iter()
-                .find(|u| u.plugin == id && matches!(u.kind, UiKind::Mouse))
-                .map(|u| u.r)
-        });
-        let keys: HashSet<String> = self.plugin_ui.keys_down.clone();
+        let active_mouse = self.plugins.active_mouse();
+        let keys = if self.plugin_ui.keys_down != self.plugin_ui.keys_sent {
+            let k = self.plugin_ui.keys_down.clone();
+            self.plugin_ui.keys_sent = k.clone();
+            Some(k)
+        } else {
+            None
+        };
         // The editor's view → workspace.CurrentCamera (not while Play shows
         // its own camera).
         let cam_now = (self.game.play.is_none()).then(|| {
@@ -1296,54 +1417,27 @@ impl Editor {
             let rot = glam::Mat3::from_cols(c.right(), c.up(), -c.forward());
             (rustudio_core::math::Xform { pos: c.pos, rot }, c.focus, c.fov_deg)
         });
-        let mut cam_sent = self.plugin_ui.cam_sent;
+        let cam_sent = self.plugin_ui.cam_sent;
         let dt = self.plugin_ui.dt;
         let vp_rect = Some(self.game.viewport_rect).filter(|r| r.is_finite() && r.is_positive());
-        let doc: *mut Document = edit_doc(self);
-        // SAFETY: as in plugin_widget_ui.
-        let doc = unsafe { &mut *doc };
-        self.plugins.with_edit(doc, |rt| {
-            let lua = &rt.lua;
-            if let Ok(mut w) = rustudio_engine::runtime::world(lua) {
-                if let Some(rect) = view.rect.or(vp_rect) {
-                    w.input.view_size = [rect.width(), rect.height()];
-                }
-                w.input.mouse_xy = view.xy.unwrap_or([-1.0, -1.0]);
-                w.input.mouse_ray = view.ray;
-                w.input.mouse_target = view.hit.map(|h| h.0);
-                w.input.mouse_hit = view.hit.map(|h| rustudio_core::math::Xform {
-                    pos: h.1,
-                    rot: glam::Mat3::IDENTITY,
-                });
-                if view.hit.is_none() && view.xy.is_some() {
-                    w.input.mouse_hit = Some(rustudio_core::math::Xform {
-                        pos: view.ray.0 + view.ray.1 * 10000.0,
-                        rot: glam::Mat3::IDENTITY,
-                    });
-                }
-                if layout_changed {
-                    w.input.gui_layout = layout;
-                }
-                w.keys_down = keys;
-            }
-            crate::plugin_host::api::mouse::set_pointer_in_view(lua, view.xy.is_some());
-            if let Some(now) = cam_now {
-                if cam_sent.is_none_or(|s| !same_cam(&s, &now)) {
-                    write_camera(rt, &now);
-                    cam_sent = Some(now);
-                }
-            }
-            let _ = rustudio_engine::runtime::ext::fire_layout_changes(lua);
-            let gui_service = rustudio_engine::runtime::world(lua).ok().and_then(|w| {
-                let d = w.d();
-                d.find_child(d.dom.root_ref(), "GuiService")
-            });
-            fire_inputs(rt, queue, active_mouse, gui_service);
-            crate::play::game::step_smooth_scrolls(rt, dt);
-            rt.spawn_global("__rs_input_frame_end", vec![Value::Number(0.0)]);
-        });
+        PluginUiFlush {
+            layout,
+            queue,
+            view,
+            active_mouse,
+            keys,
+            cam_now,
+            cam_sent,
+            dt,
+            vp_rect,
+        }
+    }
+
+    pub(super) fn finish_plugin_ui_flush(&mut self, cam_sent: Option<(rustudio_core::math::Xform, glam::Vec3, f32)>) {
         self.plugin_ui.cam_sent = cam_sent;
-        self.plugin_play_flush();
+        if self.game.play.is_some() {
+            self.plugin_play_flush();
+        }
     }
 
     /// The Play copies' widgets: their queued input and their panels'
@@ -1426,6 +1520,78 @@ impl Editor {
             self.game.cam.fov_deg = now.2;
         }
         self.plugin_ui.cam_sent = Some(now);
+    }
+}
+
+pub(super) struct PluginUiFlush {
+    layout: Option<HashMap<Ref, GuiBox>>,
+    queue: Vec<In>,
+    view: ViewIn,
+    active_mouse: Option<Ref>,
+    keys: Option<HashSet<String>>,
+    cam_now: Option<(rustudio_core::math::Xform, glam::Vec3, f32)>,
+    pub(super) cam_sent: Option<(rustudio_core::math::Xform, glam::Vec3, f32)>,
+    dt: f32,
+    vp_rect: Option<Rect>,
+}
+
+pub(super) fn apply_plugin_ui_flush(
+    rt: &rustudio_engine::runtime::Runtime,
+    flush: PluginUiFlush,
+    cam_sent: &mut Option<(rustudio_core::math::Xform, glam::Vec3, f32)>,
+) {
+    let lua = &rt.lua;
+    let layout_changed = flush.layout.is_some();
+    let had_keys = flush.keys.is_some();
+    let had_queue = !flush.queue.is_empty();
+    let view = flush.view;
+    let mut mouse_changed = false;
+    if let Ok(mut w) = rustudio_engine::runtime::world(lua) {
+        if let Some(rect) = view.rect.or(flush.vp_rect) {
+            w.input.view_size = [rect.width(), rect.height()];
+        }
+        let next_xy = view.xy.unwrap_or([-1.0, -1.0]);
+        mouse_changed = w.input.mouse_xy != next_xy;
+        w.input.mouse_xy = next_xy;
+        w.input.mouse_ray = view.ray;
+        w.input.mouse_target = view.hit.map(|h| h.0);
+        w.input.mouse_hit = view.hit.map(|h| rustudio_core::math::Xform {
+            pos: h.1,
+            rot: glam::Mat3::IDENTITY,
+        });
+        if view.hit.is_none() && view.xy.is_some() {
+            w.input.mouse_hit = Some(rustudio_core::math::Xform {
+                pos: view.ray.0 + view.ray.1 * 10000.0,
+                rot: glam::Mat3::IDENTITY,
+            });
+        }
+        if let Some(layout) = flush.layout {
+            w.input.gui_layout = layout;
+        }
+        if let Some(keys) = flush.keys {
+            w.keys_down = keys;
+        }
+    }
+    crate::plugin_host::api::mouse::set_pointer_in_view(lua, view.xy.is_some());
+    if let Some(now) = flush.cam_now {
+        if cam_sent.is_none_or(|s| !same_cam(&s, &now)) {
+            write_camera(rt, &now);
+            *cam_sent = Some(now);
+        }
+    }
+    if layout_changed {
+        let _ = rustudio_engine::runtime::ext::fire_layout_changes(lua);
+    }
+    if had_queue {
+        let gui_service = rustudio_engine::runtime::world(lua).ok().and_then(|w| {
+            let d = w.d();
+            d.find_child(d.dom.root_ref(), "GuiService")
+        });
+        fire_inputs(rt, flush.queue, flush.active_mouse, gui_service);
+    }
+    crate::play::game::step_smooth_scrolls(rt, flush.dt);
+    if had_queue || had_keys || mouse_changed {
+        rt.spawn_global("__rs_input_frame_end", vec![Value::Number(0.0)]);
     }
 }
 
@@ -1560,6 +1726,19 @@ fn fire_inputs(rt: &rustudio_engine::runtime::Runtime, queue: Vec<In>, active_mo
                     if let Ok(t) = list {
                         rt.fire(m, "DragEnter", vec![Value::Table(t)]);
                     }
+                }
+            }
+            In::ViewportHover(entered) => {
+                let svc = rt.world_mut().and_then(|w| {
+                    let d = w.d();
+                    d.find_child(d.dom.root_ref(), "MouseService")
+                });
+                if let Some(ms) = svc {
+                    rt.fire(
+                        ms,
+                        if entered { "MouseEnterStudioViewport" } else { "MouseLeaveStudioViewport" },
+                        vec![],
+                    );
                 }
             }
         }
@@ -1756,6 +1935,14 @@ impl Editor {
             push_pointer(raw, p, verb);
             return true;
         }
+        if !name.starts_with("plugin-widget:") {
+            return false;
+        }
+        self.try_plugin_widget_action(name, raw, true);
+        true
+    }
+
+    fn try_plugin_widget_action(&mut self, name: &str, raw: &mut egui::RawInput, wake_deferred: bool) -> bool {
         let Some(rest) = name.strip_prefix("plugin-widget:") else {
             return false;
         };
@@ -1784,8 +1971,18 @@ impl Editor {
             }
         }
         let Some(slot) = self.plugin_ui.slots.iter().find(|s| s.key == key) else {
-            self.push_log(crate::app::Level::Warn, format!("--action {name}: no plugin widget {key}"));
-            return true;
+            if wake_deferred && at == Where::Edit {
+                if let Some((pname, _)) = who.split_once('/') {
+                    if self.plugins.wake_plugin_by_name(pname).is_some() {
+                        self.plugin_ui.pending_widget_actions.push((name.to_string(), 20));
+                        return false;
+                    }
+                }
+            }
+            if wake_deferred {
+                self.push_log(crate::app::Level::Warn, format!("--action {name}: no plugin widget {key}"));
+            }
+            return false;
         };
         let (r, rect, at) = (slot.r, slot.rect, slot.at);
         let (verb, arg) = cmd.split_once(':').unwrap_or((cmd, ""));

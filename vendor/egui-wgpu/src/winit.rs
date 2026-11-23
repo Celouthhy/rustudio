@@ -11,6 +11,18 @@ use crate::{
 use core::num::NonZeroU32;
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// rustudio: whether the root window surface actually configured Mailbox
+// (false when the surface lacked Mailbox and fell back to Fifo, e.g. Metal
+// or OpenGL, so native_loop.rs doesn't double-pace Fifo with a software timer).
+static ROOT_SURFACE_MAILBOX: AtomicBool = AtomicBool::new(false);
+
+/// rustudio: returns whether the root window's configured surface is actually
+/// presenting in `PresentMode::Mailbox` (as opposed to falling back to `Fifo`).
+pub fn root_surface_uses_mailbox() -> bool {
+    ROOT_SURFACE_MAILBOX.load(Ordering::Relaxed)
+}
 
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
@@ -19,6 +31,7 @@ struct SurfaceState {
     // to Fifo where the surface has no mailbox (wgpu refuses a mode the
     // surface doesn't list unless it is one of the Auto modes).
     present_modes: Vec<wgpu::PresentMode>,
+    is_root: bool,
     width: u32,
     height: u32,
     resizing: bool,
@@ -128,6 +141,12 @@ impl Painter {
         } else {
             present_mode
         };
+        if surface_state.is_root {
+            ROOT_SURFACE_MAILBOX.store(
+                present_mode == wgpu::PresentMode::Mailbox,
+                Ordering::Relaxed,
+            );
+        }
         static SHOWN: std::sync::Once = std::sync::Once::new();
         SHOWN.call_once(|| {
             eprintln!(
@@ -320,6 +339,7 @@ impl Painter {
             SurfaceState {
                 surface,
                 present_modes,
+                is_root: viewport_id == ViewportId::ROOT,
                 width,
                 height,
                 alpha_mode,

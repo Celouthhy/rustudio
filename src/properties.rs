@@ -312,7 +312,12 @@ impl Editor {
                         .filter(|r| {
                             filter.is_empty()
                                 || match r {
-                                    Row::Prop(n, _) => n.to_lowercase().contains(&filter),
+                                    Row::Prop(n, _) => {
+                                        n.to_lowercase().contains(&filter)
+                                            || (n == "AudioContent"
+                                                && matches!(class.as_str(), "Sound" | "AudioPlayer")
+                                                && "preview".contains(&filter))
+                                    }
                                     Row::Frame(l, _) => l.to_lowercase().contains(&filter),
                                 }
                         })
@@ -591,6 +596,24 @@ impl Editor {
                 self.game.doc.prop(first, name),
                 Some(Variant::PhysicalProperties(PhysicalProperties::Custom(_)))
             ))),
+            "AudioContent" if matches!(class, "Sound" | "AudioPlayer") => {
+                let read = |prop: &str| match self.game.doc.prop(first, prop) {
+                    Some(Variant::Content(c)) => c.as_uri().unwrap_or("").to_string(),
+                    Some(Variant::ContentId(c)) => c.as_str().to_string(),
+                    Some(Variant::String(s)) => s,
+                    _ => String::new(),
+                };
+                let uri = read("AudioContent");
+                let uri = if !uri.trim().is_empty() {
+                    uri
+                } else {
+                    read(if class == "Sound" { "SoundId" } else { "Asset" })
+                };
+                Some(Variant::Content(rbx_dom_weak::types::Content::from(uri)))
+            }
+            _ if matches!(class, "Sound" | "AudioPlayer") && self.live_sound_prop(first, name).is_some() => {
+                self.live_sound_prop(first, name)
+            }
             _ => self.game.doc.prop(first, name).or_else(|| typed_empty(class, name)),
         };
         let ro = ro_api
@@ -598,6 +621,8 @@ impl Editor {
             || (name == "Parent" && parent_is_root);
         let color = if ro { READ_ONLY } else { TEXT };
         let vec_like = matches!(value, Some(Variant::Vector3(_)) | Some(Variant::Vector2(_)));
+        let audio_content_row = name == "AudioContent" && matches!(class, "Sound" | "AudioPlayer");
+        let audio_folded = self.props.open_rows.contains("fold:AudioContent");
         let open = self.props.open_rows.contains(name);
         let (r, v, resp) = Self::cells(p, name);
         self.props.row_rects.insert(name.to_string(), r);
@@ -607,15 +632,25 @@ impl Editor {
             p.ui.painter().rect_filled(Rect::from_min_max(r.min, Pos2::new(div, r.max.y - 1.0)), 0.0, Color32::from_rgb(19, 35, 93));
         }
         let custom_set = name == "CustomPhysicalProperties" && matches!(value, Some(Variant::Bool(true)));
-        let arrow = vec_like
-            .then_some(open)
-            .or((matches!(value, Some(Variant::Faces(_))) || matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties") || custom_set).then_some(false));
+        let arrow = if audio_content_row {
+            Some(!audio_folded)
+        } else {
+            vec_like
+                .then_some(open)
+                .or((matches!(value, Some(Variant::Faces(_))) || matches!(name, "ResizeableFaces" | "CurrentPhysicalProperties") || custom_set).then_some(false))
+        };
         Self::name_text(p, r, 0.0, name, color, arrow);
         self.props.drawn.push(name.to_string());
         let on_name = resp.interact_pointer_pos().is_some_and(|q| q.x < v.min.x);
-        if resp.clicked() && on_name && vec_like {
-            if !self.props.open_rows.remove(name) {
-                self.props.open_rows.insert(name.to_string());
+        if resp.clicked() && on_name {
+            if audio_content_row {
+                if !self.props.open_rows.remove("fold:AudioContent") {
+                    self.props.open_rows.insert("fold:AudioContent".to_string());
+                }
+            } else if vec_like {
+                if !self.props.open_rows.remove(name) {
+                    self.props.open_rows.insert(name.to_string());
+                }
             }
         }
         let clicked_value = resp.clicked() && !on_name;
@@ -799,6 +834,87 @@ impl Editor {
                     }
                 }
             }
+        }
+        if audio_content_row && !audio_folded && self.game.doc.selection.len() == 1 {
+            self.audio_preview_row(p, first);
+        }
+    }
+
+    /// Studio 0.748's indented `Preview` child row under `Asset -> AudioContent`
+    /// for `Sound` and `AudioPlayer`: green Play / yellow Pause toggle button +
+    /// interactive horizontal scrubber track (`0 .. TimeLength`).
+    fn audio_preview_row(&mut self, p: &mut Painter, r: Ref) {
+        let (row_rect, v, _) = Self::cells(p, "AudioContent.Preview");
+        self.props.row_rects.insert("Preview".to_string(), row_rect);
+        Self::name_text(p, row_rect, 1.0, "Preview", TEXT, None);
+        self.props.drawn.push("Preview".to_string());
+
+        let edit = self.game.play.is_none();
+        let (playing, pos, len) = self.game.edit_audio.preview_state(r);
+        let btn = Rect::from_min_size(Pos2::new(v.min.x + 1.0, v.center().y - 9.0), Vec2::splat(18.0));
+        let slider = Rect::from_min_max(Pos2::new(btn.max.x + 6.0, v.min.y + 1.0), Pos2::new(v.max.x, v.max.y - 1.0));
+        self.ui_rects.insert("props.audio_preview_btn", btn);
+        self.ui_rects.insert("props.audio_preview_slider", slider);
+
+        let btn_resp = p.ui.interact(
+            btn,
+            p.ui.id().with(("audio_preview_btn", r)),
+            if edit { Sense::click() } else { Sense::hover() },
+        );
+        let painter = p.ui.painter().clone();
+        if edit && btn_resp.hovered() {
+            painter.rect_filled(btn, 2.0, Color32::from_rgb(45, 48, 58));
+        }
+        if playing {
+            // Studio 0.748 Pause icon: two yellow vertical bars with dark outline.
+            let yellow = Color32::from_rgb(235, 200, 60);
+            let edge = Stroke::new(1.0, Color32::from_rgb(32, 34, 39));
+            let c = btn.center();
+            let left_bar = Rect::from_min_size(Pos2::new(c.x - 4.5, c.y - 5.0), Vec2::new(3.5, 10.0));
+            let right_bar = Rect::from_min_size(Pos2::new(c.x + 1.0, c.y - 5.0), Vec2::new(3.5, 10.0));
+            for bar in [left_bar, right_bar] {
+                painter.rect_filled(bar, 0.5, yellow);
+                painter.rect_stroke(bar, 0.5, edge, egui::StrokeKind::Outside);
+            }
+        } else {
+            // Studio 0.748 Play icon: green right-pointing triangle.
+            let green = if edit && len > 0.0 {
+                Color32::from_rgb(56, 198, 92)
+            } else {
+                Color32::from_rgb(65, 118, 78)
+            };
+            let c = btn.center();
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - 4.0, c.y - 5.0),
+                    Pos2::new(c.x + 5.0, c.y),
+                    Pos2::new(c.x - 4.0, c.y + 5.0),
+                ],
+                green,
+                Stroke::new(1.0, Color32::from_rgb(32, 34, 39)),
+            ));
+        }
+        if edit && btn_resp.clicked() {
+            self.game.edit_audio_preview_toggle(r);
+        }
+
+        if slider.width() > 16.0 {
+            let frac = if len > 0.0 { (pos / len).clamp(0.0, 1.0) } else { 0.0 };
+            crate::prop_slider::paint_slider(&painter, slider, frac);
+            let sresp = p.ui.interact(
+                slider,
+                p.ui.id().with(("audio_preview_slider", r)),
+                if edit && len > 0.0 { Sense::click_and_drag() } else { Sense::hover() },
+            );
+            if edit && len > 0.0 && (sresp.clicked() || sresp.dragged() || sresp.drag_started()) {
+                if let Some(q) = sresp.interact_pointer_pos() {
+                    let seek = crate::prop_slider::fraction_at(slider, q.x) * len;
+                    self.game.edit_audio_preview_seek(r, seek);
+                }
+            }
+        }
+        if playing {
+            p.ui.ctx().request_repaint();
         }
     }
 
@@ -1124,6 +1240,29 @@ impl Editor {
                         .collect();
                     self.game.doc.set_props("Set CustomPhysicalProperties", changes, None);
                 }
+                // Editing AudioContent on Sound / AudioPlayer keeps legacy
+                // SoundId / Asset in sync (Roblox treats the pair as one property).
+                Edit::Prop(name, Variant::Content(c))
+                    if name == "AudioContent"
+                        && self.game.doc.class_of(first).is_some_and(|cl| matches!(cl.as_str(), "Sound" | "AudioPlayer")) =>
+                {
+                    let uri = c.as_uri().unwrap_or("").to_string();
+                    let mut changes = Vec::new();
+                    for &r in sel {
+                        match self.game.doc.class_of(r).as_deref() {
+                            Some("Sound") => {
+                                changes.push((r, ustr("AudioContent"), Variant::Content(c.clone())));
+                                changes.push((r, ustr("SoundId"), Variant::ContentId(uri.clone().into())));
+                            }
+                            Some("AudioPlayer") => {
+                                changes.push((r, ustr("AudioContent"), Variant::Content(c.clone())));
+                                changes.push((r, ustr("Asset"), Variant::ContentId(uri.clone().into())));
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.game.doc.set_props("Set AudioContent", changes, None);
+                }
                 Edit::Prop(name, v) => {
                     let targets: Vec<Ref> = sel
                         .iter()
@@ -1217,6 +1356,8 @@ fn typed_empty(class: &str, prop: &str) -> Option<Variant> {
         T::Vector2 => Variant::Vector2(Vector2::new(0.0, 0.0)),
         T::Vector3 => Variant::Vector3(rbx_dom_weak::types::Vector3::new(0.0, 0.0, 0.0)),
         T::Ref => Variant::Ref(Ref::none()),
+        T::Content => Variant::Content(rbx_dom_weak::types::Content::from(String::new())),
+        T::ContentId => Variant::ContentId(String::new().into()),
         _ => return None,
     })
 }

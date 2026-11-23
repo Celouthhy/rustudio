@@ -532,3 +532,772 @@ fn command_identity_gets_plugin_manager_interface() {
     }).unwrap();
     assert_eq!(class, "PluginManagerInterface");
 }
+
+#[test]
+fn builtin_plugin_runs_at_identity_6_with_roblox_script_capabilities() {
+    temp_data();
+    let dir = std::env::temp_dir().join(format!("rustudio-builtin-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Write a minimal valid binary .rbxm with a Script whose Source is Luau bytecode or plain string.
+    // CoreScripts/BuiltInPlugins decode plain strings too when Source isn't ProtectedString.
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    dom.insert(
+        root,
+        InstanceBuilder::new("Script").with_name("Loader").with_property(
+            "Source",
+            r#"
+            printidentity("bi")
+            print("name", plugin.Name)
+            print("dm", plugin.HostDataModelType.Name, plugin.HostDataModelTypeIsCurrent)
+            local mdi = plugin.MultipleDocumentInterfaceInstance
+            print("mdi", mdi and mdi.ClassName, mdi and mdi.FocusedDataModelSession and mdi.FocusedDataModelSession.CurrentDataModelType.Name)
+            local okf, fv = pcall(function() return game:DefineFastFlag("BuiltInTestFlag", true) end)
+            print("flag", okf, fv)
+            local w = plugin:CreateDockWidgetPluginGui("TestDock", DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Left, true, true, 200, 200, 100, 100))
+            print("widget_parent", w.Parent and w.Parent.ClassName)
+            "#
+            .to_string(),
+        ),
+    );
+    let tops = dom.root().children().to_vec();
+    let mut bin = Vec::new();
+    rbx_binary::to_writer(&mut bin, &dom, &tops).unwrap();
+    let file = dir.join("SampleTool.rbxm");
+    std::fs::write(&file, &bin).unwrap();
+
+    let mut doc = Document::new_place();
+    let mut h = PluginHost::default();
+    h.load_builtin_dir(&dir, None).into_iter().for_each(|r| { r.unwrap(); });
+    frames(&mut h, &mut doc, 4);
+    let out = lines(&mut h);
+    assert!(has(&out, "bi 6"), "{out:#?}");
+    assert!(has(&out, "name builtin_SampleTool.rbxm"), "{out:#?}");
+    assert!(has(&out, "dm Edit true"), "{out:#?}");
+    assert!(has(&out, "mdi MultipleDocumentInterfaceInstance Edit"), "{out:#?}");
+    assert!(has(&out, "flag true true"), "{out:#?}");
+    assert!(has(&out, "widget_parent RobloxPluginGuiService"), "{out:#?}");
+    // Built-in widget under RobloxPluginGuiService must not dirty the place.
+    assert!(!doc.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_plugin_round2_apis_and_security_gates() {
+    temp_data();
+    let dir = std::env::temp_dir().join(format!("rustudio-builtin-r2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    dom.insert(
+        root,
+        InstanceBuilder::new("Script").with_name("Loader").with_property(
+            "Source",
+            r#"
+            -- Actions component: CreateAsync returns { signal }, BindToChangedAsync & GetAsync defaults
+            local actions = plugin:GetPluginComponent("Actions")
+            local uri = { DataModel = "Standalone", PluginType = "Standalone", PluginId = "Test", Category = "Actions", ItemId = "DoThing" }
+            local created = actions:CreateAsync({ Uri = uri, Text = "Do", Enabled = true }, false)
+            assert(type(created) == "table" and typeof(created[1]) == "RBXScriptSignal", "CreateAsync array signal")
+            local fired = 0
+            created[1]:Connect(function() fired += 1 end)
+            local ch = actions:BindToChangedAsync(uri)
+            assert(typeof(ch) == "RBXScriptSignal", "BindToChangedAsync signal")
+            local changed = 0
+            ch:Connect(function() changed += 1 end)
+            local got = actions:GetAsync({ { DataModel = "Edit", PluginId = "Studio", Category = "Actions", ItemId = "PreExisting" } })
+            assert(got[1] and got[1].Checked == false and got[1].Enabled == true, "GetAsync default descriptor")
+            actions:UpdateAsync({ { Uri = uri, Checked = true } })
+            assert(changed == 1, "UpdateAsync fires BindToChangedAsync")
+
+            -- Policy service (lowercase alias + canonical)
+            local pps = game:GetService("PluginPolicyService")
+            local tb = pps:getPluginPolicy("Toolbox")
+            assert(type(tb) == "table" and tb.ShowRobloxCreatedAssets == false and tb.Enabled == true, "getPluginPolicy Toolbox")
+
+            -- Built-in services & signals
+            local gs = game:GetService("GuiService")
+            assert(typeof(gs.Open9SliceEditor) == "RBXScriptSignal")
+            assert(typeof(gs.OpenStyleEditor) == "RBXScriptSignal")
+            local ss = game:GetService("StudioService")
+            assert(typeof(ss.OnOpenGameSettings) == "RBXScriptSignal")
+            assert(ss:GetStartupAssetId() == "")
+            local pkg = game:GetService("PackageUIService")
+            assert(typeof(pkg.OnOpenConvertToPackagePlugin) == "RBXScriptSignal")
+            local pub = game:GetService("StudioPublishService")
+            assert(pub ~= nil and typeof(pub.OnSaveOrPublishPlaceToRoblox) == "RBXScriptSignal")
+            local ms = game:GetService("MaterialService")
+            assert(typeof(ms.MaterialFillToolEnabledChanged) == "RBXScriptSignal")
+            assert(ms:GetBaseMaterialOverride(Enum.Material.Grass) == "Grass")
+            local cs = game:GetService("CollaboratorsService")
+            assert(cs:GetSelectionHighlightsEnabled() == true)
+            cs:ToggleSelectionHighlights()
+            assert(cs:GetSelectionHighlightsEnabled() == false)
+
+            -- Toolbar popup button
+            local tbar = plugin:CreateToolbar("PopupBar")
+            local pbtn = tbar:CreatePopupButton("Pop", "Tip", "rbxlocaltheme://GameSettings", "Pop")
+            pbtn:SetDropdownActive(true)
+            pbtn:SetDropdownActive(false)
+
+            -- SecurityCapabilities global
+            local caps = SecurityCapabilities.new(Enum.SecurityCapability.Basic, Enum.SecurityCapability.RunClientScript)
+            assert(caps:Contains(Enum.SecurityCapability.Basic))
+            caps:Remove(Enum.SecurityCapability.Basic)
+            assert(not caps:Contains(Enum.SecurityCapability.Basic))
+            caps:Add(Enum.SecurityCapability.Basic)
+            assert(caps:Contains(Enum.SecurityCapability.Basic, Enum.SecurityCapability.RunClientScript))
+
+            -- Plugin callback assignment (Toolbox drag)
+            plugin.ProcessAssetInsertionDrag = function() return true end
+            plugin.ProcessAssetInsertionDrop = function() return true end
+
+            -- R15 HumanoidDescription creates standard scale NumberValues (UGCValidation)
+            local desc = Instance.new("HumanoidDescription")
+            local rig = game:GetService("Players"):CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
+            local hum = rig:FindFirstChildOfClass("Humanoid")
+            assert(hum and hum:FindFirstChild("BodyTypeScale") and hum:FindFirstChild("BodyProportionScale"), "R15 scales")
+
+            -- LocalizationTable FormatByKey cache + invalidation on SetEntryValue
+            local lt = Instance.new("LocalizationTable")
+            lt:SetEntryValue("k.hello", "Hello", "", "en-us", "Hello")
+            local tr = lt:GetTranslator("en-us")
+            assert(tr:FormatByKey("k.hello") == "Hello", "loc first read")
+            lt:SetEntryValue("k.hello", "Hello", "", "en-us", "Updated")
+            assert(tr:FormatByKey("k.hello") == "Updated", "loc cache invalidated")
+
+            -- HeightmapImporterService validation + import (including rbxtemp:// generated image)
+            local hmi = game:GetService("HeightmapImporterService")
+            local okH, errH = hmi:IsValidHeightmap("")
+            assert(okH == false and type(errH) == "string", "empty heightmap invalid")
+            local okV, errV, wV, hV = hmi:IsValidHeightmap("rbxtemp://987654321")
+            assert(okV == true and errV == "" and wV == 4 and hV == 4, "rbxtemp heightmap valid")
+            local prevId, prevDiscard = hmi:GetHeightmapPreviewAsync("rbxtemp://987654321")
+            assert(prevId == "rbxtemp://987654321" and prevDiscard == false, "heightmap preview")
+            workspace.Terrain:Clear()
+            hmi:ImportHeightmap(Region3.new(Vector3.new(-8, 0, -8), Vector3.new(8, 16, 8)), "rbxtemp://987654321", "", Enum.Material.Grass)
+            assert(workspace.Terrain:CountCells() > 0, "heightmap import writes voxels")
+
+            -- SetMaterialInTransformSubregion / ReplaceMaterialInTransformSubregion offset subregions
+            workspace.Terrain:Clear()
+            local cf = CFrame.new(0, 0, 0)
+            local sz = Vector3.new(32, 16, 32)
+            for ox = 0, 4, 4 do
+                for oy = 0, 2, 2 do
+                    for oz = 0, 4, 4 do
+                        workspace.Terrain:SetMaterialInTransformSubregion(
+                            cf, sz, Enum.Material.Grass,
+                            Region3int16.new(Vector3int16.new(ox, oy, oz), Vector3int16.new(ox + 4, oy + 2, oz + 4))
+                        )
+                    end
+                end
+            end
+            assert(workspace.Terrain:CountCells() == 256, "subregion fill count=" .. workspace.Terrain:CountCells())
+            workspace.Terrain:ReplaceMaterialInTransformSubregion(
+                cf, sz, Enum.Material.Grass, Enum.Material.Water,
+                Region3int16.new(Vector3int16.new(0, 0, 0), Vector3int16.new(8, 4, 8))
+            )
+            local mats, _ = workspace.Terrain:ReadVoxels(Region3.new(Vector3.new(-16, -8, -16), Vector3.new(16, 8, 16)), 4)
+            assert(mats[1][1][1] == Enum.Material.Water and mats[8][4][8] == Enum.Material.Water, "subregion replace all octants")
+
+            -- FastInt defaults for Toolbox & TerrainEditor (Studio 0.748 values)
+            assert(game:GetFastInt("ToolboxHomeViewInitialPageSize") == 30, "ToolboxHomeViewInitialPageSize")
+            assert(game:GetFastInt("TerrainEditorMaxImportVolumeMegaVoxels") == 256, "TerrainEditorMaxImportVolumeMegaVoxels")
+            assert(game:GetFastInt("SmoothTerrainMaxCppRegion") == 67108864, "SmoothTerrainMaxCppRegion")
+            assert(game:GetFastInt("SmoothTerrainMaxLuaRegion") == 4194304, "SmoothTerrainMaxLuaRegion")
+
+            -- GameSettings FastFlags (Studio 0.748): must override DefineFastFlag(..., false)
+            game:DefineFastFlag("GameSettingsExperienceGuidelines", false)
+            game:DefineFastFlag("PruneGameSettings", false)
+            assert(game:GetFastFlag("GameSettingsExperienceGuidelines") == true, "GameSettingsExperienceGuidelines")
+            assert(game:GetFastFlag("PruneGameSettings") == true, "PruneGameSettings")
+
+            -- TerrainRegion:ApplyTransform & ApplyTransformSubregion + SetMaterialInTransform Air clear
+            workspace.Terrain:Clear()
+            workspace.Terrain:FillBlock(CFrame.new(0, 8, 0), Vector3.new(32, 16, 32), Enum.Material.Grass)
+            assert(workspace.Terrain:CountCells() == 256, "fill 256")
+            local copied = workspace.Terrain:CopyRegion(Region3int16.new(Vector3int16.new(-4, 0, -4), Vector3int16.new(3, 3, 3)))
+            workspace.Terrain:SetMaterialInTransform(CFrame.new(0, 8, 0), Vector3.new(32, 16, 32), Enum.Material.Air)
+            assert(workspace.Terrain:CountCells() == 0, "clear source to 0, got " .. workspace.Terrain:CountCells())
+            workspace.Terrain:PasteRegion(copied, Vector3int16.new(4, 0, -4), false)
+            assert(workspace.Terrain:CountCells() == 256, "moved 256, got " .. workspace.Terrain:CountCells())
+
+            -- ApplyTransform 90 deg Y rotation on asymmetric 8x4x4 (Grass -X, Rock +X)
+            workspace.Terrain:Clear()
+            workspace.Terrain:FillBlock(CFrame.new(-8, 8, 0), Vector3.new(16, 16, 16), Enum.Material.Grass)
+            workspace.Terrain:FillBlock(CFrame.new(8, 8, 0), Vector3.new(16, 16, 16), Enum.Material.Rock)
+            local asym = workspace.Terrain:CopyRegion(Region3int16.new(Vector3int16.new(-4, 0, -2), Vector3int16.new(3, 3, 1)))
+            local sub = asym:ApplyTransformSubregion(
+                CFrame.Angles(0, math.pi / 2, 0),
+                Vector3.new(32, 16, 16),
+                Region3int16.new(Vector3int16.new(0, 0, 0), Vector3int16.new(4, 4, 4))
+            )
+            assert(sub.SizeInCells == Vector3.new(4, 4, 4), "sub size=" .. tostring(sub.SizeInCells))
+            asym:ApplyTransform(CFrame.Angles(0, math.pi / 2, 0), Vector3.new(32, 16, 16))
+            assert(asym.SizeInCells == Vector3.new(4, 4, 8), "rot90 size=" .. tostring(asym.SizeInCells))
+            workspace.Terrain:Clear()
+            workspace.Terrain:PasteRegion(asym, Vector3int16.new(0, 0, 0), false)
+            assert(workspace.Terrain:CountCells() == 128, "rot90 cells=" .. workspace.Terrain:CountCells())
+
+            local tc = game:GetService("TeamCreateService")
+            tc:CloseGameIfUserDoesntHavePerms()
+
+            print("r2_ok")
+            "#
+            .to_string(),
+        ),
+    );
+    let tops = dom.root().children().to_vec();
+    let mut bin = Vec::new();
+    rbx_binary::to_writer(&mut bin, &dom, &tops).unwrap();
+    std::fs::write(dir.join("Round2Check.rbxm"), &bin).unwrap();
+
+    // Register a tiny 4x4 white PNG under a plain `rbxtemp://<id>` (matching File:GetTemporaryId).
+    let mut png_bytes = Vec::new();
+    {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+    }
+    rustudio_core::assets::register_generated("rbxtemp://987654321", png_bytes);
+
+    let mut doc = Document::new_place();
+    let mut h = PluginHost::default();
+    h.load_builtin_dir(&dir, None).into_iter().for_each(|r| { r.unwrap(); });
+    // User plugin (identity 5) must NOT see StudioPublishService, ProcessAssetInsertionDrag, or HttpService:RequestInternal.
+    h.load(source(
+        "UserGate",
+        r#"
+        local ok_pub, pub = pcall(function() return game:GetService("StudioPublishService") end)
+        local ok_cb = pcall(function() plugin.ProcessAssetInsertionDrag = function() end end)
+        local ok_http = pcall(function() game:GetService("HttpService"):RequestInternal({ Url = "https://example.com" }) end)
+        print("user_gate", ok_pub, pub == nil, ok_cb, ok_http)
+        "#,
+    ))
+    .unwrap();
+    frames(&mut h, &mut doc, 4);
+    let out = lines(&mut h);
+    assert!(has(&out, "r2_ok"), "{out:#?}");
+    assert!(has(&out, "user_gate true true false false"), "{out:#?}");
+    rustudio_core::assets::unregister_generated("rbxtemp://987654321");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_builtin_plugins_load_on_first_use() {
+    temp_data();
+    let dir = std::env::temp_dir().join(format!("rustudio-lazy-builtin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let write_rbxm = |file: &str, code: &str| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        dom.insert(
+            root,
+            InstanceBuilder::new("Script")
+                .with_name("Main")
+                .with_property("Source", code.to_string()),
+        );
+        let tops = dom.root().children().to_vec();
+        let mut bin = Vec::new();
+        rbx_binary::to_writer(&mut bin, &dom, &tops).unwrap();
+        std::fs::write(dir.join(file), &bin).unwrap();
+    };
+
+    // 1) TagEditor-style: CreateDockWidgetPluginGuiAsync (InitialEnabled=false) then Click opens it.
+    write_rbxm(
+        "TagEditor.rbxm",
+        r#"
+        print("tag_loaded")
+        local tb = plugin:CreateToolbar("tagEditorToolbar")
+        local btn = tb:CreateButton("TagEditor", "", "")
+        local w = plugin:CreateDockWidgetPluginGuiAsync("TagEditor", DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 300, 400))
+        btn.Click:Connect(function()
+            w.Enabled = not w.Enabled
+            print("tag_clicked", w.Enabled)
+        end)
+        "#,
+    );
+
+    // 2) Toolbox-style: InitialEnabled=true opens immediately on load; lazy click must NOT toggle it off.
+    write_rbxm(
+        "Toolbox.rbxm",
+        r#"
+        print("tb_loaded")
+        local tb = plugin:CreateToolbar("luaToolboxToolbar")
+        local btn = tb:CreateButton("luaToolboxButton", "Insert items from the toolbox", "")
+        local w = plugin:CreateDockWidgetPluginGuiAsync("Toolbox", DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Left, true, false, 300, 400))
+        btn.Click:Connect(function()
+            w.Enabled = not w.Enabled
+            print("tb_clicked", w.Enabled)
+        end)
+        "#,
+    );
+
+    // 3) PathEditor-style: wakes on PluginAction or selecting a Path2D.
+    write_rbxm(
+        "PathEditor.rbxm",
+        r#"
+        print("path_loaded")
+        local act = plugin:CreatePluginAction("PathEditor_MoveTool", "Path2D Editor Select Mode", "Activate Select Mode")
+        act.Triggered:Connect(function()
+            print("path_triggered")
+        end)
+        "#,
+    );
+
+    // 4) LightGuides-style: wakes automatically when a Light is selected.
+    write_rbxm(
+        "LightGuides.rbxm",
+        r#"
+        print("light_loaded")
+        "#,
+    );
+
+    let mut doc = Document::new_place();
+    let mut h = PluginHost::default();
+    h.load_builtin_dir(&dir, None).into_iter().for_each(|r| { r.unwrap(); });
+
+    // Nothing runs yet; ribbon model already exposes deferred buttons & actions.
+    frames(&mut h, &mut doc, 3);
+    let out = lines(&mut h);
+    assert!(out.is_empty(), "deferred plugins must not run at startup: {out:#?}");
+    assert!(h.loaded().iter().all(|p| !p.running));
+    let model = h.ui_model_for_edit(&doc);
+    let tag_btn = model
+        .groups
+        .iter()
+        .find(|g| g.name == "tagEditorToolbar")
+        .and_then(|g| g.buttons.first())
+        .expect("deferred TagEditor button")
+        .r;
+    let tb_btn = model
+        .groups
+        .iter()
+        .find(|g| g.name == "luaToolboxToolbar")
+        .and_then(|g| g.buttons.first())
+        .expect("deferred Toolbox button")
+        .r;
+    let path_act = model
+        .actions
+        .iter()
+        .find(|a| a.key == "builtin_PathEditor.rbxm_PathEditor_MoveTool")
+        .expect("deferred PathEditor action")
+        .r;
+
+    // Clicking TagEditor materializes it and delivers Click after its async widget yields.
+    h.trigger(Trigger::Fire(tag_btn, "Click"));
+    frames(&mut h, &mut doc, 5);
+    let out = lines(&mut h);
+    assert!(has(&out, "tag_loaded"), "{out:#?}");
+    assert!(has(&out, "tag_clicked true"), "{out:#?}");
+
+    // Clicking Toolbox materializes it and leaves InitialEnabled=true open without toggling off.
+    h.trigger(Trigger::Fire(tb_btn, "Click"));
+    frames(&mut h, &mut doc, 5);
+    let out = lines(&mut h);
+    assert!(has(&out, "tb_loaded"), "{out:#?}");
+    assert!(!out.iter().any(|l| l.starts_with("tb_clicked")), "must not toggle off InitialEnabled widget: {out:#?}");
+
+    // Triggering PathEditor's deferred action materializes it and fires Triggered.
+    h.trigger(Trigger::Fire(path_act, "Triggered"));
+    frames(&mut h, &mut doc, 4);
+    let out = lines(&mut h);
+    assert!(has(&out, "path_loaded"), "{out:#?}");
+    assert!(has(&out, "path_triggered"), "{out:#?}");
+
+    // Selecting a PointLight automatically wakes LightGuides.
+    let ws = doc.workspace().unwrap();
+    let light = doc.dom.insert(ws, InstanceBuilder::new("PointLight").with_name("L"));
+    doc.selection = vec![light];
+    frames(&mut h, &mut doc, 3);
+    let out = lines(&mut h);
+    assert!(has(&out, "light_loaded"), "{out:#?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_tool_selector_registers_one_of_each_and_never_materializes_unchosen() {
+    use rustudio_core::rustudio_settings::{BuiltinTool, BuiltinToolChoices, ToolImpl};
+
+    temp_data();
+    let dir = std::env::temp_dir().join(format!("rustudio-tool-selector-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let write_rbxm = |file: &str, tag: &str| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        dom.insert(
+            root,
+            InstanceBuilder::new("Script")
+                .with_name("Main")
+                .with_property("Source", format!("print(\"loaded:{tag}\")")),
+        );
+        let tops = dom.root().children().to_vec();
+        let mut bin = Vec::new();
+        rbx_binary::to_writer(&mut bin, &dom, &tops).unwrap();
+        std::fs::write(dir.join(file), &bin).unwrap();
+    };
+
+    for (file, tag) in [
+        ("TagEditor.rbxm", "tag"),
+        ("Toolbox.rbxm", "toolbox"),
+        ("TerrainEditor.rbxm", "terrain"),
+        ("TerrainPaletteEditor.rbxm", "terrain_palette"),
+        ("SelectDragger.rbxm", "select"),
+        ("MoveDragger.rbxm", "move"),
+        ("RotateDragger.rbxm", "rotate"),
+        ("ScaleDragger.rbxm", "scale"),
+        ("ViewSelector.rbxm", "view_selector"),
+        ("RigGenerator.rbxm", "rig"),
+        ("MaterialPicker.rbxm", "material_picker"),
+    ] {
+        write_rbxm(file, tag);
+    }
+
+    let names = |h: &PluginHost| -> Vec<String> {
+        let mut v: Vec<String> = h.loaded().into_iter().map(|p| p.name).collect();
+        v.sort();
+        v
+    };
+
+    // 1) Built-in plugins OFF: nothing loads, native dock keeps Toolbox, nothing promoted.
+    {
+        let mut doc = Document::new_place();
+        let mut h = PluginHost::default();
+        let choices = BuiltinToolChoices {
+            plugins_enabled: false,
+            toolbox: ToolImpl::Roblox,
+            terrain_editor: ToolImpl::Roblox,
+            draggers: ToolImpl::Roblox,
+            view_selector: ToolImpl::Roblox,
+            rig_builder: ToolImpl::Roblox,
+            material_picker: ToolImpl::Roblox,
+        };
+        h.load_builtin_dir_with_choices(&dir, None, choices);
+        frames(&mut h, &mut doc, 3);
+        assert!(h.loaded().is_empty());
+        assert!(lines(&mut h).is_empty());
+        assert!(crate::app::default_dock_for(choices).find_tab(&crate::app::Tab::Toolbox).is_some());
+        assert_eq!(ui_ribbon::promoted_builtin_tool("builtin_Toolbox.rbxm", choices), None);
+        assert_eq!(ui_ribbon::promoted_builtin_tool("builtin_MaterialPicker.rbxm", choices), None);
+    }
+
+    // 2) Built-in plugins ON, default (all rustudio): only non-duplicated TagEditor registers.
+    //    Unchosen duplicated plugins are absent and never materialize even if woken or triggered.
+    {
+        let mut doc = Document::new_place();
+        let mut h = PluginHost::default();
+        let choices = BuiltinToolChoices { plugins_enabled: true, ..Default::default() };
+        h.load_builtin_dir_with_choices(&dir, None, choices);
+        assert_eq!(names(&h), vec!["builtin_TagEditor.rbxm"]);
+        let model = h.ui_model_for_edit(&doc);
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].plugin_name, "builtin_TagEditor.rbxm");
+        // Attempt to wake / trigger unchosen plugins: must do nothing and never load them.
+        for stem in [
+            "Toolbox",
+            "TerrainEditor",
+            "TerrainPaletteEditor",
+            "SelectDragger",
+            "MoveDragger",
+            "RotateDragger",
+            "ScaleDragger",
+            "ViewSelector",
+            "RigGenerator",
+            "MaterialPicker",
+        ] {
+            assert!(h.wake_plugin_by_name(stem).is_none(), "unchosen {stem} must not exist");
+        }
+        h.trigger(Trigger::Button("luaToolboxToolbar".into(), "luaToolboxButton".into()));
+        h.trigger(Trigger::Button("TerrainEditorLuaToolbarName".into(), "Editor".into()));
+        h.trigger(Trigger::Button("Home".into(), "Select".into()));
+        h.trigger(Trigger::Button("ViewSelector".into(), "ViewSelector".into()));
+        h.trigger(Trigger::Button("Rig Generator".into(), "Generate Rig".into()));
+        h.trigger(Trigger::Button("Edit".into(), "MaterialPicker".into()));
+        frames(&mut h, &mut doc, 4);
+        let out = lines(&mut h);
+        assert!(!out.iter().any(|l| l.starts_with("loaded:")), "unchosen plugins must never materialize: {out:#?}");
+        assert!(h.loaded().iter().all(|p| !p.running));
+        assert!(crate::app::default_dock_for(choices).find_tab(&crate::app::Tab::Toolbox).is_some());
+    }
+
+    // 3) Each duplicated tool set to Roblox's registers only its plugin(s), promotes them out
+    //    of the Plugins tab, and keeps every other duplicated plugin absent.
+    let cases: &[(BuiltinTool, &[&str], &[&str])] = &[
+        (BuiltinTool::Toolbox, &["builtin_TagEditor.rbxm", "builtin_Toolbox.rbxm"], &["builtin_Toolbox.rbxm"]),
+        (
+            BuiltinTool::TerrainEditor,
+            &["builtin_TagEditor.rbxm", "builtin_TerrainEditor.rbxm", "builtin_TerrainPaletteEditor.rbxm"],
+            &["builtin_TerrainEditor.rbxm"],
+        ),
+        (
+            BuiltinTool::Draggers,
+            &[
+                "builtin_MoveDragger.rbxm",
+                "builtin_RotateDragger.rbxm",
+                "builtin_ScaleDragger.rbxm",
+                "builtin_SelectDragger.rbxm",
+                "builtin_TagEditor.rbxm",
+            ],
+            &[
+                "builtin_MoveDragger.rbxm",
+                "builtin_RotateDragger.rbxm",
+                "builtin_ScaleDragger.rbxm",
+                "builtin_SelectDragger.rbxm",
+            ],
+        ),
+        (BuiltinTool::ViewSelector, &["builtin_TagEditor.rbxm", "builtin_ViewSelector.rbxm"], &["builtin_ViewSelector.rbxm"]),
+        (BuiltinTool::RigBuilder, &["builtin_RigGenerator.rbxm", "builtin_TagEditor.rbxm"], &["builtin_RigGenerator.rbxm"]),
+        (
+            BuiltinTool::MaterialPicker,
+            &["builtin_MaterialPicker.rbxm", "builtin_TagEditor.rbxm"],
+            &["builtin_MaterialPicker.rbxm"],
+        ),
+    ];
+
+    for &(tool, expected_loaded, expected_promoted) in cases {
+        let mut choices = BuiltinToolChoices { plugins_enabled: true, ..Default::default() };
+        match tool {
+            BuiltinTool::Toolbox => choices.toolbox = ToolImpl::Roblox,
+            BuiltinTool::TerrainEditor => choices.terrain_editor = ToolImpl::Roblox,
+            BuiltinTool::Draggers => choices.draggers = ToolImpl::Roblox,
+            BuiltinTool::ViewSelector => choices.view_selector = ToolImpl::Roblox,
+            BuiltinTool::RigBuilder => choices.rig_builder = ToolImpl::Roblox,
+            BuiltinTool::MaterialPicker => choices.material_picker = ToolImpl::Roblox,
+        }
+        let mut doc = Document::new_place();
+        let mut h = PluginHost::default();
+        h.load_builtin_dir_with_choices(&dir, None, choices);
+        assert_eq!(names(&h), expected_loaded, "loaded plugins for {tool:?}");
+
+        let model = h.ui_model_for_edit(&doc);
+        let plugins_tab: Vec<&str> = model
+            .groups
+            .iter()
+            .filter(|g| !ui_ribbon::is_builtin_plugin_group(&g.plugin_name))
+            .map(|g| g.plugin_name.as_str())
+            .collect();
+        let mut promoted: Vec<&str> = model
+            .groups
+            .iter()
+            .filter(|g| ui_ribbon::promoted_builtin_tool(&g.plugin_name, choices).is_some())
+            .map(|g| g.plugin_name.as_str())
+            .collect();
+        promoted.sort();
+        assert!(plugins_tab.is_empty(), "Plugins tab must hide all built-ins for {tool:?}: {plugins_tab:?}");
+        assert_eq!(promoted, expected_promoted, "promoted groups for {tool:?}");
+
+        // Native Toolbox tab is omitted from default dock only when Toolbox is Roblox's.
+        let has_native_tb = crate::app::default_dock_for(choices).find_tab(&crate::app::Tab::Toolbox).is_some();
+        assert_eq!(has_native_tb, tool != BuiltinTool::Toolbox);
+
+        // Unchosen plugins still stay absent and unmaterialized after ticking.
+        frames(&mut h, &mut doc, 2);
+        assert!(lines(&mut h).is_empty(), "deferred plugins stay unmaterialized until used");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_plugins_stay_off_plugins_tab_and_have_studio_icons() {
+    use super::builtin_lazy::{all_manifests, builtin_default_icon, DeferredStub};
+
+    // Every built-in plugin manifest button must resolve to a non-empty Studio
+    // icon URI so no blank diamond placeholders remain.
+    let mut icon_uris = Vec::new();
+    for m in all_manifests() {
+        let plugin_name = format!("builtin_{}.rbxm", m.stem);
+        assert!(ui_ribbon::is_builtin_plugin_group(&plugin_name));
+        let stub = DeferredStub::new(PluginId(1), &plugin_name, m);
+        for g in &stub.groups {
+            for b in &g.buttons {
+                assert!(
+                    !b.icon.trim().is_empty(),
+                    "built-in button {plugin_name} {}/{} has empty icon",
+                    g.name,
+                    b.id
+                );
+                assert!(
+                    builtin_default_icon(&plugin_name, &g.name, &b.id).is_some(),
+                    "built-in button {plugin_name} {}/{} missing from builtin_default_icon",
+                    g.name,
+                    b.id
+                );
+                icon_uris.push((plugin_name.clone(), g.name.clone(), b.id.clone(), b.icon.clone()));
+            }
+        }
+    }
+    assert!(icon_uris.len() >= 45, "expected all 46 built-in toolbar buttons, got {}", icon_uris.len());
+
+    // User / cloud plugins stay on the Plugins tab; built-ins never do.
+    assert!(!ui_ribbon::is_builtin_plugin_group("user_MyPlugin.lua"));
+    assert!(!ui_ribbon::is_builtin_plugin_group("cloud_123456"));
+
+    // On a machine with Studio SVG textures installed, every single built-in
+    // icon URI must resolve to an existing PNG file on disk.
+    let has_svg = rustudio_core::assets::resolve(
+        "rbxasset://studio_svg_textures/Shared/Ribbon/Dark/Medium/RibbonToolbox.png",
+        None,
+    )
+    .is_some_and(|p| p.is_file());
+    if has_svg {
+        let mut missing = Vec::new();
+        for (p, tb, id, uri) in &icon_uris {
+            let ok = rustudio_core::assets::resolve(uri, None).is_some_and(|path| path.is_file());
+            if !ok {
+                missing.push(format!("{p} {tb}/{id} -> {uri}"));
+            }
+        }
+        assert!(missing.is_empty(), "unresolved built-in icons: {missing:#?}");
+    }
+}
+
+#[test]
+fn edit_sound_preview_syncs_dom_properties_and_edit_vm() {
+    use rbx_dom_weak::types::Variant;
+    use rbx_dom_weak::{ustr, InstanceBuilder};
+    use std::time::Duration;
+
+    let dir = rustudio_core::assets::content_dir().join("sounds");
+    let _ = std::fs::create_dir_all(&dir);
+    // 0.30 s 16-bit mono WAV at 16 kHz.
+    let n = 4800u32;
+    let data_len = n * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&32000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..n {
+        let v: i16 = if (i / 16) % 2 == 0 { 3000 } else { -3000 };
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::write(dir.join("app-edit-preview.wav"), &wav);
+    let id = "rbxasset://sounds/app-edit-preview.wav".to_string();
+
+    let mut game = rustudio_player::game::Game::new(None);
+    let mut host = PluginHost::default();
+    let _ = host.with_edit_vm(&mut game.doc, |_| ());
+
+    let tick = |game: &mut rustudio_player::game::Game, host: &mut PluginHost| {
+        let (cmds, seeks, listener) = host.take_edit_audio_requests();
+        let ev = game.edit_audio_tick(cmds, seeks, listener);
+        host.deliver_edit_audio_events(&mut game.doc, &ev);
+        host.sync_edit_audio_to_vm(&game.edit_audio.lengths);
+    };
+
+    tick(&mut game, &mut host);
+    let ws = game.doc.workspace().unwrap();
+    let s = game.doc.insert(
+        ws,
+        InstanceBuilder::new("Sound")
+            .with_name("Preview")
+            .with_property("SoundId", Variant::ContentId(id.into()))
+            .with_property("Looped", Variant::Bool(true)),
+    );
+    tick(&mut game, &mut host);
+    assert!(game.edit_audio.is_loaded(s));
+    assert!((game.edit_audio.time_length(s) - 0.30).abs() < 0.02);
+
+    // Studio 0.748 parity: setting Playing=true in Edit updates flags without
+    // starting audible audio or advancing TimePosition.
+    game.doc
+        .set_props("Set Playing", vec![(s, ustr("Playing"), Variant::Bool(true))], None);
+    tick(&mut game, &mut host);
+    std::thread::sleep(Duration::from_millis(60));
+    tick(&mut game, &mut host);
+    assert_eq!(game.edit_audio.playing_count(), 0);
+
+    let (loaded, len, playing, paused, lua_tp): (bool, f64, bool, bool, f64) = host
+        .with_edit_vm(&mut game.doc, |rt| {
+            rt.lua
+                .load("local s = workspace.Preview return s.IsLoaded, s.TimeLength, s.IsPlaying, s.IsPaused, s.TimePosition")
+                .eval()
+                .unwrap()
+        })
+        .unwrap();
+    assert!(loaded && playing && !paused && (len - 0.30).abs() < 0.02 && lua_tp == 0.0);
+
+    // Properties panel Preview plays audibly and advances preview_state while
+    // remaining completely invisible to Sound properties and Edit Luau.
+    game.doc
+        .set_props("Clear Playing", vec![(s, ustr("Playing"), Variant::Bool(false))], None);
+    game.doc.selection = vec![s];
+    game.edit_audio_preview_toggle(s);
+    std::thread::sleep(Duration::from_millis(80));
+    tick(&mut game, &mut host);
+    let (pv_playing, pv_pos, pv_len) = game.edit_audio.preview_state(s);
+    assert!(pv_playing && pv_pos > 0.02 && (pv_len - 0.30).abs() < 0.02);
+
+    let (lua_pl, lua_ip, lua_pa, lua_tp2): (bool, bool, bool, f64) = host
+        .with_edit_vm(&mut game.doc, |rt| {
+            rt.lua
+                .load("local s = workspace.Preview return s.Playing, s.IsPlaying, s.IsPaused, s.TimePosition")
+                .eval()
+                .unwrap()
+        })
+        .unwrap();
+    assert!(!lua_pl && !lua_ip && lua_pa && lua_tp2 == 0.0);
+
+    // Stopping Edit preview (e.g. entering Play) stops audio and resets preview thumb.
+    game.edit_audio.stop_playback();
+    host.stop_edit_audio_vm_state();
+    assert_eq!(game.edit_audio.playing_count(), 0);
+    assert_eq!(game.edit_audio.preview_state(s).0, false);
+}
+
+#[test]
+fn sound_and_audio_player_props_layout_matches_studio() {
+    let sound_asset = crate::props_layout::rows("Sound", false)
+        .into_iter()
+        .find(|c| c.name == "Asset")
+        .map(|c| {
+            c.rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::props_layout::Row::Prop(n, _) => Some(n),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+    if let Some(rows) = sound_asset {
+        assert!(rows.contains(&"AudioContent".to_string()), "got {rows:?}");
+        assert!(!rows.contains(&"SoundId".to_string()), "SoundId should be hidden: {rows:?}");
+        assert!(rows.contains(&"IsLoaded".to_string()), "got {rows:?}");
+        assert!(rows.contains(&"TimeLength".to_string()), "got {rows:?}");
+    }
+    let ap_asset = crate::props_layout::rows("AudioPlayer", false)
+        .into_iter()
+        .find(|c| c.name == "Asset")
+        .map(|c| {
+            c.rows
+                .into_iter()
+                .filter_map(|r| match r {
+                    crate::props_layout::Row::Prop(n, _) => Some(n),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+    if let Some(rows) = ap_asset {
+        assert!(rows.contains(&"AudioContent".to_string()), "got {rows:?}");
+        assert!(!rows.contains(&"Asset".to_string()), "Asset should be hidden: {rows:?}");
+        assert!(rows.contains(&"IsReady".to_string()), "got {rows:?}");
+        assert!(rows.contains(&"TimeLength".to_string()), "got {rows:?}");
+    }
+}

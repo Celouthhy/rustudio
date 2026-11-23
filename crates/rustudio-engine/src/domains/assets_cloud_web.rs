@@ -23,6 +23,10 @@ pub const LUA_METHODS: &[(&str,&str)] = &[
     ("GetAssetIdsForPackage","AssetService"),
     ("GetAssetIdsForPackageAsync","AssetService"),
     ("GetObjects","DataModel"),
+    ("GetObjectsAsync","DataModel"),
+    ("GetObjectsAllOrNone","DataModel"),
+    ("GetObjectsList","DataModel"),
+    ("InsertObjectsAndJoinIfLegacyAsync","DataModel"),
 ];
 /// An asset load's error as Studio gives it ("Request asset was not
 /// found"), tagged with the id for the Output warning Studio prints
@@ -153,6 +157,15 @@ M.GetObjects=function(self,url)
     local out=m:GetChildren()
     for _,c in out do c.Parent=nil end
     m:Destroy()
+    return out
+end
+M.GetObjectsAsync=M.GetObjects
+M.GetObjectsAllOrNone=M.GetObjects
+M.InsertObjectsAndJoinIfLegacyAsync=M.GetObjects
+M.GetObjectsList=function(self,urls)
+    if type(urls)~='table' then error('Unable to cast value to Array',2) end
+    local out={}
+    for i,u in ipairs(urls) do out[i]=M.GetObjects(self,u) end
     return out
 end
 local function audioSubtype(value)

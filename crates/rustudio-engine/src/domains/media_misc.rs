@@ -32,6 +32,10 @@ use super::video::{self as vid, Decoder, Stream, Track};
 use super::{one, pb, pd, pstr};
 
 pub const METHODS: &[(&str, &str)] = &[
+    ("play", "Sound"),
+    ("stop", "Sound"),
+    ("pause", "Sound"),
+    ("resume", "Sound"),
     ("Play", "AudioTextToSpeech"),
     ("Pause", "AudioTextToSpeech"),
     ("Unload", "AudioTextToSpeech"),
@@ -136,6 +140,16 @@ fn set_bool(lua: &Lua, r: Ref, k: &str, v: bool) -> mlua::Result<()> {
 pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
     let none = || Ok(MultiValue::new());
     let r = match (class, name) {
+        ("Sound", "play" | "stop" | "pause" | "resume") => {
+            use crate::runtime::ext::{SoundCmd, sound};
+            let command = match name {
+                "play" => SoundCmd::Play,
+                "stop" => SoundCmd::Stop,
+                "pause" => SoundCmd::Pause,
+                _ => SoundCmd::Resume,
+            };
+            sound(lua, this, command).and_then(|_| none())
+        }
         // ------------------------------------------------ text to speech
         ("AudioTextToSpeech", "LoadAsync") => (|| {
             world(lua)?.output.push((Level::Error, "Failed to load text to speech".into()));

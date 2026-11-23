@@ -62,6 +62,10 @@ pub fn apply(ctx: &egui::Context) {
     // Studio's menus and panels appear at once (no fades).
     style.animation_time = 0.0;
     style.spacing.button_padding = egui::vec2(6.0, 2.0);
+    // Studio's scroll bars take their own strip beside the content (Qt);
+    // egui's default floats them over it, covering the right edge of rows
+    // (values, checkboxes, buttons) so they can't be clicked.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
     ctx.set_global_style(style);
 }
 

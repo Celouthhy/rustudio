@@ -107,7 +107,11 @@ pub fn joint_parts(doc: &Document, j: Ref) -> Option<(Ref, Ref)> {
 /// AnimationConstraint by its attachments (Studio derives its Part0 /
 /// Part1 / C0 / C1 from them).
 pub fn joint_frames(doc: &Document, r: Ref) -> Option<(Ref, Ref, Xform, Xform)> {
-    let i = doc.dom.get_by_ref(r)?;
+    joint_frames_for(doc, doc.dom.get_by_ref(r)?)
+}
+
+/// Resolve joint frames when the joint instance is already available.
+pub fn joint_frames_for(doc: &Document, i: &rbx_dom_weak::Instance) -> Option<(Ref, Ref, Xform, Xform)> {
     let refp = |k: rbx_dom_weak::Ustr| match i.properties.get(&k) {
         Some(Variant::Ref(x)) if x.is_some() && doc.dom.get_by_ref(*x).is_some() => Some(*x),
         _ => None,

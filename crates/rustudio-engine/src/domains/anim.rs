@@ -298,6 +298,25 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) 
             state(lua).dirty = true;
             Ok(MultiValue::new())
         }
+        "StepAnimations" => {
+            let dt = match arg_at(args, 1) {
+                Value::Number(n) => n,
+                Value::Integer(n) => n as f64,
+                Value::Nil => 0.0,
+                ref v => {
+                    return Err(rt_err(format!(
+                        "Unable to cast {} to float",
+                        anim_types::cast_name(v)
+                    )))
+                }
+            };
+            anim_tracks::step_animator(lua, this, dt)?;
+            Ok(MultiValue::new())
+        }
+        "ApplyJointVelocities" => {
+            apply_joint_velocities(lua, &arg_at(args, 1))?;
+            Ok(MultiValue::new())
+        }
         "GetChainCount" | "GetChainLength" | "GetNodeLocalCFrame" | "GetNodeWorldCFrame"
         | "GetRawFinalTarget" | "GetSmoothedFinalTarget" => {
             let index = match arg_at(args, 1) {
@@ -522,6 +541,9 @@ fn rescan(lua: &Lua) -> mlua::Result<()> {
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
+    if world(lua)?.mode == RunMode::Edit {
+        return Ok(());
+    }
     let need = {
         let mut s = state(lua);
         s.frame += 1;
@@ -586,6 +608,134 @@ fn step_motors(lua: &Lua, dt: f32) -> mlua::Result<()> {
         if let Some((p, xf)) = place {
             store_prop(lua, p, "CFrame", anim_ik::to_variant(&xf))?;
         }
+    }
+    Ok(())
+}
+
+/// Animator:ApplyJointVelocities(motors): transfers the last Animator frame's
+/// joint Transform velocity onto each motor's unanchored Part1 assembly.
+/// Formula measured exact to 5 decimals against Studio 0.748:
+///   delta = C0 * T_curr * T_prev^-1 * C0^-1
+///   v_part1 = v_part0 + R_part0 * (delta.pos / dt)
+///   w_part1 = w_part0 + R_part0 * (axis_angle(delta.rot) / dt)
+/// Skipped when Part1 is anchored or joined to an anchored part via an enabled joint.
+fn apply_joint_velocities(lua: &Lua, arg: &Value) -> mlua::Result<()> {
+    let Value::Table(tbl) = arg else {
+        return Ok(());
+    };
+    let mut motors: Vec<Ref> = Vec::new();
+    for pair in tbl.pairs::<Value, Value>() {
+        let (_, v) = pair?;
+        if let Some(r) = opt_inst(&v) {
+            motors.push(r);
+        } else if let Value::Table(sub) = v {
+            if let Ok(first) = sub.get::<Value>(1) {
+                if let Some(r) = opt_inst(&first) {
+                    motors.push(r);
+                }
+            }
+        }
+    }
+    if motors.is_empty() {
+        return Ok(());
+    }
+    let mut updates: Vec<(Ref, Vec3, Vec3, Vec3)> = Vec::new();
+    let doc_id = {
+        let w = world(lua)?;
+        let d = w.d();
+        let doc_id = d.id;
+        for m in motors {
+            let Some((t_prev, t_curr, dt)) = anim_tracks::last_joint_delta(lua, m) else {
+                continue;
+            };
+            if dt <= 1e-9 {
+                continue;
+            }
+            let Some((p0, p1, c0, _c1)) = rustudio_core::body::joint_frames(d, m) else {
+                continue;
+            };
+            if matches!(d.prop(p1, "Anchored"), Some(Variant::Bool(true))) {
+                continue;
+            }
+            // If the motor itself is enabled and Part0 is anchored, Part1's assembly
+            // is grounded (Studio 0.748 leaves AssemblyLinear/AngularVelocity at 0).
+            let m_enabled = !matches!(d.prop(m, "Enabled"), Some(Variant::Bool(false)));
+            if m_enabled && matches!(d.prop(p0, "Anchored"), Some(Variant::Bool(true))) {
+                continue;
+            }
+            // Check if any enabled joint on p1 connects to an anchored part.
+            let p1_grounded = d
+                .dom
+                .get_by_ref(p1)
+                .map(|i| {
+                    i.children().iter().any(|&c| {
+                        let Some(ci) = d.dom.get_by_ref(c) else { return false };
+                        if !matches!(
+                            ci.class.as_str(),
+                            "Motor6D" | "Weld" | "WeldConstraint" | "Motor" | "Snap" | "RigidConstraint" | "AnimationConstraint"
+                        ) {
+                            return false;
+                        }
+                        if matches!(d.prop(c, "Enabled"), Some(Variant::Bool(false))) {
+                            return false;
+                        }
+                        if let Some((a, b)) = rustudio_core::body::joint_parts(d, c) {
+                            let other = if a == p1 { b } else if b == p1 { a } else { return false };
+                            matches!(d.prop(other, "Anchored"), Some(Variant::Bool(true)))
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if p1_grounded {
+                continue;
+            }
+            let p0_xf = match d.prop(p0, "CFrame") {
+                Some(Variant::CFrame(c)) => rustudio_core::math::Xform::from_cframe(&c),
+                _ => anim_ik::ident(),
+            };
+            let p1_pos = match d.prop(p1, "CFrame") {
+                Some(Variant::CFrame(c)) => rustudio_core::math::Xform::from_cframe(&c).pos,
+                _ => Vec3::ZERO,
+            };
+            let t_delta = anim_ik::mul(&t_curr, &t_prev.inverse());
+            let delta = anim_ik::mul(&anim_ik::mul(&c0, &t_delta), &c0.inverse());
+            let inv_dt = 1.0 / (dt as f32);
+            let v_rel = p0_xf.rot * (delta.pos * inv_dt);
+            let mut q = glam::Quat::from_mat3(&delta.rot).normalize();
+            if q.w < 0.0 {
+                q = -q;
+            }
+            let (axis, angle) = q.to_axis_angle();
+            let w_rel = p0_xf.rot * (axis * (angle * inv_dt));
+            let v0 = w.velocities.get(&p0).copied().unwrap_or(Vec3::ZERO);
+            let w0 = rustudio_physics::physics::live::with_stats(doc_id, |s| s.spin.get(&p0).map(|x| x.0))
+                .flatten()
+                .unwrap_or(Vec3::ZERO);
+            updates.push((p1, v0 + v_rel, w0 + w_rel, p1_pos));
+        }
+        doc_id
+    };
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut spins_overlay = Vec::with_capacity(updates.len());
+    {
+        let mut w = world(lua)?;
+        for &(p1, v, ang, pos) in &updates {
+            w.velocities.insert(p1, v);
+            w.velocity_requests.push((p1, v));
+            rustudio_physics::physics::live::queue_spin_set(doc_id, p1, ang);
+            spins_overlay.push((p1, (ang, pos)));
+        }
+    }
+    rustudio_physics::physics::live::overlay_spins(doc_id, spins_overlay);
+    for (p1, v, ang, _) in updates {
+        let lv = Variant::Vector3(rbx_dom_weak::types::Vector3::new(v.x, v.y, v.z));
+        let av = Variant::Vector3(rbx_dom_weak::types::Vector3::new(ang.x, ang.y, ang.z));
+        let _ = store_prop(lua, p1, "AssemblyLinearVelocity", lv);
+        let _ = store_prop(lua, p1, "AssemblyAngularVelocity", av);
     }
     Ok(())
 }

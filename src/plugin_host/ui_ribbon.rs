@@ -102,6 +102,9 @@ pub struct PluginUi {
     pub rects: Vec<(String, Rect)>,
     pub menu_rects: Vec<(String, Rect)>,
     pub popup_rects: Vec<(u64, Rect)>,
+    /// Cache key for skipping `snapshot` on idle edit frames:
+    /// `(at, doc.id, vm.ui_rev, deferred_rev, has_vm)`.
+    last_sync: Option<(Where, u64, u64, u64, bool)>,
 }
 
 // ------------------------------------------------------------------ icons
@@ -159,7 +162,7 @@ impl IconCache {
                     self.map.insert(id, Icon::Image(img));
                 }
                 Err(_) => {
-                    let local = id.starts_with("rbxasset://");
+                    let local = id.starts_with("rbxasset://") || id.starts_with("rbxlocaltheme://");
                     self.map.insert(id.clone(), Icon::Failed { local });
                     if self.kind.get(&id).copied().unwrap_or(true) {
                         out.push(format!("Unable to load plugin icon: {id}"));
@@ -185,6 +188,10 @@ impl IconCache {
         match e {
             Icon::Tex(t) => Some(Ok(t.clone())),
             Icon::Failed { local } => Some(Err(*local)),
+            Icon::Loading => {
+                ctx.request_repaint();
+                None
+            }
             _ => None,
         }
     }
@@ -292,7 +299,150 @@ mod elide_tests {
     }
 }
 
+/// True when a plugin ribbon group belongs to one of Roblox Studio's built-in
+/// plugins (`builtin_*.rbxm`). Real Studio 0.748 routes all built-in toolbars
+/// into Home, Model, Avatar, UI, Script, or top menus (File/View/Test/Window)
+/// via `Ribbon.rbxm` and `PluginUIRelayGuard`; only user/third-party plugins
+/// belong on the Plugins ribbon tab and Plugins menu.
+pub fn is_builtin_plugin_group(plugin_name: &str) -> bool {
+    plugin_name.starts_with("builtin_")
+}
+
+/// If a plugin ribbon group belongs to a Roblox built-in plugin that is
+/// promoted into rustudio's own ribbon / menus via the duplicated-tool
+/// selector (Toolbox, Terrain Editor, Draggers, View Selector, Rig Builder,
+/// Material Picker), returns which `BuiltinTool` owns it.
+pub fn promoted_builtin_tool(
+    plugin_name: &str,
+    choices: rustudio_core::rustudio_settings::BuiltinToolChoices,
+) -> Option<rustudio_core::rustudio_settings::BuiltinTool> {
+    let stem = plugin_name.strip_prefix("builtin_")?.trim_end_matches(".rbxm");
+    let tool = rustudio_core::rustudio_settings::BuiltinTool::for_plugin_stem(stem)?;
+    choices.use_roblox(tool).then_some(tool)
+}
+
 impl Editor {
+    /// True when `g`'s buttons should stay off the Plugins tab and Plugins menu
+    /// (every Roblox Studio built-in plugin; only third-party / user plugins
+    /// belong on the Plugins tab).
+    pub fn is_hidden_from_plugins_tab(&self, g: &RibbonGroup) -> bool {
+        is_builtin_plugin_group(&g.plugin_name)
+    }
+
+    /// True when `g`'s buttons belong to a duplicated tool whose selector is
+    /// set to Roblox's implementation.
+    pub fn is_promoted_plugin_group(&self, g: &RibbonGroup) -> bool {
+        promoted_builtin_tool(&g.plugin_name, self.builtin_tools).is_some()
+    }
+
+    /// Looks up a ribbon button belonging to built-in plugin `stem` (e.g.
+    /// `"Toolbox"`, `"PivotEditor"`, `"ConstraintTool"`), optionally filtered
+    /// by toolbar name and/or button id.
+    pub fn builtin_plugin_button(&self, stem: &str, toolbar: Option<&str>, id: Option<&str>) -> Option<&RibbonButton> {
+        let want = format!("builtin_{stem}.rbxm");
+        self.plugin_bar
+            .model
+            .groups
+            .iter()
+            .filter(|g| g.plugin_name.eq_ignore_ascii_case(&want))
+            .filter(|g| toolbar.is_none_or(|tb| g.name == tb))
+            .flat_map(|g| g.buttons.iter())
+            .find(|b| id.is_none_or(|want_id| b.id == want_id))
+    }
+
+    /// `(enabled, Some(active))` for a built-in plugin button.
+    pub fn builtin_button_state(&self, stem: &str, toolbar: Option<&str>, id: Option<&str>) -> (bool, Option<bool>) {
+        match self.builtin_plugin_button(stem, toolbar, id) {
+            Some(b) => {
+                let usable = b.enabled && (!self.viewport_hidden() || b.clickable_when_viewport_hidden);
+                (usable, Some(b.active))
+            }
+            None => (false, Some(false)),
+        }
+    }
+
+    /// Fires `Click` on a built-in plugin button (materializing it lazily on
+    /// first click if deferred).
+    pub fn trigger_builtin_plugin_button(&mut self, stem: &str, toolbar: Option<&str>, id: Option<&str>) -> bool {
+        if let Some(r) = self.builtin_plugin_button(stem, toolbar, id).map(|b| b.r) {
+            self.plugin_fire(r, "Click");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Looks up the ribbon button belonging to built-in plugin `stem`
+    /// (e.g. `"Toolbox"`, `"TerrainEditor"`, `"SelectDragger"`).
+    pub fn promoted_plugin_button(&self, stem: &str) -> Option<&RibbonButton> {
+        self.builtin_plugin_button(stem, None, None)
+    }
+
+    /// `(enabled, Some(active))` for a promoted built-in plugin button.
+    pub fn promoted_button_state(&self, stem: &str) -> (bool, Option<bool>) {
+        self.builtin_button_state(stem, None, None)
+    }
+
+    /// Fires `Click` on a promoted built-in plugin button (materializing it
+    /// lazily on first click if deferred).
+    pub fn trigger_promoted_plugin_button(&mut self, stem: &str) -> bool {
+        self.trigger_builtin_plugin_button(stem, None, None)
+    }
+
+    /// Fires `DropdownClick` on a promoted built-in popup button (materializing
+    /// it lazily on first click if deferred).
+    pub fn trigger_promoted_plugin_dropdown(&mut self, stem: &str) -> bool {
+        if let Some(r) = self.builtin_plugin_button(stem, None, None).map(|b| b.r) {
+            self.plugin_fire(r, "DropdownClick");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Draws a resolved Studio plugin icon texture into `rect` if already
+    /// decoded. Returns `true` when painted, `false` while loading or
+    /// unavailable (caller renders its Tabler fallback — never a diamond).
+    pub fn paint_builtin_icon(&mut self, ctx: &egui::Context, p: &egui::Painter, rect: Rect, icon: &str, tint: Color32) -> bool {
+        let icon = icon.trim();
+        if icon.is_empty() {
+            return false;
+        }
+        self.plugin_bar.icons.request(icon, true);
+        if let Some(Ok(tex)) = self.plugin_bar.icons.texture(ctx, icon) {
+            p.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), tint);
+            return true;
+        }
+        false
+    }
+
+    /// Label of whichever Roblox dragger plugin button is currently active,
+    /// for the status bar when Roblox's draggers are selected.
+    pub fn active_roblox_dragger_label(&self) -> Option<&'static str> {
+        for (stem, label) in [
+            ("SelectDragger", "Select"),
+            ("MoveDragger", "Move"),
+            ("ScaleDragger", "Scale"),
+            ("RotateDragger", "Rotate"),
+        ] {
+            if self.promoted_plugin_button(stem).is_some_and(|b| b.active) {
+                return Some(label);
+            }
+        }
+        None
+    }
+
+    /// Switches a Select/Move/Scale/Rotate tool using either Roblox's dragger
+    /// plugin or rustudio's native `Tool`.
+    pub fn trigger_dragger_or_native(&mut self, tool: Tool, stem: &str) {
+        if self.builtin_tools.use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers) {
+            self.tool = Tool::None;
+            self.trigger_promoted_plugin_button(stem);
+        } else {
+            self.tool = self.tool.toggle(tool);
+        }
+    }
+
     /// After the plugin tick: what the UI shows this frame (the toolbars of
     /// the DataModel in front, open popups, bindable actions), icon loads,
     /// and the ribbon tool against plugin activation.
@@ -305,45 +455,65 @@ impl Editor {
             Some(p) => Where::Play(p.showing),
             None => Where::Edit,
         };
+        let mut rebuilt = true;
         let model = match at {
             Where::Edit => {
                 let doc = match self.game.play_saved_doc() {
                     Some(d) => d,
                     None => &self.game.doc,
                 };
-                match self.plugins.edit_lua() {
-                    Some(lua) => snapshot(lua, doc),
-                    None => UiModel::default(),
+                let drev = self.plugins.deferred_rev();
+                let key = match self.plugins.edit_lua() {
+                    Some(lua) => {
+                        let rev = lua.app_data_ref::<super::vm::PluginVm>().map(|v| v.ui_rev).unwrap_or(0);
+                        (at, doc.id, rev, drev, true)
+                    }
+                    None => (at, doc.id, 0, drev, false),
+                };
+                if self.plugin_bar.last_sync == Some(key) {
+                    rebuilt = false;
+                    UiModel::default()
+                } else {
+                    self.plugin_bar.last_sync = Some(key);
+                    self.plugins.ui_model_for_edit(doc)
                 }
             }
-            Where::Play(side) if self.game.has_play_worker() => self.plugins.play_ribbon(side),
-            Where::Play(side) => self.game
-                .with_play_side(side, |rt, _, _| match rustudio_engine::runtime::world(&rt.lua) {
-                    Ok(w) => {
-                        let d: &rustudio_core::doc::Document = w.d();
-                        snapshot(&rt.lua, d)
-                    }
-                    Err(_) => UiModel::default(),
-                })
-                .unwrap_or_default(),
+            Where::Play(side) if self.game.has_play_worker() => {
+                self.plugin_bar.last_sync = None;
+                self.plugins.play_ribbon(side)
+            }
+            Where::Play(side) => {
+                self.plugin_bar.last_sync = None;
+                self.game
+                    .with_play_side(side, |rt, _, _| match rustudio_engine::runtime::world(&rt.lua) {
+                        Ok(w) => {
+                            let d: &rustudio_core::doc::Document = w.d();
+                            snapshot(&rt.lua, d)
+                        }
+                        Err(_) => UiModel::default(),
+                    })
+                    .unwrap_or_default()
+            }
         };
-        self.plugin_bar.model = UiModel { at: Some(at), ..model };
-        // Icons load as soon as a button or action exists (Studio reports a
-        // bad one in Output whether or not the tab is shown).
-        let mut want: Vec<(String, bool)> = Vec::new();
-        for g in &self.plugin_bar.model.groups {
-            for b in &g.buttons {
-                want.push((b.icon.clone(), true));
+        if rebuilt {
+            self.plugin_bar.model = UiModel { at: Some(at), ..model };
+            // Icons load as soon as a button or action exists (Studio reports a
+            // bad one in Output whether or not the tab is shown).
+            let mut want: Vec<(String, bool)> = Vec::new();
+            for g in &self.plugin_bar.model.groups {
+                for b in &g.buttons {
+                    want.push((b.icon.clone(), true));
+                }
             }
-        }
-        for u in self.plugins.ui_items() {
-            match &u.kind {
-                UiKind::Action { icon, .. } | UiKind::Menu { icon, .. } => want.push((icon.clone(), false)),
-                _ => {}
+            for u in self.plugins.ui_items() {
+                match &u.kind {
+                    UiKind::Action { icon, .. } | UiKind::Menu { icon, .. } => want.push((icon.clone(), false)),
+                    _ => {}
+                }
             }
-        }
-        for (id, button) in want {
-            self.plugin_bar.icons.request(&id, button);
+            for (id, button) in want {
+                self.plugin_bar.icons.request(&id, button);
+            }
         }
         for line in self.plugin_bar.icons.poll() {
             self.push_log(Level::Error, line);
@@ -367,7 +537,11 @@ impl Editor {
                 }
                 None => {
                     if let Some(t) = self.plugin_bar.saved_tool.take() {
-                        if self.tool == Tool::None {
+                        let native_ok = !self
+                            .builtin_tools
+                            .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers)
+                            || !matches!(t, Tool::Select | Tool::Move | Tool::Scale | Tool::Rotate);
+                        if self.tool == Tool::None && native_ok {
                             self.tool = t;
                         }
                     }
@@ -399,12 +573,12 @@ impl Editor {
     }
 
     /// `--result`'s "plugin_toolbars": the Plugins tab as drawn (groups in
-    /// order with their buttons), open popups, the active plugin, the
-    /// ribbon tool.
+    /// order with their buttons), promoted built-in groups, open popups, the
+    /// active plugin, the ribbon tool.
     pub fn plugin_ui_json(&self) -> serde_json::Value {
         let m = &self.plugin_bar.model;
-        serde_json::json!({
-            "groups": m.groups.iter().map(|g| serde_json::json!({
+        let encode_group = |g: &RibbonGroup| {
+            serde_json::json!({
                 "plugin": g.plugin_name,
                 "toolbar": g.name,
                 "buttons": g.buttons.iter().map(|b| serde_json::json!({
@@ -412,7 +586,25 @@ impl Editor {
                     "enabled": b.enabled, "clickable_when_viewport_hidden": b.clickable_when_viewport_hidden,
                     "active": b.active, "shortcut_key": b.key,
                 })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
+            })
+        };
+        let groups: Vec<_> = m.groups.iter().filter(|g| !self.is_hidden_from_plugins_tab(g)).map(encode_group).collect();
+        let builtin_groups: Vec<_> = m.groups.iter().filter(|g| self.is_hidden_from_plugins_tab(g)).map(encode_group).collect();
+        let promoted_groups: Vec<_> = m.groups.iter().filter(|g| self.is_promoted_plugin_group(g)).map(encode_group).collect();
+        let c = self.builtin_tools;
+        serde_json::json!({
+            "groups": groups,
+            "builtin_groups": builtin_groups,
+            "promoted_groups": promoted_groups,
+            "builtin_tools": {
+                "plugins_enabled": c.plugins_enabled,
+                "toolbox": c.toolbox.id(),
+                "terrain_editor": c.terrain_editor.id(),
+                "draggers": c.draggers.id(),
+                "view_selector": c.view_selector.id(),
+                "rig_builder": c.rig_builder.id(),
+                "material_picker": c.material_picker.id(),
+            },
             "actions": m.actions.iter().map(|a| serde_json::json!({"action_id": a.key, "text": a.text, "status_tip": a.status_tip})).collect::<Vec<_>>(),
             "open_menus": m.menus.len(),
             "active_plugin": self.plugins.active_plugin().map(|p| p.0),
@@ -430,13 +622,16 @@ impl Editor {
             .model
             .groups
             .iter()
-            .filter(|g| g.name == tb)
+            .filter(|g| tb == "*" || g.name == tb)
             .flat_map(|g| g.buttons.iter())
             .find(|x| x.id == b || x.label == b)
             .cloned();
         match hit {
             Some(x) if x.enabled && (!self.viewport_hidden() || x.clickable_when_viewport_hidden) => self.plugin_fire(x.r, "Click"),
             Some(_) => eprintln!("--action plugin-button:{tb}/{b}: the button is disabled, nothing happens"),
+            None if self.plugins.has_deferred() => {
+                self.plugins.trigger(Trigger::Button(tb.to_string(), b.to_string()));
+            }
             None => self.warn(format!("--action: no plugin button {tb}/{b} to click")),
         }
     }
@@ -472,7 +667,14 @@ impl Editor {
         self.plugin_bar.was_plugins_tab = true;
         let font = egui::FontId::proportional(11.5);
         let hidden = self.viewport_hidden();
-        let groups = self.plugin_bar.model.groups.clone();
+        let groups: Vec<RibbonGroup> = self
+            .plugin_bar
+            .model
+            .groups
+            .iter()
+            .filter(|g| !self.is_hidden_from_plugins_tab(g))
+            .cloned()
+            .collect();
         // Layout: x of every cell from the strip's left edge.
         let mut cells: Vec<(usize, usize, f32, f32, String)> = Vec::new();
         let mut dividers: Vec<f32> = Vec::new();
@@ -603,7 +805,14 @@ impl Editor {
 
     /// The Plugins menu's toolbar submenus (after its own items).
     pub fn plugins_menu_toolbars(&mut self, ui: &mut egui::Ui) {
-        let groups = self.plugin_bar.model.groups.clone();
+        let groups: Vec<RibbonGroup> = self
+            .plugin_bar
+            .model
+            .groups
+            .iter()
+            .filter(|g| !self.is_hidden_from_plugins_tab(g))
+            .cloned()
+            .collect();
         self.plugin_bar.menu_rects.clear();
         if groups.is_empty() {
             return;

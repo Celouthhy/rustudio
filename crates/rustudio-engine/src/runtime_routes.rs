@@ -984,6 +984,10 @@ unsafe fn fast_namecall(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     rustudio_core::bench::api_timed("call", name, || {
                         let w = lua.app_data_ref::<World>()?;
+                        // DataModel hides CoreGui/CorePackages from game scripts based on caller identity.
+                        if w.d().dom.root_ref() == r {
+                            return None;
+                        }
                         let instance = w.d().dom.get_by_ref(r)?;
                         if !traversal_routes(instance.class).get_children {
                             return None;

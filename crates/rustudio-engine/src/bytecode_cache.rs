@@ -3,18 +3,24 @@
 //! data modules of tens of megabytes (a large ported place: 150 MB of
 //! Luau, one module 47 MB) spent seconds compiling the same text twice per
 //! Play and again on every run. Bytecode of sources over MIN_MEMORY is kept
-//! for the process; over MIN_DISK also in <cache>/bytecode/, keyed by the
-//! source and the compiler (settings and its output for a probe).
-//! RUSTUDIO_NO_BYTECODE_CACHE=1 turns it off.
+//! for the process; over MIN_DISK (on Android: 4 KB) also in
+//! <cache>/bytecode/, keyed by the source and the compiler (settings and
+//! its output for a probe). RUSTUDIO_NO_BYTECODE_CACHE=1 turns it off.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const MIN_MEMORY: usize = 16 * 1024;
-const MIN_DISK: usize = 256 * 1024;
+/// (1 KB: a Play compiles most ModuleScripts twice, once a side; below
+/// this the hash costs what the compiler does.)
+const MIN_MEMORY: usize = 1024;
+/// On a phone every launch is a cold process and the compiler is slower
+/// (a fighting game's 685 scripts, 7 MB of Luau, compiled again each
+/// launch otherwise): nearly everything the memory cache keeps goes to
+/// disk too (a few MB, one file a script, in the app's cache directory).
+const MIN_DISK: usize = if cfg!(target_os = "android") { 4 * 1024 } else { 256 * 1024 };
 /// Bytecode held in memory at most (later sources compile as before).
-const MEMORY_CAP: usize = 768 * 1024 * 1024;
+const MEMORY_CAP: usize = if cfg!(target_os = "android") { 128 * 1024 * 1024 } else { 768 * 1024 * 1024 };
 
 /// The compiler every script runs through: Studio's options (runtime.rs
 /// Runtime::new explains each).

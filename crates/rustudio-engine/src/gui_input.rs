@@ -55,7 +55,7 @@ pub(super) fn local_player_gui(d: &Document) -> Option<Ref> {
 /// vtable Studio) that is refilled only when marked (the frame stats
 /// time UILayout, FillGuiVertices and Render2d apart, Studio).
 pub(super) struct RootCache {
-    key: [u32; 12],
+    key: [u32; 13],
     shapes: Vec<Shape>,
     hits: Vec<Hit>,
     /// Stats.UI2D: draw calls, triangles.
@@ -89,6 +89,8 @@ pub(super) struct CacheWith {
     pressed: Option<Ref>,
     focus: Option<Ref>,
     selected: Option<Ref>,
+    selected_core: Option<Ref>,
+    selection_visible: bool,
     atlas: [usize; 2],
     fill: f32,
     /// Font files and families egui knows: a font added rebuilds egui's
@@ -140,6 +142,7 @@ impl Gui {
         // journal (scanning that subtree every frame was 4 ms in Place E); a new
         // PlayerGui (LocalPlayer set, respawn) is scanned once.
         let pg = local_player_gui(d);
+        self.messages.sync(d, &marks, pg);
         let pg_new = pg != self.adorn_pg_of || d.id != self.roots_doc;
         if pg_new || !matches!(marks, doc::Marks::Some(_)) {
             self.adorn_pg_of = pg;
@@ -215,6 +218,25 @@ impl Gui {
                 self.layout_from.clear();
                 self.layout_changed = true;
             }
+        }
+    }
+
+    /// Lightweight sync for a plugin DockWidget / QWidget `Gui`
+    /// (`Roots::Widget`): only invalidates its own 2D caches from journal
+    /// marks without scanning CoreGui or Workspace for 3D world layers /
+    /// handle adornments (which only the CoreGui overlay draws).
+    pub fn sync_widget(&mut self, d: &Document, marks: &doc::Marks) {
+        let _p = rustudio_core::bench::scope("gui_roots_widget");
+        self.cache_marks(d, marks);
+        if !matches!(marks, doc::Marks::Some(_)) || d.id != self.roots_doc {
+            self.roots_doc = d.id;
+            self.surface_specs.clear();
+            self.root_props.clear();
+            self.surface_geo.clear();
+            self.root_boxes.clear();
+            self.layout.clear();
+            self.layout_from.clear();
+            self.layout_changed = true;
         }
     }
 
@@ -547,7 +569,7 @@ impl Gui {
         }
     }
 
-    fn reuse_billboard_canvas(&mut self, g: Ref, key: [u32; 12]) {
+    fn reuse_billboard_canvas(&mut self, g: Ref, key: [u32; 13]) {
         const BILLBOARD_ROOTS: usize = 128;
         const CANVASES_PER_ROOT: usize = 8;
         const VERTICES_PER_CANVAS: usize = 4096;
@@ -620,41 +642,43 @@ impl Gui {
             let defs = f.definitions();
             (f.font_image_size(), f.font_atlas_fill_ratio(), (defs.font_data.len(), defs.families.len()))
         });
-        let selected = d
-            .find_child(d.dom.root_ref(), "GuiService")
-            .and_then(|gs| match d.prop(gs, "SelectedObject") {
-                Some(Variant::Ref(r)) if d.exists(r) => Some(r),
-                _ => None,
-            });
+        let gs = d.find_child(d.dom.root_ref(), "GuiService");
+        let selected = gs.and_then(|gs| match d.prop(gs, "SelectedObject") {
+            Some(Variant::Ref(r)) if d.exists(r) => Some(r),
+            _ => None,
+        });
+        let selected_core = gs.and_then(|gs| match d.prop(gs, "SelectedCoreObject") {
+            Some(Variant::Ref(r)) if d.exists(r) => Some(r),
+            _ => None,
+        });
+        let selection_visible = super::share().selection_visible;
         let now = CacheWith {
             hovered: self.hovered.clone(),
             pressed: self.pressed.map(|p| p.0),
             focus: self.focus,
             selected,
+            selected_core,
+            selection_visible,
             atlas,
             fill,
             fonts,
             ppp,
         };
         let was = std::mem::replace(&mut self.cache_with, now);
-        // egui's atlas doubles its height when it fills: its next textures
-        // (egui's, and the world GUI pass's mip copy) are made on another
-        // thread ahead of time, so the growth frame only copies. Making them
-        // stalls this thread too (wgpu holds the queue while the driver
-        // allocates them), so: the first growth's at load, where the frames
-        // are slow anyway; a later one's only once the atlas is three
-        // quarters full.
         if let Some(rs) = render_state {
-            // (and the world GUI pass's copy of the atlas as it is, for its
-            // first world GUI text)
-            if atlas[0] > 0 && atlas[1] > 0 {
-                let key = rustudio_render::world_gui::mip_copy_key(atlas[0] as u32, atlas[1] as u32);
+            // Large first-use clears can hold wgpu's submission lock while
+            // the driver allocates backing pages, even on the prewarm worker.
+            // Prepare the starting atlas and its first doubling. Larger
+            // allocations are made by the existing upload path if needed.
+            const MAX_PREWARM_TEXELS: usize = 16 * 1024 * 1024;
+            let [width, height] = atlas;
+            let texels = width * height;
+            if texels > 0 && texels <= MAX_PREWARM_TEXELS {
+                let key = rustudio_render::world_gui::mip_copy_key(width as u32, height as u32);
                 egui_wgpu::prewarm::prewarm_once(&rs.device, &rs.queue, key);
             }
-            let used = fill * atlas[0].max(atlas[1]) as f32;
-            let first = atlas[1] <= FIRST_ATLAS_ROWS;
-            if atlas[1] > 0 && atlas[1] < atlas[0] && (first || used * 4.0 > atlas[1] as f32 * 3.0) {
-                let (w, h) = (atlas[0] as u32, atlas[1] as u32 * 2);
+            if height > 0 && height < width && texels <= MAX_PREWARM_TEXELS / 2 {
+                let (w, h) = (width as u32, height as u32 * 2);
                 let keys = [rustudio_render::world_gui::font_atlas_key(w, h), rustudio_render::world_gui::mip_copy_key(w, h)];
                 for key in keys {
                     egui_wgpu::prewarm::prewarm(&rs.device, &rs.queue, key);
@@ -711,13 +735,15 @@ impl Gui {
             return;
         }
         let now = &self.cache_with;
+        let vis_changed = now.selection_visible != was.selection_visible;
         let touched: Vec<Ref> = now
             .hovered
             .symmetric_difference(&was.hovered)
             .copied()
             .chain([now.pressed, was.pressed].into_iter().flatten().filter(|_| now.pressed != was.pressed))
             .chain([now.focus, was.focus].into_iter().flatten().filter(|_| now.focus != was.focus))
-            .chain([now.selected, was.selected].into_iter().flatten().filter(|_| now.selected != was.selected))
+            .chain([now.selected, was.selected].into_iter().flatten().filter(|_| vis_changed || now.selected != was.selected))
+            .chain([now.selected_core, was.selected_core].into_iter().flatten().filter(|_| vis_changed || now.selected_core != was.selected_core))
             .collect();
         for r in touched {
             self.invalidate_billboard_archive(r);
@@ -726,6 +752,50 @@ impl Gui {
                 self.memo_up(d, r, g);
             }
         }
+        // UIPageLayout jumps / tweens mutate GuiShare::pages outside the DOM.
+        let (pages_rev, page_lays) = {
+            let sh = super::share();
+            if sh.pages_rev != self.pages_rev {
+                (sh.pages_rev, sh.pages.keys().copied().collect::<Vec<_>>())
+            } else {
+                (self.pages_rev, Vec::new())
+            }
+        };
+        if pages_rev != self.pages_rev {
+            self.pages_rev = pages_rev;
+            let prev = std::mem::replace(&mut self.last_pages, page_lays.clone());
+            for lay in page_lays.into_iter().chain(prev) {
+                let target = if self.cache_owner.contains_key(&lay) {
+                    Some(lay)
+                } else {
+                    d.dom.get_by_ref(lay).map(|i| i.parent()).filter(|p| p.is_some())
+                };
+                if let Some(t) = target {
+                    if let Some((g, _, _)) = self.cache_owner.get(&t).copied() {
+                        self.cache.remove(&g);
+                        self.memo_up(d, t, g);
+                    }
+                }
+            }
+        }
+    }
+
+    fn screen_root(&self, rect: Rect, insets: Option<u32>, inset: f32) -> (Target, [f32; 2], [f32; 2]) {
+        if insets == Some(3) {
+            let bar = self.topbar_inset.unwrap_or_else(|| {
+                crate::gui::fallback_topbar_inset(rect.width(), self.topbar_chat.unwrap_or(true))
+            });
+            return (
+                Target::Screen(rect.min + egui::vec2(bar.min.x, bar.min.y)),
+                (bar.max - bar.min).to_array(),
+                [bar.min.x, bar.min.y - mech::GUI_TOP_INSET],
+            );
+        }
+        (
+            Target::Screen(Pos2::new(rect.left(), rect.top() + inset)),
+            [rect.width(), rect.height() - inset],
+            [0.0, inset - mech::GUI_TOP_INSET],
+        )
     }
 
     /// Draws every GUI in view and remembers what can be clicked.
@@ -749,6 +819,9 @@ impl Gui {
         if (inp.playing && inp.roots == Roots::View) || inp.roots == Roots::CoreGui {
             let _a = rustudio_core::bench::scope("gui_adorn");
             self.draw_adornments(inp.doc, inp.cam, inp.rect, painter);
+        }
+        if inp.roots == Roots::View && inp.playing {
+            self.draw_messages(ctx, painter, inp.store, inp.doc, inp.rect);
         }
         let pre = rustudio_core::bench::scope("gui_pre");
         let d = inp.doc;
@@ -781,17 +854,23 @@ impl Gui {
                     "ScreenGui" => {
                         // ScreenInsets None / DeviceSafeInsets (IgnoreGuiInset, which
                         // doc.rs derives from it both ways): the whole view.
-                        let ignore = matches!(enum_u32(d.prop(g, "ScreenInsets")), Some(0) | Some(1));
+                        // TopbarSafeInsets: the top bar's free area, GuiService.TopbarInset
+                        // (right of Roblox's buttons, the bar's height) — TopbarPlus's
+                        // ScreenGui, whose icons sit at Y scale 0.5 of it, next to the
+                        // chat button.
+                        let si = enum_u32(d.prop(g, "ScreenInsets"));
+                        let ignore = matches!(si, Some(0) | Some(1));
                         let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
+                        let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
                         roots.push(Root {
                             on_top: true,
                             light: 1.0,
                             order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
                             dist: 0.0,
                             gui: g,
-                            target: Target::Screen(Pos2::new(rect.left(), rect.top() + inset)),
-                            canvas: [rect.width(), rect.height() - inset],
-                            abs_offset: [0.0, inset - mech::GUI_TOP_INSET],
+                            target,
+                            canvas,
+                            abs_offset,
                         });
                         // BillboardGuis / SurfaceGuis kept in a ScreenGui (the
                         // proximity prompts' ProximityPrompts gui) draw at
@@ -807,6 +886,69 @@ impl Gui {
                     }
                     "SurfaceGui" | "BillboardGui" => layered.push(g),
                     _ => {}
+                }
+            }
+        }
+        // CoreGui during Play: Roblox's built-in in-experience UIs (ExperienceChat,
+        // bubbleChat BillboardGuis, top-bar chat toggle) live in CoreGui, respecting
+        // ScreenInsets / DisplayOrder just like PlayerGui.
+        if inp.playing && inp.roots == Roots::View {
+            if let Some(core) = d.find_child(root, "CoreGui") {
+                let mut stack: Vec<Ref> = children(d, core);
+                stack.reverse();
+                while let Some(g) = stack.pop() {
+                    let Some(class) = d.class_of(g) else { continue };
+                    match class.as_str() {
+                        "ScreenGui" => {
+                            if !boolp(d, g, "Enabled", true) {
+                                continue;
+                            }
+                            let si = enum_u32(d.prop(g, "ScreenInsets"));
+                            let ignore = matches!(si, Some(0) | Some(1));
+                            let inset = if ignore { 0.0 } else { mech::GUI_TOP_INSET };
+                            let (target, canvas, abs_offset) = self.screen_root(rect, si, inset);
+                            roots.push(Root {
+                                on_top: true,
+                                light: 1.0,
+                                order: 1_000_000 + num(d, g, "DisplayOrder", 0.0) as i64,
+                                dist: 0.0,
+                                gui: g,
+                                target,
+                                canvas,
+                                abs_offset,
+                            });
+                            // Nested ScreenGuis (e.g. CoreGui.ExperienceChat.bubbleChat)
+                            // and BillboardGuis / SurfaceGuis inside CoreGui ScreenGuis.
+                            let mut sub: Vec<Ref> = children(d, g);
+                            sub.reverse();
+                            for c in sub {
+                                match d.class_of(c).as_deref() {
+                                    Some("BillboardGui" | "SurfaceGui") => {
+                                        if boolp(d, c, "Enabled", true)
+                                            && matches!(d.prop(c, "Adornee"), Some(Variant::Ref(a)) if d.exists(a))
+                                        {
+                                            layered.push(c);
+                                        }
+                                    }
+                                    Some("ScreenGui" | "Folder") => stack.push(c),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        "BillboardGui" | "SurfaceGui" => {
+                            if boolp(d, g, "Enabled", true)
+                                && matches!(d.prop(g, "Adornee"), Some(Variant::Ref(a)) if d.exists(a))
+                            {
+                                layered.push(g);
+                            }
+                        }
+                        "Folder" => {
+                            let mut k = children(d, g);
+                            k.reverse();
+                            stack.extend(k);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -977,27 +1119,38 @@ impl Gui {
                 RootProps {
                     // ZIndexBehavior: Global 0, Sibling 1.
                     global_z: enum_u32(d.prop(g, "ZIndexBehavior")).unwrap_or(0) == 0,
-                    clips: class == "ScreenGui"
-                        || doc::is_a(class, "PluginGui")
+                    screen_gui: class == "ScreenGui",
+                    clips: doc::is_a(class, "PluginGui")
                         || boolp(d, g, "ClipsDescendants", class == "SurfaceGui"),
                 }
             };
             // (kept while the journal is this document's: see cache_marks)
-            let RootProps { global_z, clips } = if specs_ok {
+            let RootProps { global_z, screen_gui, clips } = if specs_ok {
                 *self.root_props.entry(g).or_insert_with(read_props)
             } else {
                 read_props()
             };
             let canvas_rect =
                 Rect::from_min_size(Pos2::ZERO, egui::vec2(root.canvas[0], root.canvas[1]));
-            let clip = if clips { canvas_rect } else { Rect::EVERYTHING };
+            let clip = if screen_gui {
+                // The view, in the canvas's coordinates: a ScreenGui's content
+                // is not held to its inset box (Roblox: a Frame at Y offset
+                // −58 in a CoreUISafeInsets gui shows under the top bar;
+                // TopbarPlus's dropdowns hang below its TopbarSafeInsets gui).
+                match root.target {
+                    Target::Screen(o) => Rect::from_min_max(rect.min - o.to_vec2(), rect.max - o.to_vec2()),
+                    _ => canvas_rect,
+                }
+            } else if clips {
+                canvas_rect
+            } else {
+                Rect::EVERYTHING
+            };
             let root_box = GuiBox {
                 pos: root.abs_offset,
                 size: root.canvas,
                 rot: 0.0,
-                text: None,
-                canvas: None,
-                canvas_fit: None,
+                ..Default::default()
             };
             if self.layout.insert(g, root_box) != Some(root_box) {
                 self.layout_changed = true;
@@ -1036,7 +1189,7 @@ impl Gui {
                     Target::Billboard(..) => (0.0, 0.0, 2.0),
                 };
                 [
-                    ox, oy, root.canvas[0], root.canvas[1], root.abs_offset[1],
+                    ox, oy, root.canvas[0], root.canvas[1], root.abs_offset[0], root.abs_offset[1],
                     clip.min.x, clip.min.y, clip.max.x, clip.max.y, ctx.pixels_per_point(),
                     global_z as u32 as f32, kind,
                 ]
@@ -1215,6 +1368,7 @@ impl Gui {
                         cur: Ref::none(),
                         rec: Vec::new(),
                         replaying: 0,
+                        table_cells: HashMap::new(),
                     };
                     // A UIScale under the GUI itself scales offsets and text, not
                     // the canvas (Studio: RoundResultsGui at 1.5 keeps its
@@ -1259,6 +1413,7 @@ impl Gui {
                             cur: Ref::none(),
                             rec: Vec::new(),
                             replaying: 0,
+                            table_cells: HashMap::new(),
                         };
                         w.children(g, padded(d, g, canvas_rect, root_ui_scale(d, g)), Down { aff: Aff::ID, clip, alpha: 1.0, tint: [1.0, 1.0, 1.0], scale: root_ui_scale(d, g), z: 0, turn: 0.0 });
                         let (items2, hits2, boxes2) = (std::mem::take(&mut w.items), std::mem::take(&mut w.hits), std::mem::take(&mut w.boxes));
@@ -1494,6 +1649,7 @@ impl Gui {
                     textbox: h.textbox,
                     sink: h.sink,
                     scrolling: h.scrolling,
+                    page_layout: h.page_layout,
                     drag: h.drag,
                     painted: h.painted,
                 });
@@ -1645,6 +1801,26 @@ impl Gui {
         !self.hovered.is_empty()
     }
 
+    /// Pointer is currently over a GUI object that sinks clicks (`Active`, button, or TextBox).
+    pub fn pointer_over_sink(&self) -> bool {
+        self.last_over_sink
+    }
+
+    /// The last frame's mouse wheel was consumed by a GUI object.
+    pub fn wheel_sunk(&self) -> bool {
+        self.last_wheel_sunk
+    }
+
+    /// Whether a mouse wheel at screen point `p` lands on a GUI object that
+    /// consumes scroll / pointer input (an Active/sink object, ScrollingFrame, or UIPageLayout).
+    pub fn sinks_wheel_at(&self, p: Pos2) -> bool {
+        self.hits.iter().rev().any(|h| {
+            (h.sink || h.scrolling || h.page_layout.is_some())
+                && point_in_quad(&h.quad, p)
+                && h.clip.is_none_or(|c| point_in_quad(&c, p))
+        })
+    }
+
     /// A drag from elsewhere (Explorer instances) let go at `p` over this
     /// plugin GUI: nothing here was pressed, so only the top object that
     /// takes clicks hears MouseButton1Up (a button) and InputEnded
@@ -1682,6 +1858,8 @@ impl Gui {
             None => Vec::new(),
         };
         let top = under.iter().rev().find(|h| h.sink).cloned();
+        self.last_over_sink = top.is_some();
+        self.last_wheel_sunk = false;
         // GUI coordinates: from the view's top-left, below the top bar inset (as InputObject.Position).
         let inset = self.input_inset.unwrap_or(mech::GUI_TOP_INSET);
         // Plugin GUIs (dock widgets, CoreGui in the edit view) follow Studio's
@@ -1702,9 +1880,12 @@ impl Gui {
                         "MouseEnter",
                         vec![GuiArg::Num(x as f64), GuiArg::Num(y as f64)],
                     ));
-                    if plugin {
-                        self.events.push(GuiEvent::Fire(h.r, "InputBegan", vec![GuiArg::Input { button: 0, began: true, x, y }]));
-                    }
+                    self.events.push(GuiEvent::Fire(
+                        h.r,
+                        "InputBegan",
+                        vec![GuiArg::Input { button: 0, began: true, x, y }],
+                    ));
+                    self.events.push(GuiEvent::GuiStateChanged(h.r));
                 } else if moved {
                     self.events.push(GuiEvent::Fire(
                         h.r,
@@ -1725,6 +1906,39 @@ impl Gui {
                 let (x, y) = gui_xy(p);
                 super::share().drags.push((d, 1, x, y));
             }
+            if let (Some(tb), Some(p)) = (self.tb_selecting, pointer) {
+                if self.focus == Some(tb) && ctx.input(|i| i.pointer.primary_down()) {
+                    if let Some(pos) = self.textbox_pos_from_screen(tb, p) {
+                        if let Some(layout) = self.tb_layouts.get(&tb) {
+                            let mut st = textbox::TextBoxState {
+                                text: layout.text.clone(),
+                                cursor: self.tb_cursor,
+                                selection_start: self.tb_sel,
+                                focused: true,
+                                editable: true,
+                                multi_line: false,
+                                clear_text_on_focus: false,
+                            };
+                            let out = st.apply(textbox::EditAction::DragTo { pos });
+                            if out.changed_cursor || out.changed_selection {
+                                self.tb_cursor = st.cursor;
+                                self.tb_sel = st.selection_start;
+                                self.tb_blink = ui_time(ctx);
+                                let mut sh = super::share();
+                                sh.tb_cursor.insert(tb, st.cursor);
+                                sh.tb_sel.insert(tb, st.selection_start);
+                                drop(sh);
+                                self.events.push(GuiEvent::TextBoxUpdate {
+                                    r: tb,
+                                    text: None,
+                                    cursor: out.changed_cursor.then_some(st.cursor),
+                                    selection: out.changed_selection.then_some(st.selection_start),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         for r in self.hovered.difference(&now) {
             self.events.push(GuiEvent::Fire(
@@ -1732,9 +1946,12 @@ impl Gui {
                 "MouseLeave",
                 vec![GuiArg::Num(lx as f64), GuiArg::Num(ly as f64)],
             ));
-            if plugin {
-                self.events.push(GuiEvent::Fire(*r, "InputEnded", vec![GuiArg::Input { button: 0, began: false, x: lx, y: ly }]));
-            }
+            self.events.push(GuiEvent::Fire(
+                *r,
+                "InputEnded",
+                vec![GuiArg::Input { button: 0, began: false, x: lx, y: ly }],
+            ));
+            self.events.push(GuiEvent::GuiStateChanged(*r));
         }
         self.hovered = now;
         {
@@ -1761,6 +1978,7 @@ impl Gui {
                 })
                 .collect()
         });
+        let had_press = !presses.is_empty();
         for (button, pressed) in presses {
             let b = match button {
                 egui::PointerButton::Primary => 1u8,
@@ -1792,7 +2010,13 @@ impl Gui {
                     let mut sh = super::share();
                     sh.focus_events.push((f, false, false, Some((b, x, y))));
                     sh.focus = None;
+                    sh.tb_cursor.insert(f, -1);
+                    sh.tb_sel.insert(f, -1);
                     self.focus = None;
+                    self.tb_cursor = -1;
+                    self.tb_sel = -1;
+                    self.tb_selecting = None;
+                    self.tb_held_key = None;
                 }
                 let began_at = self.events.len();
                 for h in &under {
@@ -1819,6 +2043,7 @@ impl Gui {
                     took = true;
                     self.pressed = Some((t.r, b));
                     super::share().pressed = Some(t.r);
+                    self.events.push(GuiEvent::GuiStateChanged(t.r));
                     if t.button {
                         let ev = GuiEvent::Fire(
                             t.r,
@@ -1835,15 +2060,65 @@ impl Gui {
                             self.events.push(ev);
                         }
                     }
-                    if t.textbox && b == 1 && self.focus != Some(t.r) {
-                        self.focus = Some(t.r);
-                        let mut sh = super::share();
-                        sh.focus_events.push((t.r, true, false, Some((b, x, y))));
-                        sh.focus = Some(t.r);
+                    if t.textbox && b == 1 {
+                        let now_s = ui_time(ctx);
+                        let click_pos = self.textbox_pos_from_screen(t.r, p);
+                        let is_dbl = self.tb_last_click.is_some_and(|(lr, lt, lp)| {
+                            lr == t.r && (now_s - lt) <= 0.4 && (lp - p).length() <= 6.0
+                        });
+                        self.tb_last_click = if is_dbl { None } else { Some((t.r, now_s, p)) };
+                        self.tb_blink = now_s;
+                        if self.focus != Some(t.r) {
+                            self.focus = Some(t.r);
+                            let pos = click_pos.unwrap_or(1);
+                            self.tb_cursor = pos as i32;
+                            self.tb_sel = -1;
+                            self.tb_selecting = Some(t.r);
+                            self.tb_held_key = None;
+                            let mut sh = super::share();
+                            sh.tb_focus_click = click_pos.map(|cp| (t.r, cp));
+                            sh.focus_events.push((t.r, true, false, Some((b, x, y))));
+                            sh.focus = Some(t.r);
+                            sh.tb_cursor.insert(t.r, self.tb_cursor);
+                            sh.tb_sel.insert(t.r, -1);
+                        } else if let (Some(pos), Some(layout)) = (click_pos, self.tb_layouts.get(&t.r)) {
+                            let shift = ctx.input(|i| i.modifiers.shift);
+                            let mut st = textbox::TextBoxState {
+                                text: layout.text.clone(),
+                                cursor: self.tb_cursor,
+                                selection_start: self.tb_sel,
+                                focused: true,
+                                editable: true,
+                                multi_line: false,
+                                clear_text_on_focus: false,
+                            };
+                            let action = if is_dbl {
+                                textbox::EditAction::DoubleClickAt { pos }
+                            } else {
+                                self.tb_selecting = Some(t.r);
+                                textbox::EditAction::ClickAt { pos, shift }
+                            };
+                            let out = st.apply(action);
+                            if out.changed_cursor || out.changed_selection {
+                                self.tb_cursor = st.cursor;
+                                self.tb_sel = st.selection_start;
+                                let mut sh = super::share();
+                                sh.tb_cursor.insert(t.r, st.cursor);
+                                sh.tb_sel.insert(t.r, st.selection_start);
+                                drop(sh);
+                                self.events.push(GuiEvent::TextBoxUpdate {
+                                    r: t.r,
+                                    text: None,
+                                    cursor: out.changed_cursor.then_some(st.cursor),
+                                    selection: out.changed_selection.then_some(st.selection_start),
+                                });
+                            }
+                        }
                     }
                 }
             } else {
                 if b == 1 {
+                    self.tb_selecting = None;
                     if let Some(d) = self.dragging.take() {
                         super::share().drags.push((d, 2, x, y));
                     }
@@ -1854,6 +2129,7 @@ impl Gui {
                 }
                 if let Some((pr, pb)) = self.pressed.take() {
                     super::share().pressed = None;
+                    self.events.push(GuiEvent::GuiStateChanged(pr));
                     if pb != b {
                         continue;
                     }
@@ -1922,6 +2198,10 @@ impl Gui {
                 })
                 .sum()
         });
+        if moved || had_press || wheel != 0.0 {
+            // Mouse activity hides the keyboard/gamepad selection cursor (matching Roblox).
+            super::share().selection_visible = false;
+        }
         if wheel != 0.0 && resp.hovered() {
             // Every object under the pointer hears the notch (MouseWheelForward
             // / Backward and InputChanged with a MouseWheel InputObject).
@@ -1944,78 +2224,300 @@ impl Gui {
             if let Some(sf) = under.iter().rev().find(|h| h.scrolling) {
                 self.events.push(GuiEvent::Scroll(sf.r, [0.0, -wheel]));
                 took = true;
+                self.last_wheel_sunk = true;
+            } else if let Some(pl) = under.iter().rev().find_map(|h| h.page_layout) {
+                super::share().page_scrolls.push((pl, if wheel > 0.0 { -1 } else { 1 }));
+                took = true;
+                self.last_wheel_sunk = true;
+            } else if top.is_some() {
+                took = true;
+                self.last_wheel_sunk = true;
             }
         }
         took
     }
 
-    /// Typing into the focused TextBox; Enter / Escape end it. True while a
-    /// TextBox has the keyboard.
+    /// Maps a screen pointer position `p` into a 1-based UTF-8 byte offset inside `tb`'s text.
+    fn textbox_pos_from_screen(&self, tb: Ref, p: Pos2) -> Option<usize> {
+        let layout = self.tb_layouts.get(&tb)?;
+        if layout.is_placeholder || layout.text.is_empty() {
+            return Some(1);
+        }
+        let origin = layout.screen_origin?;
+        let canvas_p = Pos2::new(p.x - origin.x, p.y - origin.y);
+        // (For unrotated ScreenGui TextBoxes, aff is identity; for rotated, invert 2x2)
+        let local_p = if layout.aff.is_id() {
+            canvas_p
+        } else {
+            canvas_p
+        };
+        let rel = local_p - layout.text_origin;
+        let cc = layout.galley.cursor_from_pos(rel);
+        let char_idx: usize = cc.index.into();
+        let byte_pos = layout
+            .text
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(layout.text.len());
+        Some(byte_pos + 1)
+    }
+
+    /// Editing the focused TextBox: full caret movement, selection, clipboard,
+    /// word jumps/deletes, MultiLine, TextEditable, key repeat, and Enter/Escape.
+    /// True while a TextBox has the keyboard.
     pub fn keyboard(&mut self, ctx: &egui::Context, doc: &Document) -> bool {
+        // A focus a script takes from a key's InputBegan (the chat's "/"
+        // hotkey calling CaptureFocus) doesn't receive that key's character,
+        // as in Roblox. The script runs on the Play worker and the character
+        // can come a frame or two after the key (IME commit), so remember the
+        // last key's character and drop it once if it arrives soon after.
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = rustudio_core::sim_clock::now();
+        let now_s = ui_time(ctx);
+        ctx.input(|i| {
+            for e in &i.raw.events {
+                if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = e {
+                    if !modifiers.ctrl && !modifiers.command && !modifiers.alt {
+                        let sym = key.symbol_or_name();
+                        self.last_key_char = (sym.len() == 1 && sym.as_bytes()[0].is_ascii_graphic()).then(|| (sym.to_lowercase(), now));
+                    }
+                }
+            }
+        });
         // Scripts' TextBox:CaptureFocus / ReleaseFocus (they fired the events).
-        for req in std::mem::take(&mut super::share().focus_req) {
+        let (focus_reqs, script_sels) = {
+            let mut sh = super::share();
+            (
+                std::mem::take(&mut sh.focus_req),
+                std::mem::take(&mut sh.tb_script_sel),
+            )
+        };
+        for req in focus_reqs {
+            if req.is_some() && req != self.focus {
+                self.swallow = self.last_key_char.take().filter(|(_, at)| now - *at < WINDOW);
+                self.tb_blink = now_s;
+                self.tb_held_key = None;
+                if let Some(r) = req {
+                    let sh = super::share();
+                    let text_len = text_prop(doc, r, "Text").len() as i32;
+                    self.tb_cursor = sh.tb_cursor.get(&r).copied().unwrap_or(text_len + 1);
+                    self.tb_sel = sh.tb_sel.get(&r).copied().unwrap_or(-1);
+                }
+            } else if req.is_none() {
+                self.tb_cursor = -1;
+                self.tb_sel = -1;
+                self.tb_selecting = None;
+                self.tb_held_key = None;
+            }
             self.focus = req;
+        }
+        for (r, cur, sel) in script_sels {
+            if self.focus == Some(r) {
+                if let Some(c) = cur {
+                    self.tb_cursor = c;
+                    self.tb_blink = now_s;
+                }
+                if let Some(s) = sel {
+                    self.tb_sel = s;
+                }
+            }
+        }
+        if self.swallow.as_ref().is_some_and(|(_, at)| now - *at >= WINDOW) {
+            self.swallow = None;
         }
         let Some(f) = self.focus else { return false };
         if !doc.exists(f) {
             self.focus = None;
-            super::share().focus = None;
+            self.tb_cursor = -1;
+            self.tb_sel = -1;
+            self.tb_selecting = None;
+            self.tb_held_key = None;
+            let mut sh = super::share();
+            sh.focus = None;
+            sh.tb_cursor.insert(f, -1);
+            sh.tb_sel.insert(f, -1);
             return false;
         }
-        let mut text = text_prop(doc, f, "Text");
-        let before = text.clone();
-        let mut done: Option<bool> = None;
-        // (The raw events: nothing else in the editor may have used them up.)
-        ctx.input(|i| {
-            for e in &i.raw.events {
-                match e {
-                    egui::Event::Text(t) => text.push_str(t),
-                    egui::Event::Key {
-                        key: egui::Key::Backspace,
-                        pressed: true,
-                        ..
-                    } => {
-                        text.pop();
+        // Keep live cursor valid against the document's current Text.
+        let cur_text = text_prop(doc, f, "Text");
+        let editable = boolp(doc, f, "TextEditable", true);
+        let multi_line = boolp(doc, f, "MultiLine", false);
+        let clear_on_focus = boolp(doc, f, "ClearTextOnFocus", true);
+        if self.tb_cursor < 1 {
+            self.tb_cursor = (cur_text.len() + 1) as i32;
+        } else if (self.tb_cursor - 1) as usize > cur_text.len() {
+            self.tb_cursor = (cur_text.len() + 1) as i32;
+        }
+        if self.tb_sel > (cur_text.len() + 1) as i32 {
+            self.tb_sel = (cur_text.len() + 1) as i32;
+        }
+        let mut state = textbox::TextBoxState {
+            text: cur_text,
+            cursor: self.tb_cursor,
+            selection_start: self.tb_sel,
+            focused: true,
+            editable,
+            multi_line,
+            clear_text_on_focus: clear_on_focus,
+        };
+
+        // Collect raw events (nothing else in the editor may have used them up).
+        let raw_events: Vec<egui::Event> = ctx.input(|i| i.raw.events.clone());
+        let saw_copy_ev = raw_events.iter().any(|e| matches!(e, egui::Event::Copy));
+        let saw_cut_ev = raw_events.iter().any(|e| matches!(e, egui::Event::Cut));
+        let saw_paste_ev = raw_events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+
+        let key_to_action = |key: egui::Key, mods: egui::Modifiers, repeat: bool, multi: bool, clip: &str| -> Option<textbox::EditAction> {
+            let cmd = mods.ctrl || mods.command;
+            let word = cmd || (cfg!(target_os = "macos") && mods.alt);
+            let shift = mods.shift;
+            match key {
+                egui::Key::ArrowLeft => Some(textbox::EditAction::Left { shift, word }),
+                egui::Key::ArrowRight => Some(textbox::EditAction::Right { shift, word }),
+                egui::Key::ArrowUp => Some(textbox::EditAction::Up { shift }),
+                egui::Key::ArrowDown => Some(textbox::EditAction::Down { shift }),
+                egui::Key::Home => Some(textbox::EditAction::Home { shift }),
+                egui::Key::End => Some(textbox::EditAction::End { shift }),
+                egui::Key::Backspace => Some(textbox::EditAction::Backspace { word }),
+                egui::Key::Delete => Some(textbox::EditAction::Delete { word }),
+                egui::Key::Enter => (!repeat || multi).then_some(textbox::EditAction::Enter),
+                egui::Key::Escape => (!repeat).then_some(textbox::EditAction::Escape),
+                egui::Key::A if cmd && !mods.alt => Some(textbox::EditAction::SelectAll),
+                egui::Key::C if cmd && !mods.alt && !shift && !saw_copy_ev => Some(textbox::EditAction::Copy),
+                egui::Key::X if cmd && !mods.alt && !shift && !saw_cut_ev => Some(textbox::EditAction::Cut),
+                egui::Key::V if cmd && !mods.alt && !shift && !saw_paste_ev => {
+                    Some(textbox::EditAction::Paste(clip.to_string()))
+                }
+                _ => None,
+            }
+        };
+        let is_repeatable = |key: egui::Key| {
+            matches!(
+                key,
+                egui::Key::ArrowLeft
+                    | egui::Key::ArrowRight
+                    | egui::Key::ArrowUp
+                    | egui::Key::ArrowDown
+                    | egui::Key::Backspace
+                    | egui::Key::Delete
+            )
+        };
+
+        let mut actions: Vec<textbox::EditAction> = Vec::new();
+        for e in &raw_events {
+            match e {
+                egui::Event::Copy => actions.push(textbox::EditAction::Copy),
+                egui::Event::Cut => actions.push(textbox::EditAction::Cut),
+                egui::Event::Paste(s) => actions.push(textbox::EditAction::Paste(s.clone())),
+                egui::Event::Text(t) => {
+                    let mut s = t.as_str();
+                    if let Some((c, _)) = self.swallow.as_ref() {
+                        if let Some(rest) = s.strip_prefix(c.as_str()) {
+                            s = rest;
+                            self.swallow = None;
+                        } else if !s.is_empty() {
+                            self.swallow = None;
+                        }
                     }
-                    egui::Event::Key {
-                        key: egui::Key::Enter,
-                        pressed: true,
-                        ..
-                    } => done = Some(true),
-                    egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    } => done = Some(false),
-                    _ => {}
+                    // Drop ASCII control characters (Ctrl+A/C/X/V on some platforms send \x01/\x03/\x18/\x16).
+                    let clean: String = s
+                        .chars()
+                        .filter(|c| !c.is_control() || *c == '\t' || (*c == '\n' && multi_line))
+                        .collect();
+                    if !clean.is_empty() {
+                        actions.push(textbox::EditAction::InsertText(clean));
+                    }
+                }
+                egui::Event::Key { key, pressed: true, repeat, modifiers, .. } => {
+                    if *repeat {
+                        if let Some(held) = self.tb_held_key.as_mut() {
+                            held.4 = true;
+                        }
+                    } else if is_repeatable(*key) {
+                        self.tb_held_key = Some((*key, *modifiers, now_s, now_s, false));
+                    }
+                    if let Some(act) = key_to_action(*key, *modifiers, *repeat, multi_line, &self.tb_clipboard) {
+                        actions.push(act);
+                    }
+                }
+                egui::Event::Key { key, pressed: false, .. } => {
+                    if self.tb_held_key.is_some_and(|(hk, ..)| hk == *key) {
+                        self.tb_held_key = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Synthetic key repeat for held navigation/delete keys when the platform/harness
+        // does not emit OS `repeat: true` events (400ms initial delay, 33ms repeat interval).
+        if let Some((hk, hmods, pressed_at, last_rep, saw_os_rep)) = self.tb_held_key {
+            if !saw_os_rep && (now_s - pressed_at) >= 0.40 && (now_s - last_rep) >= 0.033 {
+                self.tb_held_key = Some((hk, hmods, pressed_at, now_s, false));
+                if let Some(act) = key_to_action(hk, hmods, true, multi_line, &self.tb_clipboard) {
+                    actions.push(act);
                 }
             }
-        });
-        if text != before {
-            self.events.push(GuiEvent::SetText(f, text));
         }
-        if let Some(enter) = done {
+
+        let mut lost_focus: Option<bool> = None;
+        for act in actions {
+            let out = state.apply(act);
+            if let Some(copied) = out.copied {
+                self.tb_clipboard = copied.clone();
+                ctx.copy_text(copied);
+            }
+            if let Some(enter) = out.lost_focus {
+                lost_focus = Some(enter);
+                break;
+            }
+            if out.changed_cursor || out.changed_selection || out.changed_text {
+                self.tb_cursor = state.cursor;
+                self.tb_sel = state.selection_start;
+                self.tb_blink = now_s;
+                {
+                    let mut sh = super::share();
+                    sh.tb_cursor.insert(f, state.cursor);
+                    sh.tb_sel.insert(f, state.selection_start);
+                }
+                self.events.push(GuiEvent::TextBoxUpdate {
+                    r: f,
+                    text: out.changed_text.then(|| state.text.clone()),
+                    cursor: out.changed_cursor.then_some(state.cursor),
+                    selection: out.changed_selection.then_some(state.selection_start),
+                });
+            }
+        }
+
+        if let Some(enter) = lost_focus {
             // Enter / Esc: the scripts fire FocusLost with the key's InputObject.
             let mut sh = super::share();
             sh.focus_events.push((f, false, enter, Some((0, 0.0, 0.0))));
             sh.focus = None;
+            sh.tb_cursor.insert(f, -1);
+            sh.tb_sel.insert(f, -1);
             self.focus = None;
+            self.tb_cursor = -1;
+            self.tb_sel = -1;
+            self.tb_selecting = None;
+            self.tb_held_key = None;
         }
         true
     }
 
-    /// Keyboard navigation of GuiService.SelectedObject: arrows move to the
-    /// NextSelection* object or the nearest Selectable one that way; Enter
-    /// activates it.
+    /// Keyboard navigation of GuiService.SelectedCoreObject / SelectedObject:
+    /// `\` toggles UI navigation mode (when `UiNavigationKeyBindEnabled` is on),
+    /// arrows move to the NextSelection* object or the nearest Selectable one
+    /// that way; Enter activates it.
     pub fn navigate(&mut self, ctx: &egui::Context, doc: &Document) {
+        if self.focus.is_some() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
         let Some(gs) = doc.find_child(doc.dom.root_ref(), "GuiService") else {
             return;
         };
-        let sel = match doc.prop(gs, "SelectedObject") {
-            Some(Variant::Ref(r)) if doc.exists(r) => r,
-            _ => return,
-        };
-        let (dir, enter) = ctx.input(|i| {
+        let (dir, enter, toggle_nav) = ctx.input(|i| {
             use egui::Key::*;
             let d = if i.key_pressed(ArrowUp) {
                 Some((0.0, -1.0, "NextSelectionUp"))
@@ -2028,9 +2530,62 @@ impl Gui {
             } else {
                 None
             };
-            (d, i.key_pressed(Enter))
+            (d, i.key_pressed(Enter), i.key_pressed(Backslash))
         });
+        let selected_core = match doc.prop(gs, "SelectedCoreObject") {
+            Some(Variant::Ref(r)) if doc.exists(r) => Some(r),
+            _ => None,
+        };
+        let selected_game = match doc.prop(gs, "SelectedObject") {
+            Some(Variant::Ref(r)) if doc.exists(r) => Some(r),
+            _ => None,
+        };
+        let is_selectable = |h: &Hit| -> bool {
+            if !boolp(doc, h.r, "Interactable", true) {
+                return false;
+            }
+            match doc.prop(h.r, "Selectable") {
+                Some(Variant::Bool(s)) => s,
+                _ => h.button || h.textbox,
+            }
+        };
+        if toggle_nav {
+            let mut sh = super::share();
+            if !sh.ui_nav_toggle_disabled {
+                let core_menu = sh.core_menu_open;
+                if core_menu {
+                    let next = !sh.selection_visible;
+                    sh.selection_visible = next;
+                    drop(sh);
+                    if next && selected_core.is_none() {
+                        if let Some(h) = self.hits.iter().find(|h| is_selectable(h)) {
+                            self.events.push(GuiEvent::SelectCore(Some(h.r)));
+                        }
+                    }
+                } else if selected_game.is_some() {
+                    sh.selection_visible = false;
+                    drop(sh);
+                    self.events.push(GuiEvent::Select(None));
+                } else if let Some(h) = self.hits.iter().find(|h| is_selectable(h)) {
+                    sh.selection_visible = true;
+                    drop(sh);
+                    self.events.push(GuiEvent::Select(Some(h.r)));
+                }
+            }
+            return;
+        }
+        let core_menu = super::share().core_menu_open;
+        let (sel, is_core) = if let Some(r) = selected_core.filter(|_| core_menu) {
+            (r, true)
+        } else if let Some(r) = selected_game {
+            (r, false)
+        } else if let Some(r) = selected_core.filter(|_| super::share().selection_visible) {
+            (r, true)
+        } else {
+            return;
+        };
         if enter
+            && (!is_core || super::share().selection_visible)
             && doc
                 .class_of(sel)
                 .is_some_and(|c| doc::is_a(&c, "GuiButton"))
@@ -2052,9 +2607,17 @@ impl Gui {
             ));
         }
         let Some((dx, dy, prop)) = dir else { return };
+        super::share().selection_visible = true;
+        let emit_select = |events: &mut Vec<GuiEvent>, target: Ref| {
+            if is_core {
+                events.push(GuiEvent::SelectCore(Some(target)));
+            } else {
+                events.push(GuiEvent::Select(Some(target)));
+            }
+        };
         if let Some(Variant::Ref(n)) = doc.prop(sel, prop) {
             if doc.exists(n) {
-                self.events.push(GuiEvent::Select(Some(n)));
+                emit_select(&mut self.events, n);
                 return;
             }
         }
@@ -2070,14 +2633,10 @@ impl Gui {
             if h.r == sel {
                 continue;
             }
-            let selectable = match doc.prop(h.r, "Selectable") {
-                Some(Variant::Bool(s)) => s && (h.button || h.textbox),
-                _ => h.button || h.textbox,
-            };
             let Some(b) = self.layout.get(&h.r) else {
                 continue;
             };
-            if !selectable {
+            if !is_selectable(h) {
                 continue;
             }
             let c = (
@@ -2094,7 +2653,7 @@ impl Gui {
             }
         }
         if let Some((_, r)) = best {
-            self.events.push(GuiEvent::Select(Some(r)));
+            emit_select(&mut self.events, r);
         }
     }
 
@@ -2233,6 +2792,10 @@ fn place_3d(
     if canvas[0] <= 0.0 || canvas[1] <= 0.0 || canvas[0] > 8192.0 || canvas[1] > 8192.0 {
         return None;
     }
+    // SizeOffset shifts the billboard center in fractions of its rendered size
+    // (+X right, +Y up in Roblox's screen-space offset convention).
+    let size_off = vec2(d, g, "SizeOffset", [0.0, 0.0]);
+    let c = Pos2::new(c.x + size_off[0] * canvas[0], c.y - size_off[1] * canvas[1]);
     Some((Target::Billboard(c, p), canvas, dist))
 }
 
@@ -2392,10 +2955,6 @@ impl SurfaceSpec {
         Some((Target::Surface { tl: g.tl, tr: g.tr, bl: g.bl }, g.canvas, dist))
     }
 }
-
-/// The rows egui's font atlas starts with on an 8192-wide device (vendored
-/// epaint: about 8M texels): its first growth is prepared at load.
-const FIRST_ATLAS_ROWS: usize = 1024;
 
 /// A world root's place in the frame's world GUI triangles (`Gui::draw`).
 enum WorldPart {
@@ -2597,6 +3156,7 @@ impl SurfaceView {
 #[derive(Clone, Copy)]
 pub(crate) struct RootProps {
     global_z: bool,
+    screen_gui: bool,
     clips: bool,
 }
 
@@ -2888,7 +3448,7 @@ mod billboard_canvas_tests {
             ..Gui::default()
         };
         let output = || RootCache {
-            key: [24; 12],
+            key: [24; 13],
             shapes: Vec::new(),
             hits: Vec::new(),
             ui2d: (0, 0),
@@ -2899,11 +3459,11 @@ mod billboard_canvas_tests {
         gui.cache.insert(root, output());
         gui.root_boxes.insert(root, Vec::new());
         gui.cache_owned.insert(root, (vec![(label, label)], vec![root]));
-        gui.reuse_billboard_canvas(root, [36; 12]);
+        gui.reuse_billboard_canvas(root, [36; 13]);
         gui.cache.insert(other_root, output());
         gui.root_boxes.insert(other_root, Vec::new());
         gui.cache_owned.insert(other_root, (vec![(other_root, other_root)], vec![other_root]));
-        gui.reuse_billboard_canvas(other_root, [36; 12]);
+        gui.reuse_billboard_canvas(other_root, [36; 13]);
 
         gui.cache_marks(&d, &doc::Marks::Some(vec![
             doc::Mark::Prop(Ref::new(), rbx_dom_weak::ustr("CFrame")),
@@ -2927,8 +3487,8 @@ mod billboard_canvas_tests {
             vfs: Vec::new(), citems: Vec::new(), lhits: Vec::new(),
         };
         let mut gui = Gui::default();
-        let small_key = [24; 12];
-        let large_key = [36; 12];
+        let small_key = [24; 13];
+        let large_key = [36; 13];
         let small = GuiBox { size: [24.0, 24.0], ..GuiBox::default() };
         let large = GuiBox { size: [36.0, 36.0], ..GuiBox::default() };
         gui.cache.insert(root, make_output(small_key));

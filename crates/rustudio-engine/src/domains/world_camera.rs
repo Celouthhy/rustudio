@@ -219,6 +219,46 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         "ViewStretch" => {
             store_prop(lua, r, key, Variant::Float32(number()?))?;
         }
+        "CameraSubject" => {
+            let target = match value {
+                Value::Nil => {
+                    // In Roblox, setting workspace.CurrentCamera.CameraSubject = nil
+                    // resets it to the LocalPlayer's Character Humanoid if one exists.
+                    let w = world(lua)?;
+                    let d = w.d();
+                    let is_current = d
+                        .workspace()
+                        .and_then(|ws| match d.prop(ws, "CurrentCamera") {
+                            Some(Variant::Ref(c)) => Some(c),
+                            _ => None,
+                        })
+                        == Some(r);
+                    if is_current {
+                        let root = d.dom.root_ref();
+                        d.find_child(root, "Players")
+                            .and_then(|ps| match d.prop(ps, "LocalPlayer") {
+                                Some(Variant::Ref(lp)) if d.exists(lp) => Some(lp),
+                                _ => None,
+                            })
+                            .and_then(|lp| match d.prop(lp, "Character") {
+                                Some(Variant::Ref(ch)) if d.exists(ch) => Some(ch),
+                                _ => None,
+                            })
+                            .and_then(|ch| d.find_child(ch, "Humanoid"))
+                            .unwrap_or(Ref::none())
+                    } else {
+                        Ref::none()
+                    }
+                }
+                v => opt_inst(v).ok_or_else(|| {
+                    rt_err(format!(
+                        "Unable to assign property CameraSubject. Object expected, got {}",
+                        v.type_name()
+                    ))
+                })?,
+            };
+            store_prop(lua, r, key, Variant::Ref(target))?;
+        }
         "ProjectionType" | "OrthographicMode" => {
             let v = enum_of(value, key).ok_or_else(|| {
                 rt_err(format!("Unable to assign property {key}. EnumItem expected, got {}", value.type_name()))
@@ -231,7 +271,9 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
 }
 
 pub fn write_acts(class: &str, key: &str) -> bool {
-    class == "Camera" && matches!(key, "DiagonalFieldOfView" | "MaxAxisFieldOfView")
+    // The bundled PlayerModule consumes CameraOffset in both humanoid follow paths.
+    (class == "Humanoid" && key == "CameraOffset")
+        || (class == "Camera" && matches!(key, "CameraSubject" | "DiagonalFieldOfView" | "MaxAxisFieldOfView"))
 }
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
@@ -268,4 +310,73 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbx_dom_weak::InstanceBuilder;
+    use rustudio_core::doc::Document;
+
+    #[test]
+    fn api_tail_camera_offset_feeds_the_camera_script() {
+        assert!(super::write_acts("Humanoid", "CameraOffset"));
+        let runtime = Runtime::new().unwrap();
+        runtime.enter(World::new(Document::new_place(), RunMode::Run));
+        runtime.bind_globals().unwrap();
+        runtime.lua.load(r#"
+            local subject = Instance.new("Humanoid")
+            assert(subject.CameraOffset == Vector3.zero)
+            subject.CameraOffset = Vector3.new(1, 2, 3)
+            assert(subject.CameraOffset == Vector3.new(1, 2, 3))
+        "#).exec().unwrap();
+        runtime.leave();
+    }
+
+    #[test]
+    fn camera_subject_nil_resets_to_local_humanoid() {
+        let mut doc = Document::new_place();
+        doc.ensure_services();
+        let root = doc.dom.root_ref();
+        let ws = doc.workspace().unwrap();
+        let players = doc.find_child(root, "Players").unwrap();
+        let ch = doc.dom.insert(ws, InstanceBuilder::new("Model").with_name("Char"));
+        let hum = doc.dom.insert(ch, InstanceBuilder::new("Humanoid").with_name("Humanoid"));
+        let other = doc.dom.insert(ws, InstanceBuilder::new("Part").with_name("Other"));
+        let lp = doc.dom.insert(
+            players,
+            InstanceBuilder::new("Player")
+                .with_name("P1")
+                .with_property("Character", Variant::Ref(ch)),
+        );
+        doc.dom.get_by_ref_mut(players).unwrap().properties.insert(ustr("LocalPlayer"), Variant::Ref(lp));
+        let cam = doc.dom.insert(
+            ws,
+            InstanceBuilder::new("Camera")
+                .with_name("Camera")
+                .with_property("CameraSubject", Variant::Ref(other)),
+        );
+        doc.dom.get_by_ref_mut(ws).unwrap().properties.insert(ustr("CurrentCamera"), Variant::Ref(cam));
+        let rt = Runtime::new().expect("runtime");
+        rt.enter(World::new(doc, RunMode::Play));
+        rt.bind_globals().expect("globals");
+        let ok: bool = rt
+            .lua
+            .load(
+                r#"
+                local cam = workspace.CurrentCamera
+                assert(cam.CameraSubject == workspace.Other)
+                cam.CameraSubject = nil
+                assert(cam.CameraSubject == workspace.Char.Humanoid, "CurrentCamera nil -> LocalPlayer Humanoid")
+                local extra = Instance.new("Camera")
+                extra.CameraSubject = workspace.Other
+                extra.CameraSubject = nil
+                assert(extra.CameraSubject == nil, "non-CurrentCamera nil stays nil")
+                return true
+                "#,
+            )
+            .eval()
+            .expect("camera subject test");
+        assert!(ok && hum.is_some());
+    }
 }

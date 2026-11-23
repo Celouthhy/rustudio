@@ -232,6 +232,9 @@ struct OutputRows {
     tops: Vec<f32>,
     height: f32,
     row_height: f32,
+    /// The widest line drawn so far (the content's width: long lines
+    /// scroll sideways, as Studio's Output does).
+    width: f32,
 }
 
 impl OutputRows {
@@ -240,6 +243,7 @@ impl OutputRows {
         self.shown.clear();
         self.tops.clear();
         self.height = 0.0;
+        self.width = 0.0;
     }
 }
 
@@ -364,20 +368,26 @@ impl Editor {
                     }
                 });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let more = ui.add(egui::Button::new("⋯").min_size(Vec2::new(24.0, 20.0)));
-                egui::Popup::menu(&more).show(|ui| {
+                let more = ui.add(egui::Button::new(String::default()).min_size(Vec2::new(24.0, 20.0))).on_hover_text("Output Settings");
+                rustudio_engine::ti::paint(ui.painter(), more.rect.shrink(2.0), "settings", theme::TEXT);
+                egui::Popup::menu(&more).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                     ui.checkbox(&mut st.show_timestamp, "Show Timestamp");
                     ui.checkbox(&mut st.show_context, "Show Context");
                     ui.checkbox(&mut st.show_source, "Show Source");
+                    // Studio Settings > Output > Clear Output On Start (the same setting).
+                    let mut clear = crate::studio_settings::flag("Studio", "Clear Output On Start", true);
+                    if ui.checkbox(&mut clear, "Clear On Play").changed() {
+                        crate::studio_settings::set("Studio", "Clear Output On Start", crate::studio_settings::Val::Bool(clear));
+                    }
                     if let Some(path) = rustudio_core::diagnostics::path() {
                         if ui.button("Copy Diagnostic Log Path").clicked() {
                             ui.ctx().copy_text(path.display().to_string());
                         }
                     }
                 });
-                let (r, clear) = ui.allocate_exact_size(Vec2::new(24.0, 20.0), Sense::click());
-                rustudio_engine::ti::paint(ui.painter(), r.shrink(2.0), "clear-all", theme::TEXT);
-                if clear.on_hover_text("Clear Output").clicked() {
+                let clear = ui.add(egui::Button::new(String::default()).min_size(Vec2::new(24.0, 20.0))).on_hover_text("Clear Output");
+                rustudio_engine::ti::paint(ui.painter(), clear.rect.shrink(2.0), "trash", theme::TEXT);
+                if clear.clicked() {
                     self.game.log.clear();
                     st.log_cleared();
                 }
@@ -421,12 +431,13 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
     let text_of = |st: &OutputState, i: usize| line_job(st, &log[i], &parse(&log[i])).text;
     let id = egui::Id::new("output_text");
     let mut drawn = 0;
-    egui::ScrollArea::vertical()
+    let mut widest = index.width;
+    egui::ScrollArea::both()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show_viewport(ui, |ui, viewport| {
             let total = *tops.last().unwrap_or(&0.0);
-            let (content, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total), Sense::hover());
+            let (content, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(widest), total), Sense::hover());
             let view = ui.clip_rect();
             // Under the lines (they only sense hover), above nothing: the
             // scroll bar is added after and stays on top.
@@ -457,6 +468,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
                 // (as the earlier row layout spaced them: bar, gap, space, gap)
                 let pos = egui::pos2(content.min.x + 2.0 * space + 2.0 * ui.spacing().item_spacing.x, top);
                 ui.painter().galley(pos, galley.clone(), PRINT);
+                widest = widest.max(pos.x - content.min.x + galley.size().x + space);
                 rows.push((i, tops[k + 1] - tops[k], top, pos, galley, slot, space));
                 drawn += 1;
             }
@@ -606,6 +618,7 @@ pub fn log_view(ui: &mut egui::Ui, st: &mut OutputState, log: &[LogLine]) -> usi
             }
         }
     }
+    index.width = widest;
     st.rows = index;
     drawn
 }

@@ -88,6 +88,12 @@ thread_local! {
 /// The text's size in pixels: Studio's GetTextSize (`width` the frame width
 /// it wraps at). Lines are TextSize tall; widths round up.
 pub fn text_size(text: &str, size: f32, family_json: &str, weight: u32, italic: bool, width: f32) -> [f32; 2] {
+    let legacy_scale = if family_json.ends_with("/LegacyArial.json") {
+        rustudio_core::mech::GUI_LEGACY_TEXT_SCALE
+    } else {
+        1.0
+    };
+    let eff_size = (size * legacy_scale).max(1.0);
     let lines = text.split('\n').count().max(1) as f32;
     if text.is_empty() {
         return [0.0, size];
@@ -96,7 +102,7 @@ pub fn text_size(text: &str, size: f32, family_json: &str, weight: u32, italic: 
         .or_else(|| face_path("rbxasset://fonts/families/SourceSansPro.json", 400, false));
     let Some(path) = path else {
         // No font files at all: Studio's average advance (half the size).
-        let w = text.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * size * 0.5;
+        let w = text.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32 * eff_size * 0.5;
         return [w.ceil(), size * lines];
     };
     M.with(|m| {
@@ -111,6 +117,7 @@ pub fn text_size(text: &str, size: f32, family_json: &str, weight: u32, italic: 
                 ms.defs.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
                 ms.defs.families.insert(FontFamily::Name(name.clone().into()), vec![name.clone()]);
                 ms.fonts = Fonts::new(TextOptions::default(), ms.defs.clone());
+                ms.fonts.set_measure_only(true);
                 let fam = FontFamily::Name(name.into());
                 let line = ms.fonts.with_pixels_per_point(1.0).row_height(&FontId::new(100.0, fam.clone())) / 100.0;
                 let em = rustudio_core::mech::GUI_FONT_EM_PER_TEXT_SIZE / line.max(0.5);
@@ -120,11 +127,13 @@ pub fn text_size(text: &str, size: f32, family_json: &str, weight: u32, italic: 
         let Some((fam, em)) = ms.faces.get(&path).cloned() else {
             return [0.0, size * lines];
         };
-        let mut f = egui::TextFormat::simple(FontId::new(size * em, fam), egui::Color32::WHITE);
+        let mut f = egui::TextFormat::simple(FontId::new(eff_size * em, fam), egui::Color32::WHITE);
         f.line_height = Some(size);
+        f.studio_text_size = Some(eff_size);
         let mut job = egui::text::LayoutJob::default();
         job.append(text, 0.0, f);
         job.wrap.max_width = if width > 0.0 { width } else { f32::INFINITY };
+        job.keep_trailing_whitespace = true;
         job.round_output_to_gui = false;
         let g = ms.fonts.with_pixels_per_point(1.0).layout_job(job);
         let rows = g.rows.len().max(1) as f32;
@@ -217,9 +226,7 @@ mod tests {
     use super::*;
 
     /// Studio 0.747's GetTextSize for the probe's cases
-    /// (captures/history.txt e.textsize): within a pixel, except Roboto
-    /// Mono (2 px wider here: Studio's hinted advances for that face are
-    /// narrower than its outline metrics).
+    /// (captures/history.txt e.textsize): exact match to the pixel.
     #[test]
     fn get_text_size_matches_studio() {
         if face_path("rbxasset://fonts/families/SourceSansPro.json", 400, false).is_none() {
@@ -242,8 +249,7 @@ mod tests {
             let (fam, wt, it) = legacy(f);
             let got = text_size(t, *s, &format!("rbxasset://fonts/families/{fam}.json"), wt, it, *w);
             println!("CAL {t:?} {s} {f}: {got:?} studio {want:?}");
-            let tol = if *f == "RobotoMono" { 2.0 } else { 1.0 };
-            if (got[0] - want[0]).abs() > tol || (got[1] - want[1]).abs() > 1.0 {
+            if got != *want {
                 bad.push(format!("{t:?} {s} {f}: {got:?} vs Studio {want:?}"));
             }
         }

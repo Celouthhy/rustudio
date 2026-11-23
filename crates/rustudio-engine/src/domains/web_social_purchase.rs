@@ -106,6 +106,33 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, ()| Ok(world(lua)?.has_peer))?,
     )?;
     ctx.set(
+        "has_purchase_prompt_app",
+        lua.create_function(|lua, ()| {
+            let w = world(lua)?;
+            let d = w.d();
+            let root = d.dom.root_ref();
+            let has = d
+                .dom
+                .get_by_ref(root)
+                .and_then(|r| {
+                    r.children()
+                        .iter()
+                        .copied()
+                        .find(|c| d.class_of(*c).is_some_and(|k| k == "CoreGui"))
+                })
+                .and_then(|cg| {
+                    d.dom.get_by_ref(cg).and_then(|i| {
+                        i.children()
+                            .iter()
+                            .copied()
+                            .find(|c| d.dom.get_by_ref(*c).is_some_and(|ch| ch.name == "PurchasePromptApp"))
+                    })
+                })
+                .is_some();
+            Ok(has)
+        })?,
+    )?;
+    ctx.set(
         "isplayer",
         lua.create_function(|lua, v: Value| {
             Ok(opt_inst(&v)
@@ -379,6 +406,27 @@ function module.pump()
     end)
 end
 local function local_prompt(service,token,player,kind,id)
+    if not ctx.present and ctx.has_purchase_prompt_app and ctx.has_purchase_prompt_app() then
+        if kind == 'Asset' then
+            ctx.fire(service, 'PromptPurchaseRequestedV2', player, id, false, Enum.CurrencyType.Robux, '', '')
+            return
+        elseif kind == 'GamePass' then
+            ctx.fire(service, 'PromptGamePassPurchaseRequested', player, id)
+            return
+        elseif kind == 'Product' then
+            ctx.fire(service, 'PromptProductPurchaseRequested', player, id, false, Enum.CurrencyType.Robux)
+            return
+        elseif kind == 'Bundle' then
+            ctx.fire(service, 'PromptBundlePurchaseRequested', player, id)
+            return
+        elseif kind == 'Subscription' then
+            ctx.fire(service, 'PromptSubscriptionPurchaseRequested', id)
+            return
+        elseif kind == 'RobloxSubscription' then
+            ctx.fire(service, 'PromptPremiumPurchaseRequested', player)
+            return
+        end
+    end
     table.insert(queue,{service=service,token=token,player=player,kind=kind,id=id})
     module.pump()
 end

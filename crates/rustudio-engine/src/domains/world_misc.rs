@@ -352,6 +352,17 @@ fn grip(lua: &Lua, r: Ref) -> mlua::Result<Xform> {
 
 pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
     Some(match (class, name) {
+        ("Lighting", "GetMinutesAfterMidnight" | "getMinutesAfterMidnight") => {
+            crate::runtime::ext::clock_hours(lua, this)
+                .and_then(|hours| one(Value::Number(f64::from(hours) * 60.0)))
+        }
+        ("Lighting", "SetMinutesAfterMidnight" | "setMinutesAfterMidnight") => {
+            let minutes = num_arg(args, 1).ok_or_else(|| rt_err(format!("{name}: number expected")));
+            minutes.and_then(|minutes| {
+                crate::runtime::ext::set_clock(lua, this, minutes as f32 / 60.0)?;
+                none()
+            })
+        }
         ("Beam", "SetTextureOffset") => {
             let id = world(lua).ok()?.d().id;
             rustudio_render::effects::set_texture_offset(id, this, num_arg(args, 1).unwrap_or(0.0) as f32);
@@ -524,4 +535,29 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
 
 pub fn write_acts(class: &str, key: &str) -> bool {
     class == "Tool" && matches!(key, "GripPos" | "GripForward" | "GripRight" | "GripUp")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::{RunMode, Runtime, World};
+    use rustudio_core::doc::Document;
+
+    #[test]
+    fn api_tail_legacy_lighting_clock_methods() {
+        let runtime = Runtime::new().unwrap();
+        runtime.enter(World::new(Document::new_place(), RunMode::Run));
+        runtime.bind_globals().unwrap();
+        runtime.lua.load(r#"
+            local lighting = game:GetService("Lighting")
+            assert(lighting.getMinutesAfterMidnight ~= lighting.GetMinutesAfterMidnight)
+            assert(lighting.setMinutesAfterMidnight ~= lighting.SetMinutesAfterMidnight)
+            lighting:setMinutesAfterMidnight(87)
+            assert(math.abs(lighting.ClockTime - 1.45) < 1e-5)
+            assert(lighting.TimeOfDay == "01:27:00")
+            assert(math.abs(lighting:GetMinutesAfterMidnight() - 87) < 1e-4)
+            lighting:SetMinutesAfterMidnight(432)
+            assert(math.abs(lighting:getMinutesAfterMidnight() - 432) < 1e-4)
+        "#).exec().unwrap();
+        runtime.leave();
+    }
 }

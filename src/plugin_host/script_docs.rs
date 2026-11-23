@@ -173,6 +173,10 @@ pub fn set_viewport(script: Ref, vp: (i64, i64)) {
     })
 }
 
+pub fn has_events() -> bool {
+    with(|s| !s.events.is_empty())
+}
+
 pub fn take_events() -> Vec<DocEvent> {
     with(|s| std::mem::take(&mut s.events))
 }

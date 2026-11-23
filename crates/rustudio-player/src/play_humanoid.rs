@@ -54,7 +54,7 @@ pub(crate) struct HumDyn {
     pub had_floor: bool,
     pub floor_part: Option<Ref>,
     /// Joint transforms used for this frame's pose.
-    transforms: HashMap<Ref, Xform>,
+    pub(super) transforms: HashMap<Ref, Xform>,
     /// Swimming's vertical speed (the measured swim law).
     swim_vy: Option<f32>,
     /// A seat this character began to touch and the frames left until the
@@ -90,8 +90,7 @@ impl Default for HumDyn {
 /// What a frame of the character produced for the events Lua sees.
 pub(super) struct HumFrameOut {
     pub humanoid: Ref,
-    pub char_part: Ref,
-    pub touches: Vec<Ref>,
+    pub touches: Option<rustc_hash::FxHashSet<(Ref, Ref)>>,
     pub state_change: Option<(State, State)>,
     pub seat_change: Option<SeatChange>,
     pub move_event: Option<(&'static str, f32)>,
@@ -107,8 +106,7 @@ impl Default for HumFrameOut {
     fn default() -> Self {
         HumFrameOut {
             humanoid: Ref::none(),
-            char_part: Ref::none(),
-            touches: Vec::new(),
+            touches: None,
             state_change: None,
             seat_change: None,
             move_event: None,
@@ -219,14 +217,14 @@ impl Game {
                 s.physics.set_humanoid_velocity(model, None, Some(*w));
             }
         }
-        // The client's own movers on the character.
+        // Movers on client-owned assemblies and on the player's character
+        // (both client-created and client-edited replicated movers like
+        // VectorForce on HumanoidRootPart).
         if let (Some(cd), Some(mc)) = (s.other_doc.as_ref(), model_c) {
-            s.physics.set_client_movers(cd, &s.map.c2s, mc);
-            // What the player owns besides its character: parts a script
-            // gave it, the seat it sits in.
             let mut owned = rustudio_engine::runtime::domains::world::part::player_owned_roots(self.doc.id);
             owned.extend(s.character.as_ref().and_then(|c| c.seat));
             s.physics.set_owned_movers(cd, &s.map.s2c, &s.map.c2s, &owned);
+            s.physics.set_client_movers(cd, &s.map.c2s, mc);
         }
     }
 
@@ -276,6 +274,11 @@ impl Game {
         let cam_yaw = rustudio_physics::humanoid::yaw_of_look(look);
         let Some(s) = self.play.as_mut() else { return };
         let Some((root_xf, _, _)) = s.physics.humanoid_root(model) else { return };
+        // Replication and the client render callbacks run after the body's
+        // last step. Turn the newest script pose, using the same precedence
+        // as the next physics step.
+        let script_root = Self::hum_written_root(&self.doc, s);
+        let root_xf = script_root.unwrap_or(root_xf);
         let facing = -root_xf.rot.z_axis;
         if facing.x.abs() + facing.z.abs() < 1e-4 {
             return;
@@ -285,6 +288,9 @@ impl Game {
             return;
         }
         let xf = Xform { pos: root_xf.pos, rot: Mat3::from_rotation_y(delta) * root_xf.rot };
+        if let Some(root) = script_root {
+            s.physics.teleport_humanoid(model, &root);
+        }
         s.physics.turn_humanoid(model, delta);
         let Some(ch) = s.character.as_mut() else { return };
         ch.last_root = Some(xf);
@@ -325,20 +331,41 @@ impl Game {
         Some(d.unwrap_or(-cf.rot.z_axis))
     }
 
+    /// The root scripts put on either side since the last published pose.
+    /// Studio drops owner poses older than a server CFrame write until the
+    /// client acknowledges it.
+    fn hum_written_root(doc: &Document, s: &PlaySession) -> Option<Xform> {
+        let ch = s.character.as_ref()?;
+        let last = ch.last_root?;
+        let root = ch.rig.root;
+        let server = rustudio_render::scene::xform_of(doc, root);
+        let client = || rustudio_render::scene::xform_of(s.other_doc.as_ref()?, *s.map.s2c.get(&root)?);
+        let changed = |xf: &Xform| {
+            (xf.pos - last.pos).length() > 1e-4 || !(xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4)
+        };
+        let next = server.filter(changed).or_else(|| client().filter(changed));
+        if let Some(xf) = next {
+            if rustudio_physics::physics::hum_debug() {
+                eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})",
+                    last.pos, xf.pos, client().map(|c| c.pos), server.map(|c| c.pos));
+            }
+        }
+        next
+    }
+
     /// stepHumanoid: the body, the sensors, the
     /// timers, the transition table and the state's update.
     pub(super) fn hum_pre(&mut self, dt: f32) -> HumFrameOut {
         let mut out = HumFrameOut::default();
-        let Some((humanoid, touch_part, model, root, rig_type)) = self
+        let Some((humanoid, model, root, rig_type)) = self
             .play
             .as_ref()
             .and_then(|s| s.character.as_ref())
-            .map(|c| (c.humanoid, c.touch_part, c.model, c.rig.root, c.rig_type))
+            .map(|c| (c.humanoid, c.model, c.rig.root, c.rig_type))
         else {
             return out;
         };
         out.humanoid = humanoid;
-        out.char_part = touch_part;
         {
             let _scope = rustudio_core::bench::scope("hum_body_refresh");
             self.ensure_hum_body(model, root);
@@ -347,25 +374,30 @@ impl Game {
         // goes there (Roblox moves the whole assembly).
         {
             let s = self.play.as_mut().expect("playing");
+            let script_root = Self::hum_written_root(&self.doc, s);
             let ch = s.character.as_mut().expect("character");
-            if let Some(last) = ch.last_root {
-                let client = s.map.s2c.get(&root).and_then(|c| s.other_doc.as_ref().and_then(|cd| rustudio_render::scene::xform_of(cd, *c)));
-                let server = rustudio_render::scene::xform_of(&self.doc, root);
-                // (Both moved: the server's write wins, as Studio's server drops the
-                // owner's poses older than its CFrame until the client acks it.)
-                if let Some(xf) = [server, client].into_iter().flatten().find(|xf| (xf.pos - last.pos).length() > 1e-4 || (xf.rot - last.rot).abs_diff_eq(Mat3::ZERO, 1e-4) == false) {
-                    if rustudio_physics::physics::hum_debug() {
-                        eprintln!("HUMDBG teleport from {:?} to {:?} (client {:?} server {:?})", last.pos, xf.pos, client.map(|c| c.pos), server.map(|c| c.pos));
-                    }
-                    s.physics.teleport_humanoid(model, &xf);
-                    ch.last_root = Some(xf);
-                }
+            if let Some(xf) = script_root {
+                s.physics.teleport_humanoid(model, &xf);
+                ch.last_root = Some(xf);
             }
-            // An Anchored root (either side) holds the body where it is.
-            let anchored = |d: &doc::Document, r: Ref| matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)));
+            // An Anchored root (either side) or a root rigidly welded to an
+            // Anchored part (e.g. Motor6D to a moving anchored craft) holds the
+            // body where its root is; seated characters use seat_humanoid.
+            let unseated = ch.seat.is_none();
+            let anchored = |d: &doc::Document, r: Ref| {
+                matches!(d.prop(r, "Anchored"), Some(Variant::Bool(true)))
+                    || (unseated && rustudio_engine::runtime::domains::world::part::with_graph(d, |g| g.grounded(d, r)))
+            };
             let held = anchored(&self.doc, root)
                 || s.map.s2c.get(&root).is_some_and(|c| s.other_doc.as_ref().is_some_and(|cd| anchored(cd, *c)));
-            let at = if held { ch.last_root.or_else(|| rustudio_render::scene::xform_of(&self.doc, root)) } else { None };
+            let at = if held {
+                rustudio_render::scene::xform_of(&self.doc, root).or(ch.last_root)
+            } else {
+                None
+            };
+            if let Some(xf) = at {
+                ch.last_root = Some(xf);
+            }
             s.physics.anchor_humanoid(model, at);
         }
         // What the client's PreAnimation / RenderStepped wrote (again after PreSimulation:
@@ -431,6 +463,11 @@ impl Game {
         let had_seat = self.play.as_ref().and_then(|s| s.character.as_ref()).is_some_and(|c| c.seat.is_some());
         out.seat_change = self.update_seat(humanoid, jump_req && seated_state, dt);
         let seat_root = self.seat_root_xform();
+        if out.seat_change.as_ref().is_some_and(|sc| sc.active) {
+            if let (Some(xf), Some(ch)) = (seat_root, self.play.as_mut().and_then(|s| s.character.as_mut())) {
+                ch.last_root = Some(xf);
+            }
+        }
         let sit = matches!(self.doc.prop(humanoid, "Sit"), Some(Variant::Bool(true)))
             || matches!(self.owned_humanoid_prop(humanoid, "Sit"), Some(Variant::Bool(true)));
         let platform = matches!(self.doc.prop(humanoid, "PlatformStand"), Some(Variant::Bool(true)))
@@ -475,7 +512,11 @@ impl Game {
         // part's face is climbed from a root centre up to 1.1994 studs away
         // (1.2 × scale 1), a TrussPart from 1.8001 (the broad query).
         let head_y = rustudio_render::scene::f32_of(self.doc.prop(model, "Scale")).unwrap_or(1.0);
-        let anchored = matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true)));
+        let anchored = matches!(self.doc.prop(root, "Anchored"), Some(Variant::Bool(true)))
+            || (!seated_state
+                && !had_seat
+                && seat_root.is_none()
+                && rustudio_engine::runtime::domains::world::part::with_graph(&self.doc, |g| g.grounded(&self.doc, root)));
         let hip_height = self.owned_humanoid_f32(humanoid, "HipHeight", 0.0);
         let legs = if rig_type == RigType::R6 {
             ["Left Leg", "Right Leg"]
@@ -795,7 +836,7 @@ impl Game {
     }
 
     /// Where the SeatWeld holds the root: seat · C0 · C1⁻¹.
-    fn seat_root_xform(&self) -> Option<Xform> {
+    pub(super) fn seat_root_xform(&self) -> Option<Xform> {
         let seat = self.play.as_ref()?.character.as_ref()?.seat?;
         let xf = rustudio_render::scene::xform_of(&self.doc, seat)?;
         let weld = self.doc.find_named(seat, "SeatWeld")?;
@@ -826,6 +867,17 @@ impl Game {
             }
         }
         let Some(s) = self.play.as_mut() else { return };
+        // Claim late descendants before the physics sync. Otherwise the
+        // character body can collide with a duplicate in the loose world.
+        let late: Vec<Ref> = parts.iter().map(|(r, _)| *r).filter(|r| !s.physics.skip.contains(r)).collect();
+        if !late.is_empty() {
+            s.physics.skip.extend(late.iter().copied());
+            if let Some(ch) = s.character.as_mut() {
+                ch.carried.extend(late.iter().copied());
+                ch.rig.refresh_attached(&self.doc, model);
+            }
+            s.physics.refresh(late);
+        }
         if s.physics.has_humanoid(model) {
             s.physics.refresh_humanoid(&self.doc, model, root, &parts);
             return;
@@ -939,14 +991,8 @@ impl Game {
             ch.floor_material = floor;
             out.floor_changed = Some(floor);
         }
-        let mut touches = s.physics.humanoid_touching(model);
-        if let Some(f) = ch.dynamic.floor_part {
-            if !touches.contains(&f) {
-                touches.push(f);
-            }
-        }
-        out.touches = touches;
-        let fell = root_xf.pos.y < mech::FALLEN_PARTS_HEIGHT;
+        out.touches = Some(s.physics.humanoid_touching(model));
+        let fell = root_xf.pos.y < s.physics.fallen_height;
         let mut pose = pose;
         pose.extend(self.tool_pose(&pose));
         let client_tool = self.client_tool_pose(&pose);
@@ -1034,6 +1080,131 @@ mod anchored_root_tests {
         tick(&mut game, 120);
         assert_eq!(
             game.run_luau(Side::Server, "local a = _G.anch; assert(a.root.Position.Y < a.y1 - 4, 'stayed at ' .. a.root.Position.Y)"),
+            None
+        );
+    }
+
+    /// A character welded by a Motor6D to a moving Anchored part stays locked
+    /// to that part (no gravity drop) and begins falling once the weld is destroyed.
+    #[test]
+    fn welded_to_anchored_part_holds_the_character() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 60);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                local root = plr.Character.HumanoidRootPart
+                local craft = Instance.new("Part")
+                craft.Name = "Craft"
+                craft.Anchored = true
+                craft.CanCollide = false
+                craft.Size = Vector3.new(10, 4, 10)
+                craft.CFrame = CFrame.new(100, 400, 100)
+                craft.Parent = workspace
+                root.CFrame = craft.CFrame
+                local w = Instance.new("Motor6D")
+                w.Name = "CraftWeld"
+                w.Part0 = craft
+                w.Part1 = root
+                w.Parent = root
+                _G.craft = { craft = craft, root = root, weld = w }
+            "#),
+            None
+        );
+        for step in 1..=60 {
+            let x = 100.0 + step as f32 * 2.0;
+            assert_eq!(
+                game.run_luau(Side::Server, &format!("_G.craft.craft.CFrame = CFrame.new({x}, 400, 100)")),
+                None
+            );
+            tick(&mut game, 1);
+        }
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local d = (_G.craft.root.Position - _G.craft.craft.Position).Magnitude
+                assert(d < 0.1, "drifted from anchored craft: " .. d .. " pos=" .. tostring(_G.craft.root.Position))
+                _G.craft.weld:Destroy()
+            "#),
+            None
+        );
+        tick(&mut game, 60);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                assert(_G.craft.root.Position.Y < 380, "did not fall after weld destroyed: " .. _G.craft.root.Position.Y)
+            "#),
+            None
+        );
+    }
+
+    /// A LocalScript mutating a replicated VectorForce on its own character
+    /// (e.g. skydiving FlightForce) drives the character's velocity, matching Studio.
+    #[test]
+    fn client_edits_to_replicated_character_vector_force_act() {
+        let mut game = Game::new(None);
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        let tick = |game: &mut Game, n: usize| {
+            for _ in 0..n {
+                game.play_tick(&ctx, 1.0 / 60.0, &mut (), true, false);
+            }
+        };
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local plr = game:GetService("Players"):GetPlayers()[1]
+                if not plr.Character then plr:LoadCharacter() end
+            "#),
+            None
+        );
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local root = game:GetService("Players"):GetPlayers()[1].Character.HumanoidRootPart
+                local att = Instance.new("Attachment"); att.Name = "Center"; att.Parent = root
+                local vf = Instance.new("VectorForce")
+                vf.Name = "FlightForce"
+                vf.Attachment0 = att
+                vf.RelativeTo = Enum.ActuatorRelativeTo.World
+                vf.Force = Vector3.new(0, 0, 0)
+                vf.Enabled = true
+                vf.Parent = root
+                root.CFrame = CFrame.new(0, 500, 0)
+                _G.root = root
+            "#),
+            None
+        );
+        tick(&mut game, 5);
+        // Client sets upward VectorForce countering gravity with +50 studs/s^2 net upward accel.
+        assert_eq!(
+            game.run_luau(Side::Client, r#"
+                local root = game:GetService("Players").LocalPlayer.Character.HumanoidRootPart
+                local vf = root:WaitForChild("FlightForce")
+                local mass = root.AssemblyMass
+                vf.Force = Vector3.new(0, mass * workspace.Gravity + mass * 50, 0)
+            "#),
+            None
+        );
+        tick(&mut game, 30);
+        assert_eq!(
+            game.run_luau(Side::Server, r#"
+                local vy = _G.root.AssemblyLinearVelocity.Y
+                assert(vy > 5, "client VectorForce did not reverse freefall: vy=" .. vy)
+            "#),
             None
         );
     }
@@ -1220,6 +1391,40 @@ mod script_moves_player_character_tests {
             }
         }
         assert!(client_since.is_some(), "the client never had the server's CFrame");
+    }
+
+    #[test]
+    fn local_character_falls_through_a_streamed_out_floor() {
+        use rbx_dom_weak::types::{Enum, Variant};
+        use rbx_dom_weak::ustr;
+
+        let mut game = Game::new(None);
+        let ws = game.doc.workspace().unwrap();
+        let props = &mut game.doc.dom.get_by_ref_mut(ws).unwrap().properties;
+        props.insert(ustr("StreamingEnabled"), Variant::Bool(true));
+        props.insert(ustr("StreamingMinRadius"), Variant::Int32(64));
+        props.insert(ustr("StreamingTargetRadius"), Variant::Int32(128));
+        props.insert(ustr("StreamOutBehavior"), Variant::Enum(Enum::from_u32(2)));
+        game.start_play(RunMode::Play, &mut (), false, None);
+        let ctx = egui::Context::default();
+        tick(&mut game, &ctx, 120);
+        assert_eq!(game.run_luau(Side::Client, r#"
+            assert(workspace.Baseplate)
+            assert(game.Players.LocalPlayer.Character.HumanoidRootPart.Position.Y > 0)
+        "#), None);
+        assert_eq!(game.run_luau(Side::Server, r#"
+            local focus = Instance.new("Part")
+            focus.Anchored = true
+            focus.Position = Vector3.new(4096, 5, 0)
+            focus.Parent = workspace
+            game.Players:GetPlayers()[1].ReplicationFocus = focus
+        "#), None);
+        tick(&mut game, &ctx, 350);
+        assert_eq!(game.run_luau(Side::Client, r#"
+            assert(not workspace:FindFirstChild("Baseplate"))
+            assert(game.Players.LocalPlayer.Character.HumanoidRootPart.Position.Y < -10)
+        "#), None);
+        assert_eq!(game.run_luau(Side::Server, "assert(workspace.Baseplate.CanCollide)"), None);
     }
 
     /// Studio 0.748 (a test place's dungeon door: the server fires a RemoteEvent and

@@ -309,16 +309,18 @@ pub fn fallback_albedo(material: u32, use2022: bool) -> [f32; 3] {
     }
 }
 
-/// A pack's decoded maps: two RGBA8 mip chains and scalar height and
-/// emission mip chains. `albedo`: colour RGB and its alpha tint mask (not
-/// height). `surface`: normal X/Y (OpenGL convention), roughness, metalness.
+/// A pack's decoded maps and their mip chains. `albedo` holds colour RGB
+/// and the tint mask before terrain repacking. `surface` holds the normal
+/// X/Y (OpenGL convention), roughness and metalness.
 pub struct Pixels {
+    pub size: u32,
+    source_maps: Option<[Option<u64>; 4]>,
     pub albedo: Vec<u8>,
     pub surface: Vec<u8>,
     /// Linear height mip chain, independent of the part tint mask.
     pub height: Vec<u8>,
-    /// Scalar emissive mask, linear R8 mip chain.
-    pub emissive: Vec<u8>,
+    /// Linear RG8 mip chain (emissive mask, terrain tint mask).
+    pub emission_tint: Vec<u8>,
     _held: Held,
 }
 
@@ -358,6 +360,7 @@ pub struct Maps {
     /// Mean colour of the top level (gamma 2.2 mean), for `mean_albedo`.
     pub mean: [f32; 3],
     color: u32,
+    source_maps: Option<[Option<u64>; 4]>,
     pixels: Mutex<Option<Arc<Pixels>>>,
 }
 
@@ -373,6 +376,7 @@ pub fn preview_levels() -> Vec<(usize, u32)> {
 
 impl Maps {
     fn new(pack: u64, found: [bool; 5], color: u32, pixels: Pixels) -> Maps {
+        let standalone = is_surface_appearance_pack(pack);
         let from = mip_levels().into_iter().find(|(_, s)| *s <= PREVIEW_SIZE).map_or(0, |(at, _)| at);
         Maps {
             pack,
@@ -381,11 +385,24 @@ impl Maps {
             // Repeat density comes from uvScale and PartMaterialConsts instead.
             tiling: 1.0,
             found,
-            preview: pixels.albedo.get(from..).unwrap_or_default().to_vec(),
-            mean: top_level_mean(&pixels.albedo),
+            preview: if standalone { Vec::new() } else { pixels.albedo.get(from..).unwrap_or_default().to_vec() },
+            mean: if standalone { [1.0; 3] } else { top_level_mean(&pixels.albedo) },
             color,
+            source_maps: pixels.source_maps,
             pixels: Mutex::new(Some(Arc::new(pixels))),
         }
+    }
+
+    /// A map edit can leave a stale pack id on the instance. In that case
+    /// draw the current maps through the loose-texture path.
+    pub fn matches_surface_maps(&self, maps: [Option<&str>; 4]) -> bool {
+        self.source_maps.is_some_and(|source| {
+            source.into_iter().zip(maps).all(|(saved, uri)| match uri {
+                None => saved.is_none(),
+                Some(uri) => rustudio_core::assets::asset_ref(uri)
+                    .is_some_and(|asset| saved == Some(asset.id) && asset.version.is_none()),
+            })
+        })
     }
 
     /// The maps, while they are held (see `Maps`).
@@ -409,8 +426,7 @@ pub fn request_pixels(maps: &Maps) {
     if !s.rebuilding.lock().expect("material rebuilds").insert(maps.pack) {
         return;
     }
-    s.queue.lock().expect("material queue").push_back((maps.pack, maps.color, true));
-    s.wake.notify_one();
+    s.enqueue(maps.pack, maps.color, true);
 }
 
 #[derive(Clone)]
@@ -422,8 +438,8 @@ enum State {
 
 struct Store {
     states: Mutex<HashMap<u64, State>>,
-    /// (pack, colour, keep the maps for the renderer)
-    queue: Mutex<VecDeque<(u64, u32, bool)>>,
+    /// (pack, colour, keep the maps for the renderer, priority)
+    queue: Mutex<VecDeque<(u64, u32, bool, u8)>>,
     /// Packs first asked for their preview only, then by the renderer
     /// while still being built.
     wanted: Mutex<std::collections::HashSet<u64>>,
@@ -434,6 +450,23 @@ struct Store {
     generation: AtomicU64,
 }
 
+impl Store {
+    fn enqueue(&self, pack: u64, color: u32, keep: bool) {
+        // Terrain and built-in materials take priority. Among appearance
+        // packs, decode local chains before starting network requests.
+        let priority = if is_surface_appearance_pack(pack) {
+            let id = pack & !SURFACE_APPEARANCE_BIT;
+            if ACR_REPS.iter().all(|(_, fidelity)| acr_cache_path(id, fidelity).is_file()) { 1 } else { 2 }
+        } else {
+            0
+        };
+        let mut queue = self.queue.lock().expect("material queue");
+        let index = queue.partition_point(|(_, _, _, queued_priority)| *queued_priority <= priority);
+        queue.insert(index, (pack, color, keep, priority));
+        self.wake.notify_one();
+    }
+}
+
 fn store() -> &'static Store {
     static S: OnceLock<Store> = OnceLock::new();
     S.get_or_init(|| {
@@ -441,7 +474,7 @@ fn store() -> &'static Store {
             std::thread::Builder::new()
                 .name("material packs".into())
                 .spawn(|| loop {
-                    let (pack, color, keep) = {
+                    let (pack, color, keep, _) = {
                         let s = store();
                         let mut q = s.queue.lock().expect("material queue");
                         loop {
@@ -512,6 +545,11 @@ pub fn pack_maps(pack: u64, color: u32) -> Lookup {
     lookup(pack, color, true)
 }
 
+/// The published SurfaceAppearance's mip chains, in mesh UV space.
+pub fn surface_appearance_maps(pack: u64) -> Lookup {
+    lookup(pack | SURFACE_APPEARANCE_BIT, 0xffff_ffff, true)
+}
+
 /// As `pack_maps` for what only reads `Maps::preview` / `mean` (thumbnails):
 /// the full maps are not kept for it.
 pub fn pack_preview(pack: u64, color: u32) -> Lookup {
@@ -540,11 +578,7 @@ fn lookup(pack: u64, color: u32, keep: bool) -> Lookup {
         None => {
             states.insert(e.pack, State::Pending);
             drop(states);
-            s.queue
-                .lock()
-                .expect("material queue")
-                .push_back((e.pack, e.color, keep));
-            s.wake.notify_one();
+            s.enqueue(e.pack, e.color, keep);
             Lookup::Pending
         }
     }
@@ -625,16 +659,24 @@ fn build(pack_id: u64, color: u32) -> Result<Maps, String> {
 
 /// Key bit: the terrain view of a pack (`terrain_pack_maps`).
 const TERRAIN_BIT: u64 = 1 << 63;
+const SURFACE_APPEARANCE_BIT: u64 = 1 << 60;
+
+fn is_surface_appearance_pack(pack: u64) -> bool {
+    pack >> 60 == 1
+}
 
 fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String> {
+    if is_surface_appearance_pack(pack_id) {
+        return build_surface_appearance_acr(pack_id & !SURFACE_APPEARANCE_BIT);
+    }
     if pack_id & TERRAIN_BIT != 0 {
         let (found, mut terrain) = build_pixels(pack_id & !TERRAIN_BIT, color)?;
-        // The tint mask (colour alpha) moves to the surface map's alpha
-        // (metalness, unused by terrain) for CB4's tint form.
-        for (s, a) in terrain.surface.chunks_exact_mut(4).zip(terrain.albedo.chunks_exact(4)) {
-            s[3] = a[3];
-        }
-        for (pixel, height) in terrain.albedo.chunks_exact_mut(4).zip(&terrain.height) {
+        // Terrain needs both the tint mask and the height. Keep metalness
+        // in surface alpha and move the tint into the emission texture.
+        for ((pixel, height), aux) in terrain.albedo.chunks_exact_mut(4)
+            .zip(&terrain.height).zip(terrain.emission_tint.chunks_exact_mut(2))
+        {
+            aux[1] = pixel[3];
             pixel[3] = *height;
         }
         return Ok((found, terrain));
@@ -688,10 +730,12 @@ fn build_pixels(pack_id: u64, color: u32) -> Result<([bool; 5], Pixels), String>
         surface[i * 4 + 3] = px(&metal, 0, 0);
     }
     Ok((found, Pixels {
+        size: LAYER_SIZE,
+        source_maps: None,
         albedo: mip_chain(&albedo, true),
         surface: mip_chain(&surface, false),
         height: height_chain(height.as_ref()),
-        emissive: mip_chain(&emissive, false).into_iter().step_by(4).collect(),
+        emission_tint: mip_chain(&emissive, false).chunks_exact(4).flat_map(|pixel| [pixel[0], 0]).collect(),
         _held: Held::new(),
     }))
 }
@@ -960,11 +1004,16 @@ fn acr_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("RUSTUDIO_TERRAIN_ACR").is_ok_and(|v| v == "0"))
 }
 
+fn acr_cache_path(pack: u64, fidelity: &str) -> std::path::PathBuf {
+    rustudio_core::assets::cache_dir().join("assets")
+        .join(format!("{pack}_acr_ktx2-7rdo-{fidelity}.ktx2"))
+}
+
 /// One KTX2 representation of a pack: the disk cache, else assetdelivery
 /// (anonymous, as for public assets).
 fn acr_bytes(pack: u64, rep: usize) -> Result<Vec<u8>, String> {
     let (list, fid) = ACR_REPS[rep];
-    let path = rustudio_core::assets::cache_dir().join("assets").join(format!("{pack}_acr_ktx2-7rdo-{fid}.ktx2"));
+    let path = acr_cache_path(pack, fid);
     if let Ok(b) = std::fs::read(&path) {
         return Ok(b);
     }
@@ -1030,7 +1079,8 @@ pub fn ktx2_levels(d: &[u8]) -> Result<Vec<(u32, Vec<u8>)>, String> {
     }
     let (format, width, levels, scheme) = (u32_at(12)?, u32_at(20)?, u32_at(40)?.max(1), u32_at(44)?);
     let block: fn(&[u8], &mut [[u8; 4]; 16]) = match format {
-        131..=134 => bc1_block,
+        131 | 132 => bc1_block,
+        133 | 134 => bc1_alpha_block,
         137 | 138 => bc3_block,
         f => return Err(format!("KTX2 format {f} isn't BC1 / BC3")),
     };
@@ -1091,6 +1141,20 @@ fn bc1_colors(b: &[u8], four: bool, px: &mut [[u8; 4]; 16]) {
 fn bc1_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
     bc1_colors(b, false, px);
     px.iter_mut().for_each(|p| p[3] = 255);
+}
+
+fn bc1_alpha_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
+    bc1_block(b, px);
+    let c0 = u16::from_le_bytes([b[0], b[1]]);
+    let c1 = u16::from_le_bytes([b[2], b[3]]);
+    if c0 <= c1 {
+        let indices = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        for (i, p) in px.iter_mut().enumerate() {
+            if (indices >> (2 * i)) & 3 == 3 {
+                p[3] = 0;
+            }
+        }
+    }
 }
 
 fn bc3_block(b: &[u8], px: &mut [[u8; 4]; 16]) {
@@ -1154,12 +1218,12 @@ fn acr_level(levels: &[(u32, Vec<u8>)], size: u32) -> Vec<u8> {
 }
 
 /// A terrain pack's maps from its KTX2 representations, laid out like
-/// `build`'s (albedo sRGB RGB, surface normal X / Y / roughness / 0, linear
-/// height and emissive), one mip chain level per KTX2 level.
+/// `build`'s (albedo sRGB RGB, surface normal X / Y / roughness / metalness,
+/// linear height and emission/tint), one mip chain level per KTX2 level.
 fn build_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
     let reps = (0..3).map(|i| acr_bytes(pack, i).and_then(|b| ktx2_levels(&b)))
         .collect::<Result<Vec<_>, _>>()?;
-    let (mut albedo, mut surface, mut height, mut emissive) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut albedo, mut surface, mut height, mut emission_tint) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     // Pre-2022 packs come as YCoCg, 2022 packs as RGB + tint mask.
     let ycocg = rustudio_core::terrain_mat::pre2022_pack(pack);
     for (_, size) in mip_levels() {
@@ -1172,12 +1236,51 @@ fn build_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
             } else {
                 albedo.extend_from_slice(a);
             }
-            surface.extend_from_slice(&[n[3], n[1], s[1], 0]);
+            surface.extend_from_slice(&[n[3], n[1], s[1], s[0]]);
             height.push(s[3]);
-            emissive.push(s[2]);
+            emission_tint.extend_from_slice(&[s[2], 0]);
         }
     }
-    Ok(([true, true, true, false, true], Pixels { albedo, surface, height, emissive, _held: Held::new() }))
+    let has_metal = surface.chunks_exact(4).any(|pixel| pixel[3] != 0);
+    Ok(([true, true, true, has_metal, true], Pixels { size: LAYER_SIZE, source_maps: None, albedo, surface, height, emission_tint, _held: Held::new() }))
+}
+
+/// The three high-fidelity representations in a Studio SurfaceAppearance
+/// draw. Preserve their mip levels, especially the baked roughness in G.
+fn build_surface_appearance_acr(pack: u64) -> Result<([bool; 5], Pixels), String> {
+    let xml = rustudio_core::assets::public_cached(pack)?;
+    let source = rustudio_core::texture_pack::parse_pack(&String::from_utf8_lossy(&xml))?;
+    let reps = (0..3).map(|i| {
+        let bytes = acr_bytes(pack, i)?;
+        let dims = bytes.get(20..28).ok_or("short SurfaceAppearance KTX2 header")?;
+        let width = u32::from_le_bytes(dims[..4].try_into().unwrap());
+        if dims[..4] != dims[4..] || !width.is_power_of_two() || width > 4096 {
+            return Err("unsupported SurfaceAppearance pack dimensions".into());
+        }
+        ktx2_levels(&bytes)
+    }).collect::<Result<Vec<_>, _>>()?;
+    let size = reps.iter().filter_map(|levels| levels.first().map(|level| level.0))
+        .max().ok_or("SurfaceAppearance pack has no texture levels")?;
+    let mut albedo = Vec::new();
+    let mut surface = Vec::new();
+    for shift in 0..size.ilog2() + 1 {
+        let width = size >> shift;
+        let [a, n, s] = [0, 1, 2].map(|i| acr_level(&reps[i], width));
+        albedo.extend(a);
+        for (n, s) in n.chunks_exact(4).zip(s.chunks_exact(4)) {
+            surface.extend_from_slice(&[n[3], n[1], s[1], s[0]]);
+        }
+    }
+    let has_metal = surface.chunks_exact(4).any(|pixel| pixel[3] != 0);
+    Ok(([true, true, true, has_metal, false], Pixels {
+        size,
+        source_maps: Some([source.color, source.normal, source.roughness, source.metalness]),
+        albedo,
+        surface,
+        height: Vec::new(),
+        emission_tint: Vec::new(),
+        _held: Held::new(),
+    }))
 }
 
 #[cfg(test)]
@@ -1208,6 +1311,9 @@ mod ktx2_tests {
         assert_eq!(&px[4..8], &[0, 0, 0, 255]);
         assert_eq!(&px[8..12], &[170, 170, 170, 255]);
         assert_eq!(&px[12..16], &[85, 85, 85, 255]);
+        // RGBA BC1 uses index 3 as transparent when endpoint 0 <= endpoint 1.
+        let cutout = ktx2(133, &[0, 0, 255, 255, 0xff, 0xff, 0xff, 0xff]);
+        assert!(ktx2_levels(&cutout).unwrap()[0].1.iter().all(|byte| *byte == 0));
         // BC3: alpha 200 / 100 (8-value mode), every index 1 → 100; colour as above.
         let mut bc3 = vec![200, 100];
         bc3.extend_from_slice(&[0b0100_1001, 0b1001_0010, 0b0010_0100, 0b0100_1001, 0b1001_0010, 0b0010_0100]);

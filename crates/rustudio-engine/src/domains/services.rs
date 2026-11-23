@@ -27,6 +27,8 @@ use rbx_dom_weak::types::{Ref, Variant};
 
 use crate::runtime::*;
 
+#[path = "services_core.rs"]
+mod core_members;
 #[path = "services_encoding.rs"]
 pub(crate) mod encoding;
 #[path = "services_http.rs"]
@@ -45,18 +47,414 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetMessage", "DataModel"),
     ("GetRemoteBuildMode", "DataModel"),
     ("IsGearTypeAllowed", "DataModel"),
+    ("DefineFastFlag", "DataModel"),
+    ("DefineFastInt", "DataModel"),
+    ("DefineFastString", "DataModel"),
+    ("GetFastFlag", "DataModel"),
+    ("GetFastInt", "DataModel"),
+    ("GetFastString", "DataModel"),
+    ("GetEngineFeature", "DataModel"),
+    ("SetFlagVersion", "DataModel"),
+    ("GetPlaySessionId", "DataModel"),
+    ("AddCoreScriptLocal", "ScriptContext"),
+    ("LoadLocalAsset", "InsertService"),
+    ("GetLocalFileContents", "InsertService"),
+    ("GetPlatform", "UserInputService"),
+    ("GetNotificationTypeList", "GuiService"),
+    ("RegisterSetCore", "StarterGui"),
+    ("RegisterGetCore", "StarterGui"),
+    ("GetRobloxVersion", "RunService"),
+    ("GetCoreScriptVersion", "RunService"),
+    ("SetRobloxGuiFocused", "RunService"),
+    ("GetRobloxGuiFocused", "RunService"),
+    // IXPService
+    ("ClearCreatorLayers", "IXPService"),
+    ("ClearUserLayers", "IXPService"),
+    ("GetBrowserTrackerLayerLoadingStatus", "IXPService"),
+    ("GetBrowserTrackerLayerVariables", "IXPService"),
+    ("GetBrowserTrackerStatusForLayer", "IXPService"),
+    ("GetCreatorLayerLoadingStatus", "IXPService"),
+    ("GetCreatorLayerVariables", "IXPService"),
+    ("GetCreatorStatusForLayer", "IXPService"),
+    ("GetRegisteredCreatorLayersToStatus", "IXPService"),
+    ("GetRegisteredUserLayersToStatus", "IXPService"),
+    ("GetUserLayerLoadingStatus", "IXPService"),
+    ("GetUserLayerVariables", "IXPService"),
+    ("GetUserStatusForLayer", "IXPService"),
+    ("InitializeCreatorLayers", "IXPService"),
+    ("InitializeUserLayers", "IXPService"),
+    ("LogBrowserTrackerLayerExposure", "IXPService"),
+    ("LogCreatorLayerExposure", "IXPService"),
+    ("LogFlagLinkedUserLayerExposure", "IXPService"),
+    ("LogUserLayerExposure", "IXPService"),
+    ("RegisterCreatorLayers", "IXPService"),
+    ("RegisterUserLayers", "IXPService"),
+    // MemStorageService
+    ("Bind", "MemStorageService"),
+    ("BindAndFire", "MemStorageService"),
+    ("Call", "MemStorageService"),
+    ("Fire", "MemStorageService"),
+    ("GetItem", "MemStorageService"),
+    ("HasItem", "MemStorageService"),
+    ("RemoveItem", "MemStorageService"),
+    ("SetItem", "MemStorageService"),
+    ("Disconnect", "MemStorageConnection"),
+    // RbxAnalyticsService
+    ("AddGlobalPointsField", "RbxAnalyticsService"),
+    ("AddGlobalPointsTag", "RbxAnalyticsService"),
+    ("DEPRECATED_TrackEvent", "RbxAnalyticsService"),
+    ("DEPRECATED_TrackEventWithArgs", "RbxAnalyticsService"),
+    ("GetClientId", "RbxAnalyticsService"),
+    ("GetPlaySessionId", "RbxAnalyticsService"),
+    ("GetSessionId", "RbxAnalyticsService"),
+    ("ReleaseRBXEventStream", "RbxAnalyticsService"),
+    ("RemoveGlobalPointsField", "RbxAnalyticsService"),
+    ("RemoveGlobalPointsTag", "RbxAnalyticsService"),
+    ("ReportCounter", "RbxAnalyticsService"),
+    ("ReportInfluxSeries", "RbxAnalyticsService"),
+    ("ReportStats", "RbxAnalyticsService"),
+    ("ReportToDiagByCountryCode", "RbxAnalyticsService"),
+    ("SendEventDeferred", "RbxAnalyticsService"),
+    ("SendEventImmediately", "RbxAnalyticsService"),
+    ("SetRBXEvent", "RbxAnalyticsService"),
+    ("SetRBXEventStream", "RbxAnalyticsService"),
+    ("TrackEvent", "RbxAnalyticsService"),
+    ("TrackEventWithArgs", "RbxAnalyticsService"),
+    ("UpdateHeartbeatObject", "RbxAnalyticsService"),
+    // SessionService
+    ("AcquireContextFocus", "SessionService"),
+    ("GenerateSessionInfoString", "SessionService"),
+    ("GetBreadcrumbs", "SessionService"),
+    ("GetCreatedTimestampUtcMs", "SessionService"),
+    ("GetHistory", "SessionService"),
+    ("GetMetadata", "SessionService"),
+    ("GetRootSID", "SessionService"),
+    ("GetSessionID", "SessionService"),
+    ("GetSessionTag", "SessionService"),
+    ("IsContextFocused", "SessionService"),
+    ("ReleaseContextFocus", "SessionService"),
+    ("RemoveMetadata", "SessionService"),
+    ("RemoveSession", "SessionService"),
+    ("RemoveSessionsWithMetadataKey", "SessionService"),
+    ("ReplaceSession", "SessionService"),
+    ("SessionExists", "SessionService"),
+    ("SetMetadata", "SessionService"),
+    ("SetSession", "SessionService"),
+    // ExperienceService
+    ("ConsumePendingExperienceLeaveWithReason", "ExperienceService"),
+    ("ExecuteCrossExperienceCall", "ExperienceService"),
+    ("GetFollowUserId", "ExperienceService"),
+    ("GetPendingJoinAttempt", "ExperienceService"),
+    ("GetPlaceJoinState", "ExperienceService"),
+    ("GetQueuePosition", "ExperienceService"),
+    ("IsInExperience", "ExperienceService"),
+    ("LaunchExperience", "ExperienceService"),
+    ("LaunchExperienceFromSource", "ExperienceService"),
+    ("LaunchExperienceFromSourceWithCallback", "ExperienceService"),
+    ("LeaveExperienceWithReason", "ExperienceService"),
+    ("RegisterForExperienceJoin", "ExperienceService"),
+    ("RegisterForExperienceLeave", "ExperienceService"),
+    ("StartCrossExperience", "ExperienceService"),
+    ("StopCrossExperience", "ExperienceService"),
+    // PolicyService / SafetyService / PermissionsService / UserGameSettings
+    ("GetPolicyInfoForServerRobloxOnlyAsync", "PolicyService"),
+    ("DecodeAvatarMovementProto", "SafetyService"),
+    ("ReportBuildUIClose", "SafetyService"),
+    ("ReportBuildUIOpen", "SafetyService"),
+    ("ReportCapturesUIClose", "SafetyService"),
+    ("ReportCapturesUIOpen", "SafetyService"),
+    ("ReportChatLineReportingClose", "SafetyService"),
+    ("ReportChatLineReportingOpen", "SafetyService"),
+    ("ReportChatSuspensionDialogClose", "SafetyService"),
+    ("ReportChatSuspensionDialogOpen", "SafetyService"),
+    ("ReportMenuTabClose", "SafetyService"),
+    ("ReportMenuTabOpen", "SafetyService"),
+    ("ReportPartyChatWindowClose", "SafetyService"),
+    ("ReportPartyChatWindowOpen", "SafetyService"),
+    ("TakeScreenshot", "SafetyService"),
+    ("GetIsThirdPartyAssetAllowed", "PermissionsService"),
+    ("GetIsThirdPartyPurchaseAllowed", "PermissionsService"),
+    ("GetIsThirdPartyTeleportAllowed", "PermissionsService"),
+    ("GetPermissions", "PermissionsService"),
+    ("SetPermissions", "PermissionsService"),
+    ("GetDefaultFramerateCap", "UserGameSettings"),
+    ("GetTutorialState", "UserGameSettings"),
+    ("ResetOnboardingCompleted", "UserGameSettings"),
+    ("SetTutorialState", "UserGameSettings"),
+    // ThirdPartyUserService
+    ("GetUserPlatformName", "ThirdPartyUserService"),
+    ("GetVoiceChatRestrictionStatus", "ThirdPartyUserService"),
+    ("HaveActiveUser", "ThirdPartyUserService"),
+    ("IsAccountSwitchingSupported", "ThirdPartyUserService"),
+    ("IsChatRestrictionSupported", "ThirdPartyUserService"),
+    ("IsSingleSignOnSupported", "ThirdPartyUserService"),
+    ("ShowAccountPicker", "ThirdPartyUserService"),
+    // NotificationService
+    ("ActionEnabled", "NotificationService"),
+    ("ActionTaken", "NotificationService"),
+    ("CancelAllNotification", "NotificationService"),
+    ("CancelNotification", "NotificationService"),
+    ("ScheduleNotification", "NotificationService"),
+    ("SubscribeToRccEventNamespace", "NotificationService"),
+    ("SubscribeToTopic", "NotificationService"),
+    ("SwitchedToAppShellFeature", "NotificationService"),
+    ("UnsubscribeFromTopic", "NotificationService"),
+    ("GetScheduledNotifications", "NotificationService"),
+    // AdService CoreScript members
+    ("GetAdTeleportInfo", "AdService"),
+    ("GetReportAdInfo", "AdService"),
+    ("GetUniversalAppAdsEligibility", "AdService"),
+    ("HandleWhyThisAdClicked", "AdService"),
+    ("HideEudsaDisclosure", "AdService"),
+    ("IsAdLoaded", "AdService"),
+    ("OnDemandVideoCompleteFromUI", "AdService"),
+    ("ReturnToPublisherExperience", "AdService"),
+    ("SetAdGuiInteractivityHandlerInitialized", "AdService"),
+    ("SubmitAdNotification", "AdService"),
+    ("GetAdAvailabilityNowForUniverseAsync", "AdService"),
+    // AchievementService
+    ("IsAvailable", "AchievementService"),
+    ("GrantAchievement", "AchievementService"),
+    ("HasAchieved", "AchievementService"),
+    // Animator CoreScript members
+    ("GetPlayingAnimationTracksCoreScript", "Animator"),
+    ("LoadAnimationCoreScript", "Animator"),
+    ("StepAnimationsInternal", "Animator"),
+    ("SynchronizeWith", "Animator"),
+    // CaptureService CoreScript members
+    ("CanCaptureVideo", "CaptureService"),
+    ("DeleteCapture", "CaptureService"),
+    ("DeleteVideoCapture", "CaptureService"),
+    ("GetScreenshotCaptureObject", "CaptureService"),
+    ("IsCapturingVideo", "CaptureService"),
+    ("OnCaptureBegan", "CaptureService"),
+    ("OnCaptureEnded", "CaptureService"),
+    ("OnCaptureObjectShared", "CaptureService"),
+    ("OnCapturePermissionsPromptFinished", "CaptureService"),
+    ("OnCaptureShared", "CaptureService"),
+    ("OnSavePromptFinished", "CaptureService"),
+    ("OnSharePromptFinished", "CaptureService"),
+    ("OnVideoCaptureShared", "CaptureService"),
+    ("PreCaptureShared", "CaptureService"),
+    ("PreVideoCaptureShared", "CaptureService"),
+    ("RetrieveCaptures", "CaptureService"),
+    ("SaveCaptureObjectToExternalStorage", "CaptureService"),
+    ("SaveCaptureToExternalStorage", "CaptureService"),
+    ("SaveScreenshotCapture", "CaptureService"),
+    ("SaveVideoCaptureToExternalStorage", "CaptureService"),
+    ("StopVideoCaptureForMCP", "CaptureService"),
+    ("StopVideoCaptureInternal", "CaptureService"),
+    ("UploadCaptureAndPostMoment", "CaptureService"),
+    ("CheckMomentTextStatusAsync", "CaptureService"),
+    ("CheckUploadCaptureStatusForSupportTicketAsync", "CaptureService"),
+    ("CreatePostAsync", "CaptureService"),
+    ("DeleteCapturesAsync", "CaptureService"),
+    ("DeleteVideoCaptureAsync", "CaptureService"),
+    ("GenerateMomentTextAsync", "CaptureService"),
+    ("GetCaptureFilePathAsync", "CaptureService"),
+    ("GetCaptureSizeAsync", "CaptureService"),
+    ("GetCaptureStorageSizeAsync", "CaptureService"),
+    ("GetCaptureUploadDataAsync", "CaptureService"),
+    ("SaveCapturesToExternalStorageAsync", "CaptureService"),
+    ("StartUploadCaptureForSupportTicketAsync", "CaptureService"),
+    ("StartVideoCaptureForMCPAsync", "CaptureService"),
+    ("StartVideoCaptureInternalAsync", "CaptureService"),
+    ("UploadPostAsync", "CaptureService"),
+    // HttpService / HttpRequest CoreScript members
+    ("RequestInternal", "HttpService"),
+    ("GetHttpEnabled", "HttpService"),
+    ("SetHttpEnabled", "HttpService"),
+    ("GetUserAgent", "HttpService"),
+    ("JSONDecodeAsync", "HttpService"),
+    ("JSONEncodeAsync", "HttpService"),
+    ("Start", "HttpRequest"),
+    ("Cancel", "HttpRequest"),
+    // TextService measurement
+    ("GetTextSize", "TextService"),
+    ("GetTextBoundsAsync", "TextService"),
+    ("GetTextSizeOffsetAsync", "TextService"),
+    // DataModel / AvatarEditorService / GenericChallengeService CoreScript members
+    ("OpenScreenshotsFolder", "DataModel"),
+    ("BustAvatarFetchCache", "AvatarEditorService"),
+    ("NoPromptApplyProfileConfiguration", "AvatarEditorService"),
+    ("NoPromptCreateOutfit", "AvatarEditorService"),
+    ("NoPromptDeleteOutfit", "AvatarEditorService"),
+    ("NoPromptRenameOutfit", "AvatarEditorService"),
+    ("NoPromptSaveAvatar", "AvatarEditorService"),
+    ("NoPromptSaveAvatarThumbnailCustomization", "AvatarEditorService"),
+    ("NoPromptSetFavorite", "AvatarEditorService"),
+    ("NoPromptUpdateOutfit", "AvatarEditorService"),
+    ("PerformCreateOutfitWithDescription", "AvatarEditorService"),
+    ("PerformDeleteOutfit", "AvatarEditorService"),
+    ("PerformRenameOutfit", "AvatarEditorService"),
+    ("PerformSaveAvatarWithDescription", "AvatarEditorService"),
+    ("PerformSetFavorite", "AvatarEditorService"),
+    ("PerformUpdateOutfit", "AvatarEditorService"),
+    ("SetAllowInventoryReadAccess", "AvatarEditorService"),
+    ("SignalCreateOutfitFailed", "AvatarEditorService"),
+    ("SignalCreateOutfitPermissionDenied", "AvatarEditorService"),
+    ("SignalDeleteOutfitFailed", "AvatarEditorService"),
+    ("SignalDeleteOutfitPermissionDenied", "AvatarEditorService"),
+    ("SignalRenameOutfitFailed", "AvatarEditorService"),
+    ("SignalRenameOutfitPermissionDenied", "AvatarEditorService"),
+    ("SignalSaveAvatarFailed", "AvatarEditorService"),
+    ("SignalSaveAvatarPermissionDenied", "AvatarEditorService"),
+    ("SignalSetFavoriteFailed", "AvatarEditorService"),
+    ("SignalSetFavoritePermissionDenied", "AvatarEditorService"),
+    ("SignalUpdateOutfitFailed", "AvatarEditorService"),
+    ("SignalUpdateOutfitPermissionDenied", "AvatarEditorService"),
+    ("refreshAvatarThumbnails", "AvatarEditorService"),
+    ("SignalChallengeAbandoned", "GenericChallengeService"),
+    ("SignalChallengeCompleted", "GenericChallengeService"),
+    ("SignalChallengeInvalidated", "GenericChallengeService"),
+    ("SignalChallengeLoaded", "GenericChallengeService"),
+    ("SignalChallengeRequired", "GenericChallengeService"),
+    // AvatarChatService / VideoCaptureService / CoreGui / EventIngestService / SocialService / GroupService / AvatarCreationService / MarketplaceService
+    ("DebugCounterGet", "AvatarChatService"),
+    ("EnableVoice", "AvatarChatService"),
+    ("IsEnabled", "AvatarChatService"),
+    ("IsPlaceEnabled", "AvatarChatService"),
+    ("IsUniverseEnabled", "AvatarChatService"),
+    ("PollClientFeatures", "AvatarChatService"),
+    ("PollServerFeatures", "AvatarChatService"),
+    ("deviceMeetsRequirementsForFeature", "AvatarChatService"),
+    ("GetClientFeaturesAsync", "AvatarChatService"),
+    ("GetServerFeaturesAsync", "AvatarChatService"),
+    ("GetCameraDevices", "VideoCaptureService"),
+    ("SetUserGuiRendering", "CoreGui"),
+    ("TakeScreenshot", "CoreGui"),
+    ("ToggleRecording", "CoreGui"),
+    ("SendEventDeferred", "EventIngestService"),
+    ("SendEventImmediately", "EventIngestService"),
+    ("SetRBXEvent", "EventIngestService"),
+    ("SetRBXEventStream", "EventIngestService"),
+    ("InvokeGameInvitePromptClosed", "SocialService"),
+    ("InvokeIrisInvite", "SocialService"),
+    ("InvokeIrisInvitePromptClosed", "SocialService"),
+    ("InvokeShareSheetClosed", "SocialService"),
+    ("PromptRsvpToEventCompleted", "SocialService"),
+    ("SignalFeedbackSubmissionCompleted", "SocialService"),
+    ("SignalFeedbackSubmissionPermissionDenied", "SocialService"),
+    ("UpdatePlayerPartyData", "SocialService"),
+    ("PromptJoinCompleted", "GroupService"),
+    ("DeserializeAvatarModel", "AvatarCreationService"),
+    ("HandleSelfieConsentResult", "AvatarCreationService"),
+    ("HandleSelfieQRResult", "AvatarCreationService"),
+    ("CreateCageMeshPartsWithScaleForExportAsync", "AvatarCreationService"),
+    ("ClearProductInfoCaches", "MarketplaceService"),
+    ("IsPurchaseSimulated", "MarketplaceService"),
+    ("PlayerCanMakePurchases", "MarketplaceService"),
+    ("PrepareCollectiblesPurchase", "MarketplaceService"),
+    ("PromptCollectiblesPurchase", "MarketplaceService"),
+    ("PromptNativePurchase", "MarketplaceService"),
+    ("PromptNativePurchaseWithLocalPlayer", "MarketplaceService"),
+    ("PromptNativePurchaseWithLocalPlayerWithPaymentSessionId", "MarketplaceService"),
+    ("PromptNativePurchaseWithPaymentSessionId", "MarketplaceService"),
+    ("PromptRobloxPurchase", "MarketplaceService"),
+    ("PromptThirdPartyPurchase", "MarketplaceService"),
+    ("RedeemGamePassFreeTrial", "MarketplaceService"),
+    ("RefreshBulkPurchase", "MarketplaceService"),
+    ("ReportAssetSale", "MarketplaceService"),
+    ("ReportRobuxUpsellStarted", "MarketplaceService"),
+    ("SignalAssetTypePurchased", "MarketplaceService"),
+    ("SignalCheckPlayerHasRobloxSubscription", "MarketplaceService"),
+    ("SignalClientPurchaseSuccess", "MarketplaceService"),
+    ("SignalMockPurchasePremium", "MarketplaceService"),
+    ("SignalMockPurchaseRobloxSubscription", "MarketplaceService"),
+    ("SignalPromptBulkPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptBundlePurchaseFinished", "MarketplaceService"),
+    ("SignalPromptGamePassPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptPremiumPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptProductPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptRobloxSubscriptionPurchaseFinished", "MarketplaceService"),
+    ("SignalPromptSubscriptionPurchaseFinished", "MarketplaceService"),
+    ("SignalRobuxTransferCompleted", "MarketplaceService"),
+    ("SignalServerLuaDialogClosed", "MarketplaceService"),
+    ("SignalUserSubscriptionStatusChanged", "MarketplaceService"),
+    ("GetAvailableSubscriptionProductsAsync", "MarketplaceService"),
+    ("GetRobuxBalance", "MarketplaceService"),
+    ("GetSubscriptionPurchaseInfoAsync", "MarketplaceService"),
+    ("GetUserSubscriptionDetailsInternalAsync", "MarketplaceService"),
+    ("PerformBulkPurchase", "MarketplaceService"),
+    ("PerformCancelSubscription", "MarketplaceService"),
+    ("PerformPurchase", "MarketplaceService"),
+    ("PerformPurchaseV2", "MarketplaceService"),
+    ("PerformSubscriptionPurchase", "MarketplaceService"),
+    ("PerformSubscriptionPurchaseV2", "MarketplaceService"),
+    ("PerformSubscriptionPurchaseV3Async", "MarketplaceService"),
+    ("PerformSubscriptionPurchaseWithRobuxAsync", "MarketplaceService"),
+    // PlayerScripts / TelemetryService CoreScript members
+    ("GetRegisteredComputerCameraMovementModes", "PlayerScripts"),
+    ("GetRegisteredComputerMovementModes", "PlayerScripts"),
+    ("GetRegisteredTouchCameraMovementModes", "PlayerScripts"),
+    ("GetRegisteredTouchMovementModes", "PlayerScripts"),
+    ("LogCounter", "TelemetryService"),
+    ("LogDurationEvent", "TelemetryService"),
+    ("LogDurationEventWithTimestamp", "TelemetryService"),
+    ("LogEvent", "TelemetryService"),
+    ("LogStat", "TelemetryService"),
+    ("AcquireFocus", "AudioFocusService"),
+    ("GetFocusedContextId", "AudioFocusService"),
+    ("GetRegisteredContexts", "AudioFocusService"),
+    ("RegisterContextIdFromLua", "AudioFocusService"),
+    ("RequestFocus", "AudioFocusService"),
+    ("GetInputDevice", "SoundService"),
+    ("GetInputDevices", "SoundService"),
+    ("GetOutputDevice", "SoundService"),
+    ("GetOutputDevices", "SoundService"),
+    ("SetOutputDevice", "SoundService"),
+    ("GetRecordingDevices", "SoundService"),
+    ("SetRecordingDevice", "SoundService"),
+    ("SetSoundEnabled", "SoundService"),
+    ("GetAudioApiByDefault", "SoundService"),
+    ("SetAudioApiByDefault", "SoundService"),
+    ("GetPeakLevel", "SoundService"),
+    ("GetListenerWorldCFrame", "SoundService"),
+    ("GetAudioInstances", "SoundService"),
+    ("GetSoundMemoryData", "SoundService"),
+    ("GetIsMaterialActionAsToolEnabled", "MaterialService"),
+    ("GetMaterialOverrideChanged", "MaterialService"),
+    ("GetOverrideStatus", "MaterialService"),
+    ("SetCurrentMaterial", "MaterialService"),
+    ("ToggleMaterialFillToolEnabled", "MaterialService"),
+    ("GetMaxQualityLevel", "RenderSettings"),
+    ("GetMessageId", "MessageBusService"),
+    ("GetProtocolMethodRequestMessageId", "MessageBusService"),
+    ("GetProtocolMethodResponseMessageId", "MessageBusService"),
+    ("Subscribe", "MessageBusService"),
+    ("SubscribeToProtocolMethodRequest", "MessageBusService"),
+    ("SubscribeToProtocolMethodResponse", "MessageBusService"),
+    ("Publish", "MessageBusService"),
+    ("GetLast", "MessageBusService"),
+    ("Call", "MessageBusService"),
+    ("PublishProtocolMethodRequest", "MessageBusService"),
+    ("PublishProtocolMethodResponse", "MessageBusService"),
+    ("SetRequestHandler", "MessageBusService"),
+    ("MakeRequest", "MessageBusService"),
+    ("Disconnect", "MessageBusConnection"),
+    ("GetItem", "LocalStorageService"),
+    ("SetItem", "LocalStorageService"),
+    ("Flush", "LocalStorageService"),
+    ("WhenLoaded", "LocalStorageService"),
     ("BindToSimulation", "RunService"),
     ("BindToAnimation", "RunService"),
     ("GetPredictionStatus", "RunService"),
     ("IsResimulating", "RunService"),
     ("SetPredictionMode", "RunService"),
     ("ClearOutput", "LogService"),
+    ("ExecuteScript", "LogService"),
+    ("GetHttpResultHistory", "LogService"),
     ("GetLogHistory", "LogService"),
     ("GetLogger", "LogService"),
     ("Info", "LogService"),
     ("Log", "LogService"),
     ("Output", "LogService"),
+    ("RequestHttpResultApproved", "LogService"),
+    ("RequestServerHttpResult", "LogService"),
+    ("RequestServerOutput", "LogService"),
     ("Warn", "LogService"),
+    ("RequestServerStats", "ClientReplicator"),
     ("GetLogger", "Logger"),
     ("Info", "Logger"),
     ("Log", "Logger"),
@@ -64,6 +462,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("Warn", "Logger"),
     ("EnableCoverage", "ScriptContext"),
     ("GetCoverageStats", "ScriptContext"),
+    ("GetBrowserTrackerId", "Stats"),
     ("GetHarmonyQualityLevel", "Stats"),
     ("GetMemoryCategoryNames", "Stats"),
     ("GetMemoryUsageMbAllCategories", "Stats"),
@@ -73,6 +472,8 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetTotalMemoryUsageMb", "Stats"),
     ("ResetHarmonyMemoryTarget", "Stats"),
     ("SetHarmonyMemoryTarget", "Stats"),
+    ("GetValue", "StatsItem"),
+    ("GetValueString", "StatsItem"),
     ("CreateCollection", "CollectionService"),
     ("GetCollection", "CollectionService"),
     ("GetCollections", "CollectionService"),
@@ -137,6 +538,7 @@ pub const METHODS: &[(&str, &str)] = &[
     // Studio declares IsA on Object: the non-Instance objects (Logger,
     // EditableImage…) have it too (Instances take the core one).
     ("IsA", "Object"),
+    ("GetDocumentationUrl", "HttpRbxApiService"),
     ("Send", "WebStreamClient"),
     ("Close", "WebStreamClient"),
 ];
@@ -148,6 +550,11 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
     ("GetLogHistoryAsync", "LogService"),
     ("SavePlace", "DataModel"),
     ("RequestLimitedAsync", "HttpRbxApiService"),
+    ("GetAsync", "HttpRbxApiService"),
+    ("GetAsyncFullUrl", "HttpRbxApiService"),
+    ("PostAsync", "HttpRbxApiService"),
+    ("PostAsyncFullUrl", "HttpRbxApiService"),
+    ("RequestAsync", "HttpRbxApiService"),
     ("GetPlayerSegmentsAsync", "AnalyticsService"),
     ("SerializeInstancesAsync", "SerializationService"),
     ("DeserializeInstancesAsync", "SerializationService"),
@@ -159,8 +566,141 @@ pub const LUA_METHODS: &[(&str, &str)] = &[
 pub const EVENTS: &[(&str, &str)] = &[
     // Fired from the session's output (services `on_leave`), deferred as in Studio.
     ("MessageOut", "LogService"),
+    ("HttpResultOut", "LogService"),
+    ("OnHttpResultApproved", "LogService"),
+    ("ServerMessageOut", "LogService"),
+    ("ServerHttpResultOut", "LogService"),
+    ("ServerContextOut", "LogService"),
+    ("StatsReceived", "ClientReplicator"),
     // Fired at once by the logger's own calls, on it and the loggers above it.
     ("MessageOut", "Logger"),
+    // LocalStorageService:SetItem (services_core.luau).
+    ("ItemWasSet", "LocalStorageService"),
+    // StarterGui:SetCoreGuiEnabled (runtime_ext.rs).
+    ("CoreGuiChangedSignal", "StarterGui"),
+    ("OnUserLayerLoadingStatusChanged", "IXPService"),
+    ("OnBrowserTrackerLayerLoadingStatusChanged", "IXPService"),
+    ("OnCreatorLayerLoadingStatusChanged", "IXPService"),
+    ("SessionChanged", "SessionService"),
+    ("OnContextRegistered", "AudioFocusService"),
+    ("OnContextUnregistered", "AudioFocusService"),
+    ("OnDeafenVoiceAudio", "AudioFocusService"),
+    ("OnUndeafenVoiceAudio", "AudioFocusService"),
+    ("DeviceListChanged", "SoundService"),
+    ("AudioDeviceInputAdded", "SoundService"),
+    ("AudioInstanceAdded", "SoundService"),
+    ("MaterialFillToolEnabledChanged", "MaterialService"),
+    ("OverrideStatusChanged", "MaterialService"),
+    ("OnCrossExperienceStarted", "ExperienceService"),
+    ("OnCrossExperienceStopped", "ExperienceService"),
+    ("OnNewJoinAttempt", "ExperienceService"),
+    ("PlaceJoinStateChanged", "ExperienceService"),
+    ("QueuePositionChanged", "ExperienceService"),
+    ("ScreenshotContentReady", "SafetyService"),
+    ("ScreenshotUploaded", "SafetyService"),
+    ("PerformanceStatsVisibleChanged", "UserGameSettings"),
+    ("ActiveUserSignedOut", "ThirdPartyUserService"),
+    ("RccConnectionChanged", "NotificationService"),
+    ("RccEventReceived", "NotificationService"),
+    ("Roblox17sConnectionChanged", "NotificationService"),
+    ("Roblox17sEventReceived", "NotificationService"),
+    ("RobloxConnectionChanged", "NotificationService"),
+    ("RobloxEventReceived", "NotificationService"),
+    ("TopicNotificationReceived", "NotificationService"),
+    ("TopicSubscriptionError", "NotificationService"),
+    ("TopicTokenExpiry", "NotificationService"),
+    ("AdTeleportEnded", "AdService"),
+    ("AdTeleportInitiated", "AdService"),
+    ("RewardedVideoAdEnded", "AdService"),
+    ("RewardedVideoAdStarted", "AdService"),
+    ("ShowDynamicEudsaDisclosure", "AdService"),
+    ("ShowReportAdPopup", "AdService"),
+    ("adGuiRegisterUI", "AdService"),
+    ("AnimationPlayedCoreScript", "Animator"),
+    ("AnimationStreamTrackPlayed", "Animator"),
+    ("BadgeAwarded", "BadgeService"),
+    ("OnBadgeAwarded", "BadgeService"),
+    ("CaptureObjectSavedInternal", "CaptureService"),
+    ("CaptureSavedInternal", "CaptureService"),
+    ("OpenCapturePermissionsPrompt", "CaptureService"),
+    ("OpenSaveCapturesPrompt", "CaptureService"),
+    ("OpenShareCapturePrompt", "CaptureService"),
+    ("UserVideoCaptureFailed", "CaptureService"),
+    ("UserVideoCaptureStartFailed", "CaptureService"),
+    ("VideoCaptureInProgress", "CaptureService"),
+    ("ScreenshotReady", "DataModel"),
+    ("ScreenshotSavedToAlbum", "DataModel"),
+    ("OpenAllowInventoryReadAccess", "AvatarEditorService"),
+    ("OpenPromptCreateOufit", "AvatarEditorService"),
+    ("OpenPromptDeleteOutfit", "AvatarEditorService"),
+    ("OpenPromptRenameOutfit", "AvatarEditorService"),
+    ("OpenPromptSaveAvatar", "AvatarEditorService"),
+    ("OpenPromptSetFavorite", "AvatarEditorService"),
+    ("OpenPromptUpdateOutfit", "AvatarEditorService"),
+    ("PromptApplyProfileConfigurationCompleted", "AvatarEditorService"),
+    ("PromptSaveAvatarThumbnailCustomizationCompleted", "AvatarEditorService"),
+    ("ChallengeAbandonedEvent", "GenericChallengeService"),
+    ("ChallengeCompletedEvent", "GenericChallengeService"),
+    ("ChallengeInvalidatedEvent", "GenericChallengeService"),
+    ("ChallengeLoadedEvent", "GenericChallengeService"),
+    ("ChallengeRequiredEvent", "GenericChallengeService"),
+    ("DevicesChanged", "VideoCaptureService"),
+    ("Error", "VideoCaptureService"),
+    ("Started", "VideoCaptureService"),
+    ("Stopped", "VideoCaptureService"),
+    ("VideoRecordingChangeRequest", "GameSettings"),
+    ("UserGuiRenderingChanged", "CoreGui"),
+    ("OpenShareSheetWithLink", "SocialService"),
+    ("PlayerPartyDataChanged", "SocialService"),
+    ("PromptInviteRequested", "SocialService"),
+    ("PromptIrisInviteRequested", "SocialService"),
+    ("SelfViewHidden", "SocialService"),
+    ("SelfViewVisible", "SocialService"),
+    ("ShowPromptFeedbackSubmission", "SocialService"),
+    ("ShowPromptFeedbackUnavailable", "SocialService"),
+    ("ShowPromptRsvpToEvent", "SocialService"),
+    ("ShowJoinPrompt", "GroupService"),
+    ("OpenSelfieConsent", "AvatarCreationService"),
+    ("OpenSelfieQRCode", "AvatarCreationService"),
+    ("UgcValidationFailure", "AvatarCreationService"),
+    ("UgcValidationSuccess", "AvatarCreationService"),
+    ("ClientLuaDialogRequested", "MarketplaceService"),
+    ("ClientPurchaseSuccess", "MarketplaceService"),
+    ("GamePassFreeTrialRedeemed", "MarketplaceService"),
+    ("NativePurchaseFinished", "MarketplaceService"),
+    ("NativePurchaseFinishedV2", "MarketplaceService"),
+    ("NativePurchaseFinishedWithLocalPlayer", "MarketplaceService"),
+    ("NativePurchaseFinishedWithLocalPlayerV2", "MarketplaceService"),
+    ("OpenShopRequested", "MarketplaceService"),
+    ("PrepareCollectiblesPurchaseRequested", "MarketplaceService"),
+    ("PromptBulkPurchaseRefreshed", "MarketplaceService"),
+    ("PromptBulkPurchaseRequested", "MarketplaceService"),
+    ("PromptBulkPurchaseRequestedV2", "MarketplaceService"),
+    ("PromptBulkPurchaseRequestedV3", "MarketplaceService"),
+    ("PromptBundlePurchaseRequested", "MarketplaceService"),
+    ("PromptCancelSubscriptionRequested", "MarketplaceService"),
+    ("PromptCollectibleBundlePurchaseRequested", "MarketplaceService"),
+    ("PromptCollectiblesPurchaseRequested", "MarketplaceService"),
+    ("PromptGamePassPurchaseRequested", "MarketplaceService"),
+    ("PromptPremiumPurchaseRequested", "MarketplaceService"),
+    ("PromptProductPurchaseRequested", "MarketplaceService"),
+    ("PromptPurchaseRequested", "MarketplaceService"),
+    ("PromptPurchaseRequestedV2", "MarketplaceService"),
+    ("PromptRobloxPurchaseRequested", "MarketplaceService"),
+    ("PromptRobloxSubscriptionPurchaseRequested", "MarketplaceService"),
+    ("PromptRobuxTransferRequested", "MarketplaceService"),
+    ("PromptRobuxTransferSubscriptionUpsellRequested", "MarketplaceService"),
+    ("PromptSubscriptionPurchaseRequested", "MarketplaceService"),
+    ("PromptVIPServerPurchaseRequested", "MarketplaceService"),
+    ("RefreshBulkPurchaseRequested", "MarketplaceService"),
+    ("RobuxTransferCompleted", "MarketplaceService"),
+    ("ServerPurchaseVerification", "MarketplaceService"),
+    ("ThirdPartyPurchaseFinished", "MarketplaceService"),
+    ("UserSubscriptionStatusChanged", "MarketplaceService"),
+    ("ComputerCameraMovementModeRegistered", "PlayerScripts"),
+    ("ComputerMovementModeRegistered", "PlayerScripts"),
+    ("TouchCameraMovementModeRegistered", "PlayerScripts"),
+    ("TouchMovementModeRegistered", "PlayerScripts"),
     // Source links and SetValue (services `newindex`, services.luau).
     ("ReceiverConnected", "CustomEvent"),
     ("ReceiverDisconnected", "CustomEvent"),
@@ -224,6 +764,8 @@ struct State {
     physics_step: f64,
     /// HttpService:CreateWebStreamClient's clients (their objects' Refs).
     streams: Streams,
+    /// DataModel:DefineFastFlag and friends (services_core.rs).
+    fast_flags: core_members::FastFlags,
 }
 
 /// A WebStreamClient: its connection (`stream` module) and state.
@@ -360,6 +902,34 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             enum_arg(args, 1, "GearType")?;
             ok(Value::Boolean(false))
         }
+        ("DataModel", "DefineFastFlag" | "DefineFastInt" | "DefineFastString" | "GetFastFlag" | "GetFastInt" | "GetFastString" | "GetEngineFeature" | "SetFlagVersion" | "GetPlaySessionId")
+        | ("ScriptContext", "AddCoreScriptLocal")
+        | ("InsertService", "LoadLocalAsset" | "GetLocalFileContents")
+        | ("UserInputService", "GetPlatform")
+        | ("GuiService", "GetNotificationTypeList")
+        | ("StarterGui", "RegisterSetCore" | "RegisterGetCore")
+        | ("RunService", "GetRobloxVersion" | "GetCoreScriptVersion" | "SetRobloxGuiFocused" | "GetRobloxGuiFocused")
+        | ("MessageBusService" | "MessageBusConnection" | "LocalStorageService"
+            | "IXPService" | "MemStorageService" | "MemStorageConnection"
+            | "RbxAnalyticsService" | "SessionService" | "ExperienceService"
+            | "PolicyService" | "SafetyService" | "PermissionsService"
+            | "ThirdPartyUserService" | "NotificationService" | "AdService"
+            | "AchievementService" | "Animator" | "CaptureService" | "HttpRequest"
+            | "AvatarEditorService" | "GenericChallengeService" | "AvatarChatService"
+            | "VideoCaptureService" | "CoreGui" | "EventIngestService" | "SocialService"
+            | "GroupService" | "AvatarCreationService" | "MarketplaceService"
+            | "PlayerScripts" | "TelemetryService" | "AudioFocusService" | "SoundService"
+            | "MaterialService", _) => core_members::call(lua, owner, name, args),
+        ("DataModel", "OpenScreenshotsFolder")
+        | ("RenderSettings", "GetMaxQualityLevel")
+        | ("HttpService", "RequestInternal" | "GetHttpEnabled" | "SetHttpEnabled" | "GetUserAgent" | "JSONDecodeAsync" | "JSONEncodeAsync")
+        | ("HttpRbxApiService", "GetDocumentationUrl")
+        | ("TextService", "GetTextSize" | "GetTextBoundsAsync" | "GetTextSizeOffsetAsync") => {
+            core_members::call(lua, owner, name, args)
+        }
+        ("UserGameSettings", "GetDefaultFramerateCap" | "GetTutorialState" | "ResetOnboardingCompleted" | "SetTutorialState") => {
+            core_members::call(lua, owner, name, args)
+        }
 
         // ---------------------------------------------------- RunService
         ("RunService", "BindToSimulation" | "BindToAnimation") => lcall(lua, name, args.clone()),
@@ -397,6 +967,21 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             // Studio clears its Output window; the session's history stays.
             nothing()
         }
+        ("LogService", "GetHttpResultHistory") => ok(Value::Table(lua.create_table()?)),
+        ("LogService", "RequestHttpResultApproved") => {
+            world(lua)?.fire(this, "OnHttpResultApproved", vec![Value::Boolean(true)]);
+            nothing()
+        }
+        ("LogService", "RequestServerOutput" | "RequestServerHttpResult") => nothing(),
+        ("LogService", "ExecuteScript") => {
+            if let Ok(code) = arg_str(args, 1, "string") {
+                if !code.trim().is_empty() {
+                    let _ = lua.load(&code).set_name("=DevConsoleCommand").exec();
+                }
+            }
+            nothing()
+        }
+        ("ClientReplicator", "RequestServerStats") => nothing(),
         ("LogService" | "Logger", "GetLogger") => lcall(lua, "GetLogger", args.clone()),
         ("LogService" | "Logger", "Info" | "Warn" | "Output" | "Log") => {
             let mut a = MultiValue::new();
@@ -410,6 +995,7 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         ("ScriptContext", _) => Err(capability("call", name, "PluginOrOpenCloud")),
 
         // ---------------------------------------------------- Stats
+        ("Stats", "GetBrowserTrackerId") => ok(s(lua, "0")?),
         ("Stats", "GetMemoryUsageMbForTag") => {
             let tag = enum_arg(args, 1, "DeveloperMemoryTag")?;
             let lua_mb = lua.used_memory() as f64 / (1024.0 * 1024.0);
@@ -421,6 +1007,32 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
         }
         ("Stats", "GetTotalMemoryUsageMb") => ok(Value::Number(rss_mb())),
         ("Stats", _) => Err(capability("call", name, "InternalTest")),
+        ("StatsItem", "GetValue" | "GetValueString") => {
+            let item_name = world(lua)?
+                .d()
+                .dom
+                .get_by_ref(this)
+                .map(|i| i.name.clone())
+                .unwrap_or_default();
+            let ft = state(lua)?.frame_time * 1000.0;
+            let val = match item_name.as_str() {
+                "Memory" => rss_mb(),
+                "CPU" => if ft > 0.0 { ft } else { 16.6 },
+                "GPU" => if ft > 0.0 { (ft * 0.6).max(0.5) } else { 8.0 },
+                "NetworkSent" | "NetworkReceived" => 0.0,
+                "Ping" => 1.0,
+                "MaxMemory" => 1024.0,
+                "MaxCPU" | "MaxGPU" => 16.67,
+                "MaxNetworkSent" | "MaxNetworkReceived" => 50.0,
+                "MaxPing" => 100.0,
+                _ => 0.0,
+            };
+            if name == "GetValueString" {
+                ok(s(lua, format!("{val:.2}"))?)
+            } else {
+                ok(Value::Number(val))
+            }
+        }
 
         // ---------------------------------------------------- CollectionService
         ("CollectionService", "CreateCollection") => Err(rt_err("Collections are not enabled")),
@@ -559,11 +1171,17 @@ fn call_inner(lua: &Lua, name: &str, owner: &str, class: &str, this: Ref, args: 
             arg_str(args, 1, "string")?;
             Err(rt_err("Invalid onboarding ID"))
         }
-        ("UserGameSettings", "InFullScreen") => ok(Value::Boolean(false)),
+        ("UserGameSettings", "InFullScreen") => {
+            let fs = matches!(ugs(lua)?.raw_get::<Value>("Fullscreen")?, Value::Boolean(true));
+            ok(Value::Boolean(fs))
+        }
         ("UserGameSettings", "InStudioMode") => ok(Value::Boolean(true)),
         ("UserGameSettings", _) => nothing(),
         ("GlobalSettings", _) => {
             let f = arg_str(args, 1, "string")?;
+            if crate::runtime::security::current(lua) >= crate::runtime::security::CORE {
+                return core_members::get_global_flag(lua, name, &f);
+            }
             Err(rt_err(format!("Flag {f} does not exist")))
         }
 
@@ -763,7 +1381,12 @@ fn http_enabled_check(lua: &Lua, hs: Ref) -> mlua::Result<()> {
     let on = matches!(world(lua)?.d().prop(hs, "HttpEnabled"), Some(Variant::Bool(true)));
     // Plugins reach the web with HttpEnabled off (measured in Studio: a local
     // plugin's GetAsync / RequestAsync worked, no prompt).
-    if on || crate::runtime::security::current(lua) == crate::runtime::security::PLUGIN_IDENT {
+    if on
+        || matches!(
+            crate::runtime::security::current(lua),
+            crate::runtime::security::PLUGIN_IDENT | crate::runtime::security::BUILTIN_PLUGIN
+        )
+    {
         return Ok(());
     }
     let first = {
@@ -839,6 +1462,51 @@ fn http_start_inner(lua: &Lua, (hs, method, url, headers, body): (LInst, String,
         headers: http::studio_headers(hv, place_id),
         body: body.map(|b| b.as_bytes().to_vec()),
     }))
+}
+
+/// `__svc_http_internal_start(method, url, headers, body)` → request id (CoreScript / built-in plugin only).
+fn http_internal_start(
+    lua: &Lua,
+    (method, url, headers, body): (Value, Value, Value, Value),
+) -> mlua::Result<(Option<u64>, Option<String>)> {
+    if !matches!(security::current(lua), security::CORE | security::BUILTIN_PLUGIN) {
+        return Ok((None, Some("HttpService.RequestInternal requires RobloxScriptSecurity".into())));
+    }
+    let url = match url {
+        Value::String(s) => s.to_str()?.to_string(),
+        _ => return Ok((None, Some("Invalid URL".into()))),
+    };
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok((None, Some("URL must be http".into())));
+    }
+    let method = match method {
+        Value::String(s) => s.to_str()?.to_ascii_uppercase(),
+        _ => "GET".to_string(),
+    };
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS") {
+        return Ok((None, Some("HttpError: Aborted".into())));
+    }
+    let mut hv = Vec::new();
+    if let Value::Table(h) = headers {
+        for p in h.pairs::<String, Value>() {
+            if let Ok((k, Value::String(v))) = p {
+                if let Ok(vs) = v.to_str() {
+                    hv.push((k, vs.to_string()));
+                }
+            }
+        }
+    }
+    let body_bytes = match body {
+        Value::String(b) => Some(b.as_bytes().to_vec()),
+        _ => None,
+    };
+    let id = http::start_internal(http::Request {
+        method,
+        url,
+        headers: hv,
+        body: body_bytes,
+    });
+    Ok((Some(id), None))
 }
 
 /// `__svc_http_poll(id)` → nil (pending), or (ok, status, message, headers, body | error).
@@ -1074,7 +1742,7 @@ pub fn close_streams_of(lua: &Lua, code: &HashSet<Ref>) {
 }
 
 const HTTP_LUA: &str = r#"
-local start, poll = ...
+local start, poll, internal_start = ...
 local M = __rs_lua_methods
 local function fail(m) error(m, 0) end
 local function wait_for(id)
@@ -1116,18 +1784,55 @@ local function simple(self, method, url, body, ct, compress, headers)
 	if status < 200 or status >= 300 then fail(status_error(status, msg)) end
 	return resp
 end
+local function rbx_api_url(path)
+	if type(path) ~= "string" then fail("Invalid URL") end
+	if path:sub(1, 7) == "http://" or path:sub(1, 8) == "https://" then return path end
+	if path:sub(1, 1) == "/" then path = path:sub(2) end
+	return "https://api.roblox.com/" .. path
+end
+local function rbx_api_req(method, url, body, ct, headers)
+	local h = {}
+	if type(headers) == "table" then for k, v in headers do h[k] = v end end
+	if (method == "POST" or method == "PUT" or method == "PATCH") and h["Content-Type"] == nil then
+		h["Content-Type"] = content_type(ct)
+	end
+	local id, err = internal_start(method, url, h, body)
+	if not id then fail(err or "HttpError: ConnectFail") end
+	local okk, status, msg, _, resp = wait_for(id)
+	if not okk then fail(status) end
+	if status < 200 or status >= 300 then fail(status_error(status, msg)) end
+	return resp
+end
 local prev_get, prev_post, prev_req = M.GetAsync, M.PostAsync, M.RequestAsync
 M.GetAsync = function(self, url, nocache, headers)
+	if typeof(self) == "Instance" and self.ClassName == "HttpRbxApiService" then
+		return rbx_api_req("GET", rbx_api_url(url), nil, nil, nil)
+	end
 	if typeof(self) ~= "Instance" or self.ClassName ~= "HttpService" then return prev_get(self, url, nocache, headers) end
 	return simple(self, "GET", url, nil, nil, nil, headers)
 end
+M.GetAsyncFullUrl = function(self, url)
+	return rbx_api_req("GET", tostring(url), nil, nil, nil)
+end
 M.PostAsync = function(self, url, data, ct, compress, headers)
+	if typeof(self) == "Instance" and self.ClassName == "HttpRbxApiService" then
+		-- HttpRbxApiService:PostAsync(apiUrlPath, data, priority, content_type, httpRequestType)
+		return rbx_api_req("POST", rbx_api_url(url), tostring(data or ""), compress, nil)
+	end
 	if typeof(self) ~= "Instance" or self.ClassName ~= "HttpService" then return prev_post(self, url, data, ct, compress, headers) end
 	if data == nil then fail("Argument 2 missing or nil") end
 	-- (compress: Studio sends the body as it is, verified with httpbin.)
 	return simple(self, "POST", url, tostring(data), ct, compress, headers)
 end
-M.RequestAsync = function(self, opts)
+M.PostAsyncFullUrl = function(self, url, data, priority, ct)
+	return rbx_api_req("POST", tostring(url), tostring(data or ""), ct, nil)
+end
+M.RequestAsync = function(self, opts, priority, ct)
+	if typeof(self) == "Instance" and self.ClassName == "HttpRbxApiService" then
+		if type(opts) ~= "table" or type(opts.Url) ~= "string" then fail("Invalid request options") end
+		local method = if opts.Method == nil then "GET" else tostring(opts.Method)
+		return rbx_api_req(method, opts.Url, opts.Body, ct, opts.Headers)
+	end
 	if typeof(self) ~= "Instance" or self.ClassName ~= "HttpService" then return prev_req(self, opts) end
 	if type(opts) ~= "table" then fail("Unable to cast " .. cast_name(opts) .. " to Dictionary") end
 	if opts.Url == nil then fail("Invalid request options") end
@@ -1157,7 +1862,16 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             let full = world(lua)?.full_name(r);
             return Err(rt_err(format!("{key} is not a valid member of {class} \"{full}\"")));
         }
+        // File-backed Studio sessions have no deployed server region.
+        "ServerRegion" if class == "DataModel" => s(lua, "")?,
         "GearGenreSetting" if class == "DataModel" => enum_val(lua, "GearGenreSetting", 0)?,
+        "ClientGitHash" if class == "RunService" => s(lua, "000000")?,
+        "ClientFeatures" | "ServerFeatures" if class == "AvatarChatService" => Value::Integer(0),
+        "ClientFeaturesInitialized" if class == "AvatarChatService" => Value::Boolean(true),
+        "Active" if class == "VideoCaptureService" => Value::Boolean(false),
+        "CameraID" if class == "VideoCaptureService" => s(lua, "")?,
+        "VideoCaptureEnabled" if class == "GameSettings" => Value::Boolean(false),
+        "Version" if class == "CoreGui" => Value::Integer(2),
         "FrameNumber" if class == "RunService" => return Err(capability("read", key, "InternalTest")),
         // Plugins and the command bar read it (measured in Studio: Stopped in
         // the edit DataModel, Running in Play / Run).
@@ -1221,6 +1935,24 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             Some(v) => v,
             None => return Ok(None),
         },
+        "IsLuobuServer" | "LuobuWhitelisted" if class == "PolicyService" => {
+            match crate::ltypes::LEnumItem::from_name("TriStateBoolean", "False") {
+                Some(item) => crate::ltypes::enum_value(lua, item)?,
+                None => Value::Boolean(false),
+            }
+        }
+        "IsCaptureModeForReport" if class == "SafetyService" => Value::Boolean(false),
+        "HasActiveUser" if class == "ThirdPartyUserService" => Value::Boolean(false),
+        "FriendCommunicationRestrictionStatus" | "VoiceChatRestrictionStatus" if class == "ThirdPartyUserService" => {
+            match crate::ltypes::LEnumItem::from_name("ChatRestrictionStatus", "NotRestricted") {
+                Some(item) => crate::ltypes::enum_value(lua, item)?,
+                None => Value::Nil,
+            }
+        }
+        "IsConnected" | "IsLuaChatEnabled" | "IsLuaGameDetailsEnabled" if class == "NotificationService" => {
+            Value::Boolean(false)
+        }
+        "SelectedTheme" if class == "NotificationService" => s(lua, "Dark")?,
         _ => return Ok(None),
     }))
 }
@@ -1409,6 +2141,9 @@ pub mod perf {
 
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
     match key {
+        "ServerRegion" if class == "DataModel" => {
+            Err(rt_err("Unable to assign property ServerRegion. Property is read only"))
+        }
         "Sandboxed" if rustudio_core::doc::is_a(class, "Instance") => {
             let b = match value {
                 Value::Boolean(b) => *b,
@@ -1456,6 +2191,9 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         // Kept in library.luau's table (see prop_get); the normal write
         // follows (type check, Changed).
         _ if class == "UserGameSettings" => {
+            if key == "SavedQualityLevel" {
+                crate::runtime::security::check_set_quality(lua)?;
+            }
             let t = ugs(lua)?;
             if !t.raw_get::<Value>(key)?.is_nil() {
                 let mut a = MultiValue::new();
@@ -1472,17 +2210,35 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
                 // reflection database lists them as unscriptable, so the
                 // normal write would refuse them as read-only. The identity
                 // check already passed; finish the write here.
-                if crate::runtime::security::member_write_secured(class, key) {
-                    let changed = t.raw_get::<Value>(key)? != v;
-                    t.raw_set(key, v)?;
+                let prev = t.raw_get::<Value>(key)?;
+                let changed = prev != v;
+                let secured = crate::runtime::security::member_write_secured(class, key);
+                if secured || matches!(
+                    key,
+                    "PerformanceStatsVisible" | "Fullscreen" | "ReducedMotion"
+                        | "PreferredTransparency" | "PreferredTextSize"
+                        | "ComputerCameraMovementMode" | "ComputerMovementMode"
+                        | "ControlMode" | "UiNavigationKeyBindEnabled"
+                        | "MouseSensitivity" | "MouseSensitivityFirstPerson"
+                        | "MouseSensitivityThirdPerson" | "OnScreenProfilerEnabled"
+                        | "MicroProfilerWebServerEnabled" | "HapticStrength"
+                        | "ChatTranslationEnabled" | "PeoplePageLayout"
+                ) {
+                    t.raw_set(key, v.clone())?;
                     if changed {
+                        sync_ugs_side_effects(lua, r, key, &v)?;
+                        persist_ugs_prop(key, &v);
                         let mut w = world(lua)?;
                         w.fire(r, "Changed", vec![Value::String(lua.create_string(key)?)]);
                         w.fire(r, &format!("Changed:{key}"), vec![]);
                     }
                     return Ok(true);
                 }
-                t.raw_set(key, v)?;
+                t.raw_set(key, v.clone())?;
+                if changed {
+                    sync_ugs_side_effects(lua, r, key, &v)?;
+                    persist_ugs_prop(key, &v);
+                }
             }
             Ok(false)
         }
@@ -1629,17 +2385,252 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(if ft > 0.0 { ft.min(1.0 / 15.0) } else { 1.0 / 60.0 })
         })?,
     )?;
+    let start = lua.create_function(http_start)?;
+    let internal_start = crate::cmeta::wrap(lua, lua.create_function(http_internal_start)?, false)?;
+    let poll = crate::cmeta::wrap(lua, lua.create_function(http_poll)?, false)?;
+    rs.set("http_internal_start", internal_start.clone())?;
+    rs.set("http_poll", poll.clone())?;
+    rs.set("http_debug", std::env::var_os("RUSTUDIO_HTTP_DEBUG").is_some())?;
     let m: Table = lua
         .load(include_str!("services.luau"))
         .set_name("=rustudio.services")
-        .call(rs)?;
+        .call(rs.clone())?;
     lua.set_named_registry_value("svc_impl", m)?;
-    let start = lua.create_function(http_start)?;
-    let poll = lua.create_function(http_poll)?;
-    lua.load(HTTP_LUA).set_name("=rustudio.services.http").call::<()>((start, poll))?;
+    core_members::install(lua, &rs)?;
+    lua.load(HTTP_LUA)
+        .set_name("=rustudio.services.http")
+        .call::<()>((start, poll, internal_start))?;
     let ser = lua.create_function(serialize)?;
     let deser = lua.create_function(deserialize)?;
     lua.load(SER_LUA).set_name("=rustudio.services.serialization").call::<()>((ser, deser))?;
+    hydrate_persisted_ugs(lua)?;
+    Ok(())
+}
+
+/// Side effects when a UserGameSettings property changes (audio volume,
+/// dedicated change signals, and mirrored GuiService accessibility properties).
+fn sync_ugs_side_effects(lua: &Lua, r: Ref, key: &str, v: &Value) -> mlua::Result<()> {
+    match key {
+        "MasterVolume" => {
+            if let Value::Number(n) = v {
+                crate::audio::set_master_global(*n as f32);
+            } else if let Value::Integer(n) = v {
+                crate::audio::set_master_global(*n as f32);
+            }
+        }
+        "PerformanceStatsVisible" => {
+            let on = matches!(v, Value::Boolean(true));
+            world(lua)?.fire(r, "PerformanceStatsVisibleChanged", vec![Value::Boolean(on)]);
+        }
+        "Fullscreen" => {
+            let on = matches!(v, Value::Boolean(true));
+            crate::gui::share().fullscreen_req = Some(on);
+            world(lua)?.fire(r, "FullscreenChanged", vec![Value::Boolean(on)]);
+        }
+        "OnScreenProfilerEnabled" => {
+            let on = matches!(v, Value::Boolean(true));
+            crate::gui::share().microprofiler_req = Some(on);
+        }
+        "UiNavigationKeyBindEnabled" => {
+            let on = matches!(v, Value::Boolean(true));
+            crate::gui::share().ui_nav_toggle_disabled = !on;
+        }
+        "SavedQualityLevel" => {
+            let level = match v {
+                Value::UserData(u) => u.borrow::<crate::ltypes::LEnumItem>().ok().map(|e| e.value as u8),
+                Value::Integer(i) => Some((*i).clamp(0, 10) as u8),
+                Value::Number(f) => Some((*f as i64).clamp(0, 10) as u8),
+                _ => None,
+            };
+            if let Some(level) = level {
+                crate::gui::share().saved_quality = Some(level.min(10));
+            }
+        }
+        "ReducedMotion" | "PreferredTransparency" | "PreferredTextSize" => {
+            let gs_prop = if key == "ReducedMotion" { "ReducedMotionEnabled" } else { key };
+            let gs_ref = {
+                let w = world(lua)?;
+                let d = w.d();
+                d.dom
+                    .get_by_ref(d.dom.root_ref())
+                    .and_then(|root| {
+                        root.children()
+                            .iter()
+                            .copied()
+                            .find(|c| d.class_of(*c).is_some_and(|k| k == "GuiService"))
+                    })
+            };
+            if let Some(gs) = gs_ref {
+                let mut w = world(lua)?;
+                w.fire(gs, "Changed", vec![Value::String(lua.create_string(gs_prop)?)]);
+                w.fire(gs, &format!("Changed:{gs_prop}"), vec![]);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+static KEEP_UGS_PERSIST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable disk persistence of UserGameSettings (`user-game-settings.json`) for
+/// interactive Play sessions (`Game::keep_game_settings`).
+pub fn set_keep_game_settings(on: bool) {
+    KEEP_UGS_PERSIST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ugs_settings_path() -> Option<std::path::PathBuf> {
+    if cfg!(test) || std::env::var_os("RUSTUDIO_DETERMINISTIC").is_some() {
+        return None;
+    }
+    if let Ok(p) = std::env::var("RUSTUDIO_GAME_SETTINGS_FILE") {
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    if !KEEP_UGS_PERSIST.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("RUSTUDIO_NO_SETTINGS_SAVE").is_some()
+    {
+        return None;
+    }
+    Some(rustudio_core::paths::config().join("rustudio/user-game-settings.json"))
+}
+
+/// UserGameSettings the escape menu saves across Play sessions. MasterVolume,
+/// MouseSensitivity and CameraYInverted are owned by `game-settings.json`
+/// (rustudio_core::game_settings, applied at Play start): writes of those go
+/// there (`persist_shared_setting`) so both menus share one store and the
+/// value a person last chose is the one the next Play loads.
+const PERSISTED_UGS_KEYS: &[&str] = &[
+    "ControlMode",
+    "ComputerCameraMovementMode",
+    "ComputerMovementMode",
+    "SavedQualityLevel",
+    "PerformanceStatsVisible",
+    "ReducedMotion",
+    "PreferredTransparency",
+    "PreferredTextSize",
+    "UiNavigationKeyBindEnabled",
+    "ChatTranslationEnabled",
+    "PeoplePageLayout",
+];
+
+fn persist_shared_setting(key: &str, v: &Value) -> bool {
+    let num = match v {
+        Value::Number(f) if f.is_finite() => Some(*f),
+        Value::Integer(i) => Some(*i as f64),
+        _ => None,
+    };
+    match key {
+        "MasterVolume" => {
+            if let Some(f) = num {
+                rustudio_core::game_settings::update(|s| s.volume = Some(f as f32));
+            }
+        }
+        "MouseSensitivity" => {
+            if let Some(f) = num {
+                rustudio_core::game_settings::update(|s| s.sensitivity = Some(f));
+            }
+        }
+        "CameraYInverted" => {
+            if let Value::Boolean(b) = v {
+                rustudio_core::game_settings::update(|s| s.inverted = Some(*b));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn persist_ugs_prop(key: &str, v: &Value) {
+    if matches!(key, "MasterVolume" | "MouseSensitivity" | "CameraYInverted") {
+        if ugs_settings_path().is_some() {
+            persist_shared_setting(key, v);
+        }
+        return;
+    }
+    if !PERSISTED_UGS_KEYS.contains(&key) {
+        return;
+    }
+    let Some(path) = ugs_settings_path() else { return };
+    let json_val = match v {
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(i) => serde_json::json!(i),
+        Value::Number(f) if f.is_finite() => serde_json::json!(f),
+        Value::String(s) => match s.to_str() {
+            Ok(st) => serde_json::Value::String(st.to_string()),
+            Err(_) => return,
+        },
+        Value::UserData(u) => match u.borrow::<crate::ltypes::LEnumItem>() {
+            Ok(e) => serde_json::json!({ "enum": e.enum_type, "value": e.value }),
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    let mut map = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok())
+        .unwrap_or_default();
+    map.insert(key.to_string(), json_val);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+fn hydrate_persisted_ugs(lua: &Lua) -> mlua::Result<()> {
+    let Some(path) = ugs_settings_path() else { return Ok(()) };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) else {
+        return Ok(());
+    };
+    let Ok(t) = ugs(lua) else { return Ok(()) };
+    for (k, val) in map {
+        if !PERSISTED_UGS_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        let lv = match val {
+            serde_json::Value::Bool(b) => Value::Boolean(b),
+            serde_json::Value::Number(n) => match n.as_f64() {
+                Some(f) => Value::Number(f),
+                None => continue,
+            },
+            serde_json::Value::String(s) => Value::String(lua.create_string(s)?),
+            serde_json::Value::Object(o) => {
+                let Some(en) = o.get("enum").and_then(|v| v.as_str()) else { continue };
+                let Some(ev) = o.get("value").and_then(|v| v.as_u64()) else { continue };
+                enum_val(lua, en, ev as u32)?
+            }
+            _ => continue,
+        };
+        if !matches!(lv, Value::Nil) {
+            let _ = t.raw_set(k.as_str(), lv.clone());
+            match k.as_str() {
+                "MasterVolume" => {
+                    if let Value::Number(n) = lv {
+                        crate::audio::set_master_global(n as f32);
+                    }
+                }
+                "UiNavigationKeyBindEnabled" => {
+                    crate::gui::share().ui_nav_toggle_disabled = !matches!(lv, Value::Boolean(true));
+                }
+                "SavedQualityLevel" => {
+                    let level = match &lv {
+                        Value::UserData(u) => u.borrow::<crate::ltypes::LEnumItem>().ok().map(|e| e.value as u8),
+                        Value::Integer(i) => Some((*i).clamp(0, 10) as u8),
+                        Value::Number(f) => Some((*f as i64).clamp(0, 10) as u8),
+                        _ => None,
+                    };
+                    if let Some(level) = level {
+                        crate::gui::share().saved_quality = Some(level.min(10));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1650,9 +2641,7 @@ fn fire_sync(lua: &Lua, r: Ref, name: &str, args: Vec<Value>) {
     let (funcs, waiters) = {
         let Ok(mut s) = signals(lua) else { return };
         let funcs: Vec<(Function, u8)> = s.conns.get(&key).map(|v| v.iter().map(|c| (c.func.clone(), c.ident)).collect()).unwrap_or_default();
-        if let Some(v) = s.conns.get_mut(&key) {
-            v.retain(|c| !c.once);
-        }
+        s.remove_connections(&key, false, |c| c.once);
         let waiters: Vec<mlua::Thread> = s.waiters.remove(&key).unwrap_or_default().into_iter().map(|(_, t)| t).collect();
         (funcs, waiters)
     };
@@ -1672,6 +2661,7 @@ fn fire_sync(lua: &Lua, r: Ref, name: &str, args: Vec<Value>) {
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     // (RunService.FrameTime: simulated under --fixed-dt)
+    let edit = world(lua).is_ok_and(|w| w.mode == RunMode::Edit);
     let now = rustudio_core::sim_clock::now();
     let hooked = {
         let mut st = state(lua)?;
@@ -1679,11 +2669,13 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
             st.frame_time = now.duration_since(prev).as_secs_f64();
         }
         st.step_started = Some(now);
-        // The physics step's own time (play.rs's p3 section), per step.
-        let (ms, calls) = rustudio_core::bench::section_total("p3_physics_step");
-        let (pms, pcalls) = std::mem::replace(&mut st.physics_prev, (ms, calls));
-        if calls > pcalls && ms >= pms {
-            st.physics_step = (ms - pms) / (calls - pcalls) as f64 / 1000.0;
+        if !edit {
+            // The physics step's own time (play.rs's p3 section), per step.
+            let (ms, calls) = rustudio_core::bench::section_total("p3_physics_step");
+            let (pms, pcalls) = std::mem::replace(&mut st.physics_prev, (ms, calls));
+            if calls > pcalls && ms >= pms {
+                st.physics_step = (ms - pms) / (calls - pcalls) as f64 / 1000.0;
+            }
         }
         st.sim_hooked
     };
@@ -1927,3 +2919,80 @@ M.DeserializeInstancesAsync = function(self, b)
 	return r
 end
 "#;
+
+#[cfg(test)]
+mod offline_data_model_tests {
+    use crate::runtime::{RunMode, Runtime, World};
+    use rustudio_core::doc::Document;
+
+    #[test]
+    fn api_tail_offline_server_region_is_read_only() {
+        let runtime = Runtime::new().unwrap();
+        runtime.enter(World::new(Document::new_place(), RunMode::Run));
+        runtime.bind_globals().unwrap();
+        runtime.lua.load(r#"
+            assert(game.ServerRegion == "")
+            local ok, err = pcall(function() game.ServerRegion = "invalid" end)
+            assert(not ok and err == "Unable to assign property ServerRegion. Property is read only")
+        "#).exec().unwrap();
+        runtime.leave();
+    }
+
+    #[test]
+    fn coreui_settings_and_guistate_side_effects() {
+        use crate::runtime::security;
+        let runtime = Runtime::new().unwrap();
+        let mut w = World::new(Document::new_place(), RunMode::Play);
+        w.side = crate::runtime::Side::Client;
+        runtime.enter(w);
+        runtime.bind_globals().unwrap();
+        {
+            let mut sh = crate::gui::share();
+            sh.core_menu_open = false;
+            sh.fullscreen_req = None;
+            sh.microprofiler_req = None;
+            sh.saved_quality = None;
+            sh.ui_nav_toggle_disabled = false;
+        }
+        security::with_main_identity(&runtime.lua, security::CORE, || {
+            runtime.lua.load(r#"
+                local GS = game:GetService("GuiService")
+                local ugs = UserSettings():GetService("UserGameSettings")
+                GS:SetMenuIsOpen(true, "SettingsMenu")
+                assert(GS.MenuIsOpen == true)
+                ugs.Fullscreen = true
+                ugs.OnScreenProfilerEnabled = true
+                ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel4
+                ugs.UiNavigationKeyBindEnabled = false
+                ugs.ReducedMotion = true
+                assert(GS.ReducedMotionEnabled == true)
+
+                local btn = Instance.new("TextButton")
+                local states = {}
+                btn:GetPropertyChangedSignal("GuiState"):Connect(function()
+                    table.insert(states, btn.GuiState.Name)
+                end)
+                btn.Interactable = false
+                btn.Interactable = true
+                assert(#states == 2 and states[1] == "NonInteractable" and states[2] == "Idle",
+                    "expected NonInteractable->Idle, got " .. table.concat(states, ","))
+            "#).exec()
+        }).unwrap();
+        runtime.dispatch();
+        {
+            let sh = crate::gui::share();
+            assert!(sh.core_menu_open);
+            assert_eq!(sh.fullscreen_req, Some(true));
+            assert_eq!(sh.microprofiler_req, Some(true));
+            assert_eq!(sh.saved_quality, Some(4));
+            assert!(sh.ui_nav_toggle_disabled);
+        }
+        security::with_main_identity(&runtime.lua, security::CORE, || {
+            runtime.lua.load(r#"
+                game:GetService("GuiService"):SetMenuIsOpen(false, "SettingsMenu")
+            "#).exec()
+        }).unwrap();
+        assert!(!crate::gui::share().core_menu_open);
+        runtime.leave();
+    }
+}

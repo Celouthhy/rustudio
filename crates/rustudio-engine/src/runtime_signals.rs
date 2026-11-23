@@ -233,26 +233,75 @@ fn has_handlers(lua: &Lua, key: &(Ref, String), seq: u64) -> bool {
     })
 }
 
+/// Delivers an event immediately to either non-CORE (`core_only = false`) or
+/// CORE (`core_only = true`) connections. Used by TextChatService so game
+/// listeners on MessageReceived / BubbleDisplayed run in Studio's exact order
+/// before OnChatWindowAdded / OnBubbleAdded populate message properties for
+/// CoreScripts (ExpChat).
+pub(crate) fn deliver_filtered(lua: &Lua, r: Ref, name: &str, args: &[Value], core_only: bool) {
+    let seq = world(lua).map(|w| w.conn_seq).unwrap_or(u64::MAX);
+    let key = (r, name.to_string());
+    let (funcs, waiters, removed) = {
+        let Ok(mut s) = signals(lua) else { return };
+        let funcs: Vec<(Function, u8)> = s
+            .conns
+            .get(&key)
+            .map(|v| {
+                v.iter()
+                    .filter(|c| c.id <= seq && ((c.ident >= super::security::CORE) == core_only))
+                    .map(|c| (c.func.clone(), c.ident))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut removed = s.remove_connections(&key, false, |c| {
+            c.once && c.id <= seq && ((c.ident >= super::security::CORE) == core_only)
+        });
+        let waiters = if !core_only {
+            let all = s.waiters.remove(&key).unwrap_or_default();
+            let (now, later): (Vec<(u64, Thread)>, Vec<(u64, Thread)>) =
+                all.into_iter().partition(|(id, _)| *id <= seq);
+            if !later.is_empty() {
+                s.waiters.insert(key.clone(), later);
+            } else {
+                removed |= !now.is_empty();
+            }
+            now.into_iter().map(|(_, t)| t).collect::<Vec<Thread>>()
+        } else {
+            Vec::new()
+        };
+        (funcs, waiters, removed)
+    };
+    if removed {
+        super::prune_layout_listener(lua, key.0);
+    }
+    for (f, ident) in funcs {
+        let th = domains::assets_cloud::scene::create_thread(lua, f.clone())
+            .inspect(|th| super::security::set(th, ident));
+        match th {
+            Ok(th) => resume(lua, &th, args.to_vec()),
+            Err(e) => report(lua, &e),
+        }
+    }
+    for th in waiters {
+        resume(lua, &th, args.to_vec());
+    }
+}
+
 /// Resumes the handlers connected (and waiters waiting) when the event fired.
 fn deliver(lua: &Lua, key: &(Ref, String), args: &[Value], seq: u64) {
     let (funcs, waiters, removed) = {
         let Ok(mut s) = signals(lua) else { return };
-        let mut removed = false;
         let mut funcs: Vec<(Function, u8)> = s
             .conns
             .get(key)
             .map(|v| v.iter().filter(|c| c.id <= seq).map(|c| (c.func.clone(), c.ident)).collect())
             .unwrap_or_default();
-        if let Some(v) = s.conns.get_mut(key) {
-            let before = v.len();
-            v.retain(|c| !(c.once && c.id <= seq));
-            removed = before != v.len() && v.is_empty();
-        }
+        let mut removed = s.remove_connections(key, false, |c| c.once && c.id <= seq);
         if key.1 == "AncestryChanged" {
-            if let Some((cutoff, v)) = s.destroyed_ancestry.get_mut(&key.0) {
+            if let Some((cutoff, v)) = s.destroyed_ancestry.get(&key.0) {
                 if seq <= *cutoff {
                     funcs.extend(v.iter().filter(|c| c.id <= seq).map(|c| (c.func.clone(), c.ident)));
-                    v.retain(|c| !(c.once && c.id <= seq));
+                    s.remove_connections(key, true, |c| c.once && c.id <= seq);
                 }
             }
         }

@@ -2075,7 +2075,18 @@ impl Tessellator {
                         if let Some(override_text_color) = override_text_color {
                             // Only override the glyph color (not background color, strike-through color, etc)
                             if row.visuals.glyph_vertex_range.contains(&i) {
-                                color = *override_text_color;
+                                let is_color_glyph = !row.visuals.color_glyph_vertex_starts.is_empty()
+                                    && row
+                                        .visuals
+                                        .color_glyph_vertex_starts
+                                        .iter()
+                                        .any(|&start| i >= start as usize && i < start as usize + 4);
+                                if is_color_glyph {
+                                    let a = override_text_color.a();
+                                    color = Color32::from_rgba_premultiplied(a, a, a, a);
+                                } else {
+                                    color = *override_text_color;
+                                }
                             }
                         } else if color == Color32::PLACEHOLDER {
                             color = *fallback_color;

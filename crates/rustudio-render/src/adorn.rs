@@ -408,7 +408,7 @@ impl AdornPass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("adorn3d params"),

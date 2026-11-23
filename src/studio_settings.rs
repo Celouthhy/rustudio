@@ -1066,11 +1066,12 @@ impl Dialog {
             let env = rs::overridden_by(o);
             let inactive = rs::inactive(o);
             let locked = env.is_some();
+            let disabled = locked || inactive.is_some();
             let mut note = o.desc.to_string();
             if let Some(e) = env {
                 note = format!("Set by {e} (the environment wins over this setting). {note}");
-            } else if inactive.is_some() {
-                note = format!("No effect with the Legacy solver. {note}");
+            } else if let Some(reason) = inactive {
+                note = format!("{reason} {note}");
             }
             let galley = ui.fonts_mut(|f| {
                 f.layout(note, FontId::proportional(DESC_FONT), c::TEXT_DIM, (w - 22.0 - 8.0).max(80.0))
@@ -1082,13 +1083,22 @@ impl Dialog {
             p.rect_filled(inner, 0.0, if resp.hovered() { c::ROW_HOVER } else { c::ROW });
             let top = Rect::from_min_size(r.min, Vec2::new(w, ROW_H));
             p.vline(r.min.x + col - 4.0, top.y_range(), egui::Stroke::new(1.0, c::BG));
-            let dim = locked || inactive.is_some();
+            let dim = disabled;
             let tc = if dim { c::TEXT_DIM } else { c::TEXT };
-            p.text(Pos2::new(r.min.x + 22.0, top.center().y), egui::Align2::LEFT_CENTER, o.label, font.clone(), tc);
+            let label = p.text(Pos2::new(r.min.x + 22.0, top.center().y), egui::Align2::LEFT_CENTER, o.label, font.clone(), tc);
+            if rs::restart_pending(o) {
+                p.text(
+                    Pos2::new(label.max.x + 8.0, top.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "Restart",
+                    font.clone(),
+                    egui::Color32::from_rgb(245, 166, 35),
+                );
+            }
             p.galley(Pos2::new(r.min.x + 22.0, top.max.y + 1.0), galley, c::TEXT_DIM);
             let vx = r.min.x + col;
             let vr = Rect::from_min_max(Pos2::new(vx, top.min.y), Pos2::new(top.max.x, top.max.y - 1.0));
-            let vresp = ui.interact(vr, egui::Id::new(("rustudio_option_value", i)), if locked { Sense::hover() } else { Sense::click() });
+            let vresp = ui.interact(vr, egui::Id::new(("rustudio_option_value", i)), if disabled { Sense::hover() } else { Sense::click() });
             if ui.clip_rect().intersects(vr) {
                 self.hits.push((Hit::Opt(i), vr.intersect(ui.clip_rect())));
             }
@@ -1104,6 +1114,83 @@ impl Dialog {
                     }
                     if vresp.clicked() {
                         rs::set_bool(o.key, !b);
+                    }
+                }
+                // Editor frame limit: type any number, or pick a preset from ▾.
+                (OptKind::Choice(items), Shown::Choice(_)) if o.key == "fps" => {
+                    let ei = DEFS.len() + i;
+                    let fmt = |f: f32| if f.fract() == 0.0 { format!("{}", f as u32) } else { format!("{f}") };
+                    let current = rs::fps_limit();
+                    let arrow = Rect::from_min_max(Pos2::new(top.max.x - 20.0, top.min.y + 1.0), Pos2::new(top.max.x - 2.0, top.max.y - 2.0));
+                    let id = egui::Id::new(("rustudio_option_choice", i));
+                    let editing = self.editing.as_ref().is_some_and(|(e, _)| *e == ei);
+                    if editing && !disabled {
+                        let er = Rect::from_min_max(Pos2::new(vx + 1.0, top.min.y + 1.0), Pos2::new(arrow.min.x - 2.0, top.max.y - 2.0));
+                        let mut text = self.editing.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+                        let te = ui.put(
+                            er,
+                            egui::TextEdit::singleline(&mut text)
+                                .id(egui::Id::new(("rustudio_option_edit", i)))
+                                .hint_text("FPS (empty: Unlimited)")
+                                .font(font.clone())
+                                .margin(egui::Margin::symmetric(2, 1)),
+                        );
+                        if !te.has_focus() && !te.lost_focus() {
+                            te.request_focus();
+                        }
+                        let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                        let esc = ui.input(|inp| inp.key_pressed(egui::Key::Escape));
+                        if esc {
+                            self.editing = None;
+                        } else if te.lost_focus() || enter {
+                            let t = text.trim();
+                            if t.is_empty() || t.eq_ignore_ascii_case("unlimited") {
+                                rs::set_choice(o.key, "unlimited", items[0].0);
+                            } else if let Some(f) = rs::parse_fps(t) {
+                                rs::set_choice(o.key, &fmt(f), items[0].0);
+                            }
+                            self.editing = None;
+                        } else {
+                            self.editing = Some((ei, text));
+                        }
+                    } else {
+                        let label = current.map_or_else(|| "Unlimited".to_string(), |f| format!("{} FPS", fmt(f)));
+                        p.text(Pos2::new(vx + 3.0, top.center().y), egui::Align2::LEFT_CENTER, label, font.clone(), tc);
+                        let on_arrow = ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|q| arrow.contains(q));
+                        if vresp.clicked() && !on_arrow && !disabled {
+                            self.editing = Some((ei, current.map(fmt).unwrap_or_default()));
+                        }
+                        if vresp.clicked() && on_arrow && !disabled {
+                            egui::Popup::open_id(ui.ctx(), id);
+                        }
+                    }
+                    rustudio_engine::ti::paint(&p, arrow.shrink(3.0), "caret-down-filled", if disabled { c::TEXT_DIM } else { tc });
+                    let width = vr.width().clamp(140.0, 320.0);
+                    let mut picked = None;
+                    egui::Popup::new(id, ui.ctx().clone(), egui::PopupAnchor::Position(vr.left_bottom()), ui.layer_id())
+                        .kind(egui::PopupKind::Menu)
+                        .open_memory(None)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                        .width(width)
+                        .frame(egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(2)).corner_radius(0))
+                        .show(|ui| {
+                            ui.set_width(width - 4.0);
+                            ui.spacing_mut().item_spacing = Vec2::ZERO;
+                            for (n, (v, s)) in items.iter().enumerate() {
+                                let sel = rs::parse_fps(v) == current;
+                                let (ir, iresp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 19.0), Sense::click());
+                                if sel || iresp.hovered() {
+                                    ui.painter().rect_filled(ir, 0.0, if sel { c::LIST_SEL } else { c::LIST_HOVER });
+                                }
+                                ui.painter().text(Pos2::new(ir.min.x + 6.0, ir.center().y), egui::Align2::LEFT_CENTER, *s, FontId::proportional(FONT), c::TEXT);
+                                if iresp.clicked() {
+                                    picked = Some(n);
+                                }
+                            }
+                        });
+                    if let Some(n) = picked {
+                        rs::set_choice(o.key, items[n].0, items[0].0);
+                        self.editing = None;
                     }
                 }
                 (OptKind::Choice(items), Shown::Choice(sel)) => {
@@ -1143,7 +1230,7 @@ impl Dialog {
                     // Index past DEFS so it never shares Studio's rows' edit state.
                     let ei = DEFS.len() + i;
                     let editing = self.editing.as_ref().is_some_and(|(e, _)| *e == ei);
-                    if editing && !locked {
+                    if editing && !disabled {
                         let er = Rect::from_min_max(Pos2::new(vx + 1.0, top.min.y + 1.0), Pos2::new(top.max.x - 2.0, top.max.y - 2.0));
                         let mut text = self.editing.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
                         let te = ui.put(

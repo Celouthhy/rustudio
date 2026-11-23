@@ -240,11 +240,12 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
     Ok(None)
 }
 pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlua::Result<bool> {
-    if class == "MarketplaceService" && key == "ProcessReceipt" && world(lua)?.side == Side::Client
-    {
-        return Err(rt_err(
-            "Can only register ProcessReceipt callback on server",
-        ));
+    if class == "MarketplaceService" && key == "ProcessReceipt" {
+        if world(lua)?.side == Side::Client {
+            return Err(rt_err("Can only register ProcessReceipt callback on server"));
+        }
+        crate::runtime::set_callback(lua, r, key, value.clone())?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -718,5 +719,46 @@ response={};assert(next(__rs_lua_methods.GetRecommendationItemAsync({},'missing'
         };
         assert_eq!(second.get::<i32>("x")?, 7);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use crate::runtime::{RunMode, Runtime, Side, World};
+    use rustudio_core::doc::Document;
+
+    #[test]
+    fn api_tail_process_receipt_registration() {
+        let runtime = Runtime::new().unwrap();
+        let mut world = World::new(Document::new_place(), RunMode::Run);
+        world.side = Side::Server;
+        runtime.enter(world);
+        runtime.bind_globals().unwrap();
+        runtime.lua.load(r#"
+            local service = game:GetService("MarketplaceService")
+            local receipt = { ProductId = 123 }
+            service.ProcessReceipt = function(data)
+                assert(data == receipt)
+                return Enum.ProductPurchaseDecision.PurchaseGranted
+            end
+            local ok, message = pcall(function() return service.ProcessReceipt end)
+            assert(not ok and message:find("is a callback member", 1, true))
+            local callback = __rs_get_callback(service, "ProcessReceipt")
+            assert(callback(receipt) == Enum.ProductPurchaseDecision.PurchaseGranted)
+            service.ProcessReceipt = 42
+            assert(__rs_get_callback(service, "ProcessReceipt") == nil)
+            service.ProcessReceipt = callback
+            service.ProcessReceipt = nil
+            assert(__rs_get_callback(service, "ProcessReceipt") == nil)
+        "#).exec().unwrap();
+        runtime.world_mut().unwrap().side = Side::Client;
+        runtime.lua.load(r#"
+            local service = game:GetService("MarketplaceService")
+            local ok, message = pcall(function()
+                service.ProcessReceipt = function() end
+            end)
+            assert(not ok and message == "Can only register ProcessReceipt callback on server")
+        "#).exec().unwrap();
+        runtime.leave();
     }
 }

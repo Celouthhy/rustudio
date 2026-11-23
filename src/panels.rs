@@ -499,13 +499,22 @@ pub struct Popped {
     /// Frames in a row the window couldn't be shown (app.rs panel_windows
     /// docks its tabs back after mech::PANEL_WINDOW_MAX_FAILS).
     pub fails: u32,
+    /// Hyprland was told this window's size and place before it opened.
+    pub preplaced: bool,
 }
 
 impl Popped {
     pub fn new(key: String, dock: DockState<Tab>, size: [f32; 2], pos: Option<[f32; 2]>) -> Self {
         let size = sane_size(size);
         let pos = pos.filter(|p| p.iter().all(|v| v.is_finite()));
-        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, wm: None, wm_restore: None, fails: 0 }
+        Popped { key, dock, size, pos, open_size: size, open_pos: pos, focus: false, wm: None, wm_restore: None, fails: 0, preplaced: false }
+    }
+    /// The size and place the window asks for when it opens.
+    pub fn open_size(&self) -> [f32; 2] {
+        self.open_size
+    }
+    pub fn open_pos(&self) -> Option<[f32; 2]> {
+        self.open_pos
     }
     pub fn viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("rustudio-panel", &self.key))
@@ -593,6 +602,11 @@ pub enum DockMove {
     MoveTo(Tab, String),
     /// Every panel window's tabs back into the main window.
     DockAll,
+    /// Into a floating window inside the main window (the tab's pop-out
+    /// button, a rustudio choice: Studio floats it as its own OS window).
+    Float(Tab),
+    /// A floating window's tab back into the main dock.
+    Unfloat(Tab),
 }
 
 /// The popped windows and where each panel lives in the main window.
@@ -738,6 +752,8 @@ impl Panels {
                     }
                 }
             }
+            // (RustudioApp floats and unfloats with the tab's on-screen rect.)
+            DockMove::Float(_) | DockMove::Unfloat(_) => {}
             DockMove::MoveTo(tab, key) => {
                 let Some(dest) = self.popped.iter().position(|w| w.key == key) else { return };
                 if let Some(Location::Popped(i, _)) = self.locate(main, &tab) {

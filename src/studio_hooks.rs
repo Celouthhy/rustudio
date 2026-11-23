@@ -125,6 +125,7 @@ impl Editor {
         self.game.keep_game_settings = self.harness.keeps_game_settings();
         // Deterministic editor self-tests inspect intermediate VM state.
         let threaded = self.game.use_gameplay_worker() && self.harness.selftest.is_none();
+        self.plugins.stop_edit_audio_vm_state();
         self.with_game_host(|game, host| {
             if threaded {
                 game.start_play_threaded(mode, host, clear_output, live_ids);
@@ -162,6 +163,7 @@ impl Editor {
 
     pub fn stop_play(&mut self) {
         self.with_game_host(|game, host| game.stop_play(host));
+        self.plugins.stop_edit_audio_vm_state();
         self.finish_stopped_plugin_playtest();
         self.restore_place_context();
     }

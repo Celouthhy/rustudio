@@ -153,7 +153,7 @@ pub fn run<A: eframe::App>(
             v.monitor_size = Some(egui::vec2(size[0] as f32, size[1] as f32));
         }
         app.raw_input_hook(&ctx, &mut raw);
-        let out = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             draw(&mut app, ui);
             // RawInput defaults to a 2048 atlas offscreen. Keep its packing
             // for small scenes, but grow to the device limit when epaint
@@ -168,6 +168,10 @@ pub fn run<A: eframe::App>(
                 }
             }
         });
+        // (epaint's debug builds assert that a TexturesDelta was handled
+        // before it is dropped: applied below where there is a GPU, and
+        // there is nothing to apply it to without one)
+        let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let mut close = false;
         let mut shots = Vec::new();
         for (_, v) in out.viewport_output.iter() {
@@ -184,7 +188,7 @@ pub fn run<A: eframe::App>(
             let jobs = ctx.tessellate(out.shapes, ppp);
             let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: ppp };
             let mut renderer = rs.renderer.write();
-            for (id, deltas) in &out.textures_delta.set {
+            for (id, deltas) in &textures_delta.set {
                 for delta in deltas {
                     renderer.update_texture(&rs.device, &rs.queue, *id, delta);
                 }
@@ -208,7 +212,7 @@ pub fn run<A: eframe::App>(
                 renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
             }
             rustudio_render::gpu_timing::submit(&rs.device, &rs.queue, "gpu: egui (offscreen)", extra.into_iter().chain([enc.finish()]));
-            for id in &out.textures_delta.free {
+            for id in &textures_delta.free {
                 renderer.free_texture(id);
             }
             drop(renderer);
@@ -235,6 +239,7 @@ pub fn run<A: eframe::App>(
                 });
             }
         }
+        textures_delta.clear();
         if close {
             app.on_exit();
             return 0;
@@ -283,6 +288,10 @@ pub fn wgpu_options(bench_mode: bool) -> egui_wgpu::WgpuConfiguration {
                 d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
                 // RUSTUDIO_GPU_TIMING: timestamp queries (gpu_timing.rs).
                 d.required_features |= rustudio_render::gpu_timing::features(adapter.features());
+                // The driver's pipeline cache, kept between runs (Vulkan;
+                // pipeline_cache.rs): a second start skips the shader compiles
+                // of its first.
+                d.required_features |= adapter.features() & egui_wgpu::wgpu::Features::PIPELINE_CACHE;
                 // GPU memory in blocks sized for memory use (8-64 MB), not
                 // wgpu's default 128-256 MB device blocks: the allocator keeps
                 // its last empty block, so a 1440 island settled 2.18-2.19 GB

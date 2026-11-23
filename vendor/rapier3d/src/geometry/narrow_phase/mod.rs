@@ -252,6 +252,7 @@ fn pair_qualified_manifold_count(pair: &ContactPair) -> u16 {
 /// bodies' colliders is exhaustive (pipeline-moved colliders leave the set; body is active).
 fn collect_pairs_to_update<E>(
     candidates: &mut Vec<u32>,
+    candidate_bits: &mut Vec<u64>,
     graph_indices: &Coarena<ColliderGraphIndices>,
     graph: &crate::data::graph::Graph<ColliderHandle, E>,
     islands: &IslandManager,
@@ -275,6 +276,16 @@ fn collect_pairs_to_update<E>(
         return;
     }
 
+    let probes = modified_colliders.len() + num_active;
+    let words = graph.edges.len().div_ceil(64);
+    // Dense updates can deduplicate directly by edge index. Sparse updates
+    // still sort the few candidates instead of sweeping the whole bitset.
+    let dense = probes >= 64 && words <= probes;
+    if dense {
+        candidate_bits.resize(words, 0);
+        candidate_bits.fill(0);
+    }
+
     let mut push_edges_of = |handle: ColliderHandle, require_change_flags: bool| {
         let Some(co) = colliders.get(handle) else {
             return;
@@ -286,7 +297,12 @@ fn collect_pairs_to_update<E>(
             return;
         };
         for edge in graph.edges(select_graph_id(gid)) {
-            candidates.push(edge.id().index() as u32);
+            let index = edge.id().index();
+            if dense {
+                candidate_bits[index / 64] |= 1u64 << (index % 64);
+            } else {
+                candidates.push(index as u32);
+            }
         }
     };
 
@@ -305,10 +321,19 @@ fn collect_pairs_to_update<E>(
         }
     }
 
-    // Sort + dedup: each edge visited exactly once (it can be pushed once per seeded
-    // collider), and the deterministic edge-index order of a full graph scan is preserved.
-    candidates.sort_unstable();
-    candidates.dedup();
+    // Both paths visit each seeded edge once, in full graph scan order.
+    if dense {
+        for (offset, &word) in candidate_bits.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                candidates.push((offset * 64 + remaining.trailing_zeros() as usize) as u32);
+                remaining &= remaining - 1;
+            }
+        }
+    } else {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
 }
 
 /// The narrow-phase collision detector that computes precise contact points between colliders.
@@ -338,6 +363,9 @@ pub struct NarrowPhase {
     /// the per-step loops don’t have to iterate on the whole interaction graphs.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     update_candidates: Vec<u32>,
+    /// Scratch for deduplicating dense candidate sets in edge order.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    update_candidate_bits: Vec<u64>,
     /// Solver graph coloring masks: per rigid-body (arena index), the set of solver colors
     /// used by its active contact pairs. Maintained incrementally on contact start/stop,
     /// so the solver never recolors its constraint graph from scratch.
@@ -447,6 +475,7 @@ impl NarrowPhase {
             intersection_graph: InteractionGraph::new(),
             graph_indices: Coarena::new(),
             update_candidates: Vec::new(),
+            update_candidate_bits: Vec::new(),
             retired_pairs: Vec::new(),
             body_solver_color_masks: Vec::new(),
             body_qualify_info: Vec::new(),

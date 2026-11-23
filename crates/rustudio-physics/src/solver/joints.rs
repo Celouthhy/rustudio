@@ -698,7 +698,7 @@ impl JointList {
     }
 
     /// Creates or updates the Instance `r` from its description (JOINT I).
-    pub fn upsert(&mut self, r: Ref, desc: &Desc) {
+    pub fn upsert(&mut self, r: Ref, desc: &Desc, wake_for_edit: bool) -> [Option<rp::RigidBodyHandle>; 2] {
         let idx = match self.of.get(&r) {
             Some(&i) if self.insts[i as usize].as_ref().is_some_and(|x| x.class_id() == desc.class_id()) => i,
             Some(&i) => {
@@ -712,8 +712,16 @@ impl JointList {
         };
         let next_key = &mut self.next_key;
         let inst = self.insts[idx as usize].as_mut().unwrap();
+        // An attachment edit can displace a passive joint whose island is
+        // asleep. Wake its bodies before gathering rows for the new frames.
+        let frame_changed = |old: instance::End, new: instance::End| {
+            old.body != new.body || old.pos != new.pos || old.rot != new.rot
+        };
+        let wake = wake_for_edit && desc.in_world
+            && (!inst.in_world || frame_changed(inst.a, desc.a) || frame_changed(inst.b, desc.b));
         inst.apply(desc, next_key);
         inst.seen = true;
+        if wake { [desc.a.body, desc.b.body] } else { [None; 2] }
     }
 
     fn alloc(&mut self, r: Ref, desc: &Desc) -> u32 {

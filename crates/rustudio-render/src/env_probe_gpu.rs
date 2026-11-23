@@ -161,7 +161,7 @@ impl ProbeGpu {
                 targets: &[Some(wgpu::ColorTargetState { format: FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         ProbeGpu {
             default_fill: pipe("fs_probe_default"),

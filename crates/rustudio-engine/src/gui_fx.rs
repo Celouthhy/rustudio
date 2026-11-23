@@ -161,6 +161,25 @@ impl Gui {
     }
 }
 
+/// A rounded rectangle's outline with `n` segments per corner whatever
+/// the radius (so two outlines of different radii pair up point by point).
+fn rounded_n(rect: Rect, radius: f32, n: usize) -> Vec<Pos2> {
+    let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5).max(0.0);
+    let mut pts = Vec::with_capacity(4 * (n + 1));
+    for (c, start) in [
+        (Pos2::new(rect.left() + r, rect.top() + r), 180.0f32),
+        (Pos2::new(rect.right() - r, rect.top() + r), 270.0),
+        (Pos2::new(rect.right() - r, rect.bottom() - r), 0.0),
+        (Pos2::new(rect.left() + r, rect.bottom() - r), 90.0),
+    ] {
+        for k in 0..=n {
+            let a = (start + 90.0 * k as f32 / n as f32).to_radians();
+            pts.push(Pos2::new(c.x + r * a.cos(), c.y + r * a.sin()));
+        }
+    }
+    pts
+}
+
 impl Walk<'_, '_> {
     /// The ParticleEmitter2D children of `host` (drawn over it, under its
     /// children).
@@ -330,6 +349,97 @@ impl Walk<'_, '_> {
                 at.z = num(d, em, "ZIndex", 1.0) as i32;
             }
             self.push_item(Shape::Mesh(mesh.into()), &at);
+        }
+    }
+
+    /// The UIShadow children of `host` (Enabled, Mode Shape, not Inset;
+    /// in ZIndex order): a drop shadow of the object's box behind its
+    /// background, with the box's UICorner — moved by Offset (scale of the
+    /// box's size), grown by Spread (each side), its edge softened over
+    /// BlurRadius (scale of the box's shorter side), in Color at
+    /// 1 - Transparency. ShowBehindParent false leaves out the part under
+    /// the box (its own outline, Offset ignored). Not drawn: Inset, Text
+    /// mode, a UIGradient under the shadow.
+    pub(super) fn shadow(&mut self, host: Ref, rect: Rect, corner: f32, me: &Down) {
+        let d = self.input.doc;
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let mut shadows: Vec<Ref> = children(d, host)
+            .into_iter()
+            .filter(|c| d.class_of(*c).is_some_and(|k| k == "UIShadow"))
+            .filter(|c| boolp(d, *c, "Enabled", true) && !boolp(d, *c, "Inset", false))
+            .filter(|c| enum_u32(d.prop(*c, "Mode")).unwrap_or(0) == 0)
+            .collect();
+        if shadows.is_empty() {
+            return;
+        }
+        shadows.sort_by_key(|c| num(d, *c, "ZIndex", 0.0) as i32);
+        let short = rect.width().min(rect.height());
+        for sh in shadows {
+            let a = (1.0 - num(d, sh, "Transparency", 0.0)).clamp(0.0, 1.0) * me.alpha;
+            if a <= 0.0 {
+                continue;
+            }
+            let c = color(d, sh, "Color", [0.0, 0.0, 0.0]);
+            let ct = [c[0] * me.tint[0], c[1] * me.tint[1], c[2] * me.tint[2]];
+            let br = udim(d, sh, "BlurRadius");
+            let blur = (br[0] * short + br[1] * me.scale).max(0.0);
+            let o = udim2(d, sh, "Offset");
+            let offset = egui::vec2(o[0] * rect.width() + o[1] * me.scale, o[2] * rect.height() + o[3] * me.scale);
+            let sp = udim2(d, sh, "Spread");
+            let spread = egui::vec2(sp[0] * rect.width() + sp[1] * me.scale, sp[2] * rect.height() + sp[3] * me.scale);
+            let base = rect.translate(offset).expand2(spread);
+            if base.width() <= 0.0 || base.height() <= 0.0 {
+                continue;
+            }
+            let show_behind = boolp(d, sh, "ShowBehindParent", true);
+            // The edge: full inside base shrunk by half the blur, gone at
+            // base grown by it, a smooth step between (a Gaussian's shape).
+            let half = blur * 0.5;
+            let fade = |e: f32| -> f32 {
+                if half <= 0.0 {
+                    return if e <= 0.0 { 1.0 } else { 0.0 };
+                }
+                let t = ((e + half) / (2.0 * half)).clamp(0.0, 1.0);
+                1.0 - t * t * (3.0 - 2.0 * t)
+            };
+            // From the solid inside (or the box's own outline, which hides
+            // what's behind it) out to where the shadow ends.
+            let start = if show_behind { -half } else { (-spread.x.min(spread.y)).max(-half) };
+            let end = half.max(start);
+            let ring = |e: f32| rounded_n(base.expand(e), (corner + spread.x.min(spread.y) + e).max(0.0), 6);
+            let with_alpha = |e: f32| rgba(ct, a * fade(e));
+            let mut mesh = Mesh::default();
+            if show_behind {
+                mesh.append(fill_mesh(&ring(start), &|_| with_alpha(start)));
+            }
+            if end > start {
+                let steps = 6;
+                let polys: Vec<(Vec<Pos2>, Color32)> = (0..=steps)
+                    .map(|k| {
+                        let e = start + (end - start) * k as f32 / steps as f32;
+                        (ring(e), with_alpha(e))
+                    })
+                    .collect();
+                let n = polys[0].0.len() as u32;
+                let v0 = mesh.vertices.len() as u32;
+                for (pts, c) in &polys {
+                    for p in pts {
+                        mesh.vertices.push(Vertex { pos: *p, uv: egui::epaint::WHITE_UV, color: *c });
+                    }
+                }
+                for k in 0..steps as u32 {
+                    let (ia, ib) = (v0 + k * n, v0 + (k + 1) * n);
+                    for i in 0..n {
+                        let j = (i + 1) % n;
+                        mesh.indices.extend_from_slice(&[ia + i, ib + i, ib + j, ia + i, ib + j, ia + j]);
+                    }
+                }
+            }
+            if !mesh.vertices.is_empty() {
+                self.push_item(Shape::Mesh(mesh.into()), me);
+            }
         }
     }
 

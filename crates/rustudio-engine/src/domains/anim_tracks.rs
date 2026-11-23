@@ -1,8 +1,6 @@
 //! The Animator's tracks stepped natively (frame hook after PreAnimation,
 //! anim.rs `animate`), as Studio's Animator::animatorOnStepped /
-//! evaluateAndAccumulateAnimationTracks / AnimationTrack::accumulate do
-//! (profiler names at Studio). Notes and
-//! probes: Studio measurements.
+//! evaluateAndAccumulateAnimationTracks / AnimationTrack::accumulate do.
 //!
 //! What stays in Luau (library.luau, run once per load, not per frame):
 //! finding and parsing an AnimationId's KeyframeSequence / CurveAnimation
@@ -30,7 +28,7 @@
 //! snaps in); a curve clip's NamedKeyframeEvent markers are KeyframeReached
 //! names; at a non-looped end the order is keyframes, Stopped, DidLoop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use rustc_hash::FxHashSet;
 use rustudio_core::doc::{Mark, Marks, Reader};
@@ -38,6 +36,7 @@ use rustudio_core::doc::{Mark, Marks, Reader};
 use glam::{Mat3, Quat, Vec3};
 use mlua::{Function, Lua, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
+use rbx_dom_weak::{ustr, Ustr};
 
 use rustudio_core::math::Xform;
 use crate::runtime::*;
@@ -50,7 +49,40 @@ struct Key {
     dir: String,
 }
 
-type KeyframeJoints = rustc_hash::FxHashMap<String, Vec<Key>>;
+#[derive(Clone, Copy)]
+struct FloatKey {
+    t: f64,
+    mode: u8,
+    v: f64,
+    left: f64,
+    right: f64,
+}
+
+/// Studio ignores track contributions below 0.001 (measured: 0.0009 -> 0, 0.001 -> included).
+const MIN_BLEND_WEIGHT: f64 = 0.001;
+
+/// The name of Part0 and Part1, or the parent Bone and child Bone names.
+type JointName = (Ustr, Ustr);
+type KeyframeJoints = rustc_hash::FxHashMap<JointName, Vec<Key>>;
+
+struct BoundJoint {
+    name: JointName,
+    instance: Ref,
+    /// Flat clips carry only a target name. Keep their existing last-match rule.
+    unqualified: bool,
+}
+
+impl BoundJoint {
+    fn channel<'a, T>(&self, channels: &'a rustc_hash::FxHashMap<JointName, T>) -> Option<&'a T> {
+        channels.get(&self.name).or_else(|| {
+            if self.unqualified {
+                channels.get(&(ustr(""), self.name.1))
+            } else {
+                None
+            }
+        })
+    }
+}
 type Retargeter = super::anim_retarget::Retargeter;
 
 struct Frame {
@@ -63,7 +95,9 @@ pub struct Seq {
     /// Native keyframes can be sampled without the Lua VM.
     keys: KeyframeJoints,
     /// CurveAnimation channels are Lua tables and stay on the VM thread.
-    curves: rustc_hash::FxHashMap<String, Table>,
+    curves: rustc_hash::FxHashMap<JointName, Table>,
+    /// CurveAnimation FaceControls FACS channels (control name -> FloatCurve keys).
+    facs: rustc_hash::FxHashMap<Ustr, Vec<FloatKey>>,
     frames: Vec<Frame>,
     length: f64,
     looped: bool,
@@ -84,8 +118,9 @@ struct Track {
     playing: bool,
     active: bool,
     ended: bool,
-    release: bool,
-    first_step: bool,
+    end_pending: bool,
+    start_at_end: bool,
+    zero_weight_steps: u8,
     speed: f64,
     weight: f64,
     target: f64,
@@ -99,6 +134,10 @@ struct Track {
     priority_set: bool,
     /// Stop(0) let it go: not stepped, WeightCurrent kept (Studio).
     cut: bool,
+    /// Bumped on every Play() / explicit TimePosition write for replication.
+    play_gen: u64,
+    /// True for tracks created by anim_replicate::sync (never echoed back).
+    mirrored: bool,
 }
 
 #[derive(Default)]
@@ -109,18 +148,21 @@ pub struct Tracks {
     seqs: HashMap<String, Rc<Seq>>,
     /// Rig → cached animation bindings, refreshed when its topology changes.
     animated: rustc_hash::FxHashMap<Ref, RigBindings>,
-    /// The order in which rigs began posing, also used for rest-pose writes.
+    /// The order in which rigs began posing.
     animated_order: Vec<Ref>,
     /// rig → the rig Studio builds from it for retargeting (None: not an R15
     /// Humanoid rig), kept while it animates.
     char_rigs: HashMap<Ref, Option<Rc<super::anim_retarget::Rig>>>,
     /// (clip, rig) → its retargeter.
     retargeters: HashMap<(usize, Ref), Rc<super::anim_retarget::Retargeter>>,
+    /// Last written Transform and previous Transform per joint, plus dt, for ApplyJointVelocities.
+    prev_transforms: rustc_hash::FxHashMap<Ref, (Xform, Xform, f64)>,
     steps: u64,
 }
 
 struct RigBindings {
-    joints: Rc<Vec<(String, Ref)>>,
+    joints: Rc<Vec<BoundJoint>>,
+    face_controls: Vec<Ref>,
     /// Joint and Bone references, their ancestors inside the rig, and the
     /// endpoints that determine the binding names. A move out of the rig
     /// leaves no ancestry path back to it in the current document.
@@ -151,24 +193,28 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
     let mut curves = rustc_hash::FxHashMap::default();
     let jt: Table = t.get("joints")?;
     for pair in jt.pairs::<String, Table>() {
-        let (name, list) = pair?;
-        if matches!(list.get::<Option<Table>>("curves"), Ok(Some(_))) {
-            curves.insert(name, list);
-            continue;
+        let (parent, children) = pair?;
+        for pair in children.pairs::<String, Table>() {
+            let (name, list) = pair?;
+            let name = (ustr(&parent), ustr(&name));
+            if matches!(list.get::<Option<Table>>("curves"), Ok(Some(_))) {
+                curves.insert(name, list);
+                continue;
+            }
+            let mut keys = Vec::new();
+            for k in list.sequence_values::<Table>() {
+                let k = k?;
+                let cf = xform_of(&k.get::<Value>("cf")?).unwrap_or_else(super::anim_ik::ident);
+                keys.push(Key {
+                    t: k.get("t")?,
+                    cf,
+                    rotation: Quat::from_mat3(&cf.rot),
+                    style: k.get::<Option<String>>("style")?.unwrap_or_else(|| "Linear".into()),
+                    dir: k.get::<Option<String>>("dir")?.unwrap_or_else(|| "In".into()),
+                });
+            }
+            keyframes.insert(name, keys);
         }
-        let mut keys = Vec::new();
-        for k in list.sequence_values::<Table>() {
-            let k = k?;
-            let cf = xform_of(&k.get::<Value>("cf")?).unwrap_or_else(super::anim_ik::ident);
-            keys.push(Key {
-                t: k.get("t")?,
-                cf,
-                rotation: Quat::from_mat3(&cf.rot),
-                style: k.get::<Option<String>>("style")?.unwrap_or_else(|| "Linear".into()),
-                dir: k.get::<Option<String>>("dir")?.unwrap_or_else(|| "In".into()),
-            });
-        }
-        keyframes.insert(name, keys);
     }
     let mut frames = Vec::new();
     for f in t.get::<Table>("frames")?.sequence_values::<Table>() {
@@ -182,6 +228,26 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
         }
         frames.push(Frame { t: f.get("t")?, name: f.get::<Option<String>>("name")?.unwrap_or_default(), markers });
     }
+    let mut facs = rustc_hash::FxHashMap::default();
+    if let Ok(Some(ft)) = t.get::<Option<Table>>("facs") {
+        for pair in ft.pairs::<String, Table>() {
+            let (name, list) = pair?;
+            let mut keys = Vec::new();
+            for k in list.sequence_values::<Table>() {
+                let k = k?;
+                keys.push(FloatKey {
+                    t: k.get("t")?,
+                    mode: k.get::<Option<u8>>("mode")?.unwrap_or(1),
+                    v: k.get::<Option<f64>>("v")?.unwrap_or(0.0),
+                    left: k.get::<Option<f64>>("left")?.unwrap_or(0.0),
+                    right: k.get::<Option<f64>>("right")?.unwrap_or(0.0),
+                });
+            }
+            if !keys.is_empty() {
+                facs.insert(ustr(&name), keys);
+            }
+        }
+    }
     let rig = match opt_inst(&t.get::<Value>("rig")?) {
         Some(r) => {
             let w = world(lua)?;
@@ -193,6 +259,7 @@ fn convert(lua: &Lua, t: &Table) -> mlua::Result<Seq> {
         rig,
         keys: keyframes,
         curves,
+        facs,
         frames,
         length: t.get::<Option<f64>>("length")?.unwrap_or(0.0),
         looped: t.get::<Option<bool>>("loop")?.unwrap_or(false),
@@ -320,21 +387,71 @@ fn pose_alpha(a: f64, style: &str, dir: &str) -> f64 {
                 1.0 + 0.5 * 2f64.powf(-10.0 * t) * ((t - 0.1125) * 2.0 * PI / 0.45).sin()
             }
         }
+        // Measured in Studio: Bounce InOut uses BounceIn on both halves
+        // (0.5*BounceIn(2a) for a<0.5, 0.5 + 0.5*BounceIn(2a-1) for a>=0.5).
+        "Bounce" if dir == "InOut" => {
+            if a < 0.5 {
+                ease_in("Bounce", a * 2.0) * 0.5
+            } else {
+                0.5 + ease_in("Bounce", (a - 0.5) * 2.0) * 0.5
+            }
+        }
         _ => ease(a, style, dir),
     }
 }
 
-/// Keyframe poses: normalized linear quaternion interpolation.
-fn pose_lerp(a: &Key, b: &Key, t: f64) -> Xform {
+/// Keyframe poses: Linear uses NLERP; eased styles (Cubic/CubicV2/Elastic/Bounce)
+/// use unclamped SLERP so Elastic overshoots outside [0, 1] extrapolate along the arc
+/// (measured against Studio on 150° rotations across all 18 style×dir pairs).
+fn pose_lerp(a: &Key, b: &Key, t: f64, slerp: bool) -> Xform {
     let qa = a.rotation;
     let mut qb = b.rotation;
     if qa.dot(qb) < 0.0 {
         qb = -qb;
     }
     let tf = t as f32;
-    let q = qa * (1.0 - tf) + qb * tf;
-    let rot = if q.length() > 1e-8 { Mat3::from_quat(q.normalize()) } else { Mat3::IDENTITY };
+    let rot = if slerp {
+        let delta = (qa.conjugate() * qb).normalize();
+        let (axis, angle) = delta.to_axis_angle();
+        if angle.abs() < 1e-7 {
+            Mat3::from_quat(qa.normalize())
+        } else {
+            let q = (qa * Quat::from_axis_angle(axis, (angle as f64 * t) as f32)).normalize();
+            Mat3::from_quat(q)
+        }
+    } else {
+        let q = qa * (1.0 - tf) + qb * tf;
+        if q.length() > 1e-8 { Mat3::from_quat(q.normalize()) } else { Mat3::IDENTITY }
+    };
     Xform { pos: a.cf.pos.lerp(b.cf.pos, tf), rot }
+}
+
+fn sample_float_keys(keys: &[FloatKey], t: f64) -> f64 {
+    let Some(first) = keys.first() else { return 0.0 };
+    if t <= first.t {
+        return first.v;
+    }
+    let last = keys.last().unwrap();
+    if t >= last.t {
+        return last.v;
+    }
+    let next = keys.partition_point(|k| k.t <= t);
+    let b = &keys[next.min(keys.len() - 1)];
+    let a = &keys[next.saturating_sub(1)];
+    if a.mode == 0 || b.t <= a.t {
+        return a.v;
+    }
+    let dt = b.t - a.t;
+    let u = (t - a.t) / dt;
+    if a.mode == 1 {
+        return a.v + (b.v - a.v) * u;
+    }
+    let u2 = u * u;
+    let u3 = u2 * u;
+    (2.0 * u3 - 3.0 * u2 + 1.0) * a.v
+        + (u3 - 2.0 * u2 + u) * dt * a.right
+        + (-2.0 * u3 + 3.0 * u2) * b.v
+        + (u3 - u2) * dt * b.left
 }
 
 fn sample_keys(list: &[Key], t: f64) -> Option<Xform> {
@@ -350,7 +467,9 @@ fn sample_keys(list: &[Key], t: f64) -> Option<Xform> {
     if b.t <= a.t {
         return Some(a.cf);
     }
-    Some(pose_lerp(a, b, pose_alpha((t - a.t) / (b.t - a.t), &a.style, &a.dir)))
+    let alpha = pose_alpha((t - a.t) / (b.t - a.t), &a.style, &a.dir);
+    let slerp = a.style != "Linear" && a.style != "Constant";
+    Some(pose_lerp(a, b, alpha, slerp))
 }
 
 fn rank(priority: &Value) -> i64 {
@@ -385,16 +504,9 @@ const END_FADE: f64 = 0.3;
 
 /// One track's time / weight / events; returns whether it poses its rig.
 fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
-    // Let go of a track whose Ended handlers ran without replaying it.
     let pending = {
-        let mut t = tracks(lua);
-        let Some(st) = t.all.get_mut(&r) else { return Ok(None) };
-        if st.release {
-            st.release = false;
-            if st.ended && !st.playing {
-                st.active = false;
-            }
-        }
+        let t = tracks(lua);
+        let Some(st) = t.all.get(&r) else { return Ok(None) };
         st.pending.clone()
     };
     if let Some(id) = pending {
@@ -408,111 +520,218 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
                 if !st.priority_set {
                     st.priority = seq.priority.clone();
                 }
+                if st.start_at_end {
+                    st.time = seq.length;
+                    st.start_at_end = false;
+                }
             }
             if seq.is_some() || !still {
                 st.pending = None;
             }
         }
     }
-    // (frames crossed, loops, stopped now, end now)
-    let (crossed, loops, stopped, ended_now) = {
+    // Check deferred releases/cuts at the start of the step:
+    // - Stop(0) (`st.cut`): drops immediately on the first step, keeping WeightCurrent and not zeroing joints.
+    // - Smooth fade-out (`st.end_pending` set on the step weight reached 0): fires Ended and releases next step.
+    enum ImmediateEnd {
+        None,
+        Cut,
+        FadedOut,
+    }
+    let imm_end = {
         let mut t = tracks(lua);
         let Some(st) = t.all.get_mut(&r) else { return Ok(None) };
         if !st.active {
             return Ok(None);
         }
         if st.cut {
-            // Stop(0): gone this step, TimePosition / WeightCurrent as they were.
-            let now = !st.ended;
-            drop(t);
-            if now {
-                if let Some(st) = tracks(lua).all.get_mut(&r) {
-                    st.ended = true;
-                    st.release = true;
-                }
-                fire(lua, r, "Ended", vec![])?;
+            st.cut = false;
+            let fire_end = !st.ended;
+            st.ended = true;
+            if fire_end {
+                ImmediateEnd::Cut
+            } else {
+                st.active = false;
+                return Ok(None);
             }
+        } else if st.end_pending && !st.playing {
+            st.end_pending = false;
+            let fire_end = !st.ended;
+            st.ended = true;
+            if fire_end {
+                ImmediateEnd::FadedOut
+            } else {
+                st.active = false;
+                return Ok(None);
+            }
+        } else {
+            ImmediateEnd::None
+        }
+    };
+    match imm_end {
+        ImmediateEnd::Cut | ImmediateEnd::FadedOut => {
+            fire(lua, r, "Ended", vec![])?;
+            if let Some(st) = tracks(lua).all.get_mut(&r) {
+                if !st.playing {
+                    st.active = false;
+                }
+            }
+            return Ok(None);
+        }
+        ImmediateEnd::None => {}
+    }
+
+    // (frames crossed, loops, stopped_natural, stopped_zero_weight, ended_now)
+    let (crossed, loops, stopped_natural, stopped_zero_weight, ended_now) = {
+        let mut t = tracks(lua);
+        let Some(st) = t.all.get_mut(&r) else { return Ok(None) };
+        if !st.active {
             return Ok(None);
         }
         let length = st.seq.as_ref().map(|s| s.length).unwrap_or(0.0);
         let mut crossed: Vec<usize> = Vec::new();
         let mut loops = 0usize;
-        let mut stopped = false;
+        let mut stopped_natural = false;
+        let mut stopped_zero_weight = false;
         let mut ended_now = false;
         if length > 0.0 {
             let seq = st.seq.clone().expect("seq with length");
             let frames = &seq.frames;
-            let before = st.time;
-            let after = before + dt * st.speed;
-            let events = |lo: f64, hi: f64, reverse: bool, include_start: bool, out: &mut Vec<usize>| {
-                if lo.is_nan() || hi.is_nan() || lo > hi {
-                    return;
-                }
-                let first = frames.partition_point(|f| f.t < lo || (!reverse && !include_start && f.t == lo));
-                let end = frames.partition_point(|f| f.t < hi || ((!reverse || include_start) && f.t == hi));
-                if reverse {
-                    out.extend((first..end).rev());
+            // Studio advances current fade BEFORE handling a natural end on this step
+            // (so a non-looped end starts its 0.3s fade-out on the NEXT step, not this one).
+            let was_zero = st.weight <= 0.0 && st.target <= 0.0;
+            if st.fade > 0.0 {
+                st.fade_elapsed += dt;
+                let a = (st.fade_elapsed / st.fade).min(1.0);
+                st.weight = st.fade_start + (st.target - st.fade_start) * a;
+            } else {
+                st.weight = st.target;
+            }
+            if st.playing && st.weight <= 0.0 && st.target <= 0.0 {
+                if st.fade <= 0.0 {
+                    // Play(0, 0, speed) or AdjustWeight(0, 0): stops immediately on this step.
+                    st.playing = false;
+                    st.ended = true;
+                    stopped_zero_weight = true;
+                    ended_now = true;
                 } else {
-                    out.extend(first..end);
-                }
-            };
-            if st.looped {
-                st.time = after.rem_euclid(length);
-                if st.speed >= 0.0 {
-                    let mut lo = before;
-                    for _ in 0..(after / length).floor().max(0.0) as i64 {
-                        events(lo, length, false, st.first_step, &mut crossed);
-                        st.first_step = true;
-                        lo = 0.0;
-                        loops += 1;
+                    // AdjustWeight(0, fade > 0): Studio stays playing for 2 steps at wc==0, then stops+ends.
+                    if was_zero {
+                        st.zero_weight_steps = st.zero_weight_steps.saturating_add(1);
+                    } else {
+                        st.zero_weight_steps = 0;
                     }
-                    events(lo, st.time, false, st.first_step, &mut crossed);
-                } else {
-                    let mut hi = before;
-                    for _ in 0..(-(after / length).floor()).max(0.0) as i64 {
-                        events(0.0, hi, true, st.first_step || hi == length, &mut crossed);
-                        hi = length;
-                        loops += 1;
+                    if st.zero_weight_steps >= 2 {
+                        st.playing = false;
+                        st.ended = true;
+                        stopped_zero_weight = true;
+                        ended_now = true;
                     }
-                    events(st.time, hi, true, hi == length || st.first_step, &mut crossed);
                 }
             } else {
-                st.time = after.clamp(0.0, length);
-                events(before.min(st.time), before.max(st.time), st.speed < 0.0, st.first_step, &mut crossed);
-                // Speed 0 at the end counts as reaching it (Studio).
-                if st.playing && (after >= length && st.speed >= 0.0 || after <= 0.0 && st.speed < 0.0) {
-                    st.playing = false;
-                    fade_track(st, 0.0, END_FADE);
-                    stopped = true;
-                    // Studio fires DidLoop as a non-looped track ends.
-                    loops += 1;
+                st.zero_weight_steps = 0;
+            }
+            if !stopped_zero_weight {
+                // Studio accumulates TimePosition in f32 (even while fading out after
+                // Stop(fade > 0) so looped clips keep moving smoothly during fade-out),
+                // and fires markers/keyframes/DidLoop only while IsPlaying is true.
+                let before = st.time as f32;
+                let step_dt = (dt as f32) * (st.speed as f32);
+                let after = (before + step_dt) as f64;
+                let before_f64 = before as f64;
+                let emit_events = st.playing;
+                let events_fwd = |lo: f64, hi: f64, include_hi: bool, out: &mut Vec<usize>| {
+                    if !emit_events || lo.is_nan() || hi.is_nan() || lo > hi {
+                        return;
+                    }
+                    let first = frames.partition_point(|f| f.t < lo);
+                    let end = frames.partition_point(|f| f.t < hi || (include_hi && f.t == hi));
+                    out.extend(first..end);
+                };
+                let events_rev = |lo: f64, hi: f64, include_lo: bool, include_hi: bool, out: &mut Vec<usize>| {
+                    if !emit_events || lo.is_nan() || hi.is_nan() || lo > hi {
+                        return;
+                    }
+                    let first = frames.partition_point(|f| f.t < lo || (!include_lo && f.t == lo));
+                    let end = frames.partition_point(|f| f.t < hi || (include_hi && f.t == hi));
+                    out.extend((first..end).rev());
+                };
+                if st.looped {
+                    if st.speed >= 0.0 {
+                        let wraps = (after / length).floor().max(0.0) as i64;
+                        let rem = after.rem_euclid(length);
+                        st.time = rem;
+                        let mut lo = before_f64;
+                        for _ in 0..wraps {
+                            events_fwd(lo, length, true, &mut crossed);
+                            lo = 0.0;
+                            if emit_events {
+                                loops += 1;
+                            }
+                        }
+                        if wraps > 0 {
+                            // At a wrap boundary, include t == 0.0 (Start) even if rem == 0.0.
+                            events_fwd(0.0, st.time, st.time == 0.0, &mut crossed);
+                        } else {
+                            events_fwd(lo, st.time, false, &mut crossed);
+                        }
+                    } else {
+                        // Studio includes the departure and excludes the destination
+                        // during reverse playback. Landing exactly at zero leaves
+                        // both endpoint events for the next step, which wraps.
+                        let wraps = (-(after / length).floor()).max(0.0) as i64;
+                        let rem = after.rem_euclid(length);
+                        st.time = if rem == 0.0 && wraps > 0 { length } else { rem };
+                        let mut hi = before_f64;
+                        for _ in 0..wraps {
+                            events_rev(0.0, hi, true, true, &mut crossed);
+                            hi = length;
+                            if emit_events {
+                                loops += 1;
+                            }
+                        }
+                        events_rev(st.time, hi, false, true, &mut crossed);
+                    }
+                } else {
+                    st.time = after.clamp(0.0, length);
+                    if st.speed >= 0.0 {
+                        let hit_end = after >= length;
+                        events_fwd(before_f64, st.time, hit_end, &mut crossed);
+                        if emit_events && hit_end {
+                            stopped_natural = true;
+                            loops += 1;
+                        }
+                    } else {
+                        let hit_start = after <= 0.0;
+                        events_rev(st.time, before_f64, true, false, &mut crossed);
+                        if emit_events && hit_start {
+                            stopped_natural = true;
+                            loops += 1;
+                        }
+                    }
+                }
+                if st.weight <= 0.0 && !st.playing && !st.ended {
+                    // Weight hit 0 during a smooth fade-out: fire Ended on the NEXT step.
+                    st.end_pending = true;
                 }
             }
-            st.first_step = false;
-            // Linear over the requested duration, whatever the size of the
-            // change; unloaded tracks don't advance.
-            st.fade_elapsed += dt;
-            let a = if st.fade > 0.0 { (st.fade_elapsed / st.fade).min(1.0) } else { 1.0 };
-            st.weight = st.fade_start + (st.target - st.fade_start) * a;
-            if st.weight <= 0.0 && !st.playing && !st.ended {
-                ended_now = true;
-            }
         } else if !st.playing && st.fade <= 0.0 {
-            // A failed / unloaded clip with a positive fade never evaluates
-            // it in Studio; Stop(0) still lets it go.
             st.weight = 0.0;
             if !st.ended {
+                st.ended = true;
                 ended_now = true;
+            } else {
+                st.active = false;
             }
         }
-        (crossed, loops, stopped, ended_now)
+        (crossed, loops, stopped_natural, stopped_zero_weight, ended_now)
     };
-    if !crossed.is_empty() || loops > 0 || stopped {
+    if !crossed.is_empty() || loops > 0 || stopped_natural || stopped_zero_weight {
         let seq = tracks(lua).all.get(&r).and_then(|s| s.seq.clone());
         if let Some(seq) = seq {
-            // Studio: markers, then named keyframes, then (a non-looped
-            // track's end) Stopped, then DidLoop; a wrap's terminal and
-            // initial keys share the batch.
+            // Studio: markers, then named keyframes (while IsPlaying is still true!),
+            // then (on natural end) flip IsPlaying=false + begin 0.3s fade-out,
+            // then Stopped, then DidLoop.
             for &i in &crossed {
                 for (name, value) in &seq.frames[i].markers {
                     fire(lua, r, &format!("MarkerReached:{name}"), vec![Value::String(lua.create_string(value)?)])?;
@@ -524,7 +743,13 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
                     fire(lua, r, "KeyframeReached", vec![Value::String(lua.create_string(&f.name)?)])?;
                 }
             }
-            if stopped {
+            if stopped_natural {
+                if let Some(st) = tracks(lua).all.get_mut(&r) {
+                    st.playing = false;
+                    fade_track(st, 0.0, END_FADE);
+                }
+                fire(lua, r, "Stopped", vec![])?;
+            } else if stopped_zero_weight {
                 fire(lua, r, "Stopped", vec![])?;
             }
             for _ in 0..loops {
@@ -533,17 +758,16 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
         }
     }
     if ended_now {
-        let mut t = tracks(lua);
-        if let Some(st) = t.all.get_mut(&r) {
-            st.ended = true;
-            st.release = true;
-        }
-        drop(t);
         fire(lua, r, "Ended", vec![])?;
+        if let Some(st) = tracks(lua).all.get_mut(&r) {
+            if !st.playing {
+                st.active = false;
+            }
+        }
     }
     let t = tracks(lua);
     let Some(st) = t.all.get(&r) else { return Ok(None) };
-    if !st.active || st.seq.is_none() || st.weight <= 0.0 || st.rig.is_none() {
+    if !st.active || st.seq.is_none() || st.cut || st.rig.is_none() {
         return Ok(None);
     }
     let rig = st.rig;
@@ -567,7 +791,7 @@ fn step_track(lua: &Lua, r: Ref, dt: f64) -> mlua::Result<Option<Ref>> {
     Ok(Some(rig))
 }
 
-/// Workspace.Retargeting on (Studio's Workspace check Studio): Enabled,
+/// Workspace.Retargeting on: Enabled,
 /// or Default while DFFlagWorkspaceAnimatorRetargetingEnabledDefault (on in
 /// Studio 0.744); Disabled is off. A script's write lives in the stub
 /// store, a place's saved value in the document.
@@ -592,8 +816,7 @@ fn retargeting_enabled(lua: &Lua) -> mlua::Result<bool> {
 }
 
 /// The retargeter for a clip on a rig: the clip carries an AnimationRigData
-/// and the rig is an R15 Humanoid character (Studio's factory Studio
-/// makes an R15ToR15Retargeter then; see anim_retarget.rs).
+/// and the rig is an R15 Humanoid character.
 fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<super::anim_retarget::Retargeter>>> {
     let Some(src) = seq.rig.clone() else { return Ok(None) };
     let key = (Rc::as_ptr(seq) as usize, rig);
@@ -632,7 +855,7 @@ fn retargeter_for(lua: &Lua, seq: &Rc<Seq>, rig: Ref) -> mlua::Result<Option<Rc<
 fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<RigBindings> {
     let w = world(lua)?;
     let d = w.d();
-    let mut out: Vec<(String, Ref)> = Vec::new();
+    let mut out: Vec<BoundJoint> = Vec::new();
     let mut dependencies = FxHashSet::default();
     let note_hierarchy = |mut node, dependencies: &mut FxHashSet<Ref>| {
         while node != rig && dependencies.insert(node) {
@@ -640,7 +863,26 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<RigBindings> {
             node = i.parent();
         }
     };
-    for i in d.dom.descendants_of(rig) {
+    let mut nodes = Vec::new();
+    let mut pending = VecDeque::from([rig]);
+    while let Some(node) = pending.pop_front() {
+        let Some(instance) = d.dom.get_by_ref(node) else { continue };
+        // Studio's rig walk stops at the host of another
+        // Humanoid/AnimationController or a nested Animator.
+        let boundary = node != rig && instance.children().iter().any(|child| {
+            d.class_of(*child).is_some_and(|class| {
+                matches!(class.as_str(), "Animator" | "AnimationController" | "Humanoid")
+            })
+        });
+        if boundary {
+            note_hierarchy(node, &mut dependencies);
+            dependencies.extend(instance.children().iter().copied());
+            continue;
+        }
+        pending.extend(instance.children().iter().copied());
+        nodes.push(instance);
+    }
+    for i in &nodes {
         // AnimationConstraint: Studio's upgraded avatar joint (anim domain).
         if i.class != "Motor6D" && i.class != "AnimationConstraint" {
             continue;
@@ -655,43 +897,44 @@ fn joints_of(lua: &Lua, rig: Ref) -> mlua::Result<RigBindings> {
                 }
             }
         }
-        let stored = match d.prop(i.referent(), "Part1") {
-            Some(Variant::Ref(p)) if p.is_some() => Some(p),
-            _ => None,
+        let Some((p0, p1, _, _)) = rustudio_core::body::joint_frames(d, i.referent()) else {
+            continue;
         };
-        let derived = || {
-            let has_att = matches!(d.prop(i.referent(), "Attachment0"), Some(Variant::Ref(a)) if a.is_some());
-            if has_att { rustudio_core::body::joint_frames(d, i.referent()).map(|f| f.1) } else { None }
+        dependencies.extend([p0, p1]);
+        let (Some(parent), Some(child)) = (d.dom.get_by_ref(p0), d.dom.get_by_ref(p1)) else {
+            continue;
         };
-        let p1 = if i.class == "AnimationConstraint" { derived().or(stored) } else { stored };
-        let Some(p1) = p1.filter(|p| p.is_some()) else { continue };
-        dependencies.insert(p1);
-        let Some(name) = d.dom.get_by_ref(p1).map(|p| p.name.clone()) else { continue };
-        // The last one found for a name wins (a table keyed by name).
-        if let Some(e) = out.iter_mut().find(|e| e.0 == name) {
-            e.1 = i.referent();
+        let name = (ustr(&parent.name), ustr(&child.name));
+        if let Some(binding) = out.iter_mut().find(|binding| binding.name == name) {
+            binding.instance = i.referent();
         } else {
-            out.push((name, i.referent()));
+            out.push(BoundJoint { name, instance: i.referent(), unqualified: false });
         }
     }
-    // Bones are animated by their own name (a skinned rig's poses name its
-    // Bones); a joint already posed through a Motor6D's Part1 keeps that.
-    let joints = out.len();
-    for i in d.dom.descendants_of(rig) {
+    // A skinned rig targets Bones by name within their parent. If a part and
+    // a Bone share the same endpoints' names, the animated joint takes precedence.
+    let mut face_controls = Vec::new();
+    for i in nodes {
+        if i.class == "FaceControls" {
+            note_hierarchy(i.referent(), &mut dependencies);
+            face_controls.push(i.referent());
+            continue;
+        }
         if i.class != "Bone" {
             continue;
         }
         note_hierarchy(i.referent(), &mut dependencies);
-        if out[..joints].iter().any(|e| e.0 == i.name) {
-            continue;
-        }
-        if let Some(e) = out[joints..].iter_mut().find(|e| e.0 == i.name) {
-            e.1 = i.referent();
-        } else {
-            out.push((i.name.clone(), i.referent()));
+        let parent = d.dom.get_by_ref(i.parent()).map_or("", |p| p.name.as_str());
+        let name = (ustr(parent), ustr(&i.name));
+        if !out.iter().any(|binding| binding.name == name) {
+            out.push(BoundJoint { name, instance: i.referent(), unqualified: false });
         }
     }
-    Ok(RigBindings { joints: Rc::new(out), dependencies })
+    let mut seen = FxHashSet::default();
+    for binding in out.iter_mut().rev() {
+        binding.unqualified = seen.insert(binding.name.1);
+    }
+    Ok(RigBindings { joints: Rc::new(out), face_controls, dependencies })
 }
 
 fn dirty_bindings(lua: &Lua) -> mlua::Result<FxHashSet<Ref>> {
@@ -734,18 +977,117 @@ fn dirty_bindings(lua: &Lua) -> mlua::Result<FxHashSet<Ref>> {
     Ok(dirty)
 }
 
-fn write_transforms(lua: &Lua, pose: impl IntoIterator<Item = (Ref, Xform)>) -> mlua::Result<()> {
+fn write_transforms(lua: &Lua, dt: f64, pose: impl IntoIterator<Item = (Ref, Xform)>) -> mlua::Result<()> {
     // Transform goes to the engine's readers without firing Changed or
     // replicating. Apply each completed pose on the VM thread.
     let mut w = world(lua)?;
     let d = w.dm();
     let key = rbx_dom_weak::ustr("Transform");
+    let mut history: Vec<(Ref, Xform, Xform)> = Vec::new();
     for (motor, xf) in pose {
         let Some(i) = d.dom.get_by_ref_mut(motor) else { continue };
+        let prev = match i.properties.get(&key) {
+            Some(Variant::CFrame(c)) => Xform::from_cframe(c),
+            _ => super::anim_ik::ident(),
+        };
+        history.push((motor, prev, xf));
         let value = Variant::CFrame(xf.to_cframe());
         if i.parent().is_some() && i.properties.get(&key) != Some(&value) {
             i.properties.insert(key, value);
             d.mark_prop(motor, key);
+        }
+    }
+    drop(w);
+    if !history.is_empty() && dt > 0.0 {
+        let mut t = tracks(lua);
+        for (m, prev, curr) in history {
+            t.prev_transforms.insert(m, (prev, curr, dt));
+        }
+    }
+    Ok(())
+}
+
+/// Last Animator Transform delta for a joint (prev, curr, dt), for ApplyJointVelocities.
+pub fn last_joint_delta(lua: &Lua, joint: Ref) -> Option<(Xform, Xform, f64)> {
+    tracks(lua).prev_transforms.get(&joint).copied()
+}
+
+/// Blend scalar values (FACS FaceControls) in priority order with Roblox's weighted blend rules.
+fn blend_scalar(samples: &mut [(i64, f64, f64)]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| b.0.cmp(&a.0));
+    let (mut remaining, mut acc) = (1.0f64, 0.0f64);
+    for band in samples.chunk_by(|a, b| a.0 == b.0) {
+        let total: f64 = band.iter().filter(|p| p.2 >= MIN_BLEND_WEIGHT).map(|p| p.2).sum();
+        let take = total.min(remaining);
+        if take > 0.0 {
+            for (_, v, pw) in band {
+                if *pw >= MIN_BLEND_WEIGHT {
+                    acc += *v * (*pw * take / total);
+                }
+            }
+            remaining -= take;
+        }
+    }
+    Some(acc.clamp(0.0, 1.0))
+}
+
+fn write_facs(lua: &Lua, face_controls: &[Ref], tracks_list: &[PoseTrack]) -> mlua::Result<()> {
+    if face_controls.is_empty() || tracks_list.iter().all(|t| t.seq.facs.is_empty()) {
+        return Ok(());
+    }
+    let mut keys: FxHashSet<Ustr> = FxHashSet::default();
+    for tr in tracks_list {
+        keys.extend(tr.seq.facs.keys().copied());
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut samples: Vec<(i64, f64, f64)> = Vec::with_capacity(tracks_list.len());
+    let mut writes: Vec<(Ustr, f32)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        samples.clear();
+        for tr in tracks_list {
+            if let Some(fkeys) = tr.seq.facs.get(&key) {
+                let v = sample_float_keys(fkeys, tr.time);
+                samples.push((tr.rank, v, tr.weight));
+            }
+        }
+        if let Some(v) = blend_scalar(&mut samples) {
+            writes.push((key, v as f32));
+        }
+    }
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let mut dirty_fcs = Vec::new();
+    {
+        let mut w = world(lua)?;
+        let d = w.dm();
+        for &fc in face_controls {
+            let mut changed_keys = Vec::new();
+            if let Some(i) = d.dom.get_by_ref_mut(fc) {
+                for &(k, v) in &writes {
+                    let val = Variant::Float32(v);
+                    if i.properties.get(&k) != Some(&val) {
+                        i.properties.insert(k, val);
+                        changed_keys.push(k);
+                    }
+                }
+            }
+            if !changed_keys.is_empty() {
+                for k in changed_keys {
+                    d.mark_prop(fc, k);
+                }
+                dirty_fcs.push(fc);
+            }
+        }
+    }
+    if !dirty_fcs.is_empty() {
+        if let Some(mut dirty) = lua.app_data_mut::<crate::runtime::domains::avatar::face::Dirty>() {
+            dirty.0.extend(dirty_fcs);
         }
     }
     Ok(())
@@ -773,6 +1115,9 @@ fn retarget(name: &str, cf: Xform, retargeter: Option<&Retargeter>) -> Xform {
 
 /// Blend the contributions in priority order, retaining load order within each
 /// priority. Reuse the contribution storage across a rig's joints.
+/// Measured in Studio: track weights < 0.001 are ignored; any remaining weight
+/// `(1 - used)` blends directly with the Identity quaternion (0, 0, 0, 1) in
+/// the NLERP sum rather than post-slerping from Identity.
 fn blend(poses: &mut [(i64, Xform, f64)]) -> Option<Xform> {
     if poses.is_empty() {
         return None;
@@ -783,10 +1128,13 @@ fn blend(poses: &mut [(i64, Xform, f64)]) -> Option<Xform> {
     let (mut vector, mut scalar) = (glam::DVec3::ZERO, 0.0f64);
     let mut reference: Option<(glam::DVec3, f64)> = None;
     for poses in poses.chunk_by(|a, b| a.0 == b.0) {
-        let total: f64 = poses.iter().map(|p| p.2).sum();
+        let total: f64 = poses.iter().filter(|p| p.2 >= MIN_BLEND_WEIGHT).map(|p| p.2).sum();
         let take = total.min(remaining);
         if take > 0.0 {
             for (_, cf, pw) in poses {
+                if *pw < MIN_BLEND_WEIGHT {
+                    continue;
+                }
                 let w = pw * take / total;
                 let q = Quat::from_mat3(&cf.rot);
                 // Canonical (w ≥ 0) like an axis-angle round trip.
@@ -806,32 +1154,51 @@ fn blend(poses: &mut [(i64, Xform, f64)]) -> Option<Xform> {
             remaining -= take;
         }
     }
-    let norm = (vector.dot(vector) + scalar * scalar).sqrt();
-    let mut rot = Quat::IDENTITY;
-    if norm > 1e-8 {
-        let mag = vector.length();
-        if mag > 1e-8 {
-            let axis = (vector / mag).as_vec3();
-            let angle = (2.0 * mag.atan2(scalar)) as f32;
-            rot = Quat::from_mat3(&Mat3::from_quat(Quat::from_axis_angle(axis, angle)));
-        }
+    if used <= 0.0 {
+        return Some(super::anim_ik::ident());
     }
-    let rot = Quat::IDENTITY.slerp(rot, used as f32);
+    let norm = (vector.dot(vector) + scalar * scalar).sqrt();
+    let mut rot = if norm > 1e-8 {
+        Quat::from_xyzw(
+            (vector.x / norm) as f32,
+            (vector.y / norm) as f32,
+            (vector.z / norm) as f32,
+            (scalar / norm) as f32,
+        )
+    } else {
+        Quat::IDENTITY
+    };
+    // Remaining weight (1 - used) NLERPs the normalized blended quaternion with Identity.
+    // Verified exact against Studio 0.748 for single-track, same-priority, and cross-priority <1.0 sums.
+    if used < 1.0 {
+        let u = used as f32;
+        if rot.w < 0.0 {
+            rot = -rot;
+        }
+        let iv = glam::Vec3::new(rot.x * u, rot.y * u, rot.z * u);
+        let iw = (1.0 - u) + rot.w * u;
+        let inorm = (iv.length_squared() + iw * iw).sqrt();
+        rot = if inorm > 1e-8 {
+            Quat::from_xyzw(iv.x / inorm, iv.y / inorm, iv.z / inorm, iw / inorm)
+        } else {
+            Quat::IDENTITY
+        };
+    }
     Some(Xform { pos: position, rot: Mat3::from_quat(rot) })
 }
 
-fn evaluate_native(joints: &[(String, Ref)], tracks: &[NativePoseTrack<'_>]) -> Vec<(Ref, Xform)> {
+fn evaluate_native(joints: &[BoundJoint], tracks: &[NativePoseTrack<'_>]) -> Vec<(Ref, Xform)> {
     let mut contributions = Vec::with_capacity(tracks.len());
     let mut pose = Vec::with_capacity(joints.len());
-    for (name, motor) in joints {
+    for joint in joints {
         contributions.clear();
         for track in tracks {
-            if let Some(cf) = track.keys.get(name).and_then(|keys| sample_keys(keys, track.time)) {
-                contributions.push((track.rank, retarget(name, cf, track.retargeter), track.weight));
+            if let Some(cf) = joint.channel(track.keys).and_then(|keys| sample_keys(keys, track.time)) {
+                contributions.push((track.rank, retarget(joint.name.1.as_str(), cf, track.retargeter), track.weight));
             }
         }
         if let Some(cf) = blend(&mut contributions) {
-            pose.push((*motor, cf));
+            pose.push((joint.instance, cf));
         }
     }
     pose
@@ -839,25 +1206,39 @@ fn evaluate_native(joints: &[(String, Ref)], tracks: &[NativePoseTrack<'_>]) -> 
 
 /// The Animator step over every track, then each animated rig's joints.
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
+    step_filtered(lua, None, dt)
+}
+
+/// Animator:StepAnimations(dt): steps only this Animator's tracks and poses its rig.
+pub fn step_animator(lua: &Lua, animator: Ref, dt: f64) -> mlua::Result<()> {
+    step_filtered(lua, Some(animator), dt)
+}
+
+fn step_filtered(lua: &Lua, only_owner: Option<Ref>, dt: f64) -> mlua::Result<()> {
     let _animator = rustudio_core::bench::scope("animator");
     let advance = rustudio_core::bench::scope("anim_tracks_advance");
     let order = {
         let mut t = tracks(lua);
-        t.steps += 1;
-        if t.steps % 120 == 0 {
-            // Tracks the collector freed (inactive and unreferenced).
-            let alive: Vec<Ref> = {
-                let w = world(lua)?;
-                let d = w.d();
-                t.order.iter().copied().filter(|r| t.all.get(r).is_some_and(|s| s.active) || d.dom.get_by_ref(*r).is_some()).collect()
-            };
-            t.all.retain(|r, _| alive.contains(r));
-            t.order = alive;
+        if only_owner.is_none() {
+            t.steps += 1;
+            if t.steps % 120 == 0 {
+                // Tracks the collector freed (inactive and unreferenced).
+                let alive: Vec<Ref> = {
+                    let w = world(lua)?;
+                    let d = w.d();
+                    t.order.iter().copied().filter(|r| t.all.get(r).is_some_and(|s| s.active) || d.dom.get_by_ref(*r).is_some()).collect()
+                };
+                t.all.retain(|r, _| alive.contains(r));
+                t.order = alive;
+            }
         }
         if t.order.is_empty() && t.animated.is_empty() {
             return Ok(());
         }
-        t.order.clone()
+        match only_owner {
+            Some(owner) => t.order.iter().copied().filter(|r| t.all.get(r).is_some_and(|s| s.owner == owner)).collect(),
+            None => t.order.clone(),
+        }
     };
     // rig → tracks posing it, in step order.
     let mut by_rig: Vec<(Ref, Vec<Ref>)> = Vec::new();
@@ -889,21 +1270,21 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     let mut retarget_on: Option<bool> = None;
     let mut rigs = Vec::with_capacity(by_rig.len());
     for (rig, list) in &by_rig {
-        let joints = {
+        let cached = {
             let t = tracks(lua);
-            t.animated.get(rig).map(|bindings| bindings.joints.clone())
+            t.animated.get(rig).map(|b| (b.joints.clone(), b.face_controls.clone()))
         };
-        let joints = match joints {
-            Some(j) if !dirty.contains(rig) => j,
+        let (joints, face_controls) = match cached {
+            Some(c) if !dirty.contains(rig) => c,
             previous => {
                 let bindings = joints_of(lua, *rig)?;
-                let joints = bindings.joints.clone();
+                let out = (bindings.joints.clone(), bindings.face_controls.clone());
                 let mut state = tracks(lua);
                 state.animated.insert(*rig, bindings);
                 if previous.is_none() {
                     state.animated_order.push(*rig);
                 }
-                joints
+                out
             }
         };
         let mut posing: Vec<PoseTrack> = {
@@ -928,12 +1309,12 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
                 track.retargeter = retargeter_for(lua, &track.seq, *rig)?;
             }
         }
-        rigs.push((joints, posing));
+        rigs.push((joints, face_controls, posing));
     }
     let keyframes_only = |tracks: &[PoseTrack]| tracks.iter().all(|t| t.seq.curves.is_empty());
-    let native_count = rigs.iter().filter(|(_, tracks)| keyframes_only(tracks)).count();
+    let native_count = rigs.iter().filter(|(_, _, tracks)| keyframes_only(tracks)).count();
     let mut worker_poses = if let Some(pool) = crate::rig::character_pool(native_count) {
-        let inputs: Vec<_> = rigs.iter().filter(|(_, tracks)| keyframes_only(tracks)).map(|(joints, tracks)| {
+        let inputs: Vec<_> = rigs.iter().filter(|(_, _, tracks)| keyframes_only(tracks)).map(|(joints, _, tracks)| {
             let tracks: Vec<_> = tracks.iter().map(|t| NativePoseTrack {
                 keys: &t.seq.keys,
                 weight: t.weight,
@@ -955,70 +1336,69 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
         None
     };
     if native_count == rigs.len() && worker_poses.is_some() {
-        write_transforms(lua, worker_poses.take().unwrap().flatten())?;
+        write_transforms(lua, dt, worker_poses.take().unwrap().flatten())?;
+        for (_, face_controls, tracks) in &rigs {
+            write_facs(lua, face_controls, tracks)?;
+        }
     } else {
         let mut contributions = Vec::new();
         let mut pose = Vec::new();
-        for (joints, tracks) in rigs {
+        for (joints, face_controls, tracks) in rigs {
             let native = keyframes_only(&tracks);
             if let Some(worker) = worker_poses.as_mut().filter(|_| native) {
-                write_transforms(lua, worker.next().expect("keyframe pose in rig order"))?;
+                write_transforms(lua, dt, worker.next().expect("keyframe pose in rig order"))?;
+                write_facs(lua, &face_controls, &tracks)?;
                 continue;
             }
-            for (name, motor) in joints.iter() {
+            for joint in joints.iter() {
                 contributions.clear();
                 for track in &tracks {
-                    let cf = if let Some(curves) = track.seq.curves.get(name) {
+                    let cf = if let Some(curves) = joint.channel(&track.seq.curves) {
                         let f: Function = lua.globals().get("__rs_anim_sample")?;
                         xform_of(&f.call::<Value>((curves.clone(), track.time))?)
                     } else {
-                        track.seq.keys.get(name).and_then(|keys| sample_keys(keys, track.time))
+                        joint.channel(&track.seq.keys).and_then(|keys| sample_keys(keys, track.time))
                     };
                     if let Some(cf) = cf {
-                        contributions.push((track.rank, retarget(name, cf, track.retargeter.as_deref()), track.weight));
+                        contributions.push((track.rank, retarget(joint.name.1.as_str(), cf, track.retargeter.as_deref()), track.weight));
                     }
                 }
                 if let Some(cf) = blend(&mut contributions) {
                     if native {
-                        pose.push((*motor, cf));
+                        pose.push((joint.instance, cf));
                     } else {
-                        write_transforms(lua, [(*motor, cf)])?;
+                        write_transforms(lua, dt, [(joint.instance, cf)])?;
                     }
                 }
             }
             if native {
-                write_transforms(lua, pose.drain(..))?;
+                write_transforms(lua, dt, pose.drain(..))?;
             }
+            write_facs(lua, &face_controls, &tracks)?;
         }
     }
-    // Rigs whose tracks all faded out go back to their rest pose once.
-    let gone = {
+    // Drop cached rig bindings once no active tracks remain (smooth fade-outs
+    // already wrote Identity on the frame weight reached 0; Stop(0) keeps the
+    // last pose in Studio, so we do not force-reset Transforms here).
+    if only_owner.is_none() {
         let mut t = tracks(lua);
         let mut order = std::mem::take(&mut t.animated_order);
-        let mut gone = Vec::new();
         order.retain(|r| {
             if rig_at.contains_key(r) {
                 return true;
             }
-            if let Some(bindings) = t.animated.remove(r) {
-                gone.push(bindings.joints);
-            }
+            t.animated.remove(r);
             t.char_rigs.remove(r);
             t.retargeters.retain(|k, _| k.1 != *r);
             false
         });
         t.animated_order = order;
-        gone
-    };
-    for joints in gone {
-        write_transforms(lua, joints.iter().map(|(_, motor)| (*motor, super::anim_ik::ident())))?;
-    }
-    // The Animator holds playing and fading tracks only: a released one is
-    // the collector's once no script holds it.
-    let mut t = tracks(lua);
-    for st in t.all.values_mut() {
-        if !st.active && !matches!(st.me, Value::Nil) {
-            st.me = Value::Nil;
+        // The Animator holds playing and fading tracks only: a released one is
+        // the collector's once no script holds it.
+        for st in t.all.values_mut() {
+            if !st.active && !matches!(st.me, Value::Nil) {
+                st.me = Value::Nil;
+            }
         }
     }
     Ok(())
@@ -1041,6 +1421,8 @@ pub struct TrackRep {
     /// The AnimationPriority's enum value (Idle 0 … Action4 5, Core 1000),
     /// as Animator replication carries it.
     pub priority: u32,
+    pub play_gen: u64,
+    pub mirrored: bool,
 }
 
 /// The active tracks, in load order.
@@ -1064,8 +1446,19 @@ pub fn replicated_state(lua: &Lua) -> Vec<TrackRep> {
                 Value::UserData(u) => u.borrow::<LEnumItem>().map(|e| e.value as u32).unwrap_or(1000),
                 _ => 1000,
             },
+            play_gen: s.play_gen,
+            mirrored: s.mirrored,
         })
         .collect()
+}
+
+/// Marks a track created by anim_replicate::sync so it is never echoed back.
+pub fn mark_mirrored(lua: &Lua, track: &Value) {
+    if let Some(r) = me_ref(track) {
+        if let Some(st) = tracks(lua).all.get_mut(&r) {
+            st.mirrored = true;
+        }
+    }
 }
 
 // ------------------------------------------------------------------ API
@@ -1093,8 +1486,9 @@ fn new_track(lua: &Lua, (me, anim, owner, rig, id): (Value, Value, Value, Value,
         playing: false,
         active: false,
         ended: false,
-        release: false,
-        first_step: false,
+        end_pending: false,
+        start_at_end: false,
+        zero_weight_steps: 0,
         speed: 1.0,
         weight: 0.0,
         target: 0.0,
@@ -1105,6 +1499,8 @@ fn new_track(lua: &Lua, (me, anim, owner, rig, id): (Value, Value, Value, Value,
         looped_set: false,
         priority_set: false,
         cut: false,
+        play_gen: 0,
+        mirrored: false,
     };
     let mut t = tracks(lua);
     t.all.insert(r, st);
@@ -1122,14 +1518,27 @@ fn play(lua: &Lua, (me, fade, weight, speed): (Value, Option<f64>, Option<f64>, 
     };
     let count = t.all.values().filter(|s| s.active && s.owner == owner).count();
     let st = t.all.get_mut(&r).expect("track");
-    // Studio restarts a playing track too.
-    st.time = 0.0;
+    let spd = speed.unwrap_or(1.0);
+    // Studio restarts a playing track too; negative speed starts at Length.
+    if spd < 0.0 {
+        if let Some(seq) = &st.seq {
+            st.time = seq.length;
+            st.start_at_end = false;
+        } else {
+            st.time = 0.0;
+            st.start_at_end = true;
+        }
+    } else {
+        st.time = 0.0;
+        st.start_at_end = false;
+    }
     st.cut = false;
     st.playing = true;
     st.ended = false;
-    st.release = false;
-    st.first_step = true;
-    fade_track(st, weight.unwrap_or(1.0), fade.unwrap_or(0.1));
+    st.end_pending = false;
+    st.zero_weight_steps = 0;
+    st.play_gen = st.play_gen.wrapping_add(1);
+    fade_track(st, weight.unwrap_or(1.0).max(0.0), fade.unwrap_or(0.1).max(0.0));
     if !st.active {
         // Studio's insertion checks count > the configured limit (257 slots).
         if count > 256 {
@@ -1140,7 +1549,7 @@ fn play(lua: &Lua, (me, fade, weight, speed): (Value, Option<f64>, Option<f64>, 
         st.active = true;
     }
     st.me = me.clone();
-    st.speed = speed.unwrap_or(1.0);
+    st.speed = spd;
     drop(t);
     // AnimationPlayed fires on the Animator and on its Humanoid /
     // AnimationController.
@@ -1159,6 +1568,8 @@ fn stop(lua: &Lua, (me, fade): (Value, Option<f64>)) -> mlua::Result<()> {
         match t.all.get_mut(&r) {
             Some(st) if st.playing => {
                 st.playing = false;
+                st.end_pending = false;
+                st.zero_weight_steps = 0;
                 let fade = fade.unwrap_or(0.1);
                 if fade <= 0.0 {
                     // Let go at once; WeightCurrent keeps its value (Studio).
@@ -1190,7 +1601,10 @@ fn adjust_speed(lua: &Lua, (me, speed): (Value, Option<f64>)) -> mlua::Result<()
 fn adjust_weight(lua: &Lua, (me, weight, fade): (Value, Option<f64>, Option<f64>)) -> mlua::Result<()> {
     let Some(r) = me_ref(&me) else { return Ok(()) };
     if let Some(st) = tracks(lua).all.get_mut(&r) {
-        fade_track(st, weight.unwrap_or(1.0), fade.unwrap_or(0.1));
+        if st.playing {
+            st.zero_weight_steps = 0;
+            fade_track(st, weight.unwrap_or(1.0).max(0.0), fade.unwrap_or(0.1).max(0.0));
+        }
     }
     Ok(())
 }
@@ -1242,7 +1656,7 @@ fn set(lua: &Lua, (me, key, value): (Value, String, Value)) -> mlua::Result<bool
             } else {
                 v.clamp(0.0, length)
             };
-            st.first_step = false;
+            st.start_at_end = false;
         }
         _ => return Ok(false),
     }
@@ -1377,8 +1791,9 @@ mod tests {
                     playing: true,
                     active: true,
                     ended: false,
-                    release: false,
-                    first_step: false,
+                    end_pending: false,
+                    start_at_end: false,
+                    zero_weight_steps: 0,
                     speed: 1.0,
                     weight: 1.0,
                     target: 1.0,
@@ -1391,6 +1806,8 @@ mod tests {
                     priority,
                     priority_set: true,
                     cut: false,
+                    play_gen: 0,
+                    mirrored: false,
                 },
             );
             drop(t);

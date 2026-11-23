@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, Mutex};
 
 use egui::{Rect, TextureId};
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 #[cfg(test)]
 use glam::Mat3;
 use rbx_dom_weak::types::{Ref, Variant};
@@ -187,13 +187,20 @@ impl SceneLight {
     /// light read every 1.3 studs). Spot and surface lights keep their
     /// cone (shader.wgsl's).
     fn local(&self, l: &crate::render::LightRaw, p: Vec3) -> Vec3 {
-        let pos = Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]);
+        let mut source = Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]);
         let range = l.pos_range[3];
         let color = Vec3::new(l.color[0], l.color[1], l.color[2]) / mech::LIGHT_INTENSITY;
         let kind = l.color[3];
+        if kind > 1.5 {
+            let u = Vec3::new(l.surface_u[0], l.surface_u[1], l.surface_u[2]);
+            let v = Vec3::new(l.surface_v[0], l.surface_v[1], l.surface_v[2]);
+            let rel = p - source;
+            source += u * rel.dot(u).clamp(-l.surface_u[3], l.surface_u[3])
+                + v * rel.dot(v).clamp(-l.surface_v[3], l.surface_v[3]);
+        }
         let axis = Vec3::new(l.dir[0], l.dir[1], l.dir[2]);
         let cos_cut = l.dir[3];
-        let to = pos - p;
+        let to = source - p;
         let d = to.length();
         let reach = range + mech::FX_LOCAL_REACH;
         if range <= 0.0 || d >= reach {
@@ -217,7 +224,8 @@ impl SceneLight {
         self.lights
             .iter()
             .filter(|l| {
-                let reach = l.pos_range[3] + mech::FX_LOCAL_REACH;
+                let surface_r = (l.surface_u[3] * l.surface_u[3] + l.surface_v[3] * l.surface_v[3]).sqrt();
+                let reach = l.pos_range[3] + mech::FX_LOCAL_REACH + surface_r;
                 (Vec3::new(l.pos_range[0], l.pos_range[1], l.pos_range[2]) - c).length() < reach + r
             })
             .collect()
@@ -689,6 +697,10 @@ struct EmitterCfg {
     orientation: u32,
     zoffset: f32,
     look: Look,
+    /// Legacy Sparkles emitter (ParticleCurveCrazySparklesFS + ParticleCurveVS).
+    sparkles: bool,
+    /// Legacy Sparkles ModulateColor (CB1[0].xyz = Sparkles.SparkleColor).
+    modulate: Vec3,
 }
 
 fn emitter_cfg(d: &Document, r: Ref) -> EmitterCfg {
@@ -741,36 +753,69 @@ fn emitter_cfg(d: &Document, r: Ref) -> EmitterCfg {
         orientation: enum_u32(d.prop(r, "Orientation")).unwrap_or(0),
         zoffset: num(d, r, "ZOffset", 0.0),
         look: look(d, r),
+        sparkles: false,
+        modulate: Vec3::ONE,
     }
 }
 
 /// Legacy Sparkles, as Studio draws them:
-/// Studio builds TWO additive `sparkles_main.dds` emitters tinted by SparkleColor:
+/// Studio builds TWO `sparkles_main.dds` emitters using `ParticleCurveVS` +
+/// `ParticleCurveCrazySparklesFS`, `BlendMode = PremultipliedAlpha`,
+/// `Params.y = 0.6` (LightEmission = 0.4), `ModulateColor = SparkleColor`,
+/// no soft-particle fade, and linear size growth over lifetime:
 /// - Emitter 1 (rising stars): Rate 30, Drag 0.2, Accel (0,1,0), Speed 5,
-///   Spread 100°, Lifetime 1.3, Rotation (-90°,90°), RotSpeed (40,100)°/s, Size 0.5.
+///   Spread 100°, Lifetime 1.3, Rotation (-90°,90°), RotSpeed (40,100)°/s,
+///   Size 0.37 + 0.50*t -> 1.02.
 /// - Emitter 2 (fast spinning burst stars): Rate 5, Drag 2.0, Accel (0,0,0),
-///   Speed 8, Spread 150°, Lifetime 1.7, Rotation (-90°,90°), RotSpeed (-500,500)°/s, Size 0.2.
+///   Speed 8, Spread 150°, Lifetime 1.7, Rotation (-90°,90°), RotSpeed (-500,500)°/s,
+///   Size 0.10 + 0.20*t -> 0.44.
 fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
     let base = emitter_cfg(d, r);
-    let color = match d.prop(r, "SparkleColor").or_else(|| d.prop(r, "Color")) {
+    let default_color = Vec3::new(144.0, 25.0, 255.0) / 255.0;
+    let color = match d.prop(r, "SparkleColor") {
         Some(Variant::Color3(k)) => Vec3::new(k.r, k.g, k.b),
         Some(Variant::Color3uint8(k)) => Vec3::new(k.r as f32, k.g as f32, k.b as f32) / 255.0,
-        _ => Vec3::new(144.0, 25.0, 255.0) / 255.0,
+        _ => match d.prop(r, "Color") {
+            Some(Variant::Color3(k)) => Vec3::new(k.r, k.g, k.b) * default_color,
+            Some(Variant::Color3uint8(k)) => Vec3::new(k.r as f32, k.g as f32, k.b as f32) / 255.0 * default_color,
+            _ => default_color,
+        },
     };
-    // Studio's transparency curve.
+    // Exact 16-keypoint color curve.
+    let color_curve = CSeq(vec![
+        (0.0 / 15.0, Vec3::new(1.000000, 1.000000, 1.000000)),
+        (1.0 / 15.0, Vec3::new(1.000000, 1.000000, 1.000000)),
+        (2.0 / 15.0, Vec3::new(1.000000, 1.000000, 1.000000)),
+        (3.0 / 15.0, Vec3::new(0.901961, 0.878431, 0.878431)),
+        (4.0 / 15.0, Vec3::new(0.776471, 0.666667, 0.666667)),
+        (5.0 / 15.0, Vec3::new(0.756863, 0.611765, 0.603922)),
+        (6.0 / 15.0, Vec3::new(0.431373, 0.431373, 0.474510)),
+        (7.0 / 15.0, Vec3::new(0.513726, 0.419608, 0.400000)),
+        (8.0 / 15.0, Vec3::new(0.470588, 0.478431, 0.513726)),
+        (9.0 / 15.0, Vec3::new(0.494118, 0.592157, 0.431373)),
+        (10.0 / 15.0, Vec3::new(0.686275, 0.541176, 0.529412)),
+        (11.0 / 15.0, Vec3::new(0.607843, 0.580392, 0.513726)),
+        (12.0 / 15.0, Vec3::new(0.619608, 0.588235, 0.541176)),
+        (13.0 / 15.0, Vec3::new(0.666667, 0.611765, 0.596078)),
+        (14.0 / 15.0, Vec3::new(0.756863, 0.729412, 0.729412)),
+        (15.0 / 15.0, Vec3::new(0.905882, 0.886275, 0.886275)),
+    ]);
+    // Exact 16-keypoint transparency curve.
     let transparency = Seq(vec![
-        (0.0, 0.776, 0.0),
-        (0.067, 0.161, 0.0),
-        (0.133, 0.0, 0.0),
-        (0.667, 0.0, 0.0),
-        (0.733, 0.161, 0.0),
-        (0.8, 0.337, 0.0),
-        (0.867, 0.533, 0.0),
-        (0.933, 0.694, 0.0),
-        (1.0, 0.888, 0.0),
+        (0.0 / 15.0, 0.776471, 0.0),
+        (1.0 / 15.0, 0.160784, 0.0),
+        (2.0 / 15.0, 0.0, 0.0),
+        (10.0 / 15.0, 0.0, 0.0),
+        (11.0 / 15.0, 0.160784, 0.0),
+        (12.0 / 15.0, 0.337255, 0.015686),
+        (13.0 / 15.0, 0.533333, 0.015686),
+        (14.0 / 15.0, 0.694118, 0.015686),
+        (15.0 / 15.0, 0.888235, 0.017647),
     ]);
     let mut e1 = base.clone();
-    e1.color = CSeq(vec![(0.0, color)]);
+    e1.sparkles = true;
+    e1.modulate = color;
+    e1.color = color_curve;
     e1.rate = 30.0;
     e1.life = (1.3, 1.3);
     e1.speed = (5.0, 5.0);
@@ -779,8 +824,9 @@ fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
     e1.shape = 0;
     e1.drag = 0.2;
     e1.accel = Vec3::new(0.0, 1.0, 0.0);
-    e1.size = Seq(vec![(0.0, 0.5, 0.0)]);
-    e1.transparency = transparency.clone();
+    // Size grows linearly: 0.37 + 0.50 * age over 1.3 s lifetime.
+    e1.size = Seq(vec![(0.0, 0.37, 0.0), (1.0, 0.37 + 0.50 * 1.3, 0.0)]);
+    e1.transparency = transparency;
     e1.squash = Seq(vec![(0.0, 0.0, 0.0)]);
     e1.rotation = (-90.0, 90.0);
     e1.rot_speed = (40.0, 100.0);
@@ -788,7 +834,7 @@ fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
     e1.grid = (1, 1);
     e1.locked = false;
     e1.inherit = 0.0;
-    e1.look = Look { influence: 0.0, brightness: 1.5, emission: 1.0, alpha: base.look.alpha };
+    e1.look = Look { influence: 0.0, brightness: 1.0, emission: 0.4, alpha: base.look.alpha };
 
     let mut e2 = e1.clone();
     e2.rate = 5.0;
@@ -797,7 +843,8 @@ fn sparkles_cfgs(d: &Document, r: Ref) -> [EmitterCfg; 2] {
     e2.spread = Vec2::new(150.0, 150.0);
     e2.drag = 2.0;
     e2.accel = Vec3::ZERO;
-    e2.size = Seq(vec![(0.0, 0.2, 0.0)]);
+    // Size grows linearly: 0.10 + 0.20 * age over 1.7 s lifetime.
+    e2.size = Seq(vec![(0.0, 0.10, 0.0), (1.0, 0.10 + 0.20 * 1.7, 0.0)]);
     e2.rot_speed = (-500.0, 500.0);
 
     [e1, e2]
@@ -913,7 +960,7 @@ enum Cfg {
 
 // ------------------------------------------------------------- simulation
 
-/// xorshift64*: cheap, and seeded per emitter so runs repeat.
+/// Each emitter keeps its own xorshift64* stream.
 struct Rng(u64);
 
 /// An emitter's generator, taken out to spawn with (`spawn` puts it back).
@@ -922,9 +969,9 @@ fn rng_of(slot: &mut Option<Rng>, r: Ref) -> Rng {
 }
 
 impl Rng {
-    fn seeded(r: Ref) -> Rng {
+    fn seeded(seed: impl std::hash::Hash) -> Rng {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&r, &mut h);
+        seed.hash(&mut h);
         Rng(std::hash::Hasher::finish(&h) | 1)
     }
     fn next(&mut self) -> u64 {
@@ -1021,7 +1068,8 @@ fn spread_axes(n: Vec3) -> (Vec3, Vec3) {
 fn spawn_local(c: &EmitterCfg, size: Vec3, rng: &mut Rng) -> (Vec3, Vec3) {
     let n = normal_id(c.dir);
     let (u, v) = across(n);
-    let half = size * 0.5;
+    // Legacy Sparkles always uses a fixed [-0.2, 0.2]^3 spawn box.
+    let half = if c.sparkles { Vec3::splat(0.2) } else { size * 0.5 };
     let surface = c.style == 1;
     let (pos, base) = match c.shape {
         // Sphere: on / in the ellipsoid, outward along the radius;
@@ -1087,14 +1135,32 @@ fn spawn_local(c: &EmitterCfg, size: Vec3, rng: &mut Rng) -> (Vec3, Vec3) {
         2 if rng.unit() < 0.5 => -base,
         _ => base,
     };
-    // SpreadAngle: X turns the direction about the part's X axis (Z when
-    // the direction lies along X), Y about the third axis (calibration d:
-    // Top spreads X into Z and Y into X, Front X into Y and Y into X, Right
-    // X into Y and Y into Z).
+    // SpreadAngle: Studio samples a uniform-solid-angle spherical patch around
+    // the emission axis, where X
+    // spreads along `a` (Z for Top, Y for Front/Right) and Y spreads along `b`
+    // (X for Top/Front, Z for Right), avoiding the ±Z pole bunching of naive
+    // Euler rotations at large angles (e.g. Sparkles 100° / 150°).
     let (a, b) = spread_axes(base);
-    let rx = (rng.sym() * c.spread.x).to_radians();
-    let ry = (rng.sym() * c.spread.y).to_radians();
-    let dir = Quat::from_axis_angle(a, ry) * (Quat::from_axis_angle(b, -rx) * base);
+    let sx = c.spread.x.abs().to_radians();
+    let sy = c.spread.y.abs().to_radians().min(std::f32::consts::PI);
+    let dir = if sx <= 0.001 {
+        let phi = rng.sym() * sy + std::f32::consts::FRAC_PI_2;
+        base * phi.sin() + b * phi.cos()
+    } else {
+        let theta = rng.sym() * sx;
+        let phi = rng.sym() * sy + std::f32::consts::FRAC_PI_2;
+        let (z, r) = if (0.0..=std::f32::consts::PI).contains(&phi) {
+            let m = -(sy.min(std::f32::consts::FRAC_PI_2) + std::f32::consts::FRAC_PI_2).cos();
+            let z = rng.sym() * m;
+            (z, (1.0 - z * z).max(0.0).sqrt())
+        } else {
+            let m = -(sy + std::f32::consts::FRAC_PI_2).cos();
+            let u = rng.sym();
+            let z = if u >= 0.0 { (1.0 - m) * u + m } else { (1.0 - m) * u - m };
+            (z, -(1.0 - z * z).max(0.0).sqrt())
+        };
+        base * (theta.cos() * r) + a * (theta.sin() * r) + b * z
+    };
     (pos, dir.normalize_or(base))
 }
 
@@ -1258,10 +1324,11 @@ impl View<'_> {
     }
 }
 
-/// Premultiplied gamma-space colour.
-fn premul(rgb: Vec3, a: f32) -> [u8; 4] {
+/// Straight (unpremultiplied) gamma-space RGBA8 vertex colour (Studio's
+/// ParticleCustomVS / ParticleCurveVS / TrailVS VARYING1 = TEXCOORD3 / 255).
+fn unpremul(rgb: Vec3, a: f32) -> [u8; 4] {
     let a = a.clamp(0.0, 1.0);
-    let c = (rgb.clamp(Vec3::ZERO, Vec3::ONE) * a * 255.0).round();
+    let c = (rgb.clamp(Vec3::ZERO, Vec3::ONE) * 255.0).round();
     [c.x as u8, c.y as u8, c.z as u8, (a * 255.0).round() as u8]
 }
 
@@ -1276,6 +1343,7 @@ struct Draw {
 enum Geom {
     Strip(Vec<FxVertex>, Vec<u32>),
     Particles(Vec<FxParticle>),
+    Sparkles(Vec<FxParticle>),
     /// A beam's kept strip (`Effects::kept`).
     Kept(Ref),
 }
@@ -1396,8 +1464,8 @@ fn particles_draw(
             continue;
         }
         let half = size * mech::FX_PARTICLE_HALF_SIZE;
-        // Behind the camera, or too small to colour a pixel.
-        if depth < -half * 2.0 || (depth > 0.0 && half * 2.0 * view.px_per_stud / depth < mech::FX_MIN_PIXELS) {
+        // Behind the camera (Studio culls depth < 0.001), or too small to colour a pixel.
+        if depth < 0.001 || half * 2.0 * view.px_per_stud / depth < mech::FX_MIN_PIXELS {
             continue;
         }
         // (the glass in front dims it on the GPU, at the centre)
@@ -1405,10 +1473,17 @@ fn particles_draw(
         if alpha <= 0.0 {
             continue;
         }
-        let color = premul(c.color.at(t), alpha);
+        let (color, p_look) = if c.sparkles {
+            // ParticleCurveCrazySparklesFS: f1 = color_curve(t) * ModulateColor
+            // passed in full f32 via look.xyz; Params.y = 0.6 in look.w.
+            let f1 = c.color.at(t) * c.modulate;
+            ([255, 255, 255, (alpha.clamp(0.0, 1.0) * 255.0).round() as u8], [f1.x, f1.y, f1.z, 1.0 - c.look.emission])
+        } else {
+            (unpremul(c.color.at(t), alpha), look)
+        };
         // Lit once per particle, FX_LIGHT_TOWARD_CAMERA toward the camera
         // (ParticleLightingVS), on the GPU; the CPU's for the check.
-        let check = if view.check {
+        let check = if view.check && !c.sparkles {
             let at = center + (view.pos - center).normalize_or_zero() * mech::FX_LIGHT_TOWARD_CAMERA;
             view.check(view.light_at(&c.look, at, &lights), glass, center)
         } else {
@@ -1434,10 +1509,10 @@ fn particles_draw(
                 let v = vel / speed;
                 (v, view.forward.cross(v).normalize_or(view.up))
             }
-            // VelocityPerpendicular: Y is world up made square to the
-            // velocity, X = v × Y (moving away shows the image as is,
-            // moving toward the camera mirrored left to right, whatever the
-            // part's turn). Straight up or down: Y = v × the part's X.
+            // VelocityPerpendicular (ParticleCustomVS with default identity
+            // CB1[4]): Y is world up
+            // made square to the velocity, X = v × Y (independent of host
+            // part rotation). Straight up or down: Y = v × the part's X.
             3 if speed > 1e-4 => {
                 let v = vel / speed;
                 let up = Vec3::Y - v * v.y;
@@ -1493,9 +1568,9 @@ fn particles_draw(
         } else {
             ([white.x, white.y], [white.x, white.y], [0.0, 0.0])
         };
-        // Soft particles: only the camera-facing ones (ParticleCustomFS_Soft
-        // tests the orientation for 0), faded over their half size.
-        let soft = if c.orientation == 0 { 1.0 / half.max(1e-3) } else { 0.0 };
+        // Soft particles: only camera-facing ParticleEmitters (Sparkles uses
+        // ParticleCurveVS + ParticleCurveCrazySparklesFS with no soft fade).
+        let soft = if c.orientation == 0 && !c.sparkles { 1.0 / half.max(1e-3) } else { 0.0 };
         // The quad's corners: centre ± e1 ± e2 (ParticleCustomVS).
         out.push(FxParticle {
             centre: center.to_array(),
@@ -1508,7 +1583,7 @@ fn particles_draw(
             uv1,
             cell,
             color,
-            look,
+            look: p_look,
             check,
             glass,
         });
@@ -1518,7 +1593,8 @@ fn particles_draw(
     if out.is_empty() {
         return None;
     }
-    Some(Draw { dist: far, texture: tex.0, wrap: false, geom: Geom::Particles(out) })
+    let geom = if c.sparkles { Geom::Sparkles(out) } else { Geom::Particles(out) };
+    Some(Draw { dist: far, texture: tex.0, wrap: false, geom })
 }
 
 /// A strip of (point, side half-vector, t along, u) rows as triangles;
@@ -1570,7 +1646,7 @@ fn strip(
         let shifted = if zoffset_pos != 0.0 { p + (view.pos - p).normalize_or_zero() * zoffset_pos } else { p };
         // (the glass in front dims it on the GPU, at the row's centre)
         let alpha = (1.0 - transparency.at((t - fade_back).max(0.0), 0.0)).clamp(0.0, 1.0) * look.alpha;
-        let col = premul(color.at(t), alpha);
+        let col = unpremul(color.at(t), alpha);
         // Lit at the row's centre (TrailFSLight reads the grid at the
         // pixel; here per row), on the GPU; the CPU's for the check.
         let check = if view.check { view.check(view.light_at(look, shifted, &lights), glass, shifted) } else { [0.0; 3] };
@@ -2026,6 +2102,7 @@ impl Effects {
                     self.kept.retain(|r, _| set.contains(r));
                     self.list.retain(|r| set.contains(r));
                     self.emitters.retain(|r, _| set.contains(r));
+                    self.sparkles_extra.retain(|r, _| set.contains(r));
                     self.trails.retain(|r, _| set.contains(r));
                     self.poses.retain(|r, _| set.contains(r));
                     self.beam_phase.retain(|r, _| set.contains(r));
@@ -2148,7 +2225,14 @@ impl Effects {
         let (mut n_beams, mut n_kept) = (0u64, 0u64);
         // Emitters nearest first get the particle budget.
         let mut emitters: Vec<(f32, Ref, Xform, Vec3)> = Vec::new();
-        for &r in &self.list {
+        let fixed_clock = rustudio_core::sim_clock::on();
+        for (index, &r) in self.list.iter().enumerate() {
+            // Serialized instances receive new random Ref values on load.
+            // Their traversal order gives fixed-step captures repeatable streams.
+            let new_emitter = || EmitterState {
+                rng: fixed_clock.then(|| Rng::seeded(index)),
+                ..Default::default()
+            };
             if !d.exists(r) {
                 continue;
             }
@@ -2185,7 +2269,7 @@ impl Effects {
                         }
                         continue;
                     }
-                    let st = self.emitters.entry(r).or_default();
+                    let st = self.emitters.entry(r).or_insert_with(new_emitter);
                     let t0 = rustudio_core::bench::now();
                     st.step(c, r, &xf, size, dt, emits.remove(&r).unwrap_or(0), moving, wind);
                     t_sim += rustudio_core::bench::now() - t0;
@@ -2209,8 +2293,8 @@ impl Effects {
                         continue;
                     }
                     let emit = emits.remove(&r).unwrap_or(0);
-                    let st1 = self.emitters.entry(r).or_default();
-                    let st2 = self.sparkles_extra.entry(r).or_default();
+                    let st1 = self.emitters.entry(r).or_insert_with(new_emitter);
+                    let st2 = self.sparkles_extra.entry(r).or_insert_with(new_emitter);
                     let t0 = rustudio_core::bench::now();
                     st1.step(&pair[0], r, &xf, size, dt, emit, moving, wind);
                     st2.step(&pair[1], r, &xf, size, dt, 0, moving, wind);
@@ -2368,12 +2452,14 @@ impl Effects {
         out.vp = view.vp.to_cols_array_2d();
         out.cam = [view.pos.x, view.pos.y, view.pos.z, if view.check { 1.0 } else { 0.0 }];
         out.right = [view.right.x, view.right.y, view.right.z, 0.0];
+        out.cam_back = [-view.forward.x, -view.forward.y, -view.forward.z, 0.0];
         let l = f.light;
         out.light = [l.ambient, l.outdoor, l.sun, l.env].map(|v| [v.x, v.y, v.z, 0.0]);
         for dr in draws {
             match dr.geom {
                 Geom::Strip(v, i) => out.push_strip(dr.texture, dr.wrap, &v, &i),
                 Geom::Particles(p) => out.push_particles(dr.texture, &p),
+                Geom::Sparkles(p) => out.push_sparkles(dr.texture, &p),
                 Geom::Kept(r) => {
                     if let Some(k) = self.kept.get(&r) {
                         out.push_strip(dr.texture, dr.wrap, &k.vertices, &k.indices);
@@ -2792,6 +2878,8 @@ mod tests {
             flip_blend: false,
             orientation: 0,
             zoffset: 0.0,
+            sparkles: false,
+            modulate: Vec3::ONE,
             look: Look { influence: 0.0, brightness: 1.0, emission: 0.0, alpha: 1.0 },
         }
     }
@@ -2848,6 +2936,13 @@ mod texture_tests {
                 .with_property("SparkleColor", rbx_dom_weak::types::Color3::new(1.0, 0.35, 0.7)),
         );
         let [e1, e2] = sparkles_cfgs(&d, sp);
+        assert!(e1.sparkles && e2.sparkles);
+        assert_eq!(e1.modulate, Vec3::new(1.0, 0.35, 0.7));
+        assert!((e1.look.emission - 0.4).abs() < 1e-6);
+        assert!((e1.size.at(0.0, 0.0) - 0.37).abs() < 1e-5);
+        assert!((e1.size.at(1.0, 0.0) - 1.02).abs() < 1e-5);
+        assert!((e2.size.at(0.0, 0.0) - 0.10).abs() < 1e-5);
+        assert!((e2.size.at(1.0, 0.0) - 0.44).abs() < 1e-5);
         assert_eq!(e1.rate, 30.0);
         assert_eq!(e1.drag, 0.2);
         assert_eq!(e1.accel, Vec3::new(0.0, 1.0, 0.0));

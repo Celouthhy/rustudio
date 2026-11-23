@@ -10,6 +10,8 @@ use rustudio_engine::theme;
 
 /// The dragger settings drop-down's popup id (the `dragger_menu` action opens it).
 pub(crate) const DRAGGER_MENU_ID: &str = "dragger_menu";
+/// Model > Constraint drop-down's popup id (the `constraint_menu` action opens it).
+pub(crate) const CONSTRAINT_MENU_ID: &str = "constraint_menu";
 
 fn divider(ui: &mut egui::Ui) {
     ui.add_space(4.0);
@@ -195,13 +197,20 @@ impl Editor {
     }
 
     fn ribbon_tools(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
+        let roblox_draggers = self
+            .builtin_tools
+            .use_roblox(rustudio_core::rustudio_settings::BuiltinTool::Draggers);
         for (icon, label, a, tool) in [
             ("pointer", "Select", "tool_select", Tool::Select),
             ("arrows-move", "Move", "tool_move", Tool::Move),
             ("resize", "Scale", "tool_scale", Tool::Scale),
             ("rotate-clockwise-2", "Rotate", "tool_rotate", Tool::Rotate),
         ] {
-            let on = self.tool == tool;
+            let on = if roblox_draggers {
+                self.action_state(a).1 == Some(true)
+            } else {
+                self.tool == tool
+            };
             let r = self.rb(ui, icon, label, a, on, act);
             self.ui_rects.insert(tool_key(tool), r);
             self.hud.toolbar_buttons += 1;
@@ -227,14 +236,16 @@ impl Editor {
                 RibbonTab::Home => {
                     self.ribbon_tools(ui, a);
                     self.part_button(ui, a);
-                    self.rb(ui, "mountain", "Terrain", "terrain_editor", false, a);
-                    let r = self.rb(ui, "user-plus", "Character", "character", self.chars.open, a);
+                    let terrain_on = self.action_state("terrain_editor").1 == Some(true);
+                    self.rb(ui, "mountain", "Terrain", "terrain_editor", terrain_on, a);
+                    let char_on = self.action_state("character").1 == Some(true);
+                    let r = self.rb(ui, "user-plus", "Character", "character", char_on, a);
                     self.ui_rects.insert("home.character", r);
                     self.rb(ui, "app-window", "GUI", "gui", false, a);
                     self.rb(ui, "file-code", "Script", "script", false, a);
-                    self.rb(ui, "file-import", "Import", "import_model", false, a);
+                    self.import_button(ui, a);
                     divider(ui);
-                    self.material_quick_button(ui);
+                    self.material_quick_button(ui, a);
                     self.color_quick_button(ui);
                     self.rb(ui, "box-multiple", "Group", "group", false, a);
                     let lock = self.action_state("lock").1 == Some(true);
@@ -247,23 +258,26 @@ impl Editor {
                     self.rb(ui, "list-tree", "Explorer", "panel_explorer", e, a);
                     let p = self.ui.panels_open.contains("Properties");
                     self.rb(ui, "list-details", "Properties", "panel_properties", p, a);
-                    self.rb(ui, "tools", "Toolbox", "toolbox", false, a);
+                    let tb_on = self.action_state("toolbox").1 == Some(true);
+                    self.rb(ui, "tools", "Toolbox", "toolbox", tb_on, a);
                     self.rb(ui, "folders", "Assets", "asset_manager", false, a);
                 }
                 RibbonTab::Model => {
                     self.ribbon_tools(ui, a);
-                    self.rb(ui, "focus-centered", "Pivot", "pivot", false, a);
+                    let pivot_on = self.action_state("pivot").1 == Some(true);
+                    self.rb(ui, "focus-centered", "Pivot", "pivot", pivot_on, a);
                     self.rb(ui, "restore", "Reset", "pivot_reset", false, a);
                     divider(ui);
                     self.part_button(ui, a);
                     let fx = ["ParticleEmitter", "Beam", "Trail", "Fire", "Smoke", "Sparkles", "Highlight"];
                     self.class_menu_button(ui, "sparkles", "Effect", "effect", &fx, a);
                     divider(ui);
-                    self.rb(ui, "circle-dot", "Attachment", "attachment", false, a);
-                    self.rb(ui, "link", "Constraint", "constraint", false, a);
-                    self.rb(ui, "link-plus", "Weld", "weld", false, a);
+                    self.attachment_button(ui, a);
+                    self.constraint_button(ui, a);
+                    let weld_on = self.action_state("weld").1 == Some(true);
+                    self.rb(ui, "link-plus", "Weld", "weld", weld_on, a);
                     divider(ui);
-                    self.material_quick_button(ui);
+                    self.material_quick_button(ui, a);
                     self.color_quick_button(ui);
                     self.rb(ui, "photo", "Texture", "texture_tool", false, a);
                     self.rb(ui, "box-multiple", "Group", "group", false, a);
@@ -272,7 +286,8 @@ impl Editor {
                     let anchored = self.action_state("anchor").1 == Some(true);
                     self.rb(ui, "anchor", "Anchor", "anchor", anchored, a);
                     divider(ui);
-                    self.rb(ui, "layout-align-center", "Align", "align", false, a);
+                    let align_on = self.action_state("align").1 == Some(true);
+                    self.rb(ui, "layout-align-center", "Align", "align", align_on, a);
                 }
                 RibbonTab::Avatar => {
                     self.ribbon_tools(ui, a);
@@ -280,14 +295,17 @@ impl Editor {
                     let r = self.rb(ui, "user-cog", "Settings", "avatar_settings", open, a);
                     self.ui_rects.insert("avatar.settings", r);
                     divider(ui);
-                    let r = self.rb(ui, "user-plus", "Character", "character", self.chars.open, a);
+                    let char_on = self.action_state("character").1 == Some(true);
+                    let r = self.rb(ui, "user-plus", "Character", "character", char_on, a);
                     self.ui_rects.insert("avatar.character", r);
-                    self.rb(ui, "accessible", "Setup", "avatar_setup", false, a);
+                    let setup_on = self.action_state("avatar_setup").1 == Some(true);
+                    self.rb(ui, "accessible", "Setup", "avatar_setup", setup_on, a);
                     self.rb(ui, "hanger", "Accessory", "accessory_editor", false, a);
                     self.rb(ui, "shirt", "Adaptive…", "adaptive", false, a);
                     self.rb(ui, "checklist", "UGC Validati…", "ugc_validation", false, a);
                     divider(ui);
-                    self.rb(ui, "movie", "Clip Editor", "clip_editor", false, a);
+                    let clip_on = self.action_state("clip_editor").1 == Some(true);
+                    self.rb(ui, "movie", "Clip Editor", "clip_editor", clip_on, a);
                     self.rb(ui, "chart-line", "Graph Editor", "graph_editor", false, a);
                 }
                 RibbonTab::Ui => {
@@ -302,7 +320,8 @@ impl Editor {
                     let co = ["UIAspectRatioConstraint", "UISizeConstraint", "UITextSizeConstraint"];
                     self.class_menu_button(ui, "aspect-ratio", "Constraint", "ui_constraint", &co, a);
                     divider(ui);
-                    self.rb(ui, "brush", "Style Editor", "style_editor", false, a);
+                    let style_on = self.action_state("style_editor").1 == Some(true);
+                    self.rb(ui, "brush", "Style Editor", "style_editor", style_on, a);
                 }
                 RibbonTab::Script => {
                     self.rb(ui, "chevron-left", "Back", "script_back", false, a);
@@ -336,19 +355,249 @@ impl Editor {
         }
     }
 
+    /// Studio PNG icon URI when `action` is currently backed by a Roblox
+    /// built-in plugin (so Home/Model/Avatar/UI draw Studio's real PNG icon
+    /// with the Tabler icon as fallback, never a diamond placeholder).
+    fn action_plugin_icon(&self, action: &str) -> Option<String> {
+        use rustudio_core::rustudio_settings::BuiltinTool;
+        if !self.builtin_tools.plugins_enabled {
+            return None;
+        }
+        let btn = match action {
+            "toolbox" if self.builtin_tools.use_roblox(BuiltinTool::Toolbox) => {
+                self.builtin_plugin_button("Toolbox", None, None)
+            }
+            "terrain_editor" if self.builtin_tools.use_roblox(BuiltinTool::TerrainEditor) => {
+                self.builtin_plugin_button("TerrainEditor", None, None)
+            }
+            "character" if self.builtin_tools.use_roblox(BuiltinTool::RigBuilder) => {
+                self.builtin_plugin_button("RigGenerator", None, None)
+            }
+            "material" if self.builtin_tools.use_roblox(BuiltinTool::MaterialPicker) => {
+                self.builtin_plugin_button("MaterialPicker", None, None)
+            }
+            "tool_select" if self.builtin_tools.use_roblox(BuiltinTool::Draggers) => {
+                self.builtin_plugin_button("SelectDragger", None, None)
+            }
+            "tool_move" if self.builtin_tools.use_roblox(BuiltinTool::Draggers) => {
+                self.builtin_plugin_button("MoveDragger", None, None)
+            }
+            "tool_scale" if self.builtin_tools.use_roblox(BuiltinTool::Draggers) => {
+                self.builtin_plugin_button("ScaleDragger", None, None)
+            }
+            "tool_rotate" if self.builtin_tools.use_roblox(BuiltinTool::Draggers) => {
+                self.builtin_plugin_button("RotateDragger", None, None)
+            }
+            "import_3d" => self.builtin_plugin_button("AssetImporter", Some("Mesh Importer"), Some("Import")),
+            "pivot" => self.builtin_plugin_button("PivotEditor", Some("Pivot"), Some("EditPivot")),
+            "pivot_reset" => self.builtin_plugin_button("PivotEditor", Some("Pivot"), Some("ClearPivot")),
+            "attachment" => self.builtin_plugin_button("ConstraintTool", Some("Attachment"), Some("Place")),
+            "weld" => self.builtin_plugin_button("ConstraintTool", Some("WeldConstraint"), Some("Place")),
+            "align" => self.builtin_plugin_button("AlignmentTool", Some("Alignment"), Some("AlignTool")),
+            "avatar_setup" => self.builtin_plugin_button("AvatarCompatibilityPreviewer", Some("AvatarPreviewer"), Some("previewAvatar")),
+            "clip_editor" => self.builtin_plugin_button("AnimationClipEditor", Some("Animations"), Some("Animation Editor")),
+            "style_editor" => self.builtin_plugin_button("StyleEditor", Some("StyleEditor"), Some("StyleEditorToolbarButton")),
+            _ => None,
+        }?;
+        (!btn.icon.trim().is_empty()).then(|| btn.icon.clone())
+    }
+
+    /// Ribbon button that paints a Studio PNG icon (when available) over the
+    /// standard ribbon cell, falling back to the Tabler icon while loading or
+    /// when Studio textures aren't present.
+    fn rb_icon(
+        &mut self,
+        ui: &mut egui::Ui,
+        fallback_icon: &str,
+        plugin_icon: Option<&str>,
+        label: &str,
+        active: bool,
+        enabled: bool,
+    ) -> egui::Response {
+        let font = egui::FontId::proportional(11.5);
+        let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), theme::TEXT).size().x);
+        let w = (tw + 10.0).max(48.0);
+        let sense = if enabled { Sense::click() } else { Sense::hover() };
+        let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 50.0), sense);
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        let icon_r = Rect::from_center_size(r.center() - Vec2::new(0.0, 8.0), Vec2::splat(24.0));
+        if active {
+            p.rect_filled(icon_r.expand(5.0), 4.0, theme::ACTIVE_TAB.gamma_multiply(1.5));
+        } else if enabled && resp.hovered() {
+            p.rect_filled(r, 4.0, theme::HOVER_BG);
+        }
+        let col = if !enabled {
+            theme::TEXT_DIM.gamma_multiply(0.8)
+        } else if active {
+            Color32::WHITE
+        } else {
+            theme::TEXT
+        };
+        let tint = if enabled { Color32::WHITE } else { Color32::WHITE.gamma_multiply(0.45) };
+        let painted = plugin_icon.is_some_and(|uri| self.paint_builtin_icon(&ctx, &p, icon_r, uri, tint));
+        if !painted {
+            let icon_color = ribbon_icon_color(fallback_icon);
+            let icon_color = if enabled { icon_color } else { icon_color.gamma_multiply(0.55) };
+            rustudio_engine::ti::paint(&p, icon_r, fallback_icon, icon_color);
+        }
+        p.text(egui::pos2(r.center().x, r.max.y - 7.0), egui::Align2::CENTER_CENTER, label, font, col);
+        resp
+    }
+
     /// A ribbon button for an action; disabled ones say so. Returns its rect.
-    fn rb(&mut self, ui: &mut egui::Ui, icon: &str, label: &str, action: &str, active: bool, act: &mut Option<String>) -> Rect {
+    pub(crate) fn rb(&mut self, ui: &mut egui::Ui, icon: &str, label: &str, action: &str, active: bool, act: &mut Option<String>) -> Rect {
         let (enabled, _) = self.action_state(action);
-        let resp = ribbon_button(ui, icon, label, active, enabled);
+        let plugin_icon = self.action_plugin_icon(action);
+        let resp = self.rb_icon(ui, icon, plugin_icon.as_deref(), label, active, enabled);
         let rect = resp.rect;
         if enabled {
             if resp.clicked() {
                 *act = Some(action.to_string());
             }
         } else {
-            resp.on_hover_text(format!("{label}: not in rustudio yet"));
+            let tip = match action {
+                "toolbox" | "terrain_editor" | "character" | "material" | "tool_select" | "tool_move" | "tool_scale" | "tool_rotate"
+                    if self.builtin_tools.plugins_enabled =>
+                {
+                    format!("{label}: Roblox's built-in plugin is unavailable")
+                }
+                _ => format!("{label}: not in rustudio yet"),
+            };
+            resp.on_hover_text(tip);
         }
         rect
+    }
+
+    /// Home > Import: native Import Roblox Model when built-in plugins are OFF;
+    /// split button for Studio's 3D Asset Importer + Import Roblox Model when ON.
+    fn import_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
+        if !self.builtin_tools.plugins_enabled || !self.action_state("import_3d").0 {
+            self.rb(ui, "file-import", "Import", "import_model", false, act);
+            return;
+        }
+        let active = self.action_state("import_3d").1 == Some(true);
+        let icon_uri = self.action_plugin_icon("import_3d");
+        let resp = self.rb_icon(ui, "file-import", icon_uri.as_deref(), "Import", active, true);
+        self.ui_rects.insert("home.import", resp.rect);
+        let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        let ar = ui.interact(arrow, egui::Id::new("import_arrow"), Sense::click());
+        if resp.clicked() && !ar.hovered() {
+            *act = Some("import_3d".into());
+        }
+        egui::Popup::menu(&ar).show(|ui| {
+            if ui.button("Import 3D… (Ctrl+M)").clicked() {
+                *act = Some("import_3d".into());
+                ui.close();
+            }
+            if ui.button("Import Roblox Model…").clicked() {
+                *act = Some("import_model".into());
+                ui.close();
+            }
+        });
+    }
+
+    /// Model > Attachment: native Attachment inserter when built-in plugins are
+    /// OFF; Studio's ConstraintTool Attachment / Bone placer when ON.
+    fn attachment_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
+        if !self.builtin_tools.plugins_enabled
+            || self.builtin_plugin_button("ConstraintTool", Some("Attachment"), Some("Place")).is_none()
+        {
+            self.rb(ui, "circle-dot", "Attachment", "attachment", false, act);
+            return;
+        }
+        let (enabled, active) = self.action_state("attachment");
+        let bone_active = self.action_state("constraint:Bone").1 == Some(true);
+        let active = active == Some(true) || bone_active;
+        let icon_uri = if bone_active {
+            self.builtin_plugin_button("ConstraintTool", Some("Bone"), Some("Place"))
+                .map(|b| b.icon.clone())
+        } else {
+            self.action_plugin_icon("attachment")
+        };
+        let resp = self.rb_icon(ui, "circle-dot", icon_uri.as_deref(), "Attachment", active, enabled);
+        self.ui_rects.insert("model.attachment", resp.rect);
+        let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        let ar = ui.interact(arrow, egui::Id::new("attachment_arrow"), Sense::click());
+        if enabled && resp.clicked() && !ar.hovered() {
+            *act = Some("attachment".into());
+        }
+        let ctx = ui.ctx().clone();
+        egui::Popup::menu(&ar).show(|ui| {
+            for &(tb, label) in crate::plugin_host::builtin_lazy::ATTACHMENT_MENU_ITEMS {
+                let icon = self
+                    .builtin_plugin_button("ConstraintTool", Some(tb), Some("Place"))
+                    .map(|b| b.icon.clone())
+                    .unwrap_or_default();
+                let item_on = self.action_state(&format!("constraint:{tb}")).1 == Some(true);
+                ui.horizontal(|ui| {
+                    let (ir, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    let p = ui.painter().clone();
+                    if !self.paint_builtin_icon(&ctx, &p, ir, &icon, Color32::WHITE) {
+                        rustudio_engine::ti::paint(&p, ir, "circle-dot", ribbon_icon_color("circle-dot"));
+                    }
+                    if ui.selectable_label(item_on, label).clicked() {
+                        *act = Some(format!("constraint:{tb}"));
+                        ui.close();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Model > Constraint: Studio 0.748's ConstraintTool dropdown listing all
+    /// mechanical & mover constraints with their Studio PNG icons.
+    fn constraint_button(&mut self, ui: &mut egui::Ui, act: &mut Option<String>) {
+        let (enabled, active) = self.action_state("constraint");
+        if !self.builtin_tools.plugins_enabled || !enabled {
+            let r = self.rb(ui, "link", "Constraint", "constraint", false, act);
+            self.ui_rects.insert("model.constraint", r);
+            return;
+        }
+        let active_icon = crate::plugin_host::builtin_lazy::CONSTRAINT_MENU_ITEMS
+            .iter()
+            .flatten()
+            .find_map(|(tb, _)| {
+                let b = self.builtin_plugin_button("ConstraintTool", Some(tb), Some("Place"))?;
+                b.active.then(|| b.icon.clone())
+            })
+            .or_else(|| {
+                self.builtin_plugin_button("ConstraintTool", Some("HingeConstraint"), Some("Place"))
+                    .map(|b| b.icon.clone())
+            });
+        let resp = self.rb_icon(ui, "link", active_icon.as_deref(), "Constraint", active == Some(true), true);
+        self.ui_rects.insert("model.constraint", resp.rect);
+        let arrow = Rect::from_min_size(resp.rect.right_top() + Vec2::new(-13.0, 18.0), Vec2::splat(12.0));
+        rustudio_engine::ti::paint(ui.painter(), arrow, "chevron-down", theme::TEXT_DIM);
+        let ctx = ui.ctx().clone();
+        egui::Popup::menu(&resp)
+            .id(egui::Id::new(CONSTRAINT_MENU_ID))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(168.0);
+                for entry in crate::plugin_host::builtin_lazy::CONSTRAINT_MENU_ITEMS {
+                    let Some((tb, label)) = *entry else {
+                        ui.separator();
+                        continue;
+                    };
+                    let Some(btn) = self.builtin_plugin_button("ConstraintTool", Some(tb), Some("Place")).cloned() else {
+                        continue;
+                    };
+                    ui.horizontal(|ui| {
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                        let p = ui.painter().clone();
+                        if !self.paint_builtin_icon(&ctx, &p, ir, &btn.icon, Color32::WHITE) {
+                            rustudio_engine::ti::paint(&p, ir, "link", ribbon_icon_color("link"));
+                        }
+                        if ui.selectable_label(btn.active, label).clicked() {
+                            *act = Some(format!("constraint:{tb}"));
+                            ui.close();
+                        }
+                    });
+                }
+            });
     }
 
     fn rb_class(&mut self, ui: &mut egui::Ui, icon: &str, label: &str, action: &str, class: &str, act: &mut Option<String>) {

@@ -207,6 +207,66 @@ impl Region {
         out
     }
 
+    /// TerrainRegion:ApplyTransform / ApplyTransformSubregion: rotates the
+    /// region by `rot` and scales it to `size_studs` (in studs; 1 cell = 4
+    /// studs). When `subregion` is `Some((min, max))` (half-open cell offsets
+    /// within the transformed bounding box), returns only that subregion.
+    pub fn apply_transform(
+        &self,
+        rot: glam::Mat3,
+        size_studs: glam::Vec3,
+        subregion: Option<([i32; 3], [i32; 3])>,
+    ) -> Region {
+        let size_studs = size_studs.abs();
+        let half = size_studs * 0.5;
+        let ext = rot.x_axis.abs() * half.x + rot.y_axis.abs() * half.y + rot.z_axis.abs() * half.z;
+        let voxel = crate::terrain::VOXEL;
+        let full_size = [0, 1, 2].map(|k| ((2.0 * ext[k] / voxel) - 1e-4).ceil().max(0.0) as i32);
+
+        let (sub_lo, sub_size) = match subregion {
+            Some((rlo, rhi)) => (rlo, [0, 1, 2].map(|k| (rhi[k] - rlo[k]).max(0))),
+            None => ([0; 3], full_size),
+        };
+        if sub_size.contains(&0)
+            || full_size.contains(&0)
+            || self.size.contains(&0)
+            || self.n.contains(&0)
+            || size_studs.x <= 1e-4
+            || size_studs.y <= 1e-4
+            || size_studs.z <= 1e-4
+        {
+            return Region::empty(sub_size);
+        }
+
+        let inv_rot = rot.transpose();
+        let full_half = glam::Vec3::new(full_size[0] as f32, full_size[1] as f32, full_size[2] as f32) * 0.5;
+        let src_size = glam::Vec3::new(self.size[0] as f32, self.size[1] as f32, self.size[2] as f32);
+        let mut out = Region::stored(sub_size, [0; 3], sub_size);
+        for oz in 0..sub_size[2] {
+            for oy in 0..sub_size[1] {
+                for ox in 0..sub_size[0] {
+                    let gx = sub_lo[0] + ox;
+                    let gy = sub_lo[1] + oy;
+                    let gz = sub_lo[2] + oz;
+                    let p_out = (glam::Vec3::new(gx as f32 + 0.5, gy as f32 + 0.5, gz as f32 + 0.5) - full_half) * voxel;
+                    let local = inv_rot * p_out;
+                    if local.x.abs() > half.x + 1e-3 || local.y.abs() > half.y + 1e-3 || local.z.abs() > half.z + 1e-3 {
+                        continue;
+                    }
+                    let u = (local + half) / size_studs;
+                    let sx = ((u.x * src_size.x).floor() as i32).clamp(0, self.size[0] - 1);
+                    let sy = ((u.y * src_size.y).floor() as i32).clamp(0, self.size[1] - 1);
+                    let sz = ((u.z * src_size.z).floor() as i32).clamp(0, self.size[2] - 1);
+                    let c = self.get([sx, sy, sz]);
+                    if c.0 != 0 {
+                        out.set([ox, oy, oz], c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether any cell holds water (a Water voxel or shoreline water).
     pub fn has_water(&self) -> bool {
         self.cells.iter().any(|c| c.0 == crate::terrain::WATER || c.2 != 0)
@@ -380,5 +440,55 @@ mod tests {
         assert_eq!(r.get([3, 1, 3]).0, 2, "Grass last");
         // rustudio writes the same blob.
         assert_eq!(Voxels::decode(&r.to_smooth_grid([10, 1, 20])).unwrap().encode(), v.encode());
+    }
+
+    #[test]
+    fn apply_transform_and_subregion() {
+        let mut v = Voxels::empty();
+        // 8x4x4: Grass on -X half (x=0..4), Rock on +X half (x=4..8)
+        for x in 0..8 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    v.set([x, y, z], if x < 4 { 2 } else { 8 }, 1.0);
+                }
+            }
+        }
+        let r = Region::copy(&v, [0, 0, 0], [8, 4, 4]);
+        // Identity matches original
+        let same = r.apply_transform(glam::Mat3::IDENTITY, glam::Vec3::new(32.0, 16.0, 16.0), None);
+        assert_eq!(same, r);
+        // 90 deg about +Y: +X turns to -Z, so size becomes 4x4x8
+        let rot_y = glam::Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let turned = r.apply_transform(rot_y, glam::Vec3::new(32.0, 16.0, 16.0), None);
+        assert_eq!(turned.size, [4, 4, 8]);
+        assert_eq!(turned.count(), 128);
+        assert_eq!(turned.get([0, 0, 0]).0, 8, "Rock (+X) rotates to -Z (z=0..4)");
+        assert_eq!(turned.get([0, 0, 7]).0, 2, "Grass (-X) rotates to +Z (z=4..8)");
+        // Subregion halves match the full transform
+        let sub_a = r.apply_transform(rot_y, glam::Vec3::new(32.0, 16.0, 16.0), Some(([0, 0, 0], [4, 4, 4])));
+        let sub_b = r.apply_transform(rot_y, glam::Vec3::new(32.0, 16.0, 16.0), Some(([0, 0, 4], [4, 4, 8])));
+        assert_eq!(sub_a.size, [4, 4, 4]);
+        assert_eq!(sub_a.count(), 64);
+        assert_eq!(sub_a.get([1, 1, 1]).0, 8);
+        assert_eq!(sub_b.size, [4, 4, 4]);
+        assert_eq!(sub_b.count(), 64);
+        assert_eq!(sub_b.get([1, 1, 1]).0, 2);
+        // Scale 2x
+        let big = r.apply_transform(glam::Mat3::IDENTITY, glam::Vec3::new(64.0, 32.0, 32.0), None);
+        assert_eq!(big.size, [16, 8, 8]);
+        assert_eq!(big.count(), 128 * 8);
+        // Odd cell dimensions (3x3x3) preserve exact size on identity and 90-deg rotation
+        let mut vo = Voxels::empty();
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    vo.set([x, y, z], 2, 1.0);
+                }
+            }
+        }
+        let odd = Region::copy(&vo, [0, 0, 0], [3, 3, 3]);
+        let odd_rot = odd.apply_transform(rot_y, glam::Vec3::new(12.0, 12.0, 12.0), None);
+        assert_eq!(odd_rot.size, [3, 3, 3]);
+        assert_eq!(odd_rot.count(), 27);
     }
 }

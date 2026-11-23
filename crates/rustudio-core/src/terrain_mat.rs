@@ -173,6 +173,23 @@ pub fn material(m: u8, use2022: bool) -> Option<&'static Material> {
     if use2022 { &t.v2022 } else { &t.pre2022 }.get(m as usize)
 }
 
+pub(crate) fn default_colors_2022() -> rbx_dom_weak::types::MaterialColors {
+    use rbx_dom_weak::types::{Color3uint8, MaterialColors, TerrainMaterials};
+    static COLORS: OnceLock<MaterialColors> = OnceLock::new();
+    COLORS
+        .get_or_init(|| {
+            let mut colors = MaterialColors::new();
+            for material in &tables().v2022 {
+                if let Ok(slot) = material.name.parse::<TerrainMaterials>() {
+                    let [r, g, b] = material.default_color;
+                    colors.set_color(slot, Color3uint8::new(r, g, b));
+                }
+            }
+            colors
+        })
+        .clone()
+}
+
 /// Studio's recolour of a terrain albedo for MaterialColors (CB4, built by
 /// Studio): the default MaterialColor `default` and the
 /// current `color` as HSV straight from their sRGB bytes / 255;
@@ -337,6 +354,25 @@ pub fn palette_generation(doc: &crate::doc::Document, packs: u64) -> u64 {
 mod live_palette_tests {
     use super::*;
     use rbx_dom_weak::{InstanceBuilder, types::Variant};
+
+    #[test]
+    fn absent_colors_follow_the_material_table_and_saved_colors_win() {
+        let mut doc = crate::doc::Document::empty();
+        let root = doc.dom.root_ref();
+        let terrain = doc.dom.insert(root, InstanceBuilder::new("Terrain"));
+        let colors = |doc: &crate::doc::Document| {
+            material_colors_bytes(&doc.prop(terrain, "MaterialColors").unwrap()).unwrap()
+        };
+        assert_eq!(&colors(&doc)[48..51], &[115, 123, 107]);
+        doc.dom.insert(root, InstanceBuilder::new("MaterialService")
+            .with_property("Use2022MaterialsXml", true));
+        assert_eq!(&colors(&doc)[48..51], &[80, 84, 84]);
+
+        let mut custom = colors(&doc);
+        custom[48..51].copy_from_slice(&[45, 70, 90]);
+        doc.set_prop_live(terrain, rbx_dom_weak::ustr("MaterialColors"), Variant::BinaryString(custom.into()));
+        assert_eq!(&colors(&doc)[48..51], &[45, 70, 90]);
+    }
     #[test]
     fn live_color_invalidates_without_mesh_change() {
         let mut doc = crate::doc::Document::empty();

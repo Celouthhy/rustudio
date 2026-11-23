@@ -26,6 +26,14 @@ pub struct AvatarLook {
     pub pants: Option<String>,
     pub tshirt: Option<String>,
     pub face: Option<String>,
+    /// Source asset ids for HumanoidDescription population (GetHumanoidDescriptionFromUserId).
+    pub shirt_id: Option<u64>,
+    pub pants_id: Option<u64>,
+    pub tshirt_id: Option<u64>,
+    pub face_id: Option<u64>,
+    pub head_id: Option<u64>,
+    pub body_part_ids: Vec<(String, u64)>,
+    pub accessory_ids: Vec<(String, u64)>,
     /// Accessory models (.rbxm bytes).
     pub accessories: Vec<Vec<u8>>,
     /// Body part packages (Torso / arms / legs: .rbxm bytes with R6
@@ -235,6 +243,13 @@ pub fn look_from_info(
         pants: None,
         tshirt: None,
         face: None,
+        shirt_id: None,
+        pants_id: None,
+        tshirt_id: None,
+        face_id: None,
+        head_id: None,
+        body_part_ids: Vec::new(),
+        accessory_ids: Vec::new(),
         accessories: Vec::new(),
         body_parts: Vec::new(),
         head: None,
@@ -282,14 +297,35 @@ pub fn look_from_info(
             }
         };
         match kind.as_str() {
-            "Shirt" => look.shirt = content_of(&dom, "Shirt", "ShirtTemplate"),
-            "Pants" => look.pants = content_of(&dom, "Pants", "PantsTemplate"),
-            "TShirt" => look.tshirt = content_of(&dom, "ShirtGraphic", "Graphic"),
-            "Face" => look.face = content_of(&dom, "Decal", "Texture"),
-            "Head" | "DynamicHead" => look.head = Some(head_for_rig(client, a.id, look.r15, bytes)),
-            k if is_body_part(k) => look.body_parts.push(bytes),
+            "Shirt" => {
+                look.shirt = content_of(&dom, "Shirt", "ShirtTemplate");
+                look.shirt_id = Some(a.id);
+            }
+            "Pants" => {
+                look.pants = content_of(&dom, "Pants", "PantsTemplate");
+                look.pants_id = Some(a.id);
+            }
+            "TShirt" => {
+                look.tshirt = content_of(&dom, "ShirtGraphic", "Graphic");
+                look.tshirt_id = Some(a.id);
+            }
+            "Face" => {
+                look.face = content_of(&dom, "Decal", "Texture");
+                look.face_id = Some(a.id);
+            }
+            "Head" | "DynamicHead" => {
+                look.head = Some(head_for_rig(client, a.id, look.r15, bytes));
+                look.head_id = Some(a.id);
+            }
+            k if is_body_part(k) => {
+                look.body_parts.push(bytes);
+                look.body_part_ids.push((kind.clone(), a.id));
+            }
             k if is_animation_pack(k) => look.animations.push((kind.clone(), a.id, bytes)),
-            _ => look.accessories.push(bytes),
+            _ => {
+                look.accessories.push(bytes);
+                look.accessory_ids.push((kind.clone(), a.id));
+            }
         }
     }
     if !look.skipped.is_empty() {
@@ -1121,6 +1157,13 @@ mod tests {
             pants: None,
             tshirt: None,
             face: None,
+            shirt_id: None,
+            pants_id: None,
+            tshirt_id: None,
+            face_id: None,
+            head_id: None,
+            body_part_ids: Vec::new(),
+            accessory_ids: Vec::new(),
             accessories: Vec::new(),
             body_parts: Vec::new(),
             head: None,

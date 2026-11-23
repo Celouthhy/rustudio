@@ -520,6 +520,13 @@ pub struct TextFormat {
     /// around a common center-line, which is nice when mixining emojis
     /// and normal text in e.g. a button.
     pub valign: Align,
+
+    /// rustudio: when set, size each face (including fallbacks) and round
+    /// per-glyph advances using Roblox Studio's FreeType `REAL_DIM` + `hhea`
+    /// + `(trunc(text_size) + 1)` formula, and trim trailing break-whitespace
+    /// on soft-wrapped rows.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub studio_text_size: Option<f32>,
 }
 
 impl Default for TextFormat {
@@ -537,6 +544,7 @@ impl Default for TextFormat {
             underline: Stroke::NONE,
             strikethrough: Stroke::NONE,
             valign: Align::BOTTOM,
+            studio_text_size: None,
         }
     }
 }
@@ -556,6 +564,7 @@ impl core::hash::Hash for TextFormat {
             underline,
             strikethrough,
             valign,
+            studio_text_size,
         } = self;
         font_id.hash(state);
         emath::OrderedFloat(*extra_letter_spacing).hash(state);
@@ -570,6 +579,7 @@ impl core::hash::Hash for TextFormat {
         underline.hash(state);
         strikethrough.hash(state);
         valign.hash(state);
+        studio_text_size.map(emath::OrderedFloat).hash(state);
     }
 }
 
@@ -868,6 +878,12 @@ pub struct RowVisuals {
     ///
     /// The glyph vertices comes after backgrounds (if any), but before any underlines and strikethrough.
     pub glyph_vertex_range: Range<usize>,
+
+    /// rustudio: starting vertex indices (each 4 vertices) of color glyphs (COLR/CPAL)
+    /// in `mesh`, so `override_text_color` doesn't tint them to a flat color.
+    /// Empty when the row has no color glyphs.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub color_glyph_vertex_starts: Vec<u32>,
 }
 
 impl Default for RowVisuals {
@@ -877,6 +893,7 @@ impl Default for RowVisuals {
             mesh_bounds: Rect::NOTHING,
             glyph_index_start: 0,
             glyph_vertex_range: 0..0,
+            color_glyph_vertex_starts: Vec::new(),
         }
     }
 }
@@ -924,6 +941,14 @@ pub struct Glyph {
 
     /// Which is our first vertex in [`RowVisuals::mesh`].
     pub first_vertex: u32,
+
+    /// rustudio: UAX #9 bidi embedding level (0 = LTR, odd = RTL).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) bidi_level: u8,
+
+    /// rustudio: shaped run id within the paragraph, for per-row L2 visual reordering.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) bidi_run: u32,
 }
 
 impl Glyph {

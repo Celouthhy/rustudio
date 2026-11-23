@@ -24,6 +24,21 @@ use serde_json::Value as J;
 #[derive(Clone, Debug, PartialEq)]
 pub struct LCaps(pub Vec<String>);
 
+fn cap_name(v: &Value) -> mlua::Result<String> {
+    match v {
+        Value::UserData(u) => {
+            if let Ok(e) = u.borrow::<crate::ltypes::LEnumItem>() {
+                if e.enum_type == "SecurityCapability" {
+                    return Ok(e.name.clone());
+                }
+            }
+            Err(mlua::Error::runtime("Expected Enum.SecurityCapability"))
+        }
+        Value::String(s) => Ok(s.to_string_lossy()),
+        _ => Err(mlua::Error::runtime("Expected Enum.SecurityCapability")),
+    }
+}
+
 impl UserData for LCaps {
     fn add_fields<F: UserDataFields<Self>>(f: &mut F) {
         f.add_meta_field("__type", "SecurityCapabilities");
@@ -32,11 +47,55 @@ impl UserData for LCaps {
         // Studio: "RunClientScript | Physics" (empty: "").
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(this.0.join(" | ")));
         m.add_meta_method(MetaMethod::Eq, |_, this, other: mlua::AnyUserData| {
-            Ok(other.borrow::<LCaps>().map(|o| o.0 == this.0).unwrap_or(false))
+            Ok(other.borrow::<LCaps>().map(|o| {
+                o.0.len() == this.0.len() && o.0.iter().all(|c| this.0.contains(c))
+            }).unwrap_or(false))
         });
-        m.add_method("Contains", |_, this, other: mlua::AnyUserData| {
-            let o = other.borrow::<LCaps>()?;
-            Ok(o.0.iter().all(|c| this.0.contains(c)))
+        m.add_meta_method(MetaMethod::Index, |_, this, key: String| {
+            Ok(Value::Boolean(this.0.iter().any(|c| c == &key)))
+        });
+        m.add_meta_method_mut(MetaMethod::NewIndex, |_, this, (key, val): (String, bool)| {
+            if val {
+                if !this.0.iter().any(|c| c == &key) {
+                    this.0.push(key);
+                }
+            } else {
+                this.0.retain(|c| c != &key);
+            }
+            Ok(())
+        });
+        m.add_method("Contains", |_, this, args: mlua::MultiValue| {
+            for v in args {
+                if let Value::UserData(u) = &v {
+                    if let Ok(o) = u.borrow::<LCaps>() {
+                        if !o.0.iter().all(|c| this.0.contains(c)) {
+                            return Ok(false);
+                        }
+                        continue;
+                    }
+                }
+                let name = cap_name(&v)?;
+                if !this.0.contains(&name) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        });
+        m.add_method_mut("Add", |_, this, args: mlua::MultiValue| {
+            for v in args {
+                let name = cap_name(&v)?;
+                if !this.0.contains(&name) {
+                    this.0.push(name);
+                }
+            }
+            Ok(())
+        });
+        m.add_method_mut("Remove", |_, this, args: mlua::MultiValue| {
+            for v in args {
+                let name = cap_name(&v)?;
+                this.0.retain(|c| c != &name);
+            }
+            Ok(())
         });
     }
 }

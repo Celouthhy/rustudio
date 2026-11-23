@@ -386,13 +386,20 @@ assert(table.concat(hits,',')=='Hit',table.concat(hits,','))
 c.Root.Limb.Rotation.RotationOrder=Enum.RotationOrder.ZYX
 local t=load(c);t:Play(0,1,0);t.TimePosition=.25;task.wait(.05)
 near(motor.Transform.RightVector.Y,math.sin(.5));t:Stop(0);task.wait(.05)
-for _,case in {{.1,.15,'MK0,MK1,K0,K1,LOOP'},{1/60,.05,'MK0,K0,MK1,K1,LOOP'}} do
+for _,case in {{.1,.15},{1/60,.05}} do
 local t=pose(CFrame.new(),1);local ev={}
 t.KeyframeReached:Connect(function(n) table.insert(ev,n) end)
 t:GetMarkerReachedSignal('M'):Connect(function(n) table.insert(ev,'M'..n) end)
 t.DidLoop:Connect(function() table.insert(ev,'LOOP') end)
-t:Play(0,1,-1);t.TimePosition=case[1];task.wait(case[2]);t:Stop(0);task.wait(.05)
-assert(table.concat(ev,',')==case[3],table.concat(ev,','))
+t:Play(0,1,-1);t.TimePosition=case[1]
+if case[1]==1/60 then
+ -- Studio lands on zero without firing either endpoint.
+ -- The next step crosses zero and dispatches both endpoints before DidLoop.
+ task.wait()
+ assert(t.TimePosition==0 and #ev==0,tostring(t.TimePosition)..':'..table.concat(ev,','))
+end
+task.wait(case[2]);t:Stop(0);task.wait(.05)
+assert(table.concat(ev,',')=='MK0,MK1,K0,K1,LOOP',table.concat(ev,','))
 end
 print('animation-semantics-pass')
 "#);

@@ -642,6 +642,14 @@ impl Voxels {
     /// Finds Workspace.Terrain and decodes its SmoothGrid. `None` when there is
     /// no Terrain or it has no SmoothGrid property.
     pub fn from_dom(dom: &rbx_dom_weak::WeakDom) -> Option<Result<Voxels, String>> {
+        Some(Self::smooth_grid_bytes(dom)?.map_err(|kind| {
+            format!("SmoothGrid has unexpected type {kind:?}")
+        }).and_then(Self::decode))
+    }
+
+    /// Borrows the serialized grid so consumers can detect identical terrain
+    /// across a general document invalidation without decoding it again.
+    pub fn smooth_grid_bytes(dom: &rbx_dom_weak::WeakDom) -> Option<Result<&[u8], rbx_types::VariantType>> {
         let ws = dom
             .root()
             .children()
@@ -654,12 +662,9 @@ impl Voxels {
             .filter_map(|r| dom.get_by_ref(*r))
             .find(|i| i.class.as_str() == "Terrain")?;
         match terrain.properties.get(&rbx_dom_weak::ustr("SmoothGrid"))? {
-            rbx_types::Variant::BinaryString(b) => Some(Voxels::decode(b.as_ref())),
-            rbx_types::Variant::SharedString(s) => Some(Voxels::decode(s.data())),
-            other => Some(Err(format!(
-                "SmoothGrid has unexpected type {:?}",
-                other.ty()
-            ))),
+            rbx_types::Variant::BinaryString(b) => Some(Ok(b.as_ref())),
+            rbx_types::Variant::SharedString(s) => Some(Ok(s.data())),
+            other => Some(Err(other.ty())),
         }
     }
 }
@@ -673,8 +678,16 @@ impl Voxels {
     /// `flag (material | 0x40 occupancy byte | 0x80 count byte) [occ] [n - 1]`,
     /// a count byte of 0 carrying one voxel's shoreline water instead.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_where(|_| true)
+    }
+
+    pub fn chunk_keys(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
+        self.chunks.keys().copied()
+    }
+
+    pub fn encode_where(&self, include: impl Fn([i32; 3]) -> bool) -> Vec<u8> {
         let mut out = vec![1u8, CHUNK_SHIFT as u8];
-        let mut keys: Vec<[i32; 3]> = self.chunks.keys().copied().collect();
+        let mut keys: Vec<[i32; 3]> = self.chunk_keys().filter(|&key| include(key)).collect();
         keys.sort();
         let mut prev = [0i32; 3];
         for key in keys {
@@ -766,8 +779,15 @@ impl Voxels {
             for z in a[2]..b[2] {
                 for x in a[0]..b[0] {
                     let (m, o) = self.get(x, y, z);
-                    if m == from && m != 0 {
-                        self.write_one([x, y, z], to, if to == 0 { 0.0 } else { o });
+                    if m == from {
+                        let new_o = if to == 0 {
+                            0.0
+                        } else if from == 0 {
+                            1.0
+                        } else {
+                            o
+                        };
+                        self.write_one([x, y, z], to, new_o);
                     }
                 }
             }
@@ -1309,6 +1329,11 @@ impl State {
 /// counter-clockwise seen from outside.
 pub fn build_meshes(v: &Voxels) -> Vec<MaterialMesh> {
     build_fields(v, [true, true])
+}
+
+/// The solid surface used by terrain colliders. Water never collides.
+pub fn build_solid_meshes(v: &Voxels) -> Vec<MaterialMesh> {
+    build_fields(v, [true, false])
 }
 
 /// The water surface alone (the renderer draws solid terrain by chunk).

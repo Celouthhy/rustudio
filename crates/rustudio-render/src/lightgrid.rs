@@ -1957,7 +1957,9 @@ fn encode_local(c: Vec3) -> [u8; 4] {
 /// then Y, as the texture), from the unfiltered `raw`: the separable
 /// uniform 3x3x3 filter, in the full build's order, so the voxels come out
 /// as a full build gives them.
-fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3]) -> Vec<u8> {
+fn filter_region(
+    raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3], scratch: &mut [Vec<f32>; 2],
+) -> Vec<u8> {
     let [nx, _, nz] = dims;
     // What the filter reads: one voxel more on every side (in the grid).
     let slo = [0, 1, 2].map(|k| lo[k].saturating_sub(1));
@@ -1966,14 +1968,14 @@ fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3])
     // The sub-volume as plain floats (3 a voxel; X fastest, then Z, then Y).
     let row = size[0] * 3;
     let layer = row * size[2];
-    // (scratch kept per thread: every float is written before it's read)
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    let [sub, tmp] = scratch;
+    let len = layer * size[1];
+    if sub.len() < len {
+        sub.resize(len, 0.0);
+        tmp.resize(len, 0.0);
     }
-    SCRATCH.with(|scratch| {
-    let (sub, tmp) = &mut *scratch.borrow_mut();
-    sub.resize(layer * size[1], 0.0);
-    tmp.resize(layer * size[1], 0.0);
+    let sub = &mut sub[..len];
+    let tmp = &mut tmp[..len];
     for y in slo[1]..=shi[1] {
         for z in slo[2]..=shi[2] {
             let from = (y * nz + z) * nx;
@@ -2079,7 +2081,6 @@ fn filter_region(raw: &[Vec3], dims: [usize; 3], lo: [usize; 3], hi: [usize; 3])
         }
     }
     out
-    })
 }
 
 /// The local channel as it is kept between frames: the unfiltered sum of
@@ -2098,6 +2099,9 @@ pub struct LocalLights {
     /// Per light (as `lights`): its box and weight field, None when it
     /// reaches no voxel.
     kept: Vec<Option<Kept>>,
+    /// Reuse the filter volumes even when successive updates run on
+    /// different short-lived workers.
+    filter_scratch: [Vec<f32>; 2],
 }
 
 /// A re-light of part of the local channel: its first and last voxel and
@@ -2136,7 +2140,10 @@ impl LocalLights {
     fn build_dims(occ: &Occupancy, lights: &[crate::render::LightRaw], dims: [usize; 3]) -> (LocalLights, Vec<u8>) {
         let len = dims.iter().product::<usize>();
         let kept = Self::keep(occ, lights, dims, &Default::default());
-        let mut me = LocalLights { origin: occ.origin, dims, raw: Vec::new(), lights: lights.to_vec(), kept };
+        let mut me = LocalLights {
+            origin: occ.origin, dims, raw: Vec::new(), lights: lights.to_vec(), kept,
+            filter_scratch: Default::default(),
+        };
         let mut active: Option<([usize; 3], [usize; 3])> = None;
         let all = ([0; 3], [dims[0] - 1, dims[1] - 1, dims[2] - 1]);
         for (l, k) in me.lights.iter().zip(&me.kept) {
@@ -2151,7 +2158,7 @@ impl LocalLights {
         let mut out: Vec<u8> = zero.iter().copied().cycle().take(len * 4).collect();
         if let Some((lo, hi)) = active {
             let (lo, hi) = grow(lo, hi, dims);
-            let patch = filter_region(&me.raw, dims, lo, hi);
+            let patch = filter_region(&me.raw, dims, lo, hi, &mut me.filter_scratch);
             me.write(&mut out, lo, hi, &patch);
         }
         (me, out)
@@ -2289,7 +2296,7 @@ impl LocalLights {
                     add_field(&mut self.raw, self.dims, Vec3::from_slice(&l.color), k, lo, hi);
                 }
             }
-            patches.push(LocalPatch { lo, hi, data: filter_region(&self.raw, self.dims, lo, hi) });
+            patches.push(LocalPatch { lo, hi, data: filter_region(&self.raw, self.dims, lo, hi, &mut self.filter_scratch) });
         }
         patches
     }

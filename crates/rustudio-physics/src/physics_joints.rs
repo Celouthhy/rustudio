@@ -198,6 +198,23 @@ impl Physics {
                 }
             }
         }
+        if self.studio.is_some() {
+            // A seated character and its vehicle form a single assembly in Studio
+            // and never collide with each other.
+            for hb in self.hums.by_model.values() {
+                if let Some((seat_part, Some(_))) = hb.seat {
+                    if let Some(body) = self.body_of(seat_part).and_then(|sb| self.world.bodies.get(sb)) {
+                        for hp in &hb.parts {
+                            let a = hp.collider.into_raw_parts().0;
+                            for &sc in body.colliders() {
+                                let b = sc.into_raw_parts().0;
+                                no_collide.insert((a.min(b), a.max(b)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(sv) = self.studio.as_mut() {
             sv.contacts.no_collide = no_collide;
         }
@@ -537,8 +554,33 @@ impl Physics {
         // or the journal was lost. Ends on a Humanoid's body and client-owned movers read
         // live state: read every frame.
         let sig = (self.dyn_version, self.world.bodies.len(), self.world.colliders.len());
+        let mut wake_joints = HashSet::default();
         let full = match (&self.sj_cache, &marks) {
-            (Some(c), doc::Marks::Some(_)) => c.sig != sig || new || c.refs != refs,
+            (Some(c), doc::Marks::Some(ms)) => {
+                let mut rebound = false;
+                for mark in ms {
+                    let doc::Mark::Prop(r, key) = mark else { continue };
+                    if matches!(key.as_str(), "Attachment0" | "Attachment1") && c.known.contains(r) {
+                        // Rebinding changes reverse dependencies as well as the frame.
+                        rebound = true;
+                        wake_joints.insert(*r);
+                    }
+                    if *key != "CFrame" {
+                        continue;
+                    }
+                    let Some(indices) = c.deps.get(r) else { continue };
+                    // Moving bodies also publish CFrame marks. Their local attachment
+                    // frames can pick up rounding noise when rebuilt from world poses.
+                    // Only an attachment edit or a fixed support's move wakes the joint.
+                    if doc.class_of(*r).is_some_and(|class| {
+                        doc::is_a(&class, "Attachment")
+                            || doc::is_a(&class, "BasePart") && self.body_of(*r).is_none()
+                    }) {
+                        wake_joints.extend(indices.iter().map(|&i| c.refs[i as usize]));
+                    }
+                }
+                c.sig != sig || new || c.refs != refs || rebound
+            }
             _ => true,
         };
         let mut cache = if full { None } else { self.sj_cache.take() };
@@ -595,19 +637,57 @@ impl Physics {
                 c
             }
         };
+        // Seated characters on dynamic seats: a rigid 6-DOF weld between the seat
+        // assembly and the character body (matching Studio's merged assembly).
+        let seat_welds: Vec<(Ref, solver_joints::Desc)> = self
+            .hums
+            .by_model
+            .iter()
+            .filter_map(|(&model, hb)| {
+                let Some((seat_part, Some(_))) = hb.seat else { return None };
+                let sb = self.body_of(seat_part)?;
+                if !self.world.bodies.get(sb).is_some_and(|b| b.is_dynamic()) {
+                    return None;
+                }
+                let t = hb.seat_local.translation;
+                let q = hb.seat_local.rotation;
+                let a = solver_joints::End {
+                    body: Some(sb),
+                    pos: Vec3::new(t.x, t.y, t.z),
+                    rot: Mat3::from_quat(Quat::from_xyzw(q.x, q.y, q.z, q.w)),
+                    mass: 0.0,
+                };
+                let b = solver_joints::End {
+                    body: Some(hb.body),
+                    pos: Vec3::ZERO,
+                    rot: Mat3::IDENTITY,
+                    mass: 0.0,
+                };
+                Some((model, solver_joints::Desc { class: SClass::Fixed, a, b, in_world: true }))
+            })
+            .collect();
         let Some(sv) = self.studio.as_mut() else { return };
         sv.joints.begin_sync();
         let changed: HashSet<usize> = if full { (0..c.refs.len()).collect() } else { dirty.iter().copied().collect() };
         for (i, (r, d)) in c.refs.iter().zip(&c.descs).enumerate() {
             let Some(d) = d else { continue };
             if changed.contains(&i) {
-                sv.joints.upsert(*r, d);
+                for body in sv.joints.upsert(*r, d, wake_joints.contains(r)).into_iter().flatten() {
+                    sv.property_wake(body);
+                }
             } else {
                 sv.joints.keep(*r);
             }
         }
         for (r, d) in &self.hums.foreign_descs {
-            sv.joints.upsert(*r, d);
+            for body in sv.joints.upsert(*r, d, true).into_iter().flatten() {
+                sv.property_wake(body);
+            }
+        }
+        for (r, d) in &seat_welds {
+            for body in sv.joints.upsert(*r, d, true).into_iter().flatten() {
+                sv.property_wake(body);
+            }
         }
         sv.joints.end_sync();
         c.sig = sig;
@@ -1038,6 +1118,40 @@ mod tests {
         let b = pos(&doc, bob);
         assert!(b.x.abs() < 0.05 && b.z.abs() < 0.05, "stays on the axis: {b:?}");
         assert!((b.y - 296.0).abs() < 0.2, "rests on the 4-stud limit: {b:?}");
+    }
+
+    #[test]
+    fn moving_replacement_attachment_updates_the_hinge_frame() {
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let start = Vec3::new(0.0, 300.0, 0.0);
+        let top = doc.dom.insert(ws, part("Top", start, true));
+        let bob = doc.dom.insert(ws, part("Bob", start, false).with_property("CanCollide", false));
+        let initial = doc.dom.insert(top, InstanceBuilder::new("Attachment"));
+        let replacement = doc.dom.insert(top, InstanceBuilder::new("Attachment"));
+        let driven = doc.dom.insert(bob, InstanceBuilder::new("Attachment"));
+        let hinge = doc.dom.insert(top, InstanceBuilder::new("HingeConstraint")
+            .with_property("Attachment0", initial)
+            .with_property("Attachment1", driven));
+        let mut physics = Physics::new(&mut doc);
+        let mut step = |doc: &mut Document| {
+            physics.sync(doc);
+            physics.step(doc, 1.0 / 60.0);
+        };
+        for _ in 0..30 {
+            step(&mut doc);
+        }
+        doc.set_prop_live(hinge, "Attachment0".into(), replacement.into());
+        for _ in 0..30 {
+            step(&mut doc);
+        }
+        let moved = CFrame::new(Vector3::new(2.0, 0.0, 0.0), CFrame::identity().orientation);
+        doc.set_prop_live(replacement, "CFrame".into(), moved.into());
+        for _ in 0..60 {
+            step(&mut doc);
+        }
+        let actual = pos(&doc, bob).x;
+        assert!((actual - 2.0).abs() < 0.05, "replacement hinge endpoint moved to x=2, bob x={actual}");
     }
 
     #[test]

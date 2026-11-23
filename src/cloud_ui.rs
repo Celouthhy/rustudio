@@ -795,6 +795,18 @@ impl Editor {
         };
         match Document::from_place_bytes(&bytes, title) {
             Ok(mut d) => {
+                let root = d.dom.root_ref();
+                if let Some(i) = d.dom.get_by_ref_mut(root) {
+                    use rbx_dom_weak::{types::{Enum, Variant}, ustr};
+                    i.properties.insert(ustr("PlaceId"), Variant::Int64(origin.place_id as i64));
+                    i.properties.insert(ustr("GameId"), Variant::Int64(origin.universe_id as i64));
+                    i.properties.insert(ustr("CreatorId"), Variant::Int64(origin.creator_id as i64));
+                    i.properties.insert(
+                        ustr("CreatorType"),
+                        Variant::Enum(Enum::from_u32(origin.creator_type.enum_value())),
+                    );
+                    i.properties.insert(ustr("PlaceVersion"), Variant::Int32(origin.version as i32));
+                }
                 d.cloud = Some(origin.clone());
                 let n = d.dom.descendants().count();
                 self.set_document(d);

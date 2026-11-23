@@ -21,8 +21,17 @@ use super::*;
 use rustudio_core::api::Kind;
 use rustudio_core::api_stubs::{Stub, STUBS};
 
-/// Callbacks with real behaviour (BindableFunction / RemoteFunction invokes).
-pub const REAL_CALLBACKS: &[&str] = &["OnInvoke", "OnServerInvoke", "OnClientInvoke"];
+/// Callbacks with real behaviour (BindableFunction / RemoteFunction / TextChatService).
+pub const REAL_CALLBACKS: &[&str] = &[
+    "OnInvoke",
+    "OnServerInvoke",
+    "OnClientInvoke",
+    "ProcessReceipt",
+    "OnIncomingMessage",
+    "ShouldDeliverCallback",
+    "OnBubbleAdded",
+    "OnChatWindowAdded",
+];
 
 fn table() -> &'static HashMap<String, &'static Stub> {
     static T: OnceLock<HashMap<String, &'static Stub>> = OnceLock::new();

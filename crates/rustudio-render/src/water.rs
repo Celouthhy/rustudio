@@ -142,7 +142,7 @@ impl WaterPass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("water"),

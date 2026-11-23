@@ -360,6 +360,8 @@ pub struct Media {
     carry: f64,
     actions: Vec<Action>,
     next_action: i64,
+    /// Last SoundId seen for each Sound, including failed and empty ids.
+    sound_assets: HashMap<Ref, String>,
     /// Sounds whose SoundId is loading for Sound.Loaded / TimeLength.
     sound_loads: HashMap<Ref, (String, Option<Load>)>,
     pub misc: misc::MiscState,
@@ -383,6 +385,7 @@ impl Default for Media {
             carry: 0.0,
             actions: Vec::new(),
             next_action: 1,
+            sound_assets: HashMap::new(),
             sound_loads: HashMap::new(),
             misc: Default::default(),
         }
@@ -670,16 +673,7 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             Some(Value::Boolean(w.input.sound_playing.contains(&r)))
         }
         ("Sound", "PlaybackLoudness") => Some(Value::Number(sound_loudness(lua, r)?)),
-        ("Sound", "TimeLength") => {
-            let known = world(lua)?.input.sound_len.get(&r).copied();
-            match known {
-                Some(l) => Some(Value::Number(l)),
-                None => {
-                    let id = pstr(world(lua)?.d(), r, "SoundId");
-                    Some(Value::Number(pcm_cached(&id).map_or(0.0, |p| p.len_secs())))
-                }
-            }
-        }
+        ("Sound", "TimeLength") => Some(Value::Number(sound_length(lua, r)?.unwrap_or(0.0))),
         ("AudioSearchParams", "MaxPageSize") => {
             let w = world(lua)?;
             Some(Value::Integer(match w.d().prop(r, "MaxPageSize") {
@@ -776,7 +770,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             store_prop(lua, r, "RollOffMaxDistance", Variant::Float32(n as f32))?;
             Ok(true)
         }
-        ("Sound", "SoundId") => {
+        ("Sound", "SoundId" | "AudioContent") => {
             let Some((canon, rbx_reflection::DataType::Value(ty), _)) = prop_desc(class, key) else {
                 return Ok(false);
             };
@@ -784,22 +778,25 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
             let new = lua_to_variant(key, value, ty, None, old.as_ref())?;
             if old.as_ref() != Some(&new) {
                 store_prop(lua, r, canon, new)?;
-                world(lua)?.input.sound_len.remove(&r);
-                media(lua)?.sound_loads.remove(&r);
-                let id = pstr(world(lua)?.d(), r, canon);
-                if !id.trim().is_empty() {
-                    // Studio loads its built-in content and resident assets
-                    // during assignment. Uncached remote audio is completed
-                    // from the regular media step.
-                    let got = if id.starts_with("rbxasset://") {
-                        start_load(&id, true)
-                    } else if let Some(pcm) = pcm_cached(&id) {
-                        Got::Ready(pcm)
+                let (edit, inside, id) = {
+                    let w = world(lua)?;
+                    let a = pstr(w.d(), r, canon);
+                    let id = if a.is_empty() {
+                        pstr(w.d(), r, if canon == "SoundId" { "AudioContent" } else { "SoundId" })
                     } else {
-                        media(lua)?.sound_loads.insert(r, (id, None));
-                        return Ok(true);
+                        a
                     };
-                    finish_sound_load(lua, r, id, got)?;
+                    (w.mode == RunMode::Edit, in_dm(w.d(), r), id)
+                };
+                if edit && !inside {
+                    clear_sound_asset(lua, r)?;
+                } else {
+                    let got = if id.starts_with("rbxasset://") {
+                        Some(start_load(&id, true))
+                    } else {
+                        pcm_cached(&id).map(Got::Ready)
+                    };
+                    update_sound_asset(lua, r, id, got)?;
                 }
             }
             Ok(true)
@@ -813,7 +810,7 @@ pub fn write_acts(class: &str, key: &str) -> bool {
         (class, key),
         ("Wire", "SourceInstance" | "TargetInstance" | "SourceName" | "TargetName")
             | ("AudioPlayer", "Asset" | "AudioContent" | "IsPlaying" | "TimePosition")
-            | ("Sound", "SoundId" | "MaxDistance")
+            | ("Sound", "SoundId" | "AudioContent" | "MaxDistance")
     ) || CLAMPS.iter().any(|(c, p, _, _)| *c == class && *p == key)
         || misc::write_acts(class, key)
 }
@@ -1112,6 +1109,17 @@ fn refresh(lua: &Lua, force: bool) -> mlua::Result<()> {
         }
         (wires, nodes)
     };
+    {
+        let w = world(lua)?;
+        let d = w.d();
+        media(lua)?.sound_assets.retain(|r, _| d.exists(*r));
+    }
+    for (r, class) in &nodes {
+        if class == "Sound" && in_dm(world(lua)?.d(), *r) {
+            let id = pstr(world(lua)?.d(), *r, "SoundId");
+            update_sound_asset(lua, *r, id, None)?;
+        }
+    }
     let fresh: Vec<Ref> = {
         let mut m = media(lua)?;
         m.index = Some(index);
@@ -1644,6 +1652,9 @@ fn interacting(lua: &Lua, this: Ref, emitter: bool) -> mlua::Result<MultiValue> 
 fn get_spectrum(lua: &Lua, r: Ref) -> mlua::Result<MultiValue> {
     let (enabled, win) = {
         let w = world(lua)?;
+        if w.side == Side::Server {
+            return Ok(one(Value::Table(lua.create_table()?)));
+        }
         (pb(w.d(), r, "SpectrumEnabled", true), dsp::window_samples(pe(w.d(), r, "WindowSize", 1)))
     };
     let spec = {
@@ -1721,15 +1732,32 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     if lua.app_data_ref::<Media>().is_none() {
         return Ok(());
     }
-    // Scripts' own wires / players register as they're touched; a full scan
-    // (files, Clone, replication) runs 4× a second.
-    let due = {
-        let now = world(lua)?.time;
-        now - media(lua)?.scanned_at >= 0.25
-    };
-    if due {
-        let _scope = rustudio_core::bench::scope("media_refresh");
-        refresh(lua, true)?;
+    let edit = world(lua)?.mode == RunMode::Edit;
+    if edit {
+        // Edit mode does not play place audio or eagerly decode every Sound
+        // in the place; only step explicit plugin-created audio objects.
+        let idle = {
+            let m = media(lua)?;
+            m.actions.is_empty()
+                && m.wire_order.is_empty()
+                && m.players.is_empty()
+                && m.sound_loads.is_empty()
+                && m.nodes.is_empty()
+        };
+        if idle {
+            return Ok(());
+        }
+    } else {
+        // Scripts' own wires / players register as they're touched; a full scan
+        // (files, Clone, replication) runs 4× a second.
+        let due = {
+            let now = world(lua)?.time;
+            now - media(lua)?.scanned_at >= 0.25
+        };
+        if due {
+            let _scope = rustudio_core::bench::scope("media_refresh");
+            refresh(lua, true)?;
+        }
     }
     // Scheduled Play / Stop (atTime on the mixer clock).
     let due: Vec<Action> = {
@@ -1831,6 +1859,74 @@ pub fn sound_length(lua: &Lua, r: Ref) -> mlua::Result<Option<f64>> {
     Ok(world(lua)?.input.sound_len.get(&r).copied())
 }
 
+/// Register a single `Sound` with media on demand (used in `RunMode::Edit`
+/// when a Sound is created, reparented, edited, or played, so Edit mode loads
+/// only touched Sounds without scanning the whole place).
+pub fn touch_sound(lua: &Lua, r: Ref) -> mlua::Result<()> {
+    if lua.app_data_ref::<Media>().is_none() {
+        return Ok(());
+    }
+    let (inside, id) = {
+        let w = world(lua)?;
+        let d = w.d();
+        if d.class_of(r).as_deref() != Some("Sound") {
+            return Ok(());
+        }
+        let sid = pstr(d, r, "SoundId");
+        let id = if sid.is_empty() { pstr(d, r, "AudioContent") } else { sid };
+        (in_dm(d, r), id)
+    };
+    if !inside {
+        return clear_sound_asset(lua, r);
+    }
+    let already_loaded = {
+        let m = media(lua)?;
+        m.sound_assets.get(&r) == Some(&id)
+            && (world(lua)?.input.sound_len.contains_key(&r) || m.sound_loads.contains_key(&r))
+    };
+    if already_loaded {
+        return Ok(());
+    }
+    let got = if id.trim().is_empty() {
+        None
+    } else if id.starts_with("rbxasset://") {
+        Some(start_load(&id, true))
+    } else {
+        pcm_cached(&id).map(Got::Ready)
+    };
+    update_sound_asset(lua, r, id, got)
+}
+
+/// Drops media's loaded state for an unparented or removed `Sound`.
+pub fn clear_sound_asset(lua: &Lua, r: Ref) -> mlua::Result<()> {
+    if let Some(mut m) = lua.app_data_mut::<Media>() {
+        m.sound_assets.remove(&r);
+        m.sound_loads.remove(&r);
+    }
+    world(lua)?.input.sound_len.remove(&r);
+    Ok(())
+}
+
+fn update_sound_asset(lua: &Lua, r: Ref, id: String, got: Option<Got>) -> mlua::Result<()> {
+    {
+        let mut m = media(lua)?;
+        if m.sound_assets.get(&r) == Some(&id) {
+            return Ok(());
+        }
+        m.sound_assets.insert(r, id.clone());
+        m.sound_loads.remove(&r);
+    }
+    world(lua)?.input.sound_len.remove(&r);
+    if !id.trim().is_empty() {
+        if let Some(got) = got {
+            finish_sound_load(lua, r, id, got)?;
+        } else {
+            media(lua)?.sound_loads.insert(r, (id, None));
+        }
+    }
+    Ok(())
+}
+
 fn sound_loads(lua: &Lua) -> mlua::Result<()> {
     let items: Vec<(Ref, String, Option<Load>)> = {
         let mut m = media(lua)?;
@@ -1885,7 +1981,7 @@ fn advance_players(lua: &Lua, dt: f64) -> mlua::Result<()> {
             let play = region(d, r, len);
             if p.reset_next {
                 p.reset_next = false;
-                p.pos = play.0;
+                p.pos = 0.0;
             }
             if !p.playing || p.pcm.is_none() || !in_dm(d, r) {
                 continue;
@@ -1939,9 +2035,10 @@ struct Ctx<'a> {
 /// sum (silence when nothing plays) goes to the device minus the first `drop`
 /// frames (time it already played as silence, see audio::graph_demand).
 fn render(lua: &Lua, nodes: &[(Ref, String)], n: usize, drop: usize, device: bool) -> mlua::Result<()> {
+    let client = world(lua)?.side == Side::Client;
     let sinks: Vec<(Ref, String)> = nodes
         .iter()
-        .filter(|(_, c)| matches!(c.as_str(), "AudioAnalyzer" | "AudioDeviceOutput"))
+        .filter(|(_, c)| c == "AudioDeviceOutput" || (client && c == "AudioAnalyzer"))
         .cloned()
         .collect();
     if sinks.is_empty() {
@@ -2325,6 +2422,24 @@ mod asset_tests {
         rt.leave().output.iter().map(|(_, t)| t.split("  —").next().unwrap_or("").to_string()).collect()
     }
 
+    #[test]
+    fn api_tail_legacy_sound_methods() {
+        run(r#"
+            local s = Instance.new("Sound")
+            assert(s.play ~= s.Play and s.stop ~= s.Stop)
+            assert(s.pause ~= s.Pause and s.resume ~= s.Resume)
+            s:play()
+            assert(s.Playing)
+            s:pause()
+            assert(not s.Playing)
+            s:resume()
+            assert(s.Playing)
+            s:stop()
+            assert(not s.Playing)
+            assert(not pcall(s.play, workspace))
+        "#);
+    }
+
     /// playSoundFromSource (Laser Tag): Clone a template, parent it to a bus,
     /// wire it, Play, Ended:Once(Destroy). Studio: the unparented clone
     /// isn't loaded (IsReady false, TimeLength 0), it loads and plays once
@@ -2383,5 +2498,84 @@ mod asset_tests {
         assert!(out.iter().any(|l| l == "a rbxassetid://17682716783"), "{out:?}");
         assert!(out.iter().any(|l| l == "b rbxassetid://17686647820 rbxassetid://17686647820"), "{out:?}");
         assert!(out.iter().any(|l| l == "c true"), "{out:?}");
+    }
+
+    #[test]
+    fn edit_mode_loads_touched_sounds_and_allows_play_local_sound_without_place_scan() {
+        let id = "rbxassetid://9900012099";
+        let bulk = "rbxassetid://9900012098";
+        super::pcm_store(id, std::sync::Arc::new(crate::audio::Pcm { rate: 48000, chans: vec![vec![0.25; 16300]; 2] }));
+        super::pcm_store(bulk, std::sync::Arc::new(crate::audio::Pcm { rate: 48000, chans: vec![vec![0.1; 48000]; 2] }));
+
+        let mut doc = Document::new_place();
+        let ws = doc.workspace().unwrap();
+        let pre = doc.dom.insert(
+            ws,
+            rbx_dom_weak::InstanceBuilder::new("Sound")
+                .with_name("PreExisting")
+                .with_property("SoundId", rbx_dom_weak::types::Variant::ContentId(bulk.into())),
+        );
+
+        let rt = Runtime::new().unwrap();
+        let w = World::new(doc, RunMode::Edit);
+        rt.enter(w);
+        rt.bind_globals().unwrap();
+        rt.step(1.0 / 60.0);
+        // Place-wide scan must stay skipped in Edit mode: pre-existing untouched sound is not loaded.
+        assert!(!crate::runtime::world(&rt.lua).unwrap().input.sound_len.contains_key(&pre));
+
+        rt.lua
+            .load(
+                r#"
+                local SS = game:GetService("SoundService")
+                local s = Instance.new("Sound")
+                s.SoundId = "rbxassetid://9900012099"
+                assert(not s.IsLoaded and s.TimeLength == 0, "unparented sound must stay unloaded in Edit")
+                s.Parent = workspace
+                assert(s.IsLoaded and math.abs(s.TimeLength - (16300 / 48000)) < 1e-4, "parented sound must load in Edit")
+                local ok, err = pcall(function() SS:PlayLocalSound(s) end)
+                assert(ok, "PlayLocalSound must work in Edit: " .. tostring(err))
+                assert(not s.Playing and not s.IsPlaying)
+                s.Parent = nil
+                assert(not s.IsLoaded and s.TimeLength == 0, "unparented sound must unload in Edit")
+                -- Studio 0.748 Edit semantics: Play/Pause/Resume/Stop/Playing update flags and fire
+                -- events without starting audible playback or advancing TimePosition.
+                local pre = workspace:FindFirstChild("PreExisting")
+                assert(not pre.IsLoaded)
+                local evs = {}
+                for _, name in { "Played", "Paused", "Resumed", "Stopped", "Ended", "DidLoop" } do
+                    pre[name]:Connect(function() table.insert(evs, name) end)
+                end
+                pre.TimePosition = 0.25
+                pre:Play()
+                assert(pre.IsLoaded and math.abs(pre.TimeLength - 1.0) < 1e-4)
+                assert(pre.Playing and pre.IsPlaying and not pre.IsPaused and math.abs(pre.TimePosition - 0.25) < 1e-6)
+                pre:Pause()
+                assert(not pre.Playing and not pre.IsPlaying and pre.IsPaused and math.abs(pre.TimePosition - 0.25) < 1e-6)
+                pre:Resume()
+                assert(pre.Playing and pre.IsPlaying and not pre.IsPaused and math.abs(pre.TimePosition - 0.25) < 1e-6)
+                pre:Stop()
+                assert(not pre.Playing and not pre.IsPlaying and pre.IsPaused and pre.TimePosition == 0)
+                pre.TimePosition = 0.15
+                pre.Playing = true
+                assert(pre.Playing and pre.IsPlaying and not pre.IsPaused and math.abs(pre.TimePosition - 0.15) < 1e-6)
+                pre.Playing = false
+                assert(not pre.Playing and not pre.IsPlaying and pre.IsPaused and math.abs(pre.TimePosition - 0.15) < 1e-6)
+                assert(table.concat(evs, ",") == "Played,Paused,Resumed,Stopped", "unexpected events: " .. table.concat(evs, ","))
+                "#,
+            )
+            .set_name("=edit_sound_test")
+            .exec()
+            .unwrap();
+        rt.step(1.0 / 60.0);
+        let w = rt.leave();
+        assert!(
+            w.requests.sounds.iter().any(|(_, c)| *c == crate::runtime::ext::SoundCmd::PlayLocal),
+            "PlayLocalSound should queue a PlayLocal request"
+        );
+        assert!(
+            !w.requests.sounds.iter().any(|(r, c)| *r == pre && *c != crate::runtime::ext::SoundCmd::PlayLocal),
+            "Play/Pause/Resume/Stop in Edit must not queue audible playback"
+        );
     }
 }

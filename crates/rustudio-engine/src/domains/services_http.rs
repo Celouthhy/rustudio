@@ -106,6 +106,55 @@ pub fn start(req: Request) -> u64 {
     id
 }
 
+/// Starts an internal Studio/CoreScript HTTP request (`HttpService:RequestInternal`,
+/// `HttpRbxApiService`). Uses the signed-in Roblox session (cookie + CSRF) for
+/// `*.roblox.com` URLs when signed in, falling back to unauthenticated HTTP.
+pub fn start_internal(req: Request) -> u64 {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::thread::Builder::new()
+        .name("rustudio-http-internal".into())
+        .spawn(move || {
+            let r = {
+                let _p = rustudio_core::profiler::scope("http_internal", rustudio_core::profiler::Cat::Network);
+                run_internal(req)
+            };
+            done().lock().unwrap().insert(id, r);
+        })
+        .ok();
+    id
+}
+
+fn run_internal(req: Request) -> Result<Response, String> {
+    let dbg = std::env::var_os("RUSTUDIO_HTTP_DEBUG").is_some();
+    let method = req.method.clone();
+    let url = req.url.clone();
+    let res = if is_roblox_domain(&req.url) {
+        let _ = rustudio_core::assets::wait_for_session(Duration::from_secs(10));
+        let session = rustudio_core::assets::session_client()
+            .and_then(|c| c.lock().ok().and_then(|g| g.as_ref().map(|c| c.session.downloader())));
+        if let Some(s) = session {
+            let (status, status_message, headers, body) = s
+                .raw_request(&req.method, &req.url, &req.headers, req.body.as_deref())
+                .map_err(|e| format!("HttpError: ConnectFail ({e})"))?;
+            Ok(Response { status, status_message, headers, body })
+        } else {
+            run(req)
+        }
+    } else {
+        run(req)
+    };
+    if dbg {
+        match &res {
+            Ok(r) => {
+                let preview: String = String::from_utf8_lossy(&r.body).chars().take(180).collect();
+                eprintln!("[HTTP-INT] {method} {url} -> {} ({}B) {}", r.status, r.body.len(), preview);
+            }
+            Err(e) => eprintln!("[HTTP-INT] {method} {url} -> ERR {e}"),
+        }
+    }
+    res
+}
+
 pub fn poll(id: u64) -> Option<Result<Response, String>> {
     done().lock().unwrap().remove(&id)
 }

@@ -99,6 +99,8 @@ pub enum Class {
     BodyPosition { position: Vec3, max_force: Vec3, p: f32, d: f32 },
     /// BodyGyro ([J3] I.15): slot 78 Studio → ConstraintBodyAngularVelocity (D3.17, legacy).
     BodyGyro { cframe: Mat3, max_torque: Vec3, p: f32, d: f32 },
+    /// Rigid 6-DOF weld between two dynamic bodies (e.g. a seated character welded to a vehicle).
+    Fixed,
 }
 
 impl Class {
@@ -127,6 +129,7 @@ impl Class {
             Class::BodyAngularVelocity { .. } => 22,
             Class::BodyPosition { .. } => 23,
             Class::BodyGyro { .. } => 24,
+            Class::Fixed => 25,
         }
     }
 }
@@ -345,6 +348,7 @@ impl Inst {
                 Conn::new(Kind::DoubleLinVel(d::DoubleLinVel::new()), key(next)),
                 Conn::new(Kind::TripleLinVel(d::TripleLinVel { basis: Mat3::IDENTITY, p_a: Vec3::ZERO, p_b: Vec3::ZERO, max_force: Vec3::ZERO, target: Vec3::ZERO, frame: 2, bits: 0 }), key(next)),
             ],
+            Class::Fixed => vec![bis(next), orient(next)],
             _ => Vec::new(),
         };
         let mut inst = Inst { class: desc.class_id(), a: desc.a, b: desc.b, conns, active: 0, in_world: false, force: None, seen: true, spring_pick: None, props: None };
@@ -980,6 +984,20 @@ impl Inst {
             }
             Class::LegacyMover => {
                 crate::todo_spec!("JOINT Open 6: legacy body movers' parameter updates (slot 82s) and force functions (vt slot 78) — no rows, no force");
+            }
+            Class::Fixed => {
+                if let Kind::BallInSocket { p_a, p_b, .. } = &mut self.conns[0].kind {
+                    *p_a = a.pos;
+                    *p_b = b.pos;
+                }
+                if let Kind::Orient(o) = &mut self.conns[1].kind {
+                    o.servo = false;
+                    o.a1 = a.x();
+                    o.a2 = a.y();
+                    o.b1 = b.x();
+                    o.b2 = b.y();
+                }
+                active = 0b11;
             }
         }
         // the mode setters' conn (RigidityEnabled → servo flags, [J2])

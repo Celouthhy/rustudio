@@ -24,6 +24,8 @@ pub struct Game {
     pub account: crate::account::Account,
     /// The running Play / Run session, if any.
     pub play: Option<crate::play::PlaySession>,
+    /// Edit-mode on-demand Sound loading and preview playback.
+    pub edit_audio: crate::edit_audio::EditAudio,
     pub(crate) play_thread: Option<crate::play_worker::ThreadedPlay>,
     /// A play-testing teleport's destination, loading (play_teleport.rs).
     pub(crate) teleport_job: Option<crate::play_teleport::TeleportJob>,
@@ -141,6 +143,9 @@ impl Game {
             // before automatic_quality below takes its first level.
             let caps = rustudio_render::gpu_caps::GpuCaps::of_adapter(&rs.adapter, &rs.device);
             rustudio_core::rustudio_settings::set_weak_gpu(rustudio_render::gpu_caps::decide_lowend(&caps));
+            // The driver's pipeline cache from the last run, before the
+            // first pipelines are made (pipeline_cache.rs).
+            rustudio_render::pipeline_cache::init(&rs.device, &rs.adapter.get_info(), rustudio_core::assets::cache_dir());
             Renderer::with_caps(&rs.device, &rs.queue, &caps)
         });
         Self {
@@ -157,6 +162,7 @@ impl Game {
             log: Vec::new(),
             account: crate::account::Account::new(),
             play: None,
+            edit_audio: Default::default(),
             play_thread: None,
             teleport_job: None,
             teleport_to: None,
@@ -279,6 +285,7 @@ impl Game {
     /// menu, and no editor shortcut (F5, Shift+F5, F8) comes first.
     pub fn game_keys(&mut self, ctx: &egui::Context, no_ui: bool) {
         if self.play_game_input() {
+            let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
             let esc = ctx.input(|i| {
                 i.events.iter().any(|e| {
                     matches!(
@@ -287,13 +294,17 @@ impl Game {
                     )
                 })
             });
-            if esc {
+            // When a TextBox is focused, Escape blurs the TextBox instead of
+            // toggling the Roblox in-game menu.
+            let textbox_focused = self.gui.focus.is_some();
+            if esc && !core_scripts && !textbox_focused {
                 self.toggle_game_menu();
             }
             // Presses this frame: a tap pressed and released within one frame
             // never shows in keys_down, yet scripts must see it. The key
             // positions are physical, like Roblox's KeyCodes (src/keys.rs).
-            // (Escape belongs to the Roblox menu: games never hear it.)
+            // (When CoreScripts run and no TextBox is focused, Escape goes to
+            // the client runtime so SettingsHub's ContextActionService handles it.)
             let taps: Vec<Key> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -304,7 +315,7 @@ impl Game {
                             pressed: true,
                             repeat: false,
                             ..
-                        } if physical_key.unwrap_or(*key) != Key::Escape => {
+                        } if (core_scripts && !textbox_focused) || physical_key.unwrap_or(*key) != Key::Escape => {
                             Some(physical_key.unwrap_or(*key))
                         }
                         _ => None,
@@ -312,11 +323,11 @@ impl Game {
                     .collect()
             });
             // The open menu takes the keys (R, L); the game hears none.
-            if !self.game_menu_keys(&taps) {
+            if core_scripts || !self.game_menu_keys(&taps) {
                 // (A focused TextBox has them: game-processed, Enter included.)
                 let processed = self.gui.focus.is_some();
                 if let Some(s) = self.play.as_mut() {
-                    if !processed {
+                    if !processed && !core_scripts {
                         s.game.hotbar_taps.extend(taps.iter().copied());
                     }
                     s.game.key_taps.extend(taps.into_iter().map(|k| (k, processed)));
@@ -324,7 +335,7 @@ impl Game {
             }
             // No UI: the menu has Escape first, and UserInputService hears it
             // too, as processed (play_tick lets it past the open menu).
-            if esc && no_ui {
+            if esc && no_ui && !core_scripts {
                 if let Some(s) = self.play.as_mut() {
                     s.game.key_taps.push((Key::Escape, true));
                 }

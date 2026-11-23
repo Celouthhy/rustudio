@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use egui::{Color32, Pos2, Rect, Stroke};
+use egui::{Color32, Rect, Stroke};
 
 use super::*;
 use rustudio_engine::audio::Audio;
@@ -112,10 +112,14 @@ pub struct GameState {
     pub states_off: HashSet<String>,
     audio: Option<Audio>,
     tracks: HashMap<u64, Track>,
+    removed_sounds: Vec<rustudio_engine::audio_scene::RemovedSound>,
     /// SoundService:PlayLocalSound calls so far (keys their copies).
     local_plays: u64,
     pub flashes: Vec<Flash>,
     pub chat_open: bool,
+    /// True once Roblox's real CoreScripts started in this Play session
+    /// (suppresses rustudio's native fallback HUD / Escape menu / hotbar).
+    pub core_scripts_active: bool,
     /// Frames the playtest view had chat available but closed: where the
     /// old "Press / to chat" hint was drawn (the self-test checks none is).
     pub chat_ready_frames: u64,
@@ -191,6 +195,16 @@ pub fn mouse_input_object(
     began: bool,
     at: Option<(f32, f32)>,
 ) -> mlua::Result<Value> {
+    mouse_input_object_for_event(lua, None, button, began, at)
+}
+
+fn mouse_input_object_for_event(
+    lua: &mlua::Lua,
+    event_name: Option<&str>,
+    button: u8,
+    began: bool,
+    at: Option<(f32, f32)>,
+) -> mlua::Result<Value> {
     let t = lua.create_table()?;
     let kind = match button {
         1 => "MouseButton1",
@@ -199,19 +213,17 @@ pub fn mouse_input_object(
         3 | 4 => "MouseWheel",
         _ => "MouseMovement",
     };
+    let state = match event_name {
+        Some("InputBegan") => "Begin",
+        Some("InputEnded") => "End",
+        Some("InputChanged") => "Change",
+        _ if matches!(button, 0 | 3 | 4) => "Change",
+        _ if began => "Begin",
+        _ => "End",
+    };
     for (prop, en, item) in [
         ("UserInputType", "UserInputType", kind),
-        (
-            "UserInputState",
-            "UserInputState",
-            if matches!(button, 0 | 3 | 4) {
-                "Change"
-            } else if began {
-                "Begin"
-            } else {
-                "End"
-            },
-        ),
+        ("UserInputState", "UserInputState", state),
         ("KeyCode", "KeyCode", "Unknown"),
     ] {
         if let Some(k) = LEnumItem::from_name(en, item) {
@@ -273,7 +285,7 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                             began,
                             x,
                             y,
-                        } => mouse_input_object(lua, *button, *began, Some((*x, *y))).ok(),
+                        } => mouse_input_object_for_event(lua, Some(name), *button, *began, Some((*x, *y))).ok(),
                     })
                     .collect();
                 rt.fire(r, name, vals);
@@ -299,6 +311,16 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                     rt.set(r, "Text", Value::String(s));
                 }
             }
+            GuiEvent::TextBoxUpdate {
+                r,
+                text,
+                cursor,
+                selection,
+            } => {
+                rustudio_engine::runtime::domains::gui_input::apply_textbox_edit(
+                    lua, r, text, cursor, selection,
+                );
+            }
             GuiEvent::Select(sel) => {
                 if let Some(gs) = gui_service {
                     rt.set(
@@ -307,6 +329,25 @@ pub fn fire_gui_events(rt: &Runtime, events: Vec<rustudio_engine::gui::GuiEvent>
                         sel.map(|s| rt.inst(s)).unwrap_or(Value::Nil),
                     );
                 }
+            }
+            GuiEvent::SelectCore(sel) => {
+                if let Some(gs) = gui_service {
+                    let _ = rustudio_engine::runtime::security::with_main_identity(
+                        lua,
+                        rustudio_engine::runtime::security::CORE,
+                        || {
+                            rt.set(
+                                gs,
+                                "SelectedCoreObject",
+                                sel.map(|s| rt.inst(s)).unwrap_or(Value::Nil),
+                            );
+                            Ok::<(), mlua::Error>(())
+                        },
+                    );
+                }
+            }
+            GuiEvent::GuiStateChanged(r) => {
+                rustudio_engine::runtime::domains::gui_input::check_gui_state(lua, r);
             }
             GuiEvent::Scroll(r, d) => scroll_by(rt, r, d),
         }
@@ -356,10 +397,12 @@ fn scroll_range(rt: &rustudio_engine::runtime::Runtime, r: Ref) -> Option<(glam:
     };
     let laid = w.input.gui_layout.get(&r);
     let size = laid.map(|b| b.size).unwrap_or([0.0, 0.0]);
+    let win = laid.and_then(|b| b.window).unwrap_or(size);
     let cs_prop = match doc.prop(r, "CanvasSize") {
         Some(Variant::UDim2(u)) => Some([u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32]),
         _ => None,
     };
+    let sd = rustudio_render::scene::enum_u32(doc.prop(r, "ScrollingDirection")).unwrap_or(4);
     // The drawn canvas (AutomaticCanvasSize included), redone with the
     // current CanvasSize when the layout recorded how.
     let cs = match (laid.and_then(|b| cs_prop.and_then(|c| b.canvas_for(c))), laid.and_then(|b| b.canvas), cs_prop) {
@@ -368,7 +411,9 @@ fn scroll_range(rt: &rustudio_engine::runtime::Runtime, r: Ref) -> Option<(glam:
         (None, None, Some(u)) => [u[0] * size[0] + u[1], u[2] * size[1] + u[3]],
         _ => size,
     };
-    Some((cp, glam::Vec2::new((cs[0] - size[0]).max(0.0), (cs[1] - size[1]).max(0.0))))
+    let max_x = if sd == 2 { 0.0 } else { (cs[0] - win[0]).max(0.0) };
+    let max_y = if sd == 1 { 0.0 } else { (cs[1] - win[1]).max(0.0) };
+    Some((cp, glam::Vec2::new(max_x, max_y)))
 }
 
 /// The wheel over a ScrollingFrame: its target moves by the notches
@@ -510,9 +555,20 @@ return ChatService
 
 impl Game {
     /// Adds ServerScriptService.ChatServiceRunner (with a ChatService module)
-    /// when the place has none, so WaitForChild("ChatServiceRunner") returns.
+    /// and Chat.ChatModules when the place has none, so WaitForChild calls on
+    /// legacy Chat children return instead of infinitely yielding.
     pub(super) fn add_chat_stub(&mut self) {
         let root = self.doc.dom.root_ref();
+        if let Some(chat) = self.doc.find_child(root, "Chat") {
+            let load_default = !matches!(self.doc.prop(chat, "LoadDefaultChat"), Some(Variant::Bool(false)));
+            if load_default && self.doc.find_named(chat, "ChatModules").is_none() {
+                let m = self
+                    .doc
+                    .dom
+                    .insert(chat, InstanceBuilder::new("Folder").with_name("ChatModules"));
+                self.doc.mark_tree(m);
+            }
+        }
         let Some(sss) = self.doc.find_child(root, "ServerScriptService") else {
             return;
         };
@@ -550,8 +606,12 @@ impl Game {
             _ => 0,
         };
         for m in out {
-            let Some(server_ch) = self.server_of(m.channel) else {
-                continue;
+            let server_ch = match m.channel {
+                Some(c) => match self.server_of(c) {
+                    Some(sc) => Some(sc),
+                    None => continue,
+                },
+                None => None,
             };
             let to = self
                 .with_side(Side::Server, |rt, _, _| {
@@ -561,9 +621,10 @@ impl Game {
                 })
                 .unwrap_or_default();
             if to.contains(&uid) {
-                if let Some(ch) = self.client_of(server_ch) {
+                let client_ch = server_ch.and_then(|sc| self.client_of(sc));
+                if m.kind == "legacy" || client_ch.is_some() {
                     self.with_side(Side::Client, |rt, _, _| {
-                        pc::client_receive(&rt.lua, ch, uid, &m);
+                        pc::client_receive(&rt.lua, client_ch, uid, &m);
                         rt.dispatch();
                     });
                 }
@@ -985,6 +1046,9 @@ impl Game {
                 continue;
             }
             self.sound_command(server, client, cmd);
+        }
+        if let Some(s) = self.play.as_mut() {
+            s.game.removed_sounds.extend(reqs.removed_sounds);
         }
         for (r, t) in reqs.sound_seeks {
             let (server, client) = match side {
@@ -1805,6 +1869,38 @@ impl Game {
         }
     }
 
+    fn play_removed_sounds(&mut self) {
+        let Some(s) = self.play.as_mut() else { return };
+        let removed = std::mem::take(&mut s.game.removed_sounds);
+        for sound in removed {
+            use rustudio_core::assets::Fetch;
+            match self.sound_bytes(&sound.id) {
+                Fetch::Ready(bytes) => {
+                    let Some(s) = self.play.as_mut() else { return };
+                    s.game.local_plays += 1;
+                    let key = sound_key(sound.source)
+                        ^ (s.game.local_plays.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+                    let audio = s.game.audio.get_or_insert_with(Audio::new);
+                    audio.configure(key, sound.groups, sound.settings);
+                    if audio.play(key, bytes, sound.volume, sound.speed, false, sound.position, sound.region).is_ok() {
+                        s.game.tracks.insert(key, Track {
+                            server: None, client: None, pending: None, id: None, detached: true,
+                        });
+                        self.log_audio_start(key, &sound.id);
+                    } else {
+                        audio.stop(key);
+                    }
+                }
+                Fetch::Pending => {
+                    if let Some(s) = self.play.as_mut() {
+                        s.game.removed_sounds.push(sound);
+                    }
+                }
+                Fetch::Unavailable(_) => {}
+            }
+        }
+    }
+
     /// RUSTUDIO_AUDIO_LOG=FILE: one line per Audio::play start (key, sound id,
     /// frame, how many times this key has started), to tell a caller that
     /// re-triggers from a mixer that repeats.
@@ -1880,6 +1976,31 @@ impl Game {
         // (still downloading: the stored TimePosition is where it starts)
         if sought {
             self.reset_sound_doc_time(server, client);
+        }
+    }
+
+    fn fire_sound_event(
+        &mut self,
+        server: Option<Ref>,
+        client: Option<Ref>,
+        event: &str,
+        id: &str,
+        count: Option<u64>,
+    ) {
+        for (side, sound) in [(Side::Server, server), (Side::Client, client)] {
+            if let Some(sound) = sound {
+                self.with_side(side, |rt, _, _| {
+                    if rt.world_mut().is_some_and(|w| w.d().exists(sound)) {
+                        if let Ok(id) = rt.lua.create_string(id) {
+                            let mut args = vec![Value::String(id)];
+                            if let Some(count) = count {
+                                args.push(Value::Number(count as f64));
+                            }
+                            rt.fire(sound, event, args);
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -1960,7 +2081,9 @@ impl Game {
                     .tracks
                     .iter()
                     .filter(|(_, t)| {
-                        !alive(Some(&self.doc), t.server) && !alive(s.other_doc.as_ref(), t.client)
+                        (t.server.is_some() || t.client.is_some())
+                            && !alive(Some(&self.doc), t.server)
+                            && !alive(s.other_doc.as_ref(), t.client)
                     })
                     .map(|(k, _)| *k)
                     .collect()
@@ -1974,6 +2097,8 @@ impl Game {
                 }
             }
         }
+
+        self.play_removed_sounds();
 
         // Sounds still downloading.
         let pending: Vec<u64> = self
@@ -1999,11 +2124,11 @@ impl Game {
             None => (Vec::new(), Vec::new()),
         };
         for k in done {
-            let Some((server, client, detached)) = self
+            let Some((server, client, detached, id)) = self
                 .play
                 .as_ref()
                 .and_then(|s| s.game.tracks.get(&k))
-                .map(|t| (t.server, t.client, t.detached))
+                .map(|t| (t.server, t.client, t.detached, t.id.clone().unwrap_or_default()))
             else {
                 continue;
             };
@@ -2025,29 +2150,19 @@ impl Game {
                 i.properties.insert(ustr("Playing"), Variant::Bool(false));
                 i.properties.insert(ustr("TimePosition"), Variant::Float64(0.0));
             });
-            if let Some(r) = server.filter(|r| self.doc.exists(*r)) {
-                self.with_side(Side::Server, |rt, _, _| rt.fire(r, "Ended", vec![]));
-            }
-            if let Some(c) = client {
-                self.with_side(Side::Client, |rt, _, _| rt.fire(c, "Ended", vec![]));
-            }
+            self.fire_sound_event(server, client, "Ended", &id, None);
         }
-        for k in looped {
-            let Some((server, client)) = self
+        for (k, count) in looped {
+            let Some((server, client, id)) = self
                 .play
                 .as_ref()
                 .and_then(|s| s.game.tracks.get(&k))
                 .filter(|t| !t.detached)
-                .map(|t| (t.server, t.client))
+                .map(|t| (t.server, t.client, t.id.clone().unwrap_or_default()))
             else {
                 continue;
             };
-            if let Some(r) = server {
-                self.with_side(Side::Server, |rt, _, _| rt.fire(r, "DidLoop", vec![]));
-            }
-            if let Some(c) = client {
-                self.with_side(Side::Client, |rt, _, _| rt.fire(c, "DidLoop", vec![]));
-            }
+            self.fire_sound_event(server, client, "DidLoop", &id, Some(count));
         }
         let tracks: Vec<(u64, Option<Ref>, Option<Ref>, bool)> = self
             .play
@@ -2207,10 +2322,16 @@ impl Game {
                 side,
             }
         });
-        let pointer = if threaded { pointer } else { pointer.map(|p| self.resolve_play_pointer(p)) };
+        let core_menu = rustudio_engine::gui::share().core_menu_open;
+        let over_gui = gui_took || self.gui.pointer_over_sink() || core_menu;
+        let pointer = if threaded {
+            pointer
+        } else {
+            pointer.map(|p| if over_gui { p } else { self.resolve_play_pointer(p) })
+        };
         let mut clicks = Vec::new();
         let mut ray_clicks = Vec::new();
-        if let Some(p) = pointer.filter(|_| !gui_took) {
+        if let Some(p) = pointer.filter(|_| !over_gui) {
             for (btn, id) in [(egui::PointerButton::Primary, 1), (egui::PointerButton::Secondary, 2)] {
                 if resp.clicked_by(btn) {
                     if threaded {
@@ -2242,24 +2363,25 @@ impl Game {
                             egui::PointerButton::Secondary => 2,
                             _ => continue,
                         };
-                        // UserInputService hears every click (gameProcessedEvent when the GUI took it).
-                        uis.push((b, *pressed, gui_took));
-                        if !gui_took {
+                        // UserInputService hears every click (gameProcessedEvent when GUI or menu took it).
+                        uis.push((b, *pressed, over_gui));
+                        if !over_gui {
                             buttons.push((b, *pressed));
                         }
                     }
                 }
             });
         }
-        // Number keys pick hotbar slots; "/" opens chat.
+        // Number keys pick hotbar slots; "." toggles the emote wheel.
+        // (Chat focus hotkey is handled natively on the CoreGui TextBox path
+        // by players_chat_ui.luau via UserInputService + KeyboardKeyCode.)
         let mut slots = Vec::new();
-        let mut open_chat = false;
         let taps = self
             .play
             .as_mut()
             .map(|s| std::mem::take(&mut s.game.hotbar_taps))
             .unwrap_or_default();
-        if !ctx.egui_wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() && self.gui.focus.is_none() {
             use egui::Key::*;
             for (n, k) in [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
                 .iter()
@@ -2269,16 +2391,12 @@ impl Game {
                     slots.push(n);
                 }
             }
-            if taps.contains(&Slash) {
-                open_chat = true;
-            }
             // "." opens the emote wheel (Roblox's Emotes menu key).
             if taps.contains(&Period) {
                 crate::emote_wheel::toggle();
             }
         }
-        // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat (Place A's
-        // menu does; Studio shows no chat there).
+        // StarterGui:SetCoreGuiEnabled(Chat, false) hides Roblox's chat.
         let core_gui_on = |name: &str| self.play.as_ref()
             .and_then(|s| s.client.as_ref())
             .and_then(|c| c.world.as_ref())
@@ -2286,19 +2404,20 @@ impl Game {
         let presentation = self.play.as_ref().and_then(|s| s.presentation.as_ref());
         let chat_on = presentation.map_or_else(|| core_gui_on("Chat"), |view| view.chat_on);
         let backpack_on = presentation.map_or_else(|| core_gui_on("Backpack"), |view| view.backpack_on);
-        open_chat &= chat_on;
         if !backpack_on {
             slots.clear();
         }
         // The open menu has the mouse and keys: none of it reaches the game
         // (SettingsHub's Modal shield and RbxSettingsHubStopCharacter).
         let menu = self.play.as_ref().is_some_and(|s| s.game.menu_open);
+        if core_menu {
+            slots.clear();
+        }
         if menu {
             clicks.clear();
             ray_clicks.clear();
             buttons.clear();
             slots.clear();
-            open_chat = false;
             // A button let go while it's open still ends what its press began
             // (UserInputService.InputEnded, gameProcessedEvent true): a camera
             // pan or a held drag can't stay stuck holding the mouse after Resume.
@@ -2349,9 +2468,11 @@ impl Game {
             }
         }
 
-        // Hotbar.
+        let core_scripts = self.play.as_ref().is_some_and(|s| s.game.core_scripts_active);
+
+        // Hotbar (native fallback only when CoreScripts aren't running).
         let info = self.play_hotbar();
-        if backpack_on && !info.is_empty() {
+        if !core_scripts && backpack_on && !info.is_empty() {
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
@@ -2362,93 +2483,40 @@ impl Game {
             }
         }
 
-        // Chat: TextChatService's default chat (window, input bar, bubbles,
-        // drawn as Studio's ExpChat lays them out), else the legacy lines.
-        // Bubbles (Chat:Chat, so Dialog speech too) show either way: Studio's
-        // ExpChat bubble chat runs whatever the place's ChatVersion, and
-        // SetCoreGuiEnabled(Chat, false) hides only the window and bar.
-        // (with_side needs the server's DataModel in front.)
-        let live_view = (!threaded).then(|| self.with_play_side(Side::Client, |rt, _, _| {
-            rustudio_engine::runtime::domains::players_chat::chat_view(&rt.lua)
-        }).flatten()).flatten();
-        let presented_chat = self.play.as_ref().and_then(|s| s.presentation.as_ref())
-            .and_then(|view| view.chat.as_ref());
-        let view = presented_chat.or(live_view.as_ref());
-        let chat_open_now = self.play.as_ref().is_some_and(|s| s.game.chat_open);
-        let input_rect = match view {
-            Some(v) if v.tcs && chat_on => draw_text_chat(&painter, rect, v, chat_open_now, &self.cam),
-            _ => {
-                draw_legacy_chat(self, &painter, rect, chat_on);
-                if let Some(v) = view {
-                    draw_chat_bubbles(&painter, rect, v, &self.cam);
-                }
-                None
-            }
-        };
+        // Chat UI (ExperienceChat, ChannelTabs, BubbleChat, TopBar toggle, and
+        // LegacyChat) is drawn on the engine GUI path via CoreGui (either real
+        // Roblox CoreScripts or the native players_chat_ui.luau fallback).
         if let Some(s) = self.play.as_ref().and_then(|s| s.game.kicked.clone()) {
             draw_kicked(&painter, rect, &s);
         }
-        self.game_menu(ui, rect);
-        if !menu {
-            self.emote_wheel(ui, rect, &mut slots);
-        }
-        let mut sent: Option<String> = None;
-        if let Some(s) = self.play.as_mut() {
-            if open_chat {
-                s.game.chat_open = true;
+        if !core_scripts {
+            self.game_menu(ui, rect);
+            if !menu {
+                self.emote_wheel(ui, rect, &mut slots);
             }
-            let box_rect = input_rect.unwrap_or(Rect::from_min_size(
-                Pos2::new(rect.min.x + 10.0, rect.max.y - 38.0),
-                egui::vec2(320.0f32.min(rect.width() - 20.0), 26.0),
-            ));
-            if s.game.chat_open {
-                let hint = if input_rect.is_some() {
-                    "To chat click here or press \"/\" key"
-                } else {
-                    "Say something (Enter to send, Esc to close)"
-                };
-                let mut edit = egui::TextEdit::singleline(&mut s.game.chat_text)
-                    .hint_text(hint)
-                    .id(egui::Id::new("play_chat"));
-                if input_rect.is_some() {
-                    edit = edit.frame(egui::Frame::NONE).text_color(Color32::WHITE);
-                }
-                let r = ui.put(box_rect, edit);
-                if open_chat {
-                    r.request_focus();
-                }
-                let (enter, esc) = ctx.input(|i| {
-                    (
-                        i.key_pressed(egui::Key::Enter),
-                        i.key_pressed(egui::Key::Escape),
-                    )
-                });
-                if r.lost_focus() || esc {
-                    if enter && !s.game.chat_text.trim().is_empty() {
-                        sent = Some(std::mem::take(&mut s.game.chat_text));
-                    }
-                    s.game.chat_open = false;
-                }
-            } else if chat_on {
-                // Studio's playtest shows no "/ to chat" hint (the Studio
-                // an offline Studio runs); "/" still opens the chat box.
+        }
+        if let Some(s) = self.play.as_mut() {
+            let unfocused = self.gui.focus.is_none();
+            s.game.chat_open = !unfocused;
+            if chat_on && unfocused {
                 s.game.chat_ready_frames += 1;
             }
-            if let Ok(mut l) = rustudio_engine::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
-                l.focused = s.game.chat_open;
-            }
             if !menu {
-                s.game.input.pointer = pointer;
+                s.game.input.pointer = if over_gui {
+                    pointer.map(|mut p| {
+                        p.click = None;
+                        p
+                    })
+                } else {
+                    pointer
+                };
             }
             s.game.input.clicks.extend(clicks);
             s.game.input.ray_clicks.extend(ray_clicks);
             s.game.input.buttons.extend(buttons);
             s.game.uis_mouse.extend(uis);
             s.game.input.slots.extend(slots);
-            if let Some(m) = sent {
-                s.game.input.chat.push(m);
-            }
-            if s.game.clickable && !menu {
+            if s.game.clickable && !menu && !over_gui {
                 ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
@@ -2597,198 +2665,6 @@ impl Game {
             }
         }
         best.map(|(t, r)| (r, t))
-    }
-}
-
-/// Roblox's default chat name colours (the legacy chat's and ExpChat's
-/// `GetNameValue` hash over the name).
-fn chat_name_color(name: &str) -> Color32 {
-    const COLORS: [[u8; 3]; 8] = [
-        [253, 41, 67],
-        [1, 162, 255],
-        [2, 184, 87],
-        [107, 50, 124],
-        [218, 133, 65],
-        [245, 205, 48],
-        [232, 186, 200],
-        [215, 197, 154],
-    ];
-    let b = name.as_bytes();
-    let n = b.len() as i64;
-    let mut value: i64 = 0;
-    for (i, c) in b.iter().enumerate() {
-        let mut rev = n - i as i64;
-        if n % 2 == 1 {
-            rev -= 1;
-        }
-        let v = *c as i64;
-        value += if rev % 4 >= 2 { -v } else { v };
-    }
-    let c = COLORS[value.rem_euclid(8) as usize];
-    Color32::from_rgb(c[0], c[1], c[2])
-}
-
-fn c32(c: [f32; 3], alpha: f32) -> Color32 {
-    let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Color32::from_rgba_unmultiplied(u(c[0]), u(c[1]), u(c[2]), u(alpha))
-}
-
-/// The TextChatService window (top left under the top bar, Studio's
-/// ChatWindowConfiguration 8,12 344.8x154.75), its input bar while open,
-/// and the bubbles over characters. Returns where the input box goes.
-fn draw_text_chat(
-    painter: &egui::Painter,
-    rect: Rect,
-    v: &rustudio_engine::runtime::domains::players_chat::ChatView,
-    open: bool,
-    cam: &rustudio_render::camera::Camera,
-) -> Option<Rect> {
-    use egui::text::{LayoutJob, TextFormat};
-    // ExpChat's container starts under the 58 px top bar.
-    const INSET: f32 = 58.0;
-    const TEXT_FADE_S: f64 = 30.0;
-    let w = &v.window;
-    let win = Rect::from_min_size(
-        Pos2::new(rect.min.x + 8.0, rect.min.y + INSET + 12.0),
-        egui::vec2(344.8 * w.width_scale, 154.75 * w.height_scale),
-    );
-    let bar = Rect::from_min_size(
-        Pos2::new(rect.min.x + 16.0, win.max.y),
-        egui::vec2(win.width() - 16.0, 43.0),
-    );
-    if let Ok(mut l) = rustudio_engine::runtime::domains::players_chat::CHAT_LAYOUT.lock() {
-        l.window = ([win.min.x - rect.min.x, win.min.y - rect.min.y - INSET], [win.width(), win.height()]);
-        l.input = ([bar.min.x - rect.min.x, bar.min.y - rect.min.y - INSET], [bar.width(), bar.height()]);
-        l.tabs = ([0.0, 0.0], [0.0, 0.0]);
-    }
-    if w.enabled {
-        if open {
-            painter.rect_filled(win, 8.0, c32(w.bg, 1.0 - w.bg_transparency));
-        }
-        let newest = v.lines.iter().map(|l| l.age).fold(f64::INFINITY, f64::min);
-        let fade = if open { 1.0 } else { (1.0 - (newest - TEXT_FADE_S).max(0.0)).clamp(0.0, 1.0) as f32 };
-        if fade > 0.0 {
-            let font = egui::FontId::proportional(w.text_size);
-            let wrap = win.width() - 16.0;
-            let galleys: Vec<_> = v
-                .lines
-                .iter()
-                .map(|l| {
-                    let mut job = LayoutJob::default();
-                    job.wrap.max_width = wrap;
-                    let text_c = c32(l.text_color.unwrap_or(w.text), fade);
-                    if !l.prefix.is_empty() {
-                        let name = l.prefix.trim_end_matches(':');
-                        let name = name.rsplit(' ').next().unwrap_or(name);
-                        let nc = match l.name_color {
-                            Some(c) => c32(c, fade),
-                            None if l.system => text_c,
-                            None => chat_name_color(name).gamma_multiply(fade),
-                        };
-                        job.append(&l.prefix, 0.0, TextFormat { font_id: font.clone(), color: nc, ..Default::default() });
-                        job.append(" ", 0.0, TextFormat { font_id: font.clone(), color: text_c, ..Default::default() });
-                    }
-                    job.append(&l.text, 0.0, TextFormat { font_id: font.clone(), color: text_c, ..Default::default() });
-                    painter.layout_job(job)
-                })
-                .collect();
-            // Newest at the bottom; the oldest scroll off the top.
-            let room = win.height() - 16.0;
-            let mut used = 0.0;
-            let mut first = galleys.len();
-            for g in galleys.iter().rev() {
-                if used + g.size().y > room {
-                    break;
-                }
-                used += g.size().y + 2.0;
-                first -= 1;
-            }
-            let mut y = win.min.y + 8.0;
-            let stroke = c32(w.stroke, (1.0 - w.stroke_transparency) * fade);
-            for g in &galleys[first..] {
-                let p = Pos2::new(win.min.x + 8.0, y);
-                painter.galley(p + egui::vec2(1.0, 1.0), g.clone(), stroke);
-                painter.galley(p, g.clone(), Color32::WHITE);
-                y += g.size().y + 2.0;
-            }
-        }
-    }
-    let input = if open && w.input_enabled {
-        painter.rect_filled(bar, 8.0, c32(w.input_bg, 1.0 - w.input_bg_transparency));
-        Some(bar.shrink2(egui::vec2(12.0, 10.0)))
-    } else {
-        None
-    };
-    draw_chat_bubbles(painter, rect, v, cam);
-    input
-}
-
-/// Bubble chat over its adornees: the newest MaxBubbles per adornee, stacked
-/// upwards (Chat:Chat and TextChatService bubbles).
-fn draw_chat_bubbles(
-    painter: &egui::Painter,
-    rect: Rect,
-    v: &rustudio_engine::runtime::domains::players_chat::ChatView,
-    cam: &rustudio_render::camera::Camera,
-) {
-    let b = &v.bubble;
-    if b.enabled {
-        let mut per: std::collections::HashMap<Ref, usize> = Default::default();
-        let mut list: Vec<_> = v.bubbles.iter().filter(|x| x.pos.is_some()).collect();
-        list.sort_by(|x, y| y.id.cmp(&x.id));
-        let mut stack: std::collections::HashMap<Ref, f32> = Default::default();
-        for x in list {
-            let n = per.entry(x.adornee).or_insert(0);
-            *n += 1;
-            if *n > b.max_bubbles {
-                continue;
-            }
-            let Some(at) = x.pos else { continue };
-            if (at - cam.pos).length() > b.max_distance {
-                continue;
-            }
-            let Some(anchor) = cam.project(rect, at + Vec3::Y * b.offset) else {
-                continue;
-            };
-            let font = egui::FontId::proportional(b.text_size);
-            let fg = c32(x.fg.unwrap_or(b.fg), 1.0);
-            let g = painter.layout(x.text.clone(), font, fg, 260.0);
-            let size = g.size() + egui::vec2(24.0, 16.0);
-            let lift = stack.entry(x.adornee).or_insert(0.0);
-            let bottom = anchor.y - 10.0 - *lift;
-            let r = Rect::from_min_size(Pos2::new(anchor.x - size.x / 2.0, bottom - size.y), size);
-            let bg = c32(x.bg.unwrap_or(b.bg), 1.0 - x.bg_transparency.unwrap_or(b.bg_transparency));
-            painter.rect_filled(r, 12.0, bg);
-            if *lift == 0.0 {
-                painter.add(egui::Shape::convex_polygon(
-                    vec![
-                        Pos2::new(anchor.x - 7.0, r.max.y),
-                        Pos2::new(anchor.x + 7.0, r.max.y),
-                        Pos2::new(anchor.x, r.max.y + 7.0),
-                    ],
-                    bg,
-                    Stroke::NONE,
-                ));
-            }
-            painter.galley(r.min + egui::vec2(12.0, 8.0), g, fg);
-            *lift += size.y + 6.0;
-        }
-    }
-}
-
-/// The legacy chat (LegacyChatService): recent lines bottom left.
-fn draw_legacy_chat(ed: &Game, painter: &egui::Painter, rect: Rect, chat_on: bool) {
-    let lines: Vec<String> = ed
-        .play
-        .as_ref()
-        .filter(|_| chat_on)
-        .map(|s| s.game.chat_log.iter().rev().take(6).rev().map(|(l, _)| l.clone()).collect())
-        .unwrap_or_default();
-    let base = Pos2::new(rect.min.x + 12.0, rect.max.y - 44.0);
-    for (i, l) in lines.iter().rev().enumerate() {
-        let p = base - egui::vec2(0.0, 18.0 * (i as f32 + 1.0));
-        painter.text(p + egui::vec2(1.0, 1.0), egui::Align2::LEFT_BOTTOM, l, egui::FontId::proportional(13.0), Color32::from_black_alpha(180));
-        painter.text(p, egui::Align2::LEFT_BOTTOM, l, egui::FontId::proportional(13.0), Color32::WHITE);
     }
 }
 

@@ -131,6 +131,13 @@ impl PlayerApp {
         });
         // Ctrl+F6 (Studio's MicroProfiler key in a game): the profiler overlay;
         // RUSTUDIO_PROFILER_OVERLAY=1 opens it from the start (checks).
+        if let Some(on) = rustudio_engine::gui::share().microprofiler_req.take() {
+            self.profiler = if on {
+                Some(self.profiler.take().unwrap_or_else(rustudio_profiler_ui::ProfilerWindow::new))
+            } else {
+                None
+            };
+        }
         let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F6))
             || (self.profiler.is_none() && game.frame_no == 2 && std::env::var_os("RUSTUDIO_PROFILER_OVERLAY").is_some());
         if toggle {
@@ -191,6 +198,7 @@ impl PlayerApp {
 impl eframe::App for PlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         rustudio_render::gpu_health::check();
+        rustudio_render::pipeline_cache::save(false);
         self.frame(ui);
     }
 
@@ -201,6 +209,7 @@ impl eframe::App for PlayerApp {
     }
 
     fn on_exit(&mut self) {
+        rustudio_render::pipeline_cache::save(true);
         rustudio_core::telemetry::flush();
     }
 }
@@ -258,6 +267,20 @@ pub fn run() -> eframe::Result<()> {
                 match HarnessAction::parse(&v, a == "--click") {
                     Some(x) => actions.extend(x),
                     None => eprintln!("{a}: can't read {v:?}"),
+                }
+            }
+            "--dblclick" => {
+                let v = args.next().unwrap_or_default();
+                match HarnessAction::parse_dblclick(&v) {
+                    Some(x) => actions.extend(x),
+                    None => eprintln!("--dblclick: can't read {v:?} (X,Y@SECONDS)"),
+                }
+            }
+            "--paste" => {
+                let v = args.next().unwrap_or_default();
+                match HarnessAction::parse_paste(&v) {
+                    Some(x) => actions.push(x),
+                    None => eprintln!("--paste: can't read {v:?} (TEXT@SECONDS)"),
                 }
             }
             "--move" => {

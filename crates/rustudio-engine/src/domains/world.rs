@@ -61,11 +61,17 @@ pub const METHODS: &[(&str, &str)] = &[
     ("ArePartsTouchingOthers", "WorldRoot"),
     ("IsRegion3Empty", "WorldRoot"),
     ("IsRegion3EmptyWithIgnoreList", "WorldRoot"),
+    ("GetStreamingEnabled", "Workspace"),
     ("GetNumAwakeParts", "Workspace"),
     ("GetPhysicsThrottling", "Workspace"),
     ("JoinToOutsiders", "Workspace"),
     ("UnjoinFromOutsiders", "Workspace"),
     ("PGSIsEnabled", "Workspace"),
+    // Lighting
+    ("GetMinutesAfterMidnight", "Lighting"),
+    ("SetMinutesAfterMidnight", "Lighting"),
+    ("getMinutesAfterMidnight", "Lighting"),
+    ("setMinutesAfterMidnight", "Lighting"),
     // Camera
     ("GetPanSpeed", "Camera"),
     ("GetTiltSpeed", "Camera"),
@@ -100,11 +106,31 @@ pub const METHODS: &[(&str, &str)] = &[
     ("GetMaterialSlot", "Terrain"),
     ("SetMaterialSlot", "Terrain"),
     ("ResetMaterialSlot", "Terrain"),
+    ("IsMaterialSlotInvalid", "Terrain"),
+    ("CanSmoothVoxelsBeUpgraded", "Terrain"),
+    ("GetTerrainWireframe", "Terrain"),
+    ("GenerateWaterFlowMap", "Terrain"),
+    ("ResetWaterFlowMap", "Terrain"),
+    ("ReplaceMaterialInTransform", "Terrain"),
+    ("ReplaceMaterialInTransformSubregion", "Terrain"),
+    ("ReplaceMaterialInTransformSubregionSlot", "Terrain"),
+    ("SetMaterialInTransform", "Terrain"),
+    ("SetMaterialInTransformSubregion", "Terrain"),
+    ("SetMaterialInTransformSubregionSlot", "Terrain"),
+    ("FillBallSlot", "Terrain"),
+    ("FillBlockSlot", "Terrain"),
+    ("FillCylinderSlot", "Terrain"),
+    ("FillRegionSlot", "Terrain"),
+    ("FillWedgeSlot", "Terrain"),
+    ("SmoothRegion", "Terrain"),
+    ("SmoothRegionMaterialSlots", "Terrain"),
     ("ReadVoxelsAsync_beta", "Terrain"),
     ("WriteVoxelsAsync_beta", "Terrain"),
     ("ModifyVoxelsAsync_beta", "Terrain"),
     ("IterateVoxelsAsync_beta", "Terrain"),
     ("ClearVoxelsAsync_beta", "Terrain"),
+    ("ApplyTransform", "TerrainRegion"),
+    ("ApplyTransformSubregion", "TerrainRegion"),
     // Misc
     ("SetTextureOffset", "Beam"),
     ("Clear", "Trail"),
@@ -163,6 +189,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("ButtonChanged", "Controller"),
     ("Equipped", "SkateboardPlatform"),
     ("equipped", "SkateboardPlatform"),
+    ("GridBackendReloadRequired", "Terrain"),
 ];
 
 pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
@@ -222,6 +249,9 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
 
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     camera::step(lua, dt)?;
+    if world(lua).is_ok_and(|w| w.mode == RunMode::Edit) {
+        return Ok(());
+    }
     constraints::step(lua, dt)?;
     controls::step(lua)?;
     Ok(())

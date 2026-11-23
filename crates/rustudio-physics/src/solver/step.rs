@@ -923,52 +923,57 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
     // cfg = Workspace.Gravity (STEP §0.2 [STEP2]).
     let mut cfg = LevelCfg::new(level, h, -gravity.y);
     diag_cfg(&mut cfg, h, gravity);
-    w.batch.clear();
     let damping = (-(cfg.ang_damp) * cfg.dt).exp();
-    // Studio (STEP §4.1a): sim bodies' records in list order.
-    for k in start..end {
-        let s = isl.order[k] as usize;
-        let (rec, mass) = free_velocity(sh.bodies, s, &cfg, gravity, damping);
-        let l = w.batch.add_body(rec, mass, true);
-        w.local.local[s] = l;
-    }
     let (mf, ml) = (isl.contact_start[i] as usize, isl.contact_start[i + 1] as usize);
     let list = &sh.contacts.list;
+    let constrained = mf != ml || !isl.joint_ids(i).is_empty();
     let mut rows = 0;
-    for mk in mf..ml {
-        let m = isl.contacts[mk] as usize;
-        let a = side(w, sh, m, true);
-        let b = side(w, sh, m, false);
-        let (first, count) = (list.first[m] as usize, list.count[m] as usize);
-        let (ra, rb) = (w.batch.body(a), w.batch.body(b));
-        for c in first..first + count {
-            let kept = sh.contacts.conn(c).kept.map(|k| (k.lv, k.lp, k.s_v, k.s_p));
-            let r = w.batch.begin(&kept, &cfg);
-            // The connector's own A / B (narrow.rs: a face point's A is the incident body).
-            let (ca, cb, pair) = if list.swap[c] { (&rb, &ra, [b, a]) } else { (&ra, &rb, [a, b]) };
-            rows::contact_rows_dual(r, list.p[c], list.n[c], list.sep[c], list.mu[c], list.e[c], ca, cb, &cfg);
-            // Contacts: 3 ordinary rows (mask conn = 0), group 4, key conn.
-            w.batch.commit(dual::ctype::CONTACT, list.id[c], pair, 3, 0, [0.0, 0.0], ConnSrc::Contact(c as u32));
-            rows += 3;
+    // An island without connectors has zero solve deltas. Integrate it
+    // from the same free velocity without filling a batch or local indices.
+    if constrained {
+        w.batch.clear();
+        // Studio: sim bodies' records in list order.
+        for k in start..end {
+            let s = isl.order[k] as usize;
+            let (rec, mass) = free_velocity(sh.bodies, s, &cfg, gravity, damping);
+            let l = w.batch.add_body(rec, mass, true);
+            w.local.local[s] = l;
         }
-    }
-    rows::build_joint_rows_dual(i, isl, sh.joints, sh.bodies, &w.local, &mut w.nonsim, &cfg, &mut w.batch, &mut w.joint_state, &mut w.gs);
-    // "Init Batch Solve" and "PGS Solve" / "Finalize" (DUAL §2–§4).
-    if w.batch.conn_count() > 0 {
-        w.batch.prepare(&cfg);
-        w.batch.solve(&cfg);
-        // DUAL §5.4 step 5: if cfg, every connector's slot 7 in X order.
-        if cfg.store {
-            for (src, pgs, omega, ldl) in w.batch.results() {
-                match src {
-                    ConnSrc::Contact(c) => {
-                        let lam = [[pgs[0][6], pgs[0][7]], [pgs[1][6], pgs[1][7]], [pgs[2][6], pgs[2][7]]];
-                        let s_in = [omega[0], omega[1], omega[2]];
-                        let mut conn = *sh.contacts.conn(c as usize);
-                        contact::write_back_contact(&mut conn, &lam, &s_in, cfg.dt);
-                        w.kept.push((c, conn.kept));
+        for mk in mf..ml {
+            let m = isl.contacts[mk] as usize;
+            let a = side(w, sh, m, true);
+            let b = side(w, sh, m, false);
+            let (first, count) = (list.first[m] as usize, list.count[m] as usize);
+            let (ra, rb) = (w.batch.body(a), w.batch.body(b));
+            for c in first..first + count {
+                let kept = sh.contacts.conn(c).kept.map(|k| (k.lv, k.lp, k.s_v, k.s_p));
+                let r = w.batch.begin(&kept, &cfg);
+                // The connector's own A / B (narrow.rs: a face point's A is the incident body).
+                let (ca, cb, pair) = if list.swap[c] { (&rb, &ra, [b, a]) } else { (&ra, &rb, [a, b]) };
+                rows::contact_rows_dual(r, list.p[c], list.n[c], list.sep[c], list.mu[c], list.e[c], ca, cb, &cfg);
+                // Contacts use three ordinary rows in group 4 and keep the connector key.
+                w.batch.commit(dual::ctype::CONTACT, list.id[c], pair, 3, 0, [0.0, 0.0], ConnSrc::Contact(c as u32));
+                rows += 3;
+            }
+        }
+        rows::build_joint_rows_dual(i, isl, sh.joints, sh.bodies, &w.local, &mut w.nonsim, &cfg, &mut w.batch, &mut w.joint_state, &mut w.gs);
+        // "Init Batch Solve" and "PGS Solve" / "Finalize" (DUAL §2–§4).
+        if w.batch.conn_count() > 0 {
+            w.batch.prepare(&cfg);
+            w.batch.solve(&cfg);
+            // When enabled, seed slot 7 for each connector in solver order.
+            if cfg.store {
+                for (src, pgs, omega, ldl) in w.batch.results() {
+                    match src {
+                        ConnSrc::Contact(c) => {
+                            let lam = [[pgs[0][6], pgs[0][7]], [pgs[1][6], pgs[1][7]], [pgs[2][6], pgs[2][7]]];
+                            let s_in = [omega[0], omega[1], omega[2]];
+                            let mut conn = *sh.contacts.conn(c as usize);
+                            contact::write_back_contact(&mut conn, &lam, &s_in, cfg.dt);
+                            w.kept.push((c, conn.kept));
+                        }
+                        ConnSrc::Joint(j) => w.joint_kept.push((j, sh.joints.write_back_dual(j, pgs, omega, ldl, cfg.level, cfg.dt))),
                     }
-                    ConnSrc::Joint(j) => w.joint_kept.push((j, sh.joints.write_back_dual(j, pgs, omega, ldl, cfg.level, cfg.dt))),
                 }
             }
         }
@@ -983,7 +988,11 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
     for k in start..end {
         let s = isl.order[k] as usize;
         let l = k - start;
-        let (rec, u, cond) = (w.batch.rec[l], w.batch.u[l], w.batch.cond[l]);
+        let (rec, u, cond) = if constrained {
+            (w.batch.rec[l], w.batch.u[l], w.batch.cond[l])
+        } else {
+            (free_velocity(sh.bodies, s, &cfg, gravity, damping).0, [0.0; 12], f32::NAN)
+        };
         let idx = sh.bodies.handle[s].into_raw_parts();
         let mut p = sh.bodies.persist[idx.0 as usize];
         if p.sleep.state == super::sleep::ASLEEP_IN {
@@ -999,9 +1008,10 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
         let mut o = integrate(sh.bodies, s, &rec, &u, &cfg, sh.cfg, &mut p);
         if spin_debug() && (o.w - rec.w0).length() > 300.0 {
             let b = sh.bodies;
+            let connectors = if constrained { w.batch.conn_count() } else { 0 };
             eprintln!(
                 "SPIN body {:?} L{} dt {} v0 {:?} v1 {:?} w0 {:?} wf {:?} w1 {:?} du {:?} im {} ii {:?} ib {:?} com {:?} nrows {}",
-                b.handle[s].into_raw_parts(), level, cfg.dt, rec.v0, o.v, rec.w0, rec.wf, o.w, u, b.inv_mass[s], b.inv_inertia[s], b.inertia_body[s], o.com, w.batch.conn_count()
+                b.handle[s].into_raw_parts(), level, cfg.dt, rec.v0, o.v, rec.w0, rec.wf, o.w, u, b.inv_mass[s], b.inv_inertia[s], b.inertia_body[s], o.com, connectors
             );
             for mk in mf..ml {
                 let m = isl.contacts[mk] as usize;
@@ -1013,9 +1023,8 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
                 }
             }
         }
-        // body: cleared by this solve's free velocity, refilled by its row collection
-        p.gs = w.gs.get(l).copied().unwrap_or(Vec3::ZERO);
-        // Studio after the write-back:.. = 0
+        // Gyroscopic impulse: cleared by this solve's free velocity, refilled by its row collection
+        p.gs = if constrained { w.gs[l] } else { Vec3::ZERO };
         p.f_solver = Vec3::ZERO;
         p.t_solver = Vec3::ZERO;
         // SLEEP §3, §4: activity and eligibility after the write-back (tickByte = phase).
@@ -1049,14 +1058,16 @@ fn solve_island(w: &mut Worker, sh: &Shared, i: usize, h: f32, gravity: Vec3, ph
         o.persist = p;
         w.out.push(o);
     }
-    for k in start..end {
-        w.local.local[isl.order[k] as usize] = NONE;
-    }
-    for mk in mf..ml {
-        let m = isl.contacts[mk] as usize;
-        for s in [list.a[m], list.b[m]] {
-            if s != NONE {
-                w.nonsim[s as usize] = NONE;
+    if constrained {
+        for k in start..end {
+            w.local.local[isl.order[k] as usize] = NONE;
+        }
+        for mk in mf..ml {
+            let m = isl.contacts[mk] as usize;
+            for s in [list.a[m], list.b[m]] {
+                if s != NONE {
+                    w.nonsim[s as usize] = NONE;
+                }
             }
         }
     }

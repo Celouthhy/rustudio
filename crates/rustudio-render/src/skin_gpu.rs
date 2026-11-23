@@ -141,7 +141,7 @@ impl SkinGpu {
             module: &module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::current(),
         });
         SkinGpu { pipeline: Some(pipeline), sources: HashMap::new(), jobs: HashMap::new(), due: Vec::new(), bytes: 0 }
     }

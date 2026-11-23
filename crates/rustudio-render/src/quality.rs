@@ -79,11 +79,24 @@ impl Profile {
     pub fn bloom(self) -> bool {
         self.0 >= 6
     }
+    /// Studio post-FX quality tier:
+    /// L1..7 = 0, L8..11 = 1, L12..15 = 2, L16..21 = 3.
+    pub fn post_fx_tier(self) -> u8 {
+        match self.0 {
+            1..=7 => 0,
+            8..=11 => 1,
+            12..=15 => 2,
+            _ => 3,
+        }
+    }
     pub fn clouds(self) -> bool {
         self.0 > 10
     }
     pub fn depth_of_field(self) -> bool {
-        self.0 >= 16
+        self.post_fx_tier() >= 3
+    }
+    pub fn sun_rays(self) -> bool {
+        self.post_fx_tier() >= 3
     }
     pub fn particle_budget(self) -> usize {
         let sprite = usize::from(SPRITE_QUALITY[usize::from(self.0 - 1)]);
@@ -324,5 +337,23 @@ mod tests {
         assert!((Profile::at(21).lod_radius_pixels(1080) - 0.5).abs() < 1e-5);
         assert!((Profile::at(8).lod_radius_pixels(1080) - (0.5 * (8.0 - 7.0 * 8.0 / 21.0))).abs() < 1e-5);
         assert!((Profile::at(1).lod_radius_pixels(1080) - (0.5 * (8.0 - 7.0 / 21.0))).abs() < 1e-5);
+    }
+
+    #[test]
+    fn post_fx_tier_and_cutoffs_match_studio() {
+        assert_eq!(Profile::at(1).post_fx_tier(), 0);
+        assert_eq!(Profile::at(7).post_fx_tier(), 0);
+        assert_eq!(Profile::at(8).post_fx_tier(), 1);
+        assert_eq!(Profile::at(11).post_fx_tier(), 1);
+        assert_eq!(Profile::at(12).post_fx_tier(), 2);
+        assert_eq!(Profile::at(15).post_fx_tier(), 2);
+        assert_eq!(Profile::at(16).post_fx_tier(), 3);
+        assert_eq!(Profile::at(21).post_fx_tier(), 3);
+        assert!(!Profile::at(5).bloom());
+        assert!(Profile::at(6).bloom());
+        assert!(!Profile::at(15).depth_of_field());
+        assert!(Profile::at(16).depth_of_field());
+        assert!(!Profile::at(15).sun_rays());
+        assert!(Profile::at(16).sun_rays());
     }
 }

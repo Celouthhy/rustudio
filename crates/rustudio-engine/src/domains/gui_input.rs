@@ -44,6 +44,49 @@ pub const METHODS: &[(&str, &str)] = &[
     ("Select", "GuiService"),
     ("SetEmotesMenuOpen", "GuiService"),
     ("SetInspectMenuEnabled", "GuiService"),
+    ("GetResolutionScale", "GuiService"),
+    ("GetSafeZoneOffsets", "GuiService"),
+    ("GetHardwareSafeViewport", "GuiService"),
+    ("SetTopbarInset", "GuiService"),
+    ("SetGlobalGuiInset", "GuiService"),
+    ("SetMenuIsOpen", "GuiService"),
+    ("GetErrorMessage", "GuiService"),
+    ("GetErrorCode", "GuiService"),
+    ("GetErrorType", "GuiService"),
+    ("BroadcastNotification", "GuiService"),
+    ("AddCenterDialog", "GuiService"),
+    ("RemoveCenterDialog", "GuiService"),
+    ("IsMemoryTrackerEnabled", "GuiService"),
+    ("GetAutoUIScaleHundredths", "GuiService"),
+    ("GetEffectiveUIScaleHundredths", "GuiService"),
+    ("GetRawScreenScale", "GuiService"),
+    ("GetScreenResolution", "GuiService"),
+    ("GetBrickCount", "GuiService"),
+    ("GetUiMessage", "GuiService"),
+    ("GetErrorDetails", "GuiService"),
+    ("GetGuiIsVisible", "GuiService"),
+    ("ClearError", "GuiService"),
+    ("CloseStatsBasedOnInputString", "GuiService"),
+    ("ShowStatsBasedOnInputString", "GuiService"),
+    ("ForceTenFootInterface", "GuiService"),
+    ("AddKey", "GuiService"),
+    ("RemoveKey", "GuiService"),
+    ("AddSpecialKey", "GuiService"),
+    ("RemoveSpecialKey", "GuiService"),
+    ("SetHardwareSafeAreaInsets", "GuiService"),
+    ("SetPurchasePromptIsShown", "GuiService"),
+    ("SetSafeZoneOffsets", "GuiService"),
+    ("SetUIScaleMultiplier", "GuiService"),
+    ("SetUiMessage", "GuiService"),
+    ("ToggleFullscreen", "GuiService"),
+    ("ToggleGuiIsVisibleForCaptures", "GuiService"),
+    ("ToggleGuiIsVisibleIfAllowed", "GuiService"),
+    ("OnNotificationDisplayed", "GuiService"),
+    ("OnNotificationInteraction", "GuiService"),
+    ("OpenBrowserWindow", "GuiService"),
+    ("OpenNativeOverlay", "GuiService"),
+    ("SendUIOcclusionMetricsForQueryRegion", "GuiService"),
+    ("InspectPlayerFromUserIdWithCtx", "GuiService"),
     // UserInputService
     ("CreateVirtualInput", "UserInputService"),
     ("GetDeviceAcceleration", "UserInputService"),
@@ -62,6 +105,11 @@ pub const METHODS: &[(&str, &str)] = &[
     // ContextActionService
     ("BindActionToInputTypes", "ContextActionService"),
     ("GetCurrentLocalToolIcon", "ContextActionService"),
+    ("BindCoreAction", "ContextActionService"),
+    ("BindCoreActionAtPriority", "ContextActionService"),
+    ("UnbindCoreAction", "ContextActionService"),
+    ("GetBoundCoreActionInfo", "ContextActionService"),
+    ("GetAllBoundCoreActionInfo", "ContextActionService"),
     // LayerCollector / PlayerGui
     ("GetGuiObjectsAtPosition", "LayerCollector"),
     ("GetGuiObjectsAtPosition", "BasePlayerGui"),
@@ -139,6 +187,8 @@ pub const METHODS: &[(&str, &str)] = &[
     ("Stop", "HapticEffect"),
     ("GetTouchpadMode", "VRService"),
     ("SetTouchpadMode", "VRService"),
+    ("IsVRAppBuild", "VRService"),
+    ("IsMaquettes", "VRService"),
     // ProximityPrompt / Dialog / TextGenerator
     ("InputHoldBegin", "ProximityPrompt"),
     ("InputHoldEnd", "ProximityPrompt"),
@@ -146,7 +196,10 @@ pub const METHODS: &[(&str, &str)] = &[
 ];
 
 /// Yielding methods, written in gui_input.luau (put in `__rs_lua_methods`).
-pub const LUA_METHODS: &[(&str, &str)] = &[("GenerateTextAsync", "TextGenerator")];
+pub const LUA_METHODS: &[(&str, &str)] = &[
+    ("GenerateTextAsync", "TextGenerator"),
+    ("CaptureSnapshotAsync", "ViewportFrame"),
+];
 
 /// Events this domain fires (the rest of its classes' events were already
 /// known to runtime_ext.rs; gui_input.luau fires many of those too).
@@ -157,6 +210,27 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("UserCFrameChanged", "UserInputService"),
     ("LocalToolEquipped", "ContextActionService"),
     ("LocalToolUnequipped", "ContextActionService"),
+    ("SafeZoneOffsetsChanged", "GuiService"),
+    ("ErrorMessageChanged", "GuiService"),
+    ("NativeClose", "GuiService"),
+    ("CoreGuiRenderOverflowed", "GuiService"),
+    ("BrowserWindowClosed", "GuiService"),
+    ("CloseInspectMenuRequest", "GuiService"),
+    ("EmotesMenuOpenChanged", "GuiService"),
+    ("GuiVisibilityChangedSignal", "GuiService"),
+    ("InspectMenuEnabledChangedSignal", "GuiService"),
+    ("InspectPlayerFromHumanoidDescriptionRequest", "GuiService"),
+    ("InspectPlayerFromUserIdWithCtxRequest", "GuiService"),
+    ("KeyPressed", "GuiService"),
+    ("NetworkPausedEnabledChanged", "GuiService"),
+    ("PurchasePromptShown", "GuiService"),
+    ("ScrollStateChanged", "GuiService"),
+    ("ShowLeaveConfirmation", "GuiService"),
+    ("SpecialKeyPressed", "GuiService"),
+    ("UiMessageChanged", "GuiService"),
+    ("Open9SliceEditor", "GuiService"),
+    ("OpenStyleEditor", "GuiService"),
+    ("LaserPointerTriggered", "VRService"),
     ("DragBegin", "GuiObject"),
     ("DragStopped", "GuiObject"),
     ("TouchLongPress", "GuiObject"),
@@ -205,6 +279,9 @@ pub const EVENTS: &[(&str, &str)] = &[
 /// saved and replicated like any other): class, name, type, enum, Studio's
 /// default (a Luau expression; measured, the API dump's are placeholders).
 const STORED: &[(&str, &str, VariantType, &str, &str)] = &[
+    ("UserInputService", "OverrideMouseIconBehavior", VariantType::Enum, "OverrideMouseIconBehavior", "Enum.OverrideMouseIconBehavior.None"),
+    ("ScreenGui", "OnTopOfCoreBlur", VariantType::Bool, "", "false"),
+    ("ScreenGui", "IgnoresTitleBarReservation", VariantType::Bool, "", "false"),
     ("UIBlur", "Color", VariantType::Color3, "", "Color3.new(1, 1, 1)"),
     ("UIBlur", "Enabled", VariantType::Bool, "", "true"),
     ("UIBlur", "Strength", VariantType::Enum, "UIBlurStrength", "Enum.UIBlurStrength.Heavy"),
@@ -252,16 +329,24 @@ fn stored(class: &str, key: &str) -> Option<&'static (&'static str, &'static str
 /// (class matched with IsA).
 const LUA_PROPS: &[(&str, &str)] = &[
     ("GuiService", "CoreGuiNavigationEnabled"),
+    ("GuiService", "SendCoreUiNotification"),
     ("GuiService", "PreferredTextSize"),
     ("GuiService", "PreferredTransparency"),
     ("GuiService", "ReducedMotionEnabled"),
     ("GuiService", "TopbarInset"),
     ("GuiService", "ViewportDisplaySize"),
+    ("GuiService", "SelectedCoreObject"),
+    ("GuiService", "CoreGuiFolder"),
+    ("GuiService", "CoreEffectFolder"),
+    ("GuiService", "DisplayScalingMode"),
+    ("GuiService", "ViewportSizeInMM"),
+    ("GuiService", "IsWindows"),
     ("UserInputService", "OnScreenKeyboardPosition"),
     ("UserInputService", "OnScreenKeyboardSize"),
     ("UserInputService", "UserHeadCFrame"),
     ("GuiObject", "GuiState"),
     ("GuiObject", "InputSink"),
+    ("GuiObject", "Transparency"),
     ("BillboardGui", "CurrentDistance"),
     ("PlayerGui", "CurrentScreenOrientation"),
     ("CoreGui", "Version"),
@@ -291,6 +376,16 @@ const LUA_PROPS: &[(&str, &str)] = &[
     ("InputActionLabel", "ResolvedText"),
     ("InputActionLabel", "ResolvedImageContent"),
     ("VRService", "GuiInputUserCFrame"),
+    ("VRService", "VRDeviceAvailable"),
+    ("VRService", "VRDeviceName"),
+    ("VRService", "VRSessionState"),
+    ("VRService", "DidPointerHit"),
+    ("VRService", "LaserDistance"),
+    ("VRService", "PointerHitCFrame"),
+    ("VRService", "QuestDisplayRefreshRate"),
+    ("VRService", "QuestASWState"),
+    ("VRService", "LaserPointer"),
+    ("VRService", "PresentationMode"),
     ("Dialog", "InUse"),
     ("GuiService", "MenuIsOpen"),
 ];
@@ -307,8 +402,12 @@ const LUA_WRITES: &[(&str, &str)] = &[
     ("TextBox", "CursorPosition"),
     ("TextBox", "SelectionStart"),
     ("GuiService", "SelectedObject"),
+    ("GuiService", "SelectedCoreObject"),
     ("GuiService", "CoreGuiNavigationEnabled"),
+    ("GuiService", "SendCoreUiNotification"),
     ("GuiObject", "InputSink"),
+    ("GuiObject", "Interactable"),
+    ("GuiObject", "Transparency"),
     ("VRService", "GuiInputUserCFrame"),
     ("Dialog", "InUse"),
     ("InputAction", "Type"),
@@ -380,6 +479,7 @@ pub fn call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> Option<mlua:
     if base == "Path2D" {
         return Some(path2d::call(lua, name, this, args));
     }
+    lua.remove_app_data::<EditStepCache>();
     Some((|| {
         let m: Table = module(lua)?.get("methods")?;
         let f: Function = m.get(format!("{base}.{name}"))?;
@@ -394,6 +494,9 @@ pub fn prop_get(lua: &Lua, r: Ref, class: &str, key: &str) -> mlua::Result<Optio
             Some(v) => variant_to_lua(lua, &v, (!s.3.is_empty()).then_some(s.3))?,
             None => default_of(lua, s.4)?,
         }));
+    }
+    if class == "ScrollingFrame" && matches!(key, "AbsoluteCanvasSize" | "AbsoluteWindowSize") {
+        return crate::runtime::ext::scrolling_prop(lua, r, key).map(Some);
     }
     if let Some(base) = lua_prop(class, key) {
         let get: Table = module(lua)?.get("get")?;
@@ -420,6 +523,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         let en = (!s.3.is_empty()).then_some(s.3);
         let v = lua_to_variant(key, value, s.2, en, existing.as_ref())?;
         store_prop(lua, r, key, v)?;
+        lua.remove_app_data::<EditStepCache>();
         return Ok(true);
     }
     if let Some(base) = lua_write(class, key) {
@@ -427,6 +531,7 @@ pub fn newindex(lua: &Lua, r: Ref, class: &str, key: &str, value: &Value) -> mlu
         let f: Function = set.get(format!("{base}.{key}"))?;
         // true: the Luau stored it itself; false: store it as usual too.
         let done: bool = f.call((inst_value(lua, r)?, key, value.clone()))?;
+        lua.remove_app_data::<EditStepCache>();
         return Ok(done);
     }
     Ok(false)
@@ -474,7 +579,19 @@ fn objects_at(w: &mut World, guis: &[Ref], x: f32, y: f32) -> Vec<Ref> {
     let inside = |w: &mut World, o: Ref| {
         let b = crate::runtime::ext::abs_now(w, o);
         let (px, py, sx, sy) = (b.pos[0] as f64, b.pos[1] as f64, b.size[0] as f64, b.size[1] as f64);
-        x >= px && y >= py && x < px + sx && y < py + sy
+        if b.rot.abs() > 1e-3 {
+            let cx = px + sx * 0.5;
+            let cy = py + sy * 0.5;
+            let rad = -(b.rot as f64).to_radians();
+            let (sn, cs) = rad.sin_cos();
+            let dx = x - cx;
+            let dy = y - cy;
+            let lx = cs * dx - sn * dy;
+            let ly = sn * dx + cs * dy;
+            lx >= -sx * 0.5 && ly >= -sy * 0.5 && lx < sx * 0.5 && ly < sy * 0.5
+        } else {
+            x >= px && y >= py && x < px + sx && y < py + sy
+        }
     };
     // One walk in draw order (ZIndex then child order: among siblings, or
     // across the whole GUI for a Global ScreenGui). An invisible object's
@@ -506,7 +623,8 @@ fn objects_at(w: &mut World, guis: &[Ref], x: f32, y: f32) -> Vec<Ref> {
         }
         let mine = p_gui && clip_ok && {
             let clips = class(w, p).is_some_and(|k| is_a(k, "ScrollingFrame")) || boolp(w, p, "ClipsDescendants", false);
-            !clips || (st.inside)(w, p)
+            let rotated = clips && crate::runtime::ext::abs_now(w, p).rot.abs() > 1e-3;
+            !clips || rotated || (st.inside)(w, p)
         };
         for (z, _, c, direct) in keyed {
             if !boolp(w, c, "Visible", true) {
@@ -627,6 +745,25 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "is_edit",
         lua.create_function(|lua, ()| Ok(world(lua).is_ok_and(|w| w.mode == RunMode::Edit)))?,
     )?;
+    g.set(
+        "topbar_inset",
+        lua.create_function(|lua, ()| {
+            let w = world(lua)?;
+            Ok(w.topbar_inset(w.input.view_size[0]))
+        })?,
+    )?;
+    g.set(
+        "set_topbar_inset",
+        lua.create_function(|lua, rect: LRect| {
+            let mut w = world(lua)?;
+            if w.topbar_inset == Some(rect) {
+                return Ok(false);
+            }
+            w.topbar_inset = Some(rect);
+            w.abs_all = true;
+            Ok(true)
+        })?,
+    )?;
     // A handle adornment is under the mouse or held: the edit viewport's
     // selection tools leave the press to it (Studio's priority).
     g.set(
@@ -683,12 +820,30 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             let w = world(lua)?;
             Ok(match w.input.gui_layout.get(&r) {
                 Some(b) => {
-                    let c = b.canvas.unwrap_or([-1.0, -1.0]);
+                    let c = if w.d().class_of(r).as_deref() == Some("ScrollingFrame") {
+                        let cs = match w.d().prop(r, "CanvasSize") {
+                            Some(Variant::UDim2(u)) => [u.x.scale, u.x.offset as f32, u.y.scale, u.y.offset as f32],
+                            _ => [0.0, 0.0, 2.0, 0.0],
+                        };
+                        b.canvas_for(cs).or(b.canvas).unwrap_or([-1.0, -1.0])
+                    } else {
+                        b.canvas.unwrap_or([-1.0, -1.0])
+                    };
                     let t = b.text.unwrap_or([-1.0, -1.0]);
-                    MultiValue::from_iter(
-                        [b.pos[0], b.pos[1], b.size[0], b.size[1], c[0], c[1], t[0], t[1]]
-                            .map(|x| Value::Number(x as f64)),
-                    )
+                    let win = b.window.unwrap_or([-1.0, -1.0]);
+                    MultiValue::from_iter([
+                        Value::Number(b.pos[0] as f64),
+                        Value::Number(b.pos[1] as f64),
+                        Value::Number(b.size[0] as f64),
+                        Value::Number(b.size[1] as f64),
+                        Value::Number(c[0] as f64),
+                        Value::Number(c[1] as f64),
+                        Value::Number(t[0] as f64),
+                        Value::Number(t[1] as f64),
+                        Value::Number(win[0] as f64),
+                        Value::Number(win[1] as f64),
+                        Value::Boolean(b.text_fits),
+                    ])
                 }
                 None => MultiValue::new(),
             })
@@ -729,6 +884,256 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             sh.focus = r;
             sh.focus_req.push(r);
             Ok(())
+        })?,
+    )?;
+    g.set(
+        "sync_tb_sel",
+        lua.create_function(|_, (inst, cur, sel): (Value, Option<i32>, Option<i32>)| {
+            if let Some(r) = opt_inst(&inst) {
+                let mut sh = crate::gui::share();
+                if let Some(c) = cur {
+                    sh.tb_cursor.insert(r, c);
+                }
+                if let Some(s) = sel {
+                    sh.tb_sel.insert(r, s);
+                }
+                sh.tb_script_sel.push((r, cur, sel));
+            }
+            Ok(())
+        })?,
+    )?;
+    g.set(
+        "take_focus_click",
+        lua.create_function(|_, inst: Value| {
+            let Some(r) = opt_inst(&inst) else { return Ok(None) };
+            let mut sh = crate::gui::share();
+            if sh.tb_focus_click.is_some_and(|(fr, _)| fr == r) {
+                Ok(sh.tb_focus_click.take().map(|(_, pos)| pos as i32))
+            } else {
+                Ok(None)
+            }
+        })?,
+    )?;
+    g.set(
+        "set_text_silent",
+        lua.create_function(|lua, (inst, text): (Value, String)| {
+            if let Some(r) = opt_inst(&inst) {
+                let mut w = world(lua)?;
+                let d = w.dm();
+                if d.exists(r) {
+                    d.set_prop_live(r, rbx_dom_weak::ustr("Text"), Variant::String(text));
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    // Sync GuiService.SelectedCoreObject into the Document so gui_walk can draw
+    // the white keyboard/gamepad focus ring around the selected CoreGui object.
+    g.set(
+        "set_selected_core",
+        lua.create_function(|lua, (gs, inst): (Value, Value)| {
+            if let Some(gs_r) = opt_inst(&gs) {
+                let target = opt_inst(&inst).unwrap_or_else(Ref::none);
+                let mut w = world(lua)?;
+                let d = w.dm();
+                if d.exists(gs_r) {
+                    d.set_prop_live(gs_r, rbx_dom_weak::ustr("SelectedCoreObject"), Variant::Ref(target));
+                }
+            }
+            Ok(())
+        })?,
+    )?;
+    g.set(
+        "set_core_menu_open",
+        lua.create_function(|_, open: bool| {
+            crate::gui::share().core_menu_open = open;
+            Ok(())
+        })?,
+    )?;
+    // Fast native class scan over DataModel skipping CorePackages (49k+ ModuleScripts),
+    // replacing full-tree Lua game:GetDescendants() scans at Play startup.
+    g.set(
+        "find_classes",
+        lua.create_function(|lua, classes: Vec<String>| {
+            let found = {
+                let w = world(lua)?;
+                let d = w.d();
+                let mut out = Vec::new();
+                let mut stack = vec![d.dom.root_ref()];
+                while let Some(r) = stack.pop() {
+                    let Some(inst) = d.dom.get_by_ref(r) else { continue };
+                    if inst.class == "CorePackages" {
+                        continue;
+                    }
+                    if classes.iter().any(|c| rustudio_core::doc::is_a(&inst.class, c)) {
+                        out.push(r);
+                    }
+                    for &child in inst.children().iter().rev() {
+                        stack.push(child);
+                    }
+                }
+                out
+            };
+            let t = lua.create_table_with_capacity(found.len(), 0)?;
+            for (i, r) in found.into_iter().enumerate() {
+                t.raw_set(i + 1, inst_value(lua, r)?)?;
+            }
+            Ok(t)
+        })?,
+    )?;
+    g.set(
+        "profile_step",
+        lua.create_function(|_, (phase, step, args): (u8, Function, MultiValue)| {
+            let name = match phase {
+                1 => "input_prune",
+                2 => "input_styles",
+                _ => return Err(rt_err("unknown GUI step phase")),
+            };
+            let _scope = rustudio_core::bench::scope(name);
+            step.call::<()>(args)
+        })?,
+    )?;
+    // Fast native style target walk under a StyleLink root: returns only
+    // styleable UI nodes (GuiBase2d / UIBase), skipping CorePackages and script
+    // module subtrees (CoreGui.RobloxGui.Modules has thousands of ModuleScripts).
+    g.set(
+        "style_targets",
+        lua.create_function(|lua, root: Value| {
+            let Some(root_r) = opt_inst(&root) else {
+                return lua.create_table();
+            };
+            let _scope = rustudio_core::bench::scope("input_style_targets");
+            let found = {
+                let w = world(lua)?;
+                let d = w.d();
+                let mut out = Vec::new();
+                let mut stack = vec![root_r];
+                while let Some(r) = stack.pop() {
+                    let Some(inst) = d.dom.get_by_ref(r) else { continue };
+                    let cls = inst.class.as_str();
+                    if matches!(cls, "CorePackages" | "ModuleScript" | "LocalScript" | "Script" | "LocalizationTable") {
+                        continue;
+                    }
+                    if rustudio_core::doc::is_a(cls, "GuiBase2d") || rustudio_core::doc::is_a(cls, "UIBase") {
+                        out.push(r);
+                    }
+                    for &child in inst.children().iter().rev() {
+                        stack.push(child);
+                    }
+                }
+                out
+            };
+            let t = lua.create_table_with_capacity(found.len(), 0)?;
+            for (i, r) in found.into_iter().enumerate() {
+                t.raw_set(i + 1, inst_value(lua, r)?)?;
+            }
+            Ok(t)
+        })?,
+    )?;
+    // Style application depends on the linked roots and their sheets, not
+    // on edits elsewhere in the DataModel. Include relatives in the old
+    // tree to notice an entire styled subtree moving out.
+    #[derive(Default)]
+    struct StyleWatch {
+        document: u64,
+        roots: rustc_hash::FxHashSet<Ref>,
+        members: rustc_hash::FxHashSet<Ref>,
+        ancestors: rustc_hash::FxHashSet<Ref>,
+    }
+    let watch = std::rc::Rc::new(std::cell::RefCell::new(StyleWatch::default()));
+    let reader = watch.clone();
+    let read_roots = |roots: Vec<Value>| roots.iter().filter_map(opt_inst).collect::<rustc_hash::FxHashSet<_>>();
+    g.set(
+        "style_watch_changed",
+        lua.create_function(move |lua, ()| {
+            let mut w = world(lua)?;
+            let d = w.dm();
+            let watch = reader.borrow();
+            if watch.document != d.id {
+                return Ok(true);
+            }
+            let rustudio_core::doc::Marks::Some(marks) = d.take_style_marks() else {
+                rustudio_core::bench::add("input_style_journal_miss", 0.0, 1);
+                return Ok(true);
+            };
+            Ok(marks.iter().any(|&mark| match mark {
+                rustudio_core::doc::Mark::Tree(r) => {
+                    if watch.members.contains(&r) || watch.ancestors.contains(&r) {
+                        return true;
+                    }
+                    // A new member can enter an old watched root. Walk its
+                    // parent chain once instead of once per StyleLink/sheet.
+                    let mut current = r;
+                    while let Some(inst) = d.dom.get_by_ref(current) {
+                        let parent = inst.parent();
+                        if watch.roots.contains(&parent) {
+                            return true;
+                        }
+                        if parent.is_none() {
+                            break;
+                        }
+                        current = parent;
+                    }
+                    false
+                }
+                rustudio_core::doc::Mark::Prop(r, _) => {
+                    watch.members.contains(&r) || watch.ancestors.contains(&r)
+                }
+            }))
+        })?,
+    )?;
+    g.set(
+        "style_watch_reset",
+        lua.create_function(move |lua, roots: Vec<Value>| {
+            let roots = read_roots(roots);
+            let mut w = world(lua)?;
+            let d = w.dm();
+            let mut watch = watch.borrow_mut();
+            let _scope = rustudio_core::bench::scope("input_style_watch_reset");
+            watch.members.clear();
+            watch.ancestors.clear();
+            for &root in &roots {
+                if d.dom.get_by_ref(root).is_none() { continue; }
+                watch.members.extend(d.dom.descendants_of(root).map(|inst| inst.referent()));
+                let mut ancestor = root;
+                while let Some(parent) = d.dom.get_by_ref(ancestor).map(|inst| inst.parent()).filter(Ref::is_some) {
+                    if !watch.ancestors.insert(parent) { break; }
+                    ancestor = parent;
+                }
+            }
+            watch.document = d.id;
+            d.take_style_marks();
+            watch.roots = roots;
+            Ok(())
+        })?,
+    )?;
+    // Cheap revision/state snapshot for skipping idle prune() and step_styles() frames.
+    g.set(
+        "style_state",
+        lua.create_function(|lua, ()| {
+            use std::hash::{Hash, Hasher};
+            let (tree_rev, style_rev, vw, vh) = {
+                let w = world(lua)?;
+                let d = w.d();
+                (d.tree_revision, d.style_revision, w.input.view_size[0], w.input.view_size[1])
+            };
+            let hover_sig = {
+                let sh = crate::gui::share();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                sh.pressed.hash(&mut h);
+                sh.focus.hash(&mut h);
+                sh.hovered.len().hash(&mut h);
+                // Order-independent mix of hovered refs.
+                let mut x = 0u64;
+                for r in &sh.hovered {
+                    let mut rh = std::collections::hash_map::DefaultHasher::new();
+                    r.hash(&mut rh);
+                    x ^= rh.finish();
+                }
+                x.hash(&mut h);
+                (h.finish() & 0x001f_ffff_ffff_ffff) as i64
+            };
+            Ok((tree_rev as i64, style_rev as i64, vw as f64, vh as f64, hover_sig))
         })?,
     )?;
     g.set(
@@ -829,18 +1234,33 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     )?;
     g.set(
         "set_page",
-        lua.create_function(|_, (lay, from, to, alpha): (Value, Value, Value, f32)| {
+        lua.create_function(|_, (lay, from, to, alpha, dir): (Value, Value, Value, f32, Option<i8>)| {
             let Some(l) = opt_inst(&lay) else { return Ok(()) };
             let mut sh = crate::gui::share();
             match opt_inst(&to) {
                 Some(t) => {
-                    sh.pages.insert(l, (opt_inst(&from).unwrap_or(t), t, alpha));
+                    sh.pages.insert(l, (opt_inst(&from).unwrap_or(t), t, alpha, dir.unwrap_or(0)));
                 }
                 None => {
                     sh.pages.remove(&l);
                 }
             }
+            sh.pages_rev = sh.pages_rev.wrapping_add(1);
             Ok(())
+        })?,
+    )?;
+    g.set(
+        "page_scrolls",
+        lua.create_function(|lua, ()| {
+            let evs = std::mem::take(&mut crate::gui::share().page_scrolls);
+            let out = lua.create_table()?;
+            for (lay, dir) in evs {
+                let t = lua.create_table()?;
+                t.set("layout", inst_value(lua, lay)?)?;
+                t.set("dir", dir)?;
+                out.push(t)?;
+            }
+            Ok(out)
         })?,
     )?;
     g.set(
@@ -980,6 +1400,18 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
         "http_error",
         lua.create_function(|_, status: u16| Ok(super::avatar::web::http_error(status)))?,
     )?;
+    // ViewportFrame:CaptureSnapshotAsync: queue on the renderer, poll from Luau.
+    g.set(
+        "vf_snap_start",
+        lua.create_function(|_, vf: LInst| Ok(crate::gui::vf_snap_request(vf.0)))?,
+    )?;
+    g.set(
+        "vf_snap_poll",
+        lua.create_function(|lua, id: u64| match crate::gui::vf_snap_poll(id) {
+            None => Ok(Value::Nil),
+            Some(uri) => Ok(Value::String(lua.create_string(uri)?)),
+        })?,
+    )?;
     // The inspect menu: set(view table or nil) / closed() (taken once).
     g.set(
         "inspect_set",
@@ -1074,13 +1506,132 @@ pub fn focus_now(lua: &Lua) {
     if crate::gui::share().focus_events.is_empty() {
         return;
     }
+    lua.remove_app_data::<EditStepCache>();
     if let Ok(f) = module(lua).and_then(|m| m.get::<Function>("focus_now")) {
         let _ = f.call::<()>(());
     }
 }
 
+/// Applies one TextBox edit/navigation commit from the UI thread in Roblox's exact
+/// signal order: commit all new values first, then fire CursorPosition -> SelectionStart -> Text.
+pub fn apply_textbox_edit(
+    lua: &Lua,
+    r: Ref,
+    text: Option<String>,
+    cursor: Option<i32>,
+    selection: Option<i32>,
+) {
+    lua.remove_app_data::<EditStepCache>();
+    let Ok(inst) = inst_value(lua, r) else { return };
+    let Ok(f) = module(lua).and_then(|m| m.get::<Function>("apply_textbox_edit")) else { return };
+    let _ = f.call::<()>((inst, text, cursor, selection));
+}
+
+/// Checks whether a GuiObject's `GuiState` transitioned (hover / press / focus)
+/// and fires `Changed` / `GetPropertyChangedSignal("GuiState")` if so.
+pub fn check_gui_state(lua: &Lua, r: Ref) {
+    let Ok(inst) = inst_value(lua, r) else { return };
+    let Ok(f) = module(lua).and_then(|m| m.get::<Function>("check_gui_state")) else { return };
+    let _ = f.call::<()>(inst);
+}
+
+#[derive(Default)]
+struct EditStepCache {
+    primed: bool,
+    busy: bool,
+    doc_id: u64,
+    tree_rev: u64,
+    style_rev: u64,
+    view_size: [u32; 2],
+    mouse_xy: [u32; 2],
+    hover_sig: i64,
+}
+
+fn compute_hover_sig() -> (i64, bool) {
+    use std::hash::{Hash, Hasher};
+    let sh = crate::gui::share();
+    let has_events = !sh.focus_events.is_empty() || !sh.mouse_edges.is_empty();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sh.pressed.hash(&mut h);
+    sh.focus.hash(&mut h);
+    sh.hovered.len().hash(&mut h);
+    let mut x = 0u64;
+    for r in &sh.hovered {
+        let mut rh = std::collections::hash_map::DefaultHasher::new();
+        r.hash(&mut rh);
+        x ^= rh.finish();
+    }
+    x.hash(&mut h);
+    ((h.finish() & 0x001f_ffff_ffff_ffff) as i64, has_events)
+}
+
 pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
-    let side = world(lua).map(|w| w.side).ok();
+    let (side, edit_key) = match world(lua) {
+        Ok(w) => {
+            let key = if w.mode == RunMode::Edit {
+                let d = w.d();
+                Some((
+                    d.id,
+                    d.tree_revision,
+                    d.style_revision,
+                    [w.input.view_size[0].to_bits(), w.input.view_size[1].to_bits()],
+                    [w.input.mouse_xy[0].to_bits(), w.input.mouse_xy[1].to_bits()],
+                ))
+            } else {
+                None
+            };
+            (Some(w.side), key)
+        }
+        Err(_) => (None, None),
+    };
+    if let Some((doc_id, tree_rev, style_rev, view_size, mouse_xy)) = edit_key {
+        let (hover_sig, has_events) = compute_hover_sig();
+        let skip = !has_events
+            && lua.app_data_ref::<EditStepCache>().is_some_and(|c| {
+                c.primed
+                    && !c.busy
+                    && c.doc_id == doc_id
+                    && c.tree_rev == tree_rev
+                    && c.style_rev == style_rev
+                    && c.view_size == view_size
+                    && c.mouse_xy == mouse_xy
+                    && c.hover_sig == hover_sig
+            });
+        if skip {
+            return Ok(());
+        }
+        let _scope = rustudio_core::bench::scope(if side == Some(Side::Server) {
+            "input_step_server"
+        } else {
+            "input_step_client"
+        });
+        let Ok(m) = module(lua) else { return Ok(()) };
+        let f: Function = m.get("step")?;
+        let busy = match f.call::<bool>(dt) {
+            Ok(b) => b,
+            Err(e) => {
+                if let Ok(mut w) = world(lua) {
+                    w.output.push((rustudio_core::log::Level::Error, format!("gui_input step: {}", error_message(&e))));
+                }
+                true
+            }
+        };
+        let (hover_after, _) = compute_hover_sig();
+        let (tree_after, style_after) = world(lua)
+            .map(|w| (w.d().tree_revision, w.d().style_revision))
+            .unwrap_or((tree_rev, style_rev));
+        lua.set_app_data(EditStepCache {
+            primed: true,
+            busy,
+            doc_id,
+            tree_rev: tree_after,
+            style_rev: style_after,
+            view_size,
+            mouse_xy,
+            hover_sig: hover_after,
+        });
+        return Ok(());
+    }
     let _scope = rustudio_core::bench::scope(if side == Some(Side::Server) {
         "input_step_server"
     } else {
@@ -1088,7 +1639,7 @@ pub fn step(lua: &Lua, dt: f64) -> mlua::Result<()> {
     });
     let Ok(m) = module(lua) else { return Ok(()) };
     let f: Function = m.get("step")?;
-    if let Err(e) = f.call::<()>(dt) {
+    if let Err(e) = f.call::<Value>(dt) {
         if let Ok(mut w) = world(lua) {
             w.output.push((rustudio_core::log::Level::Error, format!("gui_input step: {}", error_message(&e))));
         }

@@ -728,11 +728,17 @@ impl FromLua for LColor3 {
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h = (h.rem_euclid(1.0)) * 6.0;
-    let i = h.floor();
-    let f = h - i;
+    let h = h * 6.0;
+    let sector = h.floor();
+    if sector < 0.0 {
+        return [0.0; 3];
+    }
+    // HSV inputs can be outside [0, 1]. Studio uses the final sector for
+    // hue >= 1 and extrapolates its interpolation past the sector boundary.
+    let sector = sector.min(5.0);
+    let f = h - sector;
     let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
-    match i as i32 {
+    match sector as i32 {
         0 => [v, t, p],
         1 => [q, v, p],
         2 => [p, v, t],
@@ -927,7 +933,7 @@ impl UserData for LUDim2 {
     }
 
     fn add_methods<M: UserDataMethods<Self>>(m: &mut M) {
-        m.add_method("Lerp", |_, this, (o, a): (LUDim2, f32)| {
+        let do_lerp = |_: &Lua, this: &LUDim2, (o, a): (LUDim2, f32)| {
             let l = |p: LUDim, q: LUDim| LUDim {
                 scale: p.scale + (q.scale - p.scale) * a,
                 offset: (p.offset as f32 + (q.offset - p.offset) as f32 * a).round() as i32,
@@ -936,7 +942,9 @@ impl UserData for LUDim2 {
                 x: l(this.x, o.x),
                 y: l(this.y, o.y),
             })
-        });
+        };
+        m.add_method("Lerp", do_lerp);
+        m.add_method("lerp", do_lerp);
         m.add_meta_method(MetaMethod::ToString, |_, this, ()| {
             Ok(format!(
                 "{{{}, {}}}, {{{}, {}}}",
@@ -1290,12 +1298,9 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     v3.set("xAxis", LVector3(Vec3::X))?;
     v3.set("yAxis", LVector3(Vec3::Y))?;
     v3.set("zAxis", LVector3(Vec3::Z))?;
-    v3.set(
-        "FromNormalId",
-        // (an enum argument also takes the item's name or value, as Roblox's
-        // do: F3X passes "Top" etc.)
-        lua.create_function(|_, v: Value| {
-            let n = enum_arg_named(&v, "NormalId", "FromNormalId")?;
+    let from_normal_id = |func: &'static str| {
+        lua.create_function(move |_, v: Value| {
+            let n = enum_arg_named(&v, "NormalId", func)?;
             Ok(LVector3(match n.name.as_str() {
                 "Right" => Vec3::X,
                 "Top" => Vec3::Y,
@@ -1304,17 +1309,48 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
                 "Bottom" => Vec3::NEG_Y,
                 _ => Vec3::NEG_Z,
             }))
-        })?,
-    )?;
-    v3.set(
-        "FromAxis",
-        lua.create_function(|_, v: Value| {
-            let a = enum_arg_named(&v, "Axis", "FromAxis")?;
+        })
+    };
+    let from_axis = |func: &'static str| {
+        lua.create_function(move |_, v: Value| {
+            let a = enum_arg_named(&v, "Axis", func)?;
             Ok(LVector3(match a.name.as_str() {
                 "Y" => Vec3::Y,
                 "Z" => Vec3::Z,
                 _ => Vec3::X,
             }))
+        })
+    };
+    v3.set("FromNormalId", from_normal_id("FromNormalId")?)?;
+    v3.set("fromNormalId", from_normal_id("fromNormalId")?)?;
+    v3.set("FromAxis", from_axis("FromAxis")?)?;
+    v3.set("fromAxis", from_axis("fromAxis")?)?;
+    v3.set(
+        "min",
+        lua.create_function(|_, a: mlua::Variadic<Value>| {
+            if a.is_empty() {
+                return Err(rt_err("missing argument #1 to 'min' (Vector3 expected)"));
+            }
+            let mut acc = ud::<LVector3>(&a[0]).ok_or_else(|| ctor_arg(&a, 0, "Vector3"))?.0;
+            for (i, v) in a.iter().enumerate().skip(1) {
+                let u = ud::<LVector3>(v).ok_or_else(|| ctor_arg(&a, i, "Vector3"))?.0;
+                acc = acc.min(u);
+            }
+            Ok(LVector3(acc))
+        })?,
+    )?;
+    v3.set(
+        "max",
+        lua.create_function(|_, a: mlua::Variadic<Value>| {
+            if a.is_empty() {
+                return Err(rt_err("missing argument #1 to 'max' (Vector3 expected)"));
+            }
+            let mut acc = ud::<LVector3>(&a[0]).ok_or_else(|| ctor_arg(&a, 0, "Vector3"))?.0;
+            for (i, v) in a.iter().enumerate().skip(1) {
+                let u = ud::<LVector3>(v).ok_or_else(|| ctor_arg(&a, i, "Vector3"))?.0;
+                acc = acc.max(u);
+            }
+            Ok(LVector3(acc))
         })?,
     )?;
     g.set("Vector3", v3)?;
@@ -1328,6 +1364,36 @@ pub fn install(lua: &Lua, g: &Table) -> LResult<()> {
     )?;
     v2.set("zero", LVector2(Vec2::ZERO))?;
     v2.set("one", LVector2(Vec2::ONE))?;
+    v2.set("xAxis", LVector2(Vec2::X))?;
+    v2.set("yAxis", LVector2(Vec2::Y))?;
+    v2.set(
+        "min",
+        lua.create_function(|_, a: mlua::Variadic<Value>| {
+            if a.is_empty() {
+                return Err(rt_err("missing argument #1 to 'min' (Vector2 expected)"));
+            }
+            let mut acc = ud::<LVector2>(&a[0]).ok_or_else(|| ctor_arg(&a, 0, "Vector2"))?.0;
+            for (i, v) in a.iter().enumerate().skip(1) {
+                let u = ud::<LVector2>(v).ok_or_else(|| ctor_arg(&a, i, "Vector2"))?.0;
+                acc = acc.min(u);
+            }
+            Ok(LVector2(acc))
+        })?,
+    )?;
+    v2.set(
+        "max",
+        lua.create_function(|_, a: mlua::Variadic<Value>| {
+            if a.is_empty() {
+                return Err(rt_err("missing argument #1 to 'max' (Vector2 expected)"));
+            }
+            let mut acc = ud::<LVector2>(&a[0]).ok_or_else(|| ctor_arg(&a, 0, "Vector2"))?.0;
+            for (i, v) in a.iter().enumerate().skip(1) {
+                let u = ud::<LVector2>(v).ok_or_else(|| ctor_arg(&a, i, "Vector2"))?.0;
+                acc = acc.max(u);
+            }
+            Ok(LVector2(acc))
+        })?,
+    )?;
     g.set("Vector2", v2)?;
 
     // CFrame
@@ -3259,9 +3325,7 @@ impl UserData for LCatalogSearchParams {
                     },
                 }
             };
-            // (the prop is IncludeOffSaleItems; Studio's text says IncludeOffSale)
             let get = |k: &str| {
-                let k = if k == "IncludeOffSale" { "IncludeOffSaleItems" } else { k };
                 this.props.iter().find(|(n, _)| *n == k).map(|(_, v)| text(v)).unwrap_or_default()
             };
             let keys = [
@@ -3309,7 +3373,7 @@ fn catalog_search_params(lua: &Lua) -> LResult<LCatalogSearchParams> {
             ("SalesTypeFilter", e("SalesTypeFilter", "All")?),
             ("BundleTypes", Value::Table(lua.create_table()?)),
             ("AssetTypes", Value::Table(lua.create_table()?)),
-            ("IncludeOffSaleItems", Value::Boolean(false)),
+            ("IncludeOffSale", Value::Boolean(false)),
             ("CreatorName", Value::String(lua.create_string("")?)),
             ("CreatorType", e("CreatorTypeFilter", "All")?),
             ("CreatorId", Value::Number(0.0)),
@@ -3416,6 +3480,20 @@ pub fn datatype_to_variant(v: &mlua::Value) -> Option<rbx_types::Variant> {
     }
     if let Ok(x) = u.borrow::<LRegion3>() {
         return Some(V::Region3(rbx_types::Region3::new(rv3(x.min), rv3(x.max))));
+    }
+    if let Ok(x) = u.borrow::<crate::runtime::domains::services::reflect::LCaps>() {
+        let mut bits = 0u64;
+        for name in &x.0 {
+            let wire_name = match name.as_str() {
+                "Avatar" => "AvatarAppearance",
+                "AssetRequire" => "LoadUnownedAsset",
+                other => other,
+            };
+            if let Some((bit, _)) = SECURITY_CAPABILITY_BITS.iter().find(|(_, n)| *n == wire_name) {
+                bits |= 1u64 << bit;
+            }
+        }
+        return Some(V::SecurityCapabilities(rbx_types::SecurityCapabilities::from_bits(bits)));
     }
     None
 }
@@ -3733,14 +3811,21 @@ fn install_datatypes(lua: &Lua, g: &Table) -> LResult<()> {
             }
             return Ok(LPhysicalProperties::for_material(&m.name));
         }
-        // Studio casts a lone non-number to Enum.Material: a Material's name
-        // gives its properties, anything else the "default" value.
-        if let Some(Value::String(s)) = a.first().filter(|v| num(v).is_none()) {
-            let name = s.to_string_lossy();
-            if LEnumItem::from_name("Material", &name).is_some() {
-                return Ok(LPhysicalProperties::for_material(&name));
+        // Studio casts a lone non-Material argument (bad string, table, etc.)
+        // to the default PhysicalProperties (RE-DATATYPES.md constructor.bad).
+        if a.len() == 1 {
+            if let Value::String(s) = &a[0] {
+                let name = s.to_string_lossy();
+                if LEnumItem::from_name("Material", &name).is_some() {
+                    return Ok(LPhysicalProperties::for_material(&name));
+                }
             }
-            return Ok(LPhysicalProperties(PhysicalProperties { default: true, ..*LPhysicalProperties::for_material("Plastic") }));
+            if num(&a[0]).is_none() {
+                return Ok(LPhysicalProperties(PhysicalProperties {
+                    default: true,
+                    ..*LPhysicalProperties::for_material("Plastic")
+                }));
+            }
         }
         if a.len() < 3 || a.iter().take(3).any(|v| num(v).is_none()) {
             return Err(rt_err("PhysicalProperties.new expects a Material or (density, friction, elasticity[, frictionWeight, elasticityWeight[, acousticAbsorption]])"));
@@ -3885,6 +3970,41 @@ fn install_datatypes(lua: &Lua, g: &Table) -> LResult<()> {
         lua.create_function(|lua, ()| catalog_search_params(lua))?,
     )?;
     g.set("CatalogSearchParams", csp)?;
+    let sc = lua.create_table()?;
+    sc.set(
+        "new",
+        lua.create_function(|_, args: mlua::MultiValue| {
+            let mut out = Vec::new();
+            for v in args {
+                let name = match &v {
+                    Value::UserData(u) => {
+                        let e = u
+                            .borrow::<LEnumItem>()
+                            .map_err(|_| mlua::Error::runtime("Expected Enum.SecurityCapability"))?;
+                        if e.enum_type != "SecurityCapability" {
+                            return Err(mlua::Error::runtime("Expected Enum.SecurityCapability"));
+                        }
+                        e.name.clone()
+                    }
+                    Value::String(s) => s.to_string_lossy(),
+                    _ => return Err(mlua::Error::runtime("Expected Enum.SecurityCapability")),
+                };
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            Ok(crate::runtime::domains::services::reflect::LCaps(out))
+        })?,
+    )?;
+    sc.set(
+        "fromCurrent",
+        lua.create_function(|_, ()| {
+            Ok(crate::runtime::domains::services::reflect::LCaps(
+                SECURITY_CAPABILITY_BITS.iter().map(|(_, n)| (*n).to_string()).collect(),
+            ))
+        })?,
+    )?;
+    g.set("SecurityCapabilities", sc)?;
     Ok(())
 }
 
@@ -3997,6 +4117,18 @@ mod tests {
                 and la.LookVector:FuzzyEq(Vector3.new(0,0,-1))
                 and o.RightVector:FuzzyEq(Vector3.xAxis)
                 and Vector3.FromAxis(Enum.Axis.Y) == Vector3.yAxis
+                and Vector3.fromAxis(Enum.Axis.Y) == Vector3.yAxis
+                and Vector3.fromAxis(Enum.Axis.Z) == Vector3.zAxis
+                and Vector3.fromNormalId(Enum.NormalId.Top) == Vector3.yAxis
+                and Vector3.fromNormalId(Enum.NormalId.Left) == -Vector3.xAxis
+                and Vector3.min(Vector3.new(1, 5, 3), Vector3.new(4, 2, 0)) == Vector3.new(1, 2, 0)
+                and Vector3.max(Vector3.new(1, 5, 3), Vector3.new(4, 2, 0)) == Vector3.new(4, 5, 3)
+                and Vector2.xAxis == Vector2.new(1, 0)
+                and Vector2.yAxis == Vector2.new(0, 1)
+                and Vector2.min(Vector2.new(1, 5), Vector2.new(4, 2)) == Vector2.new(1, 2)
+                and Vector2.max(Vector2.new(1, 5), Vector2.new(4, 2)) == Vector2.new(4, 5)
+                and typeof(PhysicalProperties.new({ Density = 0.0001, 0.3, 0.5 })) == "PhysicalProperties"
+                and typeof(PhysicalProperties.new("bad")) == "PhysicalProperties"
                 and math.abs(v - 0.5) < 1e-6
                 and typeof(BrickColor.random()) == "BrickColor"
             "#,
@@ -4569,22 +4701,27 @@ pub fn install_font(lua: &Lua, g: &Table) -> LResult<()> {
     t.set(
         "fromEnum",
         lua.create_function(|_, e: Value| {
-            // Enum.Font items name their family (Enum.Font.Oswald → Oswald.json).
             let name = ud::<LEnumItem>(&e)
                 .map(|i| i.name)
-                .unwrap_or_else(|| "SourceSansPro".into());
-            let (family, bold) = match name.strip_suffix("Bold") {
-                Some(base) if !base.is_empty() => (base.to_string(), true),
-                _ => (name, false),
+                .unwrap_or_else(|| "SourceSans".into());
+            let (family, weight_num, italic) = crate::gui::legacy_face_key(&name);
+            let mut f = font_from_parts(family, None, None)?;
+            f.0.weight = match weight_num {
+                100 => rbx_types::FontWeight::Thin,
+                200 => rbx_types::FontWeight::ExtraLight,
+                300 => rbx_types::FontWeight::Light,
+                500 => rbx_types::FontWeight::Medium,
+                600 => rbx_types::FontWeight::SemiBold,
+                700 => rbx_types::FontWeight::Bold,
+                800 => rbx_types::FontWeight::ExtraBold,
+                900 => rbx_types::FontWeight::Heavy,
+                _ => rbx_types::FontWeight::Regular,
             };
-            let mut f = font_from_parts(
-                format!("rbxasset://fonts/families/{family}.json"),
-                None,
-                None,
-            )?;
-            if bold {
-                f.0.weight = rbx_types::FontWeight::Bold;
-            }
+            f.0.style = if italic {
+                rbx_types::FontStyle::Italic
+            } else {
+                rbx_types::FontStyle::Normal
+            };
             Ok(f)
         })?,
     )?;

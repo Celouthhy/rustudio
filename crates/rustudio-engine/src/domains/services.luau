@@ -197,7 +197,10 @@ function M.ResetPropertyToDefault(self, prop)
 	local d = default_instance(self.ClassName)
 	if not d then return end
 	local ok, def = pcall(function() return d[prop] end)
-	if ok then self[prop] = def end
+	if ok then
+		self[prop] = def
+		if __rs_styles_dirty then __rs_styles_dirty() end
+	end
 end
 
 -- No StyleSheet applies to the instance: its styled value is its own.

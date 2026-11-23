@@ -4,12 +4,20 @@
 //! the formatting rules were measured in Studio (checks/parity/players_chat.md).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mlua::{Lua, MultiValue, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 use serde_json::{json, Value as J};
 
 use crate::runtime::*;
+
+static CONTENTS_GEN: AtomicU64 = AtomicU64::new(1);
+
+/// Called whenever a LocalizationTable's `Contents` property is written.
+pub fn bump_contents_gen() {
+    CONTENTS_GEN.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Entry {
@@ -28,9 +36,35 @@ pub struct Translator {
     pub locale: String,
 }
 
+#[derive(Clone, Debug)]
+struct CachedTable {
+    gen: u64,
+    raw: String,
+    entries: Vec<Entry>,
+    by_key: HashMap<String, Vec<usize>>,
+    by_source: HashMap<String, Vec<usize>>,
+}
+
+impl CachedTable {
+    fn from_entries(gen: u64, raw: String, entries: Vec<Entry>) -> Self {
+        let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            if !e.key.is_empty() {
+                by_key.entry(e.key.clone()).or_default().push(i);
+            }
+            if !e.source.is_empty() {
+                by_source.entry(e.source.clone()).or_default().push(i);
+            }
+        }
+        Self { gen, raw, entries, by_key, by_source }
+    }
+}
+
 #[derive(Default)]
 pub struct LocState {
     pub translators: HashMap<Ref, Translator>,
+    cache: HashMap<Ref, CachedTable>,
 }
 
 fn state(lua: &Lua) -> mlua::Result<mlua::AppDataRefMut<'_, LocState>> {
@@ -89,19 +123,60 @@ pub fn serialize(entries: &[Entry]) -> String {
     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
 }
 
-pub fn entries_of(lua: &Lua, r: Ref) -> mlua::Result<Vec<Entry>> {
-    let text = match world(lua)?.d().prop(r, "Contents") {
-        Some(Variant::String(s)) => s,
-        _ => String::new(),
-    };
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
+fn ensure_cached(lua: &Lua, r: Ref) -> mlua::Result<()> {
+    let cur_gen = CONTENTS_GEN.load(Ordering::Relaxed);
+    {
+        let st = state(lua)?;
+        if let Some(c) = st.cache.get(&r) {
+            if c.gen == cur_gen {
+                return Ok(());
+            }
+        }
     }
-    Ok(parse(&text).unwrap_or_default())
+    let text_opt: Option<String> = {
+        let w = world(lua)?;
+        let d = w.d();
+        let raw_ref = d
+            .dom
+            .get_by_ref(r)
+            .and_then(|i| i.properties.get(&rbx_dom_weak::ustr("Contents")))
+            .and_then(|v| match v {
+                Variant::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let mut st = state(lua)?;
+        if let Some(c) = st.cache.get_mut(&r) {
+            if c.raw == raw_ref {
+                c.gen = cur_gen;
+                return Ok(());
+            }
+        }
+        Some(raw_ref.to_string())
+    };
+    let text = text_opt.unwrap_or_default();
+    let entries = if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse(&text).unwrap_or_default()
+    };
+    state(lua)?.cache.insert(r, CachedTable::from_entries(cur_gen, text, entries));
+    Ok(())
+}
+
+pub fn entries_of(lua: &Lua, r: Ref) -> mlua::Result<Vec<Entry>> {
+    ensure_cached(lua, r)?;
+    Ok(state(lua)?.cache.get(&r).map(|c| c.entries.clone()).unwrap_or_default())
 }
 
 fn save(lua: &Lua, r: Ref, entries: &[Entry]) -> mlua::Result<()> {
-    store_prop(lua, r, "Contents", Variant::String(serialize(entries)))
+    let raw = serialize(entries);
+    store_prop(lua, r, "Contents", Variant::String(raw.clone()))?;
+    let cur_gen = CONTENTS_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    state(lua)?
+        .cache
+        .insert(r, CachedTable::from_entries(cur_gen, raw, entries.to_vec()));
+    Ok(())
 }
 
 /// Same entry: by key when one is given, else by source and context.
@@ -152,7 +227,7 @@ fn entries_from_lua(v: &Value) -> mlua::Result<Vec<Entry>> {
         let field = |name: &str| -> mlua::Result<String> {
             match row.raw_get::<Value>(name)? {
                 Value::String(s) => Ok(s.to_str()?.to_string()),
-                Value::Nil if name == "Example" || name == "Context" || name == "Key" => Ok(String::new()),
+                Value::Nil if matches!(name, "Example" | "Context" | "Key" | "Source") => Ok(String::new()),
                 _ => Err(rt_err(format!(
                     "Entry at index {i} had invalid Key/Source/Context: Entry at index {i} \"{name}\" was not a string."
                 ))),
@@ -327,6 +402,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("RemoveTargetLocale", "LocalizationTable"),
     ("FormatByKey", "Translator"),
     ("Translate", "Translator"),
+    ("RobloxOnlyTranslate", "Translator"),
     ("GetTableEntries", "LocalizationService"),
     ("GetCorescriptLocalizations", "LocalizationService"),
 ];
@@ -377,12 +453,18 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
         "GetString" => {
             let locale = s_arg(args, 1)?;
             let key = s_arg(args, 2)?;
-            let e = entries_of(lua, this)?;
-            let Some(x) = e.iter().find(|x| x.key == key) else {
+            ensure_cached(lua, this)?;
+            let st = state(lua)?;
+            let found = st.cache.get(&this).and_then(|c| {
+                c.by_key.get(&key).and_then(|idxs| idxs.first().map(|&i| &c.entries[i]))
+            });
+            let Some(x) = found else {
                 return Err(rt_err(format!("LocalizationTable does not contain key \"{key}\"")));
             };
-            match x.values.iter().find(|(k, _)| k.eq_ignore_ascii_case(&locale)) {
-                Some((_, v)) => one(Value::String(lua.create_string(v)?)),
+            let val = x.values.iter().find(|(k, _)| k.eq_ignore_ascii_case(&locale)).map(|(_, v)| v.clone());
+            drop(st);
+            match val {
+                Some(v) => one(Value::String(lua.create_string(v)?)),
                 None => Err(rt_err(format!(
                     "LocalizationTable entry with key \"{key}\" does not contain locale \"{locale}\""
                 ))),
@@ -496,20 +578,32 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
                     Some(Variant::String(s)) if !s.is_empty() => s,
                     _ => "en-us".into(),
                 };
-                for e in entries_of(lua, r)?.iter().filter(|e| e.key == key) {
-                    let text = value_for(e, &t.locale).or_else(|| {
-                        (source_locale.split('-').next() == t.locale.to_ascii_lowercase().split('-').next())
-                            .then_some(e.source.as_str())
-                    });
-                    if let Some(p) = text {
-                        let s = format(p, &arg(args, 2)).map_err(rt_err)?;
-                        return one(Value::String(lua.create_string(s)?));
-                    }
+                ensure_cached(lua, r)?;
+                let matched: Option<String> = {
+                    let st = state(lua)?;
+                    st.cache.get(&r).and_then(|c| {
+                        c.by_key.get(&key).and_then(|idxs| {
+                            idxs.iter().find_map(|&i| {
+                                let e = &c.entries[i];
+                                value_for(e, &t.locale)
+                                    .or_else(|| {
+                                        (source_locale.split('-').next()
+                                            == t.locale.to_ascii_lowercase().split('-').next())
+                                        .then_some(e.source.as_str())
+                                    })
+                                    .map(|s| s.to_string())
+                            })
+                        })
+                    })
+                };
+                if let Some(p) = matched {
+                    let s = format(&p, &arg(args, 2)).map_err(rt_err)?;
+                    return one(Value::String(lua.create_string(s)?));
                 }
             }
             Err(rt_err(format!("Key {key} not found for locale {}", t.locale)))
         }
-        "Translate" => {
+        "Translate" | "RobloxOnlyTranslate" => {
             let ctx = opt_inst(&arg(args, 1));
             let text = s_arg(args, 2)?;
             let t = state(lua)?.translators.get(&this).cloned().unwrap_or(Translator { table: None, locale: "en-us".into() });
@@ -519,22 +613,29 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
             };
             let mut best: Option<(u8, String)> = None;
             for r in tables_for(lua, &t)? {
-                for e in entries_of(lua, r)?.iter().filter(|e| e.source == text) {
-                    let Some(v) = value_for(e, &t.locale) else { continue };
-                    // Exact context, then an entry under the instance's
-                    // path, then one without context (Studio picked the
-                    // "game.Workspace.Btn" entry for Translate(workspace)).
-                    let rank = if !e.context.is_empty() && e.context == path {
-                        3
-                    } else if !e.context.is_empty() && !path.is_empty() && e.context.starts_with(&path) {
-                        2
-                    } else if e.context.is_empty() {
-                        1
-                    } else {
-                        0
-                    };
-                    if rank > 0 && best.as_ref().is_none_or(|(b, _)| rank > *b) {
-                        best = Some((rank, v.to_string()));
+                ensure_cached(lua, r)?;
+                let st = state(lua)?;
+                if let Some(c) = st.cache.get(&r) {
+                    if let Some(idxs) = c.by_source.get(&text) {
+                        for &i in idxs {
+                            let e = &c.entries[i];
+                            let Some(v) = value_for(e, &t.locale) else { continue };
+                            // Exact context, then an entry under the instance's
+                            // path, then one without context (Studio picked the
+                            // "game.Workspace.Btn" entry for Translate(workspace)).
+                            let rank = if !e.context.is_empty() && e.context == path {
+                                3
+                            } else if !e.context.is_empty() && !path.is_empty() && e.context.starts_with(&path) {
+                                2
+                            } else if e.context.is_empty() {
+                                1
+                            } else {
+                                0
+                            };
+                            if rank > 0 && best.as_ref().is_none_or(|(b, _)| rank > *b) {
+                                best = Some((rank, v.to_string()));
+                            }
+                        }
                     }
                 }
             }
@@ -553,8 +654,29 @@ fn call_inner(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Resu
             }
             one(Value::Table(out))
         }
-        // Roblox's own CoreScript tables are only given to Roblox scripts.
-        "GetCorescriptLocalizations" => one(Value::Table(lua.create_table()?)),
+        // Roblox's own CoreScript tables under CoreGui (core_scripts.rs).
+        "GetCorescriptLocalizations" => {
+            let refs: Vec<Ref> = {
+                let w = world(lua)?;
+                let d = w.d();
+                let root = d.dom.root_ref();
+                d.find_child(root, "CoreGui")
+                    .and_then(|cg| d.dom.get_by_ref(cg))
+                    .map(|i| {
+                        i.children()
+                            .iter()
+                            .copied()
+                            .filter(|c| d.class_of(*c).is_some_and(|k| k == "LocalizationTable"))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let out = lua.create_table()?;
+            for r in refs {
+                out.raw_push(inst_value(lua, r)?)?;
+            }
+            one(Value::Table(out))
+        }
         _ => Ok(MultiValue::new()),
     }
 }

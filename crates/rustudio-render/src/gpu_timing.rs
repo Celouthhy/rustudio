@@ -179,6 +179,7 @@ pub fn end_frame(device: &wgpu::Device, queue: &wgpu::Queue) {
     if !on() {
         return;
     }
+    let _scope = rustudio_core::bench::scope("gpu_timing_end_frame");
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(st) = g.as_mut() else { return };
     if let Some(cur) = st.cur {

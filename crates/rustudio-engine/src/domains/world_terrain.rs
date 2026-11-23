@@ -126,6 +126,12 @@ fn cell_material(lua: &Lua, m: u8) -> mlua::Result<Value> {
 }
 
 pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) -> Option<mlua::Result<MultiValue>> {
+    if class == "TerrainRegion" {
+        return match name {
+            "ApplyTransform" | "ApplyTransformSubregion" => Some(region_transform_call(lua, name, this, args)),
+            _ => None,
+        };
+    }
     if class != "Terrain" {
         return None;
     }
@@ -217,10 +223,321 @@ pub fn call(lua: &Lua, name: &str, this: Ref, class: &str, args: &MultiValue) ->
             if arg(args, 1).is_nil() { Err(missing(1)) } else { none() }
         }
         "GetMaterialSlot" | "SetMaterialSlot" | "ResetMaterialSlot" => slot_call(lua, name, this, args),
+        "IsMaterialSlotInvalid" => (|| {
+            let i = num_arg(args, 1).ok_or_else(|| missing(1))? as i64;
+            one(Value::Boolean(!(0..64).contains(&i)))
+        })(),
+        "CanSmoothVoxelsBeUpgraded" => one(Value::Boolean(false)),
+        "GetTerrainWireframe" => (|| {
+            let _cf = ud::<LCFrame>(&arg(args, 1)).ok_or_else(|| rt_err("Terrain:GetTerrainWireframe: CFrame expected"))?;
+            let _sz = vec3_arg(args, 2)?;
+            one(Value::Table(lua.create_table()?))
+        })(),
+        "GenerateWaterFlowMap" | "ResetWaterFlowMap" => none(),
+        "ReplaceMaterialInTransform"
+        | "ReplaceMaterialInTransformSubregion"
+        | "ReplaceMaterialInTransformSubregionSlot"
+        | "SetMaterialInTransform"
+        | "SetMaterialInTransformSubregion"
+        | "SetMaterialInTransformSubregionSlot" => transform_material_call(lua, name, this, args),
+        "FillBallSlot" | "FillBlockSlot" | "FillCylinderSlot" | "FillRegionSlot" | "FillWedgeSlot" => {
+            fill_slot_call(lua, name, this, args)
+        }
+        "SmoothRegion" | "SmoothRegionMaterialSlots" => smooth_region_call(lua, name, this, args),
         "ReadVoxelsAsync_beta" | "WriteVoxelsAsync_beta" | "ModifyVoxelsAsync_beta" | "IterateVoxelsAsync_beta"
         | "ClearVoxelsAsync_beta" => Err(rt_err("Beta is not enabled")),
         _ => return None,
     })
+}
+
+fn region_transform_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let rot = ud::<LCFrame>(&arg(args, 1))
+        .ok_or_else(|| rt_err(format!("TerrainRegion:{name}: CFrame expected")))?
+        .0
+        .rot;
+    let size = vec3_arg(args, 2)?;
+    let sub = if name == "ApplyTransformSubregion" {
+        let rg = ud::<LRegion3int16>(&arg(args, 3))
+            .ok_or_else(|| rt_err("TerrainRegion:ApplyTransformSubregion: Region3int16 expected"))?;
+        Some((rg.min.0.map(i32::from), rg.max.0.map(i32::from)))
+    } else {
+        None
+    };
+    let src = {
+        let w = world(lua)?;
+        let d = w.d();
+        let ext = |k: &str| match d.prop(this, k) {
+            Some(rbx_dom_weak::types::Variant::Vector3int16(v)) => [v.x as i32, v.y as i32, v.z as i32],
+            _ => [0; 3],
+        };
+        let (min, max) = (ext("ExtentsMin"), ext("ExtentsMax"));
+        let grid = match d.prop(this, "SmoothGrid") {
+            Some(rbx_dom_weak::types::Variant::BinaryString(b)) => AsRef::<[u8]>::as_ref(&b).to_vec(),
+            _ => Vec::new(),
+        };
+        rustudio_core::terrain_region::Region::from_smooth_grid(&grid, min, max)
+            .map_err(|e| rt_err(format!("TerrainRegion:{name}: {e}")))?
+    };
+    let out = src.apply_transform(rot, size, sub);
+    let v3 = |c: [i32; 3]| {
+        rbx_dom_weak::types::Variant::Vector3int16(rbx_dom_weak::types::Vector3int16::new(
+            c[0] as i16,
+            c[1] as i16,
+            c[2] as i16,
+        ))
+    };
+    let max_ext = [0, 1, 2].map(|k| out.size[k] - 1);
+    let grid_bytes = out.to_smooth_grid([0; 3]);
+    if name == "ApplyTransformSubregion" {
+        let r = {
+            let mut w = world(lua)?;
+            let r = w.dm().dom.insert(
+                Ref::none(),
+                rbx_dom_weak::InstanceBuilder::new("TerrainRegion").with_name("TerrainRegion"),
+            );
+            w.orphans.insert(r);
+            if let Some(i) = w.dm().dom.get_by_ref_mut(r) {
+                i.properties.insert(rbx_dom_weak::ustr("ExtentsMin"), v3([0; 3]));
+                i.properties.insert(rbx_dom_weak::ustr("ExtentsMax"), v3(max_ext));
+                i.properties.insert(rbx_dom_weak::ustr("SmoothGrid"), rbx_dom_weak::types::Variant::BinaryString(grid_bytes.into()));
+            }
+            r
+        };
+        one(inst_value(lua, r)?)
+    } else {
+        let mut w = world(lua)?;
+        if let Some(i) = w.dm().dom.get_by_ref_mut(this) {
+            i.properties.insert(rbx_dom_weak::ustr("ExtentsMin"), v3([0; 3]));
+            i.properties.insert(rbx_dom_weak::ustr("ExtentsMax"), v3(max_ext));
+            i.properties.insert(rbx_dom_weak::ustr("SmoothGrid"), rbx_dom_weak::types::Variant::BinaryString(grid_bytes.into()));
+        }
+        none()
+    }
+}
+
+fn slot_to_mat(lua: &Lua, this: Ref, slot: i64) -> mlua::Result<u8> {
+    let doc_id = world(lua)?.d().id;
+    let custom = SLOTS.with(|s| s.borrow().get(&(doc_id, this)).and_then(|m| m.get(&slot)).map(|x| x.0));
+    Ok(custom.unwrap_or_else(|| if (0..23).contains(&slot) { slot as u8 } else { terrain::material_index("Grass").unwrap_or(2) }))
+}
+
+fn mat_from_arg(v: &Value) -> mlua::Result<u8> {
+    let e = ud::<LEnumItem>(v)
+        .filter(|e| e.enum_type == "Material")
+        .ok_or_else(|| rt_err("Unable to cast value to Material"))?;
+    Ok(terrain::material_index(&e.name).unwrap_or(0))
+}
+
+fn subregion_bounds(v: &Value) -> Option<([i32; 3], [i32; 3])> {
+    if let Some(r) = ud::<LRegion3int16>(v) {
+        return Some((r.min.0.map(i32::from), r.max.0.map(i32::from)));
+    }
+    if let Some(r) = ud::<LRegion3>(v) {
+        let lo = (r.min / terrain::VOXEL).floor().as_ivec3().to_array();
+        let hi = ((r.max / terrain::VOXEL).ceil().as_ivec3() - glam::IVec3::ONE).to_array();
+        return Some((lo, hi));
+    }
+    None
+}
+
+fn transform_material_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let xf = ud::<LCFrame>(&arg(args, 1)).ok_or_else(|| rt_err(format!("Terrain:{name}: CFrame expected")))?.0;
+    let h = vec3_arg(args, 2)?.abs() * 0.5;
+    let (src_mat, dst_mat, sub) = match name {
+        "ReplaceMaterialInTransform" => (Some(mat_from_arg(&arg(args, 3))?), mat_from_arg(&arg(args, 4))?, None),
+        "ReplaceMaterialInTransformSubregion" => (
+            Some(mat_from_arg(&arg(args, 3))?),
+            mat_from_arg(&arg(args, 4))?,
+            subregion_bounds(&arg(args, 5)),
+        ),
+        "ReplaceMaterialInTransformSubregionSlot" => (
+            Some(slot_to_mat(lua, this, num_arg(args, 3).unwrap_or(0.0) as i64)?),
+            slot_to_mat(lua, this, num_arg(args, 4).unwrap_or(2.0) as i64)?,
+            subregion_bounds(&arg(args, 5)),
+        ),
+        "SetMaterialInTransform" => (None, mat_from_arg(&arg(args, 3))?, None),
+        "SetMaterialInTransformSubregion" => (None, mat_from_arg(&arg(args, 3))?, subregion_bounds(&arg(args, 4))),
+        _ => (
+            None,
+            slot_to_mat(lua, this, num_arg(args, 3).unwrap_or(2.0) as i64)?,
+            subregion_bounds(&arg(args, 4)),
+        ),
+    };
+    let e = xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z;
+    let base_lo = ((xf.pos - e) / terrain::VOXEL).floor().as_ivec3().to_array();
+    let base_hi = ((xf.pos + e) / terrain::VOXEL).ceil().as_ivec3().to_array();
+    let (lo, hi) = if let Some((rlo, rhi)) = sub {
+        // SetMaterialInTransformSubregion / ReplaceMaterialInTransformSubregion take
+        // `targetRegion` as a half-open Region3int16 voxel offset from the transform's
+        // minimum bounding cell (TerrainEditor's CreateSubregions tiles [0..size/4]).
+        (
+            [0, 1, 2].map(|k| base_lo[k] + rlo[k]),
+            [0, 1, 2].map(|k| (base_lo[k] + rhi[k] - 1).min(base_hi[k])),
+        )
+    } else {
+        (base_lo, base_hi)
+    };
+    let mut v = voxels(lua, this)?;
+    let mut edits = Vec::new();
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let c = glam::Vec3::from(terrain::voxel_center([x, y, z]));
+                let local = xf.rot.transpose() * (c - xf.pos);
+                if local.x.abs() > h.x + 1e-3 || local.y.abs() > h.y + 1e-3 || local.z.abs() > h.z + 1e-3 {
+                    continue;
+                }
+                let (m, occ) = v.get(x, y, z);
+                let new_occ = match src_mat {
+                    None => {
+                        if dst_mat == 0 {
+                            0.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    Some(0) => {
+                        if m != 0 && occ > 0.0 {
+                            continue;
+                        }
+                        if dst_mat == 0 {
+                            0.0
+                        } else {
+                            1.0
+                        }
+                    }
+                    Some(src) => {
+                        if m != src || occ <= 0.0 {
+                            continue;
+                        }
+                        if dst_mat == 0 {
+                            0.0
+                        } else {
+                            occ
+                        }
+                    }
+                };
+                edits.push(([x, y, z], dst_mat, new_occ));
+            }
+        }
+    }
+    if !edits.is_empty() {
+        v.edit(edits);
+    }
+    put_back(lua, this, v)?;
+    none()
+}
+
+fn fill_slot_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let mut v = voxels(lua, this)?;
+    match name {
+        "FillBallSlot" => {
+            let center = vec3_arg(args, 1)?;
+            let r = num_arg(args, 2).ok_or_else(|| missing(2))?.abs() as f32;
+            let mat = slot_to_mat(lua, this, num_arg(args, 3).unwrap_or(2.0) as i64)?;
+            let lo = (center - glam::Vec3::splat(r)).to_array();
+            let hi = (center + glam::Vec3::splat(r)).to_array();
+            v.fill(lo, hi, mat, |c| glam::Vec3::from(c).distance(center) - r);
+        }
+        "FillBlockSlot" | "FillWedgeSlot" => {
+            let xf = ud::<LCFrame>(&arg(args, 1)).ok_or_else(|| rt_err(format!("Terrain:{name}: CFrame expected")))?.0;
+            let h = vec3_arg(args, 2)?.abs() * 0.5;
+            let mat = slot_to_mat(lua, this, num_arg(args, 3).unwrap_or(2.0) as i64)?;
+            let e = xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z;
+            let wedge = name == "FillWedgeSlot";
+            v.fill((xf.pos - e).to_array(), (xf.pos + e).to_array(), mat, |c| {
+                let p = xf.rot.transpose() * (glam::Vec3::from(c) - xf.pos);
+                let q = p.abs() - h;
+                let d = q.max(glam::Vec3::ZERO).length() + q.max_element().min(0.0);
+                if wedge {
+                    let n = glam::Vec3::new(0.0, h.z, -h.y).normalize_or_zero();
+                    d.max(n.dot(p))
+                } else {
+                    d
+                }
+            });
+        }
+        "FillCylinderSlot" => {
+            let xf = ud::<LCFrame>(&arg(args, 1)).ok_or_else(|| rt_err("Terrain:FillCylinderSlot: CFrame expected"))?.0;
+            let height = num_arg(args, 2).ok_or_else(|| missing(2))?.abs() as f32;
+            let r = num_arg(args, 3).ok_or_else(|| missing(3))?.abs() as f32;
+            let mat = slot_to_mat(lua, this, num_arg(args, 4).unwrap_or(2.0) as i64)?;
+            let h = glam::Vec3::new(r, height * 0.5, r);
+            let e = xf.rot.x_axis.abs() * h.x + xf.rot.y_axis.abs() * h.y + xf.rot.z_axis.abs() * h.z;
+            v.fill((xf.pos - e).to_array(), (xf.pos + e).to_array(), mat, |c| {
+                let p = xf.rot.transpose() * (glam::Vec3::from(c) - xf.pos);
+                let q = glam::Vec2::new(glam::Vec2::new(p.x, p.z).length() - r, p.y.abs() - height * 0.5);
+                q.max(glam::Vec2::ZERO).length() + q.max_element().min(0.0)
+            });
+        }
+        "FillRegionSlot" => {
+            let rg = ud::<LRegion3>(&arg(args, 1)).ok_or_else(|| rt_err("Terrain:FillRegionSlot: Region3 expected"))?;
+            let mat = slot_to_mat(lua, this, num_arg(args, 3).unwrap_or(2.0) as i64)?;
+            let (lo, hi) = (rg.min, rg.max);
+            v.fill(lo.to_array(), hi.to_array(), mat, |c| {
+                let c = glam::Vec3::from(c);
+                if c.cmpge(lo).all() && c.cmple(hi).all() { -terrain::VOXEL } else { terrain::VOXEL }
+            });
+        }
+        _ => {}
+    }
+    put_back(lua, this, v)?;
+    none()
+}
+
+fn smooth_region_call(lua: &Lua, name: &str, this: Ref, args: &MultiValue) -> mlua::Result<MultiValue> {
+    let rg = ud::<LRegion3>(&arg(args, 1)).ok_or_else(|| rt_err(format!("Terrain:{name}: Region3 expected")))?;
+    let strength = (num_arg(args, 3).unwrap_or(0.5) as f32).clamp(0.0, 1.0);
+    let a = (rg.min / terrain::VOXEL).round().as_ivec3().to_array();
+    let b = (rg.max / terrain::VOXEL).round().as_ivec3().to_array();
+    let dims = [0, 1, 2].map(|k| (b[k] - a[k]).max(0) as usize);
+    let v = voxels(lua, this)?;
+    let mats = lua.create_table()?;
+    let occs = lua.create_table()?;
+    let size = LVector3(glam::Vec3::new(dims[0] as f32, dims[1] as f32, dims[2] as f32)).into_value();
+    mats.set("Size", size.clone())?;
+    occs.set("Size", size)?;
+    let use_slots = name == "SmoothRegionMaterialSlots";
+    for ix in 0..dims[0] {
+        let mx = lua.create_table()?;
+        let ox = lua.create_table()?;
+        for iy in 0..dims[1] {
+            let my = lua.create_table()?;
+            let oy = lua.create_table()?;
+            for iz in 0..dims[2] {
+                let (cx, cy, cz) = (a[0] + ix as i32, a[1] + iy as i32, a[2] + iz as i32);
+                let (m0, o0) = v.get(cx, cy, cz);
+                let mut sum = 0.0f32;
+                let mut best_m = m0;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let (mn, on) = v.get(cx + dx, cy + dy, cz + dz);
+                            sum += on;
+                            if best_m == 0 && mn != 0 && on > 0.0 {
+                                best_m = mn;
+                            }
+                        }
+                    }
+                }
+                let avg = sum / 27.0;
+                let occ = (o0 + (avg - o0) * strength).clamp(0.0, 1.0);
+                let m_out = if occ <= 0.0 { 0 } else { best_m };
+                if use_slots {
+                    my.set(iz + 1, m_out as i64)?;
+                } else {
+                    my.set(iz + 1, enum_item(lua, "Material", terrain::material_name(m_out))?)?;
+                }
+                oy.set(iz + 1, occ as f64)?;
+            }
+            mx.set(iy + 1, my)?;
+            ox.set(iy + 1, oy)?;
+        }
+        mats.set(ix + 1, mx)?;
+        occs.set(ix + 1, ox)?;
+    }
+    put_back(lua, this, v)?;
+    Ok(MultiValue::from_iter([Value::Table(mats), Value::Table(occs)]))
 }
 
 /// The smooth material index a CellMaterial value writes.

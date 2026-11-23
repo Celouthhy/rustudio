@@ -24,13 +24,13 @@
 //!   shared by all plugins of a DataModel.
 //! - Plugin.Name and Plugin.Parent can be written by the plugin.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use mlua::{Lua, Table, Value};
 use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 
-use rustudio_engine::runtime::security;
+use rustudio_core::core_scripts::Bytecode;
 use rustudio_engine::runtime::{world, RunMode, Runtime};
 
 use super::PluginId;
@@ -39,15 +39,21 @@ use super::PluginId;
 #[derive(Clone)]
 pub struct LoadSpec {
     pub id: PluginId,
-    /// The Plugin instance's Name (`user_X.rbxmx`, `cloud_123`).
+    /// The Plugin instance's Name (`user_X.rbxmx`, `cloud_123`, `builtin_X.rbxm`).
     pub name: String,
-    /// printidentity's "Current asset id": -2 for a local plugin.
+    /// printidentity's "Current asset id": -2 for a local plugin, -1 for built-in.
     pub asset_id: i64,
-    /// The settings file key: "0" for local plugins (they share one
+    /// The settings file key: "0" for local/built-in plugins (they share one
     /// file), the asset id for installed ones.
     pub settings_key: String,
+    /// Thread security identity (5 for user/cloud plugins, 6 for Studio built-ins).
+    pub identity: u8,
+    /// True for Roblox Studio built-in plugins (`BuiltInPlugins/Optimized_Embedded_Signature`).
+    pub is_builtin: bool,
     /// The plugin's model: the root's children are its top-level items.
     pub tree: std::sync::Arc<WeakDom>,
+    /// Precompiled Luau bytecode keyed by Ref in `tree` (built-in plugins).
+    pub bytecode: std::sync::Arc<HashMap<Ref, Bytecode>>,
 }
 
 /// A plugin-made object the UI draws (toolbars, buttons, actions,
@@ -67,7 +73,7 @@ pub enum UiKind {
     Action { id: String, text: String, status_tip: String, icon: String, allow_binding: bool },
     Menu { id: String, title: String, icon: String },
     DockWidget { id: String, info: DockInfo },
-    QWidget { id: String },
+    QWidget { id: String, float_x: f64, float_y: f64 },
 }
 
 /// DockWidgetPluginGuiInfo.new's fields.
@@ -90,6 +96,8 @@ pub struct VmPlugin {
     pub name: String,
     pub asset_id: i64,
     pub settings_key: String,
+    pub identity: u8,
+    pub is_builtin: bool,
     /// Scripts started (each stopped on unload).
     pub scripts: Vec<Ref>,
     /// RunContext Plugin scripts waiting for the end of the load batch.
@@ -114,6 +122,9 @@ pub struct PluginVm {
     /// a plugin activates (`PluginHost::take_activation_change`).
     pub activation_seq: u64,
     pub ui: Vec<UiItem>,
+    /// Monotonic counter bumped whenever `ui`, button active state, or open
+    /// menus change, so the ribbon can skip rebuilding its model on idle frames.
+    pub ui_rev: u64,
     /// Hooks that warned already ("not implemented yet", once per VM).
     pub warned: HashSet<String>,
     /// Requests for the editor (open a script, pick a ribbon tool, …),
@@ -250,36 +261,143 @@ pub fn record_ui(lua: &Lua, owner: Ref, r: Ref, kind: UiKind) {
     if let Some(mut v) = vm(lua) {
         let Some(id) = v.by_root(owner).map(|p| p.id) else { return };
         v.ui.push(UiItem { plugin: id, r, kind });
+        v.ui_rev = v.ui_rev.wrapping_add(1);
+    }
+}
+
+/// Marks the VM's ribbon / menu UI state dirty.
+pub fn bump_ui_rev(lua: &Lua) {
+    if let Some(mut v) = vm(lua) {
+        v.ui_rev = v.ui_rev.wrapping_add(1);
     }
 }
 
 // ------------------------------------------------------------- loading
 
+fn clone_subtree_with_bytecode(
+    src_dom: &WeakDom,
+    src_bc: &HashMap<Ref, Bytecode>,
+    src: Ref,
+    dst_dom: &mut WeakDom,
+    dst_parent: Ref,
+    dst_bc: &mut HashMap<Ref, Bytecode>,
+) {
+    let Some(i) = src_dom.get_by_ref(src) else { return };
+    let mut b = InstanceBuilder::new(i.class).with_name(i.name.as_str());
+    for (k, v) in &i.properties {
+        b = b.with_property(*k, v.clone());
+    }
+    let new_r = dst_dom.insert(dst_parent, b);
+    if let Some(bc) = src_bc.get(&src) {
+        dst_bc.insert(new_r, bc.clone());
+    }
+    for &c in i.children() {
+        clone_subtree_with_bytecode(src_dom, src_bc, c, dst_dom, new_r, dst_bc);
+    }
+}
+
+enum ModelTransfer<'a> {
+    Clone {
+        tree: &'a WeakDom,
+        bytecode: &'a HashMap<Ref, Bytecode>,
+    },
+    Move {
+        dom: WeakDom,
+        bytecode: HashMap<Ref, Bytecode>,
+    },
+}
+
 /// Puts the plugin's instance tree into the entered World's document (an
 /// orphan: not in the DataModel, never saved, not in Explorer) and starts
-/// its Scripts at identity 5. Returns the Plugin instance. RunContext Plugin
-/// scripts wait for [`start_later`].
+/// its Scripts at `spec.identity` (5 for user/cloud, 6 for Studio built-ins).
+/// Returns the Plugin instance. RunContext Plugin scripts wait for [`start_later`].
 pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
+    load_inner(
+        rt,
+        spec.id,
+        &spec.name,
+        spec.asset_id,
+        &spec.settings_key,
+        spec.identity,
+        spec.is_builtin,
+        ModelTransfer::Clone { tree: &spec.tree, bytecode: &spec.bytecode },
+    )
+}
+
+/// Same as [`load`], but moves `dom` and `bytecode` directly into the edit
+/// document without cloning instances or properties (used for built-in plugins,
+/// which never load into Play DataModels).
+pub fn load_owned(
+    rt: &Runtime,
+    id: PluginId,
+    name: &str,
+    asset_id: i64,
+    settings_key: &str,
+    identity: u8,
+    is_builtin: bool,
+    dom: WeakDom,
+    bytecode: HashMap<Ref, Bytecode>,
+) -> Result<Ref, String> {
+    load_inner(rt, id, name, asset_id, settings_key, identity, is_builtin, ModelTransfer::Move { dom, bytecode })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_inner(
+    rt: &Runtime,
+    id: PluginId,
+    name: &str,
+    asset_id: i64,
+    settings_key: &str,
+    identity: u8,
+    is_builtin: bool,
+    transfer: ModelTransfer<'_>,
+) -> Result<Ref, String> {
     let lua = &rt.lua;
     install(lua);
     let (root, scripts, later, code) = {
         let mut w = world(lua).map_err(|e| e.to_string())?;
-        let d = w.dm();
-        let root = d.dom.insert(Ref::none(), InstanceBuilder::new("Plugin").with_name(spec.name.clone()));
-        let tops = spec.tree.root().children().to_vec();
-        let copies = spec.tree.clone_multiple_into_external(&tops, &mut d.dom);
-        for c in copies {
-            d.dom.transfer_within(c, root);
+        let mut bc_out = HashMap::new();
+        let root = {
+            let d = w.dm();
+            let root = d.dom.insert(Ref::none(), InstanceBuilder::new("Plugin").with_name(name));
+            match transfer {
+                ModelTransfer::Clone { tree, bytecode } => {
+                    let tops = tree.root().children().to_vec();
+                    if bytecode.is_empty() {
+                        let copies = tree.clone_multiple_into_external(&tops, &mut d.dom);
+                        for c in copies {
+                            d.dom.transfer_within(c, root);
+                        }
+                    } else {
+                        bc_out.reserve(bytecode.len());
+                        for top in tops {
+                            clone_subtree_with_bytecode(tree, bytecode, top, &mut d.dom, root, &mut bc_out);
+                        }
+                    }
+                }
+                ModelTransfer::Move { mut dom, bytecode } => {
+                    let tops = dom.root().children().to_vec();
+                    for top in tops {
+                        dom.transfer(top, &mut d.dom, root);
+                    }
+                    bc_out = bytecode;
+                }
+            }
+            // (Measured: the MultipleDocumentInterfaceInstance holds one
+            // DataModelSession named "Instance".)
+            d.dom.insert(
+                root,
+                InstanceBuilder::new("MultipleDocumentInterfaceInstance")
+                    .with_name("MultipleDocumentInterfaceInstance")
+                    .with_child(InstanceBuilder::new("DataModelSession").with_name("Instance")),
+            );
+            d.mark_tree(root);
+            root
+        };
+        if !bc_out.is_empty() {
+            w.core_scripts.modules.extend(bc_out);
         }
-        // (Measured: the MultipleDocumentInterfaceInstance holds one
-        // DataModelSession named "Instance".)
-        d.dom.insert(
-            root,
-            InstanceBuilder::new("MultipleDocumentInterfaceInstance")
-                .with_name("MultipleDocumentInterfaceInstance")
-                .with_child(InstanceBuilder::new("DataModelSession").with_name("Instance")),
-        );
-        d.mark_tree(root);
+        let d = w.d();
         let (mut now, mut later) = (Vec::new(), Vec::new());
         let code: Vec<Ref> = d
             .dom
@@ -309,11 +427,13 @@ pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
     };
     if let Some(mut v) = vm(lua) {
         v.plugins.push(VmPlugin {
-            id: spec.id,
+            id,
             root,
-            name: spec.name.clone(),
-            asset_id: spec.asset_id,
-            settings_key: spec.settings_key.clone(),
+            name: name.to_string(),
+            asset_id,
+            settings_key: settings_key.to_string(),
+            identity,
+            is_builtin,
             scripts: Vec::new(),
             later,
             code,
@@ -322,6 +442,7 @@ pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
             activated: false,
             exclusive_mouse: false,
         });
+        v.ui_rev = v.ui_rev.wrapping_add(1);
     }
     for s in scripts {
         // (A script an earlier one moved out of the plugin or disabled
@@ -331,7 +452,7 @@ pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
                 p.scripts.push(s);
             }
         }
-        rt.run_script_as(s, security::PLUGIN_IDENT);
+        rt.run_script_as(s, identity);
     }
     Ok(root)
 }
@@ -340,23 +461,23 @@ pub fn load(rt: &Runtime, spec: &LoadSpec) -> Result<Ref, String> {
 /// end of a load batch, as Studio starts them after the batch).
 pub fn start_later(rt: &Runtime) {
     let lua = &rt.lua;
-    let todo: Vec<(Ref, Vec<Ref>)> = match vm(lua) {
+    let todo: Vec<(Ref, u8, Vec<Ref>)> = match vm(lua) {
         Some(mut v) => v
             .plugins
             .iter_mut()
-            .map(|p| (p.root, std::mem::take(&mut p.later)))
-            .filter(|(_, l)| !l.is_empty())
+            .map(|p| (p.root, p.identity, std::mem::take(&mut p.later)))
+            .filter(|(_, _, l)| !l.is_empty())
             .collect(),
         None => return,
     };
-    for (root, scripts) in todo {
+    for (root, ident, scripts) in todo {
         for s in scripts {
             if let Some(mut v) = vm(lua) {
                 if let Some(p) = v.by_root_mut(root) {
                     p.scripts.push(s);
                 }
             }
-            rt.run_script_as(s, security::PLUGIN_IDENT);
+            rt.run_script_as(s, ident);
         }
     }
 }
@@ -416,6 +537,9 @@ pub fn unload(rt: &Runtime, id: PluginId) {
         }
     }
     if let Ok(mut w) = world(lua) {
+        for r in &code {
+            w.core_scripts.modules.remove(r);
+        }
         for r in p.owned.iter().chain(p.mouse.iter()).chain(std::iter::once(&p.root)) {
             if w.d().dom.get_by_ref(*r).is_some() {
                 w.orphans.insert(*r);
@@ -427,6 +551,7 @@ pub fn unload(rt: &Runtime, id: PluginId) {
     if let Some(mut v) = vm(lua) {
         v.plugins.retain(|x| x.id != id);
         v.ui.retain(|u| u.plugin != id);
+        v.ui_rev = v.ui_rev.wrapping_add(1);
     }
 }
 

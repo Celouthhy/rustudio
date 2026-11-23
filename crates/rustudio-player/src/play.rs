@@ -1270,6 +1270,9 @@ impl Game {
         }
         self.stop_play_worker();
         self.quiet_stop = false;
+        // A TextBox focused in Play (the chat bar) doesn't keep the
+        // editor's keyboard after the session ends.
+        self.gui.drop_focus();
         // A game's orthographic camera ends with the session.
         self.cam.ortho = None;
         self.cam.stretch = 1.0;

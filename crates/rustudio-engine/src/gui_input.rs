@@ -124,6 +124,21 @@ struct Root {
 }
 
 impl Gui {
+    /// Drops TextBox keyboard focus without firing FocusLost (the session
+    /// it belonged to has ended: Play stopping with the chat bar focused
+    /// would otherwise leave the editor's keys going to a box that's gone).
+    pub fn drop_focus(&mut self) {
+        self.focus = None;
+        self.tb_cursor = -1;
+        self.tb_sel = -1;
+        self.tb_selecting = None;
+        self.tb_held_key = None;
+        let mut sh = super::share();
+        sh.focus = None;
+        sh.focus_req.clear();
+        sh.focus_events.clear();
+    }
+
     /// Keeps the list of SurfaceGuis / BillboardGuis under Workspace from the
     /// document's journal: scanning Place B's 116k instances for them was
     /// 8 ms a frame. Call before `draw`.

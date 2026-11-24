@@ -2392,7 +2392,7 @@ impl Game {
                 }
             }
             // "." opens the emote wheel (Roblox's Emotes menu key).
-            if taps.contains(&Period) {
+            if self.show_core_gui && taps.contains(&Period) {
                 crate::emote_wheel::toggle();
             }
         }
@@ -2409,8 +2409,8 @@ impl Game {
         }
         // The open menu has the mouse and keys: none of it reaches the game
         // (SettingsHub's Modal shield and RbxSettingsHubStopCharacter).
-        let menu = self.play.as_ref().is_some_and(|s| s.game.menu_open);
-        if core_menu {
+        let menu = self.show_core_gui && self.play.as_ref().is_some_and(|s| s.game.menu_open);
+        if self.show_core_gui && core_menu {
             slots.clear();
         }
         if menu {
@@ -2472,7 +2472,7 @@ impl Game {
 
         // Hotbar (native fallback only when CoreScripts aren't running).
         let info = self.play_hotbar();
-        if !core_scripts && backpack_on && !info.is_empty() {
+        if !core_scripts && self.show_core_gui && backpack_on && !info.is_empty() {
             let doc_dir = self.doc.path.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let rects = self.gui.draw_hotbar(&ctx, &painter, &mut self.assets, doc_dir.as_deref(), rect, &info);
             for (n, r) in rects.into_iter().enumerate() {
@@ -2489,7 +2489,7 @@ impl Game {
         if let Some(s) = self.play.as_ref().and_then(|s| s.game.kicked.clone()) {
             draw_kicked(&painter, rect, &s);
         }
-        if !core_scripts {
+        if !core_scripts && self.show_core_gui {
             self.game_menu(ui, rect);
             if !menu {
                 self.emote_wheel(ui, rect, &mut slots);

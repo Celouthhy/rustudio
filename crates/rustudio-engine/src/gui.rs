@@ -367,6 +367,9 @@ pub struct Gui {
     pub topbar_chat: Option<bool>,
     /// Free rectangle published by the client CoreScripts, in viewport pixels.
     pub topbar_inset: Option<crate::ltypes::LRect>,
+    /// Hide Play Core UI (`CoreGui`: topbar, leaderboard, chat, backpack, …)
+    /// while keeping game UI (`PlayerGui` and world GUIs) visible.
+    pub hide_core_gui: bool,
     /// SurfaceGui / BillboardGui triangles (AlwaysOnTop false) for the
     /// renderer's depth-tested pass, by egui texture (round 23).
     pub world_batches: Vec<rustudio_render::world_gui::GuiBatch>,

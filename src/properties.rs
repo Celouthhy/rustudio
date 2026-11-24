@@ -2601,18 +2601,18 @@ mod tests {
         let cell_rect = egui::Rect::from_min_size(egui::pos2(120.0, 40.0), egui::vec2(180.0, 20.0));
 
         // Frame 1: user clicks the value cell.
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
             let out = super::text_cell_on(&mut props, 1, &mut p, key, cell_rect, initial, false, true);
             assert!(out.is_none());
-        });
+        }).textures_delta.clear();
 
         // Frame 2: TextEdit renders — must already have focus AND select-all range!
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
             let out = super::text_cell_on(&mut props, 2, &mut p, key, cell_rect, initial, false, false);
             assert!(out.is_none());
-        });
+        }).textures_delta.clear();
         assert!(ctx.memory(|m| m.has_focus(eid)), "TextEdit must be focused after clicking cell");
         let range = egui::text_edit::TextEditState::load(&ctx, eid)
             .and_then(|s| s.cursor.char_range())
@@ -2635,10 +2635,10 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         });
         let mut committed = None;
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let mut p = super::Painter { ui, width: 300.0, x0: 0.0 };
             committed = super::text_cell_on(&mut props, 3, &mut p, key, cell_rect, initial, false, false);
-        });
+        }).textures_delta.clear();
         assert_eq!(committed.as_deref(), Some("1"));
     }
 
